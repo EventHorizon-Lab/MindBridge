@@ -161,6 +161,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _dispatch(arguments: argparse.Namespace) -> _Document:
+    _reject_duplicate_content(arguments)
     composition = _resolve(arguments)
     if arguments.explain:
         return composition
@@ -577,7 +578,7 @@ def _remote_add(arguments: argparse.Namespace) -> tuple[str, str, _Document | No
 def _remote_add_many(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
     items = _jsonl(arguments.source)
     body: _Document = {
-        "contents": [item["content"] for item in items],
+        "contents": [_remote_content(item["content"]) for item in items],
         "memory_type": arguments.memory_type,
     }
     for field in ("occurred_at", "occurred_end"):
@@ -690,6 +691,19 @@ def _response(raw: bytes) -> _Document:
 # Input
 
 
+def _reject_duplicate_content(arguments: argparse.Namespace) -> None:
+    """One operand, one source. Preferring either would silently discard what the caller typed.
+
+    Checked before the composition runs, so the refusal is identical locally and against `--url`
+    and nothing is constructed or sent first.
+    """
+    if getattr(arguments, "content_json", None) is not None and arguments.content:
+        raise ValidationError(
+            "--content-json and positional content both supply this operand; pass one or the other",
+            subject="--content-json",
+        )
+
+
 def _atoms(arguments: argparse.Namespace) -> tuple[_Atom, ...]:
     """Decode ordered content atoms without shell quoting tricks."""
     values: list[str] = list(arguments.content) or [_STDIN]
@@ -718,15 +732,7 @@ def _content_input(arguments: argparse.Namespace) -> ContentInput:
 def _content_value(arguments: argparse.Namespace) -> object:
     """The `content` a `/v1` request carries. Local paths deliberately never cross the wire."""
     if arguments.content_json is not None:
-        parts = _json_source(arguments.content_json)
-        items = parts if isinstance(parts, list) else []
-        if any(isinstance(item, dict) and "path" in item for item in items):
-            raise _CompositionError(
-                "input_file.path is a local-mode part type and cannot be sent to a remote owner",
-                reason="unsupported_in_remote_mode",
-                subject="input_file.path",
-            )
-        return parts
+        return _remote_content(_json_source(arguments.content_json))
     atoms = _atoms(arguments)
     if any(kind == "path" for kind, _value in atoms):
         raise _CompositionError(
@@ -738,6 +744,22 @@ def _content_value(arguments: argparse.Namespace) -> object:
     if len(atoms) == 1:
         return atoms[0][1]
     return [{"type": "input_text", "text": value} for _kind, value in atoms]
+
+
+def _remote_content(value: object) -> object:
+    """Refuse the one CLI-only part type on every path that reaches a running owner.
+
+    `add-many` carries the same union one item per JSONL line, so it validates here too rather
+    than forwarding a local path and letting the owner reject it as an unknown field.
+    """
+    items = value if isinstance(value, list) else []
+    if any(isinstance(item, dict) and "path" in item for item in items):
+        raise _CompositionError(
+            "input_file.path is a local-mode part type and cannot be sent to a remote owner",
+            reason="unsupported_in_remote_mode",
+            subject="input_file.path",
+        )
+    return value
 
 
 def _parts_input(value: object) -> ContentInput:

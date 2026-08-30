@@ -2422,7 +2422,13 @@ def _derived_text(text: str, assets: Sequence[StoredAsset]) -> str:
         if not transcript or asset.asset_id in seen:
             continue
         seen.add(asset.asset_id)
-        marker = f"[audio transcript:{asset.asset_id}]"
+        # Modality-neutral on purpose. This text becomes `memory_records.content`, which is the
+        # BM25 document, so every word in the marker is a term any query matches for free -- and a
+        # lexical match alone clears `minimum_relevance`. Naming the modality here labelled video
+        # speech "audio" and handed every video memory a free match on that word; deriving it from
+        # `asset.modality` would only move the free match to the commoner word. The modality is
+        # already published on the record's assets, so nothing is lost by leaving it out.
+        marker = f"[transcript:{asset.asset_id}]"
         if marker not in text:
             sections.append(f"{marker}\n{transcript}")
     return "\n\n".join(sections)

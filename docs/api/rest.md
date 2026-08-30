@@ -342,7 +342,7 @@ failure that maps to `503` also carries a `Retry-After` header.
 | `validation_error` | `input_invalid`, `unknown_field`, `payload_too_large` |
 | `memory_not_found` | `memory_not_found` |
 | `speaker_not_found` | `speaker_not_found` |
-| `model_error` | `backend_not_configured`, `unsupported_modality`, `auth_failed`, `rate_limited`, `timeout`, `connection_failed`, `request_rejected`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed` |
+| `model_error` | `backend_not_configured`, `unsupported_modality`, `auth_failed`, `rate_limited`, `quota_exhausted`, `timeout`, `connection_failed`, `request_rejected`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed` |
 | `model_output_truncated` | `output_truncated` |
 | `storage_error` | `data_dir_in_use`, `schema_unsupported`, `io_failed` |
 | `index_unavailable` | *(unset; an index failure is never assumed retryable)* |

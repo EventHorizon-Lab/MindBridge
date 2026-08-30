@@ -872,6 +872,22 @@ def _search_hit() -> SearchHit:
             "rate_limited",
             True,
         ),
+        # The SDK raises `RateLimitError` for every 429, so exhausted billing is told from a
+        # transient burst by the provider's own error code and never invites a retry.
+        (
+            lambda request: httpx.Response(
+                429,
+                json={
+                    "error": {
+                        "message": "You exceeded your current quota",
+                        "type": "insufficient_quota",
+                        "code": "insufficient_quota",
+                    }
+                },
+            ),
+            "quota_exhausted",
+            False,
+        ),
         (
             lambda request: httpx.Response(400, json={"error": {"message": "bad input"}}),
             "request_rejected",

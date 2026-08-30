@@ -204,6 +204,11 @@ mindbridge --embedder jina-omni add --content-json - <<'JSON'
 JSON
 ```
 
+`--content-json` and the positional atoms are two ways to supply the **same** operand, not two
+halves of one, so passing both is refused with exit `3` during argument validation — before any
+backend is composed and before any request is sent. Preferring either would store a memory missing
+what the caller typed, or run a different query than the one that was asked.
+
 The CLI adds exactly one part type to that union, `{"type": "input_file", "path": "..."}`. It is
 valid in local mode only, because the CLI runs on the same machine as the data directory and the SDK
 already accepts a `pathlib.Path` atom. REST and MCP refuse local paths on purpose, so in `--url`
@@ -212,7 +217,9 @@ media in a data URL instead.
 
 `add-many` reads JSONL, one object per line, each with `content` plus optional `occurred_at`,
 `occurred_end`, and `metadata`. `--memory-type` applies to the batch, matching `add_many`. The whole
-batch is one embedding batch and one SQLite transaction.
+batch is one embedding batch and one SQLite transaction. Each line's `content` is the same union,
+checked by the same rule, so a batched local path is refused in `--url` mode exactly as a single
+`add` refuses one.
 
 ```bash
 mindbridge --embedder jina-omni add-many @import.jsonl

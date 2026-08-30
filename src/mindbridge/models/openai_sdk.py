@@ -45,6 +45,8 @@ _TRUNCATED_ANSWER_ERROR = (
     "answer limit"
 )
 _Operation = Literal["embedding", "generation", "transcription"]
+# The one 429 an identical retry can never clear: the account is out of quota, not too fast.
+_INSUFFICIENT_QUOTA = "insufficient_quota"
 # Bounds the base64 media the request carries, not the bytes on disk. Media reaches the provider
 # inside a data URL or an input_audio part, so the wire always carries 4/3 of the file size.
 _MAX_INLINE_MODEL_BYTES = 64 * 1024 * 1024
@@ -741,10 +743,14 @@ def _provider_reason(error: Exception) -> str | None:
         import openai
     except ImportError:  # pragma: no cover - a client call implies the SDK imported already
         return None
+    if isinstance(error, openai.RateLimitError):
+        # The SDK raises this for every 429, exhausted billing included, and an agent that retries
+        # exhausted billing never stops. ``APIError.code`` is the SDK's own parsed error body, so
+        # the permanent case is separated by the provider's code rather than by its message.
+        return "quota_exhausted" if error.code == _INSUFFICIENT_QUOTA else "rate_limited"
     # ``APITimeoutError`` subclasses ``APIConnectionError``, so the narrower class is checked first.
     for provider_error, reason in (
         (openai.AuthenticationError, "auth_failed"),
-        (openai.RateLimitError, "rate_limited"),
         (openai.APITimeoutError, "timeout"),
         (openai.APIConnectionError, "connection_failed"),
         (openai.BadRequestError, "request_rejected"),

@@ -193,6 +193,22 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   document lives on part 0 only, hybrid retrieval silently degraded to dense-only for every media
   memory. This fixes audio and video; an image has no audio track and gains nothing, and no
   benchmark has been re-run, so no score claim is made.
+- The derived-transcript marker in a memory's indexed content is `[transcript:<asset_id>]` rather
+  than `[audio transcript:<asset_id>]`. That content is also the BM25 document, and one lexical
+  match alone reaches the confidence the default weak-evidence floor requires, so naming a modality
+  both labelled video speech "audio" and gave every media memory a free full-text match on an
+  ordinary English word. Memory identity is unaffected: it is built from the caller's own text and
+  each asset's SHA-256, never from derived text.
+- The CLI refuses `--content-json` together with positional content instead of silently discarding
+  the positional atoms — a write that dropped caller data on `add`, and a different query than the
+  one typed on `search` and `ask`. It fails as `validation_error` (exit `3`) during argument
+  validation, before any backend is constructed or any request is sent.
+- `mindbridge --url ... add-many` validates every JSONL `content` through the same rule single
+  `add` uses, so the CLI-only `{"type": "input_file", "path": ...}` part is refused with
+  `unsupported_in_remote_mode` instead of sending a local filesystem path to a remote owner.
+- The `openai` recipe closes the SDK client it constructs. `OpenAIModels.close()` deliberately
+  leaves a caller-supplied client open; a recipe-built client had no other owner, so repeated
+  recipe construction retained one HTTP connection pool per call.
 - `SpeakerNotFoundError` is mapped on both transports. It served as HTTP `500` and was destroyed
   outright on MCP, where the middleware overwrote any code outside a hand-maintained allowlist.
   `model_output_truncated` had fallen into the same hole, so that set is now derived from the
@@ -202,7 +218,10 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - The OpenAI adapter raises `from error` instead of `from None` and classifies the failure from the
   official SDK's own exception classes. Authentication, rate limiting, timeouts, connection loss,
   and rejected requests were previously one indistinguishable `model_error`. An unrecognized failure
-  stays unclassified rather than being guessed into a retryable reason.
+  stays unclassified rather than being guessed into a retryable reason. Exhausted billing is
+  separated from a transient burst: the SDK raises `openai.RateLimitError` for every `429`, so the
+  provider's own `APIError.code` selects the new permanent reason `quota_exhausted` instead of the
+  retryable `rate_limited` an agent would retry forever.
 - `_open_store` separates a busy data directory from an unsupported on-disk schema, and keeps the
   message a literal so the directory travels in `subject` instead of a message every transport
   forwards.

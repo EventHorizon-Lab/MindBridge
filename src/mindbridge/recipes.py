@@ -152,6 +152,39 @@ def transcriber(name: str, *, load: bool = False) -> SpeechBackend | Transcripti
     )
 
 
+class _OwnedClientModels(OpenAIModels):
+    """``OpenAIModels`` over an SDK client this module constructed, and therefore closes.
+
+    ``OpenAIModels.close()`` leaves a caller-owned client open, which is right when an application
+    supplied one. Here the recipe is that caller, so the client's lifetime is the returned
+    backend's: without this a long-lived process retains one HTTP connection pool per recipe call
+    even after closing everything the recipe handed back.
+    """
+
+    __slots__ = ("_owned_client",)
+
+    def __init__(
+        self,
+        client: OpenAI,
+        *,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        generation_model: str = DEFAULT_GENERATION_MODEL,
+        transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL,
+    ) -> None:
+        super().__init__(
+            client,
+            embedding_model=embedding_model,
+            generation_model=generation_model,
+            transcription_model=transcription_model,
+        )
+        self._owned_client = client
+
+    def close(self) -> None:
+        """Close the backend, then the SDK client the recipe created to build it."""
+        super().close()
+        self._owned_client.close()
+
+
 def _build(name: str, *, slot: Slot, load: bool) -> object:
     family, model = _split(name)
     require_slot(name, slot)
@@ -168,10 +201,10 @@ def _build(name: str, *, slot: Slot, load: bool) -> object:
     selected = _OPENAI_MODELS[slot] if model is None else model
     client = _openai_client()
     if slot == "embedder":
-        return OpenAIModels(client, embedding_model=selected)
+        return _OwnedClientModels(client, embedding_model=selected)
     if slot == "answerer":
-        return OpenAIModels(client, generation_model=selected)
-    return OpenAIModels(client, transcription_model=selected)
+        return _OwnedClientModels(client, generation_model=selected)
+    return _OwnedClientModels(client, transcription_model=selected)
 
 
 def _openai_client() -> OpenAI:

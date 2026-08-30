@@ -438,6 +438,37 @@ def test_recipes_return_an_object_the_caller_owns() -> None:
         embedder.close()
 
 
+class _SdkClient:
+    """Stands in for the SDK client `recipes` constructs, which needs a credential to build."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize("slot", ("embedder", "answerer", "transcriber"))
+def test_a_recipe_closes_the_sdk_client_it_constructed(
+    slot: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clients: list[_SdkClient] = []
+
+    def build() -> _SdkClient:
+        clients.append(_SdkClient())
+        return clients[-1]
+
+    monkeypatch.setattr(recipes, "_openai_client", build)
+    backend = getattr(recipes, slot)("openai")
+    assert [client.closed for client in clients] == [False]
+
+    backend.close()
+
+    # `OpenAIModels.close()` leaves a caller-supplied client open; a recipe-built one is the
+    # recipe's, so the connection pool goes when the returned backend does.
+    assert [client.closed for client in clients] == [True]
+
+
 @pytest.mark.parametrize(
     "name",
     ("unknown", "jina-omni:something", "openai:", "funasr:x"),
@@ -612,6 +643,56 @@ def test_a_local_path_is_never_sent_to_a_remote_owner(
     )
     assert status == 10
     assert cast(dict[str, object], stderr[0])["subject"] == "input_file.path"
+
+
+def test_a_batched_local_path_is_never_sent_to_a_remote_owner(
+    calls: list[tuple[str, str, object]],
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "batch.jsonl"
+    source.write_text(
+        "\n".join(
+            (
+                json.dumps({"content": "a red wrench"}),
+                json.dumps({"content": [{"type": "input_file", "path": "/srv/media/panel.png"}]}),
+            )
+        ),
+        encoding="utf-8",
+    )
+    status, stdout, stderr = _run(
+        capsys, "--url", "http://owner:8000", "-q", "add-many", f"@{source}"
+    )
+    assert status == 10
+    assert stdout is None
+    envelope = cast(dict[str, object], stderr[0])
+    assert envelope["reason"] == "unsupported_in_remote_mode"
+    assert envelope["subject"] == "input_file.path"
+    # The refusal happens before the request, so no local path reached the owner.
+    assert calls == []
+
+
+@pytest.mark.parametrize("command", ("add", "search", "ask"))
+def test_two_sources_for_one_operand_are_refused_before_anything_runs(
+    command: str,
+    app: str,
+    calls: list[tuple[str, str, object]],
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    parts = json.dumps([{"type": "input_text", "text": "a blue toolbox"}])
+    for composition in (("--app", app), ("--url", "http://owner:8000")):
+        status, stdout, stderr = _run(
+            capsys, *composition, "-q", command, "a red wrench", "--content-json", parts
+        )
+        assert status == EXIT_CODES[ValidationError.code]
+        assert stdout is None
+        envelope = cast(dict[str, object], stderr[0])
+        assert envelope["code"] == ValidationError.code
+        assert envelope["subject"] == "--content-json"
+    # Refused during argument validation: nothing was composed locally and nothing was sent.
+    assert not (tmp_path / "store").exists()
+    assert calls == []
 
 
 def test_a_remote_failure_envelope_is_forwarded_and_mapped(

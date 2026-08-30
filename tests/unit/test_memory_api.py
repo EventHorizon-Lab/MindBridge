@@ -1777,6 +1777,28 @@ def test_declared_video_speech_becomes_indexed_text(tmp_path: Path) -> None:
     assert [asset.modality for asset in models.transcribe_calls[0]] == [Modality.VIDEO]
 
 
+def test_the_transcript_marker_names_no_modality(tmp_path: Path) -> None:
+    models = _FakeModels(
+        capabilities=_Capabilities(
+            embedding=ALL_INPUT_MODALITIES,
+            generation=ALL_INPUT_MODALITIES,
+            transcription=frozenset({Modality.AUDIO, Modality.VIDEO}),
+        )
+    )
+
+    with _memory(tmp_path, models) as memory:
+        record = memory.add(Blob(b"kitchen recording", "video/mp4", "kitchen.mp4"))
+        indexed = _FakeIndex.instances[-1].documents[record.id].content
+
+    # One lexical match on its own reaches `_LEXICAL_MATCH_CONFIDENCE`, which is above the default
+    # weak-evidence floor, so every word of the marker is a term that makes this memory visible to
+    # any query containing it. A marker naming a modality both mislabels a video transcript as
+    # audio and hands each media memory a free match on an ordinary English word.
+    assert memory_module._LEXICAL_MATCH_CONFIDENCE > memory_module._DEFAULT_MINIMUM_RELEVANCE
+    assert "spoken red wrench" in indexed
+    assert not {"audio", "video"} & set(re.findall(r"\w+", indexed.casefold()))
+
+
 def test_audio_fallback_also_transcribes_declared_video_speech(tmp_path: Path) -> None:
     models = _FakeModels(
         capabilities=_Capabilities(
@@ -1799,7 +1821,10 @@ def test_audio_fallback_also_transcribes_declared_video_speech(tmp_path: Path) -
     assert len(models.transcribe_calls) == 1
     assert len(models.transcribe_calls[0]) == 2
     assert [asset.transcript for asset in stored] == ["spoken red wrench"] * 2
-    assert record.content.count("[audio transcript:") == 2
+    assert record.content.count("[transcript:") == 2
+    # The indexed content is also the BM25 document, so the marker must not hand every video
+    # memory a free lexical match on a word as ordinary as "audio" or "video".
+    assert not {"audio", "video"} & set(re.findall(r"\w+", record.content))
 
 
 def test_text_only_add_never_reaches_the_transcriber(tmp_path: Path) -> None:

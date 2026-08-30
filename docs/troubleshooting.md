@@ -49,11 +49,17 @@ root cause, and `reason` classifies it from the official SDK's exception classes
 | `reason` | Provider condition | Retry |
 | --- | --- | --- |
 | `auth_failed` | `openai.AuthenticationError` | Never; fix the credential |
-| `rate_limited` | `openai.RateLimitError` | Yes, after a delay |
+| `rate_limited` | `openai.RateLimitError` with any other `code` | Yes, after a delay |
+| `quota_exhausted` | `openai.RateLimitError` whose `code` is `insufficient_quota` | Never; the account is out of quota |
 | `timeout` | `openai.APITimeoutError` | Yes |
 | `connection_failed` | `openai.APIConnectionError` | Yes |
 | `request_rejected` | `openai.BadRequestError` | Never; the request itself is wrong |
 | unset | Anything else | Treated as permanent |
+
+The SDK raises `RateLimitError` for every `429`, exhausted billing included, so the two rows above
+are separated by the provider's own `APIError.code` rather than by its message. Only
+`rate_limited` reaches `503` with a `Retry-After`; `quota_exhausted` is a `502`, because an agent
+that retries an exhausted account never stops.
 
 Check `error.retryable` instead of inspecting the message. It is `False` unless `reason` is one of
 the transient values above, because failing to retry a transient error costs one call while retrying
