@@ -14,12 +14,16 @@ Memory(
     embedder=embedder,
     answerer=None,
     transcriber=None,
+    face_analyzer=None,
     index_speech=False,
+    index_quantization=IndexQuantization.NONE,
     minimum_relevance=0.55,
     ambiguity_margin=0.01,
     decay_half_life_days=None,
     speaker_similarity=0.78,
     speaker_margin=0.05,
+    face_similarity=0.363,
+    face_margin=0.05,
     tracer=None,
 )
 ```
@@ -31,12 +35,16 @@ Memory(
   `speech()` is required. A `TranscriptionBackend` transcribes every stored asset whose modality it
   declares, so a media memory carries retrievable text even where the embedder accepts the media
   natively.
+- `face_analyzer` is optional. Configure it when `faces()` or visual identity grounding is required.
 - `index_speech` opts a configured `SpeechBackend` into add-time transcript and speaker-identity
   indexing; the default leaves analysis lazy.
+- `index_quantization` defaults to quality-first `NONE`; `FP16`, rotated `INT8`, and x86_64-only
+  `RABITQ` are explicit, lossy capacity choices that rebuild only the derived Zvec projection.
 - `minimum_relevance` drops weak dense evidence; `ambiguity_margin` drops unresolved top-two ties
   unless the winner has a lexical or temporal anchor. Set either to `0` to disable that gate.
 - `decay_half_life_days` controls query-time soft decay; `None` disables it.
-- Speaker thresholds are local matching semantics, not provider settings.
+- Face and speaker thresholds are local matching semantics, not provider settings. Each modality
+  applies its own top-two margin before enrolling a new identity.
 - `tracer` optionally injects an OpenTelemetry tracer; `None` uses the global no-op or
   application-configured provider.
 
@@ -113,8 +121,8 @@ Every embedding adapter exposes:
 
 Every transcription adapter exposes `transcription_model`, `transcription_space`, and
 `transcription_capabilities`. MindBridge persists the embedding model, vector space, dimension,
-transcription space, and index recipe in SQLite. Opening the directory with incompatible values
-fails immediately.
+transcription space, configured face spaces, and index recipe in SQLite. Opening the directory with
+incompatible values fails immediately.
 
 `reindex()` rebuilds Zvec from stored vectors. It does not re-embed or retranscribe content. Use a
 new directory when changing a semantic recipe.
@@ -131,15 +139,17 @@ paths at their trust boundaries.
 ## Local adapters
 
 ```python
-from mindbridge import FunASRTranscriber, JinaOmniEmbedder
+from mindbridge import FunASRTranscriber, JinaOmniEmbedder, OpenCVFaceAnalyzer
 
 embedder = JinaOmniEmbedder(device="cuda", batch_size=8)
 speech = FunASRTranscriber(device="cuda")
+faces = OpenCVFaceAnalyzer("./models/yunet.onnx", "./models/sface.onnx")
 ```
 
 Jina delegates query/document inference to Sentence Transformers. FunASR delegates execution and
-device selection to `funasr.AutoModel`; MindBridge does not implement a second vLLM/VAD/diarization
-engine.
+device selection to `funasr.AutoModel`. Face analysis delegates local decoding, YuNet detection,
+alignment, and SFace encoding to OpenCV; model files are caller-provided and never downloaded by
+MindBridge.
 
 ## Benchmark-only environment settings
 

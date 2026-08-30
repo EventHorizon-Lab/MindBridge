@@ -36,7 +36,10 @@ from mindbridge.benchmarks.eval_adapters import (
     EvalQuestion,
     EvalUnit,
     LoadedTask,
+    MediaResolver,
     MemoryItem,
+    _gallery_memory,
+    _query_parts,
     load_task,
 )
 from mindbridge.benchmarks.eval_statistics import (
@@ -46,6 +49,7 @@ from mindbridge.benchmarks.eval_statistics import (
     summarize,
 )
 from mindbridge.benchmarks.isolation import BenchmarkRun
+from mindbridge.benchmarks.mem_gallery import MemGalleryRound, MemGallerySession
 from mindbridge.benchmarks.model_config import ModelConfig
 from mindbridge.benchmarks.official_scorers import scorer_protocol
 from mindbridge.benchmarks.task_catalog import TASKS, TaskSpec, expand
@@ -74,6 +78,40 @@ def _egomem_sample(example_id: int, answer: str | None = None) -> SampleResult:
         metadata={"example_id": example_id, "choices": ("a", "b", "c", "d")},
         scorer_protocol=scorer_protocol("egomemreason"),
     )
+
+
+def test_query_parts_and_gallery_image_id_preserve_retrieval_evidence(tmp_path: Path) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image")
+    session = MemGallerySession(
+        session_id="D1",
+        occurred_at=datetime(2024, 5, 2, tzinfo=timezone.utc),
+        rounds=(
+            MemGalleryRound(
+                round_id="D1:4",
+                user="I bought this.",
+                assistant="It looks useful.",
+                image_id="D1:IMG_002",
+                image_path=image.name,
+            ),
+        ),
+    )
+
+    item = _gallery_memory(
+        "Mira",
+        session,
+        session.rounds[0],
+        MediaResolver("mem-gallery", tmp_path, None, None),
+    )
+
+    assert isinstance(item.content[0], str)
+    assert "Image ID: D1:IMG_002" in item.content[0]
+    assert item.content[1] == image
+    assert _query_parts(
+        "Instruction\n{question}\n{format_constraint}",
+        "Where is it?",
+        format_constraint="Answer briefly.",
+    ) == ("Where is it?", "Instruction", "Answer briefly.")
 
 
 def test_catalog_covers_requested_benchmarks_and_aliases() -> None:

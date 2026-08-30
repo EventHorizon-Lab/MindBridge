@@ -7,7 +7,7 @@ uv add "mindbridge[local]"
 ```
 
 The `local` extra supplies the pinned Jina embedding adapter and FunASR speech adapter. Add
-`openai`, `server`, or `mcp` only when the application uses those surfaces.
+`face`, `openai`, `server`, or `mcp` only when the application uses those surfaces.
 
 ## Choose an embedding backend
 
@@ -135,8 +135,37 @@ with Memory(
 
 Speech analysis is lazy by default; this example opts into add-time indexing so transcript and
 identity text can be retrieved. FunASR owns model execution; MindBridge maps its timed turns and
-speaker centroids into durable memory semantics. When an answerer is configured, `ask` reuses that
+speaker observations into bounded durable exemplars. When an answerer is configured, `ask` reuses that
 identity cache as grounding evidence while returning the original source hits.
+
+## Recognize face and voice identity
+
+```bash
+uv add "mindbridge[face,local]"
+```
+
+```python
+from pathlib import Path
+
+from mindbridge import FunASRTranscriber, JinaOmniEmbedder, Memory, OpenCVFaceAnalyzer
+
+with Memory(
+    "./data/identity",
+    embedder=JinaOmniEmbedder(),
+    transcriber=FunASRTranscriber(),
+    face_analyzer=OpenCVFaceAnalyzer(
+        "./models/face_detection_yunet.onnx",
+        "./models/face_recognition_sface.onnx",
+    ),
+) as memory:
+    record = memory.add(Path("./introduction.mp4"))
+    face = memory.faces(record.id)[0]
+    memory.register_identity(face.identity_id, "Ada")
+```
+
+The model paths are explicit and stay local. A single-face/single-speaker video can establish one
+shared identity; ambiguous scenes are kept separate. Each modality has its own matching threshold
+and bounded exemplar collection.
 
 ## Add a provider answerer
 

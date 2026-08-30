@@ -58,8 +58,8 @@ one directory; changing it is a fail-fast compatibility event and requires a new
 ## Capture and network boundaries
 
 MindBridge accepts completed files and bytes; it does not own cameras, microphones, streaming
-capture, face identity, or sensor drivers. It does provide local voice identity with optional names
-for completed audio/video assets; the application still decides when capture is complete.
+capture, or sensor drivers. It can provide local face-and-voice identity with optional names for
+completed image/audio/video assets; the application still decides when capture is complete.
 
 Edge applications usually prefer `Path` or `Blob` so ingestion does not depend on external
 storage. Fetch remote media in application code, where the platform's existing HTTP client,
@@ -72,5 +72,5 @@ use separate data directories; metadata is not isolation.
 The returned retrieval unit remains one memory; composite inputs add aggregate and atomic
 text/media vectors, and long text adds overlapping contextual keys. All keys collapse by maximum
 relevance and are bounded to 128 non-aggregate vectors per record. Budget for the extra vectors.
-Do not assume automatic frame sampling, audio/video segmentation, generated semantic keys, or
-learned reranking.
+Do not assume audio/video segmentation, generated semantic keys, or learned reranking. The optional
+OpenCV face adapter performs bounded video frame sampling only for face observations.

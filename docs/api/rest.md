@@ -235,8 +235,10 @@ Content-Type: application/json
 
 `limit` defaults to 10 and ranges from 1 through 100. `memory_type` optionally filters one role.
 `reference_at` resolves relative date expressions and must include a timezone; current UTC is the
-default. Response `200` is `{"hits": [...]}`; each hit has the memory fields plus `score`. A routed
-query containing text uses hybrid dense/full-text retrieval; pure media uses dense retrieval.
+default unless the query declares a valid English reference date such as
+`Today is May 2, 2024`; an explicit value always wins. Response `200` is `{"hits": [...]}`; each
+hit has the memory fields plus `score`. Routed aggregate and atomic query keys use dense retrieval;
+the focused text atom also supplies lexical candidates. Both routes collapse to parent memories.
 
 ### Answer from memories
 
@@ -342,6 +344,7 @@ failure that maps to `503` also carries a `Retry-After` header.
 | `validation_error` | `input_invalid`, `unknown_field`, `payload_too_large` |
 | `memory_not_found` | `memory_not_found` |
 | `speaker_not_found` | `speaker_not_found` |
+| `identity_not_found` | `identity_not_found` |
 | `model_error` | `backend_not_configured`, `unsupported_modality`, `auth_failed`, `rate_limited`, `quota_exhausted`, `timeout`, `connection_failed`, `request_rejected`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed` |
 | `model_output_truncated` | `output_truncated` |
 | `storage_error` | `data_dir_in_use`, `schema_unsupported`, `io_failed` |
@@ -360,6 +363,7 @@ process and is never serialized.
 | 404 | `not_found` | Route does not exist |
 | 404 | `memory_not_found` | Memory ID does not exist |
 | 404 | `speaker_not_found` | Local speaker identity does not exist |
+| 404 | `identity_not_found` | Face/voice identity does not exist |
 | 405 | `method_not_allowed` | Method is not allowed for this route |
 | 413 | `request_too_large` | Request body exceeds 8 MiB |
 | 422 | `validation_error` | Request, media source, or public input is invalid |
@@ -384,18 +388,21 @@ than caller input.
 ### Operations without a route
 
 REST covers `add`, `add_many`, `search`, `ask`, `get`, `list`, and `delete` with the same defaults,
-field meanings, and error semantics as the Python SDK. Five documented SDK operations have no route:
+field meanings, and error semantics as the Python SDK. Seven documented SDK operations have no
+route:
 
 | Operation | Why there is no route |
 | --- | --- |
 | `speech` | Not implemented on any transport yet |
+| `faces` | Python-only visual identity analysis |
 | `register_speaker` | Not implemented on any transport yet |
+| `register_identity` | Python-only face/voice identity naming |
 | `reinforce` | Not implemented on any transport yet |
 | `reindex` | Owner-process maintenance: it rebuilds the whole index and must not be reachable by an unauthenticated client |
 | `optimize` | Owner-process maintenance, for the same reason |
 
-`speech`, `register_speaker`, and `reinforce` are implementation gaps, not a different execution
-model. Use the Python API in the owner process until they ship. See
+`speech`, `faces`, identity registration, and `reinforce` are implementation gaps, not a different
+execution model. Use the Python API in the owner process until they ship. See
 [Python SDK](python-sdk.md) for the full inventory.
 
 ### Input limits

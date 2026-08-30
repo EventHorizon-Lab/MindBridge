@@ -27,6 +27,7 @@ from pydantic import (
 
 from mindbridge import Memory
 from mindbridge.exceptions import (
+    IdentityNotFoundError,
     IndexUnavailableError,
     MemoryNotFoundError,
     MindBridgeError,
@@ -527,6 +528,8 @@ def _error_message(error: MindBridgeError) -> str:
         return str(error) or "memory does not exist"
     if isinstance(error, SpeakerNotFoundError):
         return str(error) or "speaker does not exist"
+    if isinstance(error, IdentityNotFoundError):
+        return str(error) or "identity does not exist"
     if isinstance(error, ModelError):
         return str(error) or "model operation failed"
     if isinstance(error, IndexUnavailableError):

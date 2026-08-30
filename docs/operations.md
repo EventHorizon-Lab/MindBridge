@@ -54,10 +54,12 @@ re-embedding historical content. A configuration metadata mismatch stops startup
 embedding model, vector-space ID, dimension, and recipe that created the store.
 Restore the original `transcription_space` as well. It identifies the ASR model and
 transcript-affecting recipe used by cached transcripts and add-time derived text; a mismatch fails startup.
+Configured face embedding and analysis spaces have the same fail-fast guard.
 
-A recognized legacy index recipe is different from a missing Zvec directory: startup re-embeds
-authoritative records with the current retrieval-key recipe, then commits the new recipe marker and
-rebuilds Zvec. Plan model capacity for that one-time compatible upgrade.
+A recognized legacy retrieval-key recipe is different from a missing Zvec directory: startup
+re-embeds authoritative records, commits the new recipe marker, and rebuilds Zvec. Schema-only
+upgrades from the context-key v6 or grouped-range v7 recipes reuse stored vectors and rebuild only
+the disposable Zvec projection.
 
 ## Rebuild and optimize
 
@@ -76,11 +78,33 @@ with Memory(
 ```
 
 `reindex()` rebuilds the derived collection from SQLite. `optimize()` compacts and flushes staged
-Zvec data. Both can be I/O intensive; schedule them when request traffic is low and ensure enough
-free disk space.
+Zvec data. MindBridge also triggers Zvec's background optimize after 100,000 additional vectors
+remain unindexed; the explicit operation remains useful before latency-sensitive workloads. Both
+explicit operations can be I/O intensive, so schedule them when request traffic is low and ensure
+enough free disk space.
 
 Routine adds, deletes, and searches drain the durable outbox automatically. Do not edit
 `search_index_queue` by hand.
+
+Zvec derives process-wide thread and memory defaults from the available CPU and cgroup limits. To
+override them, initialize Zvec once at application startup, before constructing any `Memory`:
+
+```python
+import zvec
+
+zvec.init(query_threads=4, optimize_threads=2, memory_limit_mb=2048)
+```
+
+This is process-global and cannot be changed at runtime. MindBridge deliberately does not call it,
+so multiple local directories cannot silently compete to replace one another's resource policy.
+MindBridge may fan out up to four independent dense/lexical routes for one composite query; include
+that outer concurrency when selecting `query_threads`.
+
+The optional `IndexQuantization` setting changes only the derived vector index. Zvec retains the
+original vectors alongside quantized data, so quantization reduces active memory and may improve
+query throughput but does not necessarily reduce disk bytes. `RABITQ` additionally requires
+x86_64 with AVX2 and dimensions from 64 through 4095. Keep the default `NONE` unless measured
+quality and capacity results justify a lossy mode.
 
 ## Capacity signals
 
@@ -123,6 +147,9 @@ credentials by default.
 Back up the directory before changing MindBridge versions. Schema or index recipe changes are
 compatibility events and may require an explicit migration or new directory. Never bypass a startup
 compatibility failure by editing `PRAGMA user_version` or `store_metadata` manually.
+
+The schema 6 to 7 migration is automatic: each legacy speaker centroid becomes the first voice
+exemplar, existing IDs and names remain stable, and the shared face/voice identity tables are added.
 
 The upgrade from the former service architecture is described in the
 [quick start](quickstart.md#upgrading-from-the-service-based-release).

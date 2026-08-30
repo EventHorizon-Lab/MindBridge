@@ -47,12 +47,16 @@ Memory(
     embedder: EmbeddingBackend,
     answerer: GenerationBackend | None = None,
     transcriber: SpeechBackend | TranscriptionBackend | None = None,
+    face_analyzer: FaceBackend | None = None,
     index_speech: bool = False,
+    index_quantization: IndexQuantization = IndexQuantization.NONE,
     minimum_relevance: float = 0.55,
     ambiguity_margin: float = 0.01,
     decay_half_life_days: float | None = None,
     speaker_similarity: float = 0.78,
     speaker_margin: float = 0.05,
+    face_similarity: float = 0.363,
+    face_margin: float = 0.05,
     tracer: opentelemetry.trace.Tracer | None = None,
 )
 ```
@@ -74,6 +78,12 @@ A `TranscriptionBackend` needs no flag. `add` transcribes every asset whose moda
 declares and stores the transcript in the record, so a media memory has retrievable text next to
 its native media vector; the media is never replaced. `SpeechBackend` analysis stays behind
 `index_speech` because it also resolves speaker identity.
+
+`index_quantization` controls only Zvec's rebuildable vector index. `NONE` is the default and
+preserves maximum retrieval quality. `FP16` and rotated `INT8` reduce active index memory;
+`RABITQ` uses HNSW-RaBitQ and requires x86_64 with AVX2 plus an embedding dimension from 64 through
+4095. Quantization is lossy, so compare recall and latency before enabling it. Changing this value
+rebuilds Zvec from authoritative FP32 embeddings in SQLite without calling the embedder.
 
 `minimum_relevance` rejects weak dense evidence, while `ambiguity_margin` returns no hits when the
 top two dense confidences are effectively tied and the winner has neither a lexical nor temporal
@@ -136,12 +146,17 @@ result = memory.ask(
 configured answerer. It raises `ModelError` when no answerer is configured.
 
 `reference_at` controls relative-date interpretation and decay reranking. It must be
-timezone-aware; the current UTC time is used when omitted.
+timezone-aware. When omitted, the current UTC time is used unless the query declares a valid
+English reference date such as `Today is May 2, 2024`; an explicit `reference_at` always wins.
 
 Composite records are indexed with an aggregate vector and de-duplicated vectors for each text or
 media atom. Text longer than 2,048 characters also receives overlapping contextual retrieval keys;
-the complete record remains the returned evidence. Search over-fetches candidates and keeps the
-maximum part score for each record. Weak or unresolved tied evidence can therefore return `()`.
+the complete record remains the returned evidence. Queries use the same bounded aggregate and
+atomic representation in one embedding batch, discard duplicate vectors, and search up to four
+independent routes concurrently; single-text queries remain one vector. Dense and lexical
+candidates hydrate and collapse to their authoritative parent before reranking. English BM25 uses
+case folding, accent folding, and stemming; queries containing Han characters use Jieba. Weak or
+unresolved tied evidence can therefore return `()`.
 
 ### Feedback
 
@@ -181,6 +196,28 @@ registered name, and optional identity score. Grounded `ask` calls reuse this ca
 complete timed identity evidence to the answerer without changing the returned source hits.
 With `index_speech=True`, registering or renaming a speaker also re-embeds every existing memory
 that contains that identity, so name queries work for recordings captured before registration.
+
+### Face and multimodal identity
+
+```python
+observations = memory.faces(memory_id)
+memory.register_identity(observations[0].identity_id, "Ada")
+```
+
+`faces` lazily analyzes stored images or videos through the configured `FaceBackend`. Each
+`FaceObservation` contains a normalized bounding box, optional video timestamp, stable local
+identity ID, optional registered name, and optional match score. Face and voice observations share
+the same identity namespace. For a video with exactly one resolved face identity and one resolved
+speaker identity, MindBridge links them only when their stored modality sets do not conflict; a
+multi-face, multi-speaker, or conflicting-name scene remains unlinked.
+The retired ID remains a durable alias accepted by `register_identity` and `register_speaker`.
+When `index_speech=True`, a merge that changes the speaker's canonical ID atomically refreshes the
+affected record text, FP32 embeddings, and durable index outbox.
+
+Both modalities use bounded exemplar sets and max-over-exemplar cosine matching. Voice retains at
+most 20 exemplars per identity and face retains at most 10; when full, the exemplar nearest the set
+centroid is removed to preserve variation. The first observation enrolls an identity and therefore
+has no match score. Threshold and top-two margin gates are configured independently per modality.
 
 ### Index maintenance
 
@@ -343,6 +380,27 @@ speech = FunASRTranscriber(device="auto")
 The adapter delegates model, VAD, and speaker execution to `funasr.AutoModel`, then validates and
 maps the result into MindBridge speech values.
 
+### OpenCV face analysis
+
+Install `mindbridge[face]`, obtain the ONNX weights from OpenCV Zoo's
+[YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) and
+[SFace](https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface) pages, and pass
+their local paths explicitly:
+
+```python
+from mindbridge import OpenCVFaceAnalyzer
+
+faces = OpenCVFaceAnalyzer(
+    detector_model="./models/face_detection_yunet.onnx",
+    recognizer_model="./models/face_recognition_sface.onnx",
+)
+```
+
+The adapter samples videos with a bounded, configurable interval, runs locally through OpenCV, and
+never downloads weights or exports source media. Model-file digests and analysis settings form its
+durable spaces. The default face similarity `0.363` is SFace's published LFW cosine threshold;
+applications should calibrate thresholds on representative, held-out data before relying on names.
+
 ### OpenAI SDK
 
 ```python
@@ -385,6 +443,7 @@ All stable exceptions derive from `MindBridgeError`:
 
 - `ValidationError`
 - `MemoryNotFoundError`
+- `IdentityNotFoundError`
 - `SpeakerNotFoundError`
 - `ModelError`
 - `ModelOutputTruncatedError`

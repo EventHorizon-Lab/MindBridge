@@ -607,7 +607,9 @@ def test_remote_mode_passes_the_cursor_through_unparsed(
     ("command", "operands"),
     (
         ("speech", ("memory-1",)),
+        ("faces", ("memory-1",)),
         ("register-speaker", ("speaker-1", "Ana")),
+        ("register-identity", ("identity-1", "Ana")),
         ("reinforce", ("memory-1",)),
         ("reindex", ()),
         ("optimize", ()),

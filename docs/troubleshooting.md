@@ -67,10 +67,10 @@ a permanent one never terminates. The provider SDK still owns its own retry and 
 
 ## The operation says which stage failed
 
-Every public error carries `stage`: `open`, `content.prepare`, `embed`, `transcribe`, `generate`,
-`storage.write`, `storage.hydrate`, `storage.lookup`, `index.search`, `index.sync`, `retrieval.rank`,
-or `close`. These are the same names the OpenTelemetry spans use, so a failure and its trace agree.
-`stage` is `null` when MindBridge cannot attribute the failure to one stage.
+Every public error carries `stage`: `open`, `content.prepare`, `embed`, `transcribe`, `recognize`,
+`generate`, `storage.write`, `storage.hydrate`, `storage.lookup`, `index.search`, `index.sync`,
+`retrieval.rank`, or `close`. These are the same names the OpenTelemetry spans use, so a failure and
+its trace agree. `stage` is `null` when MindBridge cannot attribute the failure to one stage.
 
 ## A batch failed and I do not know which item
 

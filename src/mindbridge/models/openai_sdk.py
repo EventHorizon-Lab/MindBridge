@@ -6,7 +6,7 @@ import base64
 import json
 import math
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -298,15 +298,15 @@ class OpenAIModels:
         self,
         question: ModelInput | str,
         hits: Sequence[SearchHit],
-    ) -> Iterator[str]:
+    ) -> Generator[str, None, tuple[SearchHit, ...]]:
         """Yield grounded text deltas while recording first-token and final usage data."""
         mark_model_requests(0, token_usage_expected=0)
         prepared = self._answer_request(question, hits)
         if prepared is None:
             mark_model_requests(0, token_usage_expected=0)
             yield UNKNOWN_ANSWER
-            return
-        request, _grounded, modalities = prepared
+            return ()
+        request, grounded, modalities = prepared
         create_completion = cast(Any, self._client("generation").chat.completions.create)
         mark_model_requests(1)
         started = time.perf_counter()
@@ -380,6 +380,7 @@ class OpenAIModels:
             raise ModelError(
                 "generation response was invalid", reason="response_invalid", stage="generate"
             )
+        return grounded
 
     def _answer_request(
         self,

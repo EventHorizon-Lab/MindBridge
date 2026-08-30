@@ -3,6 +3,9 @@
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
+    FaceAnalysis,
+    FaceBackend,
+    FaceEmbedding,
     GenerationBackend,
     ModelInput,
     SpeakerEmbedding,
@@ -28,6 +31,7 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_REVISION,
     JinaOmniEmbedder,
 )
+from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
 
 __all__ = [
@@ -43,11 +47,15 @@ __all__ = [
     "DEFAULT_JINA_REVISION",
     "EmbedTask",
     "EmbeddingBackend",
+    "FaceAnalysis",
+    "FaceBackend",
+    "FaceEmbedding",
     "FunASRRecipe",
     "FunASRTranscriber",
     "GenerationBackend",
     "JinaOmniEmbedder",
     "ModelInput",
+    "OpenCVFaceAnalyzer",
     "SentenceTransformersEmbedder",
     "SpeakerEmbedding",
     "SpeechAnalysis",

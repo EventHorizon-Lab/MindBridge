@@ -62,13 +62,17 @@ SQLite stores:
 
 - Memory records, memory type, event start/end, storage timestamps, metadata, and access
   reinforcement.
-- Asset descriptors, transcript cache, speech turns, speaker centroids, and names.
+- Asset descriptors, transcript/face caches, timed observations, bounded face/voice exemplars,
+  shared identity names, and aliases for IDs retired by a face/voice merge.
 - Normalized FP32 aggregate, atomic, and contextual text embeddings with parent memory, object
   part, model, space, task, and dimension.
-- Store metadata for embedding identity, transcription space, and index recipe.
+- Store metadata for embedding identity, transcription and configured face spaces, and index recipe.
 - Ordered pending index operations.
 
-Foreign keys and transactions keep records, assets, embeddings, and outbox changes atomic.
+Foreign keys and transactions keep records, assets, embeddings, identity merges, aliases, and
+outbox changes atomic. Biometric matching scans exact model spaces in SQLite and takes the maximum
+cosine score over each identity's bounded exemplar set; Zvec remains a disposable content-search
+projection.
 
 ## Index protocol
 
@@ -79,15 +83,31 @@ For every durable mutation:
 3. Hydrate current SQLite truth for the affected embedding IDs.
 4. Upsert current documents and delete missing documents in Zvec.
 5. Flush Zvec.
-6. Acknowledge the exact SQLite outbox batch.
+6. Trigger background index maintenance after 100,000 additional vectors remain unindexed.
+7. Acknowledge the exact SQLite outbox batch.
 
 Interrupted work remains durable. Startup drains it. Reindexing builds from SQLite, then replays
 the outbox so a record committed after the rebuild scan is not lost from the projection.
 
 Composite records store one aggregate vector and de-duplicated atomic text/media vectors through
 the existing embedding `object_part`. Only the aggregate carries full text into BM25, preventing
-one record from crowding lexical results. Dense and hybrid hits hydrate their authoritative parent
-IDs from SQLite and collapse by maximum relevance before temporal/decay reranking.
+one record from crowding lexical results. Queries derive the same aggregate and atomic keys in one
+bounded embedding batch; a single text atom remains one vector. Duplicate query vectors are
+discarded and up to four independent dense/lexical routes execute concurrently. Zvec oversamples
+groups for each dense route by parent memory so sibling embeddings cannot consume the candidate
+budget; when native best-effort grouping returns too few parents, a bounded ordinary-query fallback
+fills them. Dense and lexical routes stay separate until SQLite drops stale embedding IDs and
+collapses every route to its authoritative parent memory. Parent relevance preserves the strongest
+dense evidence, admits lexical-only evidence through relative BM25, and applies exact lexical
+agreement only as a small reranking bonus before temporal, decay, and ambiguity calibration. The
+standard FTS field lowercases, folds accents, and stems English; a parallel Jieba field handles Han
+queries. For ordered multi-text queries, the first text atom is the focused lexical query while
+dense retrieval still covers every bounded atom. Event-start and event-end inverted indexes enable
+Zvec's range optimization.
+
+Relative-time parsing accepts an explicit `reference_at` first. Without one, a natural
+`Today is <date>` declaration becomes the reference clock and is removed before parsing phrases
+such as `last week`, so the declared day is not mistaken for the requested evidence day.
 
 ## Provider boundary
 
@@ -95,14 +115,16 @@ IDs from SQLite and collapse by maximum relevance before temporal/decay rerankin
 payloads to SDK methods, validates returned shapes, and maps failures to `ModelError`. It does not
 read keys, create transports, normalize base URLs, implement retries, or close clients.
 
-`SentenceTransformersEmbedder` and `FunASRTranscriber` similarly delegate inference to their
-installed runtimes. MindBridge retains only validation and mapping needed by its public semantics.
+`SentenceTransformersEmbedder`, `FunASRTranscriber`, and `OpenCVFaceAnalyzer` similarly delegate
+inference to their installed runtimes. MindBridge retains only validation and mapping needed by its
+public semantics.
 
 ## Threading and lifecycle
 
-`Memory` allows model calls and independent SQLite record commits outside its index lock. Outbox
-replay and Zvec access are serialized; several committed writes may therefore share one flush. CAS
-leases prevent temporary query media from being removed while another operation is using it.
+`Memory` allows model calls, independent SQLite record commits, and ordinary Zvec queries outside
+its write lock. Outbox replay remains serialized, so several committed writes may share one flush.
+The Zvec adapter admits concurrent queries but exclusively gates collection replacement and close.
+Final SQLite hydration and CAS leases share the write boundary so returned media cannot disappear.
 
 Closing starts a lifecycle barrier, rejects new calls, waits for active calls, and closes each
 unique adapter or storage resource once. Forked processes must create a new instance and distinct

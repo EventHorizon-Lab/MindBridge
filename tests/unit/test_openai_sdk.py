@@ -252,8 +252,13 @@ def test_answer_can_pin_sampling_for_reproducible_evaluation() -> None:
         assert payload["chat_template_kwargs"] == {"enable_thinking": False}
 
 
-def test_stream_answer_records_ttft_and_reported_multimodal_usage(tmp_path: Path) -> None:
+def test_stream_answer_records_exact_grounding_and_multimodal_usage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     audio = _asset(tmp_path, "audio", Modality.AUDIO, "audio/wav", b"speech")
+    overflow = _asset(tmp_path, "overflow", Modality.AUDIO, "audio/wav", b"second")
+    monkeypatch.setattr(openai_backend, "_MAX_INLINE_MODEL_BYTES", 8)
 
     def respond(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
@@ -311,6 +316,14 @@ def test_stream_answer_records_ttft_and_reported_multimodal_usage(tmp_path: Path
         assets=(audio,),
         modality=Modality.AUDIO,
     )
+    dropped = SearchHit(
+        id="memory_2",
+        content="",
+        score=0.8,
+        created_at=NOW,
+        assets=(overflow,),
+        modality=Modality.AUDIO,
+    )
     provider = TracerProvider()
     exporter = InMemorySpanExporter()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
@@ -318,10 +331,21 @@ def test_stream_answer_records_ttft_and_reported_multimodal_usage(tmp_path: Path
         httpx.Client(transport=httpx.MockTransport(respond)) as client,
         provider.get_tracer("test").start_as_current_span("model"),
     ):
-        chunks = tuple(_model(_sdk_client(client)).stream_answer(ModelInput(text="What?"), (hit,)))
+        stream = _model(_sdk_client(client)).stream_answer(
+            ModelInput(text="What?"),
+            (hit, dropped),
+        )
+        chunks = []
+        while True:
+            try:
+                chunks.append(next(stream))
+            except StopIteration as completed:
+                grounded = completed.value
+                break
     provider.shutdown()
 
     assert "".join(chunks) == "A greeting is audible."
+    assert grounded == (hit,)
     attributes = exporter.get_finished_spans()[0].attributes
     assert attributes is not None
     assert attributes["gen_ai.usage.input_tokens"] == 20

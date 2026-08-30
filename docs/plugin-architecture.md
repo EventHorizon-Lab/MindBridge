@@ -40,15 +40,16 @@ or retrieval implementations.
 ## Design direction
 
 MindBridge is intended to be pluggable through narrow, explicitly configured capabilities, not
-through a global registry of arbitrary hooks. The four current backend protocols are the supported
-extension surface. A host can replace an implementation without changing memory semantics or adding
-provider branches to `Memory`.
+through a global registry of arbitrary hooks. The narrow backend protocols are the supported
+extension surface. A host can replace an implementation without changing memory semantics or
+adding provider branches to `Memory`.
 
-Future capabilities may include text, visual, or speech emotion recognition and face recognition.
-They are not implemented by v0.2. A new public capability is justified only when a concrete adapter
-and end-to-end product path establish its input modalities, typed result, provenance, configuration,
-lifecycle, concurrency, privacy, and failure contracts. Omitting an optional capability must leave
-the normal API and durable record semantics unchanged.
+Face recognition now follows that rule: `FaceBackend` has typed observations and stable spaces;
+`OpenCVFaceAnalyzer` supplies a concrete local YuNet/SFace path; and `Memory.faces` persists bounded
+exemplars and links conservative face/voice identities end to end. Omitting it leaves ordinary
+memory and speech behavior unchanged. Future capabilities such as emotion recognition require the
+same concrete adapter, provenance, lifecycle, privacy, failure, and product-path evidence before a
+new public contract is added.
 
 Automatic runtime selection may eventually choose among explicitly available adapters, but it must
 remain observable and overrideable. Package discovery, configuration files, or entry points should

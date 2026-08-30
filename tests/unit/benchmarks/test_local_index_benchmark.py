@@ -39,6 +39,7 @@ def test_small_benchmark_reports_valid_metrics(tmp_path: Path) -> None:
         "queries",
         "k",
         "seed",
+        "quantization",
         "ingest_seconds",
         "optimize_seconds",
         "recall_at_k",
@@ -51,6 +52,7 @@ def test_small_benchmark_reports_valid_metrics(tmp_path: Path) -> None:
     assert result["queries"] == 4
     assert result["k"] == 3
     assert result["seed"] == 7
+    assert result["quantization"] == "none"
     assert cast(float, result["ingest_seconds"]) > 0.0
     assert cast(float, result["optimize_seconds"]) >= 0.0
     assert 0.0 <= cast(float, result["recall_at_k"]) <= 1.0
@@ -95,6 +97,7 @@ def test_cli_prints_one_json_document(tmp_path: Path, capsys: pytest.CaptureFixt
     )
     report = json.loads(capsys.readouterr().out)
     assert report["rows"] == 16
+    assert report["quantization"] == "none"
     assert 0.0 <= report["recall_at_k"] <= 1.0
 
 

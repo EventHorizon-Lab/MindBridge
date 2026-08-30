@@ -41,6 +41,7 @@ from mindbridge._telemetry import (
     traced_span,
 )
 from mindbridge.exceptions import (
+    IdentityNotFoundError,
     IndexUnavailableError,
     MemoryNotFoundError,
     MindBridgeError,
@@ -64,10 +65,16 @@ from mindbridge.infrastructure.local.store import (
     StoredMemory,
     UnsupportedSchemaError,
 )
-from mindbridge.infrastructure.local.zvec_index import IndexHit, ZvecIndex
+from mindbridge.infrastructure.local.zvec_index import (
+    IndexHit,
+    ZvecIndex,
+    validate_index_configuration,
+)
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
+    FaceAnalysis,
+    FaceBackend,
     GenerationBackend,
     ModelInput,
     SpeechAnalysis,
@@ -82,6 +89,8 @@ from mindbridge.types import (
     Blob,
     ContentAtom,
     ContentInput,
+    FaceObservation,
+    IndexQuantization,
     MemoryRecord,
     MemoryType,
     Modality,
@@ -91,8 +100,8 @@ from mindbridge.types import (
 )
 
 _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
-_INDEX_RECIPE = (
-    "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:context-keys-v6"
+_INDEX_RECIPE_PREFIX = (
+    "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:context-keys-v8"
 )
 _LEGACY_INDEX_RECIPES = frozenset(
     {
@@ -100,6 +109,12 @@ _LEGACY_INDEX_RECIPES = frozenset(
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:single-vector-v3",
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:multi-vector-v4",
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:multi-vector-v5",
+    }
+)
+_LEGACY_INDEX_ONLY_RECIPES = frozenset(
+    {
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:context-keys-v6",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:grouped-range:context-keys-v7",
     }
 )
 _OUTBOX_BATCH_SIZE = 256
@@ -115,7 +130,37 @@ _DECAY_REINFORCEMENT_LIMIT = 20
 _CONFIRMATION_WEIGHT = 0.05
 _MAX_LEXICAL_RERANK_BONUS = 0.01
 _NEGATION_WEIGHT = 6.0
+_LEXICAL_NOISE_TERMS = frozenset(
+    {
+        "a",
+        "an",
+        "answer",
+        "are",
+        "based",
+        "did",
+        "do",
+        "does",
+        "how",
+        "is",
+        "memory",
+        "memories",
+        "only",
+        "please",
+        "question",
+        "return",
+        "the",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+    }
+)
 _NO_TRANSCRIPTION_SPACE = "none:asr-v1"
+_NO_FACE_SPACE = "none:face-v1"
 _ISO_DATE = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 _LEXICAL_TERM = re.compile(r"\w+")
 _CJK_CHARACTER = re.compile(r"[\u3400-\u9fff]")
@@ -125,13 +170,35 @@ _NEGATION_TERMS = frozenset(
 _NEGATED_CONTRACTION = re.compile(r"n['\u2019]t\b", re.IGNORECASE)
 _MAX_CONTENT_PARTS = 128
 # Model span modules mapped onto the failure stage a caller sees.
-_MODEL_STAGES = {"embedding": "embed", "generation": "generate", "transcription": "transcribe"}
+_MODEL_STAGES = {
+    "embedding": "embed",
+    "face": "recognize",
+    "generation": "generate",
+    "transcription": "transcribe",
+}
 _MAX_TEXT_CHARACTERS = 65_536
 _MAX_METADATA_BYTES = 262_144
 _TEXT_KEY_CHARACTERS = 2_048
 _TEXT_KEY_OVERLAP = 256
 _TEXT_KEY_CONTEXT = 256
 _MAX_RETRIEVAL_KEYS = 128
+_MAX_QUERY_RETRIEVAL_KEYS = 7
+_MAX_INDEX_SEARCH_WORKERS = 4
+_TODAY_ISO_DATE = re.compile(r"\btoday\s+is\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
+_TODAY_NAMED_DATE = re.compile(
+    r"\btoday\s+is\s+"
+    r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    r"\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{4}))?",
+    re.IGNORECASE,
+)
+_MONTHS = {
+    name: index
+    for index, name in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"),
+        start=1,
+    )
+}
 _MEDIA_TYPES = {
     ".aac": "audio/aac",
     ".avi": "video/x-msvideo",
@@ -169,6 +236,8 @@ _STORE_METADATA_KEYS = {
     "model": "embedding.model_id",
     "space": "embedding.space_id",
     "transcription": "transcription.space_id",
+    "face": "face.space_id",
+    "face_analysis": "face.analysis_space_id",
     "dimension": "embedding.dimension",
     "index": "index.recipe",
 }
@@ -193,25 +262,23 @@ class _Index(Protocol):
         exact: bool = False,
     ) -> tuple[IndexHit, ...]: ...
 
-    def hybrid_search(
+    def lexical_search(
         self,
         text: str,
-        values: Sequence[float],
         *,
         limit: int = 10,
-        candidate_limit: int | None = None,
         space_id: str | None = None,
         task: str | None = None,
         memory_type: str | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
-        ef: int | None = None,
-        exact: bool = False,
     ) -> tuple[IndexHit, ...]: ...
 
     def flush(self) -> None: ...
 
     def optimize(self, *, concurrency: int = 0) -> None: ...
+
+    def optimize_if_needed(self, *, minimum_unindexed: int = 100_000) -> bool: ...
 
     def rebuild(
         self,
@@ -256,6 +323,14 @@ class _OperationAssets:
     speech_updates: dict[str, SpeechAnalysis]
     speech_segments: dict[str, tuple[SpeakerSegment, ...]]
     speech_rollbacks: builtins.list[SpeechRollback]
+    face_observations: dict[str, tuple[FaceObservation, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexCandidates:
+    dense: tuple[IndexHit, ...]
+    lexical: tuple[IndexHit, ...]
+    exhausted: bool
 
 
 class Memory:
@@ -268,12 +343,16 @@ class Memory:
         embedder: EmbeddingBackend,
         answerer: GenerationBackend | None = None,
         transcriber: SpeechBackend | TranscriptionBackend | None = None,
+        face_analyzer: FaceBackend | None = None,
         index_speech: bool = False,
+        index_quantization: IndexQuantization = IndexQuantization.NONE,
         minimum_relevance: float = _DEFAULT_MINIMUM_RELEVANCE,
         ambiguity_margin: float = _DEFAULT_AMBIGUITY_MARGIN,
         decay_half_life_days: float | None = None,
         speaker_similarity: float = 0.78,
         speaker_margin: float = 0.05,
+        face_similarity: float = 0.363,
+        face_margin: float = 0.05,
         tracer: Tracer | None = None,
     ) -> None:
         self.data_dir = Path(data_dir).expanduser().resolve()
@@ -285,8 +364,12 @@ class Memory:
         self._closing = False
         self._closed = True
         self._pending_asset_cleanup: dict[str, StoredAsset] = {}
+        self._index_quantization = _index_quantization(index_quantization)
+        self._index_recipe = _index_recipe(self._index_quantization)
         self._speaker_similarity = _unit_interval(speaker_similarity, "speaker_similarity")
         self._speaker_margin = _unit_interval(speaker_margin, "speaker_margin")
+        self._face_similarity = _unit_interval(face_similarity, "face_similarity")
+        self._face_margin = _unit_interval(face_margin, "face_margin")
         if not isinstance(index_speech, bool):
             raise ValidationError("index_speech must be a boolean")
         self._index_speech = index_speech
@@ -298,6 +381,7 @@ class Memory:
         self._embedder = embedder
         self._answerer = answerer
         self._transcriber = transcriber
+        self._face_analyzer = face_analyzer
 
         try:
             (
@@ -306,11 +390,24 @@ class Memory:
                 self._space_id,
                 self._embedding_dimension,
             ) = _embedding_contract(self._embedder)
+            try:
+                validate_index_configuration(
+                    self._embedding_dimension,
+                    self._index_quantization,
+                )
+            except ValueError as error:
+                raise ValidationError(str(error)) from None
             self._generation_capabilities = _generation_contract(self._answerer)
             (
                 self._transcription_capabilities,
                 self._transcription_space,
             ) = _transcription_contract(self._transcriber)
+            (
+                self._face_capabilities,
+                self._face_model,
+                self._face_space,
+                self._face_analysis_space,
+            ) = _face_contract(self._face_analyzer)
             self._assets = AssetStore(self.data_dir)
             self._collect_orphan_assets(scan_physical=True)
             index_path = self.data_dir / "zvec"
@@ -318,7 +415,7 @@ class Memory:
             index_rebuild, embedding_rebuild = self._ensure_store_metadata(index_path)
             if embedding_rebuild:
                 self._reembed_memories()
-                self._store.set_metadata(_STORE_METADATA_KEYS["index"], _INDEX_RECIPE)
+                self._store.set_metadata(_STORE_METADATA_KEYS["index"], self._index_recipe)
             if index_missing or index_rebuild:
                 with _translate_storage_errors("checkpoint a missing search index"):
                     self._store.queue_all_embeddings()
@@ -330,6 +427,7 @@ class Memory:
             self._index: _Index = ZvecIndex(
                 index_path,
                 dimension=self._embedding_dimension,
+                quantization=self._index_quantization,
             )
         except Exception as error:
             self._close_models_and_store()
@@ -475,14 +573,19 @@ class Memory:
             _limit(limit, maximum=100)
             with self._trace("mindbridge.content.prepare", kind="stage"):
                 prepared = self._prepare_content(query, assets)
-            reference = _reference_at(reference_at) or datetime.now(timezone.utc)
+            explicit_reference = _reference_at(reference_at)
+            reference, temporal_text = _temporal_context(
+                prepared.text,
+                explicit_reference or datetime.now(timezone.utc),
+                infer_reference=explicit_reference is None,
+            )
             hits = self._search_prepared(
                 prepared,
                 limit=limit,
                 operation=assets,
                 memory_type=_optional_memory_type(memory_type),
                 reference_at=reference,
-                temporal_range=_temporal_range(prepared.text, reference),
+                temporal_range=_temporal_range(temporal_text, reference),
             )
             self._persist_transcripts(assets)
             return hits
@@ -506,8 +609,13 @@ class Memory:
                 )
             with self._trace("mindbridge.content.prepare", kind="stage"):
                 prepared = self._prepare_content(question, assets)
-            reference = _reference_at(reference_at) or datetime.now(timezone.utc)
-            temporal_range = _temporal_range(prepared.text, reference)
+            explicit_reference = _reference_at(reference_at)
+            reference, temporal_text = _temporal_context(
+                prepared.text,
+                explicit_reference or datetime.now(timezone.utc),
+                infer_reference=explicit_reference is None,
+            )
+            temporal_range = _temporal_range(temporal_text, reference)
             search = partial(
                 self._search_prepared,
                 prepared,
@@ -538,7 +646,9 @@ class Memory:
             routed_question = self._route_generation(
                 (
                     _with_reference_time(prepared, reference)
-                    if reference_at is not None or temporal_range is not None
+                    if explicit_reference is not None
+                    or temporal_text != prepared.text
+                    or temporal_range is not None
                     else prepared
                 ),
                 assets,
@@ -546,7 +656,11 @@ class Memory:
             routed_hits = self._route_generation_hits(hits, assets) if hits else ()
             self._persist_transcripts(assets)
             result = self._answer(routed_question, routed_hits)
-            return AnswerResult(answer=result.answer, hits=hits)
+            used_ids = {hit.id for hit in result.hits}
+            return AnswerResult(
+                answer=result.answer,
+                hits=tuple(hit for hit in hits if hit.id in used_ids),
+            )
 
     def get(self, memory_id: str) -> MemoryRecord:
         """Return one memory or raise `MemoryNotFoundError`."""
@@ -593,19 +707,78 @@ class Memory:
                 for segment in operation.speech_segments[asset.asset_id]
             )
 
+    def faces(self, memory_id: str) -> tuple[FaceObservation, ...]:
+        """Detect faces and resolve stable local face-and-voice identities."""
+        with self._trace("mindbridge.faces", kind="operation"), self._operation() as operation:
+            normalized_id = _identifier(memory_id, "memory_id")
+            with self._write_lock, _translate_storage_errors("read face memory"):
+                memory = self._store.read_memory(normalized_id)
+            if memory is None:
+                raise MemoryNotFoundError(f"memory does not exist: {normalized_id}")
+            visual_assets = tuple(
+                {
+                    asset.asset_id: asset
+                    for asset in memory.assets
+                    if asset.modality in {"image", "video"}
+                }.values()
+            )
+            if not visual_assets:
+                return ()
+            if not isinstance(self._face_analyzer, FaceBackend):
+                raise ModelError("no face backend is configured")
+            unsupported = {
+                Modality(asset.modality)
+                for asset in visual_assets
+                if Modality(asset.modality) not in self._face_capabilities
+            }
+            if unsupported:
+                names = ", ".join(sorted(modality.value for modality in unsupported))
+                raise ModelError(f"configured face backend does not support: {names}")
+            self._lease_assets(visual_assets, operation.leased)
+            operation.persisted.update(asset.asset_id for asset in visual_assets)
+            self._recognize_faces(visual_assets, operation)
+            return tuple(
+                observation
+                for asset in visual_assets
+                for observation in operation.face_observations[asset.asset_id]
+            )
+
     def register_speaker(self, speaker_id: str, name: str) -> None:
         """Assign or replace a human-readable name for one recognized speaker."""
-        normalized_id = _identifier(speaker_id, "speaker_id")
-        normalized_name = _speaker_name(name)
+        self._register_identity(speaker_id, name, speaker=True)
+
+    def register_identity(self, identity_id: str, name: str) -> None:
+        """Assign or replace a name shared by one face-and-voice identity."""
+        self._register_identity(identity_id, name, speaker=False)
+
+    def _register_identity(self, identity_id: str, name: str, *, speaker: bool) -> None:
+        id_label = "speaker_id" if speaker else "identity_id"
+        requested_id = _identifier(identity_id, id_label)
+        normalized_name = _identity_name(name)
+        operation_name = "register_speaker" if speaker else "register_identity"
         with (
-            self._trace("mindbridge.register_speaker", kind="operation"),
+            self._trace(f"mindbridge.{operation_name}", kind="operation"),
             self._operation() as operation,
             self._write_lock,
         ):
-            with _translate_storage_errors("read speaker memories"):
-                memory_ids = self._store.speaker_memory_ids(normalized_id)
-            if memory_ids is None:
-                raise SpeakerNotFoundError(f"speaker does not exist: {normalized_id}")
+            with _translate_storage_errors("read identity memories"):
+                normalized_id = self._store.resolve_identity_id(requested_id)
+                if normalized_id is None:
+                    identity_exists = False
+                    memory_ids = None
+                elif speaker:
+                    memory_ids = self._store.speaker_memory_ids(normalized_id)
+                    identity_exists = memory_ids is not None
+                else:
+                    identity_exists = self._store.identity_memory_ids(normalized_id) is not None
+                    speaker_memory_ids = self._store.speaker_memory_ids(normalized_id)
+                    memory_ids = () if speaker_memory_ids is None else speaker_memory_ids
+            if not identity_exists:
+                if speaker:
+                    raise SpeakerNotFoundError(f"speaker does not exist: {requested_id}")
+                raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
+            assert normalized_id is not None
+            assert memory_ids is not None
             memories: tuple[StoredMemory, ...] = ()
             embeddings: tuple[StoredEmbedding, ...] = ()
             if memory_ids:
@@ -627,15 +800,17 @@ class Memory:
                         speaker_name=normalized_name,
                         operation=operation,
                     )
-            with _translate_storage_errors("register speaker"):
-                registered = self._store.register_speaker(
+            with _translate_storage_errors("register identity"):
+                registered = self._store.register_identity(
                     normalized_id,
                     normalized_name,
                     memories=memories,
                     embeddings=embeddings,
                 )
             if not registered:
-                raise SpeakerNotFoundError(f"speaker does not exist: {normalized_id}")
+                if speaker:
+                    raise SpeakerNotFoundError(f"speaker does not exist: {requested_id}")
+                raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
             self._drain_outbox()
 
     def reinforce(self, memory_ids: Sequence[str]) -> int:
@@ -1047,7 +1222,12 @@ class Memory:
             finally:
                 operation.speech_rollbacks.clear()
 
-    def _embedding_inputs(self, prepared: _PreparedContent) -> tuple[ModelInput, ...]:
+    def _embedding_inputs(
+        self,
+        prepared: _PreparedContent,
+        *,
+        maximum_keys: int = _MAX_RETRIEVAL_KEYS,
+    ) -> tuple[ModelInput, ...]:
         aggregate = self._route_embedding(prepared)
         text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
         if prepared.text and prepared.text != "\n\n".join(text_parts):
@@ -1058,10 +1238,10 @@ class Memory:
             *(self._route_embedding(_asset_content(asset)) for asset in prepared.assets),
         ]
         unique = tuple(dict.fromkeys(value for value in atomic if value != aggregate))
-        if len(unique) > _MAX_RETRIEVAL_KEYS:
+        if len(unique) > maximum_keys:
             unique = tuple(
-                unique[round(index * (len(unique) - 1) / (_MAX_RETRIEVAL_KEYS - 1))]
-                for index in range(_MAX_RETRIEVAL_KEYS)
+                unique[round(index * (len(unique) - 1) / (maximum_keys - 1))]
+                for index in range(maximum_keys)
             )
         return (aggregate, *unique)
 
@@ -1070,8 +1250,10 @@ class Memory:
         memories: Sequence[StoredMemory],
         *,
         speaker_id: str,
-        speaker_name: str,
+        speaker_name: str | None,
         operation: _OperationAssets,
+        previous_speaker_id: str | None = None,
+        update_operation: bool = True,
     ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
         prepared: list[tuple[StoredMemory, _PreparedContent]] = []
         for memory in memories:
@@ -1088,16 +1270,21 @@ class Memory:
                     if segments is None:
                         continue
                     refreshed = tuple(
-                        replace(segment, speaker_name=speaker_name)
-                        if segment.speaker_id == speaker_id
+                        replace(
+                            segment,
+                            speaker_id=speaker_id,
+                            speaker_name=speaker_name,
+                        )
+                        if segment.speaker_id in {speaker_id, previous_speaker_id}
                         else segment
                         for segment in segments
                     )
                     segments_by_asset[asset.asset_id] = refreshed
-                    operation.speech_segments[asset.asset_id] = refreshed
-                    operation.transcripts[asset.asset_id] = "\n".join(
-                        segment.text for segment in refreshed
-                    )
+                    if update_operation:
+                        operation.speech_segments[asset.asset_id] = refreshed
+                        operation.transcripts[asset.asset_id] = "\n".join(
+                            segment.text for segment in refreshed
+                        )
             base = _without_speech_identities(memory.content, tuple(segments_by_asset))
             content = _PreparedContent(
                 text=_speech_identity_text(
@@ -1155,111 +1342,118 @@ class Memory:
         temporal_range: tuple[datetime, datetime] | None,
     ) -> tuple[SearchHit, ...]:
         prepared = self._embedding_content(prepared, operation)
-        model_input = self._route_embedding(prepared)
-        vector = self._embed((model_input,), task=EmbedTask.QUERY)[0]
+        model_inputs = self._embedding_inputs(
+            prepared,
+            maximum_keys=_MAX_QUERY_RETRIEVAL_KEYS,
+        )
+        vectors = tuple(dict.fromkeys(self._embed(model_inputs, task=EmbedTask.QUERY)))
+        text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
+        lexical_query = text_parts[0] if len(text_parts) > 1 else prepared.text
+        if not (_lexical_terms(lexical_query) - _LEXICAL_NOISE_TERMS):
+            lexical_query = ""
         candidate_limit = max(_RERANK_CANDIDATES, limit * 3)
         candidate_ceiling = max(candidate_limit, limit * (_MAX_RETRIEVAL_KEYS + 1))
         with self._write_lock:
             self._drain_outbox()
-            while True:
-                with _translate_index_errors("search memories"):
-                    if temporal_range is None:
-                        index_hits = self._index_candidates(
-                            model_input,
-                            vector,
-                            limit=candidate_limit,
-                            memory_type=memory_type,
-                        )
-                        exhausted = len(index_hits) < candidate_limit
-                    else:
-                        preferred = self._index_candidates(
-                            model_input,
-                            vector,
-                            limit=candidate_limit,
-                            memory_type=memory_type,
-                            occurred_from=temporal_range[0],
-                            occurred_until=temporal_range[1],
-                        )
-                        fallback = self._index_candidates(
-                            model_input,
-                            vector,
-                            limit=candidate_limit,
-                            memory_type=memory_type,
-                        )
-                        index_hits = _merge_index_hits(preferred, fallback)
-                        exhausted = (
-                            len(preferred) < candidate_limit and len(fallback) < candidate_limit
-                        )
-                if not index_hits:
-                    return ()
-                index_by_id = {hit.id: hit for hit in index_hits}
-                with (
-                    self._trace("mindbridge.storage.hydrate", kind="stage"),
-                    _translate_storage_errors("hydrate search candidates"),
-                ):
-                    documents = self._store.read_index_documents(tuple(index_by_id))
-                parent_count = len({document.embedding.memory_id for document in documents})
-                if parent_count >= limit or exhausted or candidate_limit >= candidate_ceiling:
-                    break
-                candidate_limit = min(candidate_limit * 2, candidate_ceiling)
-            relevance: dict[str, float] = {}
-            confidence: dict[str, float] = {}
-            lexical_matches: set[str] = set()
-            for document in documents:
-                memory_id = document.embedding.memory_id
-                index_hit = index_by_id[document.embedding.embedding_id]
-                relevance[memory_id] = max(
-                    relevance.get(memory_id, 0.0),
-                    index_hit.relevance,
-                )
-                confidence[memory_id] = max(
-                    confidence.get(memory_id, 0.0),
-                    cast(float, index_hit.confidence),
-                )
-                if index_hit.lexical_match:
-                    lexical_matches.add(memory_id)
-            if not relevance:
+        while True:
+            with _translate_index_errors("search memories"):
+                if temporal_range is None:
+                    candidates = self._index_candidates(
+                        vectors,
+                        lexical_query=lexical_query,
+                        limit=candidate_limit,
+                        memory_type=memory_type,
+                    )
+                else:
+                    preferred = self._index_candidates(
+                        vectors,
+                        lexical_query=lexical_query,
+                        limit=candidate_limit,
+                        memory_type=memory_type,
+                        occurred_from=temporal_range[0],
+                        occurred_until=temporal_range[1],
+                    )
+                    fallback = self._index_candidates(
+                        vectors,
+                        lexical_query=lexical_query,
+                        limit=candidate_limit,
+                        memory_type=memory_type,
+                    )
+                    candidates = _IndexCandidates(
+                        dense=_merge_index_hits(preferred.dense, fallback.dense),
+                        lexical=_merge_index_hits(preferred.lexical, fallback.lexical),
+                        exhausted=preferred.exhausted and fallback.exhausted,
+                    )
+            index_ids = tuple(
+                dict.fromkeys(hit.id for hit in (*candidates.dense, *candidates.lexical))
+            )
+            if not index_ids:
                 return ()
+            with (
+                self._trace("mindbridge.storage.hydrate", kind="stage"),
+                _translate_storage_errors("hydrate search candidates"),
+            ):
+                documents = self._store.read_index_documents(index_ids)
+            parent_count = len({document.embedding.memory_id for document in documents})
+            if (
+                parent_count >= limit
+                or candidates.exhausted
+                or candidate_limit >= candidate_ceiling
+            ):
+                break
+            candidate_limit = min(candidate_limit * 2, candidate_ceiling)
+        (
+            dense_relevance,
+            dense_confidence,
+            lexical_relevance_by_rank,
+            lexical_matches,
+        ) = _parent_index_signals(candidates, documents)
+        parent_ids = tuple(dict.fromkeys((*dense_relevance, *lexical_matches)))
+        if not parent_ids:
+            return ()
+        with self._write_lock:
             with (
                 self._trace("mindbridge.storage.hydrate", kind="stage"),
                 _translate_storage_errors("hydrate search results"),
             ):
-                memories = self._store.read_memories(tuple(relevance))
+                memories = self._store.read_memories(parent_ids)
             with self._trace("mindbridge.retrieval.rank", kind="stage"):
                 if memory_type is not None:
                     memories = tuple(
                         memory for memory in memories if memory.memory_type == memory_type.value
                     )
-                lexical_relevance = _lexical_relevance(model_input.text, memories)
-                ranked = [
-                    (
-                        memory,
-                        _ranked_relevance(
-                            memory,
-                            min(
-                                1.0,
-                                relevance[memory.memory_id]
-                                + lexical_relevance.get(memory.memory_id, 0.0)
-                                * _MAX_LEXICAL_RERANK_BONUS,
-                            ),
-                            reference_at=reference_at,
-                            temporal_range=temporal_range,
-                            decay_half_life=self._decay_half_life,
-                        ),
-                        max(
-                            confidence[memory.memory_id],
-                            (
-                                _LEXICAL_MATCH_CONFIDENCE
-                                if memory.memory_id in lexical_matches
-                                else 0.0
-                            ),
-                        ),
-                        memory.memory_id in lexical_matches,
+                lexical_relevance = _lexical_relevance(lexical_query, memories)
+                ranked = []
+                for memory in memories:
+                    memory_id = memory.memory_id
+                    lexical_match = memory_id in lexical_matches
+                    lexical_strength = (
+                        lexical_relevance.get(memory_id, 0.0) if lexical_match else 0.0
                     )
-                    for memory in memories
-                ]
+                    lexical_score = _LEXICAL_MATCH_CONFIDENCE * lexical_relevance_by_rank.get(
+                        memory_id, 0.0
+                    )
+                    relevance = min(
+                        1.0,
+                        max(dense_relevance.get(memory_id, 0.0), lexical_score)
+                        + lexical_strength * _MAX_LEXICAL_RERANK_BONUS,
+                    )
+                    ranked.append(
+                        (
+                            memory,
+                            _ranked_relevance(
+                                memory,
+                                relevance,
+                                reference_at=reference_at,
+                                temporal_range=temporal_range,
+                                decay_half_life=self._decay_half_life,
+                            ),
+                            max(dense_confidence.get(memory_id, 0.0), lexical_score),
+                            lexical_score > 0.0,
+                        )
+                    )
                 ranked = [item for item in ranked if item[2] >= self._minimum_relevance]
-                ranked.sort(key=lambda item: item[1], reverse=True)
+                ranked.sort(key=lambda item: (-item[1], item[0].memory_id))
                 if _retrieval_is_ambiguous(
                     ranked,
                     margin=self._ambiguity_margin,
@@ -1286,28 +1480,18 @@ class Memory:
 
     def _index_candidates(
         self,
-        model_input: ModelInput,
-        vector: Sequence[float],
+        vectors: Sequence[Sequence[float]],
         *,
+        lexical_query: str,
         limit: int,
         memory_type: MemoryType | None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
-    ) -> tuple[IndexHit, ...]:
+    ) -> _IndexCandidates:
         memory_type_value = None if memory_type is None else memory_type.value
-        with self._trace("mindbridge.index.search", kind="stage"):
-            if model_input.text:
-                return self._index.hybrid_search(
-                    model_input.text,
-                    vector,
-                    limit=limit,
-                    space_id=self._space_id,
-                    task=_DOCUMENT_TASK,
-                    memory_type=memory_type_value,
-                    occurred_from=occurred_from,
-                    occurred_until=occurred_until,
-                )
-            return self._index.search(
+        dense_calls = tuple(
+            partial(
+                self._index.search,
                 vector,
                 limit=limit,
                 space_id=self._space_id,
@@ -1316,6 +1500,37 @@ class Memory:
                 occurred_from=occurred_from,
                 occurred_until=occurred_until,
             )
+            for vector in vectors
+        )
+        lexical_call = partial(
+            self._index.lexical_search,
+            lexical_query,
+            limit=limit,
+            space_id=self._space_id,
+            task=_DOCUMENT_TASK,
+            memory_type=memory_type_value,
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
+        )
+        calls = (*dense_calls, lexical_call) if lexical_query else dense_calls
+        routes: tuple[tuple[IndexHit, ...], ...]
+        with self._trace("mindbridge.index.search", kind="stage") as span:
+            span.set_attribute("mindbridge.index.route_count", len(calls))
+            if len(calls) == 1:
+                routes = (calls[0](),)
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=min(_MAX_INDEX_SEARCH_WORKERS, len(calls))
+                ) as executor:
+                    futures = tuple(executor.submit(copy_context().run, call) for call in calls)
+                    routes = tuple(future.result() for future in futures)
+        dense_routes = routes[: len(dense_calls)]
+        lexical = routes[-1] if lexical_query else ()
+        return _IndexCandidates(
+            dense=_merge_index_hits(*dense_routes),
+            lexical=lexical,
+            exhausted=all(len(route) < limit for route in routes),
+        )
 
     def _route_embedding(self, prepared: _PreparedContent) -> ModelInput:
         value = self._resolved_model_input(prepared)
@@ -1429,8 +1644,15 @@ class Memory:
                 tuple(asset for prepared in prepared_hits for asset in prepared.assets),
                 operation,
             )
+        face_assets = self._answer_face_assets(
+            tuple(asset for prepared in prepared_hits for asset in prepared.assets)
+        )
+        if face_assets:
+            self._recognize_faces(face_assets, operation)
         routed = []
         for hit, prepared in zip(hits, prepared_hits, strict=True):
+            if self._answer_face_assets(prepared.assets):
+                prepared = self._with_face_identities(prepared, operation)
             model_input = self._route_generation(prepared, operation)
             routed.append(
                 replace(
@@ -1441,6 +1663,198 @@ class Memory:
                 )
             )
         return tuple(routed)
+
+    def _answer_face_assets(
+        self,
+        assets: Sequence[StoredAsset],
+    ) -> tuple[StoredAsset, ...]:
+        if not isinstance(self._face_analyzer, FaceBackend):
+            return ()
+        supported = {modality.value for modality in self._face_capabilities}
+        return tuple(
+            {
+                asset.asset_id: asset
+                for asset in assets
+                if asset.modality in {"image", "video"} and asset.modality in supported
+            }.values()
+        )
+
+    def _with_face_identities(
+        self,
+        prepared: _PreparedContent,
+        operation: _OperationAssets,
+    ) -> _PreparedContent:
+        face_assets = self._answer_face_assets(prepared.assets)
+        self._recognize_faces(face_assets, operation)
+        text = _face_identity_text(prepared.text, face_assets, operation.face_observations)
+        if len(text) > _MAX_TEXT_CHARACTERS:
+            raise ModelError("face identity evidence exceeded the supported text length")
+        return replace(prepared, text=text)
+
+    def _recognize_faces(
+        self,
+        assets: Sequence[StoredAsset],
+        operation: _OperationAssets,
+    ) -> None:
+        if not isinstance(self._face_analyzer, FaceBackend):
+            raise ModelError("no face backend is configured")
+        face_assets = tuple(
+            {
+                asset.asset_id: asset
+                for asset in assets
+                if asset.modality in {"image", "video"}
+                and asset.asset_id not in operation.face_observations
+            }.values()
+        )
+        speech_assets = self._answer_speech_assets(
+            tuple(asset for asset in face_assets if asset.modality == "video")
+        )
+        if speech_assets:
+            self._recognize_speech(speech_assets, operation)
+        missing = []
+        with (
+            self._trace("mindbridge.storage.lookup", kind="stage"),
+            _translate_storage_errors("read cached face recognition"),
+        ):
+            for asset in face_assets:
+                observations = self._store.read_faces(
+                    asset.asset_id,
+                    space_id=self._face_analysis_space,
+                )
+                if observations is None:
+                    missing.append(asset)
+                else:
+                    operation.face_observations[asset.asset_id] = observations
+        if missing:
+            analyses = self._analyze_faces(tuple(self._asset_ref(asset) for asset in missing))
+            with (
+                self._trace("mindbridge.storage.write", kind="stage"),
+                self._write_lock,
+                _translate_storage_errors("persist face recognition"),
+            ):
+                for asset, analysis in zip(missing, analyses, strict=True):
+                    self._store.write_asset(asset)
+                    operation.persisted.add(asset.asset_id)
+                    speaker_ids = {
+                        segment.speaker_id
+                        for segment in operation.speech_segments.get(asset.asset_id, ())
+                        if segment.speaker_id is not None
+                    }
+                    preferred = next(iter(speaker_ids)) if len(speaker_ids) == 1 else None
+                    operation.face_observations[asset.asset_id] = self._store.write_faces(
+                        asset.asset_id,
+                        analysis,
+                        model_id=self._face_model,
+                        space_id=self._face_space,
+                        analysis_space_id=self._face_analysis_space,
+                        minimum_similarity=self._face_similarity,
+                        minimum_margin=self._face_margin,
+                        preferred_identity=preferred,
+                    )
+        with self._write_lock, _translate_storage_errors("link face and voice identities"):
+            for asset in face_assets:
+                self._link_asset_identity(asset.asset_id, operation)
+
+    def _link_asset_identity(self, asset_id: str, operation: _OperationAssets) -> None:
+        speaker_ids = {
+            segment.speaker_id
+            for segment in operation.speech_segments.get(asset_id, ())
+            if segment.speaker_id is not None
+        }
+        face_ids = {
+            observation.identity_id for observation in operation.face_observations.get(asset_id, ())
+        }
+        if len(speaker_ids) != 1 or len(face_ids) != 1:
+            return
+        speaker_id, face_id = next(iter(speaker_ids)), next(iter(face_ids))
+        plan = self._store.identity_link_plan(speaker_id, face_id)
+        if plan is None:
+            return
+        memories: tuple[StoredMemory, ...] = ()
+        embeddings: tuple[StoredEmbedding, ...] = ()
+        if self._index_speech and plan.source_id == speaker_id:
+            memory_ids = self._store.speaker_memory_ids(plan.source_id)
+            if memory_ids:
+                stored = self._store.read_memories(memory_ids)
+                indexed = tuple(
+                    memory
+                    for memory in stored
+                    if any(
+                        f"[speech identities:{asset.asset_id}]\n" in memory.content
+                        for asset in memory.assets
+                        if asset.modality in {"audio", "video"}
+                    )
+                )
+                if indexed:
+                    memories, embeddings = self._refresh_speaker_memories(
+                        indexed,
+                        speaker_id=plan.target_id,
+                        speaker_name=plan.name,
+                        previous_speaker_id=plan.source_id,
+                        update_operation=False,
+                        operation=operation,
+                    )
+        if (
+            self._store.link_identities(
+                speaker_id,
+                face_id,
+                expected=plan,
+                memories=memories,
+                embeddings=embeddings,
+            )
+            is None
+        ):
+            return
+        if embeddings:
+            self._drain_outbox()
+        linked_ids = {plan.target_id, plan.source_id}
+        for cached_asset, segments in tuple(operation.speech_segments.items()):
+            operation.speech_segments[cached_asset] = tuple(
+                replace(
+                    segment,
+                    speaker_id=plan.target_id,
+                    speaker_name=plan.name,
+                )
+                if segment.speaker_id in linked_ids
+                else segment
+                for segment in segments
+            )
+        for cached_asset, observations in tuple(operation.face_observations.items()):
+            operation.face_observations[cached_asset] = tuple(
+                replace(
+                    observation,
+                    identity_id=plan.target_id,
+                    identity_name=plan.name,
+                )
+                if observation.identity_id in linked_ids
+                else observation
+                for observation in observations
+            )
+
+    def _analyze_faces(
+        self,
+        assets: Sequence[AssetRef],
+    ) -> tuple[FaceAnalysis, ...]:
+        if not isinstance(self._face_analyzer, FaceBackend):
+            raise ModelError("no face backend is configured")
+        with self._model_trace(
+            "face",
+            "face_recognition",
+            model=self._face_model,
+            batch_size=len(assets),
+            modalities=(cast(Modality, asset.modality) for asset in assets),
+        ):
+            try:
+                analyses = self._face_analyzer.analyze(assets)
+            except MindBridgeError:
+                raise
+            except Exception as error:
+                raise ModelError("failed to analyze face input") from error
+            if len(analyses) != len(assets) or any(
+                not isinstance(analysis, FaceAnalysis) for analysis in analyses
+            ):
+                raise ModelError("face model returned invalid output")
+            return tuple(analyses)
 
     def _transcribable_assets(
         self,
@@ -1736,7 +2150,14 @@ class Memory:
                 if isinstance(self._answerer, StreamingGenerationBackend):
                     started = perf_counter()
                     parts: builtins.list[str] = []
-                    for part in self._answerer.stream_answer(question, hits):
+                    stream = iter(self._answerer.stream_answer(question, hits))
+                    used_hits: object = None
+                    while True:
+                        try:
+                            part = next(stream)
+                        except StopIteration as completed:
+                            used_hits = completed.value
+                            break
                         if not isinstance(part, str):
                             raise ModelError("generation model returned an invalid answer chunk")
                         if part:
@@ -1748,7 +2169,15 @@ class Memory:
                     answer = "".join(parts)
                     if not answer.strip():
                         raise ModelError("generation model returned an invalid answer")
-                    result = AnswerResult(answer=answer, hits=tuple(hits))
+                    if used_hits is None:
+                        grounded = tuple(hits)
+                    elif isinstance(used_hits, tuple) and all(
+                        isinstance(hit, SearchHit) for hit in used_hits
+                    ):
+                        grounded = used_hits
+                    else:
+                        raise ModelError("generation model returned invalid grounding hits")
+                    result = AnswerResult(answer=answer, hits=grounded)
                 else:
                     result = self._answerer.answer(question, hits)
             except MindBridgeError:
@@ -1926,6 +2355,7 @@ class Memory:
                 if documents:
                     self._index.upsert(documents)
                 self._index.flush()
+                self._index.optimize_if_needed()
             with _translate_storage_errors("acknowledge the search-index outbox"):
                 acknowledged = self._store.acknowledge_index_operations(operations)
             if acknowledged != len(operations):
@@ -2000,8 +2430,11 @@ class Memory:
             _STORE_METADATA_KEYS["space"]: self._space_id,
             _STORE_METADATA_KEYS["transcription"]: self._transcription_space,
             _STORE_METADATA_KEYS["dimension"]: str(self._embedding_dimension),
-            _STORE_METADATA_KEYS["index"]: _INDEX_RECIPE,
+            _STORE_METADATA_KEYS["index"]: self._index_recipe,
         }
+        if self._face_analyzer is not None:
+            expected[_STORE_METADATA_KEYS["face"]] = self._face_space
+            expected[_STORE_METADATA_KEYS["face_analysis"]] = self._face_analysis_space
         rebuild_index = False
         rebuild_embeddings = False
         with _translate_storage_errors("validate local store metadata"):
@@ -2015,9 +2448,13 @@ class Memory:
                         self._store.set_metadata(key, value)
                 elif stored == value:
                     continue
-                elif key == _STORE_METADATA_KEYS["index"] and stored in _LEGACY_INDEX_RECIPES:
+                elif key == _STORE_METADATA_KEYS["index"] and stored in (
+                    _LEGACY_INDEX_RECIPES
+                    | _LEGACY_INDEX_ONLY_RECIPES
+                    | {_index_recipe(mode) for mode in IndexQuantization}
+                ):
                     rebuild_index = True
-                    rebuild_embeddings = True
+                    rebuild_embeddings = stored in _LEGACY_INDEX_RECIPES
                 else:
                     raise StorageError(
                         f"local store metadata mismatch for {key}: expected {value!r}, "
@@ -2027,13 +2464,14 @@ class Memory:
                 if index_path.exists():
                     shutil.rmtree(index_path)
                 if not rebuild_embeddings:
-                    self._store.set_metadata(_STORE_METADATA_KEYS["index"], _INDEX_RECIPE)
+                    self._store.set_metadata(_STORE_METADATA_KEYS["index"], self._index_recipe)
         return rebuild_index, rebuild_embeddings
 
     def _close_models_and_store(self) -> None:
         resources = _present_resources(
             self._embedder,
             self._transcriber,
+            self._face_analyzer,
             self._answerer,
             self._store,
         )
@@ -2046,6 +2484,7 @@ class Memory:
         resources = _present_resources(
             self._embedder,
             self._transcriber,
+            self._face_analyzer,
             self._answerer,
             self._index,
             self._store,
@@ -2079,6 +2518,7 @@ class Memory:
             speech_updates={},
             speech_segments={},
             speech_rollbacks=[],
+            face_observations={},
         )
         try:
             yield assets
@@ -2121,12 +2561,16 @@ class AsyncMemory:
         embedder: EmbeddingBackend,
         answerer: GenerationBackend | None = None,
         transcriber: SpeechBackend | TranscriptionBackend | None = None,
+        face_analyzer: FaceBackend | None = None,
         index_speech: bool = False,
+        index_quantization: IndexQuantization = IndexQuantization.NONE,
         minimum_relevance: float = _DEFAULT_MINIMUM_RELEVANCE,
         ambiguity_margin: float = _DEFAULT_AMBIGUITY_MARGIN,
         decay_half_life_days: float | None = None,
         speaker_similarity: float = 0.78,
         speaker_margin: float = 0.05,
+        face_similarity: float = 0.363,
+        face_margin: float = 0.05,
         tracer: Tracer | None = None,
     ) -> None:
         self._memory = Memory(
@@ -2134,12 +2578,16 @@ class AsyncMemory:
             embedder=embedder,
             answerer=answerer,
             transcriber=transcriber,
+            face_analyzer=face_analyzer,
             index_speech=index_speech,
+            index_quantization=index_quantization,
             minimum_relevance=minimum_relevance,
             ambiguity_margin=ambiguity_margin,
             decay_half_life_days=decay_half_life_days,
             speaker_similarity=speaker_similarity,
             speaker_margin=speaker_margin,
+            face_similarity=face_similarity,
+            face_margin=face_margin,
             tracer=tracer,
         )
 
@@ -2223,8 +2671,14 @@ class AsyncMemory:
     async def speech(self, memory_id: str) -> tuple[SpeakerSegment, ...]:
         return await asyncio.to_thread(self._memory.speech, memory_id)
 
+    async def faces(self, memory_id: str) -> tuple[FaceObservation, ...]:
+        return await asyncio.to_thread(self._memory.faces, memory_id)
+
     async def register_speaker(self, speaker_id: str, name: str) -> None:
         await asyncio.to_thread(self._memory.register_speaker, speaker_id, name)
+
+    async def register_identity(self, identity_id: str, name: str) -> None:
+        await asyncio.to_thread(self._memory.register_identity, identity_id, name)
 
     async def reinforce(self, memory_ids: Sequence[str]) -> int:
         return await asyncio.to_thread(self._memory.reinforce, memory_ids)
@@ -2465,6 +2919,49 @@ def _speech_identity_text(
     return "\n\n".join(sections)
 
 
+def _face_identity_text(
+    text: str,
+    assets: Sequence[StoredAsset],
+    observations_by_asset: Mapping[str, tuple[FaceObservation, ...]],
+) -> str:
+    sections = [text] if text else []
+    for asset_id in dict.fromkeys(asset.asset_id for asset in assets):
+        grouped: dict[str, list[FaceObservation]] = {}
+        for observation in observations_by_asset[asset_id]:
+            grouped.setdefault(observation.identity_id, []).append(observation)
+        if not grouped:
+            continue
+        identities = []
+        for identity_id, observations in grouped.items():
+            times = tuple(
+                observation.observed_at_ms
+                for observation in observations
+                if observation.observed_at_ms is not None
+            )
+            scores = tuple(
+                observation.identity_score
+                for observation in observations
+                if observation.identity_score is not None
+            )
+            identities.append(
+                {
+                    "identity_id": identity_id,
+                    "identity_name": observations[0].identity_name,
+                    "first_observed_at_ms": min(times) if times else None,
+                    "last_observed_at_ms": max(times) if times else None,
+                    "observation_count": len(observations),
+                    "representative_box": observations[0].bounding_box,
+                    "max_identity_score": max(scores) if scores else None,
+                }
+            )
+        evidence = {"asset_id": asset_id, "identities": identities}
+        sections.append(
+            f"[face identities:{asset_id}]\n"
+            + json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+        )
+    return "\n\n".join(sections)
+
+
 def _without_speech_identities(text: str, asset_ids: Sequence[str]) -> str:
     markers = tuple(f"[speech identities:{asset_id}]\n" for asset_id in asset_ids)
     return "\n\n".join(section for section in text.split("\n\n") if not section.startswith(markers))
@@ -2506,6 +3003,22 @@ def _generation_contract(answerer: GenerationBackend | None) -> frozenset[Modali
         frozenset()
         if answerer is None
         else _modalities(answerer.generation_capabilities, "generation")
+    )
+
+
+def _face_contract(
+    analyzer: FaceBackend | None,
+) -> tuple[frozenset[Modality], str, str, str]:
+    if analyzer is None:
+        return frozenset(), "none", _NO_FACE_SPACE, _NO_FACE_SPACE
+    capabilities = _modalities(analyzer.face_capabilities, "face")
+    if not capabilities or capabilities - {Modality.IMAGE, Modality.VIDEO}:
+        raise ValidationError("face capabilities must contain image or video")
+    return (
+        capabilities,
+        _model_text(analyzer.face_model, "face model"),
+        _embedding_space(analyzer.face_space),
+        _embedding_space(analyzer.face_analysis_space),
     )
 
 
@@ -2641,6 +3154,16 @@ def _optional_memory_type(value: object) -> MemoryType | None:
     return None if value is None else _memory_type(value)
 
 
+def _index_quantization(value: object) -> IndexQuantization:
+    if not isinstance(value, IndexQuantization):
+        raise ValidationError("index_quantization must be an IndexQuantization value")
+    return value
+
+
+def _index_recipe(quantization: IndexQuantization) -> str:
+    return f"{_INDEX_RECIPE_PREFIX}:quantization-{quantization.value}"
+
+
 def _batch_values(
     values: Sequence[_T | None] | None,
     count: int,
@@ -2664,23 +3187,51 @@ def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _
     return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
 
 
-def _merge_index_hits(
-    preferred: Sequence[IndexHit],
-    fallback: Sequence[IndexHit],
-) -> tuple[IndexHit, ...]:
+def _merge_index_hits(*groups: Sequence[IndexHit]) -> tuple[IndexHit, ...]:
     merged: dict[str, IndexHit] = {}
-    for hit in (*preferred, *fallback):
-        current = merged.get(hit.id)
-        if current is None:
-            merged[hit.id] = hit
-        else:
-            merged[hit.id] = IndexHit(
-                id=hit.id,
-                relevance=max(current.relevance, hit.relevance),
-                confidence=max(cast(float, current.confidence), cast(float, hit.confidence)),
-                lexical_match=current.lexical_match or hit.lexical_match,
-            )
+    for group in groups:
+        for hit in group:
+            current = merged.get(hit.id)
+            if current is None:
+                merged[hit.id] = hit
+            else:
+                merged[hit.id] = IndexHit(
+                    id=hit.id,
+                    relevance=max(current.relevance, hit.relevance),
+                    confidence=max(cast(float, current.confidence), cast(float, hit.confidence)),
+                    lexical_match=current.lexical_match or hit.lexical_match,
+                )
     return tuple(merged.values())
+
+
+def _parent_index_signals(
+    candidates: _IndexCandidates,
+    documents: Sequence[IndexDocument],
+) -> tuple[dict[str, float], dict[str, float], dict[str, float], set[str]]:
+    dense_by_id = {hit.id: hit for hit in candidates.dense}
+    lexical_by_id = {hit.id: hit for hit in candidates.lexical}
+    dense_relevance: dict[str, float] = {}
+    dense_confidence: dict[str, float] = {}
+    lexical_relevance: dict[str, float] = {}
+    lexical_matches: set[str] = set()
+    for document in documents:
+        memory_id = document.embedding.memory_id
+        embedding_id = document.embedding.embedding_id
+        dense_hit = dense_by_id.get(embedding_id)
+        if dense_hit is not None:
+            dense_relevance[memory_id] = max(
+                dense_relevance.get(memory_id, 0.0), dense_hit.relevance
+            )
+            dense_confidence[memory_id] = max(
+                dense_confidence.get(memory_id, 0.0), cast(float, dense_hit.confidence)
+            )
+        lexical_hit = lexical_by_id.get(embedding_id)
+        if lexical_hit is not None:
+            lexical_matches.add(memory_id)
+            lexical_relevance[memory_id] = max(
+                lexical_relevance.get(memory_id, 0.0), lexical_hit.relevance
+            )
+    return dense_relevance, dense_confidence, lexical_relevance, lexical_matches
 
 
 def _retrieval_is_ambiguous(
@@ -2689,9 +3240,13 @@ def _retrieval_is_ambiguous(
     margin: float,
     temporal_range: tuple[datetime, datetime] | None,
 ) -> bool:
-    if margin == 0.0 or temporal_range is not None or len(ranked) < 2 or ranked[0][3]:
+    if margin == 0.0 or len(ranked) < 2:
         return False
-    return ranked[0][2] - ranked[1][2] < margin
+    first, second = ranked[:2]
+    if first[3]:
+        return False
+    difference = first[1] - second[1] if temporal_range is not None else first[2] - second[2]
+    return difference < margin
 
 
 def _ranked_relevance(
@@ -2746,7 +3301,7 @@ def _lexical_relevance(
     query: str,
     memories: Sequence[StoredMemory],
 ) -> dict[str, float]:
-    query_terms = _lexical_terms(query)
+    query_terms = _lexical_terms(query) - _LEXICAL_NOISE_TERMS
     if not query_terms or not memories:
         return {}
     documents = {memory.memory_id: _lexical_terms(memory.content) for memory in memories}
@@ -2794,6 +3349,34 @@ def _temporal_range(text: str, reference_at: datetime) -> tuple[datetime, dateti
         return _parse_temporal_range(text, reference_at)
     except (OverflowError, ValueError):
         raise ValidationError("temporal expression exceeds the supported date range") from None
+
+
+def _temporal_context(
+    text: str,
+    reference_at: datetime,
+    *,
+    infer_reference: bool,
+) -> tuple[datetime, str]:
+    match = _TODAY_ISO_DATE.search(text)
+    try:
+        if match is not None:
+            anchored = date.fromisoformat(match.group(1))
+        else:
+            match = _TODAY_NAMED_DATE.search(text)
+            if match is None:
+                return reference_at, text
+            month = _MONTHS[match.group(1)[:3].casefold()]
+            anchored = date(
+                int(match.group(3)) if match.group(3) is not None else reference_at.year,
+                month,
+                int(match.group(2)),
+            )
+    except ValueError:
+        raise ValidationError("today reference date is invalid") from None
+    temporal_text = f"{text[: match.start()]} {text[match.end() :]}".strip()
+    if infer_reference:
+        reference_at = _day_start(anchored, reference_at)
+    return reference_at, temporal_text
 
 
 def _parse_temporal_range(  # noqa: C901 - ordered phrases are clearer as one parser
@@ -2897,6 +3480,13 @@ def _shift_month(value: datetime, months: int) -> datetime:
 def _decay_half_life(days: float | None) -> timedelta | None:
     if days is None:
         return None
+    if (
+        isinstance(days, bool)
+        or not isinstance(days, int | float)
+        or not math.isfinite(days)
+        or days <= 0
+    ):
+        raise ValidationError("decay_half_life_days must be a positive finite number")
     try:
         return timedelta(days=days)
     except OverflowError:
@@ -2915,10 +3505,10 @@ def _embedding_id(memory_id: str, object_part: int) -> str:
     return hashlib.sha256(f"mindbridge-embedding:{memory_id}:{object_part}".encode()).hexdigest()
 
 
-def _speaker_name(value: object) -> str:
-    name = _text(value, "speaker name")
+def _identity_name(value: object) -> str:
+    name = _text(value, "identity name")
     if len(name) > 255 or not name.isprintable():
-        raise ValidationError("speaker name must be at most 255 printable characters")
+        raise ValidationError("identity name must be at most 255 printable characters")
     return name
 
 

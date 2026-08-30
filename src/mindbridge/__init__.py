@@ -1,6 +1,7 @@
 """Fast local multimodal memory for Python agents."""
 
 from mindbridge.exceptions import (
+    IdentityNotFoundError,
     IndexUnavailableError,
     MemoryNotFoundError,
     MindBridgeError,
@@ -14,6 +15,9 @@ from mindbridge.memory import AsyncMemory, Memory
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
+    FaceAnalysis,
+    FaceBackend,
+    FaceEmbedding,
     GenerationBackend,
     ModelInput,
     SpeakerEmbedding,
@@ -31,6 +35,7 @@ from mindbridge.models.funasr import (
 )
 from mindbridge.models.jina import JinaOmniEmbedder
 from mindbridge.models.openai_sdk import OpenAIModels
+from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
 from mindbridge.types import (
     AnswerResult,
@@ -38,6 +43,8 @@ from mindbridge.types import (
     Blob,
     ContentAtom,
     ContentInput,
+    FaceObservation,
+    IndexQuantization,
     MemoryRecord,
     MemoryType,
     Modality,
@@ -57,9 +64,15 @@ __all__ = [
     "ContentInput",
     "EmbedTask",
     "EmbeddingBackend",
+    "FaceAnalysis",
+    "FaceBackend",
+    "FaceEmbedding",
+    "FaceObservation",
     "FunASRRecipe",
     "FunASRTranscriber",
     "GenerationBackend",
+    "IdentityNotFoundError",
+    "IndexQuantization",
     "IndexUnavailableError",
     "JinaOmniEmbedder",
     "Memory",
@@ -72,6 +85,7 @@ __all__ = [
     "ModelInput",
     "ModelOutputTruncatedError",
     "OpenAIModels",
+    "OpenCVFaceAnalyzer",
     "Page",
     "SearchHit",
     "SentenceTransformersEmbedder",
