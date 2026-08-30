@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib import import_module
 from itertools import pairwise
+from pathlib import Path
 from threading import RLock
 from typing import Protocol, cast
 
@@ -214,14 +215,24 @@ class FunASRTranscriber:
         """Analyze one official batch, returning the analyses and the AutoModel calls made."""
         paths = tuple(_speech_path(asset) for asset in assets)
         output = _pipeline_output(pipeline, list(paths) if len(paths) > 1 else paths[0])
-        if (
-            not isinstance(output, list)
-            or len(output) != len(paths)
-            or any(not isinstance(result, dict) for result in output)
-        ):
+        if isinstance(output, list) and all(isinstance(result, dict) for result in output):
+            if len(output) == len(paths):
+                return tuple(_analysis(result) for result in output), 1
+            keys = tuple(result.get("key") for result in output)
+            path_keys = tuple(Path(path).stem for path in paths)
+            if (
+                output
+                and all(isinstance(key, str) for key in keys)
+                and len(set(keys)) == len(keys)
+                and len(set(path_keys)) == len(path_keys)
+                and all(key in path_keys for key in keys)
+            ):
+                keyed = dict(zip(keys, output, strict=True))
+                return tuple(_analysis(keyed.get(key, {"text": ""})) for key in path_keys), 1
+        if len(assets) > 1:
             analyses = tuple(FunASRTranscriber._analyze_one(pipeline, asset) for asset in assets)
             return analyses, 1 + len(assets)
-        return tuple(_analysis(result) for result in output), 1
+        return (FunASRTranscriber._analyze_one(pipeline, assets[0]),), 2
 
     @staticmethod
     def _analyze_one(pipeline: _Pipeline, asset: AssetRef) -> SpeechAnalysis:
