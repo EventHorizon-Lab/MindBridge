@@ -111,8 +111,12 @@ mindbridge --url http://127.0.0.1:8000 search "where is the spare key"
 ```
 
 In this mode the CLI constructs no backends at all: it sends JSON to `/v1` and echoes the response
-body unchanged. HTTP uses `urllib.request` from the standard library. The request carries no timeout
-of its own; the owner's own timeouts govern.
+body unchanged. HTTP uses `urllib.request` from the standard library. Each blocking remote operation
+has a 30-second timeout by default; set another positive finite value with `--timeout SECONDS`.
+This bounds the CLI connection/read wait and does not change the owner's model-provider timeouts.
+A timeout exits `7` with `storage_error`, `reason="timeout"`, `stage="request"`, and
+`retryable=true`. The resolved timeout appears in the normal composition banner and `--explain`
+output as `timeout_seconds`.
 
 Exit `9` from a local composition means another process owns the directory — retry with `--url`.
 
@@ -123,6 +127,7 @@ Exit `9` from a local composition means another process owns the directory — r
 --app MODULE:ATTR      }
 --embedder NAME        }  exactly one is required
 --url URL              }
+--timeout SECONDS        remote request timeout with --url (default: 30)
 --answerer NAME          generation recipe, with --embedder
 --transcriber NAME       speech recipe, with --embedder
 --index-speech           index transcripts and speaker identities on add

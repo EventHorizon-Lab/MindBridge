@@ -194,6 +194,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- Remote product CLI requests now default to a finite 30-second timeout, configurable with the
+  positive `--timeout SECONDS` option. Timeouts use the existing retryable `storage_error` envelope
+  with `reason="timeout"` and `stage="request"` instead of leaving an agent blocked indefinitely.
 - Multi-result `search` and `ask` preserve qualified candidates when the top two scores tie;
   ambiguity abstention now applies only to an unresolved `limit=1` choice.
 - Local Zvec maintenance periodically optimizes and copy-on-write compacts durable segments, so
