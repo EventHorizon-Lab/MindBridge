@@ -35,6 +35,7 @@ two or more media families are omni.
 | `assets` | Ordered, resolved `AssetRef` values |
 | `created_at` | Time the record was first stored |
 | `occurred_at` | Optional timezone-aware event time |
+| `occurred_end` | Optional timezone-aware end of an interval; requires `occurred_at` and must be later than it |
 | `metadata` | Detached JSON application payload |
 
 An asset is immutable media stored by SHA-256. Its public descriptor contains ID, modality, MIME

@@ -23,6 +23,12 @@ uv add "mindbridge[local,openai]"
 The base package depends only on Pydantic and Zvec. Torch, provider SDKs, REST, and MCP remain in
 optional extras.
 
+`JinaOmniEmbedder` pins Jina v5 Omni, whose weights are licensed **CC BY-NC 4.0 — non-commercial
+use only**. That licence covers the model, not MindBridge. Inject another embedding backend when it
+does not fit the application; see
+[choose an embedding backend](docs/quickstart.md#choose-an-embedding-backend) for a pinned
+Apache-2.0 alternative.
+
 ## Search local memory
 
 ```python
@@ -31,10 +37,15 @@ from mindbridge import JinaOmniEmbedder, Memory
 with Memory("./data/assistant", embedder=JinaOmniEmbedder()) as memory:
     memory.add("Ada prefers concise status updates.")
     hits = memory.search("How should I write Ada's update?")
-    print(hits[0].content)
+    for hit in hits:
+        print(hit.score, hit.content)
 ```
 
 `Memory` never selects a provider or reads provider credentials.
+
+`search` returns a possibly empty tuple. MindBridge withholds weak or ambiguous evidence rather
+than always returning rows, so callers must handle the empty case; see
+[search can legitimately return nothing](docs/quickstart.md#search-can-legitimately-return-nothing).
 
 ## Add grounded answers
 
@@ -179,6 +190,3 @@ Every benchmark unit receives a separate physical directory. See
 - [Architecture](docs/architecture.md)
 - [REST API](docs/api/rest.md)
 - [Deployment](docs/deployment.md) and [operations](docs/operations.md)
-
-The pinned default Jina model weights are licensed CC BY-NC 4.0. Inject another embedding backend
-when that license does not fit the application.
