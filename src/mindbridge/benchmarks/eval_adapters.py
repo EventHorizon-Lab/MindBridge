@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypeAlias, TypeVar, cast
@@ -858,6 +858,7 @@ def _atm(
     offset: int,
 ) -> tuple[EvalUnit, ...]:
     from mindbridge.benchmarks.atm_bench import (
+        atm_capture_time,
         atm_email_block,
         atm_sgm_block,
         load_atm_bench,
@@ -882,7 +883,10 @@ def _atm(
                 )
             )
     else:
-        memories.extend(media.parts(cast(str, spec.variant), allow_all=True))
+        memories.extend(
+            replace(item, occurred_at=atm_capture_time(item.source_id))
+            for item in media.parts(cast(str, spec.variant), allow_all=True)
+        )
     questions = tuple(
         EvalQuestion(
             question.question_id,

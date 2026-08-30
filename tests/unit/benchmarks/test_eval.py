@@ -15,7 +15,15 @@ from typing import cast
 import pytest
 
 import mindbridge.benchmarks.eval as eval_module
-from mindbridge import AnswerResult, AssetRef, AsyncMemory, MemoryType, Modality, SearchHit
+from mindbridge import (
+    AnswerResult,
+    AssetRef,
+    AsyncMemory,
+    IndexUnavailableError,
+    MemoryType,
+    Modality,
+    SearchHit,
+)
 from mindbridge.benchmarks.eval import (
     MemoryFactory,
     SampleResult,
@@ -447,6 +455,7 @@ def test_benchmark_speech_backend_skips_video_without_an_audio_stream(
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v7"
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(device=None, seed=7, gen_kwargs="{}", recall_limit=8),
@@ -777,6 +786,55 @@ async def test_ingest_bisects_a_failed_batch_without_losing_items() -> None:
 
     assert await _ingest(cast(AsyncMemory, memory), items, batch_size=4) == 0
     assert events == ["batch:4", "batch:2", "batch:2"]
+
+
+@pytest.mark.asyncio
+async def test_runner_records_index_failure_without_recursive_ingest(tmp_path: Path) -> None:
+    calls = 0
+
+    class Memory(_FakeMemory):
+        async def add_many(
+            self,
+            contents: Sequence[object],
+            **_kwargs: object,
+        ) -> tuple[object, ...]:
+            nonlocal calls
+            calls += 1
+            raise IndexUnavailableError("index exhausted file descriptors")
+
+    class Context:
+        async def __aenter__(self) -> AsyncMemory:
+            return cast(AsyncMemory, Memory([]))
+
+        async def __aexit__(self, *_error: object) -> None:
+            return None
+
+    spec = TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40)
+    task = LoadedTask(
+        spec,
+        tmp_path / "fixture.json",
+        "1" * 64,
+        (
+            EvalUnit(
+                "unit",
+                tuple(MemoryItem(str(number), (str(number),)) for number in range(4)),
+                (EvalQuestion("q1", ("question",), references=("answer",)),),
+            ),
+        ),
+    )
+
+    samples = await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+        memory_factory=cast(MemoryFactory, lambda _path: Context()),
+        batch_size=4,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=1,
+    )
+
+    assert calls == 1
+    assert samples[0].error_code == "index_unavailable"
 
 
 @pytest.mark.asyncio

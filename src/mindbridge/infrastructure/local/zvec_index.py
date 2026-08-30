@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import errno
 import math
+import os
 import re
 from collections.abc import Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Condition
 from types import ModuleType
 from typing import Any, NoReturn, cast
@@ -48,6 +51,9 @@ _DEFAULT_EF_SEARCH = 300
 _LEXICAL_RANK_CONSTANT = 60
 _DEFAULT_REBUILD_BATCH_SIZE = 1_024
 _AUTO_OPTIMIZE_UNINDEXED_DOCUMENTS = 100_000
+_AUTO_OPTIMIZE_FLUSHES = 64
+_AUTO_COMPACT_FLUSHES = 256
+_FILE_DESCRIPTOR_RESERVE = 128
 _GROUP_OVERSAMPLE = 2
 _GROUP_FALLBACK_MINIMUM = 50
 _MAX_EMBEDDINGS_PER_MEMORY = 129
@@ -163,6 +169,7 @@ class ZvecIndex:
         self._gate = _CollectionGate()
         self._zvec: Any = _load_zvec()
         self._schema = self._build_schema()
+        _require_file_descriptor_headroom(_persisted_index_file_count(self.path))
         option = self._zvec.CollectionOption(read_only=False, enable_mmap=True)
         if self.path.exists():
             self._collection: object | None = self._zvec.open(str(self.path), option=option)
@@ -177,6 +184,9 @@ class ZvecIndex:
             self._optimization_watermark = _indexed_document_count(
                 cast(Any, self._collection).stats
             )
+            persisted_segments = _persisted_segment_count(self.path)
+            self._flushes_since_optimization = persisted_segments
+            self._flushes_since_compaction = persisted_segments
         except BaseException:
             self.close()
             raise
@@ -205,6 +215,7 @@ class ZvecIndex:
         """Idempotently apply a batch, checking every per-document status."""
         if not documents:
             return
+        _require_file_descriptor_headroom()
         docs = []
         ids = []
         for document in documents:
@@ -248,6 +259,7 @@ class ZvecIndex:
         """Idempotently delete IDs, accepting Zvec's NOT_FOUND status."""
         if not ids:
             return
+        _require_file_descriptor_headroom()
         for document_id in ids:
             if not document_id or document_id != document_id.strip():
                 raise ValueError("index document IDs must be non-empty and trimmed")
@@ -336,8 +348,11 @@ class ZvecIndex:
 
     def flush(self) -> None:
         """Make prior Zvec writes durable before SQLite acknowledges its outbox."""
+        _require_file_descriptor_headroom()
         collection = cast(Any, self._require_collection())
         collection.flush()
+        self._flushes_since_optimization += 1
+        self._flushes_since_compaction += 1
 
     def optimize(self, *, concurrency: int = 0) -> None:
         """Merge pending vectors into HNSW without blocking normal queries."""
@@ -346,23 +361,131 @@ class ZvecIndex:
         collection = cast(Any, self._require_collection())
         collection.optimize(self._zvec.OptimizeOption(concurrency=concurrency))
         self._optimization_watermark = self.doc_count
+        self._flushes_since_optimization = 0
 
     def optimize_if_needed(
         self,
         *,
         minimum_unindexed: int = _AUTO_OPTIMIZE_UNINDEXED_DOCUMENTS,
     ) -> bool:
-        """Start background maintenance after a meaningful flat-buffer buildup."""
+        """Run maintenance after a meaningful flat-buffer or durable-segment buildup."""
         _require_positive(minimum_unindexed, "minimum_unindexed")
+        # Zvec optimize compacts search segments but leaves one idmap SST per durable flush.
+        if self._flushes_since_compaction >= _AUTO_COMPACT_FLUSHES:
+            self._compact()
+            return True
         collection = cast(Any, self._require_collection())
         stats = collection.stats
         document_count = int(stats.doc_count)
         self._optimization_watermark = min(self._optimization_watermark, document_count)
         indexed = _indexed_document_count(stats)
-        if document_count - max(indexed, self._optimization_watermark) < minimum_unindexed:
+        if (
+            self._flushes_since_optimization < _AUTO_OPTIMIZE_FLUSHES
+            and document_count - max(indexed, self._optimization_watermark) < minimum_unindexed
+        ):
             return False
         self.optimize()
         return True
+
+    def _compact(self) -> None:
+        """Copy visible documents into one flushed collection, then atomically replace it."""
+        _require_file_descriptor_headroom()
+        with TemporaryDirectory(
+            prefix=f".{self.path.name}.compact-",
+            dir=self.path.parent,
+            ignore_cleanup_errors=True,
+        ) as workspace:
+            temporary = Path(workspace) / "new"
+            backup = Path(workspace) / "old"
+            target: Any | None = None
+            try:
+                target = self._zvec.create_and_open(
+                    str(temporary),
+                    schema=self._schema,
+                    option=self._zvec.CollectionOption(read_only=False, enable_mmap=True),
+                )
+                with self._gate.read():
+                    source = cast(Any, self._require_collection())
+                    batch = []
+                    with source.iter_docs() as documents:
+                        for document in documents:
+                            batch.append(document)
+                            if len(batch) == _DEFAULT_REBUILD_BATCH_SIZE:
+                                self._upsert_native(target, batch, action="compact")
+                                batch.clear()
+                    if batch:
+                        self._upsert_native(target, batch, action="compact")
+                if int(target.stats.doc_count):
+                    target.optimize(self._zvec.OptimizeOption(concurrency=0))
+                target.flush()
+                target.close()
+                target = None
+                self._replace_compacted_collection(source, temporary, backup)
+            finally:
+                if target is not None:
+                    with suppress(Exception):
+                        target.close()
+
+    def _replace_compacted_collection(
+        self,
+        source: object,
+        temporary: Path,
+        backup: Path,
+    ) -> None:
+        with self._gate.write():
+            if self._collection is not source:
+                raise RuntimeError("Zvec collection changed during compaction")
+            cast(Any, source).close()
+            self._collection = None
+            # If the process stops between renames, the missing canonical path makes the
+            # authoritative SQLite store rebuild this disposable index on the next open.
+            try:
+                self.path.replace(backup)
+            except BaseException:
+                self._collection = self._zvec.open(
+                    str(self.path),
+                    option=self._zvec.CollectionOption(read_only=False, enable_mmap=True),
+                )
+                raise
+            try:
+                temporary.replace(self.path)
+            except BaseException:
+                backup.replace(self.path)
+                self._collection = self._zvec.open(
+                    str(self.path),
+                    option=self._zvec.CollectionOption(read_only=False, enable_mmap=True),
+                )
+                raise
+            replacement: Any | None = None
+            try:
+                replacement = self._zvec.open(
+                    str(self.path),
+                    option=self._zvec.CollectionOption(read_only=False, enable_mmap=True),
+                )
+                self._validate_schema(replacement.schema)
+                replacement_watermark = _indexed_document_count(replacement.stats)
+            except BaseException:
+                if replacement is not None:
+                    with suppress(Exception):
+                        replacement.close()
+                self.path.replace(temporary)
+                backup.replace(self.path)
+                self._collection = self._zvec.open(
+                    str(self.path),
+                    option=self._zvec.CollectionOption(read_only=False, enable_mmap=True),
+                )
+                raise
+            self._collection = replacement
+            self._optimization_watermark = replacement_watermark
+            self._flushes_since_optimization = 0
+            self._flushes_since_compaction = 0
+
+    def _upsert_native(
+        self, collection: object, documents: Sequence[object], *, action: str
+    ) -> None:
+        ids = [str(cast(Any, document).id) for document in documents]
+        statuses = cast(Sequence[object], cast(Any, collection).upsert(list(documents)))
+        self._check_statuses(action, ids, statuses)
 
     def rebuild(
         self,
@@ -399,6 +522,8 @@ class ZvecIndex:
             option=self._zvec.CollectionOption(read_only=False, enable_mmap=True),
         )
         self._optimization_watermark = 0
+        self._flushes_since_optimization = 0
+        self._flushes_since_compaction = 0
 
         count = 0
         batch: list[IndexDocument] = []
@@ -759,6 +884,58 @@ def _load_zvec() -> ModuleType:
         raise ZvecUnavailableError(
             "Zvec 0.7 is required for local search; install a supported 64-bit zvec wheel"
         ) from error
+
+
+def _require_file_descriptor_headroom(required: int = 0) -> None:
+    usage = _file_descriptor_usage()
+    if usage is None:
+        return
+    opened, soft_limit = usage
+    if opened + required + _FILE_DESCRIPTOR_RESERVE <= soft_limit:
+        return
+    raise OSError(
+        errno.EMFILE,
+        "Zvec operation refused before file descriptor exhaustion: "
+        f"{opened} descriptors are open, {required} persisted index files may be opened, "
+        f"and the soft limit is {soft_limit}; rebuild the disposable index to compact segments",
+    )
+
+
+def _file_descriptor_usage() -> tuple[int, int] | None:
+    descriptors = next(
+        (path for path in (Path("/proc/self/fd"), Path("/dev/fd")) if path.is_dir()),
+        None,
+    )
+    if os.name != "posix" or descriptors is None:
+        return None
+    try:
+        resource = import_module("resource")
+        soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if int(soft_limit) < 0:
+            return None
+        return len(os.listdir(descriptors)), int(soft_limit)
+    except (AttributeError, ImportError, OSError):
+        return None
+
+
+def _persisted_index_file_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(
+        file.suffix in {".ipc", ".proxima", ".sst", ".wal"}
+        for file in path.rglob("*")
+        if file.is_file()
+    )
+
+
+def _persisted_segment_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return max(
+        sum(1 for _file in path.rglob("*.ipc")),
+        sum(1 for _file in path.rglob("*.proxima")),
+        sum(1 for _file in (path / "idmap.0").glob("*.sst")),
+    )
 
 
 def _filter_expression(

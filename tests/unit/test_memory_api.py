@@ -861,8 +861,9 @@ def test_temporal_candidate_merge_keeps_the_best_vector_score() -> None:
     assert merged == (IndexHit(id="shared", relevance=0.9),)
 
 
-def test_search_rejects_weak_and_ambiguous_evidence(tmp_path: Path) -> None:
-    with _memory(tmp_path, _FakeModels()) as memory:
+def test_ambiguity_gate_only_rejects_single_result_retrieval(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory:
         first = memory.add("first scene")
         second = memory.add("second scene")
         index = _FakeIndex.instances[-1]
@@ -874,7 +875,17 @@ def test_search_rejects_weak_and_ambiguous_evidence(tmp_path: Path) -> None:
             IndexHit(id=first.id, relevance=0.9, confidence=0.8),
             IndexHit(id=second.id, relevance=0.89, confidence=0.795),
         )
-        assert memory.search("which repeated scene?") == ()
+        assert [hit.id for hit in memory.search("which repeated scene?", limit=2)] == [
+            first.id,
+            second.id,
+        ]
+        assert memory.search("which repeated scene?", limit=1) == ()
+        assert [hit.id for hit in memory.ask("which repeated scene?", limit=2).hits] == [
+            first.id,
+            second.id,
+        ]
+        assert memory.ask("which repeated scene?", limit=1).hits == ()
+        assert models.answer_calls[-1][1] == ()
 
         index.hits_override = (
             IndexHit(

@@ -85,11 +85,12 @@ preserves maximum retrieval quality. `FP16` and rotated `INT8` reduce active ind
 4095. Quantization is lossy, so compare recall and latency before enabling it. Changing this value
 rebuilds Zvec from authoritative FP32 embeddings in SQLite without calling the embedder.
 
-`minimum_relevance` rejects weak dense evidence, while `ambiguity_margin` returns no hits when the
-top two dense confidences are effectively tied and the winner has neither a lexical nor temporal
-anchor. Both are calibrated `[0, 1]` values and may be set to `0` to disable that gate. A candidate
-that matches the full-text index is scored at `0.6` confidence regardless of its vector distance, so
-it clears the default `minimum_relevance` on the strength of the lexical match alone.
+`minimum_relevance` rejects weak dense evidence. `ambiguity_margin` rejects an unresolved top-two
+tie only when `search()` or `ask()` is called with `limit=1`; a lexical or temporal anchor can clear
+the tie. With a larger limit, `search` returns the qualified candidates and `ask` passes them to the
+answerer. Both settings are calibrated `[0, 1]` values and may be set to `0` to disable that gate. A
+candidate that matches the full-text index is scored at `0.6` confidence regardless of its vector
+distance, so it clears the default `minimum_relevance` on the strength of the lexical match alone.
 
 Use `Memory` as a context manager:
 
@@ -156,7 +157,8 @@ atomic representation in one embedding batch, discard duplicate vectors, and sea
 independent routes concurrently; single-text queries remain one vector. Dense and lexical
 candidates hydrate and collapse to their authoritative parent before reranking. English BM25 uses
 case folding, accent folding, and stemming; queries containing Han characters use Jieba. Weak or
-unresolved tied evidence can therefore return `()`.
+missing evidence can therefore return `()`. With `limit=1`, an unresolved top-two tie can also
+empty `search` or leave `ask` with no hits; larger limits preserve those qualified candidates.
 
 ### Feedback
 

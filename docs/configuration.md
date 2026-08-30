@@ -40,8 +40,10 @@ Memory(
   indexing; the default leaves analysis lazy.
 - `index_quantization` defaults to quality-first `NONE`; `FP16`, rotated `INT8`, and x86_64-only
   `RABITQ` are explicit, lossy capacity choices that rebuild only the derived Zvec projection.
-- `minimum_relevance` drops weak dense evidence; `ambiguity_margin` drops unresolved top-two ties
-  unless the winner has a lexical or temporal anchor. Set either to `0` to disable that gate.
+- `minimum_relevance` drops weak dense evidence. `ambiguity_margin` drops unresolved top-two ties
+  only when `search()` or `ask()` uses `limit=1`, unless the winner has a lexical or temporal anchor.
+  Larger limits preserve qualified candidates for the caller or answerer. Set either to `0` to
+  disable that gate.
 - `decay_half_life_days` controls query-time soft decay; `None` disables it.
 - Face and speaker thresholds are local matching semantics, not provider settings. Each modality
   applies its own top-two margin before enrolling a new identity.

@@ -136,8 +136,10 @@ not loaded once per case.
 
 The runner stores source memories as episodic, preserves released wall-clock event spans as typed
 bounds, and retains source-relative clip intervals as provenance metadata. LoCoMo-Refined,
-MemLens, Mem-Gallery, and ATM-Bench use the public batched API for released event times, so temporal
-retrieval is measured instead of relying only on timestamps embedded in display text.
+MemLens, and Mem-Gallery use the public batched API for released event times; ATM-Bench raw media
+uses the same official filename capture-time parser as SGM, while email keeps its released
+timestamp. Temporal retrieval is therefore measured instead of relying only on timestamps embedded
+in display text.
 ATM-Bench keeps each released email or SGM record as one parent memory and lets MindBridge's derived
 context keys cover long fields. Mem-Gallery preserves released image IDs beside their images.
 Benchmark questions keep the original question as the first ordered text atom and retain answer

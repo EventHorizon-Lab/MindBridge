@@ -586,6 +586,7 @@ class Memory:
                 memory_type=_optional_memory_type(memory_type),
                 reference_at=reference,
                 temporal_range=_temporal_range(temporal_text, reference),
+                require_unambiguous=limit == 1,
             )
             self._persist_transcripts(assets)
             return hits
@@ -624,6 +625,7 @@ class Memory:
                 memory_type=_optional_memory_type(memory_type),
                 reference_at=reference,
                 temporal_range=temporal_range,
+                require_unambiguous=limit == 1,
             )
             speech_assets = self._answer_speech_assets(prepared.assets)
             if speech_assets and all(
@@ -1340,6 +1342,7 @@ class Memory:
         memory_type: MemoryType | None,
         reference_at: datetime,
         temporal_range: tuple[datetime, datetime] | None,
+        require_unambiguous: bool,
     ) -> tuple[SearchHit, ...]:
         prepared = self._embedding_content(prepared, operation)
         model_inputs = self._embedding_inputs(
@@ -1454,7 +1457,7 @@ class Memory:
                     )
                 ranked = [item for item in ranked if item[2] >= self._minimum_relevance]
                 ranked.sort(key=lambda item: (-item[1], item[0].memory_id))
-                if _retrieval_is_ambiguous(
+                if require_unambiguous and _retrieval_is_ambiguous(
                     ranked,
                     margin=self._ambiguity_margin,
                     temporal_range=temporal_range,
