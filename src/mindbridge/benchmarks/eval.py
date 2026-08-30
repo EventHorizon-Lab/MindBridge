@@ -404,7 +404,9 @@ class _BackendPool:
                     resource.close()
 
 
-def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
+def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
+    argv: Sequence[str] | None = None, *, prog: str | None = None
+) -> int:
     """Parse one reproducible evaluation sweep and write its artifacts."""
     parser = _build_parser(prog)
     parsed = parser.parse_args(argv)
@@ -413,6 +415,29 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
         print(listing(parsed.benchmarks_root.expanduser().resolve(), list_mode))
         return 0
     arguments = _arguments(parser, parsed)
+    if parsed.check_integrity:
+        manifest, manifest_directory = load_media_manifest(arguments.media_manifest)
+        loaded = _load_tasks(arguments, manifest, manifest_directory)
+        print(
+            _json_bytes(
+                {
+                    "status": "ok",
+                    "tasks": [
+                        {
+                            "task": task.spec.name,
+                            "dataset_sha256": task.dataset_sha256,
+                            "evaluation_sha256": task.evaluation_sha256,
+                            "unit_count": len(task.units),
+                            "question_count": sum(len(unit.questions) for unit in task.units),
+                        }
+                        for task in loaded
+                    ],
+                },
+                pretty=True,
+            ).decode(),
+            end="",
+        )
+        return 0
     try:
         base_config = _model_config(arguments.model, arguments.model_args)
         judge_config = _judge_config(base_config, arguments)
@@ -451,22 +476,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
         _atomic_replace(((effective_manifest, _json_bytes(manifest, pretty=True)),))
         arguments = replace(arguments, media_manifest=effective_manifest)
         manifest_directory = effective_manifest.parent
-    loaded = tuple(
-        load_task(
-            TASKS[name],
-            root=arguments.benchmarks_root,
-            dataset_path=arguments.dataset_overrides.get(name),
-            media_root=arguments.media_overrides.get(name),
-            media_manifest=manifest,
-            manifest_directory=manifest_directory,
-            limit=arguments.limit,
-            offset=arguments.offset,
-            verify_digest=not (
-                arguments.allow_unverified_data and name in arguments.dataset_overrides
-            ),
-        )
-        for name in arguments.tasks
-    )
+    loaded = _load_tasks(arguments, manifest, manifest_directory)
     config = _evaluation_config(base_config, loaded)
     batch_sizes = {task.spec.name: _batch_size(arguments, task) for task in loaded}
     samples, duration, performance = _execute(loaded, arguments, config, judge_config, batch_sizes)
@@ -501,6 +511,29 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     )
     submission_invalid = submission_status is not None and submission_status["status"] == "invalid"
     return int(has_errors or regressed or submission_invalid)
+
+
+def _load_tasks(
+    arguments: _Arguments,
+    manifest: Mapping[str, object] | None,
+    manifest_directory: Path | None,
+) -> tuple[LoadedTask, ...]:
+    return tuple(
+        load_task(
+            TASKS[name],
+            root=arguments.benchmarks_root,
+            dataset_path=arguments.dataset_overrides.get(name),
+            media_root=arguments.media_overrides.get(name),
+            media_manifest=manifest,
+            manifest_directory=manifest_directory,
+            limit=arguments.limit,
+            offset=arguments.offset,
+            verify_digest=not (
+                arguments.allow_unverified_data and name in arguments.dataset_overrides
+            ),
+        )
+        for name in arguments.tasks
+    )
 
 
 def _announce_submission(arguments: _Arguments, status: Mapping[str, object] | None) -> None:
@@ -2607,6 +2640,7 @@ def _cache_namespace(
     payload = {
         "runner": EVAL_RUNNER_VERSION,
         "schema": EVAL_SCHEMA_VERSION,
+        "implementation": _implementation_identity(),
         "model": config.generation_model,
         "base_url": config.generation_base_url,
         "embedding_model": DEFAULT_JINA_MODEL_ID,
@@ -2619,6 +2653,15 @@ def _cache_namespace(
         "batch_sizes": dict(sorted(batch_sizes.items())),
     }
     return hashlib.sha256(_json_bytes(payload)).hexdigest()
+
+
+def _implementation_identity() -> str:
+    root = Path(__file__).resolve().parents[1]
+    sources = [
+        (path.relative_to(root).as_posix(), hashlib.sha256(path.read_bytes()).hexdigest())
+        for path in sorted(root.rglob("*.py"))
+    ]
+    return hashlib.sha256(_json_bytes(sources)).hexdigest()
 
 
 def _cache_task(task: LoadedTask) -> str:

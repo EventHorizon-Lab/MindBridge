@@ -158,6 +158,86 @@ def test_lmms_style_task_listing(capsys: pytest.CaptureFixture[str], tmp_path: P
     assert "video-mme-v2" in output
 
 
+def test_integrity_check_is_an_offline_json_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    spec = TASKS["locomo-refined"]
+    task = LoadedTask(
+        spec,
+        tmp_path / "dataset.json",
+        "1" * 64,
+        (EvalUnit("unit", (), (EvalQuestion("question", ("Prompt",), ("Answer",)),)),),
+        {"dataset": "1" * 64, "memory": "2" * 64},
+    )
+    loaded_with: list[dict[str, object]] = []
+
+    def load(_spec: TaskSpec, **kwargs: object) -> LoadedTask:
+        assert _spec is spec
+        loaded_with.append(kwargs)
+        return task
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("integrity checks must remain offline and side-effect free")
+
+    monkeypatch.setattr(eval_module, "load_task", load)
+    for name in (
+        "_model_config",
+        "_require_output",
+        "acquire_inputs",
+        "prepare_task_media",
+        "_execute",
+    ):
+        monkeypatch.setattr(eval_module, name, forbidden)
+    output = tmp_path / "output"
+    data = tmp_path / "data"
+
+    assert (
+        main(
+            (
+                "--tasks",
+                spec.name,
+                "--benchmarks-root",
+                str(tmp_path),
+                "--data-root",
+                str(data),
+                "--output-path",
+                str(output),
+                "--check-integrity",
+            )
+        )
+        == 0
+    )
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "ok",
+        "tasks": [
+            {
+                "task": spec.name,
+                "dataset_sha256": task.dataset_sha256,
+                "evaluation_sha256": task.evaluation_sha256,
+                "unit_count": 1,
+                "question_count": 1,
+            }
+        ],
+    }
+    assert loaded_with == [
+        {
+            "root": tmp_path.resolve(),
+            "dataset_path": None,
+            "media_root": None,
+            "media_manifest": None,
+            "manifest_directory": None,
+            "limit": None,
+            "offset": 0,
+            "verify_digest": True,
+        }
+    ]
+    assert not output.exists()
+    assert not data.exists()
+
+
 def test_result_table_includes_per_task_time_and_tokens() -> None:
     output = eval_module._table(
         {
@@ -465,6 +545,24 @@ def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch.setattr(eval_module, "EVAL_RUNNER_VERSION", "next-runner-recipe")
 
     assert _cache_namespace(arguments, ModelConfig(), {"text": 1}) != before
+
+
+def test_implementation_identity_tracks_editable_source_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    package = tmp_path / "mindbridge"
+    benchmark = package / "benchmarks" / "eval.py"
+    benchmark.parent.mkdir(parents=True)
+    benchmark.write_text("RUNNER = 1\n", encoding="utf-8")
+    implementation = package / "memory.py"
+    implementation.write_text("RECIPE = 1\n", encoding="utf-8")
+    monkeypatch.setattr(eval_module, "__file__", str(benchmark))
+
+    identity = eval_module._implementation_identity()
+
+    assert eval_module._implementation_identity() == identity
+    implementation.write_text("RECIPE = 2\n", encoding="utf-8")
+    assert eval_module._implementation_identity() != identity
 
 
 def test_model_base_url_override_replaces_environment_operation_urls(
