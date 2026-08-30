@@ -23,6 +23,13 @@ uv add "mindbridge[local,openai]"
 Add `mindbridge[face]` only when local face identity is required; model weights remain explicit
 caller-provided files.
 
+Install every optional adapter, protocol, and benchmark dependency only when a complete development
+environment is required:
+
+```bash
+uv add "mindbridge[all]"
+```
+
 The base package depends only on Pydantic and Zvec. Torch, provider SDKs, REST, and MCP remain in
 optional extras.
 

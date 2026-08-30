@@ -24,16 +24,17 @@ MindBridge supports Python 3.10 through 3.14 and uses `uv` with `pyproject.toml`
 Install every development group and optional surface with:
 
 ```bash
-uv sync --all-groups --all-extras
+uv sync --locked --default-index https://pypi.org/simple --all-groups --all-extras
 ```
 
 Run the required quality gates before submitting a change:
 
 ```bash
-uv run ruff format --check .
-uv run ruff check .
-uv run mypy
-uv run pytest -W error
+uv lock --check --default-index https://pypi.org/simple
+uv run --frozen ruff format --check .
+uv run --frozen ruff check .
+uv run --frozen mypy
+uv run --frozen pytest -W error
 git diff --check
 ```
 

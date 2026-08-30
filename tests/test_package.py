@@ -266,7 +266,13 @@ def test_dependency_surface_is_exact() -> None:
         "pydantic",
         "zvec",
     }
-    assert {extra: {_name(item) for item in items} for extra, items in EXTRAS.items()} == {
+    assert set(EXTRAS["all"]) == {
+        item for extra, items in EXTRAS.items() if extra != "all" for item in items
+    }
+    extras = {
+        extra: {_name(item) for item in items} for extra, items in EXTRAS.items() if extra != "all"
+    }
+    assert extras == {
         "benchmarks": {"httpx", "huggingface-hub", "nltk", "opentelemetry-sdk", "pyarrow"},
         "observability": {"opentelemetry-sdk"},
         "openai": {"openai"},
