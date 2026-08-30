@@ -318,6 +318,7 @@ Every error response has one flat shape:
 | 404 | `memory_not_found` | `GET` memory ID does not exist |
 | 422 | `validation_error` | Request, media source, or public input is invalid |
 | 502 | `model_error` | Routing, embedding, transcription, or generation failed |
+| 502 | `model_output_truncated` | Generation stopped at an output token limit; retrying is pointless |
 | 503 | `index_unavailable` or `storage_error` | Embedded index or durable state failed |
 | 500 | `internal_error` | Unexpected failure |
 
@@ -329,5 +330,6 @@ messages intentionally avoid provider, local path, or native-index details.
 The REST API has no local-path input, large-file upload endpoint, update route, metadata filter,
 logical scope parameter, chunking contract, per-asset vector control, or learned reranker. Fetch large
 media in the host application and use the Python `Path`/`Blob` contract or a provider-specific
-adapter. The OpenAI adapter inlines at most 64 MiB of raw media per embedding or generation call;
-generation admits ranked evidence within that budget, and answer text evidence is limited to 4 MiB.
+adapter. The OpenAI adapter inlines at most 64 MiB of base64-encoded media per embedding or
+generation call, which is roughly 48 MiB of files on disk; generation admits ranked evidence within
+that budget, and answer text evidence is limited to 4 MiB.

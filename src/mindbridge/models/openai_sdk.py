@@ -17,12 +17,15 @@ if TYPE_CHECKING:
     from openai import OpenAI
 
 from mindbridge._telemetry import (
+    GEN_AI_FINISH_REASONS,
     GEN_AI_TTFC,
+    GROUNDING_HITS_DROPPED,
+    GROUNDING_MEDIA_ELIDED,
     MODEL_TTFT,
     mark_model_requests,
     record_model_usage,
 )
-from mindbridge.exceptions import ModelError, ValidationError
+from mindbridge.exceptions import ModelError, ModelOutputTruncatedError, ValidationError
 from mindbridge.models.base import EmbedTask, ModelInput, _modalities
 from mindbridge.types import AnswerResult, AssetRef, Modality, SearchHit
 
@@ -37,7 +40,13 @@ _GROUNDED_SYSTEM_PROMPT = (
     "use matching metadata values rather than memory_id. If the hits do not contain enough "
     f"evidence, answer exactly: {UNKNOWN_ANSWER}"
 )
+_TRUNCATED_ANSWER_ERROR = (
+    "generation stopped at the output token limit; raise generation_max_tokens or lower the "
+    "answer limit"
+)
 _Operation = Literal["embedding", "generation", "transcription"]
+# Bounds the base64 media the request carries, not the bytes on disk. Media reaches the provider
+# inside a data URL or an input_audio part, so the wire always carries 4/3 of the file size.
 _MAX_INLINE_MODEL_BYTES = 64 * 1024 * 1024
 _MAX_GROUNDED_TEXT_BYTES = 4 * 1024 * 1024
 
@@ -342,7 +351,10 @@ class OpenAIModels:
                     input_modalities=modalities,
                     output_modalities=frozenset({Modality.TEXT}),
                 )
-        if finish_reason in {"content_filter", "length"} or not emitted:
+        _record_finish_reason(finish_reason)
+        if finish_reason == "length":
+            raise ModelOutputTruncatedError(_TRUNCATED_ANSWER_ERROR)
+        if finish_reason == "content_filter" or not emitted:
             raise ModelError("generation response was invalid")
 
     def _answer_request(
@@ -355,10 +367,11 @@ class OpenAIModels:
             raise ValidationError("question must be a ModelInput value")
         if isinstance(hits, (str, bytes)):
             raise ValidationError("hits must contain SearchHit values")
-        grounded = tuple(hits)
-        if any(not isinstance(hit, SearchHit) for hit in grounded):
+        retrieved = tuple(hits)
+        if any(not isinstance(hit, SearchHit) for hit in retrieved):
             raise ValidationError("hits must contain SearchHit values")
-        grounded = _fit_grounding_media(question_input, grounded)
+        grounded = _fit_grounding_media(question_input, retrieved)
+        _record_grounding_fit(retrieved, grounded)
         if not grounded:
             return None
 
@@ -728,8 +741,13 @@ def _answer_text(response: object) -> str:
         not isinstance(choices, list)
         or len(choices) != 1
         or getattr(choices[0], "index", None) != 0
-        or getattr(choices[0], "finish_reason", None) in {"content_filter", "length"}
     ):
+        raise ModelError("generation response was invalid")
+    finish_reason = getattr(choices[0], "finish_reason", None)
+    _record_finish_reason(finish_reason)
+    if finish_reason == "length":
+        raise ModelOutputTruncatedError(_TRUNCATED_ANSWER_ERROR)
+    if finish_reason == "content_filter":
         raise ModelError("generation response was invalid")
     answer = getattr(getattr(choices[0], "message", None), "content", None)
     if not isinstance(answer, str) or not answer.strip():
@@ -827,9 +845,14 @@ def _require_inline_size(
             raise ModelError("local media asset is unavailable") from None
         if asset.size_bytes != actual_size:
             raise ModelError("local media asset changed after ingestion")
-        size += actual_size
+        size += _encoded_size(actual_size)
     if size > _MAX_INLINE_MODEL_BYTES:
-        raise ModelError("inline model media exceeds 64 MiB; use a provider upload adapter")
+        raise ModelError("encoded inline model media exceeds 64 MiB; use a provider upload adapter")
+
+
+def _encoded_size(size: int) -> int:
+    """Return the base64 length the request carries for a media file of ``size`` bytes."""
+    return (size + 2) // 3 * 4
 
 
 def _require_consistent_assets(assets: Sequence[AssetRef]) -> tuple[AssetRef, ...]:
@@ -846,11 +869,11 @@ def _fit_grounding_media(
     hits: Sequence[SearchHit],
 ) -> tuple[SearchHit, ...]:
     seen = {asset.id for asset in question.assets}
-    used = sum(cast(int, asset.size_bytes) for asset in question.assets)
+    used = sum(_encoded_size(cast(int, asset.size_bytes)) for asset in question.assets)
     selected = []
     for hit in hits:
         new_assets = tuple(asset for asset in hit.assets if asset.id not in seen)
-        size = sum(cast(int, asset.size_bytes) for asset in new_assets)
+        size = sum(_encoded_size(cast(int, asset.size_bytes)) for asset in new_assets)
         if used + size <= _MAX_INLINE_MODEL_BYTES:
             selected.append(hit)
             seen.update(asset.id for asset in new_assets)
@@ -858,6 +881,28 @@ def _fit_grounding_media(
         elif hit.content.strip():
             selected.append(replace(hit, assets=(), modality=Modality.TEXT))
     return tuple(selected)
+
+
+def _record_grounding_fit(
+    retrieved: Sequence[SearchHit],
+    grounded: Sequence[SearchHit],
+) -> None:
+    """Record how much retrieved evidence the inline budget removed, so no loss stays silent."""
+    span = trace.get_current_span()
+    if not span.is_recording():
+        return
+    with_media = sum(1 for hit in retrieved if hit.assets)
+    span.set_attribute(
+        GROUNDING_MEDIA_ELIDED,
+        with_media - sum(1 for hit in grounded if hit.assets),
+    )
+    span.set_attribute(GROUNDING_HITS_DROPPED, len(retrieved) - len(grounded))
+
+
+def _record_finish_reason(finish_reason: object) -> None:
+    """Record the provider stop reason so truncation is countable instead of inferred."""
+    if isinstance(finish_reason, str) and finish_reason:
+        trace.get_current_span().set_attribute(GEN_AI_FINISH_REASONS, (finish_reason,))
 
 
 def _input_parts(

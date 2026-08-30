@@ -65,9 +65,19 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   bounded public input, and REST body limits.
 - Typed Jina text inputs so URL- or path-shaped application text cannot trigger the model's remote
   media downloader or bypass MindBridge asset validation.
+- `ModelOutputTruncatedError`, the `ModelError` and `model_output_truncated` code raised when
+  generation stops at an output token limit, so a deterministic truncation is distinguishable from
+  a transient transport failure on every surface.
+- `gen_ai.response.finish_reasons` on the generation span, plus
+  `mindbridge.grounding.media_elided_hits` and `mindbridge.grounding.dropped_hits` recording the
+  retrieved evidence the OpenAI adapter's inline budget removed.
 
 ### Changed
 
+- The OpenAI adapter's 64 MiB inline media ceiling now counts base64-encoded request bytes instead
+  of bytes on disk. Media is sent base64-encoded, so the old accounting admitted about 85 MiB on
+  the wire; the documented number is now the number enforced, at the cost of roughly 48 MiB of
+  admitted files on disk.
 - Concurrent single-memory adds may share one durable Zvec outbox flush after their authoritative
   SQLite commits. Reindexing replays outbox work committed after its SQLite scan.
 - Speech identity analysis for audio/video questions overlaps native query retrieval. Grounded
@@ -137,8 +147,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   segmentation, generated semantic keys, or learned reranking stage.
 - No in-place re-embedding or retranscription when a persisted embedding/transcription space or
   dimension changes; create a new directory and re-encode source content instead.
-- The OpenAI adapter inlines at most 64 MiB of raw media per embedding or generation call. Answer
-  requests reserve that budget for question media, keep top-ranked evidence media that fits, and
-  retain overflow hits as text when possible. They accept at most 4 MiB of serialized text
-  evidence. Use a provider-specific upload adapter for larger media.
+- The OpenAI adapter inlines at most 64 MiB of base64-encoded media per embedding or generation
+  call, which is roughly 48 MiB of files on disk. Answer requests reserve that budget for question
+  media, keep top-ranked evidence media that fits, and retain overflow hits as text when possible.
+  They accept at most 4 MiB of serialized text evidence. Use a provider-specific upload adapter for
+  larger media.
 - No built-in user authentication, rate limiting, quotas, or secure-erasure guarantee.

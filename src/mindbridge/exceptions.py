@@ -33,6 +33,12 @@ class ModelError(MindBridgeError):
     code = "model_error"
 
 
+class ModelOutputTruncatedError(ModelError):
+    """Raised when generation stopped at an output token limit instead of finishing."""
+
+    code = "model_output_truncated"
+
+
 class StorageError(MindBridgeError):
     """Raised when durable memory state cannot be read or written."""
 

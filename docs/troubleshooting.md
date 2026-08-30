@@ -67,10 +67,22 @@ a transcriber for audio fallback. MindBridge does not silently remove image or v
 
 ## Media exceeds 64 MiB for a model call
 
-The OpenAI adapter bounds aggregate inline media. Answer generation keeps ranked evidence assets
-that fit and falls back to their text; an oversized question asset or embedding input still fails.
+The OpenAI adapter bounds the media the request actually carries. Media travels base64-encoded, so
+the limit is 64 MiB on the wire and roughly 48 MiB of files on disk. Answer generation keeps ranked
+evidence assets that fit and falls back to their text; an oversized question asset or embedding
+input still fails. `mindbridge.grounding.media_elided_hits` and
+`mindbridge.grounding.dropped_hits` on the generation span count the retrieved evidence the budget
+removed, so a shrunken payload is never silent.
 Use a provider-specific adapter that uploads or streams large assets through that provider's SDK.
 MindBridge does not expose local `file://` paths as a compatibility transport.
+
+## Answers fail with `model_output_truncated`
+
+Generation reached an output token limit before it finished, so MindBridge refused the partial
+answer instead of returning it. This is deterministic; retrying changes nothing. Raise
+`generation_max_tokens` on the adapter, or lower the `ask` limit so less evidence competes for the
+model's output budget. `gen_ai.response.finish_reasons` on `mindbridge.model.generation` records
+the provider's stop reason for every call, truncated or not.
 
 ## REST returns 422 for media
 

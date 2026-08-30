@@ -326,8 +326,14 @@ All stable exceptions derive from `MindBridgeError`:
 - `MemoryNotFoundError`
 - `SpeakerNotFoundError`
 - `ModelError`
+- `ModelOutputTruncatedError`
 - `StorageError`
 - `IndexUnavailableError`
+
+`ModelOutputTruncatedError` is the `ModelError` raised when generation stopped at an output token
+limit rather than finishing. It is deterministic: retrying the same request produces the same
+failure. Raise `generation_max_tokens`, or lower the `ask` limit so less evidence competes with the
+answer for the model's output budget. Every other `ModelError` may be transient.
 
 Provider bodies, credentials, and local paths are not included in public model/storage error
 messages.

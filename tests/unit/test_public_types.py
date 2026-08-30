@@ -12,6 +12,7 @@ from mindbridge.exceptions import (
     MemoryNotFoundError,
     MindBridgeError,
     ModelError,
+    ModelOutputTruncatedError,
     StorageError,
     ValidationError,
 )
@@ -158,16 +159,19 @@ def test_public_exceptions_have_stable_categories() -> None:
     assert issubclass(MemoryNotFoundError, MindBridgeError)
     assert issubclass(MemoryNotFoundError, LookupError)
     assert issubclass(IndexUnavailableError, StorageError)
+    assert issubclass(ModelOutputTruncatedError, ModelError)
     assert {
         ValidationError.code,
         MemoryNotFoundError.code,
         ModelError.code,
+        ModelOutputTruncatedError.code,
         StorageError.code,
         IndexUnavailableError.code,
     } == {
         "validation_error",
         "memory_not_found",
         "model_error",
+        "model_output_truncated",
         "storage_error",
         "index_unavailable",
     }

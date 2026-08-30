@@ -91,9 +91,9 @@ Track at least:
 - Free bytes and inodes on the containing filesystem.
 - Add and search latency.
 - Embedding, generation, and transcription latency/failures separately.
-- Raw media bytes per OpenAI adapter call; embeddings reject aggregates over 64 MiB, while answers
-  reserve the limit for question media and fill the remainder with ranked evidence before base64
-  expansion.
+- Encoded media bytes per OpenAI adapter call; embeddings reject aggregates over 64 MiB after
+  base64 expansion, while answers reserve the same limit for question media and fill the remainder
+  with ranked evidence.
 - REST status counts, especially 502 and 503.
 - Startup and rebuild duration.
 

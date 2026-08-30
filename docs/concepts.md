@@ -157,7 +157,7 @@ stable ID, optional registered name, and match score to the model-only grounding
 source hits remain unchanged. Generation-time analysis does not rewrite an existing record's
 `content`. `AnswerResult` contains the answer and source hits for display or grounding audits. The
 built-in backend sends one binary content part per distinct asset in an answer request, even when
-the question or several hits refer to it. It reserves the 64 MiB raw-media budget for question
+the question or several hits refer to it. It reserves the 64 MiB encoded-media budget for question
 assets, then admits ranked hit media until full; an overflow hit remains as text evidence when it
 has text.
 
@@ -167,8 +167,8 @@ SQLite commit/outbox and Zvec access sections that must observe one coherent loc
 Long text receives bounded overlapping retrieval keys while remaining one immutable returned
 record. MindBridge does not segment long media, generate model-authored semantic keys, or use a
 learned reranker. Applications should still ingest natural turns or bounded media clips. The
-OpenAI adapter inlines at most 64 MiB of raw media per model call; a provider-specific upload
-adapter is the large-video path.
+OpenAI adapter inlines at most 64 MiB of base64-encoded media per model call, which is roughly
+48 MiB of files on disk; a provider-specific upload adapter is the large-video path.
 
 ## Metadata is not isolation
 

@@ -149,8 +149,10 @@ Tool failures expose a compact JSON object in the MCP error result:
 {"code":"validation_error","message":"tool arguments are invalid"}
 ```
 
-Stable codes include `validation_error`, `memory_not_found`, `model_error`, `storage_error`,
-`index_unavailable`, and `internal_error`. Provider responses, credentials, filesystem paths, and
+Stable codes include `validation_error`, `memory_not_found`, `model_error`,
+`model_output_truncated`, `storage_error`, `index_unavailable`, and `internal_error`.
+`model_output_truncated` is the deterministic subset of `model_error`: generation stopped at an
+output token limit, so the same request fails the same way again. Provider responses, credentials, filesystem paths, and
 native-index details are not included.
 
 ## Agent consumption contract
@@ -200,7 +202,7 @@ map to the existing SDK operations and carry appropriate read, idempotency, and 
 annotations.
 
 There is no large-file upload tool, local-path input, logical scope, chunking option, per-asset
-vector control, or learned reranker option. The OpenAI adapter inlines at most 64 MiB of raw media
-per embedding or generation call; generation admits
-ranked evidence within that budget. Answer text evidence is limited to 4 MiB. Use a
-provider-specific upload adapter for larger media.
+vector control, or learned reranker option. The OpenAI adapter inlines at most 64 MiB of
+base64-encoded media per embedding or generation call, which is roughly 48 MiB of files on disk;
+generation admits ranked evidence within that budget. Answer text evidence is limited to 4 MiB. Use
+a provider-specific upload adapter for larger media.

@@ -15,7 +15,10 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 import mindbridge.models.openai_sdk as openai_backend
 from mindbridge._telemetry import (
+    GEN_AI_FINISH_REASONS,
     GEN_AI_TTFC,
+    GROUNDING_HITS_DROPPED,
+    GROUNDING_MEDIA_ELIDED,
     MODEL_TTFT,
     TOKEN_COMPLETE,
     TOKEN_REPORTED_REQUEST_COUNT,
@@ -24,7 +27,7 @@ from mindbridge._telemetry import (
     operation_span,
     token_modality_attribute,
 )
-from mindbridge.exceptions import ModelError, ValidationError
+from mindbridge.exceptions import ModelError, ModelOutputTruncatedError, ValidationError
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
@@ -326,6 +329,7 @@ def test_stream_answer_records_ttft_and_reported_multimodal_usage(tmp_path: Path
     assert attributes[token_modality_attribute("input", "text")] == 16
     assert cast(float, attributes[MODEL_TTFT]) >= 0
     assert cast(float, attributes[GEN_AI_TTFC]) >= 0
+    assert attributes[GEN_AI_FINISH_REASONS] == ("stop",)
 
 
 def test_usage_keeps_visual_audio_and_unknown_multimodal_tokens_distinct() -> None:
@@ -542,7 +546,7 @@ def test_answer_keeps_ranked_media_within_budget_and_retains_overflow_text(
             modality=Modality.IMAGE,
         ),
     )
-    monkeypatch.setattr("mindbridge.models.openai_sdk._MAX_INLINE_MODEL_BYTES", 4)
+    monkeypatch.setattr("mindbridge.models.openai_sdk._MAX_INLINE_MODEL_BYTES", 8)
 
     def respond(request: httpx.Request) -> httpx.Response:
         content = json.loads(request.content)["messages"][1]["content"]
@@ -571,6 +575,216 @@ def test_answer_keeps_ranked_media_within_budget_and_retains_overflow_text(
     assert result.hits[0].assets == (first,)
     assert result.hits[1].assets == ()
     assert result.hits[1].modality is Modality.TEXT
+
+
+def test_inline_media_budget_bounds_encoded_request_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image = _asset(tmp_path, "wire", Modality.IMAGE, "image/png", b"123456789")
+    encoded = base64.b64encode(b"123456789").decode("ascii")
+    hit = SearchHit(id="memory_1", content="a note", score=0.9, created_at=NOW)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        url = next(part["image_url"]["url"] for part in content if part["type"] == "image_url")
+        assert url.split(",", 1)[1] == encoded
+        assert len(encoded) == 12
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "grounded"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client))
+        question = ModelInput(text="What?", assets=(image,))
+        # 11 admits the nine bytes on disk but not the twelve the request carries.
+        monkeypatch.setattr("mindbridge.models.openai_sdk._MAX_INLINE_MODEL_BYTES", 11)
+        with pytest.raises(ModelError, match="encoded inline model media exceeds 64 MiB"):
+            model.answer(question, (hit,))
+        monkeypatch.setattr("mindbridge.models.openai_sdk._MAX_INLINE_MODEL_BYTES", len(encoded))
+        assert model.answer(question, (hit,)).answer == "grounded"
+
+
+def test_ranked_media_budget_counts_encoded_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    first = _asset(tmp_path, "first", Modality.IMAGE, "image/png", b"123456")
+    second = _asset(tmp_path, "second", Modality.IMAGE, "image/png", b"654321")
+    hits = tuple(
+        SearchHit(
+            id=f"memory_{index}",
+            content=f"evidence {index}",
+            score=1.0 - index / 10,
+            created_at=NOW,
+            assets=(asset,),
+            modality=Modality.IMAGE,
+        )
+        for index, asset in enumerate((first, second))
+    )
+    # Twelve holds both files on disk and only the first once base64 doubles them to eight each.
+    monkeypatch.setattr("mindbridge.models.openai_sdk._MAX_INLINE_MODEL_BYTES", 12)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        assert [part["type"] for part in content].count("image_url") == 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "grounded"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = _model(_sdk_client(client)).answer(ModelInput(text="What?"), hits)
+
+    assert result.hits[0].assets == (first,)
+    assert result.hits[1].assets == ()
+
+
+def test_grounding_span_counts_evidence_the_budget_removed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    hits = tuple(
+        SearchHit(
+            id=f"memory_{index}",
+            content=content,
+            score=1.0 - index / 10,
+            created_at=NOW,
+            assets=(_asset(tmp_path, f"asset_{index}", Modality.IMAGE, "image/png", b"1234"),),
+            modality=Modality.IMAGE,
+        )
+        for index, content in enumerate(("kept evidence", "elided evidence", ""))
+    )
+    monkeypatch.setattr("mindbridge.models.openai_sdk._MAX_INLINE_MODEL_BYTES", 8)
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "grounded"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        provider.get_tracer("test").start_as_current_span("model"),
+    ):
+        result = _model(_sdk_client(client)).answer(ModelInput(text="What?"), hits)
+    provider.shutdown()
+
+    assert len(result.hits) == 2
+    attributes = exporter.get_finished_spans()[0].attributes
+    assert attributes is not None
+    assert attributes[GROUNDING_MEDIA_ELIDED] == 2
+    assert attributes[GROUNDING_HITS_DROPPED] == 1
+
+
+def test_truncated_answer_is_distinguishable_from_a_transport_failure() -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "The cat is on the"},
+                        "finish_reason": "length",
+                    }
+                ]
+            },
+        )
+
+    hit = SearchHit(id="memory_1", content="the cat sleeps", score=0.9, created_at=NOW)
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        provider.get_tracer("test").start_as_current_span("model"),
+        pytest.raises(ModelOutputTruncatedError, match="generation_max_tokens") as raised,
+    ):
+        _model(_sdk_client(client), generation_max_tokens=4).answer(
+            ModelInput(text="Where is the cat?"), (hit,)
+        )
+    provider.shutdown()
+
+    assert raised.value.code == "model_output_truncated"
+    assert isinstance(raised.value, ModelError)
+    attributes = exporter.get_finished_spans()[0].attributes
+    assert attributes is not None
+    assert attributes[GEN_AI_FINISH_REASONS] == ("length",)
+
+
+def test_truncated_stream_reports_the_same_error_as_the_buffered_path() -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        chunks = (
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "answer-model",
+                "choices": [
+                    {"index": 0, "delta": {"content": "The cat is on the"}, "finish_reason": None}
+                ],
+            },
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "answer-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+            },
+        )
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        return httpx.Response(
+            200,
+            content=f"{body}data: [DONE]\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    hit = SearchHit(id="memory_1", content="the cat sleeps", score=0.9, created_at=NOW)
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        provider.get_tracer("test").start_as_current_span("model"),
+        pytest.raises(ModelOutputTruncatedError, match="generation_max_tokens") as raised,
+    ):
+        model = _model(_sdk_client(client), generation_max_tokens=4)
+        tuple(model.stream_answer(ModelInput(text="Where is the cat?"), (hit,)))
+    provider.shutdown()
+
+    assert raised.value.code == "model_output_truncated"
+    attributes = exporter.get_finished_spans()[0].attributes
+    assert attributes is not None
+    assert attributes[GEN_AI_FINISH_REASONS] == ("length",)
 
 
 def test_transcription_uses_its_own_endpoint_key_and_multipart_file(tmp_path: Path) -> None:

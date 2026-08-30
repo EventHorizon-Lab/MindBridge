@@ -40,8 +40,9 @@ The Jina embedder runs through Sentence Transformers on the device selected by
 execution to `funasr.AutoModel`. Generation runs through a separately supplied adapter and provider
 client.
 
-The OpenAI adapter inlines at most 64 MiB of raw media per embedding or generation call. For larger
-video on a device, use a provider-specific adapter with its native upload or streaming mechanism.
+The OpenAI adapter inlines at most 64 MiB of base64-encoded media per embedding or generation
+call, which is roughly 48 MiB of files on disk. For larger video on a device, use a
+provider-specific adapter with its native upload or streaming mechanism.
 
 For another embedding runtime, implement `EmbeddingBackend` and pass it through
 `Memory(..., embedder=backend)`. Generation and transcription use independent `answerer=` and
