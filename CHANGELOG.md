@@ -125,8 +125,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   remain in the complete aggregate but cannot become independent dense queries.
 - Dense ranking now uses nonnegative cosine separately from rescaled confidence, and exact lexical
   evidence receives a bounded reranking bonus without overriding strong semantic evidence.
-- Jina video preprocessing now adopts Qwen's reference per-frame pixel cap, reducing short-video
-  token cost; its embedding recipe advances so existing stores re-embed instead of mixing recipes.
+- Jina video preprocessing keeps local paths through Transformers' PyAV decoder so source
+  fps/duration metadata drives uniform sampling of at most 32 unique frames, while retaining
+  Qwen's reference per-frame pixel cap. Its recipe advances so existing stores re-embed.
 - The benchmark runner performs and records one local query-embedding warmup before timed task
   spans, so a cloned store cannot charge lazy Jina loading to several concurrent questions.
 - The OpenAI adapter now limits each base64-encoded media item to 20 MiB as well as keeping the
