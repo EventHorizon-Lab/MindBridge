@@ -6,9 +6,10 @@ import base64
 import binascii
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from functools import wraps
 from typing import Annotated, Any, Literal, ParamSpec, TypeAlias, TypeVar, cast
+from uuid import uuid4
 
 from mcp.server import MCPServer
 from mcp.server.context import CallNext, HandlerResult, ServerMiddleware, ServerRequestContext
@@ -30,6 +31,7 @@ from mindbridge.exceptions import (
     MemoryNotFoundError,
     MindBridgeError,
     ModelError,
+    SpeakerNotFoundError,
     StorageError,
     ValidationError,
 )
@@ -96,17 +98,22 @@ _TOOL_ARGUMENTS = {
     "get_memory": frozenset({"memory_id"}),
     "delete_memory": frozenset({"memory_id"}),
 }
-_STABLE_ERROR_CODES = frozenset(
-    {
-        "index_unavailable",
-        "internal_error",
-        "memory_not_found",
-        "mindbridge_error",
-        "model_error",
-        "storage_error",
-        "validation_error",
-    }
+# The error envelope MCP shares with REST.
+_ERROR_FIELDS = frozenset(
+    {"code", "reason", "retryable", "stage", "subject", "message", "trace_id", "issues"}
 )
+
+
+def _error_codes(root: type[MindBridgeError]) -> frozenset[str]:
+    codes = {root.code}
+    for subclass in root.__subclasses__():
+        codes |= _error_codes(subclass)
+    return frozenset(codes)
+
+
+# Derived rather than listed. A hand-maintained set silently loses every new exception class to the
+# middleware's `validation_error` overwrite, which is how `model_output_truncated` was destroyed.
+_STABLE_ERROR_CODES = _error_codes(MindBridgeError) | {"internal_error"}
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
@@ -318,12 +325,24 @@ async def _strict_tool_arguments(
     if context.method == "tools/call":
         allowed = _TOOL_ARGUMENTS.get(str(params.get("name", "")))
         if allowed is None:
-            return _error_result("validation_error", "tool does not exist")
+            return _error_result("validation_error", "tool does not exist", reason="unknown_field")
         arguments = params.get("arguments")
         if isinstance(arguments, Mapping):
             unknown = set(arguments).difference(allowed)
             if unknown:
-                return _error_result("validation_error", "tool arguments contain unknown fields")
+                return _error_result(
+                    "validation_error",
+                    "tool arguments contain unknown fields",
+                    reason="unknown_field",
+                    issues=[
+                        {
+                            "location": ["arguments", name],
+                            "message": "Extra inputs are not permitted",
+                            "type": "extra_forbidden",
+                        }
+                        for name in sorted(unknown)
+                    ],
+                )
     result = await call_next(context)
     if (
         context.method == "tools/call"
@@ -331,7 +350,9 @@ async def _strict_tool_arguments(
         and result.get("isError") is True
         and not _has_error_code(result)
     ):
-        return _error_result("validation_error", "tool arguments are invalid")
+        return _error_result(
+            "validation_error", "tool arguments are invalid", reason="input_invalid"
+        )
     return result
 
 
@@ -476,30 +497,83 @@ def _decode_base64(value: str) -> bytes:
 
 
 def _error_json(error: Exception) -> str:
-    code, message = _error_details(error)
-    return json.dumps({"code": code, "message": message}, separators=(",", ":"))
+    return json.dumps(_tool_error(error), separators=(",", ":"))
 
 
-def _error_details(error: Exception) -> tuple[str, str]:
-    if isinstance(error, ValidationError):
-        return error.code, str(error) or "input is invalid"
-    if isinstance(error, MemoryNotFoundError):
-        return error.code, str(error) or "memory does not exist"
-    if isinstance(error, ModelError):
-        return error.code, "model operation failed"
-    if isinstance(error, IndexUnavailableError):
-        return error.code, "memory index is unavailable"
-    if isinstance(error, StorageError):
-        return error.code, "memory storage is unavailable"
+def _tool_error(error: Exception) -> dict[str, object]:
     if isinstance(error, MindBridgeError):
-        return error.code, "memory operation failed"
+        return _envelope(
+            error.code,
+            _error_message(error),
+            reason=error.reason,
+            retryable=error.retryable,
+            stage=error.stage,
+            # MCP runs in the owner process as the same user, so a subject naming local state is
+            # already visible to the caller. Unauthenticated REST withholds the same value.
+            subject=error.subject,
+        )
     _LOGGER.exception("unhandled MCP tool error")
-    return "internal_error", "the memory operation failed unexpectedly"
+    return _envelope(
+        "internal_error",
+        "the memory operation failed unexpectedly",
+        reason="unexpected",
+    )
 
 
-def _error_result(code: str, message: str) -> CallToolResult:
+def _error_message(error: MindBridgeError) -> str:
+    if isinstance(error, ValidationError):
+        return str(error) or "input is invalid"
+    if isinstance(error, MemoryNotFoundError):
+        return str(error) or "memory does not exist"
+    if isinstance(error, SpeakerNotFoundError):
+        return str(error) or "speaker does not exist"
+    if isinstance(error, ModelError):
+        return str(error) or "model operation failed"
+    if isinstance(error, IndexUnavailableError):
+        return str(error) or "memory index is unavailable"
+    if isinstance(error, StorageError):
+        return str(error) or "memory storage is unavailable"
+    # An unmapped public error is a MindBridge bug, not caller-actionable detail; REST says the
+    # same thing with HTTP 500.
+    return "memory operation failed"
+
+
+def _envelope(
+    code: str,
+    message: str,
+    *,
+    reason: str | None = None,
+    retryable: bool = False,
+    stage: str | None = None,
+    subject: str | None = None,
+    issues: Sequence[Mapping[str, object]] = (),
+) -> dict[str, object]:
+    return {
+        "code": code,
+        "reason": reason,
+        "retryable": retryable,
+        "stage": stage,
+        "subject": subject,
+        "message": message,
+        "trace_id": f"trace_{uuid4().hex}",
+        "issues": list(issues),
+    }
+
+
+def _error_result(
+    code: str,
+    message: str,
+    *,
+    reason: str | None = None,
+    issues: Sequence[Mapping[str, object]] = (),
+) -> CallToolResult:
     return CallToolResult(
-        content=[TextContent(type="text", text=json.dumps({"code": code, "message": message}))],
+        content=[
+            TextContent(
+                type="text",
+                text=json.dumps(_envelope(code, message, reason=reason, issues=issues)),
+            )
+        ],
         is_error=True,
     )
 
@@ -518,7 +592,7 @@ def _has_error_code(result: Mapping[str, object]) -> bool:
             continue
         if (
             isinstance(envelope, dict)
-            and set(envelope) == {"code", "message"}
+            and set(envelope) == _ERROR_FIELDS
             and envelope.get("code") in _STABLE_ERROR_CODES
             and isinstance(envelope.get("message"), str)
         ):

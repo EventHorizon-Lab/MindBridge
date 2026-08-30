@@ -161,15 +161,16 @@ class FunASRTranscriber:
                 or asset.modality not in self.transcription_capabilities
             ):
                 raise ValidationError("assets must contain resolved audio or video AssetRef values")
+        # One batch is one AutoModel call, so the request count is calls issued, not assets sent.
+        mark_model_requests(1 if batch else 0, token_usage_expected=0)
         if not batch:
             return ()
-        mark_model_requests(len(batch), token_usage_expected=0)
         with self._lock:
             if self._closed:
                 raise ModelError("FunASR transcriber is closed")
             pipeline = self._load()
-            analyses = self._analyze_many(pipeline, batch)
-        record_unmetered_model_usage(request_count=len(batch))
+            analyses, calls = self._analyze_many(pipeline, batch)
+        record_unmetered_model_usage(request_count=calls)
         return analyses
 
     def close(self) -> None:
@@ -209,7 +210,8 @@ class FunASRTranscriber:
     def _analyze_many(
         pipeline: _Pipeline,
         assets: Sequence[AssetRef],
-    ) -> tuple[SpeechAnalysis, ...]:
+    ) -> tuple[tuple[SpeechAnalysis, ...], int]:
+        """Analyze one official batch, returning the analyses and the AutoModel calls made."""
         paths = tuple(_speech_path(asset) for asset in assets)
         output = _pipeline_output(pipeline, list(paths) if len(paths) > 1 else paths[0])
         if (
@@ -217,8 +219,9 @@ class FunASRTranscriber:
             or len(output) != len(paths)
             or any(not isinstance(result, dict) for result in output)
         ):
-            return tuple(FunASRTranscriber._analyze_one(pipeline, asset) for asset in assets)
-        return tuple(_analysis(result) for result in output)
+            analyses = tuple(FunASRTranscriber._analyze_one(pipeline, asset) for asset in assets)
+            return analyses, 1 + len(assets)
+        return tuple(_analysis(result) for result in output), 1
 
     @staticmethod
     def _analyze_one(pipeline: _Pipeline, asset: AssetRef) -> SpeechAnalysis:

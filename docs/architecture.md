@@ -16,7 +16,7 @@ Application
 ## Shared execution plane
 
 `Memory` is the canonical execution plane and the Python SDK exposes it directly. REST, MCP, and the
-required product CLI are interfaces over the same application-composed instance, not separate
+product CLI are interfaces over the same application-composed instance, not separate
 implementations of memory behavior.
 
 ```text
@@ -24,7 +24,7 @@ Developer / Agent
 ├── Python SDK ─────────────────────────┐
 ├── REST adapter ───────────────────────┤
 ├── MCP adapter ────────────────────────┤
-└── product CLI (required, pending) ────┤
+└── product CLI ─────────────────────────┤
                                         v
                          application-composed Memory
                    validation · routing · retrieval · consistency
@@ -42,8 +42,9 @@ calls its process-owned `Memory`. A CLI addressing an already running owner must
 through a supported transport rather than opening the directory again. In both cases, the operation
 executes exactly once in the owning `Memory`.
 
-The current release already follows this rule for Python, REST, and MCP. The product CLI is required
-by the architecture but is not implemented yet.
+The current release follows this rule for Python, REST, MCP, and the CLI. The CLI composes one
+`Memory` per invocation with `--app` or `--embedder`, and addresses a directory another process
+already owns with `--url`. See [command-line usage](api/cli.md).
 
 ## Responsibility boundary
 
@@ -123,6 +124,6 @@ contract permits.
 
 `create_app(memory=...)` and `build_mcp_server(memory)` expose an existing memory. They never
 construct providers or own the memory lifecycle. FastAPI and MCP own sync/async request dispatch;
-deployment infrastructure supplies auth and transport policy. The product CLI must follow the same
-boundary: reuse the shared execution plane and own only command decoding, output formatting, and
-dispatch.
+deployment infrastructure supplies auth and transport policy. The product CLI follows the same
+boundary: it reuses the shared execution plane and owns only command decoding, output formatting,
+and process lifecycle.

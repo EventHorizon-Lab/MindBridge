@@ -138,7 +138,41 @@ def test_funasr_sends_multiple_assets_in_one_official_batch(tmp_path: Path) -> N
         for path in paths
     )
 
-    analyses = FunASRTranscriber._analyze_many(_Pipeline(), assets)
+    analyses, model_calls = FunASRTranscriber._analyze_many(_Pipeline(), assets)
 
     assert len(analyses) == 2
     assert calls == [[str(path.resolve()) for path in paths]]
+    # Telemetry counts AutoModel calls, so batching two assets must report one request.
+    assert model_calls == 1
+
+
+def test_funasr_counts_the_per_asset_fallback_calls(tmp_path: Path) -> None:
+    paths = (tmp_path / "first.wav", tmp_path / "second.wav")
+    for path in paths:
+        path.write_bytes(b"fake wav")
+    calls: list[object] = []
+
+    class _Pipeline:
+        def generate(self, **kwargs: object) -> list[dict[str, object]]:
+            calls.append(kwargs["input"])
+            # A structurally unusable batch reply forces the per-asset fallback.
+            return [] if isinstance(kwargs["input"], list) else [{"text": ""}]
+
+    assets = tuple(
+        AssetRef(
+            (digest := sha256(path.read_bytes()).hexdigest()),
+            modality=Modality.AUDIO,
+            media_type="audio/wav",
+            size_bytes=path.stat().st_size,
+            sha256=digest,
+            name=path.name,
+            path=path,
+        )
+        for path in paths
+    )
+
+    analyses, model_calls = FunASRTranscriber._analyze_many(_Pipeline(), assets)
+
+    assert len(analyses) == 2
+    assert len(calls) == 3
+    assert model_calls == 3

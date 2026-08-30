@@ -24,6 +24,20 @@ authoritative modality, MIME type, size, digest, name, and local path.
 An ordered sequence combines text and media into one memory. A plain `str` always means text, even
 when it resembles a path or URL. Remote URL fetching is outside the SDK.
 
+### Input limits
+
+These bounds are enforced on the Python surface and raise `ValidationError` before any model call:
+
+| Bound | Value | Message |
+| --- | --- | --- |
+| Parts in one `ContentInput` sequence | 128 | `content must not exceed 128 parts` |
+| Characters in one text value | 65,536 after NFC normalization | `... must not exceed 65536 characters` |
+| `limit` for `search`, `ask`, and `list` | 1–100 inclusive | `limit must be between 1 and 100` |
+
+The transports are stricter than the SDK, not equal to it: REST and MCP cap one request at 16 parts.
+An agent that composes near the Python bound must therefore expect a smaller ceiling over a
+transport; see the [REST](rest.md) and [MCP](mcp.md) references for the per-transport limits.
+
 ## Memory
 
 ```python
@@ -56,9 +70,16 @@ and privacy behavior.
 `add`. Its transcript, stable speaker IDs, and names already registered at add time become stored,
 retrievable text. The default keeps speech analysis lazy.
 
+A `TranscriptionBackend` needs no flag. `add` transcribes every asset whose modality that backend
+declares and stores the transcript in the record, so a media memory has retrievable text next to
+its native media vector; the media is never replaced. `SpeechBackend` analysis stays behind
+`index_speech` because it also resolves speaker identity.
+
 `minimum_relevance` rejects weak dense evidence, while `ambiguity_margin` returns no hits when the
 top two dense confidences are effectively tied and the winner has neither a lexical nor temporal
-anchor. Both are calibrated `[0, 1]` values and may be set to `0` to disable that gate.
+anchor. Both are calibrated `[0, 1]` values and may be set to `0` to disable that gate. A candidate
+that matches the full-text index is scored at `0.6` confidence regardless of its vector distance, so
+it clears the default `minimum_relevance` on the strength of the lexical match alone.
 
 Use `Memory` as a context manager:
 
@@ -132,11 +153,15 @@ Call `reinforce` only after explicit positive feedback. Retrieval itself never c
 strength. Confirmations provide a small bounded ranking boost even without decay and also slow
 decay when it is enabled. The return value is the number of existing, distinct memories updated.
 
+`reinforce` has no REST route and no MCP tool in this release, so the feedback loop is reachable
+only from Python. An application whose retrieval runs over a transport must call back into the
+owning process to record a confirmation.
+
 ### Read, list, and delete
 
 ```python
 record = memory.get(memory_id)
-page = memory.list(limit=50, cursor=None)
+page = memory.list(limit=100, cursor=None)
 deleted = memory.delete(memory_id)
 ```
 
@@ -244,9 +269,26 @@ class TranscriptionBackend(Protocol):
     def close(self) -> None: ...
 ```
 
-`SpeechBackend` has the same transcription identity properties and returns `SpeechAnalysis` from
-`analyze()`. Backends may implement more than one protocol. Calls can overlap, so adapters must be
-thread-safe until `close()`.
+`SpeechBackend` has the same transcription identity properties as `TranscriptionBackend` and adds
+`analyze()`:
+
+```python
+class SpeechBackend(Protocol):
+    transcription_capabilities: frozenset[Modality]
+    transcription_model: str
+    transcription_space: str
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]: ...
+
+    def close(self) -> None: ...
+```
+
+`analyze()` returns one `SpeechAnalysis` per asset, in the order the assets were supplied — not a
+single value. Each `SpeechAnalysis` carries `turns` and `speakers`. An implementation that returns
+one object per call, rather than a tuple, fails inside `Memory` at runtime.
+
+Backends may implement more than one protocol. Calls can overlap, so adapters must be thread-safe
+until `close()`.
 
 ## Built-in adapters
 
@@ -254,21 +296,40 @@ thread-safe until `close()`.
 
 ```python
 embedder = SentenceTransformersEmbedder.load(
-    "organization/model",
-    revision="40-character-immutable-commit",
+    "sentence-transformers/all-MiniLM-L6-v2",
+    revision="1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+)
+```
+
+`revision` is keyword-only and required. It must be a 40-character immutable commit hash; a branch
+or tag name raises `ValidationError: revision must be an immutable 40-character commit hash`. The
+immutable revision, dimension, normalization, query/document semantics, and input recipe form the
+durable embedding space, which `Memory` records in `data_dir` and re-checks on open.
+
+`dimension`, `device`, and `batch_size` are optional. `device=None` lets Sentence Transformers
+choose; pass `"cuda"` or `"cpu"` to pin it:
+
+```python
+embedder = SentenceTransformersEmbedder.load(
+    "sentence-transformers/all-MiniLM-L6-v2",
+    revision="1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
     device="cuda",
     batch_size=8,
 )
 ```
 
-The immutable revision, dimension, normalization, query/document semantics, and input recipe form
-the durable embedding space.
+Capabilities come from the loaded model, so a text-only model yields a text-only store. See
+[choosing an embedding backend](../quickstart.md#choose-an-embedding-backend) for how to resolve a
+model's current commit hash.
 
 `JinaOmniEmbedder` is a lazy pinned specialization:
 
 ```python
 embedder = JinaOmniEmbedder(dimension=1024, device="cuda", batch_size=8)
 ```
+
+Its pinned weights are licensed CC BY-NC 4.0 — non-commercial use only. That licence covers the
+model, not MindBridge.
 
 It calls the model's official Sentence Transformers retrieval methods and wraps application text
 so URL- or path-shaped text cannot activate media autodetection.
@@ -309,8 +370,9 @@ models = OpenAIModels(
 The common `client` is used for operations without a more specific client. Missing clients fail
 only when their operation is invoked. Media is bounded and sent inline; use a provider-specific
 upload adapter for larger assets. `generation_max_tokens` maps to Chat Completions `max_tokens`;
-`generation_extra_body` passes caller-owned provider extensions through the official SDK. SDK
-clients remain caller-owned.
+`generation_extra_body` passes caller-owned provider extensions through the official SDK. Both are
+built into the shared grounded request, so `answer()` and `stream_answer()` always send identical
+generation controls. SDK clients remain caller-owned.
 
 `OpenAIModels.stream_answer()` requests streamed chat completions with final usage enabled.
 `Memory.ask()` selects it automatically to measure first chunk, first token, total generation
@@ -325,8 +387,14 @@ All stable exceptions derive from `MindBridgeError`:
 - `MemoryNotFoundError`
 - `SpeakerNotFoundError`
 - `ModelError`
+- `ModelOutputTruncatedError`
 - `StorageError`
 - `IndexUnavailableError`
+
+`ModelOutputTruncatedError` is the `ModelError` raised when generation stopped at an output token
+limit rather than finishing. It is deterministic: retrying the same request produces the same
+failure. Raise `generation_max_tokens`, or lower the `ask` limit so less evidence competes with the
+answer for the model's output budget. Every other `ModelError` may be transient.
 
 Provider bodies, credentials, and local paths are not included in public model/storage error
 messages.

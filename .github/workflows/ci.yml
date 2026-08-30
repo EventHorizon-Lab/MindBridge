@@ -15,37 +15,26 @@ concurrency:
 
 jobs:
   installability:
-    name: Install ${{ matrix.name }}
+    name: Install ${{ matrix.leg }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: base
+          - leg: base
             requirement: .
-            probe: >-
-              mindbridge
-              mindbridge.benchmarks
-              mindbridge.benchmarks.isolation
-              mindbridge.benchmarks.local_index_benchmark
-              mindbridge.exceptions
-              mindbridge.infrastructure.local
-              mindbridge.memory
-              mindbridge.models.base
-              mindbridge.types
-          - name: server
-            requirement: .[server]
-            probe: >-
-              mindbridge.api
-              mindbridge.api.app
-          - name: local
+          - leg: benchmarks
+            requirement: .[benchmarks]
+          - leg: observability
+            requirement: .[observability]
+          - leg: openai
+            requirement: .[openai]
+          - leg: local
             requirement: .[local]
-            probe: >-
-              mindbridge.models.jina
-              mindbridge.models.sentence_transformers
-          - name: mcp
+          - leg: server
+            requirement: .[server]
+          - leg: mcp
             requirement: .[mcp]
-            probe: mindbridge.api.mcp
     steps:
       - name: Check out repository
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -56,24 +45,71 @@ jobs:
           python-version: "3.10"
           enable-cache: true
 
+      # cairosvg is pure Python and dlopens libcairo at import, so the wheel installs on a host
+      # that cannot run it. Installing the library keeps the probe a dependency check.
+      - name: Install the shared library cairosvg loads
+        if: matrix.leg == 'local'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libcairo2
+
       - name: Install isolated package
         run: |
           uv venv .install-venv
           uv pip install --python .install-venv/bin/python --strict '${{ matrix.requirement }}'
 
-      - name: Import supported modules
-        env:
-          PROBE: ${{ matrix.probe }}
-        run: |
-          .install-venv/bin/python -I - <<'PY'
-          import importlib
-          import os
+      # Importing is not enough. Every heavy dependency loads through `import_module` inside a
+      # function, so `import mindbridge.models.funasr` succeeds with funasr absent. The probe
+      # imports the supported modules and then runs the loader behind them.
+      - name: Import and invoke the supported surface
+        run: .install-venv/bin/python -I .github/scripts/installability_probe.py ${{ matrix.leg }}
 
-          modules = os.environ["PROBE"].split()
-          for module in modules:
-              importlib.import_module(module)
-          print(f"imported {len(modules)} supported modules")
+  wheel:
+    name: Built artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.10"
+          enable-cache: true
+
+      - name: Build the distributions
+        run: uv build
+
+      # A `[project.scripts]` entry is written whether or not the build kept the module it names,
+      # so a source-tree gate can be green over a wheel that raises ModuleNotFoundError on import.
+      - name: Assert the distributions carry their package data
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import tarfile
+          import zipfile
+
+          WANTED = ("mindbridge/py.typed", "mindbridge/benchmarks/_official/NOTICE.md")
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          sdist = next(pathlib.Path("dist").glob("*.tar.gz"))
+          built = set(zipfile.ZipFile(wheel).namelist())
+          with tarfile.open(sdist) as archive:
+              packed = set(archive.getnames())
+          prefix = sdist.name[: -len(".tar.gz")] + "/src/"
+          missing = [f"{wheel.name}:{name}" for name in WANTED if name not in built]
+          missing += [f"{sdist.name}:{name}" for name in WANTED if prefix + name not in packed]
+          if missing:
+              raise SystemExit(f"built distributions omit package data: {missing}")
+          print(f"wheel and sdist carry {len(WANTED)} data files")
           PY
+
+      - name: Install the built wheel into a clean environment
+        run: |
+          uv venv .wheel-venv
+          uv pip install --python .wheel-venv/bin/python --strict "$(echo dist/*.whl)[benchmarks]"
+
+      - name: Invoke the loaders against the installed wheel
+        run: |
+          .wheel-venv/bin/python -I .github/scripts/installability_probe.py base
+          .wheel-venv/bin/python -I .github/scripts/installability_probe.py benchmarks
 
   documentation:
     name: Documentation

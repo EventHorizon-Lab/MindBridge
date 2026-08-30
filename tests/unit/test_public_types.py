@@ -8,10 +8,13 @@ from pathlib import Path
 import pytest
 
 from mindbridge.exceptions import (
+    RETRYABLE_REASONS,
     IndexUnavailableError,
     MemoryNotFoundError,
     MindBridgeError,
     ModelError,
+    ModelOutputTruncatedError,
+    SpeakerNotFoundError,
     StorageError,
     ValidationError,
 )
@@ -158,19 +161,54 @@ def test_public_exceptions_have_stable_categories() -> None:
     assert issubclass(MemoryNotFoundError, MindBridgeError)
     assert issubclass(MemoryNotFoundError, LookupError)
     assert issubclass(IndexUnavailableError, StorageError)
+    assert issubclass(ModelOutputTruncatedError, ModelError)
     assert {
         ValidationError.code,
         MemoryNotFoundError.code,
         ModelError.code,
+        ModelOutputTruncatedError.code,
         StorageError.code,
         IndexUnavailableError.code,
     } == {
         "validation_error",
         "memory_not_found",
         "model_error",
+        "model_output_truncated",
         "storage_error",
         "index_unavailable",
     }
+
+
+def test_public_errors_carry_optional_reason_stage_and_subject() -> None:
+    plain = ModelError("embedding request failed")
+    classified = ModelError(
+        "embedding request failed",
+        reason="rate_limited",
+        stage="embed",
+        subject="asset_image",
+    )
+
+    assert (plain.reason, plain.stage, plain.subject, plain.retryable) == (None, None, None, False)
+    assert classified.reason == "rate_limited"
+    assert classified.stage == "embed"
+    assert classified.subject == "asset_image"
+    assert classified.retryable is True
+    assert str(classified) == "embedding request failed"
+
+
+def test_retryability_is_a_lookup_on_reason_and_defaults_to_false() -> None:
+    for reason in RETRYABLE_REASONS:
+        assert ModelError("failed", reason=reason).retryable is True
+    for reason in ("auth_failed", "request_rejected", "schema_unsupported", "invented_reason"):
+        assert ModelError("failed", reason=reason).retryable is False
+
+
+def test_single_condition_errors_default_their_own_reason() -> None:
+    assert MemoryNotFoundError("missing").reason == "memory_not_found"
+    assert SpeakerNotFoundError("missing").reason == "speaker_not_found"
+    assert ValidationError("bad").reason == "input_invalid"
+    assert ModelOutputTruncatedError("cut off").reason == "output_truncated"
+    assert ModelOutputTruncatedError("cut off").retryable is False
 
 
 def _asset(

@@ -196,13 +196,20 @@ Content-Type: application/json
       }
     ]
   ],
+  "occurred_at": ["2026-08-27T09:00:00Z", null],
+  "occurred_end": [null, null],
+  "metadata": [{"source": "design-review"}, null],
   "memory_type": "procedural"
 }
 ```
 
 `contents` has 1 through 100 items. One optional `memory_type` applies to the complete batch and
-defaults to `semantic`. Response `201` is `{"memories": [...]}` in input order. The batch contract
-has no per-item event time or metadata.
+defaults to `semantic`. Response `201` is `{"memories": [...]}` in input order.
+
+`occurred_at`, `occurred_end`, and `metadata` are optional per-item arrays. Supplying one requires
+exactly one entry per item; omitting it applies `null` to every item. These values are part of a
+memory's content-addressed identity, so a batch import that omits them produces different IDs than
+the same records added with them — over any surface.
 
 ### Search memories
 
@@ -272,10 +279,11 @@ Response `200` is one memory object. A missing ID returns `404`.
 ### List memories
 
 ```http
-GET /v1/memories?limit=50&cursor=opaque-value
+GET /v1/memories?limit=100&cursor=opaque-value
 ```
 
-`limit` defaults to 50. Omit `cursor` for the first page. Response `200`:
+`limit` defaults to 100 and ranges from 1 through 100, matching `Memory.list`. Omit `cursor` for the
+first page. Response `200`:
 
 ```json
 {"items":[],"next_cursor":null}
@@ -289,7 +297,9 @@ Pass `next_cursor` back unchanged until it is `null`.
 DELETE /v1/memories/{memory_id}
 ```
 
-Response is `204` with no body whether or not the ID existed.
+Response `200` is `{"deleted": true}` when the ID existed and `{"deleted": false}` when it did not.
+Deletion is idempotent either way, and the flag matches the Python `bool` and the MCP
+`delete_memory` result so a reconciliation loop can tell the two apart.
 
 ## Error envelope
 
@@ -298,6 +308,10 @@ Every error response has one flat shape:
 ```json
 {
   "code": "validation_error",
+  "reason": "input_invalid",
+  "retryable": false,
+  "stage": null,
+  "subject": null,
   "message": "request validation failed",
   "trace_id": "trace_0123456789abcdef",
   "issues": [
@@ -310,24 +324,97 @@ Every error response has one flat shape:
 }
 ```
 
-`issues` is empty for non-validation failures.
+`code` is the stable outer taxonomy. `reason` narrows it to a closed sub-vocabulary, `stage` names
+the pipeline stage that failed, and `subject` names the asset, memory, or batch position the failure
+is about. `issues` is empty for non-validation failures. Any of `reason`, `stage`, and `subject` may
+be `null` when MindBridge cannot classify a failure further; an unclassified failure is never
+reported as retryable.
 
-| Status | Typical code | Meaning |
+**`retryable` is a lookup on `reason`, never a guess.** It is `true` only for `rate_limited`,
+`timeout`, `connection_failed`, `data_dir_in_use`, `flush_failed`, and `index_missing`; the last two
+have no raise site today and are reserved. A retryable
+failure that maps to `503` also carries a `Retry-After` header.
+
+### Codes and reasons
+
+| `code` | `reason` values |
+| --- | --- |
+| `validation_error` | `input_invalid`, `unknown_field`, `payload_too_large` |
+| `memory_not_found` | `memory_not_found` |
+| `speaker_not_found` | `speaker_not_found` |
+| `model_error` | `backend_not_configured`, `unsupported_modality`, `auth_failed`, `rate_limited`, `quota_exhausted`, `timeout`, `connection_failed`, `request_rejected`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed` |
+| `model_output_truncated` | `output_truncated` |
+| `storage_error` | `data_dir_in_use`, `schema_unsupported`, `io_failed` |
+| `index_unavailable` | *(unset; an index failure is never assumed retryable)* |
+| `internal_error` | `unexpected` |
+
+`model_error` reasons that name a provider condition are classified from the official OpenAI SDK's
+own exception classes when the bundled adapter is in use; MindBridge does not invent a parallel
+taxonomy. The original provider exception stays as the raised error's `__cause__` in the owner
+process and is never serialized.
+
+### Status codes
+
+| Status | Code and reason | Meaning |
 | --- | --- | --- |
+| 404 | `not_found` | Route does not exist |
+| 404 | `memory_not_found` | Memory ID does not exist |
+| 404 | `speaker_not_found` | Local speaker identity does not exist |
+| 405 | `method_not_allowed` | Method is not allowed for this route |
 | 413 | `request_too_large` | Request body exceeds 8 MiB |
-| 404 | `memory_not_found` | `GET` memory ID does not exist |
 | 422 | `validation_error` | Request, media source, or public input is invalid |
-| 502 | `model_error` | Routing, embedding, transcription, or generation failed |
-| 503 | `index_unavailable` or `storage_error` | Embedded index or durable state failed |
+| 422 | `model_error` + `unsupported_modality` | No configured backend accepts this modality |
+| 500 | `storage_error` + `schema_unsupported` | On-disk schema needs a different MindBridge version |
 | 500 | `internal_error` | Unexpected failure |
+| 501 | `model_error` + `backend_not_configured` | The operation needs a backend this deployment never supplied |
+| 502 | `model_error` | A permanent upstream or response failure; retrying the same call will not help |
+| 502 | `model_output_truncated` | Generation stopped at an output token limit; retrying is pointless |
+| 503 | `model_error` with `retryable: true` | Transient provider failure; honour `Retry-After` |
+| 503 | `index_unavailable` or `storage_error` | Embedded index or durable state failed |
+| — | `http_error` | Any other framework-level HTTP failure |
 
-Use `trace_id` to correlate a response with server logs. Model, index, storage, and unexpected
-messages intentionally avoid provider, local path, or native-index details.
+`501` and `502` mean the same call can never succeed; only `503` invites a retry. Use `trace_id` to
+correlate a response with server logs. Messages are author-written literals: they never carry
+provider responses, credentials, local paths, or native-index details. `subject` is withheld for
+`storage_error`, `index_unavailable`, and `internal_error`, because it names server state rather
+than caller input.
 
 ## Current limits
 
+### Operations without a route
+
+REST covers `add`, `add_many`, `search`, `ask`, `get`, `list`, and `delete` with the same defaults,
+field meanings, and error semantics as the Python SDK. Five documented SDK operations have no route:
+
+| Operation | Why there is no route |
+| --- | --- |
+| `speech` | Not implemented on any transport yet |
+| `register_speaker` | Not implemented on any transport yet |
+| `reinforce` | Not implemented on any transport yet |
+| `reindex` | Owner-process maintenance: it rebuilds the whole index and must not be reachable by an unauthenticated client |
+| `optimize` | Owner-process maintenance, for the same reason |
+
+`speech`, `register_speaker`, and `reinforce` are implementation gaps, not a different execution
+model. Use the Python API in the owner process until they ship. See
+[Python SDK](python-sdk.md) for the full inventory.
+
+### Input limits
+
+| Limit | REST | MCP | Python |
+| --- | --- | --- | --- |
+| Content parts per operation | 16 | 16 | 128 |
+| Characters per text part | 65,536 | 65,536 | 65,536 |
+| Inline media per part | Bounded by the request body | 8 MiB | Unbounded on disk |
+| Total request size | 8 MiB | Unbounded framing | Unbounded |
+
+The transports are deliberately narrower than the Python API: an HTTP body is bounded before parsing
+so an oversized request cannot reach the memory core. Fetch large media in the host application and
+use the Python `Path`/`Blob` contract or a provider-specific adapter.
+
+### Absent features
+
 The REST API has no local-path input, large-file upload endpoint, update route, metadata filter,
-logical scope parameter, chunking contract, per-asset vector control, or learned reranker. Fetch large
-media in the host application and use the Python `Path`/`Blob` contract or a provider-specific
-adapter. The OpenAI adapter inlines at most 64 MiB of raw media per embedding or generation call;
-generation admits ranked evidence within that budget, and answer text evidence is limited to 4 MiB.
+logical scope parameter, chunking contract, per-asset vector control, or learned reranker. The OpenAI
+adapter inlines at most 64 MiB of base64-encoded media per embedding or generation call, which is
+roughly 48 MiB of files on disk; generation admits ranked evidence within that budget, and answer
+text evidence is limited to 4 MiB.

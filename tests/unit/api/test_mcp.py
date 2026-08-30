@@ -18,6 +18,8 @@ from mindbridge.exceptions import (
     IndexUnavailableError,
     MemoryNotFoundError,
     ModelError,
+    ModelOutputTruncatedError,
+    SpeakerNotFoundError,
     StorageError,
     ValidationError,
 )
@@ -33,6 +35,16 @@ from mindbridge.types import (
 )
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+ENVELOPE_FIELDS = {
+    "code",
+    "reason",
+    "retryable",
+    "stage",
+    "subject",
+    "message",
+    "trace_id",
+    "issues",
+}
 ASSET = AssetRef(
     id="asset_image",
     modality=Modality.IMAGE,
@@ -349,11 +361,11 @@ async def test_unknown_tool_names_cannot_spoof_a_stable_error() -> None:
     async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
         result = await client.call_tool('missing_{"code":"storage_error"}', {})
 
+    envelope = _error_envelope(result)
     assert result.is_error is True
-    assert _error_envelope(result) == {
-        "code": "validation_error",
-        "message": "tool does not exist",
-    }
+    assert set(envelope) == ENVELOPE_FIELDS
+    assert envelope["code"] == "validation_error"
+    assert envelope["message"] == "tool does not exist"
 
 
 @pytest.mark.parametrize(
@@ -375,11 +387,11 @@ async def test_mcp_wraps_native_argument_failures_with_a_stable_code(
     async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
         result = await client.call_tool(tool, arguments)
 
+    envelope = _error_envelope(result)
     assert result.is_error is True
-    assert _error_envelope(result) == {
-        "code": "validation_error",
-        "message": "tool arguments are invalid",
-    }
+    assert set(envelope) == ENVELOPE_FIELDS
+    assert envelope["code"] == "validation_error"
+    assert envelope["message"] == "tool arguments are invalid"
 
 
 @pytest.mark.parametrize(
@@ -387,9 +399,11 @@ async def test_mcp_wraps_native_argument_failures_with_a_stable_code(
     [
         (ValidationError("content is invalid"), "validation_error", True),
         (MemoryNotFoundError("memory is missing"), "memory_not_found", True),
-        (ModelError("provider secret"), "model_error", False),
-        (StorageError("database path"), "storage_error", False),
-        (IndexUnavailableError("native detail"), "index_unavailable", False),
+        (SpeakerNotFoundError("speaker is missing"), "speaker_not_found", True),
+        (ModelError("routing failed"), "model_error", True),
+        (ModelOutputTruncatedError("answer was cut off"), "model_output_truncated", True),
+        (StorageError("durable write failed"), "storage_error", True),
+        (IndexUnavailableError("index rebuild failed"), "index_unavailable", True),
         (RuntimeError("private bug"), "internal_error", False),
     ],
 )
@@ -405,6 +419,56 @@ async def test_mcp_errors_have_stable_codes_without_private_details(
     assert result.is_error is True
     assert _error_envelope(result)["code"] == expected_code
     assert (str(failure) in text) is detail_is_public
+
+
+async def test_mcp_envelope_reports_reason_stage_subject_and_retryability() -> None:
+    failure = ModelError(
+        "provider is busy",
+        reason="rate_limited",
+        stage="embed",
+        subject="asset_image",
+    )
+    async with Client(build_mcp_server(cast(Memory, FakeMemory(failure)))) as client:
+        result = await client.call_tool("get_memory", {"memory_id": "memory_1"})
+
+    envelope = _error_envelope(result)
+    assert set(envelope) == ENVELOPE_FIELDS
+    assert envelope["code"] == "model_error"
+    assert envelope["reason"] == "rate_limited"
+    assert envelope["retryable"] is True
+    assert envelope["stage"] == "embed"
+    assert envelope["subject"] == "asset_image"
+    assert cast(str, envelope["trace_id"]).startswith("trace_")
+
+
+async def test_mcp_names_the_unknown_argument_instead_of_only_rejecting_the_call() -> None:
+    async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
+        result = await client.call_tool(
+            "get_memory", {"memory_id": "memory_1", "run_id": "private-value"}
+        )
+
+    envelope = _error_envelope(result)
+    assert envelope["code"] == "validation_error"
+    assert envelope["reason"] == "unknown_field"
+    assert envelope["issues"] == [
+        {
+            "location": ["arguments", "run_id"],
+            "message": "Extra inputs are not permitted",
+            "type": "extra_forbidden",
+        }
+    ]
+    assert "private-value" not in _error_text(result)
+
+
+async def test_mcp_never_serializes_a_provider_exception_behind_a_model_error() -> None:
+    provider_failure = RuntimeError("sk-live-provider-secret")
+    failure = ModelError("embedding request failed", reason="auth_failed", stage="embed")
+    failure.__cause__ = provider_failure
+    async with Client(build_mcp_server(cast(Memory, FakeMemory(failure)))) as client:
+        result = await client.call_tool("get_memory", {"memory_id": "memory_1"})
+
+    assert "sk-live-provider-secret" not in _error_text(result)
+    assert _error_envelope(result)["reason"] == "auth_failed"
 
 
 def _record(

@@ -139,8 +139,9 @@ bounds, and retains source-relative clip intervals as provenance metadata. LoCoM
 MemLens, Mem-Gallery, and ATM-Bench use the public batched API for released event times, so temporal
 retrieval is measured instead of relying only on timestamps embedded in display text.
 
-The benchmark's OpenAI adapter reserves at most 64 MiB of raw media per answer request for question
-media and top-ranked evidence, making prepared clips important. A benchmark against larger
+The benchmark's OpenAI adapter reserves at most 64 MiB of base64-encoded media per answer request
+for question media and top-ranked evidence — roughly 48 MiB of files on disk — making prepared clips
+important. A benchmark against larger
 question media needs a provider-specific harness adapter with that provider's native upload
 mechanism.
 

@@ -124,6 +124,8 @@ _NEGATION_TERMS = frozenset(
 )
 _NEGATED_CONTRACTION = re.compile(r"n['\u2019]t\b", re.IGNORECASE)
 _MAX_CONTENT_PARTS = 128
+# Model span modules mapped onto the failure stage a caller sees.
+_MODEL_STAGES = {"embedding": "embed", "generation": "generate", "transcription": "transcribe"}
 _MAX_TEXT_CHARACTERS = 65_536
 _MAX_METADATA_BYTES = 262_144
 _TEXT_KEY_CHARACTERS = 2_048
@@ -331,7 +333,9 @@ class Memory:
             )
         except Exception as error:
             self._close_models_and_store()
-            raise IndexUnavailableError("failed to open the local search index") from error
+            raise IndexUnavailableError(
+                "failed to open the local search index", stage="open"
+            ) from error
 
         self._closed = False
         try:
@@ -360,7 +364,10 @@ class Memory:
         values[SPAN_KIND] = kind
         if kind == "operation":
             return operation_span(self._tracer, name, attributes=values)
-        return traced_span(self._tracer, name, attributes=values)
+        return _staged(
+            traced_span(self._tracer, name, attributes=values),
+            name.removeprefix("mindbridge."),
+        )
 
     def _model_trace(
         self,
@@ -382,10 +389,9 @@ class Memory:
         if model is not None:
             attributes["gen_ai.request.model"] = model
         attributes[SPAN_KIND] = "model"
-        return model_span(
-            self._tracer,
-            f"mindbridge.model.{module}",
-            attributes=attributes,
+        return _staged(
+            model_span(self._tracer, f"mindbridge.model.{module}", attributes=attributes),
+            _MODEL_STAGES[module],
         )
 
     def add(
@@ -433,19 +439,23 @@ class Memory:
             metadata_values = _batch_values(metadata, len(batch), "metadata")
             with self._trace("mindbridge.content.prepare", kind="stage"):
                 prepared = tuple(
-                    _prepare_memory(
-                        self._prepare_content(content, assets),
+                    self._prepare_batch_item(
+                        content,
+                        index=index,
+                        operation=assets,
                         occurred_at=event_time,
                         occurred_end=event_end,
                         metadata=item_metadata,
                         memory_type=normalized_memory_type,
                     )
-                    for content, event_time, event_end, item_metadata in zip(
-                        batch,
-                        occurrences,
-                        occurrence_ends,
-                        metadata_values,
-                        strict=True,
+                    for index, (content, event_time, event_end, item_metadata) in enumerate(
+                        zip(
+                            batch,
+                            occurrences,
+                            occurrence_ends,
+                            metadata_values,
+                            strict=True,
+                        )
                     )
                 )
             if not prepared:
@@ -489,7 +499,11 @@ class Memory:
         with self._trace("mindbridge.ask", kind="operation"), self._operation() as assets:
             _limit(limit, maximum=100)
             if self._answerer is None:
-                raise ModelError("answer backend is not configured")
+                raise ModelError(
+                    "answer backend is not configured",
+                    reason="backend_not_configured",
+                    stage="generate",
+                )
             with self._trace("mindbridge.content.prepare", kind="stage"):
                 prepared = self._prepare_content(question, assets)
             reference = _reference_at(reference_at) or datetime.now(timezone.utc)
@@ -751,7 +765,34 @@ class Memory:
         first = failures[0]
         if isinstance(first, MindBridgeError):
             raise first
-        raise StorageError("failed to close local memory resources") from first
+        raise StorageError(
+            "failed to close local memory resources", reason="io_failed", stage="close"
+        ) from first
+
+    def _prepare_batch_item(
+        self,
+        content: ContentInput,
+        *,
+        index: int,
+        operation: _OperationAssets,
+        occurred_at: datetime | None,
+        occurred_end: datetime | None,
+        metadata: Mapping[str, object] | None,
+        memory_type: MemoryType,
+    ) -> _PreparedMemory:
+        """Prepare one batch item, naming its position when it is the item that fails."""
+        try:
+            return _prepare_memory(
+                self._prepare_content(content, operation),
+                occurred_at=occurred_at,
+                occurred_end=occurred_end,
+                metadata=metadata,
+                memory_type=memory_type,
+            )
+        except MindBridgeError as error:
+            if error.subject is None:
+                error.subject = f"contents[{index}]"
+            raise
 
     def _prepare_content(
         self,
@@ -890,17 +931,17 @@ class Memory:
                         operation,
                         reversible=True,
                     )
-                if Modality.AUDIO not in self._embedding_capabilities:
+                batched = tuple(asset for memory in missing for asset in memory.content.assets)
+                fallback = Modality.AUDIO not in self._embedding_capabilities
+                if fallback:
                     for memory in missing:
                         _fallback_unsupported(
                             memory.content,
                             self._embedding_capabilities,
                             "embedding",
                         )
-                    self._cache_audio_transcripts(
-                        tuple(asset for memory in missing for asset in memory.content.assets),
-                        operation,
-                    )
+                if fallback or self._derives_transcripts(batched):
+                    self._cache_audio_transcripts(batched, operation)
                 missing = [self._prepare_for_embedding(memory, operation) for memory in missing]
                 embedding_parts = tuple(
                     (memory, object_part, model_input)
@@ -1290,7 +1331,10 @@ class Memory:
                 if not missing:
                     return routed
         names = ", ".join(sorted(modality.value for modality in missing))
-        raise ModelError(f"configured embedding model does not support: {names}")
+        raise ModelError(
+            f"configured embedding model does not support: {names}",
+            reason="unsupported_modality",
+        )
 
     def _embedding_content(
         self,
@@ -1302,11 +1346,11 @@ class Memory:
             self._embedding_capabilities,
             "embedding",
         )
-        return (
-            self._with_audio_transcripts(prepared, operation)
-            if Modality.AUDIO in unsupported
-            else prepared
-        )
+        if Modality.AUDIO in unsupported:
+            _require_audio_transcription(self._transcription_capabilities)
+        elif not self._derives_transcripts(prepared.assets):
+            return prepared
+        return self._with_audio_transcripts(prepared, operation)
 
     def _route_generation(
         self,
@@ -1321,6 +1365,7 @@ class Memory:
         if self._answer_speech_assets(prepared.assets):
             prepared = self._with_speech_identities(prepared, operation)
         if Modality.AUDIO in unsupported:
+            _require_audio_transcription(self._transcription_capabilities)
             prepared = self._with_audio_transcripts(prepared, operation)
         value = self._resolved_model_input(prepared)
         unsupported = value.modalities - self._generation_capabilities
@@ -1336,7 +1381,10 @@ class Memory:
             if not routed.modalities - self._generation_capabilities:
                 return routed
         names = ", ".join(sorted(modality.value for modality in unsupported))
-        raise ModelError(f"configured generation model does not support: {names}")
+        raise ModelError(
+            f"configured generation model does not support: {names}",
+            reason="unsupported_modality",
+        )
 
     def _route_generation_hits(
         self,
@@ -1394,12 +1442,10 @@ class Memory:
             )
         return tuple(routed)
 
-    def _answer_speech_assets(
+    def _transcribable_assets(
         self,
         assets: Sequence[StoredAsset],
     ) -> tuple[StoredAsset, ...]:
-        if not isinstance(self._transcriber, SpeechBackend):
-            return ()
         supported = {modality.value for modality in self._transcription_capabilities}
         return tuple(
             {
@@ -1407,6 +1453,21 @@ class Memory:
                 for asset in assets
                 if asset.modality in {"audio", "video"} and asset.modality in supported
             }.values()
+        )
+
+    def _answer_speech_assets(
+        self,
+        assets: Sequence[StoredAsset],
+    ) -> tuple[StoredAsset, ...]:
+        if not isinstance(self._transcriber, SpeechBackend):
+            return ()
+        return self._transcribable_assets(assets)
+
+    def _derives_transcripts(self, assets: Sequence[StoredAsset]) -> bool:
+        # A SpeechBackend indexes the same text through the explicit `index_speech` opt-in, so its
+        # add-time analysis cost stays behind that flag instead of being taken twice.
+        return not isinstance(self._transcriber, SpeechBackend) and bool(
+            self._transcribable_assets(assets)
         )
 
     def _with_speech_identities(
@@ -1492,8 +1553,7 @@ class Memory:
         prepared: _PreparedContent,
         operation: _OperationAssets,
     ) -> _PreparedContent:
-        audio = tuple(asset for asset in prepared.assets if asset.modality == "audio")
-        self._cache_audio_transcripts(audio, operation)
+        self._cache_audio_transcripts(prepared.assets, operation)
         assets = tuple(
             replace(asset, transcript=operation.transcripts[asset.asset_id])
             if asset.asset_id in operation.transcripts
@@ -1513,21 +1573,17 @@ class Memory:
         assets: Sequence[StoredAsset],
         operation: _OperationAssets,
     ) -> None:
-        audio = tuple(asset for asset in assets if asset.modality == "audio")
-        for asset in audio:
+        speech = self._transcribable_assets(assets)
+        for asset in speech:
             if asset.transcript is not None:
                 operation.transcripts.setdefault(asset.asset_id, asset.transcript)
         missing = tuple(
             dict.fromkeys(
-                asset.asset_id for asset in audio if asset.asset_id not in operation.transcripts
+                asset.asset_id for asset in speech if asset.asset_id not in operation.transcripts
             )
         )
         if missing:
-            if Modality.AUDIO not in self._transcription_capabilities:
-                raise ModelError(
-                    "audio fallback requires a transcription model with audio capability"
-                )
-            by_id = {asset.asset_id: asset for asset in audio}
+            by_id = {asset.asset_id: asset for asset in speech}
             refs = tuple(self._asset_ref(by_id[asset_id]) for asset_id in missing)
             try:
                 transcribe = getattr(self._transcriber, "transcribe", None)
@@ -1658,7 +1714,11 @@ class Memory:
         hits: Sequence[SearchHit],
     ) -> AnswerResult:
         if self._answerer is None:
-            raise ModelError("answer backend is not configured")
+            raise ModelError(
+                "answer backend is not configured",
+                reason="backend_not_configured",
+                stage="generate",
+            )
         model = getattr(self._answerer, "generation_model", None)
         with self._model_trace(
             "generation",
@@ -2185,6 +2245,21 @@ class AsyncMemory:
         await asyncio.to_thread(self._memory.close)
 
 
+@contextmanager
+def _staged(span: AbstractContextManager[Span], stage: str) -> Iterator[Span]:
+    """Name the failing stage on public errors so an agent never parses prose to find it.
+
+    The innermost span wins: an adapter that already classified its own failure keeps its stage.
+    """
+    with span as opened:
+        try:
+            yield opened
+        except MindBridgeError as error:
+            if error.stage is None:
+                error.stage = stage
+            raise
+
+
 def _content_atoms(content: ContentInput) -> tuple[ContentAtom, ...]:
     if isinstance(content, (str, Path, Blob, AssetRef)):
         return (content,)
@@ -2322,19 +2397,38 @@ def _fallback_unsupported(
         fatal.add(Modality.AUDIO)
     if fatal:
         names = ", ".join(sorted(modality.value for modality in fatal))
-        raise ModelError(f"configured {operation} model does not support: {names}")
+        raise ModelError(
+            f"configured {operation} model does not support: {names}",
+            reason="unsupported_modality",
+        )
     return unsupported
+
+
+def _require_audio_transcription(capabilities: frozenset[Modality]) -> None:
+    if Modality.AUDIO not in capabilities:
+        raise ModelError(
+            "audio fallback requires a transcription model with audio capability",
+            reason="unsupported_modality",
+        )
 
 
 def _derived_text(text: str, assets: Sequence[StoredAsset]) -> str:
     sections = [text] if text else []
     seen: set[str] = set()
     for asset in assets:
+        # A transcript is only ever cached for an asset the transcriber declared, so its presence
+        # is the routing decision; a second modality comparison here would discard video speech.
         transcript = asset.transcript
-        if asset.modality != "audio" or not transcript or asset.asset_id in seen:
+        if not transcript or asset.asset_id in seen:
             continue
         seen.add(asset.asset_id)
-        marker = f"[audio transcript:{asset.asset_id}]"
+        # Modality-neutral on purpose. This text becomes `memory_records.content`, which is the
+        # BM25 document, so every word in the marker is a term any query matches for free -- and a
+        # lexical match alone clears `minimum_relevance`. Naming the modality here labelled video
+        # speech "audio" and handed every video memory a free match on that word; deriving it from
+        # `asset.modality` would only move the free match to the commoner word. The modality is
+        # already published on the record's assets, so nothing is lost by leaving it out.
+        marker = f"[transcript:{asset.asset_id}]"
         if marker not in text:
             sections.append(f"{marker}\n{transcript}")
     return "\n\n".join(sections)
@@ -2379,10 +2473,21 @@ def _without_speech_identities(text: str, asset_ids: Sequence[str]) -> str:
 def _open_store(data_dir: Path) -> LocalStore:
     try:
         return LocalStore(data_dir)
-    except (DataDirectoryInUseError, UnsupportedSchemaError) as error:
-        raise StorageError(str(error)) from error
+    except DataDirectoryInUseError as error:
+        # The path is the caller's own configuration, but it is server state to every transport,
+        # so it travels in `subject` instead of the message every surface forwards.
+        raise StorageError(
+            "the data directory is already in use by another live MindBridge instance",
+            reason="data_dir_in_use",
+            stage="open",
+            subject=str(data_dir),
+        ) from error
+    except UnsupportedSchemaError as error:
+        raise StorageError(str(error), reason="schema_unsupported", stage="open") from error
     except Exception as error:
-        raise StorageError("failed to open the local memory store") from error
+        raise StorageError(
+            "failed to open the local memory store", reason="io_failed", stage="open"
+        ) from error
 
 
 def _transcription_contract(
@@ -2879,7 +2984,7 @@ def _translate_storage_errors(action: str) -> Iterator[None]:
     except MindBridgeError:
         raise
     except Exception as error:
-        raise StorageError(f"failed to {action}") from error
+        raise StorageError(f"failed to {action}", reason="io_failed") from error
 
 
 @contextmanager

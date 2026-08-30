@@ -28,9 +28,19 @@ exists. Verify against the source before referring to any surface.
   `POST /answers`, plus an unversioned `GET /healthz` (`src/mindbridge/api/app.py`).
 - **MCP.** Exactly five tools: `add_memory`, `search_memories`, `ask_memory`, `get_memory`,
   `delete_memory` (`src/mindbridge/api/mcp.py`).
-- **Console scripts.** `mindbridge-bench` only. There is no product CLI. Both
-  `docs/design-principles.md` and [docs/api/cli.md](docs/api/cli.md) record this as a capability
-  gap; do not document, reference, or test a product CLI until one ships.
+- **Console scripts.** Two: `mindbridge` (`src/mindbridge/cli.py`) and `mindbridge-bench`
+  (`src/mindbridge/benchmarks/cli.py`). They are one documented CLI surface in two entry points, and
+  the split is load-bearing — `tests/test_package.py` scans `ast.Constant` strings, so a single
+  dispatcher could not name the benchmark package even to import it lazily. `mindbridge` commands
+  are the `Memory` operations kebab-cased plus one non-SDK command, `doctor`. Composition is one of
+  `--app MODULE:ATTR`, `--embedder NAME` (`mindbridge.recipes`, a closed three-entry table), or
+  `--url URL`; there is no default and no environment fallback. See
+  [docs/api/cli.md](docs/api/cli.md).
+- **Recipes.** `mindbridge.recipes` names `jina-omni`, `funasr`, and `openai[:model]` over the
+  bundled backends and returns the constructed object. It is a closed table, not a registry: a
+  backend this package does not bundle is reached through `--app`, never by registering a name.
+  `SentenceTransformersEmbedder` deliberately has no recipe, because its revision pin is the
+  caller's choice.
 - **Extension points.** Five protocols in `src/mindbridge/models/base.py`: `EmbeddingBackend`,
   `GenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, and the optional
   `StreamingGenerationBackend`, which `Memory.ask` selects through a structural `isinstance` check

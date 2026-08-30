@@ -52,6 +52,8 @@ Model spans use OpenTelemetry GenAI attributes where the ecosystem defines them:
 - `gen_ai.operation.name` and `gen_ai.request.model` identify the model boundary.
 - `gen_ai.usage.input_tokens` and `gen_ai.usage.output_tokens` contain provider-reported totals.
 - `gen_ai.response.time_to_first_chunk` measures request-to-first-stream-chunk time.
+- `gen_ai.response.finish_reasons` carries the provider's stop reason, so a `length` truncation is
+  countable rather than inferred from a failure.
 - `mindbridge.model.time_to_first_token` measures model-span start to the first non-empty text
   delta. It exists only for a streaming generation backend.
 - `mindbridge.model.module` is `embedding`, `transcription`, `generation`, or benchmark-only
@@ -61,6 +63,12 @@ Each end-to-end operation span rolls up its descendant model calls into
 `mindbridge.token_usage.total_tokens`. `mindbridge.token_usage.complete` is true only when every
 token-metered request supplied a usable total; request counters and known modality totals remain
 available as an exact lower bound when it is false.
+
+The bundled `OpenAIModels` generation span also reports what its inline media budget removed:
+`mindbridge.grounding.media_elided_hits` counts retrieved hits whose media did not fit, and
+`mindbridge.grounding.dropped_hits` counts hits left out of the request entirely. Both are zero on
+a request that sent every retrieved hit intact. `AnswerResult.hits` still returns the retrieved
+hits, so these counters are how a shrunken grounding payload becomes visible.
 
 `OpenAIModels` implements the optional `StreamingGenerationBackend` protocol. `Memory.ask()`
 consumes its deltas internally and still returns one `AnswerResult`, while the generation span
@@ -92,7 +100,8 @@ usage.
 `mindbridge.model.request_count`, `mindbridge.token_usage.expected_request_count`, and
 `mindbridge.token_usage.reported_request_count` make missing usage visible. A failed request or a
 custom provider that omits usage therefore makes an aggregate incomplete instead of silently
-contributing zero.
+contributing zero. These count calls issued to the provider, not work items submitted, so a
+batching backend such as Sentence Transformers or FunASR reports one request for a whole batch.
 
 ## Benchmark output
 

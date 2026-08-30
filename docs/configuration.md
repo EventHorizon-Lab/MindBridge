@@ -27,7 +27,10 @@ Memory(
 - `embedder` is required because its model, dimension, and vector-space recipe are durable data
   contracts.
 - `answerer` is optional. `ask()` raises `ModelError` when it is absent.
-- `transcriber` is optional. Configure it when audio fallback or `speech()` is required.
+- `transcriber` is optional. Configure it when audio fallback, add-time transcript indexing, or
+  `speech()` is required. A `TranscriptionBackend` transcribes every stored asset whose modality it
+  declares, so a media memory carries retrievable text even where the embedder accepts the media
+  natively.
 - `index_speech` opts a configured `SpeechBackend` into add-time transcript and speaker-identity
   indexing; the default leaves analysis lazy.
 - `minimum_relevance` drops weak dense evidence; `ambiguity_margin` drops unresolved top-two ties
@@ -95,7 +98,9 @@ models = OpenAIModels(
 
 MindBridge compares the routed input with these declarations before inference. Unsupported audio
 can be replaced with a transcript when a transcriber exists. Unsupported image or video evidence
-is never silently discarded.
+is never silently discarded. Transcription is routed by `transcription_capabilities` rather than by
+the gaps in the embedding or generation adapter, so a transcriber that declares video contributes a
+video's speech on every path that reads a transcript.
 
 ## Durable spaces
 

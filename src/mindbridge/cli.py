@@ -1,0 +1,1196 @@
+"""The MindBridge product command line: one process, one operation, one JSON document.
+
+Every command dispatches to the ``Memory`` operation of the same name, or to the ``/v1`` route a
+running owner already serves. This module owns argument decoding, output encoding, and process
+lifecycle. It owns no routing, retrieval, persistence, provider selection, or defaults of its own,
+and no error policy beyond mapping the shared error codes onto stable exit statuses.
+
+Composition is never implicit: exactly one of ``--app``, ``--embedder``, or ``--url`` must be
+given. There is no default and no environment fallback, which is this surface's analogue of
+``Memory`` requiring ``embedder`` as a keyword with no default.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import inspect
+import json
+import sys
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from datetime import datetime
+from importlib import import_module
+from importlib.metadata import version
+from pathlib import Path
+from typing import TypeAlias
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
+from uuid import uuid4
+
+from mindbridge import recipes
+from mindbridge.exceptions import (
+    IndexUnavailableError,
+    MemoryNotFoundError,
+    MindBridgeError,
+    ModelError,
+    ModelOutputTruncatedError,
+    SpeakerNotFoundError,
+    StorageError,
+    ValidationError,
+)
+from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
+from mindbridge.memory import Memory
+from mindbridge.types import (
+    AssetRef,
+    Blob,
+    ContentAtom,
+    ContentInput,
+    MemoryRecord,
+    MemoryType,
+    Modality,
+    SearchHit,
+    SpeakerSegment,
+)
+
+PROGRAM = "mindbridge"
+CONFIGURATION_ERROR = "configuration_error"
+INTERRUPT_EXIT_CODE = 130
+# One exit status per stable error code, so an agent branches on `$?` without reading anything.
+# Keyed off the exception classes rather than string literals; `tests/unit/test_cli.py` fails when
+# a new public exception has no status here instead of letting it collapse into exit 1.
+EXIT_CODES: Mapping[str, int] = {
+    ValidationError.code: 3,
+    MemoryNotFoundError.code: 4,
+    SpeakerNotFoundError.code: 5,
+    ModelError.code: 6,
+    StorageError.code: 7,
+    IndexUnavailableError.code: 8,
+    CONFIGURATION_ERROR: 10,
+    ModelOutputTruncatedError.code: 11,
+}
+# The one exit selected by `reason` rather than `code`. It is the CLI's single transport decision:
+# an agent that cannot tell "busy, retry with --url" from "the disk broke" cannot be scripted.
+DATA_DIR_IN_USE_EXIT_CODE = 9
+# Operations `Memory` publishes, in SDK order. Commands are these names kebab-cased, plus `doctor`.
+OPERATIONS: tuple[str, ...] = (
+    "add",
+    "add_many",
+    "search",
+    "ask",
+    "get",
+    "speech",
+    "register_speaker",
+    "reinforce",
+    "list",
+    "delete",
+    "reindex",
+    "optimize",
+)
+DOCTOR = "doctor"
+COMMANDS: tuple[str, ...] = (*(name.replace("_", "-") for name in OPERATIONS), DOCTOR)
+# Operations a running owner serves over `/v1`. The other five have no route today; that is a
+# documented transport gap, reported honestly, not a CLI design choice.
+REMOTE_COMMANDS = frozenset({"add", "add-many", "search", "ask", "get", "list", "delete"})
+_QUERY_METAVAR: Mapping[str, str] = {"add": "TEXT", "search": "QUERY", "ask": "QUESTION"}
+_TUNING: tuple[str, ...] = (
+    "index_speech",
+    "minimum_relevance",
+    "ambiguity_margin",
+    "decay_half_life_days",
+)
+_STDIN = "-"
+
+_Document: TypeAlias = dict[str, object]
+_Atom: TypeAlias = tuple[str, str]
+_stdin_consumed = False
+
+
+class _CompositionError(Exception):
+    """A composition or transport condition the CLI itself owns, reported as exit 10.
+
+    Deliberately not a ``MindBridgeError``: that taxonomy belongs to the SDK, and adding a class to
+    it here would silently change the code set the MCP adapter derives from the class hierarchy.
+    """
+
+    def __init__(self, message: str, *, reason: str, subject: str | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.subject = subject
+
+
+class _RemoteFailure(Exception):
+    """An error envelope a running owner already produced; forwarded, never re-derived."""
+
+    def __init__(self, envelope: _Document) -> None:
+        super().__init__(str(envelope.get("message", "")))
+        self.envelope = envelope
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run one command and return its exit status."""
+    global _stdin_consumed
+    _stdin_consumed = False
+    arguments = _parser().parse_args(None if argv is None else list(argv))
+    try:
+        document = _dispatch(arguments)
+    except KeyboardInterrupt:
+        print(f"{PROGRAM}: interrupted", file=sys.stderr)
+        return INTERRUPT_EXIT_CODE
+    except _RemoteFailure as error:
+        return _forward(error.envelope)
+    except _CompositionError as error:
+        return _fail(CONFIGURATION_ERROR, str(error), reason=error.reason, subject=error.subject)
+    except MindBridgeError as error:
+        return _fail(
+            error.code,
+            str(error) or error.code,
+            reason=error.reason,
+            retryable=error.retryable,
+            stage=error.stage,
+            subject=error.subject,
+        )
+    except Exception as error:
+        message = " ".join(str(error).split()) or type(error).__name__
+        return _fail("internal_error", message, reason="unexpected")
+    json.dump(document, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+def _dispatch(arguments: argparse.Namespace) -> _Document:
+    _reject_duplicate_content(arguments)
+    composition = _resolve(arguments)
+    if arguments.explain:
+        return composition
+    if not arguments.quiet:
+        print(json.dumps(composition, ensure_ascii=False), file=sys.stderr)
+    if arguments.url is not None:
+        return _run_remote(arguments)
+    if arguments.command == DOCTOR:
+        return _doctor(arguments, composition)
+    with _open_memory(arguments) as memory:
+        return _LOCAL[arguments.command](memory, arguments)
+
+
+# ---------------------------------------------------------------------------------------------
+# Composition
+
+
+def _resolve(arguments: argparse.Namespace) -> _Document:
+    """Report the resolved composition without running the operation it selects."""
+    if arguments.embedder is None:
+        _reject_embedder_only_options(arguments)
+    if arguments.app is None and arguments.embedder is None and arguments.url is None:
+        # Not argparse's `required=True`: a missing composition is a configuration condition an
+        # agent must be able to recognize by exit status, not a usage typo.
+        raise _CompositionError(
+            "no composition was given; pass exactly one of --app MODULE:ATTR, --embedder NAME "
+            f"({_recipes()}), or --url URL. There is no default and no environment fallback.",
+            reason="composition_missing",
+        )
+    if arguments.url is not None:
+        return {"source": f"--url {arguments.url}", "url": arguments.url}
+    if arguments.app is not None:
+        module_name, attribute = _application_target(arguments.app)
+        return {
+            "source": f"--app {arguments.app}",
+            # The application chose the directory and composed the backends, so both are the
+            # application's to report: `Memory` publishes no accessor for either.
+            "data_dir": None,
+            "app": {"module": module_name, "attribute": attribute},
+        }
+    document: _Document = {
+        "source": f"--embedder {arguments.embedder}",
+        "data_dir": str(_data_dir(arguments)),
+    }
+    with _composing():
+        for slot in ("embedder", "answerer", "transcriber"):
+            name = getattr(arguments, slot)
+            if name is None:
+                document[slot] = None
+                continue
+            # Checked while resolving, so `--explain`, `doctor`, and every operation agree that a
+            # recipe in the wrong slot is one configuration failure rather than a loader result.
+            recipes.require_slot(name, slot)
+            document[slot] = recipes.describe(name)
+    return document
+
+
+def _reject_embedder_only_options(arguments: argparse.Namespace) -> None:
+    """`--app` and `--url` compose elsewhere, so a knob meant for a recipe must not be ignored."""
+    given = [
+        f"--{name.replace('_', '-')}"
+        for name in ("data_dir", "answerer", "transcriber", *_TUNING)
+        if getattr(arguments, name) != _MEMORY_DEFAULTS[name]
+    ]
+    if given:
+        owner = "the application" if arguments.app is not None else "the running owner"
+        raise _CompositionError(
+            f"{', '.join(given)} apply to --embedder compositions; {owner} owns them here",
+            reason="option_not_applicable",
+            subject=given[0],
+        )
+
+
+def _open_memory(arguments: argparse.Namespace) -> Memory:
+    if arguments.app is not None:
+        return _application_memory(arguments.app)
+    backends: dict[str, object] = {}
+    with _composing():
+        backends["embedder"] = recipes.embedder(arguments.embedder)
+        if arguments.answerer is not None:
+            backends["answerer"] = recipes.answerer(arguments.answerer)
+        if arguments.transcriber is not None:
+            backends["transcriber"] = recipes.transcriber(arguments.transcriber)
+    try:
+        # `Memory` closes the backends it accepted, but it opens the store before it accepts them,
+        # so a busy data directory would otherwise leak whatever this process just constructed.
+        return Memory(
+            _data_dir(arguments),
+            embedder=backends["embedder"],  # type: ignore[arg-type]
+            answerer=backends.get("answerer"),  # type: ignore[arg-type]
+            transcriber=backends.get("transcriber"),  # type: ignore[arg-type]
+            index_speech=arguments.index_speech,
+            minimum_relevance=arguments.minimum_relevance,
+            ambiguity_margin=arguments.ambiguity_margin,
+            decay_half_life_days=arguments.decay_half_life_days,
+        )
+    except BaseException:
+        for backend in backends.values():
+            close = getattr(backend, "close", None)
+            if callable(close):
+                close()
+        raise
+
+
+def _application_memory(spec: str) -> Memory:
+    module_name, attribute = _application_target(spec)
+    with _composing(spec):
+        # A console script does not put the working directory on `sys.path`, while
+        # `uvicorn my_application:app` does. `--app` is the same convention, so it does too.
+        if "" not in sys.path:
+            sys.path.insert(0, "")
+        value = getattr(import_module(module_name), attribute)
+    if isinstance(value, Memory):
+        return value
+    if not callable(value):
+        raise _CompositionError(
+            f"{spec} is neither a Memory nor a zero-argument callable returning one",
+            reason="app_invalid",
+            subject=spec,
+        )
+    with _composing(spec):
+        built = value()
+    if not isinstance(built, Memory):
+        raise _CompositionError(
+            f"{spec} returned {type(built).__name__}, not a Memory",
+            reason="app_invalid",
+            subject=spec,
+        )
+    return built
+
+
+def _application_target(spec: str) -> tuple[str, str]:
+    module_name, separator, attribute = spec.partition(":")
+    if not separator or not module_name.strip() or not attribute.strip():
+        raise _CompositionError(
+            f"--app must be MODULE:ATTR, not {spec}", reason="app_invalid", subject=spec
+        )
+    return module_name.strip(), attribute.strip()
+
+
+@contextmanager
+def _composing(subject: str | None = None) -> Iterator[None]:
+    """Report every composition failure as exit 10, whatever raised it underneath."""
+    try:
+        yield
+    except (KeyboardInterrupt, SystemExit, _CompositionError):
+        raise
+    except StorageError:
+        # A busy or unreadable data directory describes the store, not the composition, and it is
+        # the one failure whose exit status tells the caller to retry against `--url` instead.
+        raise
+    except ImportError as error:
+        raise _CompositionError(
+            f"composition needs a package that is not installed: {error.name}",
+            reason="missing_dependency",
+            subject=error.name,
+        ) from error
+    except Exception as error:
+        message = " ".join(str(error).split()) or type(error).__name__
+        raise _CompositionError(message, reason="composition_failed", subject=subject) from error
+
+
+def _data_dir(arguments: argparse.Namespace) -> Path:
+    return Path(arguments.data_dir).expanduser().resolve()
+
+
+# ---------------------------------------------------------------------------------------------
+# doctor
+
+
+def _doctor(arguments: argparse.Namespace, composition: _Document) -> _Document:
+    report: _Document = {"source": composition["source"]}
+    data_dir: Path | None = None
+    state = "owned by the application"
+    if arguments.app is not None:
+        report["app"] = composition["app"]
+        # Calling the factory would open the store, so the check stops at "the target resolves".
+        report["probe"] = "resolved, not called"
+        _application_target_exists(arguments.app)
+    else:
+        data_dir = _data_dir(arguments)
+        state = _data_dir_state(data_dir)
+        for slot in ("embedder", "answerer", "transcriber"):
+            name = getattr(arguments, slot)
+            report[slot] = None if name is None else _probe(name, slot)
+    return {
+        "version": _installed_version(),
+        "python": ".".join(str(part) for part in sys.version_info[:3]),
+        "data_dir": None if data_dir is None else str(data_dir),
+        "data_dir_state": state,
+        "composition": report,
+    }
+
+
+def _application_target_exists(spec: str) -> None:
+    module_name, attribute = _application_target(spec)
+    with _composing(spec):
+        if "" not in sys.path:
+            sys.path.insert(0, "")
+        getattr(import_module(module_name), attribute)
+
+
+def _probe(name: str, slot: str) -> _Document:
+    """Construct one recipe with its loader exercised, then close what was constructed."""
+    document: _Document = dict(recipes.describe(name))
+    document["probe"] = recipes.probe(name)
+    build: Callable[..., object] = getattr(recipes, slot)
+    try:
+        backend = build(name, load=True)
+    except ImportError as error:
+        document.update(loader="failed", reason="missing_dependency", detail=error.name)
+        return document
+    except Exception as error:
+        reason = error.reason if isinstance(error, MindBridgeError) else "load_failed"
+        document.update(
+            loader="failed",
+            reason=reason,
+            detail=" ".join(str(error).split()) or type(error).__name__,
+        )
+        return document
+    try:
+        document["loader"] = "ok"
+        document.update(_identity(backend))
+    finally:
+        close = getattr(backend, "close", None)
+        if callable(close):
+            close()
+    return document
+
+
+def _identity(backend: object) -> _Document:
+    """Read the identity a loaded backend publishes; a property it does not have is skipped."""
+    document: _Document = {
+        name: getattr(backend, name)
+        for name in (
+            "embedding_model",
+            "embedding_space",
+            "embedding_dimension",
+            "transcription_model",
+            "transcription_space",
+        )
+        if hasattr(backend, name)
+    }
+    for name in ("embedding", "generation", "transcription"):
+        modalities = getattr(backend, f"{name}_capabilities", None)
+        if modalities is not None:
+            document[f"{name}_modalities"] = sorted(item.value for item in modalities)
+    return document
+
+
+def _data_dir_state(data_dir: Path) -> str:
+    """Report ownership without creating anything: with no lock file there is no live owner."""
+    if not (data_dir / ".mindbridge.lock").exists():
+        return "absent" if not data_dir.exists() else "free"
+    try:
+        lock = DataDirectoryLock(data_dir)
+    except DataDirectoryInUseError:
+        return "in use by another process"
+    except OSError as error:
+        return f"unreadable: {error.strerror}"
+    lock.close()
+    return "free"
+
+
+def _installed_version() -> str:
+    return version("mindbridge")
+
+
+# ---------------------------------------------------------------------------------------------
+# Local execution
+
+
+def _add(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return _memory_document(
+        memory.add(
+            _content_input(arguments),
+            occurred_at=_optional_time(arguments.occurred_at, "occurred_at"),
+            occurred_end=_optional_time(arguments.occurred_end, "occurred_end"),
+            metadata=_metadata_value(_json_source(arguments.metadata)),
+            memory_type=MemoryType(arguments.memory_type),
+        )
+    )
+
+
+def _add_many(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    items = _jsonl(arguments.source)
+    return {
+        "memories": [
+            _memory_document(record)
+            for record in memory.add_many(
+                tuple(_parts_input(item["content"]) for item in items),
+                occurred_at=[
+                    _optional_time(item.get("occurred_at"), "occurred_at") for item in items
+                ],
+                occurred_end=[
+                    _optional_time(item.get("occurred_end"), "occurred_end") for item in items
+                ],
+                metadata=[_metadata_value(item.get("metadata")) for item in items],
+                memory_type=MemoryType(arguments.memory_type),
+            )
+        ]
+    }
+
+
+def _search(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    hits = memory.search(
+        _content_input(arguments),
+        limit=arguments.limit,
+        memory_type=_optional_memory_type(arguments),
+        reference_at=_optional_time(arguments.reference_at, "reference_at"),
+    )
+    return {"hits": [_memory_document(hit) for hit in hits]}
+
+
+def _ask(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    result = memory.ask(
+        _content_input(arguments),
+        limit=arguments.limit,
+        memory_type=_optional_memory_type(arguments),
+        reference_at=_optional_time(arguments.reference_at, "reference_at"),
+    )
+    return {"answer": result.answer, "hits": [_memory_document(hit) for hit in result.hits]}
+
+
+def _get(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return _memory_document(memory.get(arguments.memory_id))
+
+
+def _speech(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {"segments": [_segment_document(item) for item in memory.speech(arguments.memory_id)]}
+
+
+def _register_speaker(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    memory.register_speaker(arguments.speaker_id, arguments.name)
+    return {}
+
+
+def _reinforce(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {"reinforced": memory.reinforce(arguments.memory_ids)}
+
+
+def _list(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    page = memory.list(limit=arguments.limit, cursor=arguments.cursor)
+    return {
+        "items": [_memory_document(record) for record in page.items],
+        "next_cursor": page.next_cursor,
+    }
+
+
+def _delete(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {"deleted": memory.delete(arguments.memory_id)}
+
+
+def _reindex(memory: Memory, _arguments: argparse.Namespace) -> _Document:
+    return {"memories": memory.reindex()}
+
+
+def _optimize(memory: Memory, _arguments: argparse.Namespace) -> _Document:
+    memory.optimize()
+    return {}
+
+
+_LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
+    "add": _add,
+    "add-many": _add_many,
+    "search": _search,
+    "ask": _ask,
+    "get": _get,
+    "speech": _speech,
+    "register-speaker": _register_speaker,
+    "reinforce": _reinforce,
+    "list": _list,
+    "delete": _delete,
+    "reindex": _reindex,
+    "optimize": _optimize,
+}
+
+
+def _optional_memory_type(arguments: argparse.Namespace) -> MemoryType | None:
+    value = arguments.memory_type
+    return None if value is None else MemoryType(value)
+
+
+# ---------------------------------------------------------------------------------------------
+# Remote execution against a running owner
+
+
+def _run_remote(arguments: argparse.Namespace) -> _Document:
+    command = arguments.command
+    if command == DOCTOR:
+        return _remote_doctor(arguments)
+    if command not in REMOTE_COMMANDS:
+        raise _CompositionError(
+            f"{command} has no /v1 route, so it cannot run against --url; the Python SDK and a "
+            "local --app or --embedder composition support it",
+            reason="unsupported_in_remote_mode",
+            subject=command,
+        )
+    method, path, body = _REMOTE[command](arguments)
+    return _request(arguments.url, method, path, body)
+
+
+def _remote_add(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    body: _Document = {
+        "content": _content_value(arguments),
+        "memory_type": arguments.memory_type,
+    }
+    _put(body, "occurred_at", _remote_time(arguments.occurred_at, "occurred_at"))
+    _put(body, "occurred_end", _remote_time(arguments.occurred_end, "occurred_end"))
+    _put(body, "metadata", _metadata_value(_json_source(arguments.metadata)))
+    return "POST", "/v1/memories", body
+
+
+def _remote_add_many(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    items = _jsonl(arguments.source)
+    body: _Document = {
+        "contents": [_remote_content(item["content"]) for item in items],
+        "memory_type": arguments.memory_type,
+    }
+    for field in ("occurred_at", "occurred_end"):
+        values = [_remote_time(item.get(field), field) for item in items]
+        if any(value is not None for value in values):
+            body[field] = values
+    metadata = [_metadata_value(item.get("metadata")) for item in items]
+    if any(value is not None for value in metadata):
+        body["metadata"] = metadata
+    return "POST", "/v1/memories/batch", body
+
+
+def _remote_search(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    return "POST", "/v1/memories/search", _remote_query("query", arguments)
+
+
+def _remote_ask(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    return "POST", "/v1/answers", _remote_query("question", arguments)
+
+
+def _remote_query(field: str, arguments: argparse.Namespace) -> _Document:
+    body: _Document = {field: _content_value(arguments), "limit": arguments.limit}
+    _put(body, "memory_type", arguments.memory_type)
+    _put(body, "reference_at", _remote_time(arguments.reference_at, "reference_at"))
+    return body
+
+
+def _remote_get(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    return "GET", f"/v1/memories/{quote(arguments.memory_id, safe='')}", None
+
+
+def _remote_delete(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    return "DELETE", f"/v1/memories/{quote(arguments.memory_id, safe='')}", None
+
+
+def _remote_list(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    query = {"limit": arguments.limit}
+    if arguments.cursor is not None:
+        # Opaque by contract: forwarded exactly as it was returned, never parsed.
+        query["cursor"] = arguments.cursor
+    return "GET", f"/v1/memories?{urlencode(query)}", None
+
+
+_REMOTE: Mapping[str, Callable[[argparse.Namespace], tuple[str, str, _Document | None]]] = {
+    "add": _remote_add,
+    "add-many": _remote_add_many,
+    "search": _remote_search,
+    "ask": _remote_ask,
+    "get": _remote_get,
+    "list": _remote_list,
+    "delete": _remote_delete,
+}
+
+
+def _remote_doctor(arguments: argparse.Namespace) -> _Document:
+    return {
+        "version": _installed_version(),
+        "python": ".".join(str(part) for part in sys.version_info[:3]),
+        "url": arguments.url,
+        "health": _request(arguments.url, "GET", "/healthz", None),
+        "composition": {"source": f"--url {arguments.url}", "owner": "remote"},
+    }
+
+
+def _request(url: str, method: str, path: str, body: _Document | None) -> _Document:
+    payload = None if body is None else json.dumps(body).encode("utf-8")
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    request = Request(f"{url.rstrip('/')}{path}", data=payload, headers=headers, method=method)
+    try:
+        with urlopen(request) as response:
+            return _response(response.read())
+    except HTTPError as error:
+        # An error response is still an open response: `HTTPError` wraps the body file, so leaving
+        # it unclosed leaks the socket and raises in the deallocator.
+        try:
+            envelope = _response(error.read())
+        finally:
+            error.close()
+        raise _RemoteFailure(envelope) from error
+    except URLError as error:
+        raise StorageError(
+            f"cannot reach the MindBridge owner at {url}",
+            reason="connection_failed",
+            stage="request",
+            subject=str(error.reason),
+        ) from error
+
+
+def _response(raw: bytes) -> _Document:
+    try:
+        document = json.loads(raw or b"{}")
+    except ValueError as error:
+        raise StorageError(
+            "the MindBridge owner returned a body that is not JSON",
+            reason="response_invalid",
+            stage="request",
+        ) from error
+    if not isinstance(document, dict):
+        raise StorageError(
+            "the MindBridge owner returned a body that is not a JSON object",
+            reason="response_invalid",
+            stage="request",
+        )
+    return document
+
+
+# ---------------------------------------------------------------------------------------------
+# Input
+
+
+def _reject_duplicate_content(arguments: argparse.Namespace) -> None:
+    """One operand, one source. Preferring either would silently discard what the caller typed.
+
+    Checked before the composition runs, so the refusal is identical locally and against `--url`
+    and nothing is constructed or sent first.
+    """
+    if getattr(arguments, "content_json", None) is not None and arguments.content:
+        raise ValidationError(
+            "--content-json and positional content both supply this operand; pass one or the other",
+            subject="--content-json",
+        )
+
+
+def _atoms(arguments: argparse.Namespace) -> tuple[_Atom, ...]:
+    """Decode ordered content atoms without shell quoting tricks."""
+    values: list[str] = list(arguments.content) or [_STDIN]
+    atoms: list[_Atom] = []
+    for value in values:
+        if value == _STDIN:
+            atoms.append(("text", _read_stdin()))
+        elif value.startswith("@@"):
+            atoms.append(("text", value[1:]))
+        elif value.startswith("@"):
+            atoms.append(("path", value[1:]))
+        else:
+            atoms.append(("text", value))
+    return tuple(atoms)
+
+
+def _content_input(arguments: argparse.Namespace) -> ContentInput:
+    if arguments.content_json is not None:
+        return _parts_input(_json_source(arguments.content_json))
+    atoms: list[ContentAtom] = [
+        value if kind == "text" else Path(value) for kind, value in _atoms(arguments)
+    ]
+    return atoms[0] if len(atoms) == 1 else tuple(atoms)
+
+
+def _content_value(arguments: argparse.Namespace) -> object:
+    """The `content` a `/v1` request carries. Local paths deliberately never cross the wire."""
+    if arguments.content_json is not None:
+        return _remote_content(_json_source(arguments.content_json))
+    atoms = _atoms(arguments)
+    if any(kind == "path" for kind, _value in atoms):
+        raise _CompositionError(
+            "a local file path cannot be sent to a remote owner; pass base64 media in a data URL "
+            "through --content-json, which REST accepts",
+            reason="unsupported_in_remote_mode",
+            subject="@PATH",
+        )
+    if len(atoms) == 1:
+        return atoms[0][1]
+    return [{"type": "input_text", "text": value} for _kind, value in atoms]
+
+
+def _remote_content(value: object) -> object:
+    """Refuse the one CLI-only part type on every path that reaches a running owner.
+
+    `add-many` carries the same union one item per JSONL line, so it validates here too rather
+    than forwarding a local path and letting the owner reject it as an unknown field.
+    """
+    items = value if isinstance(value, list) else []
+    if any(isinstance(item, dict) and "path" in item for item in items):
+        raise _CompositionError(
+            "input_file.path is a local-mode part type and cannot be sent to a remote owner",
+            reason="unsupported_in_remote_mode",
+            subject="input_file.path",
+        )
+    return value
+
+
+def _parts_input(value: object) -> ContentInput:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list) or not value:
+        raise ValidationError("content must be a string or a non-empty array of parts")
+    return tuple(_part(item) for item in value)
+
+
+def _part(item: object) -> ContentAtom:
+    if not isinstance(item, dict):
+        raise ValidationError("each content part must be an object")
+    kind = item.get("type")
+    if kind == "input_text":
+        _fields(item, {"type", "text"})
+        text = item.get("text")
+        if not isinstance(text, str):
+            raise ValidationError("input_text requires a text string")
+        return text
+    if kind == "input_image":
+        _fields(item, {"type", "image_url", "file_id"})
+        source, value = _one_source(item, ("image_url", "file_id"))
+        if source == "file_id":
+            return AssetRef(id=str(value), modality=Modality.IMAGE)
+        return _data_blob(str(value), name=None, expected="image/*")
+    if kind == "input_file":
+        return _file_part(item)
+    raise ValidationError(f"unknown content part type: {kind!r}")
+
+
+def _file_part(item: Mapping[str, object]) -> ContentAtom:
+    _fields(item, {"type", "file_url", "file_data", "file_id", "media_type", "filename", "path"})
+    media_type = item.get("media_type")
+    filename = item.get("filename")
+    name = None if filename is None else str(filename)
+    source, value = _one_source(item, ("file_url", "file_data", "file_id", "path"))
+    if source == "path":
+        # The one part type REST and MCP refuse: the CLI runs on the machine that owns the data
+        # directory, and `Memory` already accepts a `Path` atom.
+        return Path(str(value))
+    if source == "file_id":
+        return _asset_reference(str(value), media_type)
+    if source == "file_data":
+        if not isinstance(media_type, str) or media_type.endswith("/*"):
+            raise ValidationError("file_data requires a concrete media_type")
+        return Blob(data=_decode_base64(str(value)), media_type=media_type, name=name)
+    return _data_blob(
+        str(value), name=name, expected=None if media_type is None else str(media_type)
+    )
+
+
+def _asset_reference(file_id: str, media_type: object) -> AssetRef:
+    if media_type is None:
+        return AssetRef(id=file_id)
+    text = str(media_type)
+    if text.endswith("/*"):
+        return AssetRef(id=file_id, modality=Modality(text.split("/", 1)[0]))
+    return AssetRef(id=file_id, media_type=text)
+
+
+def _fields(item: Mapping[str, object], accepted: set[str]) -> None:
+    unexpected = sorted(set(item) - accepted)
+    if unexpected:
+        raise ValidationError(f"unexpected fields: {', '.join(unexpected)}")
+
+
+def _one_source(item: Mapping[str, object], sources: tuple[str, ...]) -> tuple[str, object]:
+    present = [name for name in sources if item.get(name) is not None]
+    if len(present) != 1:
+        raise ValidationError(f"exactly one of {', '.join(sources)} is required")
+    return present[0], item[present[0]]
+
+
+def _data_blob(value: str, *, name: str | None, expected: str | None) -> Blob:
+    header, separator, payload = value.partition(",")
+    if not value.startswith("data:") or not separator or not header.endswith(";base64"):
+        raise ValidationError(
+            "remote URLs are not accepted; supply base64 media in a data URL, or @PATH locally"
+        )
+    media_type = header.removeprefix("data:").removesuffix(";base64").lower()
+    if not media_type or "/" not in media_type:
+        raise ValidationError("data URL must declare a media type")
+    if expected is not None and not (
+        expected == media_type
+        or (expected.endswith("/*") and expected.split("/", 1)[0] == media_type.split("/", 1)[0])
+    ):
+        raise ValidationError("media_type contradicts the data URL")
+    return Blob(data=_decode_base64(payload), media_type=media_type, name=name)
+
+
+def _decode_base64(value: str) -> bytes:
+    try:
+        return base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValidationError("media bytes must be valid base64") from error
+
+
+def _jsonl(source: str) -> tuple[Mapping[str, object], ...]:
+    items: list[Mapping[str, object]] = []
+    for number, line in enumerate(_read_source(source).splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError as error:
+            raise ValidationError(f"line {number} is not valid JSON") from error
+        if not isinstance(item, dict) or "content" not in item:
+            raise ValidationError(f"line {number} must be an object with a content field")
+        _fields(item, {"content", "occurred_at", "occurred_end", "metadata"})
+        items.append(item)
+    if not items:
+        raise ValidationError("no memories were supplied")
+    return tuple(items)
+
+
+def _metadata_value(value: object) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise ValidationError("metadata must be a JSON object with string keys")
+    return value
+
+
+def _json_source(value: str | None) -> object:
+    if value is None:
+        return None
+    try:
+        return json.loads(_read_source(value))
+    except ValueError as error:
+        raise ValidationError("value must be valid JSON") from error
+
+
+def _read_source(value: str) -> str:
+    if value == _STDIN:
+        return _read_stdin()
+    if value.startswith("@"):
+        try:
+            return Path(value[1:]).read_text(encoding="utf-8")
+        except OSError as error:
+            raise ValidationError(f"cannot read {value[1:]}: {error.strerror}") from None
+    return value
+
+
+def _read_stdin() -> str:
+    global _stdin_consumed
+    if _stdin_consumed:
+        raise ValidationError("standard input can only be read once per invocation")
+    if sys.stdin.isatty():
+        raise ValidationError("no content was supplied and standard input is a terminal")
+    _stdin_consumed = True
+    return sys.stdin.read()
+
+
+def _optional_time(value: object, name: str) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValidationError(f"{name} must be an ISO 8601 timestamp")
+    text = value.strip()
+    if text.endswith(("z", "Z")):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValidationError(f"{name} must be an ISO 8601 timestamp") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValidationError(f"{name} must include a timezone")
+    return parsed
+
+
+def _remote_time(value: object, name: str) -> str | None:
+    parsed = _optional_time(value, name)
+    return None if parsed is None else _encode_time(parsed)
+
+
+def _put(body: _Document, name: str, value: object) -> None:
+    if value is not None:
+        body[name] = value
+
+
+# ---------------------------------------------------------------------------------------------
+# Output
+#
+# These are the REST response shapes, projected from the same dataclasses REST projects them from,
+# so one field vocabulary covers three surfaces. `tests/unit/test_cli.py` compares every document
+# against `MemoryResponse`, `SearchHitResponse`, `PageResponse`, `AnswerResponse`,
+# `MemoryBatchResponse`, and `DeleteResponse`, so a drifting field fails a gate. The models are not
+# imported: they live in the FastAPI adapter, and the CLI must run on an install with no web
+# framework present -- including `--url` mode, whose whole point is that the server is elsewhere.
+
+
+def _memory_document(record: MemoryRecord | SearchHit) -> _Document:
+    document: _Document = {
+        "id": record.id,
+        "content": record.content,
+        "modality": record.modality.value,
+        "memory_type": record.memory_type.value,
+        "assets": [_asset_document(asset) for asset in record.assets],
+        "created_at": _encode_time(record.created_at),
+        "occurred_at": _encode_optional_time(record.occurred_at),
+        "occurred_end": _encode_optional_time(record.occurred_end),
+        "metadata": dict(record.metadata),
+    }
+    if isinstance(record, SearchHit):
+        document["score"] = record.score
+    return document
+
+
+def _asset_document(asset: AssetRef) -> _Document:
+    return {
+        "id": asset.id,
+        "modality": None if asset.modality is None else asset.modality.value,
+        "media_type": asset.media_type,
+        "size_bytes": asset.size_bytes,
+        "sha256": asset.sha256,
+        "name": asset.name,
+    }
+
+
+def _segment_document(segment: SpeakerSegment) -> _Document:
+    return {
+        "asset_id": segment.asset_id,
+        "start_ms": segment.start_ms,
+        "end_ms": segment.end_ms,
+        "text": segment.text,
+        "speaker_id": segment.speaker_id,
+        "speaker_name": segment.speaker_name,
+        "identity_score": segment.identity_score,
+    }
+
+
+def _encode_time(value: datetime) -> str:
+    text = value.isoformat()
+    return f"{text[:-6]}Z" if text.endswith("+00:00") else text
+
+
+def _encode_optional_time(value: datetime | None) -> str | None:
+    return None if value is None else _encode_time(value)
+
+
+# ---------------------------------------------------------------------------------------------
+# Failure
+
+
+def _fail(
+    code: str,
+    message: str,
+    *,
+    reason: str | None = None,
+    retryable: bool | None = None,
+    stage: str | None = None,
+    subject: str | None = None,
+) -> int:
+    envelope: _Document = {
+        "code": code,
+        "reason": reason,
+        "retryable": MindBridgeError(reason=reason).retryable if retryable is None else retryable,
+        "stage": stage,
+        # Unlike REST, the CLI runs as the invoking user on the machine that owns `data_dir`, so a
+        # local path or a failing batch position is information the caller already holds.
+        "subject": subject,
+        "message": message,
+        "trace_id": f"trace_{uuid4().hex}",
+        "issues": [],
+    }
+    return _forward(envelope)
+
+
+def _forward(envelope: _Document) -> int:
+    print(json.dumps(envelope, ensure_ascii=False), file=sys.stderr)
+    code = envelope.get("code")
+    reason = envelope.get("reason")
+    return _exit_code(
+        code if isinstance(code, str) else "internal_error",
+        reason if isinstance(reason, str) else None,
+    )
+
+
+def _exit_code(code: str, reason: str | None) -> int:
+    if code == StorageError.code and reason == "data_dir_in_use":
+        return DATA_DIR_IN_USE_EXIT_CODE
+    return EXIT_CODES.get(code, 1)
+
+
+# ---------------------------------------------------------------------------------------------
+# Parser
+#
+# Every default is read from the SDK signature it will be passed to, so `--help` shows the real
+# value and the CLI cannot drift from it the way the REST adapter's `list` default once did.
+
+
+def _default(operation: str, parameter: str) -> object:
+    return inspect.signature(getattr(Memory, operation)).parameters[parameter].default
+
+
+_MEMORY_DEFAULTS: Mapping[str, object] = {
+    name: _default("__init__", name) for name in ("data_dir", "answerer", "transcriber", *_TUNING)
+}
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=PROGRAM,
+        description="Local multimodal memory operations over one composed Memory instance.",
+        epilog="Data is JSON on stdout; diagnostics and failures are JSON on stderr.",
+    )
+    parser.add_argument("-V", "--version", action="version", version=f"mindbridge {_version()}")
+    parser.add_argument(
+        "--data-dir",
+        default=_MEMORY_DEFAULTS["data_dir"],
+        metavar="PATH",
+        help="local memory directory (default: %(default)s)",
+    )
+    # Not `required=True`: a missing composition is reported by `_resolve` as exit 10, because an
+    # agent has to tell "you never said which backend" from "you typed the flag wrong".
+    composition = parser.add_mutually_exclusive_group()
+    composition.add_argument("--app", metavar="MODULE:ATTR", help="an application-composed Memory")
+    composition.add_argument("--embedder", metavar="NAME", help=f"one of: {_recipes()}")
+    composition.add_argument("--url", metavar="URL", help="address a running owner over /v1")
+    parser.add_argument("--answerer", metavar="NAME", help="generation recipe, with --embedder")
+    parser.add_argument("--transcriber", metavar="NAME", help="speech recipe, with --embedder")
+    parser.add_argument("--index-speech", action="store_true", help="index transcripts on add")
+    parser.add_argument(
+        "--minimum-relevance",
+        type=float,
+        metavar="FLOAT",
+        default=_MEMORY_DEFAULTS["minimum_relevance"],
+        help="weak-evidence floor (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--ambiguity-margin",
+        type=float,
+        metavar="FLOAT",
+        default=_MEMORY_DEFAULTS["ambiguity_margin"],
+        help="top-two ambiguity gate (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--decay-half-life-days",
+        type=float,
+        metavar="FLOAT",
+        default=_MEMORY_DEFAULTS["decay_half_life_days"],
+        help="opt-in recency decay (default: %(default)s)",
+    )
+    parser.add_argument("--explain", action="store_true", help="print the composition and exit")
+    parser.add_argument("-q", "--quiet", action="store_true", help="suppress the stderr banner")
+    _commands(parser.add_subparsers(dest="command", required=True, metavar="COMMAND"))
+    return parser
+
+
+def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    add = _content_command(commands, "add", "store one memory")
+    add.add_argument("--occurred-at", metavar="TIME", help="ISO 8601 event start")
+    add.add_argument("--occurred-end", metavar="TIME", help="ISO 8601 event end")
+    add.add_argument("--metadata", metavar="JSON", help="application metadata object, @PATH, or -")
+    _memory_type_option(add, "add")
+    batch = commands.add_parser("add-many", help="store a JSONL batch in one transaction")
+    batch.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
+    _memory_type_option(batch, "add_many")
+    for name in ("search", "ask"):
+        command = _content_command(commands, name, f"{name} memories")
+        command.add_argument(
+            "--limit",
+            type=int,
+            default=_default(name, "limit"),
+            help="maximum hits (default: %(default)s)",
+        )
+        _memory_type_option(command, name)
+        command.add_argument("--reference-at", metavar="TIME", help="retrieval reference clock")
+    for name, help_text in (
+        ("get", "read one memory"),
+        ("speech", "transcribe and identify speakers"),
+        ("delete", "delete one memory"),
+    ):
+        commands.add_parser(name, help=help_text).add_argument("memory_id", metavar="MEMORY_ID")
+    speaker = commands.add_parser("register-speaker", help="name one recognized speaker")
+    speaker.add_argument("speaker_id", metavar="SPEAKER_ID")
+    speaker.add_argument("name", metavar="NAME")
+    reinforce = commands.add_parser("reinforce", help="record positive feedback")
+    reinforce.add_argument("memory_ids", nargs="+", metavar="MEMORY_ID")
+    listing = commands.add_parser("list", help="list newest memories")
+    listing.add_argument(
+        "--limit",
+        type=int,
+        default=_default("list", "limit"),
+        help="page size (default: %(default)s)",
+    )
+    listing.add_argument("--cursor", help="opaque cursor from a previous page")
+    for name, help_text in (
+        ("reindex", "rebuild the search index from SQLite"),
+        ("optimize", "merge staged index vectors"),
+        (DOCTOR, "resolve the composition and exercise each loader"),
+    ):
+        commands.add_parser(name, help=help_text)
+
+
+def _content_command(
+    commands: argparse._SubParsersAction[argparse.ArgumentParser],
+    name: str,
+    help_text: str,
+) -> argparse.ArgumentParser:
+    command = commands.add_parser(name, help=help_text)
+    command.add_argument(
+        "content",
+        nargs="*",
+        metavar=_QUERY_METAVAR[name],
+        help="text, @PATH for a local file, @@TEXT for a literal @, - for stdin",
+    )
+    command.add_argument("--content-json", metavar="VALUE", help="REST parts array, @PATH, or -")
+    return command
+
+
+def _memory_type_option(command: argparse.ArgumentParser, operation: str) -> None:
+    default = _default(operation, "memory_type")
+    command.add_argument(
+        "--memory-type",
+        choices=[item.value for item in MemoryType],
+        default=None if default is None else MemoryType(default).value,
+    )
+
+
+def _recipes() -> str:
+    return ", ".join(recipes.names())
+
+
+def _version() -> str:
+    try:
+        return _installed_version()
+    except Exception:
+        return "unknown"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

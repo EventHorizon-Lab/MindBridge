@@ -35,6 +35,7 @@ two or more media families are omni.
 | `assets` | Ordered, resolved `AssetRef` values |
 | `created_at` | Time the record was first stored |
 | `occurred_at` | Optional timezone-aware event time |
+| `occurred_end` | Optional timezone-aware end of an interval; requires `occurred_at` and must be later than it |
 | `metadata` | Detached JSON application payload |
 
 An asset is immutable media stored by SHA-256. Its public descriptor contains ID, modality, MIME
@@ -115,13 +116,17 @@ not model names:
 1. Natively supported media remains in the model input.
 2. If embedding does not support audio, audio is transcribed and removed; its transcript is added
    to the text while supported image and video parts remain.
-3. Grounded generation with a `SpeechBackend` resolves timed local speaker identities for supported
+3. A configured `TranscriptionBackend` transcribes every asset whose modality it declares during
+   `add`, whatever the embedder accepts. The transcript joins the record text, so the memory gains
+   lexical and text-vector keys in addition to the native media vector; the media itself is still
+   stored, embedded, and returned as evidence.
+4. Grounded generation with a `SpeechBackend` resolves timed local speaker identities for supported
    audio/video and includes them as structured evidence. Unsupported audio is removed after that
    analysis, while supported visual evidence remains.
-4. With `index_speech=True`, the same timed transcript, stable speaker IDs, and registered names
+5. With `index_speech=True`, the same timed transcript, stable speaker IDs, and registered names
    are persisted in the record before embedding so exact-name and dialogue queries can retrieve it.
    Registering or renaming an identity refreshes already indexed recordings atomically.
-5. If the remaining input is unsupported, the operation fails with `ModelError`.
+6. If the remaining input is unsupported, the operation fails with `ModelError`.
 
 An audio-only input therefore becomes transcript-only when fallback is required. A video or image
 is not silently discarded merely to reach a text model.
@@ -157,7 +162,7 @@ stable ID, optional registered name, and match score to the model-only grounding
 source hits remain unchanged. Generation-time analysis does not rewrite an existing record's
 `content`. `AnswerResult` contains the answer and source hits for display or grounding audits. The
 built-in backend sends one binary content part per distinct asset in an answer request, even when
-the question or several hits refer to it. It reserves the 64 MiB raw-media budget for question
+the question or several hits refer to it. It reserves the 64 MiB encoded-media budget for question
 assets, then admits ranked hit media until full; an overflow hit remains as text evidence when it
 has text.
 
@@ -167,8 +172,8 @@ SQLite commit/outbox and Zvec access sections that must observe one coherent loc
 Long text receives bounded overlapping retrieval keys while remaining one immutable returned
 record. MindBridge does not segment long media, generate model-authored semantic keys, or use a
 learned reranker. Applications should still ingest natural turns or bounded media clips. The
-OpenAI adapter inlines at most 64 MiB of raw media per model call; a provider-specific upload
-adapter is the large-video path.
+OpenAI adapter inlines at most 64 MiB of base64-encoded media per model call, which is roughly
+48 MiB of files on disk; a provider-specific upload adapter is the large-video path.
 
 ## Metadata is not isolation
 

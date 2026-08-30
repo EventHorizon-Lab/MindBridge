@@ -18,11 +18,16 @@ from mindbridge.exceptions import (
     MemoryNotFoundError,
     MindBridgeError,
     ModelError,
+    SpeakerNotFoundError,
     StorageError,
     ValidationError,
 )
 
 _LOGGER = logging.getLogger(__name__)
+_RETRY_AFTER_SECONDS = "1"
+# Subjects for these codes describe server state, not caller input, so an unauthenticated client
+# gets the code, reason, and stage without the local path or row the failure names.
+_PRIVATE_SUBJECT_CODES = frozenset({"index_unavailable", "internal_error", "storage_error"})
 
 
 class ErrorIssue(BaseModel):
@@ -37,6 +42,10 @@ class ErrorEnvelope(BaseModel):
     """The only error shape emitted by the REST API."""
 
     code: str
+    reason: str | None = None
+    retryable: bool = False
+    stage: str | None = None
+    subject: str | None = None
     message: str
     trace_id: str
     issues: tuple[ErrorIssue, ...] = ()
@@ -67,6 +76,7 @@ def register_error_handlers(app: FastAPI) -> None:
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             ValidationError.code,
             "request validation failed",
+            reason="input_invalid",
             issues=issues,
         )
 
@@ -78,7 +88,20 @@ def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(MindBridgeError)
     async def public_error(_request: Request, error: MindBridgeError) -> JSONResponse:
         status_code, message = _public_error(error)
-        return error_response(status_code, error.code, message)
+        return error_response(
+            status_code,
+            error.code,
+            message,
+            reason=error.reason,
+            retryable=error.retryable,
+            stage=error.stage,
+            subject=None if error.code in _PRIVATE_SUBJECT_CODES else error.subject,
+            headers=(
+                {"Retry-After": _RETRY_AFTER_SECONDS}
+                if status_code == status.HTTP_503_SERVICE_UNAVAILABLE and error.retryable
+                else None
+            ),
+        )
 
     @app.exception_handler(Exception)
     async def unexpected_error(_request: Request, error: Exception) -> JSONResponse:
@@ -88,6 +111,7 @@ def register_error_handlers(app: FastAPI) -> None:
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "internal_error",
             "the request failed unexpectedly",
+            reason="unexpected",
             trace_id=trace_id,
         )
 
@@ -97,12 +121,20 @@ def error_response(
     code: str,
     message: str,
     *,
+    reason: str | None = None,
+    retryable: bool = False,
+    stage: str | None = None,
+    subject: str | None = None,
     issues: tuple[ErrorIssue, ...] = (),
     headers: Mapping[str, str] | None = None,
     trace_id: str | None = None,
 ) -> JSONResponse:
     body = ErrorEnvelope(
         code=code,
+        reason=reason,
+        retryable=retryable,
+        stage=stage,
+        subject=subject,
         message=message,
         trace_id=trace_id or _trace_id(),
         issues=issues,
@@ -115,17 +147,34 @@ def error_response(
 
 
 def _public_error(error: MindBridgeError) -> tuple[int, str]:
+    """Map a public failure onto a status that says whether the same call can ever succeed."""
     if isinstance(error, ValidationError):
         return status.HTTP_422_UNPROCESSABLE_CONTENT, str(error) or "input is invalid"
     if isinstance(error, MemoryNotFoundError):
         return status.HTTP_404_NOT_FOUND, str(error) or "memory does not exist"
+    if isinstance(error, SpeakerNotFoundError):
+        return status.HTTP_404_NOT_FOUND, str(error) or "speaker does not exist"
     if isinstance(error, ModelError):
-        return status.HTTP_502_BAD_GATEWAY, "model operation failed"
+        return _model_status(error), str(error) or "model operation failed"
     if isinstance(error, IndexUnavailableError):
-        return status.HTTP_503_SERVICE_UNAVAILABLE, "memory index is unavailable"
+        return _storage_status(error), str(error) or "memory index is unavailable"
     if isinstance(error, StorageError):
-        return status.HTTP_503_SERVICE_UNAVAILABLE, "memory storage is unavailable"
-    return status.HTTP_500_INTERNAL_SERVER_ERROR, "the request failed unexpectedly"
+        return _storage_status(error), str(error) or "memory storage is unavailable"
+    return status.HTTP_500_INTERNAL_SERVER_ERROR, "memory operation failed"
+
+
+def _model_status(error: ModelError) -> int:
+    if error.reason == "backend_not_configured":
+        return status.HTTP_501_NOT_IMPLEMENTED
+    if error.reason == "unsupported_modality":
+        return status.HTTP_422_UNPROCESSABLE_CONTENT
+    return status.HTTP_503_SERVICE_UNAVAILABLE if error.retryable else status.HTTP_502_BAD_GATEWAY
+
+
+def _storage_status(error: StorageError) -> int:
+    if error.reason == "schema_unsupported":
+        return status.HTTP_500_INTERNAL_SERVER_ERROR
+    return status.HTTP_503_SERVICE_UNAVAILABLE
 
 
 def _http_error(status_code: int) -> tuple[str, str]:
