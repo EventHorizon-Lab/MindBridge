@@ -8,7 +8,7 @@ import sqlite3
 from collections.abc import Generator, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier, Event, Thread
@@ -1237,6 +1237,32 @@ def test_opt_in_speech_indexing_makes_registered_names_retrievable(
         }
 
 
+def test_generation_deduplicates_indexed_speech_evidence(tmp_path: Path) -> None:
+    models = _FakeModels(
+        capabilities=_Capabilities(
+            embedding=ALL_INPUT_MODALITIES,
+            generation=frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO}),
+            transcription=frozenset({Modality.AUDIO, Modality.VIDEO}),
+        )
+    )
+    with Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        transcriber=_FakeSpeech(),
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"red speech", "audio/wav", "speech.wav"))
+
+        result = memory.ask("what was said?")
+
+    routed = models.answer_calls[-1][1][0].content
+    assert routed.count("[speech identities:") == 1
+    assert routed.count("spoken red wrench") == 1
+    assert "[transcript:" not in routed
+    assert result.hits[0].content == record.content
+
+
 def test_speech_indexing_batches_add_many_recognition(tmp_path: Path) -> None:
     speech = _FakeSpeech()
     with Memory(
@@ -2433,6 +2459,22 @@ def test_the_transcript_marker_names_no_modality(tmp_path: Path) -> None:
     assert memory_module._LEXICAL_MATCH_CONFIDENCE > memory_module._DEFAULT_MINIMUM_RELEVANCE
     assert "spoken red wrench" in indexed
     assert not {"audio", "video"} & set(re.findall(r"\w+", indexed.casefold()))
+
+
+def test_transcript_fallback_remains_when_speech_has_no_identity_block(tmp_path: Path) -> None:
+    asset = replace(
+        AssetStore(tmp_path).materialize_bytes(
+            b"speech",
+            modality="audio",
+            mime_type="audio/wav",
+            name="speech.wav",
+        ),
+        transcript="spoken red wrench",
+    )
+
+    derived = memory_module._derived_text("", (asset,))
+
+    assert derived == f"[transcript:{asset.asset_id}]\nspoken red wrench"
 
 
 def test_audio_fallback_also_transcribes_declared_video_speech(tmp_path: Path) -> None:

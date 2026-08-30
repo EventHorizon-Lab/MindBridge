@@ -1909,7 +1909,11 @@ class Memory:
     ) -> _PreparedContent:
         speech_assets = self._answer_speech_assets(prepared.assets)
         self._recognize_speech(speech_assets, operation, reversible=True)
-        text = _speech_identity_text(prepared.text, speech_assets, operation.speech_segments)
+        base = _without_speech_identities(
+            prepared.text,
+            tuple(asset.asset_id for asset in speech_assets),
+        )
+        text = _speech_identity_text(base, speech_assets, operation.speech_segments)
         if len(text) > _MAX_TEXT_CHARACTERS:
             raise ModelError("speaker identity evidence exceeded the supported text length")
         return replace(prepared, text=text)
@@ -2907,7 +2911,8 @@ def _derived_text(text: str, assets: Sequence[StoredAsset]) -> str:
         # `asset.modality` would only move the free match to the commoner word. The modality is
         # already published on the record's assets, so nothing is lost by leaving it out.
         marker = f"[transcript:{asset.asset_id}]"
-        if marker not in text:
+        identity_marker = f"[speech identities:{asset.asset_id}]\n"
+        if marker not in text and identity_marker not in text:
             sections.append(f"{marker}\n{transcript}")
     return "\n\n".join(sections)
 
