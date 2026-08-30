@@ -1,4 +1,4 @@
-"""Audit the preregistered Jina video recipe v4/v5 benchmark pair.
+"""Audit the preregistered Jina video recipe v4/v6 benchmark pair.
 
 Usage:
     uv run --frozen python autoresearch/orchestrator-260830-2214/\
@@ -32,7 +32,7 @@ DEFAULT_ROOT = HERE / "ablation-jina-video-20260831"
 OUTPUT_JSON = HERE / "jina-video-ablation-pair.json"
 OUTPUT_MARKDOWN = HERE / "jina-video-ablation-pair.md"
 
-VERSIONS = ("v4", "v5")
+VERSIONS = ("v4", "v6")
 TASKS: dict[str, dict[str, Any]] = {
     "egolife-n10": {
         "task": "egolifeqa",
@@ -115,6 +115,10 @@ STORE_COUNT_FIELDS = (
 )
 LIVE_CAPTURE = "analyzer_live_sqlite"
 MANUAL_CAPTURE = "manual_from_live_sqlite_before_cleanup"
+EXPECTED_EMBEDDING_SPACES = {
+    "v4": "sentence-transformers:42535c50b8b082d72d74a78f4da87a7832483d40dd28f7c2dbfdfda2b6d1ccfd",
+    "v6": "sentence-transformers:459b06a9f4ad55f70bc5f4401482844d4ba0bf07d341daf1f93c8d50dfa937d2",
+}
 
 
 class AuditError(ValueError):
@@ -514,76 +518,76 @@ def _percentile(values: list[float], probability: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
-def _comparison(v4: float | int, v5: float | int) -> dict[str, Any]:
+def _comparison(v4: float | int, v6: float | int) -> dict[str, Any]:
     before = float(v4)
-    after = float(v5)
+    after = float(v6)
     return {
         "v4": v4,
-        "v5": v5,
+        "v6": v6,
         "delta": after - before,
         "delta_percent": None if before == 0 else (after - before) / before * 100,
     }
 
 
 def _node_comparisons(
-    v4: dict[str, Any], v5: dict[str, Any], label: str
+    v4: dict[str, Any], v6: dict[str, Any], label: str
 ) -> dict[str, dict[str, Any]]:
-    _require(v4.keys() == v5.keys(), f"{label}: performance node sets differ")
+    _require(v4.keys() == v6.keys(), f"{label}: performance node sets differ")
     result = {}
     for name in sorted(v4):
         before = _object(v4[name], f"{label}.v4.nodes.{name}")
-        after = _object(v5[name], f"{label}.v5.nodes.{name}")
+        after = _object(v6[name], f"{label}.v6.nodes.{name}")
         result[name] = {
             "count": _comparison(
                 _integer(before.get("count"), f"{label}.v4.{name}.count"),
-                _integer(after.get("count"), f"{label}.v5.{name}.count"),
+                _integer(after.get("count"), f"{label}.v6.{name}.count"),
             ),
             "average_ms": _comparison(
                 _number(before.get("average_ms"), f"{label}.v4.{name}.average_ms"),
-                _number(after.get("average_ms"), f"{label}.v5.{name}.average_ms"),
+                _number(after.get("average_ms"), f"{label}.v6.{name}.average_ms"),
             ),
         }
     return result
 
 
-def _token_comparisons(v4: dict[str, Any], v5: dict[str, Any], label: str) -> dict[str, Any]:
+def _token_comparisons(v4: dict[str, Any], v6: dict[str, Any], label: str) -> dict[str, Any]:
     left_modules = _object(v4["by_module"], f"{label}.v4.usage.by_module")
-    right_modules = _object(v5["by_module"], f"{label}.v5.usage.by_module")
+    right_modules = _object(v6["by_module"], f"{label}.v6.usage.by_module")
     _require(left_modules.keys() == right_modules.keys(), f"{label}: usage module sets differ")
 
     def summarize(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
         return {
             field: _comparison(
                 _number(left.get(field), f"{label}.v4.usage.{field}"),
-                _number(right.get(field), f"{label}.v5.usage.{field}"),
+                _number(right.get(field), f"{label}.v6.usage.{field}"),
             )
             for field in ("input_tokens", "output_tokens", "total_tokens")
         } | {
             "request_count": _comparison(
                 _integer(left.get("request_count"), f"{label}.v4.usage.request_count"),
-                _integer(right.get("request_count"), f"{label}.v5.usage.request_count"),
+                _integer(right.get("request_count"), f"{label}.v6.usage.request_count"),
             )
         }
 
     return {
-        "aggregate": summarize(v4, v5),
+        "aggregate": summarize(v4, v6),
         "by_module": {
             name: summarize(
                 _object(left_modules[name], f"{label}.v4.usage.{name}"),
-                _object(right_modules[name], f"{label}.v5.usage.{name}"),
+                _object(right_modules[name], f"{label}.v6.usage.{name}"),
             )
             for name in sorted(left_modules)
         },
     }
 
 
-def _retrieval(rows_v4: list[dict[str, Any]], rows_v5: list[dict[str, Any]]) -> dict[str, Any]:
+def _retrieval(rows_v4: list[dict[str, Any]], rows_v6: list[dict[str, Any]]) -> dict[str, Any]:
     ordered_equal = 0
     set_equal = 0
     top1_equal = 0
     overlaps = []
     jaccards = []
-    for before, after in zip(rows_v4, rows_v5, strict=True):
+    for before, after in zip(rows_v4, rows_v6, strict=True):
         left = before["memory_ids"]
         right = after["memory_ids"]
         left_set = set(left)
@@ -607,20 +611,64 @@ def _retrieval(rows_v4: list[dict[str, Any]], rows_v5: list[dict[str, Any]]) -> 
     }
 
 
-def _pair(slug: str, v4: dict[str, Any], v5: dict[str, Any]) -> dict[str, Any]:
-    _same_fields(v4["document"], v5["document"], DOCUMENT_CONFIG_FIELDS, slug)
-    _same_fields(v4["task"], v5["task"], TASK_CONFIG_FIELDS, slug)
-    _require(v4["data_root"] != v5["data_root"], f"{slug}: data_root is shared")
+def _score_flips(
+    rows_v4: list[dict[str, Any]], rows_v6: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    flips = []
+    for before, after in zip(rows_v4, rows_v6, strict=True):
+        if before["score"] == after["score"]:
+            continue
+        left = set(before["memory_ids"])
+        right = set(after["memory_ids"])
+        intersection = left & right
+        union = left | right
+        metadata = _object(before["metadata"], f"{before['sample_id']}.metadata")
+        flips.append(
+            {
+                "direction": "gain" if before["score"] < after["score"] else "loss",
+                "sample_id": before["sample_id"],
+                "question_id": before["question_id"],
+                "question_type": metadata.get("question_type", metadata.get("question_types")),
+                "v4": {
+                    "score": before["score"],
+                    "prediction": before.get("prediction"),
+                    "parsed_choice": before.get("parsed_choice"),
+                },
+                "v6": {
+                    "score": after["score"],
+                    "prediction": after.get("prediction"),
+                    "parsed_choice": after.get("parsed_choice"),
+                },
+                "retrieval": {
+                    "intersection_count": len(intersection),
+                    "set_jaccard": len(intersection) / len(union) if union else 1.0,
+                    "ordered_equal": before["memory_ids"] == after["memory_ids"],
+                    "set_equal": left == right,
+                    "top1_equal": bool(
+                        before["memory_ids"]
+                        and after["memory_ids"]
+                        and before["memory_ids"][0] == after["memory_ids"][0]
+                    ),
+                },
+            }
+        )
+    return flips
+
+
+def _pair(slug: str, v4: dict[str, Any], v6: dict[str, Any]) -> dict[str, Any]:
+    _same_fields(v4["document"], v6["document"], DOCUMENT_CONFIG_FIELDS, slug)
+    _same_fields(v4["task"], v6["task"], TASK_CONFIG_FIELDS, slug)
+    _require(v4["data_root"] != v6["data_root"], f"{slug}: data_root is shared")
     stores_v4 = v4["store_audit"]["stores"]
-    stores_v5 = v5["store_audit"]["stores"]
+    stores_v6 = v6["store_audit"]["stores"]
     _require(
-        stores_v4.keys() == stores_v5.keys(),
+        stores_v4.keys() == stores_v6.keys(),
         f"{slug}: store unit sets differ",
     )
     embedding_spaces: dict[str, dict[str, str]] = {}
     for unit in stores_v4:
         before_store = stores_v4[unit]
-        after_store = stores_v5[unit]
+        after_store = stores_v6[unit]
         _require(
             before_store["row_counts"] == after_store["row_counts"],
             f"{slug}/{unit}: durable row counts differ",
@@ -633,40 +681,46 @@ def _pair(slug: str, v4: dict[str, Any], v5: dict[str, Any]) -> dict[str, Any]:
             f"{slug}/{unit}: store metadata differences {sorted(changed)}; "
             "only embedding.space_id is allowed",
         )
+        _require(
+            before["embedding.space_id"] == EXPECTED_EMBEDDING_SPACES["v4"],
+            f"{slug}/{unit}: unexpected v4 embedding space",
+        )
+        _require(
+            after["embedding.space_id"] == EXPECTED_EMBEDDING_SPACES["v6"],
+            f"{slug}/{unit}: unexpected v6 embedding space",
+        )
         embedding_spaces[unit] = {
             "v4": before["embedding.space_id"],
-            "v5": after["embedding.space_id"],
+            "v6": after["embedding.space_id"],
         }
 
     rows_v4 = v4["rows"]
-    rows_v5 = v5["rows"]
+    rows_v6 = v6["rows"]
     _require(
-        [row["sample_id"] for row in rows_v4] == [row["sample_id"] for row in rows_v5],
+        [row["sample_id"] for row in rows_v4] == [row["sample_id"] for row in rows_v6],
         f"{slug}: sample identity/order differs",
     )
-    for index, (before, after) in enumerate(zip(rows_v4, rows_v5, strict=True)):
+    for index, (before, after) in enumerate(zip(rows_v4, rows_v6, strict=True)):
         for field in SAMPLE_INPUT_FIELDS:
             _require(
                 before[field] == after[field],
                 f"{slug}: sample {index} input differs at {field}",
             )
 
-    quality = _comparison(v4["score_mean"], v5["score_mean"])
+    flips = _score_flips(rows_v4, rows_v6)
+    quality = _comparison(v4["score_mean"], v6["score_mean"])
     quality["metric"] = v4["task"]["primary_metric"]
     quality["v4_correct_count"] = v4["correct_count"]
-    quality["v5_correct_count"] = v5["correct_count"]
-    quality["delta_percentage_points"] = (v5["score_mean"] - v4["score_mean"]) * 100
-    quality["gains"] = sum(
-        before["score"] < after["score"] for before, after in zip(rows_v4, rows_v5, strict=True)
-    )
-    quality["losses"] = sum(
-        before["score"] > after["score"] for before, after in zip(rows_v4, rows_v5, strict=True)
-    )
+    quality["v6_correct_count"] = v6["correct_count"]
+    quality["delta_percentage_points"] = (v6["score_mean"] - v4["score_mean"]) * 100
+    quality["gains"] = sum(flip["direction"] == "gain" for flip in flips)
+    quality["losses"] = sum(flip["direction"] == "loss" for flip in flips)
+    quality["score_flips"] = flips
 
     sample_latency_v4 = [float(row["latency_ms"]) for row in rows_v4]
-    sample_latency_v5 = [float(row["latency_ms"]) for row in rows_v5]
+    sample_latency_v6 = [float(row["latency_ms"]) for row in rows_v6]
     generation_v4 = v4["nodes"]["mindbridge.model.generation"]
-    generation_v5 = v5["nodes"]["mindbridge.model.generation"]
+    generation_v6 = v6["nodes"]["mindbridge.model.generation"]
     result = {
         "integrity": {
             "status_completed": True,
@@ -689,26 +743,26 @@ def _pair(slug: str, v4: dict[str, Any], v5: dict[str, Any]) -> dict[str, Any]:
                 "store_audit_capture_method": artifact["store_audit"]["capture_method"],
                 "data_root_stat": artifact["store_audit"]["data_root_stat"],
             }
-            for version, artifact in (("v4", v4), ("v5", v5))
+            for version, artifact in (("v4", v4), ("v6", v6))
         },
         "quality": quality,
         "latency_ms": {
-            "nodes": _node_comparisons(v4["nodes"], v5["nodes"], slug),
+            "nodes": _node_comparisons(v4["nodes"], v6["nodes"], slug),
             "ttft": _comparison(
                 _number(generation_v4["ttft_ms"]["average"], f"{slug}.v4.ttft"),
-                _number(generation_v5["ttft_ms"]["average"], f"{slug}.v5.ttft"),
+                _number(generation_v6["ttft_ms"]["average"], f"{slug}.v6.ttft"),
             ),
             "sample_p50": _comparison(
                 _percentile(sample_latency_v4, 0.50),
-                _percentile(sample_latency_v5, 0.50),
+                _percentile(sample_latency_v6, 0.50),
             ),
             "sample_p95": _comparison(
                 _percentile(sample_latency_v4, 0.95),
-                _percentile(sample_latency_v5, 0.95),
+                _percentile(sample_latency_v6, 0.95),
             ),
         },
-        "tokens": _token_comparisons(v4["usage"], v5["usage"], slug),
-        "retrieval_id_overlap": _retrieval(rows_v4, rows_v5),
+        "tokens": _token_comparisons(v4["usage"], v6["usage"], slug),
+        "retrieval_id_overlap": _retrieval(rows_v4, rows_v6),
     }
     result["verdict"] = "accept" if quality["delta"] >= 0 else "reject"
     return result
@@ -738,7 +792,19 @@ def audit(root: Path) -> dict[str, Any]:
                 "experiment: data_root directories must not be nested",
             )
 
-    tasks = {slug: _pair(slug, pair["v4"], pair["v5"]) for slug, pair in artifacts.items()}
+    m3_stats = {
+        version: _object(
+            artifacts["m3-l1"][version]["store_audit"]["data_root_stat"],
+            f"{version}-m3-l1.data_root_stat",
+        )
+        for version in VERSIONS
+    }
+    m3_identities = {version: (stat["device"], stat["inode"]) for version, stat in m3_stats.items()}
+    _require(
+        m3_identities["v4"] != m3_identities["v6"],
+        "m3-l1: v4 and v6 data_root device/inode identities are equal",
+    )
+    tasks = {slug: _pair(slug, pair["v4"], pair["v6"]) for slug, pair in artifacts.items()}
     regressions = [slug for slug, result in tasks.items() if result["verdict"] == "reject"]
     evidence_limitations = [
         f"{version}-{slug}: data_root device/inode unavailable after cleanup; "
@@ -747,20 +813,32 @@ def audit(root: Path) -> dict[str, Any]:
         for version, artifact in pair.items()
         if artifact["store_audit"]["capture_method"] == MANUAL_CAPTURE
     ]
+    _require(
+        evidence_limitations
+        == [
+            "v4-egolife-n10: data_root device/inode unavailable after cleanup; "
+            "sidecar manually transcribed from the live SQLite audit"
+        ],
+        "experiment: only the preregistered v4 Ego sidecar may use manual evidence",
+    )
     return {
         "schema_version": 1,
-        "experiment": "Jina video metadata recipe v4 versus v5",
+        "experiment": "Jina video metadata recipe v4 versus v6",
         "root": str(root.resolve()),
         "integrity": {
             "ready": True,
             "all_four_data_root_paths_distinct_and_not_nested": True,
             "paired_configuration_equal_except_embedding_space_recipe": True,
+            "m3_data_root_device_inode_distinct": {
+                version: {"device": identity[0], "inode": identity[1]}
+                for version, identity in m3_identities.items()
+            },
             "evidence_limitations": evidence_limitations,
         },
         "tasks": tasks,
         "verdict": {
             "decision": "reject" if regressions else "accept",
-            "quality_rule": "reject v5 if primary accuracy regresses on either task",
+            "quality_rule": "reject v6 if primary accuracy regresses on either task",
             "quality_regressions": regressions,
         },
     }
@@ -771,9 +849,9 @@ def _markdown(report: dict[str, Any]) -> str:
         "# Jina video metadata paired ablation",
         "",
         f"Verdict: **{report['verdict']['decision'].upper()}**. "
-        "Quality is the first-priority gate; any task regression rejects v5.",
+        "Quality is the first-priority gate; any task regression rejects v6.",
         "",
-        "| Task | v4 accuracy | v5 accuracy | Delta | TTFT delta | Generation tokens delta | Retrieval set Jaccard | Verdict |",
+        "| Task | v4 accuracy | v6 accuracy | Delta | TTFT delta | Generation tokens delta | Retrieval set Jaccard | Verdict |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for slug, task in report["tasks"].items():
@@ -782,7 +860,7 @@ def _markdown(report: dict[str, Any]) -> str:
         tokens = task["tokens"]["by_module"]["generation"]["total_tokens"]
         retrieval = task["retrieval_id_overlap"]
         lines.append(
-            f"| {slug} | {quality['v4']:.4%} | {quality['v5']:.4%} | "
+            f"| {slug} | {quality['v4']:.4%} | {quality['v6']:.4%} | "
             f"{quality['delta_percentage_points']:+.4f} pp | {ttft['delta_percent']:+.4f}% | "
             f"{tokens['delta_percent']:+.4f}% | {retrieval['mean_set_jaccard']:.4f} | "
             f"{task['verdict']} |"
@@ -791,14 +869,43 @@ def _markdown(report: dict[str, Any]) -> str:
         (
             "",
             "All pairs passed identity/order/input-hash/configuration checks, use distinct "
-            "physical stores, have zero errors/ingest/cache, and report complete usage. "
-            "Store metadata differs only at `embedding.space_id`.",
+            "data-root paths, have zero errors/ingest/cache, and report complete usage. "
+            "Store metadata differs only at `embedding.space_id`; M3 also has distinct "
+            "captured device/inode identities.",
+            "",
+            "Evidence limitation: v4 Ego's device/inode was not captured before cleanup. Its "
+            "hash-bound sidecar is explicitly marked as a manual transcription of the live "
+            "SQLite integrity, lock, count, and metadata audit.",
             "",
             "Node-level latency, TTFT, tokens by module, artifact hashes, embedding-space "
             "identities, and retrieval-ID overlap are preserved in the JSON companion.",
-            "",
         )
     )
+    flips = [
+        (slug, flip)
+        for slug, task in report["tasks"].items()
+        for flip in task["quality"]["score_flips"]
+    ]
+    lines.extend(
+        (
+            "",
+            "## Paired score flips",
+            "",
+            "| Task | Direction | Sample | Question type | v4 → v6 | ID overlap | Top-1 equal |",
+            "| --- | --- | --- | --- | ---: | ---: | --- |",
+        )
+    )
+    for slug, flip in flips:
+        question_type = json.dumps(flip["question_type"], ensure_ascii=False)
+        retrieval = flip["retrieval"]
+        lines.append(
+            f"| {slug} | {flip['direction']} | `{flip['sample_id']}` | {question_type} | "
+            f"{flip['v4']['score']} → {flip['v6']['score']} | "
+            f"{retrieval['intersection_count']} | {retrieval['top1_equal']} |"
+        )
+    if not flips:
+        lines.append("| — | — | No paired score flips | — | — | — | — |")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -810,7 +917,7 @@ def _replace(path: Path, content: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Fail-closed paired audit for the preregistered Jina v4/v5 video runs.",
+        description="Fail-closed paired audit for the preregistered Jina v4/v6 video runs.",
         epilog=(
             "Run --capture-store-audit RESULT_DIR before deleting each completed data_root. "
             "Run without --write for the final JSON on stdout; add --write to persist it."
