@@ -8,7 +8,7 @@ import json
 import subprocess
 import sys
 from dataclasses import dataclass
-from importlib.metadata import packages_distributions
+from importlib.metadata import distributions
 from pathlib import Path
 from typing import cast
 
@@ -95,10 +95,7 @@ def test_imported_distributions_are_declared() -> None:
         canonicalize_name(_name(item))
         for item in [*DEPENDENCIES, *(item for items in EXTRAS.values() for item in items)]
     }
-    provided = {
-        root: {canonicalize_name(dist) for dist in dists}
-        for root, dists in packages_distributions().items()
-    }
+    provided = _installed_roots()
     undeclared = {
         f"{path.relative_to(SOURCE)}:{line}": root
         for path in sorted(SOURCE.rglob("*.py"))
@@ -109,6 +106,33 @@ def test_imported_distributions_are_declared() -> None:
         f"imported but declared in no extra: {undeclared}; add each distribution to the "
         "narrowest optional extra that reaches the import"
     )
+
+
+def _installed_roots() -> dict[str, frozenset[str]]:
+    """Map each importable root to the installed distributions that provide it.
+
+    ``importlib.metadata.packages_distributions`` reads only ``top_level.txt`` before Python
+    3.12, and modern wheels omit that file, so on 3.10 and 3.11 it reports almost nothing and
+    the declaration check above would call every third-party import undeclared. Reading the
+    recorded files instead is what 3.12 does internally and behaves the same on every
+    supported interpreter.
+    """
+    roots: dict[str, set[str]] = {}
+    for distribution in distributions():
+        name = distribution.metadata["Name"]
+        if not name:
+            continue
+        canonical = canonicalize_name(name)
+        for recorded in distribution.files or ():
+            root = recorded.parts[0]
+            if root.startswith((".", "_distutils_hack")) or root.endswith(".dist-info"):
+                continue
+            if root.endswith(".py"):
+                root = root[: -len(".py")]
+            elif "." in root:
+                continue
+            roots.setdefault(root, set()).add(canonical)
+    return {root: frozenset(names) for root, names in roots.items()}
 
 
 def test_deferred_and_conditional_imports_are_classified(tmp_path: Path) -> None:
