@@ -890,17 +890,17 @@ class Memory:
                         operation,
                         reversible=True,
                     )
-                if Modality.AUDIO not in self._embedding_capabilities:
+                batched = tuple(asset for memory in missing for asset in memory.content.assets)
+                fallback = Modality.AUDIO not in self._embedding_capabilities
+                if fallback:
                     for memory in missing:
                         _fallback_unsupported(
                             memory.content,
                             self._embedding_capabilities,
                             "embedding",
                         )
-                    self._cache_audio_transcripts(
-                        tuple(asset for memory in missing for asset in memory.content.assets),
-                        operation,
-                    )
+                if fallback or self._derives_transcripts(batched):
+                    self._cache_audio_transcripts(batched, operation)
                 missing = [self._prepare_for_embedding(memory, operation) for memory in missing]
                 embedding_parts = tuple(
                     (memory, object_part, model_input)
@@ -1302,11 +1302,11 @@ class Memory:
             self._embedding_capabilities,
             "embedding",
         )
-        return (
-            self._with_audio_transcripts(prepared, operation)
-            if Modality.AUDIO in unsupported
-            else prepared
-        )
+        if Modality.AUDIO in unsupported:
+            _require_audio_transcription(self._transcription_capabilities)
+        elif not self._derives_transcripts(prepared.assets):
+            return prepared
+        return self._with_audio_transcripts(prepared, operation)
 
     def _route_generation(
         self,
@@ -1321,6 +1321,7 @@ class Memory:
         if self._answer_speech_assets(prepared.assets):
             prepared = self._with_speech_identities(prepared, operation)
         if Modality.AUDIO in unsupported:
+            _require_audio_transcription(self._transcription_capabilities)
             prepared = self._with_audio_transcripts(prepared, operation)
         value = self._resolved_model_input(prepared)
         unsupported = value.modalities - self._generation_capabilities
@@ -1394,12 +1395,10 @@ class Memory:
             )
         return tuple(routed)
 
-    def _answer_speech_assets(
+    def _transcribable_assets(
         self,
         assets: Sequence[StoredAsset],
     ) -> tuple[StoredAsset, ...]:
-        if not isinstance(self._transcriber, SpeechBackend):
-            return ()
         supported = {modality.value for modality in self._transcription_capabilities}
         return tuple(
             {
@@ -1407,6 +1406,21 @@ class Memory:
                 for asset in assets
                 if asset.modality in {"audio", "video"} and asset.modality in supported
             }.values()
+        )
+
+    def _answer_speech_assets(
+        self,
+        assets: Sequence[StoredAsset],
+    ) -> tuple[StoredAsset, ...]:
+        if not isinstance(self._transcriber, SpeechBackend):
+            return ()
+        return self._transcribable_assets(assets)
+
+    def _derives_transcripts(self, assets: Sequence[StoredAsset]) -> bool:
+        # A SpeechBackend indexes the same text through the explicit `index_speech` opt-in, so its
+        # add-time analysis cost stays behind that flag instead of being taken twice.
+        return not isinstance(self._transcriber, SpeechBackend) and bool(
+            self._transcribable_assets(assets)
         )
 
     def _with_speech_identities(
@@ -1492,8 +1506,7 @@ class Memory:
         prepared: _PreparedContent,
         operation: _OperationAssets,
     ) -> _PreparedContent:
-        audio = tuple(asset for asset in prepared.assets if asset.modality == "audio")
-        self._cache_audio_transcripts(audio, operation)
+        self._cache_audio_transcripts(prepared.assets, operation)
         assets = tuple(
             replace(asset, transcript=operation.transcripts[asset.asset_id])
             if asset.asset_id in operation.transcripts
@@ -1513,21 +1526,17 @@ class Memory:
         assets: Sequence[StoredAsset],
         operation: _OperationAssets,
     ) -> None:
-        audio = tuple(asset for asset in assets if asset.modality == "audio")
-        for asset in audio:
+        speech = self._transcribable_assets(assets)
+        for asset in speech:
             if asset.transcript is not None:
                 operation.transcripts.setdefault(asset.asset_id, asset.transcript)
         missing = tuple(
             dict.fromkeys(
-                asset.asset_id for asset in audio if asset.asset_id not in operation.transcripts
+                asset.asset_id for asset in speech if asset.asset_id not in operation.transcripts
             )
         )
         if missing:
-            if Modality.AUDIO not in self._transcription_capabilities:
-                raise ModelError(
-                    "audio fallback requires a transcription model with audio capability"
-                )
-            by_id = {asset.asset_id: asset for asset in audio}
+            by_id = {asset.asset_id: asset for asset in speech}
             refs = tuple(self._asset_ref(by_id[asset_id]) for asset_id in missing)
             try:
                 transcribe = getattr(self._transcriber, "transcribe", None)
@@ -2326,12 +2335,19 @@ def _fallback_unsupported(
     return unsupported
 
 
+def _require_audio_transcription(capabilities: frozenset[Modality]) -> None:
+    if Modality.AUDIO not in capabilities:
+        raise ModelError("audio fallback requires a transcription model with audio capability")
+
+
 def _derived_text(text: str, assets: Sequence[StoredAsset]) -> str:
     sections = [text] if text else []
     seen: set[str] = set()
     for asset in assets:
+        # A transcript is only ever cached for an asset the transcriber declared, so its presence
+        # is the routing decision; a second modality comparison here would discard video speech.
         transcript = asset.transcript
-        if asset.modality != "audio" or not transcript or asset.asset_id in seen:
+        if not transcript or asset.asset_id in seen:
             continue
         seen.add(asset.asset_id)
         marker = f"[audio transcript:{asset.asset_id}]"

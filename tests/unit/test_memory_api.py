@@ -1531,7 +1531,7 @@ def test_ask_reuses_query_transcript_for_generation(tmp_path: Path) -> None:
     assert models.answer_calls[-1][0].modalities == {Modality.TEXT}
 
 
-def test_ask_batches_and_persists_hit_transcripts_once(
+def test_omni_add_batches_declared_transcripts_and_ask_reuses_them(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1562,13 +1562,17 @@ def test_ask_batches_and_persists_hit_transcripts_once(
                 ("red second", Blob(b"second hit audio", "audio/wav", "second.wav")),
             )
         )
+        assert len(models.transcribe_calls) == 1
+        assert len(models.transcribe_calls[0]) == 2
+        models.transcribe_calls.clear()
+
         memory.ask("red")
         memory.ask("red")
 
-    assert len(models.transcribe_calls) == 1
-    assert len(models.transcribe_calls[0]) == 2
-    assert len(writes) == 1
-    assert len(writes[0]) == 2
+    assert models.transcribe_calls == []
+    # add persists a declared transcript inside its own memory write, so answering never
+    # re-transcribes a stored hit or takes the separate transcript transaction.
+    assert writes == []
 
 
 def test_no_hit_ask_routes_media_and_cannot_accept_fabricated_hits(tmp_path: Path) -> None:
@@ -1679,6 +1683,86 @@ def test_audio_falls_back_to_asr_while_visual_input_stays_native(tmp_path: Path)
         assert len(models.transcribe_calls) == 1
 
 
+def test_bare_media_memory_indexes_a_declared_transcript(tmp_path: Path) -> None:
+    models = _FakeModels()
+
+    with _memory(tmp_path, models) as memory:
+        record = memory.add(Blob(b"kettle recording", "audio/wav", "kettle.wav"))
+        index = _FakeIndex.instances[-1]
+        documents = memory._store.read_memory_index_documents((record.id,))
+
+    assert "spoken red wrench" in record.content
+    # Zvec attaches the BM25 document to the aggregate part alone, so an empty record content is
+    # an empty lexical document for the whole memory.
+    assert "spoken red wrench" in index.documents[record.id].content
+    assert [document.embedding.object_part for document in documents] == [0, 1, 2]
+    assert {document.embedding.task for document in documents} == {"retrieval.document"}
+    assert {document.embedding.space_id for document in documents} == {models.embedding_space}
+
+
+def test_declared_video_speech_becomes_indexed_text(tmp_path: Path) -> None:
+    models = _FakeModels(
+        capabilities=_Capabilities(
+            embedding=ALL_INPUT_MODALITIES,
+            generation=ALL_INPUT_MODALITIES,
+            transcription=frozenset({Modality.AUDIO, Modality.VIDEO}),
+        )
+    )
+
+    with _memory(tmp_path, models) as memory:
+        record = memory.add(Blob(b"kitchen recording", "video/mp4", "kitchen.mp4"))
+
+    assert record.modality is Modality.VIDEO
+    assert "spoken red wrench" in record.content
+    assert [asset.modality for asset in models.transcribe_calls[0]] == [Modality.VIDEO]
+
+
+def test_audio_fallback_also_transcribes_declared_video_speech(tmp_path: Path) -> None:
+    models = _FakeModels(
+        capabilities=_Capabilities(
+            embedding=frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO}),
+            generation=ALL_INPUT_MODALITIES,
+            transcription=frozenset({Modality.AUDIO, Modality.VIDEO}),
+        )
+    )
+
+    with _memory(tmp_path, models) as memory:
+        record = memory.add(
+            (
+                "red repair session",
+                Blob(b"spoken instructions", "audio/wav", "instructions.wav"),
+                Blob(b"session frames", "video/mp4", "session.mp4"),
+            )
+        )
+        stored = memory._store.read_assets(tuple(asset.id for asset in record.assets))
+
+    assert len(models.transcribe_calls) == 1
+    assert len(models.transcribe_calls[0]) == 2
+    assert [asset.transcript for asset in stored] == ["spoken red wrench"] * 2
+    assert record.content.count("[audio transcript:") == 2
+
+
+def test_text_only_add_never_reaches_the_transcriber(tmp_path: Path) -> None:
+    models = _FakeModels()
+
+    with _memory(tmp_path, models) as memory:
+        record = memory.add("red wrench on the bench")
+
+    assert record.content == "red wrench on the bench"
+    assert models.transcribe_calls == []
+    assert models.embed_batches == [("red wrench on the bench",)]
+
+
+def test_speech_backend_analysis_stays_behind_the_index_speech_opt_in(tmp_path: Path) -> None:
+    speech = _FakeSpeech()
+
+    with _memory(tmp_path, transcriber=speech) as memory:
+        record = memory.add(Blob(b"kitchen recording", "video/mp4", "kitchen.mp4"))
+
+    assert speech.calls == []
+    assert record.content == ""
+
+
 def test_vlm_generation_transcribes_audio_once_and_keeps_video(tmp_path: Path) -> None:
     capabilities = _Capabilities(
         embedding=ALL_INPUT_MODALITIES,
@@ -1695,7 +1779,7 @@ def test_vlm_generation_transcribes_audio_once_and_keeps_video(tmp_path: Path) -
                 Blob(b"bench video", "video/mp4", "bench.mp4"),
             )
         )
-        assert models.transcribe_calls == []
+        assert len(models.transcribe_calls) == 1
 
         question = (
             "What is on the red workbench?",
@@ -1822,13 +1906,12 @@ def test_invalid_long_transcript_is_not_persisted(tmp_path: Path) -> None:
             transcription=frozenset({Modality.AUDIO}),
         )
     )
+    audio = Blob(b"audio", "audio/wav", "audio.wav")
     with _memory(tmp_path, models) as memory:
-        memory.add(("red audio", Blob(b"audio", "audio/wav", "audio.wav")))
-
         with pytest.raises(ModelError, match="transcription exceeded"):
-            memory.ask("red")
+            memory.add(("red audio", audio))
         with pytest.raises(ModelError, match="transcription exceeded"):
-            memory.ask("red")
+            memory.add(("red audio", audio))
 
     assert len(models.transcribe_calls) == 2
 

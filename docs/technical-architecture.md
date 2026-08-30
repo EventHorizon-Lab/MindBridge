@@ -47,6 +47,9 @@ Each operation validates atomic modality sets from its adapter:
 - Generation routing uses `generation_capabilities` and never drops unsupported visual evidence.
 - Audio unsupported by embedding or generation may be replaced with a transcript when a
   transcriber exists.
+- Transcript derivation routes on `transcription_capabilities`, not on the gaps in the embedding
+  adapter. A `TranscriptionBackend` therefore transcribes declared audio and video during `add`,
+  and the derived text is stored beside the native media vector rather than replacing it.
 - `speech()` requires `SpeechBackend` because plain transcription has no timing or speaker data.
 
 Jina application text is wrapped as a non-string text value before its remote model code receives

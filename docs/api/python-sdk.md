@@ -56,6 +56,11 @@ and privacy behavior.
 `add`. Its transcript, stable speaker IDs, and names already registered at add time become stored,
 retrievable text. The default keeps speech analysis lazy.
 
+A `TranscriptionBackend` needs no flag. `add` transcribes every asset whose modality that backend
+declares and stores the transcript in the record, so a media memory has retrievable text next to
+its native media vector; the media is never replaced. `SpeechBackend` analysis stays behind
+`index_speech` because it also resolves speaker identity.
+
 `minimum_relevance` rejects weak dense evidence, while `ambiguity_margin` returns no hits when the
 top two dense confidences are effectively tied and the winner has neither a lexical nor temporal
 anchor. Both are calibrated `[0, 1]` values and may be set to `0` to disable that gate.
