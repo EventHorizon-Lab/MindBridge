@@ -18,7 +18,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, MediaKind, NonEmptyString
 
-ATM_BENCH_ADAPTER_VERSION = "atm_bench_official_v2"
+ATM_BENCH_ADAPTER_VERSION = "atm_bench_official_v3"
 
 AtmQuestionType = Literal["number", "list_recall", "open_end"]
 AtmEvidenceKind = Literal["email", "media"]

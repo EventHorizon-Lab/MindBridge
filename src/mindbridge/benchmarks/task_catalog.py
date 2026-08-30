@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
 
+from mindbridge.benchmarks.atm_bench import ATM_BENCH_ADAPTER_VERSION
+
 DEFAULT_BENCHMARKS_ROOT = Path(".benchmarks")
 
 
@@ -280,7 +282,7 @@ TASKS: dict[str, TaskSpec] = {
                 f"atm-bench-{split}",
                 "ATM-Bench",
                 f"atm-bench/data/atm-bench/atm-bench{'-hard' if split == 'hard' else ''}.json",
-                "atm_bench_official_v2",
+                ATM_BENCH_ADAPTER_VERSION,
                 _ATM,
                 digest=(
                     "acd35f2a172a9741d970d2cf21184ff0af8d79a8bf59967fc8aa33d619f6af4a"
@@ -299,7 +301,7 @@ TASKS: dict[str, TaskSpec] = {
                 f"atm-bench-{split}-sgm",
                 "ATM-Bench",
                 f"atm-bench/data/atm-bench/atm-bench{'-hard' if split == 'hard' else ''}.json",
-                "atm_bench_official_v2",
+                ATM_BENCH_ADAPTER_VERSION,
                 _ATM,
                 digest=(
                     "acd35f2a172a9741d970d2cf21184ff0af8d79a8bf59967fc8aa33d619f6af4a"

@@ -6,11 +6,14 @@ import json
 import os
 import stat
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
+from mindbridge.benchmarks.atm_bench import ATM_BENCH_ADAPTER_VERSION
 from mindbridge.benchmarks.download import acquire_media
+from mindbridge.benchmarks.eval import _cache_task
 from mindbridge.benchmarks.eval_adapters import MediaResolver, load_task
 from mindbridge.benchmarks.eval_cache import CachedAnswer, EvidenceInterval, ResponseCache
 from mindbridge.benchmarks.prepare_media import (
@@ -156,6 +159,63 @@ def test_evaluation_digest_tracks_media_root_content(tmp_path: Path) -> None:
     )
 
     assert first.evaluation_sha256 != second.evaluation_sha256
+
+
+@pytest.mark.parametrize("stem", ("20240423_195526_001", "20240423_195526(0)"))
+def test_atm_raw_media_filename_supplies_capture_time(tmp_path: Path, stem: str) -> None:
+    dataset = tmp_path / "questions.json"
+    dataset.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "question-1",
+                    "question": "What was in the photo?",
+                    "answer": "A clock.",
+                    "qtype": "open_end",
+                    "evidence_ids": ["20240423_195526"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    emails = tmp_path / "atm-bench/data/raw_memory/email/emails.json"
+    emails.parent.mkdir(parents=True)
+    emails.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "email202404230001",
+                    "timestamp": "2024-04-23 10:00:00",
+                    "short_summary": "Unrelated email",
+                    "detail": "",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / f"{stem}.jpg").write_bytes(b"image")
+
+    task = load_task(
+        TASKS["atm-bench-main"],
+        root=tmp_path,
+        dataset_path=dataset,
+        media_root=media,
+        verify_digest=False,
+    )
+
+    assert {
+        spec.adapter_version for name, spec in TASKS.items() if name.startswith("atm-bench-")
+    } == {ATM_BENCH_ADAPTER_VERSION}
+    assert ATM_BENCH_ADAPTER_VERSION == "atm_bench_official_v3"
+    assert _cache_task(task) == (
+        f"atm-bench-main:{ATM_BENCH_ADAPTER_VERSION}:{task.evaluation_sha256}"
+    )
+    email = next(item for item in task.units[0].memories if item.source_id.startswith("email"))
+    assert email.occurred_at == datetime(2024, 4, 23, 10, tzinfo=timezone.utc)
+    captured = next(item for item in task.units[0].memories if item.source_id == stem)
+    assert captured.occurred_at == datetime(2024, 4, 23, 19, 55, 26, tzinfo=timezone.utc)
 
 
 def test_response_cache_merges_run_shards_into_the_shared_cache(tmp_path: Path) -> None:

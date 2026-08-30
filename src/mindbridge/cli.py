@@ -1122,7 +1122,7 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         metavar="FLOAT",
         default=_MEMORY_DEFAULTS["ambiguity_margin"],
-        help="top-two ambiguity gate (default: %(default)s)",
+        help="top-two gate when limit=1 (default: %(default)s)",
     )
     parser.add_argument(
         "--decay-half-life-days",

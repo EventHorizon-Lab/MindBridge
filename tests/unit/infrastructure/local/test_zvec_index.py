@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ from typing import Any, NoReturn, cast
 
 import pytest
 
+import mindbridge.infrastructure.local.zvec_index as zvec_index_module
 from mindbridge.infrastructure.local.store import IndexDocument, StoredEmbedding
 from mindbridge.infrastructure.local.zvec_index import (
     IndexHit,
@@ -337,6 +339,95 @@ def test_schema_optimizes_time_ranges_and_automatic_maintenance(tmp_path: Path) 
         assert index.optimize_if_needed(minimum_unindexed=1) is False
 
 
+def test_flush_maintenance_compacts_persisted_segments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_zvec()
+    monkeypatch.setattr(zvec_index_module, "_AUTO_COMPACT_FLUSHES", 4)
+    path = tmp_path / "index"
+    with ZvecIndex(path, dimension=2) as index:
+        for number in range(4):
+            index.upsert(
+                [
+                    _document(
+                        f"embedding_{number}",
+                        "unique compacted target" if number == 3 else f"ordinary {number}",
+                        (0.0, 1.0) if number == 3 else (1.0, 0.0),
+                    )
+                ]
+            )
+            index.flush()
+            maintained = index.optimize_if_needed()
+
+        assert maintained is True
+        assert index.doc_count == 4
+        assert len(tuple((path / "idmap.0").glob("*.sst"))) == 1
+
+    with ZvecIndex(path, dimension=2) as reopened:
+        assert reopened.doc_count == 4
+        assert reopened.search((0.0, 1.0), limit=1, exact=True)[0].id == "embedding_3"
+        assert reopened.lexical_search("unique compacted target", limit=1)[0].id == "embedding_3"
+
+
+@pytest.mark.parametrize("failure_stage", ("validate", "stats"))
+def test_compaction_restores_the_previous_collection_when_reopen_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    _require_zvec()
+    path = tmp_path / "index"
+    with ZvecIndex(path, dimension=2) as index:
+        index.upsert([_document("preserved", "preserved content", (0.0, 1.0))])
+        index.flush()
+
+        with monkeypatch.context() as injected:
+            expected = f"replacement {failure_stage} failed"
+            if failure_stage == "validate":
+
+                def reject_replacement(_schema: object) -> NoReturn:
+                    raise RuntimeError("replacement validation failed")
+
+                injected.setattr(index, "_validate_schema", reject_replacement)
+                expected = "replacement validation failed"
+            else:
+
+                def reject_replacement_stats(_stats: object) -> NoReturn:
+                    raise RuntimeError("replacement stats failed")
+
+                injected.setattr(
+                    zvec_index_module,
+                    "_indexed_document_count",
+                    reject_replacement_stats,
+                )
+            with pytest.raises(RuntimeError, match=expected):
+                index._compact()
+
+        assert index.doc_count == 1
+        assert index.search((0.0, 1.0), exact=True)[0].id == "preserved"
+
+    with ZvecIndex(path, dimension=2) as reopened:
+        assert reopened.lexical_search("preserved content", limit=1)[0].id == "preserved"
+
+
+def test_write_refuses_to_consume_the_fd_safety_reserve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index = object.__new__(ZvecIndex)
+    index.dimension = 2
+    index._zvec = _FakeZvec
+    collection = _CapturingCollection()
+    index._collection = collection
+    monkeypatch.setattr(zvec_index_module, "_file_descriptor_usage", lambda: (900, 1_024))
+
+    with pytest.raises(OSError, match="before file descriptor exhaustion") as failure:
+        index.upsert([_document("embedding", "content", (1.0, 0.0))])
+
+    assert failure.value.errno == errno.EMFILE
+    assert collection.documents == []
+
+
 def test_type_and_event_time_filters_apply_to_every_search_mode(tmp_path: Path) -> None:
     _require_zvec()
     start = datetime(2026, 8, 17, tzinfo=timezone.utc)
@@ -413,6 +504,8 @@ def test_rebuild_replaces_all_documents_and_delete_is_idempotent(tmp_path: Path)
             == 1
         )
         assert index.doc_count == 1
+        assert index._flushes_since_optimization == 1
+        assert index._flushes_since_compaction == 1
         rebuilt = index.search((0.0, 1.0), exact=True)
         assert tuple(hit.id for hit in rebuilt) == ("embedding_new",)
         assert rebuilt[0].relevance == pytest.approx(1.0)

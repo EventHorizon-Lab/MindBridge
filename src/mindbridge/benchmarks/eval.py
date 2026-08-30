@@ -32,6 +32,7 @@ from mindbridge import (
     AssetRef,
     AsyncMemory,
     FunASRTranscriber,
+    IndexUnavailableError,
     JinaOmniEmbedder,
     MemoryType,
     MindBridgeError,
@@ -108,7 +109,7 @@ from mindbridge.models.jina import (
 from mindbridge.models.openai_sdk import _model_usage, _record_usage_batch
 
 EVAL_SCHEMA_VERSION = 7
-EVAL_RUNNER_VERSION = "mindbridge_eval_official_v6"
+EVAL_RUNNER_VERSION = "mindbridge_eval_official_v7"
 DEFAULT_BOOTSTRAP_SAMPLES = 2_000
 _RESULTS_FILE = "results.json"
 _SAMPLES_FILE = "samples.jsonl"
@@ -879,6 +880,8 @@ async def _ingest(
                 memory_type=MemoryType.EPISODIC,
             )
             return 0
+        except IndexUnavailableError:
+            raise
         except Exception:
             if len(chunk) > 1:
                 middle = len(chunk) // 2

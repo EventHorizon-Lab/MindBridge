@@ -127,7 +127,7 @@ Exit `9` from a local composition means another process owns the directory — r
 --transcriber NAME       speech recipe, with --embedder
 --index-speech           index transcripts and speaker identities on add
 --minimum-relevance F    weak-evidence floor (default: 0.55)
---ambiguity-margin F     top-two ambiguity gate (default: 0.01)
+--ambiguity-margin F     top-two gate when limit=1 (default: 0.01)
 --decay-half-life-days F opt-in recency decay (default: none)
 --explain                print the resolved composition to stdout and execute nothing
 -q, --quiet              suppress the stderr composition banner

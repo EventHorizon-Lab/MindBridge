@@ -169,9 +169,10 @@ derived keys to their authoritative parent memory before confidence-preserving f
 range-optimized time filters are pushed into Zvec and rechecked after hydration. A temporal query retrieves both
 in-range and global candidates, then applies a smooth proximity factor instead of a hard time gate.
 Event intervals match by overlap, not only by their start. Optional decay is another soft factor.
-Weak dense evidence and unresolved top-two ties are rejected unless qualified lexical or temporal
-evidence anchors the winner. Each hydrated hit has a score from 0 through 1; scores rank results
-within a request and are not stable global probabilities.
+Weak dense evidence is rejected. An unresolved top-two tie is rejected only for `limit=1`, unless
+qualified lexical or temporal evidence anchors the winner; larger limits preserve the qualified
+candidates. Each hydrated hit has a score from 0 through 1; scores rank results within a request and
+are not stable global probabilities.
 
 `ask` retrieves evidence first and routes those hits, including retained media, to generation. A
 configured `SpeechBackend` caches complete identity analysis and adds each segment's timing, text,

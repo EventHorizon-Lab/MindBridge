@@ -77,11 +77,11 @@ with Memory(
     print(f"indexed {indexed} memories")
 ```
 
-`reindex()` rebuilds the derived collection from SQLite. `optimize()` compacts and flushes staged
-Zvec data. MindBridge also triggers Zvec's background optimize after 100,000 additional vectors
-remain unindexed; the explicit operation remains useful before latency-sensitive workloads. Both
-explicit operations can be I/O intensive, so schedule them when request traffic is low and ensure
-enough free disk space.
+`reindex()` rebuilds the derived collection from SQLite. `optimize()` merges and flushes staged Zvec
+data. Routine outbox drains also optimize after 64 durable flushes or 100,000 unindexed vectors and
+copy-on-write compact the disposable collection after 256 flushes, bounding Zvec's segment file
+descriptors. Compaction briefly needs a second index-sized disk allocation. The explicit operations
+remain useful before latency-sensitive workloads; schedule them when traffic is low.
 
 Routine adds, deletes, and searches drain the durable outbox automatically. Do not edit
 `search_index_queue` by hand.

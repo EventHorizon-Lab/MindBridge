@@ -184,6 +184,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- Multi-result `search` and `ask` preserve qualified candidates when the top two scores tie;
+  ambiguity abstention now applies only to an unresolved `limit=1` choice.
+- Local Zvec maintenance periodically optimizes and copy-on-write compacts durable segments, so
+  repeated flushes do not exhaust the process file-descriptor limit.
+- ATM-Bench raw image and video memories derive event time through the release's filename parser,
+  and benchmark cache namespaces advance with the corrected retrieval semantics.
 - Transcript derivation is routed by the configured transcriber's declared
   `transcription_capabilities` rather than by the *embedder's* capabilities, so an omni-capable
   embedder no longer suppresses a transcriber that was explicitly configured.

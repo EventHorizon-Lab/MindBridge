@@ -53,8 +53,9 @@ with Memory("./data/assistant", embedder=JinaOmniEmbedder()) as memory:
 
 `Memory` never selects a provider or reads provider credentials.
 
-`search` returns a possibly empty tuple. MindBridge withholds weak or ambiguous evidence rather
-than always returning rows, so callers must handle the empty case; see
+`search` returns a possibly empty tuple. MindBridge always withholds weak evidence and withholds an
+unresolved top-two tie when `limit=1`; multi-result search returns the qualified candidates for the
+caller to handle. `ask` applies the same rule to evidence retrieval. See
 [search can legitimately return nothing](docs/quickstart.md#search-can-legitimately-return-nothing).
 
 ## Add grounded answers

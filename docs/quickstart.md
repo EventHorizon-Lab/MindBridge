@@ -86,12 +86,15 @@ good enough. An empty result is a normal answer, not an error. Two constructor g
   dense cosine similarity rescaled to `[0, 1]`, so `0.55` is roughly `0.10` cosine. A full-text
   lexical match instead sets a candidate's confidence to `0.6`, which clears the default gate on
   its own — so a shared keyword can return a hit that the vectors alone would have rejected.
-- `ambiguity_margin` (default `0.01`) returns no hits at all when the top two dense confidences are
-  effectively tied and the winner has neither a lexical nor a temporal anchor.
+- `ambiguity_margin` (default `0.01`) withholds an unresolved choice from `search(limit=1)` or
+  `ask(limit=1)` when the top two dense confidences are effectively tied and the winner has neither
+  a lexical nor a temporal anchor. Larger limits preserve the qualified candidates for the caller
+  or answerer.
 
 Both accept `0` to disable that gate, but reaching for that first is the wrong move. Withholding
-evidence instead of returning a confidently ranked wrong row is deliberate, and it is what lets a
-grounded `ask` say it does not know. Write the empty branch before tuning a threshold.
+one unresolved choice instead of returning a confidently ranked wrong row is deliberate. With a
+larger limit, candidate handling belongs to the caller or answerer. Write the empty branch before
+tuning a threshold.
 
 An unrelated query against a small store therefore returns `()` rather than the nearest available
 row. Any caller that indexes `search(...)[0]` will eventually raise `IndexError` in production.
