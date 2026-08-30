@@ -21,10 +21,61 @@ models = OpenAIModels(generation_client=client)
 
 Configure keys, base URL, proxy, timeout, and retries on `client`, not on MindBridge.
 
+## Reading a MindBridge error
+
+Every exception deriving from `MindBridgeError` carries four attributes beside its stable `code`:
+
+```python
+try:
+    memory.ask("what happened yesterday?")
+except MindBridgeError as error:
+    error.code  # stable outer taxonomy, for example "model_error"
+    error.reason  # closed sub-vocabulary, for example "rate_limited"; may be None
+    error.stage  # which pipeline stage failed, for example "generate"; may be None
+    error.subject  # asset ID, memory ID, or batch position; may be None
+    error.retryable  # bool derived from reason, never a guess
+```
+
+All four are optional and default to an unclassified, non-retryable failure, so existing handlers
+keep working. REST and MCP serialize the same five values; see
+[the REST error contract](api/rest.md#codes-and-reasons) for the vocabularies.
+
 ## Provider request failed
 
-MindBridge intentionally returns a sanitized `ModelError`. Inspect provider SDK telemetry and
-logs, while avoiding memory content and credentials. The SDK owns retry and network behavior.
+MindBridge returns a `ModelError` whose message is an author-written literal, never the provider's
+response. The provider's own exception survives as `__cause__`, so a local traceback still shows the
+root cause, and `reason` classifies it from the official SDK's exception classes:
+
+| `reason` | Provider condition | Retry |
+| --- | --- | --- |
+| `auth_failed` | `openai.AuthenticationError` | Never; fix the credential |
+| `rate_limited` | `openai.RateLimitError` | Yes, after a delay |
+| `timeout` | `openai.APITimeoutError` | Yes |
+| `connection_failed` | `openai.APIConnectionError` | Yes |
+| `request_rejected` | `openai.BadRequestError` | Never; the request itself is wrong |
+| unset | Anything else | Treated as permanent |
+
+Check `error.retryable` instead of inspecting the message. It is `False` unless `reason` is one of
+the transient values above, because failing to retry a transient error costs one call while retrying
+a permanent one never terminates. The provider SDK still owns its own retry and network behavior.
+
+## The operation says which stage failed
+
+Every public error carries `stage`: `open`, `content.prepare`, `embed`, `transcribe`, `generate`,
+`storage.write`, `storage.hydrate`, `storage.lookup`, `index.search`, `index.sync`, `retrieval.rank`,
+or `close`. These are the same names the OpenTelemetry spans use, so a failure and its trace agree.
+`stage` is `null` when MindBridge cannot attribute the failure to one stage.
+
+## A batch failed and I do not know which item
+
+`add_many` writes in one transaction, so one bad item fails the whole batch. The raised error's
+`subject` names the position, for example `contents[7]`. Fix that item and resubmit the batch.
+
+## Answering returns 501 rather than 502
+
+`ask` without an `answerer` is a permanent misconfiguration, not an upstream failure, so REST reports
+`501` with `reason: "backend_not_configured"`. Construct `Memory` with a generation backend. A `502`
+means a real upstream failure that will not succeed on retry; only `503` invites one.
 
 ## Remote URL is rejected
 
@@ -34,7 +85,11 @@ application's HTTP stack, then pass `Blob(data, media_type, name)` or a local `P
 ## Data directory is already in use
 
 Exactly one live `Memory` owns a directory. Stop the other process or select another physical
-directory. Do not add a logical tenant or request field to work around the lock.
+directory. Do not add a logical tenant or request field to work around the lock. This failure is
+`storage_error` with `reason: "data_dir_in_use"` and is the one storage failure that is retryable;
+the directory travels in `subject` rather than in the message, so an unauthenticated REST client
+never sees the local path. `reason: "schema_unsupported"` is its opposite: it is permanent, reports
+HTTP 500, and needs a different MindBridge version or a new directory.
 
 ## Store metadata mismatch
 

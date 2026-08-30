@@ -16,6 +16,8 @@ from mindbridge.exceptions import (
     IndexUnavailableError,
     MemoryNotFoundError,
     ModelError,
+    ModelOutputTruncatedError,
+    SpeakerNotFoundError,
     StorageError,
     ValidationError,
 )
@@ -32,6 +34,16 @@ from mindbridge.types import (
 )
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+ENVELOPE_FIELDS = {
+    "code",
+    "reason",
+    "retryable",
+    "stage",
+    "subject",
+    "message",
+    "trace_id",
+    "issues",
+}
 ASSET = AssetRef(
     id="asset_image",
     modality=Modality.IMAGE,
@@ -48,6 +60,7 @@ class FakeMemory:
         self.calls: list[tuple[object, ...]] = []
         self.close_count = 0
         self.failure = failure
+        self.deleted = True
 
     def add(
         self,
@@ -76,15 +89,33 @@ class FakeMemory:
         self,
         contents: Sequence[ContentInput],
         *,
+        occurred_at: Sequence[datetime | None] | None = None,
+        occurred_end: Sequence[datetime | None] | None = None,
+        metadata: Sequence[Mapping[str, object] | None] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> tuple[MemoryRecord, ...]:
         self._fail()
         copied = tuple(contents)
-        self.calls.append(("add_many", copied, memory_type))
+        occurrences = tuple(occurred_at or ())
+        occurrence_ends = tuple(occurred_end or ())
+        metadata_values = tuple(dict(value or {}) for value in metadata or ())
+        self.calls.append(
+            (
+                "add_many",
+                copied,
+                occurrences,
+                occurrence_ends,
+                metadata_values,
+                memory_type,
+            )
+        )
         return tuple(
             _record(
                 f"batch_{index}",
                 content if isinstance(content, str) else "Multimodal memory.",
+                occurred_at=occurrences[index] if occurrences else None,
+                occurred_end=occurrence_ends[index] if occurrence_ends else None,
+                metadata=metadata_values[index] if metadata_values else None,
                 memory_type=memory_type,
             )
             for index, content in enumerate(copied)
@@ -106,7 +137,7 @@ class FakeMemory:
         self,
         question: ContentInput,
         *,
-        limit: int = 10,
+        limit: int = 5,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
     ) -> AnswerResult:
@@ -119,7 +150,7 @@ class FakeMemory:
         self.calls.append(("get", memory_id))
         return _record(memory_id, "The toolbox is blue.")
 
-    def list(self, *, limit: int = 50, cursor: str | None = None) -> Page:
+    def list(self, *, limit: int = 100, cursor: str | None = None) -> Page:
         self._fail()
         self.calls.append(("list", limit, cursor))
         return Page(items=(_record("memory_1", "The toolbox is blue."),), next_cursor="next")
@@ -127,7 +158,7 @@ class FakeMemory:
     def delete(self, memory_id: str) -> bool:
         self._fail()
         self.calls.append(("delete", memory_id))
-        return True
+        return self.deleted
 
     def close(self) -> None:
         self.close_count += 1
@@ -154,7 +185,13 @@ def test_resource_routes_map_the_public_memory_values() -> None:
         )
         batch = client.post(
             "/v1/memories/batch",
-            json={"contents": [" first ", "second"], "memory_type": "procedural"},
+            json={
+                "contents": [" first ", "second"],
+                "occurred_at": [NOW.isoformat(), None],
+                "occurred_end": [None, None],
+                "metadata": [{"room": "workshop"}, None],
+                "memory_type": "procedural",
+            },
         )
         page = client.get("/v1/memories", params={"limit": 2, "cursor": "before"})
         found = client.get("/v1/memories/memory_1")
@@ -190,8 +227,8 @@ def test_resource_routes_map_the_public_memory_values() -> None:
     assert found.json()["id"] == "memory_1"
     assert searched.json()["hits"][0]["score"] == 0.9
     assert answered.json()["answer"] == "The toolbox is blue."
-    assert deleted.status_code == 204
-    assert deleted.content == b""
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": True}
     assert memory.calls == [
         (
             "add",
@@ -201,7 +238,14 @@ def test_resource_routes_map_the_public_memory_values() -> None:
             {"room": "workshop"},
             MemoryType.EPISODIC,
         ),
-        ("add_many", ("first", "second"), MemoryType.PROCEDURAL),
+        (
+            "add_many",
+            ("first", "second"),
+            (NOW, None),
+            (None, None),
+            ({"room": "workshop"}, {}),
+            MemoryType.PROCEDURAL,
+        ),
         ("list", 2, "before"),
         ("get", "memory_1"),
         ("search", "toolbox", 3, MemoryType.EPISODIC, NOW),
@@ -359,7 +403,7 @@ def test_old_isolation_fields_are_rejected_without_echoing_values(field: str) ->
 
     body = response.json()
     assert response.status_code == 422
-    assert set(body) == {"code", "message", "trace_id", "issues"}
+    assert set(body) == ENVELOPE_FIELDS
     assert body["code"] == "validation_error"
     assert body["issues"][0]["location"][-1] == field
     assert body["trace_id"].startswith("trace_")
@@ -392,27 +436,155 @@ def test_request_boundaries_are_strict(
 
 
 @pytest.mark.parametrize(
-    ("failure", "expected_status", "expected_code", "detail_is_public"),
+    ("failure", "expected_status", "expected_code"),
     [
-        (ValidationError("content is invalid"), 422, "validation_error", True),
-        (MemoryNotFoundError("memory is missing"), 404, "memory_not_found", True),
-        (ModelError("provider secret"), 502, "model_error", False),
-        (StorageError("database path"), 503, "storage_error", False),
-        (IndexUnavailableError("native detail"), 503, "index_unavailable", False),
+        (ValidationError("content is invalid"), 422, "validation_error"),
+        (MemoryNotFoundError("memory is missing"), 404, "memory_not_found"),
+        (SpeakerNotFoundError("speaker is missing"), 404, "speaker_not_found"),
+        (ModelError("routing failed"), 502, "model_error"),
+        (ModelOutputTruncatedError("answer was cut off"), 502, "model_output_truncated"),
+        (StorageError("durable write failed"), 503, "storage_error"),
+        (IndexUnavailableError("index rebuild failed"), 503, "index_unavailable"),
     ],
 )
-def test_public_errors_use_one_sanitized_envelope(
+def test_public_errors_use_one_envelope_carrying_author_written_messages(
     failure: Exception,
     expected_status: int,
     expected_code: str,
-    detail_is_public: bool,
 ) -> None:
     with TestClient(create_app(memory=FakeMemory(failure))) as client:
         response = client.get("/v1/memories/memory_1")
 
     assert response.status_code == expected_status
     assert response.json()["code"] == expected_code
-    assert (str(failure) in response.text) is detail_is_public
+    assert str(failure) in response.text
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status", "expected_reason", "expected_retryable"),
+    [
+        (
+            ModelError("answer backend is not configured", reason="backend_not_configured"),
+            501,
+            "backend_not_configured",
+            False,
+        ),
+        (
+            ModelError("model cannot embed video", reason="unsupported_modality"),
+            422,
+            "unsupported_modality",
+            False,
+        ),
+        (ModelError("provider refused", reason="auth_failed"), 502, "auth_failed", False),
+        (ModelError("provider is busy", reason="rate_limited"), 503, "rate_limited", True),
+        (ModelError("provider timed out", reason="timeout"), 503, "timeout", True),
+        (
+            StorageError("schema is too new", reason="schema_unsupported"),
+            500,
+            "schema_unsupported",
+            False,
+        ),
+        (
+            StorageError("directory is busy", reason="data_dir_in_use"),
+            503,
+            "data_dir_in_use",
+            True,
+        ),
+    ],
+)
+def test_status_follows_whether_the_same_call_can_ever_succeed(
+    failure: Exception,
+    expected_status: int,
+    expected_reason: str,
+    expected_retryable: bool,
+) -> None:
+    with TestClient(create_app(memory=FakeMemory(failure))) as client:
+        response = client.get("/v1/memories/memory_1")
+
+    body = response.json()
+    assert response.status_code == expected_status
+    assert body["reason"] == expected_reason
+    assert body["retryable"] is expected_retryable
+    assert (response.headers.get("Retry-After") is not None) is (
+        expected_retryable and expected_status == 503
+    )
+
+
+def test_error_envelope_reports_reason_stage_and_subject() -> None:
+    failure = ModelError(
+        "local media asset is unavailable",
+        reason="asset_unavailable",
+        stage="embed",
+        subject="asset_image",
+    )
+    with TestClient(create_app(memory=FakeMemory(failure))) as client:
+        body = client.get("/v1/memories/memory_1").json()
+
+    assert set(body) == ENVELOPE_FIELDS
+    assert body["reason"] == "asset_unavailable"
+    assert body["stage"] == "embed"
+    assert body["subject"] == "asset_image"
+    assert body["retryable"] is False
+
+
+def test_storage_subjects_stay_out_of_unauthenticated_responses() -> None:
+    failure = StorageError(
+        "the data directory is already in use by another live MindBridge instance",
+        reason="data_dir_in_use",
+        stage="open",
+        subject="/srv/private/mindbridge",
+    )
+    with TestClient(create_app(memory=FakeMemory(failure))) as client:
+        response = client.get("/v1/memories/memory_1")
+
+    assert response.json()["subject"] is None
+    assert "/srv/private/mindbridge" not in response.text
+
+
+def test_list_default_page_size_matches_the_sdk() -> None:
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory)) as client:
+        client.get("/v1/memories")
+
+    assert memory.calls == [("list", 100, None)]
+
+
+def test_delete_reports_whether_the_memory_existed() -> None:
+    memory = FakeMemory()
+    memory.deleted = False
+    with TestClient(create_app(memory=memory)) as client:
+        response = client.delete("/v1/memories/memory_1")
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": False}
+
+
+def test_batch_creation_carries_every_value_the_memory_identity_uses() -> None:
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory)) as client:
+        response = client.post(
+            "/v1/memories/batch",
+            json={
+                "contents": ["first", "second"],
+                "occurred_at": [NOW.isoformat(), None],
+                "occurred_end": [None, None],
+                "metadata": [{"room": "workshop"}, None],
+            },
+        )
+
+    assert response.status_code == 201
+    assert memory.calls == [
+        (
+            "add_many",
+            ("first", "second"),
+            (NOW, None),
+            (None, None),
+            ({"room": "workshop"}, {}),
+            MemoryType.SEMANTIC,
+        )
+    ]
+    assert response.json()["memories"][0]["occurred_at"] == "2026-08-27T12:00:00Z"
+    assert response.json()["memories"][0]["metadata"] == {"room": "workshop"}
 
 
 def test_unexpected_and_framework_errors_keep_the_flat_envelope() -> None:
@@ -426,7 +598,7 @@ def test_unexpected_and_framework_errors_keep_the_flat_envelope() -> None:
     assert "private implementation detail" not in failed.text
     assert missing.status_code == 404
     assert missing.json()["code"] == "not_found"
-    assert set(missing.json()) == {"code", "message", "trace_id", "issues"}
+    assert set(missing.json()) == ENVELOPE_FIELDS
 
 
 def test_size_limit_runs_before_body_parsing() -> None:

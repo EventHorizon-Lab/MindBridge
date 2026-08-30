@@ -137,12 +137,15 @@ class MemoryCreate(_RequestModel):
     content: _Content
     occurred_at: AwareDatetime | None = None
     occurred_end: AwareDatetime | None = None
-    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    metadata: dict[str, JsonValue] | None = None
     memory_type: MemoryType = MemoryType.SEMANTIC
 
 
 class MemoryBatchCreate(_RequestModel):
     contents: Annotated[list[_Content], Field(min_length=1, max_length=100)]
+    occurred_at: list[AwareDatetime | None] | None = None
+    occurred_end: list[AwareDatetime | None] | None = None
+    metadata: list[dict[str, JsonValue] | None] | None = None
     memory_type: MemoryType = MemoryType.SEMANTIC
 
 
@@ -202,6 +205,10 @@ class AnswerResponse(_ResponseModel):
     hits: tuple[SearchHitResponse, ...]
 
 
+class DeleteResponse(_ResponseModel):
+    deleted: bool
+
+
 class PageResponse(_ResponseModel):
     items: tuple[MemoryResponse, ...]
     next_cursor: str | None = None
@@ -226,6 +233,9 @@ class _Memory(Protocol):
         self,
         contents: Sequence[ContentInput],
         *,
+        occurred_at: Sequence[datetime | None] | None = None,
+        occurred_end: Sequence[datetime | None] | None = None,
+        metadata: Sequence[Mapping[str, object] | None] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> tuple[MemoryRecord, ...]: ...
 
@@ -242,14 +252,14 @@ class _Memory(Protocol):
         self,
         question: ContentInput,
         *,
-        limit: int = 10,
+        limit: int = 5,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
     ) -> AnswerResult: ...
 
     def get(self, memory_id: str) -> MemoryRecord: ...
 
-    def list(self, *, limit: int = 50, cursor: str | None = None) -> Page: ...
+    def list(self, *, limit: int = 100, cursor: str | None = None) -> Page: ...
 
     def delete(self, memory_id: str) -> bool: ...
 
@@ -317,7 +327,11 @@ def create_app(
         status.HTTP_500_INTERNAL_SERVER_ERROR,
     )
     standard_errors = error_responses(*standard_statuses)
-    model_errors = error_responses(*standard_statuses, status.HTTP_502_BAD_GATEWAY)
+    model_errors = error_responses(
+        *standard_statuses,
+        status.HTTP_501_NOT_IMPLEMENTED,
+        status.HTTP_502_BAD_GATEWAY,
+    )
     not_found_errors = error_responses(*standard_statuses, status.HTTP_404_NOT_FOUND)
 
     @app.get(
@@ -358,6 +372,9 @@ def create_app(
             {
                 "memories": current_service().add_many(
                     tuple(_content_input(content) for content in request.contents),
+                    occurred_at=request.occurred_at,
+                    occurred_end=request.occurred_end,
+                    metadata=request.metadata,
                     memory_type=request.memory_type,
                 )
             }
@@ -370,7 +387,7 @@ def create_app(
         responses=standard_errors,
     )
     def list_memories(
-        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        limit: Annotated[int, Query(ge=1, le=100)] = 100,
         cursor: Annotated[str | None, Query(min_length=1)] = None,
     ) -> PageResponse:
         return PageResponse.model_validate(current_service().list(limit=limit, cursor=cursor))
@@ -404,13 +421,12 @@ def create_app(
 
     @router.delete(
         "/memories/{memory_id}",
-        status_code=status.HTTP_204_NO_CONTENT,
+        response_model=DeleteResponse,
         operation_id="deleteMemory",
         responses=standard_errors,
     )
-    def delete_memory(memory_id: _MemoryId) -> Response:
-        current_service().delete(memory_id)
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    def delete_memory(memory_id: _MemoryId) -> DeleteResponse:
+        return DeleteResponse(deleted=current_service().delete(memory_id))
 
     @router.post(
         "/answers",
@@ -548,4 +564,5 @@ def _request_too_large() -> Response:
         status.HTTP_413_CONTENT_TOO_LARGE,
         "request_too_large",
         f"request body must not exceed {_MAX_REQUEST_BODY_BYTES} bytes",
+        reason="payload_too_large",
     )

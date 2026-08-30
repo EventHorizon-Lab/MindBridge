@@ -245,8 +245,12 @@ class OpenAIModels:
             )
         except ModelError:
             raise
-        except Exception:
-            raise ModelError("embedding request failed") from None
+        except Exception as error:
+            raise ModelError(
+                "embedding request failed",
+                reason=_provider_reason(error),
+                stage="embed",
+            ) from error
         _record_openai_usage(
             response,
             input_modalities=frozenset(
@@ -274,8 +278,12 @@ class OpenAIModels:
             response = create_completion(**request)
         except ModelError:
             raise
-        except Exception:
-            raise ModelError("generation request failed") from None
+        except Exception as error:
+            raise ModelError(
+                "generation request failed",
+                reason=_provider_reason(error),
+                stage="generate",
+            ) from error
         _record_openai_usage(
             response,
             input_modalities=modalities,
@@ -326,7 +334,11 @@ class OpenAIModels:
                     or len(choices) != 1
                     or getattr(choices[0], "index", None) != 0
                 ):
-                    raise ModelError("generation response was invalid")
+                    raise ModelError(
+                        "generation response was invalid",
+                        reason="response_invalid",
+                        stage="generate",
+                    )
                 chunk_finish_reason = getattr(choices[0], "finish_reason", None)
                 if chunk_finish_reason is not None:
                     finish_reason = chunk_finish_reason
@@ -334,7 +346,11 @@ class OpenAIModels:
                 if content is None:
                     continue
                 if not isinstance(content, str):
-                    raise ModelError("generation response was invalid")
+                    raise ModelError(
+                        "generation response was invalid",
+                        reason="response_invalid",
+                        stage="generate",
+                    )
                 if content:
                     if not emitted:
                         span.set_attribute(MODEL_TTFT, elapsed)
@@ -342,8 +358,12 @@ class OpenAIModels:
                     yield content
         except ModelError:
             raise
-        except Exception:
-            raise ModelError("generation request failed") from None
+        except Exception as error:
+            raise ModelError(
+                "generation request failed",
+                reason=_provider_reason(error),
+                stage="generate",
+            ) from error
         finally:
             if usage_response is not None:
                 _record_openai_usage(
@@ -353,9 +373,11 @@ class OpenAIModels:
                 )
         _record_finish_reason(finish_reason)
         if finish_reason == "length":
-            raise ModelOutputTruncatedError(_TRUNCATED_ANSWER_ERROR)
+            raise ModelOutputTruncatedError(_TRUNCATED_ANSWER_ERROR, stage="generate")
         if finish_reason == "content_filter" or not emitted:
-            raise ModelError("generation response was invalid")
+            raise ModelError(
+                "generation response was invalid", reason="response_invalid", stage="generate"
+            )
 
     def _answer_request(
         self,
@@ -389,7 +411,10 @@ class OpenAIModels:
             )
         )
         if sum(len(part.encode("utf-8")) for part in text_parts) > _MAX_GROUNDED_TEXT_BYTES:
-            raise ModelError("grounding evidence exceeds 4 MiB; lower the answer limit")
+            raise ModelError(
+                "grounding evidence exceeds 4 MiB; lower the answer limit",
+                reason="payload_too_large",
+            )
         required = {Modality.TEXT}
         required.update(cast(Modality, asset.modality) for asset in assets)
         modalities = frozenset(required)
@@ -458,8 +483,12 @@ class OpenAIModels:
                         )
                 except ModelError:
                     raise
-                except Exception:
-                    raise ModelError("transcription request failed") from None
+                except Exception as error:
+                    raise ModelError(
+                        "transcription request failed",
+                        reason=_provider_reason(error),
+                        stage="transcribe",
+                    ) from error
                 usages.append(
                     _model_usage(
                         response,
@@ -469,7 +498,11 @@ class OpenAIModels:
                 )
                 text = getattr(response, "text", None)
                 if not isinstance(text, str):
-                    raise ModelError("transcription response was invalid") from None
+                    raise ModelError(
+                        "transcription response was invalid",
+                        reason="response_invalid",
+                        stage="transcribe",
+                    ) from None
                 results.append(text.strip())
         finally:
             _record_usage_batch(usages, request_count=attempted)
@@ -481,7 +514,10 @@ class OpenAIModels:
     def _client(self, operation: _Operation) -> OpenAI:
         client = self._clients.get(operation)
         if client is None:
-            raise ModelError(f"{operation} SDK client is not configured")
+            raise ModelError(
+                f"{operation} SDK client is not configured",
+                reason="backend_not_configured",
+            )
         return client
 
 
@@ -696,6 +732,28 @@ def _text(value: object, name: str) -> str:
     return value.strip()
 
 
+def _provider_reason(error: Exception) -> str | None:
+    """Classify a failed request with the official OpenAI SDK's own exception taxonomy.
+
+    An unrecognized failure stays unclassified rather than being guessed into a retryable reason.
+    """
+    try:
+        import openai
+    except ImportError:  # pragma: no cover - a client call implies the SDK imported already
+        return None
+    # ``APITimeoutError`` subclasses ``APIConnectionError``, so the narrower class is checked first.
+    for provider_error, reason in (
+        (openai.AuthenticationError, "auth_failed"),
+        (openai.RateLimitError, "rate_limited"),
+        (openai.APITimeoutError, "timeout"),
+        (openai.APIConnectionError, "connection_failed"),
+        (openai.BadRequestError, "request_rejected"),
+    ):
+        if isinstance(error, provider_error):
+            return reason
+    return None
+
+
 def _require_capabilities(
     operation: str,
     required: frozenset[Modality],
@@ -704,7 +762,10 @@ def _require_capabilities(
     missing = required - supported
     if missing:
         names = ", ".join(sorted(value.value for value in missing))
-        raise ModelError(f"configured {operation} model does not support: {names}")
+        raise ModelError(
+            f"configured {operation} model does not support: {names}",
+            reason="unsupported_modality",
+        )
 
 
 def _embedding_vectors(
@@ -714,7 +775,7 @@ def _embedding_vectors(
 ) -> tuple[tuple[float, ...], ...]:
     data = getattr(response, "data", None)
     if not isinstance(data, list) or len(data) != count:
-        raise ModelError("embedding response was invalid")
+        raise ModelError("embedding response was invalid", reason="response_invalid", stage="embed")
     ordered: list[tuple[float, ...] | None] = [None] * count
     for item in data:
         index = getattr(item, "index", None)
@@ -730,7 +791,9 @@ def _embedding_vectors(
                 isinstance(value, bool) or not isinstance(value, int | float) for value in values
             )
         ):
-            raise ModelError("embedding response was invalid")
+            raise ModelError(
+                "embedding response was invalid", reason="response_invalid", stage="embed"
+            )
         ordered[index] = _normalized(values, dimension)
     return tuple(vector for vector in ordered if vector is not None)
 
@@ -742,16 +805,22 @@ def _answer_text(response: object) -> str:
         or len(choices) != 1
         or getattr(choices[0], "index", None) != 0
     ):
-        raise ModelError("generation response was invalid")
+        raise ModelError(
+            "generation response was invalid", reason="response_invalid", stage="generate"
+        )
     finish_reason = getattr(choices[0], "finish_reason", None)
     _record_finish_reason(finish_reason)
     if finish_reason == "length":
-        raise ModelOutputTruncatedError(_TRUNCATED_ANSWER_ERROR)
+        raise ModelOutputTruncatedError(_TRUNCATED_ANSWER_ERROR, stage="generate")
     if finish_reason == "content_filter":
-        raise ModelError("generation response was invalid")
+        raise ModelError(
+            "generation response was invalid", reason="response_invalid", stage="generate"
+        )
     answer = getattr(getattr(choices[0], "message", None), "content", None)
     if not isinstance(answer, str) or not answer.strip():
-        raise ModelError("generation response was invalid")
+        raise ModelError(
+            "generation response was invalid", reason="response_invalid", stage="generate"
+        )
     return answer.strip()
 
 
@@ -842,12 +911,23 @@ def _require_inline_size(
         try:
             actual_size = path.resolve(strict=True).stat().st_size
         except OSError:
-            raise ModelError("local media asset is unavailable") from None
+            raise ModelError(
+                "local media asset is unavailable",
+                reason="asset_unavailable",
+                subject=asset.id,
+            ) from None
         if asset.size_bytes != actual_size:
-            raise ModelError("local media asset changed after ingestion")
+            raise ModelError(
+                "local media asset changed after ingestion",
+                reason="asset_changed",
+                subject=asset.id,
+            )
         size += _encoded_size(actual_size)
     if size > _MAX_INLINE_MODEL_BYTES:
-        raise ModelError("encoded inline model media exceeds 64 MiB; use a provider upload adapter")
+        raise ModelError(
+            "encoded inline model media exceeds 64 MiB; use a provider upload adapter",
+            reason="payload_too_large",
+        )
 
 
 def _encoded_size(size: int) -> int:
@@ -959,9 +1039,17 @@ def _asset_data(asset: AssetRef) -> str:
     try:
         data = path.resolve(strict=True).read_bytes()
     except OSError:
-        raise ModelError("local media asset is unavailable") from None
+        raise ModelError(
+            "local media asset is unavailable",
+            reason="asset_unavailable",
+            subject=asset.id,
+        ) from None
     if asset.size_bytes is not None and len(data) != asset.size_bytes:
-        raise ModelError("local media asset changed after ingestion")
+        raise ModelError(
+            "local media asset changed after ingestion",
+            reason="asset_changed",
+            subject=asset.id,
+        )
     return base64.b64encode(data).decode("ascii")
 
 
@@ -986,9 +1074,9 @@ def _resolved_asset(asset: AssetRef) -> tuple[Modality, str, Path]:
 
 def _normalized(values: Sequence[float], dimension: int) -> tuple[float, ...]:
     if len(values) != dimension:
-        raise ModelError("embedding response was invalid")
+        raise ModelError("embedding response was invalid", reason="response_invalid", stage="embed")
     vector = tuple(values)
     norm = math.hypot(*vector)
     if not math.isfinite(norm) or norm == 0.0:
-        raise ModelError("embedding response was invalid")
+        raise ModelError("embedding response was invalid", reason="response_invalid", stage="embed")
     return tuple(value / norm for value in vector)

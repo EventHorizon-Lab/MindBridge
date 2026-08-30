@@ -774,14 +774,67 @@ def test_ask_without_answerer_fails_before_retrieval_or_reinforcement(tmp_path: 
         record = memory.add("red target")
         index = _FakeIndex.instances[-1]
 
-        with pytest.raises(ModelError, match="answer backend is not configured"):
+        with pytest.raises(ModelError, match="answer backend is not configured") as unconfigured:
             memory.ask("red target")
+        assert unconfigured.value.reason == "backend_not_configured"
+        assert unconfigured.value.retryable is False
 
         stored = memory._store.read_memory(record.id)
         assert stored is not None
         assert stored.access_count == 0
         assert models.embed_tasks == [EmbedTask.DOCUMENT]
         assert index.hybrid_search_calls == 0
+
+
+def test_unsupported_schema_is_permanent_where_a_busy_directory_is_not(tmp_path: Path) -> None:
+    with _memory(tmp_path) as memory:
+        memory.add("remember this")
+
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.execute("PRAGMA user_version = 999")
+        connection.commit()
+
+    with pytest.raises(StorageError) as failure:
+        _memory(tmp_path)
+
+    assert failure.value.reason == "schema_unsupported"
+    assert failure.value.retryable is False
+    assert failure.value.stage == "open"
+
+
+def test_a_failing_batch_item_names_its_position(tmp_path: Path) -> None:
+    with _memory(tmp_path) as memory, pytest.raises(ValidationError) as failure:
+        memory.add_many(("first", "second", "   "))
+
+    assert failure.value.subject == "contents[2]"
+    assert failure.value.stage == "content.prepare"
+
+
+def test_storage_failures_name_the_stage_that_failed(tmp_path: Path) -> None:
+    with _memory(tmp_path) as memory:
+        memory.add("remember this")
+        with (
+            _failing_store(memory, "list_memories"),
+            pytest.raises(StorageError) as failure,
+        ):
+            memory.list()
+
+    assert failure.value.reason == "io_failed"
+    assert failure.value.retryable is False
+
+
+@contextmanager
+def _failing_store(memory: Memory, method: str) -> Iterator[None]:
+    original = getattr(memory._store, method)
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    setattr(memory._store, method, fail)
+    try:
+        yield
+    finally:
+        setattr(memory._store, method, original)
 
 
 def test_explicit_embedder_owns_embedding_and_models_own_generation(tmp_path: Path) -> None:
@@ -1372,8 +1425,15 @@ def test_data_directories_are_isolated_and_metadata_changes_fail_fast(tmp_path: 
         _memory(tmp_path / "first", first_models) as first,
         _memory(tmp_path / "second", second_models) as second,
     ):
-        with pytest.raises(StorageError, match="already in use"):
+        with pytest.raises(StorageError, match="already in use") as busy:
             _memory(tmp_path / "first", _FakeModels())
+        # Transient and permanent open failures no longer collapse into one message, and the
+        # directory travels in `subject` rather than in the message every transport forwards.
+        assert busy.value.reason == "data_dir_in_use"
+        assert busy.value.retryable is True
+        assert busy.value.stage == "open"
+        assert busy.value.subject == str(tmp_path / "first")
+        assert str(tmp_path / "first") not in str(busy.value)
         record = first.add("red item only in first")
         assert second.search("red item") == ()
         assert second.list().items == ()

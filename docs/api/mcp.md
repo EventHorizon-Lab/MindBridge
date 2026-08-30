@@ -143,17 +143,39 @@ idempotent.
 Only the five documented tool names and their exact top-level arguments are accepted. Unknown,
 tenant, user, and run fields are rejected rather than silently ignored.
 
-Tool failures expose a compact JSON object in the MCP error result:
+Tool failures expose the same JSON envelope the REST adapter returns, in the MCP error result:
 
 ```json
-{"code":"validation_error","message":"tool arguments are invalid"}
+{
+  "code": "validation_error",
+  "reason": "unknown_field",
+  "retryable": false,
+  "stage": null,
+  "subject": null,
+  "message": "tool arguments contain unknown fields",
+  "trace_id": "trace_0123456789abcdef",
+  "issues": [
+    {
+      "location": ["arguments", "run_id"],
+      "message": "Extra inputs are not permitted",
+      "type": "extra_forbidden"
+    }
+  ]
+}
 ```
 
-Stable codes include `validation_error`, `memory_not_found`, `model_error`,
-`model_output_truncated`, `storage_error`, `index_unavailable`, and `internal_error`.
-`model_output_truncated` is the deterministic subset of `model_error`: generation stopped at an
-output token limit, so the same request fails the same way again. Provider responses, credentials, filesystem paths, and
-native-index details are not included.
+Stable codes are `validation_error`, `memory_not_found`, `speaker_not_found`, `model_error`,
+`model_output_truncated`, `storage_error`, `index_unavailable`, `mindbridge_error`, and
+`internal_error`. `model_output_truncated` is the deterministic subset of `model_error`: generation
+stopped at an output token limit, so the same request fails the same way again.
+
+`reason`, `stage`, `subject`, `retryable`, and `issues` carry the same meanings and the same closed
+vocabularies as [the REST error contract](rest.md#codes-and-reasons); `retryable` is a lookup on
+`reason`, never a guess. `trace_id` correlates one failure with server logs across surfaces.
+
+Unlike REST, MCP forwards `subject` for every code: an MCP server runs in the owner process as the
+same user, so a subject naming local state is already visible to the caller. Provider responses,
+credentials, and native-index details are still never included.
 
 ## Agent consumption contract
 
@@ -195,11 +217,36 @@ maintain a second sync/async dispatch layer.
 
 ## Current limits
 
-The five current tools do not yet cover the complete SDK capability inventory. Batch addition,
-listing, speech analysis, speaker registration, reindexing, and optimization remain Python
-operations. This is an implementation gap, not a separate MCP execution model. Additive tools must
-map to the existing SDK operations and carry appropriate read, idempotency, and destructive
-annotations.
+### Operations without a tool
+
+The five current tools do not yet cover the complete SDK capability inventory:
+
+| Operation | MCP | REST | Note |
+| --- | --- | --- | --- |
+| `add_many` | absent | `POST /v1/memories/batch` | Implementation gap |
+| `list` | absent | `GET /v1/memories` | Implementation gap; **MCP therefore cannot paginate the store** |
+| `speech` | absent | absent | Not implemented on any transport yet |
+| `register_speaker` | absent | absent | Not implemented on any transport yet |
+| `reinforce` | absent | absent | Not implemented on any transport yet |
+| `reindex` | absent | absent | Owner-process maintenance |
+| `optimize` | absent | absent | Owner-process maintenance |
+
+The missing `list` tool is the one an agent feels first: an MCP client can search and answer, but it
+cannot enumerate the store or resume from a cursor, which `docs/design-principles.md` requires of an
+agent-native surface. Until a `list_memories` tool ships, enumerate through the REST adapter or the
+Python API in the owner process.
+
+These are implementation gaps, not a separate MCP execution model. Additive tools must map to the
+existing SDK operations and carry appropriate read, idempotency, and destructive annotations.
+
+### Input limits
+
+MCP accepts up to 16 content parts, 65,536 characters per text part, and 8 MiB of inline media per
+part. It has no total request budget, because stdio framing has no equivalent of an HTTP body limit;
+REST caps a whole request at 8 MiB instead. The Python API accepts up to 128 parts. See the
+[REST limits table](rest.md#input-limits) for the three side by side.
+
+### Absent features
 
 There is no large-file upload tool, local-path input, logical scope, chunking option, per-asset
 vector control, or learned reranker option. The OpenAI adapter inlines at most 64 MiB of
