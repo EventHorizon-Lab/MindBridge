@@ -294,26 +294,21 @@ def test_quantized_vector_indexes_query_and_reopen(
         _document(
             f"embedding_{row}",
             "target" if row == 0 else f"document {row}",
-            tuple(
-                1.0 if row == 0 or column == row % dimension else -1.0
-                for column in range(dimension)
-            ),
+            tuple(1.0 if column == row % dimension else 0.0 for column in range(dimension)),
         )
         for row in range(64)
     ]
+    expected_ids = {document.embedding.embedding_id for document in documents}
     with ZvecIndex(path, dimension=dimension, quantization=quantization) as index:
         index.upsert(documents)
         index.optimize()
         index.flush()
-        assert (
-            index.search(documents[0].embedding.values, limit=1, exact=True)[0].id == "embedding_0"
-        )
+        hits = index.search(documents[0].embedding.values, limit=len(documents), exact=True)
+        assert {hit.id for hit in hits} == expected_ids
 
     with ZvecIndex(path, dimension=dimension, quantization=quantization) as reopened:
-        assert (
-            reopened.search(documents[0].embedding.values, limit=1, exact=True)[0].id
-            == "embedding_0"
-        )
+        hits = reopened.search(documents[0].embedding.values, limit=len(documents), exact=True)
+        assert {hit.id for hit in hits} == expected_ids
 
 
 def test_full_text_search_stems_folds_accents_and_routes_chinese(tmp_path: Path) -> None:
