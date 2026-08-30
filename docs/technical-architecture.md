@@ -91,18 +91,19 @@ the outbox so a record committed after the rebuild scan is not lost from the pro
 
 Composite records store one aggregate vector and de-duplicated atomic text/media vectors through
 the existing embedding `object_part`. Only the aggregate carries full text into BM25, preventing
-one record from crowding lexical results. Queries derive the same aggregate and atomic keys in one
-bounded embedding batch; a single text atom remains one vector. Duplicate query vectors are
-discarded and up to four independent dense/lexical routes execute concurrently. Zvec oversamples
-groups for each dense route by parent memory so sibling embeddings cannot consume the candidate
+one record from crowding lexical results. Queries batch their complete aggregate with bounded
+focused aggregate and atomic keys derived from the first text atom and query media; later text atoms
+never become independent routes. The focused text remains the lexical query. Dense and lexical
+routes execute concurrently. Zvec oversamples groups by parent memory so sibling document embeddings cannot consume the candidate
 budget; when native best-effort grouping returns too few parents, a bounded ordinary-query fallback
 fills them. Dense and lexical routes stay separate until SQLite drops stale embedding IDs and
 collapses every route to its authoritative parent memory. Parent relevance preserves the strongest
 dense evidence, admits lexical-only evidence through relative BM25, and applies exact lexical
 agreement only as a small reranking bonus before temporal, decay, and ambiguity calibration. The
 standard FTS field lowercases, folds accents, and stems English; a parallel Jieba field handles Han
-queries. For ordered multi-text queries, the first text atom is the focused lexical query while
-dense retrieval still covers every bounded atom. Event-start and event-end inverted indexes enable
+queries. For ordered multi-text queries, the first text atom and media provide the focused dense
+and lexical routes while later text remains only in the complete aggregate. Event-start and
+event-end inverted indexes enable
 Zvec's range optimization.
 
 Relative-time parsing accepts an explicit `reference_at` first. Without one, a natural

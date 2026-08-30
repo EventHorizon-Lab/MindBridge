@@ -1345,13 +1345,27 @@ class Memory:
         require_unambiguous: bool,
     ) -> tuple[SearchHit, ...]:
         prepared = self._embedding_content(prepared, operation)
-        model_inputs = self._embedding_inputs(
+        aggregate = self._route_embedding(prepared)
+        text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
+        focused_text = text_parts[0] if len(text_parts) > 1 else prepared.text
+        focused = replace(
             prepared,
-            maximum_keys=_MAX_QUERY_RETRIEVAL_KEYS,
+            text=focused_text,
+            canonical_parts=(("text", focused_text),) if focused_text else (),
+        )
+        model_inputs = tuple(
+            dict.fromkeys(
+                (
+                    aggregate,
+                    *self._embedding_inputs(
+                        focused,
+                        maximum_keys=_MAX_QUERY_RETRIEVAL_KEYS,
+                    ),
+                )
+            )
         )
         vectors = tuple(dict.fromkeys(self._embed(model_inputs, task=EmbedTask.QUERY)))
-        text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
-        lexical_query = text_parts[0] if len(text_parts) > 1 else prepared.text
+        lexical_query = focused_text
         if not (_lexical_terms(lexical_query) - _LEXICAL_NOISE_TERMS):
             lexical_query = ""
         candidate_limit = max(_RERANK_CANDIDATES, limit * 3)

@@ -50,6 +50,7 @@ _INSUFFICIENT_QUOTA = "insufficient_quota"
 # Bounds the base64 media the request carries, not the bytes on disk. Media reaches the provider
 # inside a data URL or an input_audio part, so the wire always carries 4/3 of the file size.
 _MAX_INLINE_MODEL_BYTES = 64 * 1024 * 1024
+_MAX_INLINE_MODEL_ITEM_BYTES = 20 * 1024 * 1024
 _MAX_GROUNDED_TEXT_BYTES = 4 * 1024 * 1024
 
 
@@ -929,7 +930,13 @@ def _require_inline_size(
                 reason="asset_changed",
                 subject=asset.id,
             )
-        size += _encoded_size(actual_size)
+        encoded_size = _encoded_size(actual_size)
+        if _inline_item_size(asset, actual_size) > _MAX_INLINE_MODEL_ITEM_BYTES:
+            raise ModelError(
+                "encoded inline model media item exceeds 20 MiB; use a provider upload adapter",
+                reason="payload_too_large",
+            )
+        size += encoded_size
     if size > _MAX_INLINE_MODEL_BYTES:
         raise ModelError(
             "encoded inline model media exceeds 64 MiB; use a provider upload adapter",
@@ -940,6 +947,10 @@ def _require_inline_size(
 def _encoded_size(size: int) -> int:
     """Return the base64 length the request carries for a media file of ``size`` bytes."""
     return (size + 2) // 3 * 4
+
+
+def _inline_item_size(asset: AssetRef, size: int) -> int:
+    return len(f"data:{asset.media_type};base64,".encode()) + _encoded_size(size)
 
 
 def _require_consistent_assets(assets: Sequence[AssetRef]) -> tuple[AssetRef, ...]:
@@ -959,12 +970,32 @@ def _fit_grounding_media(
     used = sum(_encoded_size(cast(int, asset.size_bytes)) for asset in question.assets)
     selected = []
     for hit in hits:
-        new_assets = tuple(asset for asset in hit.assets if asset.id not in seen)
-        size = sum(_encoded_size(cast(int, asset.size_bytes)) for asset in new_assets)
-        if used + size <= _MAX_INLINE_MODEL_BYTES:
+        assets = []
+        for asset in hit.assets:
+            if asset.id in seen:
+                assets.append(asset)
+                continue
+            size = cast(int, asset.size_bytes)
+            encoded_size = _encoded_size(size)
+            if (
+                _inline_item_size(asset, size) > _MAX_INLINE_MODEL_ITEM_BYTES
+                or used + encoded_size > _MAX_INLINE_MODEL_BYTES
+            ):
+                continue
+            assets.append(asset)
+            seen.add(asset.id)
+            used += encoded_size
+        if assets:
+            admitted = tuple(assets)
+            selected.append(
+                replace(
+                    hit,
+                    assets=admitted,
+                    modality=ModelInput(assets=admitted).modality,
+                )
+            )
+        elif not hit.assets:
             selected.append(hit)
-            seen.update(asset.id for asset in new_assets)
-            used += size
         elif hit.content.strip():
             selected.append(replace(hit, assets=(), modality=Modality.TEXT))
     return tuple(selected)
@@ -978,10 +1009,14 @@ def _record_grounding_fit(
     span = trace.get_current_span()
     if not span.is_recording():
         return
-    with_media = sum(1 for hit in retrieved if hit.assets)
+    grounded_assets = {hit.id: {asset.id for asset in hit.assets} for hit in grounded}
     span.set_attribute(
         GROUNDING_MEDIA_ELIDED,
-        with_media - sum(1 for hit in grounded if hit.assets),
+        sum(
+            1
+            for hit in retrieved
+            if {asset.id for asset in hit.assets} - grounded_assets.get(hit.id, set())
+        ),
     )
     span.set_attribute(GROUNDING_HITS_DROPPED, len(retrieved) - len(grounded))
 

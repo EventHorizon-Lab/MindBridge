@@ -122,8 +122,8 @@ The design follows the smallest common mechanism supported by the literature:
 - [LongMemEval](https://arxiv.org/abs/2410.10813) treats temporal reasoning as a distinct long-term
   memory ability and motivates time-aware query restriction.
 - [MERIT](https://choi-yeeun.github.io/MERIT/) uses multiple retrieval keys, max-over-key scoring,
-  and temporal neighbors for long egocentric video memory; MindBridge applies the same inexpensive
-  late-interaction shape to caller-supplied text/media atoms.
+  and temporal neighbors for long egocentric video memory; MindBridge applies a bounded form of
+  that inexpensive late-interaction shape to document atoms and focused query text/media.
 - [MemLens](https://arxiv.org/abs/2605.14906) shows that compressing visual evidence into text can
   destroy information needed at answer time, motivating retrieval over durable raw media instead
   of caption-only storage.

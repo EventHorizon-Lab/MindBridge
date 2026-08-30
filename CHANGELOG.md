@@ -118,6 +118,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- Composite searches now batch the complete aggregate with bounded focused aggregate and atomic
+  keys derived from the first text atom and query media. Later answer-format or instruction atoms
+  remain in the complete aggregate but cannot become independent dense queries.
+- The OpenAI adapter now limits each base64-encoded media item to 20 MiB as well as keeping the
+  64 MiB aggregate ceiling. It removes oversized retrieved assets individually, keeps fitting
+  siblings from the same hit, and falls back to text when no media from that hit fits.
 - The OpenAI adapter's 64 MiB inline media ceiling now counts base64-encoded request bytes instead
   of bytes on disk. Media is sent base64-encoded, so the old accounting admitted about 85 MiB on
   the wire; the documented number is now the number enforced, at the cost of roughly 48 MiB of
@@ -295,11 +301,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   segmentation, generated semantic keys, or learned reranking stage.
 - No in-place re-embedding or retranscription when a persisted embedding/transcription space or
   dimension changes; create a new directory and re-encode source content instead.
-- The OpenAI adapter inlines at most 64 MiB of base64-encoded media per embedding or generation
-  call, which is roughly 48 MiB of files on disk. Answer requests reserve that budget for question
-  media, keep top-ranked evidence media that fits, and retain overflow hits as text when possible.
-  They accept at most 4 MiB of serialized text evidence. Use a provider-specific upload adapter for
-  larger media.
+- The OpenAI adapter inlines at most 20 MiB per base64-encoded media item and 64 MiB per embedding
+  or generation call, roughly 15 MiB per file and 48 MiB in aggregate on disk. Answer requests
+  reserve those budgets for question media, keep top-ranked evidence media that fits, and retain
+  overflow hits as text when possible. They accept at most 4 MiB of serialized text evidence. Use
+  a provider-specific upload adapter for larger media.
 - No built-in user authentication, rate limiting, quotas, or secure-erasure guarantee.
 - The CLI has no `--format` flag, configuration file, `MINDBRIDGE_*` composition variable, plugin
   registry, backend registration by name, streaming output, interactive prompt, `serve` command, or

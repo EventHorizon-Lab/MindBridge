@@ -93,9 +93,10 @@ Searches local memories.
 | `memory_type` | one memory role or null | no | null |
 | `reference_at` | timezone-aware ISO 8601 datetime or null | no | current UTC |
 
-The result is `{"hits": [...]}`. Each hit contains memory fields plus `score`. Routed aggregate and
-atomic query keys use dense retrieval; the focused text atom also supplies lexical candidates.
-Both routes collapse to parent memories. Relative temporal expressions resolve against
+The result is `{"hits": [...]}`. Each hit contains memory fields plus `score`. The complete ordered
+query and bounded focused keys from its first text atom and media supply dense candidates; the
+focused text also supplies lexical candidates. All routes collapse aggregate or atomic document
+keys to parent memories. Relative temporal expressions resolve against
 `reference_at`; when omitted, a valid English declaration such as `Today is May 2, 2024` replaces
 current UTC, while an explicit value always wins. Search is conservatively marked non-read-only
 because it may drain durable index work or populate transcript caches; it never reinforces a hit
@@ -254,7 +255,7 @@ REST caps a whole request at 8 MiB instead. The Python API accepts up to 128 par
 ### Absent features
 
 There is no large-file upload tool, local-path input, logical scope, chunking option, per-asset
-vector control, or learned reranker option. The OpenAI adapter inlines at most 64 MiB of
-base64-encoded media per embedding or generation call, which is roughly 48 MiB of files on disk;
-generation admits ranked evidence within that budget. Answer text evidence is limited to 4 MiB. Use
-a provider-specific upload adapter for larger media.
+vector control, or learned reranker option. The OpenAI adapter inlines at most 20 MiB per encoded
+media item and 64 MiB per embedding or generation call, roughly 15 MiB per file and 48 MiB in
+aggregate on disk; generation admits ranked evidence within those budgets. Answer text evidence is
+limited to 4 MiB. Use a provider-specific upload adapter for larger media.

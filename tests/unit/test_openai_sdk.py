@@ -602,6 +602,103 @@ def test_answer_keeps_ranked_media_within_budget_and_retains_overflow_text(
     assert result.hits[1].modality is Modality.TEXT
 
 
+def test_answer_elides_one_oversized_media_item_and_keeps_its_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    oversized = _asset(tmp_path, "oversized", Modality.IMAGE, "image/png", b"123456")
+    small = _asset(tmp_path, "small", Modality.IMAGE, "image/png", b"123")
+    hits = tuple(
+        SearchHit(
+            id=f"memory_{index}",
+            content=f"evidence {index}",
+            score=1.0 - index / 10,
+            created_at=NOW,
+            assets=(asset,),
+            modality=Modality.IMAGE,
+        )
+        for index, asset in enumerate((oversized, small))
+    )
+    monkeypatch.setattr(openai_backend, "_MAX_INLINE_MODEL_ITEM_BYTES", 28)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        assert [part["type"] for part in content].count("image_url") == 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "grounded"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client))
+        result = model.answer(ModelInput(text="What?"), hits)
+        with pytest.raises(ModelError, match="20 MiB") as failure:
+            model.answer(ModelInput(text="What?", assets=(oversized,)), hits)
+
+    assert result.hits[0].assets == ()
+    assert result.hits[0].content == "evidence 0"
+    assert result.hits[0].modality is Modality.TEXT
+    assert result.hits[1].assets == (small,)
+    assert failure.value.reason == "payload_too_large"
+
+
+def test_answer_keeps_small_sibling_of_one_oversized_media_item(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    oversized = _asset(tmp_path, "oversized", Modality.IMAGE, "image/png", b"123456")
+    small = _asset(tmp_path, "small", Modality.IMAGE, "image/png", b"123")
+    hit = SearchHit(
+        id="memory_1",
+        content="",
+        score=0.9,
+        created_at=NOW,
+        assets=(oversized, small),
+        modality=Modality.IMAGE,
+    )
+    monkeypatch.setattr(openai_backend, "_MAX_INLINE_MODEL_ITEM_BYTES", 28)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        assert [part["type"] for part in content].count("image_url") == 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "grounded"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        provider.get_tracer("test").start_as_current_span("model"),
+    ):
+        result = _model(_sdk_client(client)).answer(ModelInput(text="What?"), (hit,))
+    provider.shutdown()
+
+    assert result.hits[0].assets == (small,)
+    assert result.hits[0].modality is Modality.IMAGE
+    attributes = exporter.get_finished_spans()[0].attributes
+    assert attributes is not None
+    assert attributes[GROUNDING_MEDIA_ELIDED] == 1
+
+
 def test_inline_media_budget_bounds_encoded_request_bytes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

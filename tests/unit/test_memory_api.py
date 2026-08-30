@@ -1419,7 +1419,7 @@ def test_parent_fusion_preserves_strong_atomic_dense_evidence(tmp_path: Path) ->
     assert [hit.id for hit in hits] == [semantic.id, question_echo.id]
 
 
-def test_composite_query_embeds_aggregate_and_atoms_in_one_batch(tmp_path: Path) -> None:
+def test_composite_query_keeps_aggregate_and_focused_retrieval_keys(tmp_path: Path) -> None:
     models = _FakeModels()
     with _memory(tmp_path, models) as memory:
         memory.add(("red frame", Blob(b"stored", "image/png", "stored.png")))
@@ -1438,16 +1438,66 @@ def test_composite_query_embeds_aggregate_and_atoms_in_one_batch(tmp_path: Path)
 
     assert [value.modalities for value in composite] == [
         {Modality.TEXT, Modality.IMAGE},
-        {Modality.TEXT},
+        {Modality.TEXT, Modality.IMAGE},
         {Modality.TEXT},
         {Modality.IMAGE},
+    ]
+    assert "Answer with the matching evidence only." in composite[0].text
+    assert [value.text for value in composite[1:]] == [
+        "find the red frame",
+        "find the red frame",
+        "",
     ]
     assert lexical_query == "find the red frame"
     assert len(single) == 1
     assert models.embed_tasks[-2:] == [EmbedTask.QUERY, EmbedTask.QUERY]
 
 
-def test_search_deduplicates_and_fans_out_routes_without_serializing_callers(
+def test_composite_query_retains_atomic_media_recall(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory:
+        record = memory.add(Blob(b"stored", "image/png", "stored.png"))
+        index = _FakeIndex.instances[-1]
+
+        def media_only_search(
+            current: _FakeIndex,
+            values: Sequence[float],
+            *,
+            limit: int = 10,
+            space_id: str | None = None,
+            task: str | None = None,
+            memory_type: str | None = None,
+            occurred_from: datetime | None = None,
+            occurred_until: datetime | None = None,
+            ef: int | None = None,
+            exact: bool = False,
+        ) -> tuple[IndexHit, ...]:
+            del space_id, task, memory_type, occurred_from, occurred_until, ef, exact
+            current.dense_search_calls += 1
+            return (
+                (IndexHit(id=record.id, relevance=0.9, confidence=0.9),)
+                if tuple(values) == (0.0, 1.0)
+                else ()
+            )[:limit]
+
+        monkeypatch.setattr(_FakeIndex, "search", media_only_search)
+        hits = memory.search(
+            (
+                "red question",
+                "Answer with the matching evidence only.",
+                Blob(b"query", "image/png", "query.png"),
+            ),
+            limit=1,
+        )
+
+    assert [hit.id for hit in hits] == [record.id]
+    assert index.dense_search_calls == 2
+
+
+def test_search_does_not_serialize_callers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1486,14 +1536,11 @@ def test_search_deduplicates_and_fans_out_routes_without_serializing_callers(
         monkeypatch.setattr(_FakeIndex, "search", synchronized_search)
         index = _FakeIndex.instances[-1]
 
-        assert memory.search(("find red", Blob(b"query", "image/png")))
-        assert index.dense_search_calls == 2
-
         with ThreadPoolExecutor(max_workers=2) as executor:
             concurrent = tuple(executor.map(memory.search, ("what", "where")))
 
         assert all(concurrent)
-        assert index.dense_search_calls == 4
+        assert index.dense_search_calls == 2
 
 
 def test_equal_scores_use_memory_id_as_a_stable_tiebreaker(tmp_path: Path) -> None:

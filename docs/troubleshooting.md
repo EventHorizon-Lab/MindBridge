@@ -126,12 +126,14 @@ analysis is first requested.
 Adapter capabilities are explicit. Either select a model that supports the modality or configure
 a transcriber for audio fallback. MindBridge does not silently remove image or video evidence.
 
-## Media exceeds 64 MiB for a model call
+## Media exceeds an inline model limit
 
 The OpenAI adapter bounds the media the request actually carries. Media travels base64-encoded, so
-the limit is 64 MiB on the wire and roughly 48 MiB of files on disk. Answer generation keeps ranked
-evidence assets that fit and falls back to their text; an oversized question asset or embedding
-input still fails. `mindbridge.grounding.media_elided_hits` and
+the limits are 20 MiB per item and 64 MiB per call on the wire, roughly 15 MiB per file and 48 MiB
+in aggregate on disk. Answer generation removes oversized or overflow evidence assets individually,
+keeps fitting siblings from the same hit, and falls back to its text when no media fits; an
+oversized question asset or embedding input still fails.
+`mindbridge.grounding.media_elided_hits` and
 `mindbridge.grounding.dropped_hits` on the generation span count the retrieved evidence the budget
 removed, so a shrunken payload is never silent.
 Use a provider-specific adapter that uploads or streams large assets through that provider's SDK.
