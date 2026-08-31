@@ -129,6 +129,26 @@ ContentInput: TypeAlias = ContentAtom | Sequence[ContentAtom]
 
 
 @dataclass(frozen=True, slots=True)
+class StreamInput:
+    """One independently durable item from a lazy input stream."""
+
+    content: ContentInput
+    occurred_at: datetime | None = None
+    occurred_end: datetime | None = None
+    metadata: Mapping[str, object] | None = field(default=None, hash=False)
+    memory_type: MemoryType = MemoryType.SEMANTIC
+
+    def __post_init__(self) -> None:
+        _require_interval(self.occurred_at, self.occurred_end)
+        if not isinstance(self.memory_type, MemoryType):
+            raise ValidationError("memory_type is invalid")
+        if self.metadata is not None:
+            if not isinstance(self.metadata, Mapping):
+                raise ValidationError("metadata must be a mapping")
+            object.__setattr__(self, "metadata", dict(self.metadata))
+
+
+@dataclass(frozen=True, slots=True)
 class SpeakerSegment:
     """One timed transcript turn linked to a stable local speaker identity."""
 
@@ -259,7 +279,9 @@ def _require_matching_media_type(modality: Modality, media_type: str) -> None:
 
 
 def _require_aware(value: datetime | None, name: str) -> None:
-    if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+    if value is not None and (
+        not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None
+    ):
         raise ValidationError(f"{name} must include a timezone")
 
 

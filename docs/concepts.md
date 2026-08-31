@@ -5,8 +5,9 @@ its public behavior.
 
 ## Content and modality
 
-Python uses one `ContentInput` contract for `add`, `search`, and `ask`: one `str`, `Path`, `Blob`,
-or `AssetRef`, or an ordered sequence of those atoms.
+Python uses one `ContentInput` contract for `add`, `add_stream`, `search`, and `ask`: one `str`,
+`Path`, `Blob`, or `AssetRef`, or an ordered sequence of those atoms. `add_stream` also accepts a
+`StreamInput` wrapper when one item needs its own event time, metadata, or memory role.
 
 | Atom | Boundary |
 | --- | --- |
@@ -67,6 +68,20 @@ The asset store separately de-duplicates identical media bytes by SHA-256. Multi
 reference one immutable file. Deleting a memory removes a media file only after its final record
 reference is gone. The optional name is digest-level CAS metadata, not per-reference metadata: the
 first authoritative non-empty name is reused when identical bytes later arrive with another name.
+
+## Stream ingestion
+
+`Memory.add_stream` pulls one completed observation at a time from a lazy iterable. It runs that
+item through the ordinary `add` path and yields only after SQLite, the durable outbox, and Zvec are
+updated, so the caller can search the record before the next item is requested. Items are separate
+memories and separate transactions; an unbounded source is never collected into RAM, and a later
+failure does not roll back the committed prefix.
+
+This follows the clip-by-clip boundary in
+[M3-Agent's memorization loop](https://github.com/ByteDance-Seed/m3-agent/blob/0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c/m3_agent/memorization_memory_graphs.py#L63-L92)
+without moving sensor ownership into MindBridge. Capture, reconnection, and segmentation remain
+application concerns. A raw `ContentInput` is the short form; `StreamInput` preserves per-clip time
+and provenance. The async facade consumes an `AsyncIterable` with the same behavior.
 
 ## Data directory
 
@@ -206,7 +221,7 @@ remains exclusive while ordinary Zvec queries can overlap.
 
 Long text receives bounded overlapping retrieval keys while remaining one immutable returned
 record. MindBridge does not segment long media, generate model-authored semantic keys, or use a
-learned reranker. Applications should still ingest natural turns or bounded media clips. The
+learned reranker. Applications should still stream natural turns or bounded media clips. The
 OpenAI adapter inlines at most 20 MiB per base64-encoded media item and 64 MiB per model call,
 roughly 15 MiB per file and 48 MiB in aggregate on disk; a provider-specific upload adapter is the
 large-video path.

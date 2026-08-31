@@ -9,7 +9,7 @@ storage, defaults, or errors.
 ## Content values
 
 ```python
-from mindbridge import AssetRef, Blob, ContentAtom, ContentInput
+from mindbridge import AssetRef, Blob, ContentAtom, ContentInput, StreamInput
 ```
 
 ```python
@@ -151,6 +151,43 @@ later than it. Metadata must be a JSON-compatible mapping with non-empty string 
 `add_many`, the optional event-time and metadata sequences must contain one value per content; this
 preserves per-record provenance without losing batched model/storage work. Duplicate inputs return
 the same stable record in their original positions.
+
+### Stream input
+
+`add_stream` consumes an iterable lazily and commits each completed item before requesting the
+next. A plain `ContentInput` uses the same defaults as `add`; wrap an item in `StreamInput` when a
+clip needs its own event time, metadata, or memory role:
+
+```python
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from mindbridge import MemoryType, StreamInput
+
+started = datetime(2026, 8, 31, 9, tzinfo=timezone.utc)
+
+
+def camera_clips():
+    for sequence, path in enumerate(sorted(Path("./capture").glob("*.mp4"))):
+        occurred_at = started + timedelta(seconds=30 * sequence)
+        yield StreamInput(
+            path,
+            occurred_at=occurred_at,
+            occurred_end=occurred_at + timedelta(seconds=30),
+            metadata={"sequence": sequence},
+            memory_type=MemoryType.EPISODIC,
+        )
+
+
+for record in memory.add_stream(camera_clips()):
+    print(record.id)
+```
+
+Each yielded record is already durable and searchable. The stream is not one transaction: if a
+later item fails, earlier records remain committed and the error's `subject` identifies its
+`contents[N]` position. `AsyncMemory.add_stream` accepts an `AsyncIterable` and returns an async
+iterator with the same item semantics. MindBridge consumes completed chunks; the application owns
+camera or microphone capture and chooses chunk boundaries.
 
 ### Retrieve and answer
 
@@ -299,7 +336,8 @@ number of memories rebuilt. It never calls the embedder. `optimize` compacts the
 
 ## AsyncMemory
 
-`AsyncMemory` takes the same constructor arguments and exposes the same methods with `await`.
+`AsyncMemory` takes the same constructor arguments and exposes the same methods. Finite operations
+use `await`; `add_stream` consumes an `AsyncIterable` with `async for`.
 
 ```python
 async with AsyncMemory(
@@ -310,6 +348,8 @@ async with AsyncMemory(
 ) as memory:
     await memory.add("Remember this")
     hits = await memory.search("Remember")
+    async for record in memory.add_stream(observations()):
+        print(record.id)
 ```
 
 It runs the embedded synchronous consistency core through `asyncio.to_thread`. It is not a

@@ -57,9 +57,12 @@ one directory; changing it is a fail-fast compatibility event and requires a new
 
 ## Capture and network boundaries
 
-MindBridge accepts completed files and bytes; it does not own cameras, microphones, streaming
-capture, or sensor drivers. It can provide local face-and-voice identity with optional names for
-completed image/audio/video assets; the application still decides when capture is complete.
+MindBridge accepts a lazy stream of completed files, bytes, or composite observations through
+`Memory.add_stream`. It does not own cameras, microphones, capture reconnection, segmentation, or
+sensor drivers. The application decides when each chunk is complete and can attach its time range
+with `StreamInput`; MindBridge makes each chunk durable and searchable before pulling the next.
+It can provide local face-and-voice identity with optional names for completed image/audio/video
+assets.
 
 Edge applications usually prefer `Path` or `Blob` so ingestion does not depend on external
 storage. Fetch remote media in application code, where the platform's existing HTTP client,

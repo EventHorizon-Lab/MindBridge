@@ -18,14 +18,14 @@ import binascii
 import inspect
 import json
 import sys
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
 from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
-from typing import TypeAlias
+from typing import TextIO, TypeAlias
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -56,6 +56,7 @@ from mindbridge.types import (
     Modality,
     SearchHit,
     SpeakerSegment,
+    StreamInput,
 )
 
 PROGRAM = "mindbridge"
@@ -82,6 +83,7 @@ DATA_DIR_IN_USE_EXIT_CODE = 9
 OPERATIONS: tuple[str, ...] = (
     "add",
     "add_many",
+    "add_stream",
     "search",
     "search_with_trace",
     "ask",
@@ -478,6 +480,23 @@ def _add_many(memory: Memory, arguments: argparse.Namespace) -> _Document:
     }
 
 
+def _add_stream(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    memory_type = MemoryType(arguments.memory_type)
+    inputs = (
+        StreamInput(
+            _parts_input(item["content"]),
+            occurred_at=_optional_time(item.get("occurred_at"), "occurred_at"),
+            occurred_end=_optional_time(item.get("occurred_end"), "occurred_end"),
+            metadata=_metadata_value(item.get("metadata")),
+            memory_type=memory_type,
+        )
+        for item in _jsonl_stream(arguments.source)
+    )
+    # ponytail: preserve the CLI's one-JSON-document contract by collecting result records; add
+    # streaming output only if finite CLI imports outgrow memory. The SDK input path stays lazy.
+    return {"memories": [_memory_document(record) for record in memory.add_stream(inputs)]}
+
+
 def _search(memory: Memory, arguments: argparse.Namespace) -> _Document:
     hits = memory.search(
         _content_input(arguments),
@@ -572,6 +591,7 @@ def _optimize(memory: Memory, _arguments: argparse.Namespace) -> _Document:
 _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "add": _add,
     "add-many": _add_many,
+    "add-stream": _add_stream,
     "search": _search,
     "search-with-trace": _search_with_trace,
     "ask": _ask,
@@ -910,8 +930,12 @@ def _decode_base64(value: str) -> bytes:
 
 
 def _jsonl(source: str) -> tuple[Mapping[str, object], ...]:
-    items: list[Mapping[str, object]] = []
-    for number, line in enumerate(_read_source(source).splitlines(), start=1):
+    return tuple(_jsonl_stream(source))
+
+
+def _jsonl_stream(source: str) -> Iterator[Mapping[str, object]]:
+    found = False
+    for number, line in enumerate(_source_lines(source), start=1):
         if not line.strip():
             continue
         try:
@@ -921,10 +945,24 @@ def _jsonl(source: str) -> tuple[Mapping[str, object], ...]:
         if not isinstance(item, dict) or "content" not in item:
             raise ValidationError(f"line {number} must be an object with a content field")
         _fields(item, {"content", "occurred_at", "occurred_end", "metadata"})
-        items.append(item)
-    if not items:
+        found = True
+        yield item
+    if not found:
         raise ValidationError("no memories were supplied")
-    return tuple(items)
+
+
+def _source_lines(source: str) -> Iterable[str]:
+    if source == _STDIN:
+        yield from _claim_stdin()
+        return
+    if source.startswith("@"):
+        try:
+            with Path(source[1:]).open(encoding="utf-8") as stream:
+                yield from stream
+        except OSError as error:
+            raise ValidationError(f"cannot read {source[1:]}: {error.strerror}") from None
+        return
+    yield from source.splitlines()
 
 
 def _metadata_value(value: object) -> Mapping[str, object] | None:
@@ -956,13 +994,17 @@ def _read_source(value: str) -> str:
 
 
 def _read_stdin() -> str:
+    return _claim_stdin().read()
+
+
+def _claim_stdin() -> TextIO:
     global _stdin_consumed
     if _stdin_consumed:
         raise ValidationError("standard input can only be read once per invocation")
     if sys.stdin.isatty():
         raise ValidationError("no content was supplied and standard input is a terminal")
     _stdin_consumed = True
-    return sys.stdin.read()
+    return sys.stdin
 
 
 def _optional_time(value: object, name: str) -> datetime | None:
@@ -1181,6 +1223,9 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     batch = commands.add_parser("add-many", help="store a JSONL batch in one transaction")
     batch.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
     _memory_type_option(batch, "add_many")
+    stream = commands.add_parser("add-stream", help="store JSONL items incrementally")
+    stream.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
+    _memory_type_option(stream, "add")
     for operation in ("search", "search_with_trace", "ask"):
         name = operation.replace("_", "-")
         command = _content_command(commands, name, f"{name} memories")

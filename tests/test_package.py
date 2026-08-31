@@ -76,6 +76,7 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "EmbedTask",
         "SentenceTransformersEmbedder",
         "SpeakerNotFoundError",
+        "StreamInput",
         "StreamingGenerationBackend",
         "TranscriptionBackend",
     }

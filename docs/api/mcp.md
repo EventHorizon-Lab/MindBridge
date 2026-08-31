@@ -233,6 +233,7 @@ The five current tools do not yet cover the complete SDK capability inventory:
 | Operation | MCP | REST | Note |
 | --- | --- | --- | --- |
 | `add_many` | absent | `POST /v1/memories/batch` | Implementation gap |
+| `add_stream` | absent | absent | Python iterators are process-local; call `add_memory` per completed chunk |
 | `list` | absent | `GET /v1/memories` | Implementation gap; **MCP therefore cannot paginate the store** |
 | `search_with_trace` | absent | absent | Python/local-CLI retrieval diagnostics |
 | `speech` | absent | absent | Not implemented on any transport yet |

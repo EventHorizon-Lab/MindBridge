@@ -57,6 +57,7 @@ from mindbridge.types import (
     RetrievalTrace,
     SearchHit,
     SpeakerSegment,
+    StreamInput,
     TracedSearchResult,
 )
 
@@ -111,6 +112,7 @@ __all__ = [
     "SpeechBackend",
     "SpeechTurn",
     "StorageError",
+    "StreamInput",
     "StreamingGenerationBackend",
     "TracedSearchResult",
     "TranscriptionBackend",

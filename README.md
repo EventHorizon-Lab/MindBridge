@@ -125,6 +125,23 @@ with Memory("./data/media", embedder=JinaOmniEmbedder()) as memory:
 Use `FunASRTranscriber()` explicitly when audio fallback, timed speech, or speaker matching is
 needed. Unsupported modalities fail before inference; model support is declared by each adapter.
 
+For continuous input, pass completed application-owned chunks lazily. Each yielded record is
+already durable and searchable:
+
+```python
+from mindbridge import MemoryType, StreamInput
+
+for record in memory.add_stream(
+    StreamInput(path, metadata={"sequence": index}, memory_type=MemoryType.EPISODIC)
+    for index, path in enumerate(completed_clip_paths)
+):
+    handle(record)
+```
+
+MindBridge does not open cameras or split a live feed; the application supplies bounded text,
+image, video, or audio observations. See the
+[Python stream contract](docs/api/python-sdk.md#stream-input).
+
 ## Model boundaries
 
 MindBridge exposes narrow, operation-specific protocols:

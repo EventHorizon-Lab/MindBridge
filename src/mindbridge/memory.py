@@ -13,7 +13,7 @@ import re
 import shutil
 import unicodedata
 from collections import Counter, deque
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, suppress
 from contextvars import copy_context
@@ -103,6 +103,7 @@ from mindbridge.types import (
     RetrievalTrace,
     SearchHit,
     SpeakerSegment,
+    StreamInput,
     TracedSearchResult,
 )
 
@@ -626,6 +627,45 @@ class Memory:
             if not prepared:
                 return ()
             return self._add_prepared(prepared, operation=assets)
+
+    def add_stream(
+        self,
+        contents: Iterable[ContentInput | StreamInput],
+    ) -> Iterator[MemoryRecord]:
+        """Add a lazy stream one durable, searchable memory at a time."""
+        if isinstance(contents, (str, bytes, Path, Blob, AssetRef, Mapping)):
+            raise ValidationError("contents must be an iterable of memory inputs")
+        try:
+            iterator = iter(contents)
+        except TypeError:
+            raise ValidationError("contents must be an iterable of memory inputs") from None
+        index = 0
+        while True:
+            try:
+                content = next(iterator)
+            except StopIteration:
+                return
+            except MindBridgeError as error:
+                if error.subject is None:
+                    error.subject = f"contents[{index}]"
+                raise
+            try:
+                if isinstance(content, StreamInput):
+                    record = self.add(
+                        content.content,
+                        occurred_at=content.occurred_at,
+                        occurred_end=content.occurred_end,
+                        metadata=content.metadata,
+                        memory_type=content.memory_type,
+                    )
+                else:
+                    record = self.add(content)
+            except MindBridgeError as error:
+                if error.subject is None:
+                    error.subject = f"contents[{index}]"
+                raise
+            yield record
+            index += 1
 
     def search(
         self,
@@ -2971,6 +3011,42 @@ class AsyncMemory:
             metadata=metadata,
             memory_type=memory_type,
         )
+
+    async def add_stream(
+        self,
+        contents: AsyncIterable[ContentInput | StreamInput],
+    ) -> AsyncIterator[MemoryRecord]:
+        """Add an async stream one durable, searchable memory at a time."""
+        if not isinstance(contents, AsyncIterable):
+            raise ValidationError("contents must be an async iterable of memory inputs")
+        iterator = aiter(contents)
+        index = 0
+        while True:
+            try:
+                content = await anext(iterator)
+            except StopAsyncIteration:
+                return
+            except MindBridgeError as error:
+                if error.subject is None:
+                    error.subject = f"contents[{index}]"
+                raise
+            try:
+                if isinstance(content, StreamInput):
+                    record = await self.add(
+                        content.content,
+                        occurred_at=content.occurred_at,
+                        occurred_end=content.occurred_end,
+                        metadata=content.metadata,
+                        memory_type=content.memory_type,
+                    )
+                else:
+                    record = await self.add(content)
+            except MindBridgeError as error:
+                if error.subject is None:
+                    error.subject = f"contents[{index}]"
+                raise
+            yield record
+            index += 1
 
     async def search(
         self,

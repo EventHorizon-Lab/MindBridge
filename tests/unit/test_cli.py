@@ -408,6 +408,37 @@ def test_add_many_reads_jsonl_with_per_item_time_and_metadata(
     assert memories[1]["occurred_at"] == "2026-01-01T00:00:00Z"
 
 
+def test_add_stream_commits_before_reading_a_later_invalid_line(
+    app: str, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    source = tmp_path / "stream.jsonl"
+    source.write_text(
+        f"{json.dumps({'content': 'a red wrench', 'metadata': {'sequence': 0}})}\nnot-json\n",
+        encoding="utf-8",
+    )
+
+    status, document, stderr = _run(
+        capsys,
+        "--app",
+        app,
+        "-q",
+        "add-stream",
+        f"@{source}",
+        "--memory-type",
+        "episodic",
+    )
+
+    assert status == EXIT_CODES[ValidationError.code]
+    assert document is None
+    assert "line 2" in cast(dict[str, str], stderr[0])["message"]
+    assert cast(dict[str, object], stderr[0])["subject"] == "contents[1]"
+    with Memory(tmp_path / "store", embedder=_Embedder()) as memory:
+        records = memory.list().items
+    assert [(record.content, record.metadata, record.memory_type) for record in records] == [
+        ("a red wrench", {"sequence": 0}, MemoryType.EPISODIC)
+    ]
+
+
 def test_a_second_owner_of_the_directory_exits_nine(
     app: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

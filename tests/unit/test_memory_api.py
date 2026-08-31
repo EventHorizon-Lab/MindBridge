@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import sqlite3
-from collections.abc import Generator, Iterable, Iterator, Sequence
+from collections.abc import AsyncIterator, Generator, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import MISSING, asdict, dataclass, fields
@@ -71,6 +71,7 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     SearchHit,
+    StreamInput,
 )
 
 ALL_INPUT_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
@@ -2241,6 +2242,44 @@ def test_add_many_preserves_per_record_event_time_and_metadata(tmp_path: Path) -
             memory.add_many(("third",), occurred_at=(occurred, None))
 
 
+def test_add_stream_commits_each_input_before_pulling_the_next(tmp_path: Path) -> None:
+    occurred = datetime(2026, 8, 20, 9, tzinfo=timezone.utc)
+    pulled: list[str] = []
+
+    def contents() -> Iterator[str]:
+        for content in ("red first clip", "blue second clip", "   "):
+            pulled.append(content)
+            yield content
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        source = iter(contents())
+        stream = memory.add_stream(
+            StreamInput(
+                content,
+                occurred_at=occurred,
+                metadata={"source": "camera"},
+                memory_type=MemoryType.EPISODIC,
+            )
+            if content.strip()
+            else content
+            for content in source
+        )
+
+        first = next(stream)
+        assert pulled == ["red first clip"]
+        assert memory.get(first.id) == first
+        assert first.occurred_at == occurred
+        assert first.metadata == {"source": "camera"}
+        assert first.memory_type is MemoryType.EPISODIC
+
+        second = next(stream)
+        with pytest.raises(ValidationError) as failure:
+            next(stream)
+
+        assert failure.value.subject == "contents[2]"
+        assert {item.id for item in memory.list().items} == {first.id, second.id}
+
+
 def test_add_many_hydrates_the_index_outbox_in_batches(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3440,6 +3479,42 @@ async def test_async_memory_matches_sync_surface(tmp_path: Path) -> None:
     assert models.embed_batches == []
     assert embedder.close_calls == 1
     assert models.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_async_add_stream_consumes_an_async_iterable(tmp_path: Path) -> None:
+    pulled: list[str] = []
+
+    async def contents() -> AsyncIterator[str]:
+        for content in ("red async clip", "blue async clip"):
+            pulled.append(content)
+            yield content
+
+    async with AsyncMemory(tmp_path, embedder=_FakeEmbedder()) as memory:
+        stream = memory.add_stream(contents())
+        first = await anext(stream)
+        assert pulled == ["red async clip"]
+        records = [first, *[record async for record in stream]]
+
+        assert pulled == ["red async clip", "blue async clip"]
+        assert len(records) == 2
+        assert await memory.get(records[1].id) == records[1]
+
+
+@pytest.mark.asyncio
+async def test_async_add_stream_names_a_source_failure(tmp_path: Path) -> None:
+    async def contents() -> AsyncIterator[str]:
+        yield "red async clip"
+        raise ValidationError("source failed")
+
+    async with AsyncMemory(tmp_path, embedder=_FakeEmbedder()) as memory:
+        stream = memory.add_stream(contents())
+        first = await anext(stream)
+        with pytest.raises(ValidationError) as failure:
+            await anext(stream)
+
+        assert failure.value.subject == "contents[1]"
+        assert await memory.get(first.id) == first
 
 
 @pytest.mark.asyncio
