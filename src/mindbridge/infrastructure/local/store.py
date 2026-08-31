@@ -809,6 +809,60 @@ class LocalStore:
         }
         return tuple(by_id[memory_id] for memory_id in memory_ids if memory_id in by_id)
 
+    def embedding_ids_in_range(
+        self,
+        occurred_from: datetime,
+        occurred_until: datetime,
+        *,
+        space_id: str,
+        task: str,
+        memory_type: str | None = None,
+    ) -> tuple[frozenset[str], int]:
+        """Return current embedding IDs in a time range and the searchable total."""
+        _require_aware(occurred_from, "occurred_from")
+        _require_aware(occurred_until, "occurred_until")
+        if occurred_until <= occurred_from:
+            raise ValueError("occurred_until must be later than occurred_from")
+        _require_identifier(space_id, "space_id")
+        _require_identifier(task, "task")
+        if memory_type is not None and memory_type not in _MEMORY_TYPES:
+            raise ValueError("memory_type is invalid")
+        start = _datetime_text(occurred_from)
+        until = _datetime_text(occurred_until)
+        type_clause = "" if memory_type is None else "AND m.memory_type = ?"
+        scope: tuple[object, ...] = (
+            (space_id, task) if memory_type is None else (space_id, task, memory_type)
+        )
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT e.embedding_id
+                FROM embeddings AS e
+                JOIN memory_records AS m ON m.memory_id = e.memory_id
+                WHERE e.space_id = ? AND e.task = ? AND e.object_part = 0
+                  AND m.occurred_at IS NOT NULL
+                  AND (
+                      (m.occurred_end IS NOT NULL AND m.occurred_end > ?)
+                      OR (m.occurred_end IS NULL AND m.occurred_at >= ?)
+                  )
+                  AND m.occurred_at < ?
+                  {type_clause}
+                """,
+                (*scope[:2], start, start, until, *scope[2:]),
+            ).fetchall()
+            total_row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM embeddings AS e
+                JOIN memory_records AS m ON m.memory_id = e.memory_id
+                WHERE e.space_id = ? AND e.task = ? AND e.object_part = 0
+                {type_clause}
+                """,
+                scope,
+            ).fetchone()
+        total = 0 if total_row is None else int(total_row["count"])
+        return frozenset(_row_text(row, "embedding_id") for row in rows), total
+
     def list_memories(
         self,
         *,

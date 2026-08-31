@@ -195,8 +195,12 @@ _TODAY_NAMED_DATE = re.compile(
     re.IGNORECASE,
 )
 _NAMED_MONTH_YEAR = re.compile(rf"\b({_MONTH_NAME})\s+((?:19|20|21)\d{{2}})\b", re.IGNORECASE)
-_CJK_YEAR_MONTH = re.compile(r"(?<!\d)((?:19|20|21)\d{2})年\s*(1[0-2]|0?[1-9])月")
-_CALENDAR_YEAR = re.compile(r"(?<![\d$])((?:19|20|21)\d{2})(?![\d-])")
+_CJK_YEAR_MONTH = re.compile(
+    r"(?<![A-Za-z0-9_$-])((?:19|20|21)\d{2})年\s*(1[0-2]|0?[1-9])月"
+    r"(?![A-Za-z0-9_$-])"
+)
+_CJK_CALENDAR_YEAR = re.compile(r"(?<![A-Za-z0-9_$-])((?:19|20|21)\d{2})年(?![A-Za-z0-9_$-])")
+_CALENDAR_YEAR = re.compile(r"(?<![\w$-])((?:19|20|21)\d{2})(?![\w-])")
 _MONTHS = {
     name: index
     for index, name in enumerate(
@@ -1388,10 +1392,9 @@ class Memory:
                         memory_type=memory_type,
                     )
                 else:
+                    # Filtered Zvec FTS is unstable; deepen global FTS against SQLite time IDs.
                     preferred = self._index_candidates(
                         vectors,
-                        # Zvec range-filtered FTS is unstable after dense queries; the global
-                        # fallback below still contributes the same lexical route.
                         lexical_query="",
                         limit=candidate_limit,
                         memory_type=memory_type,
@@ -1406,7 +1409,7 @@ class Memory:
                     )
                     candidates = _IndexCandidates(
                         dense=_merge_index_hits(preferred.dense, fallback.dense),
-                        lexical=_merge_index_hits(preferred.lexical, fallback.lexical),
+                        lexical=fallback.lexical,
                         exhausted=preferred.exhausted and fallback.exhausted,
                     )
             index_ids = tuple(
@@ -1419,6 +1422,16 @@ class Memory:
                 _translate_storage_errors("hydrate search candidates"),
             ):
                 documents = self._store.read_index_documents(index_ids)
+            with _translate_index_errors("search memories"):
+                candidates, documents = self._deepen_temporal_lexical_candidates(
+                    candidates,
+                    documents,
+                    lexical_query=lexical_query,
+                    temporal_range=temporal_range,
+                    memory_type=memory_type,
+                    route_limit=candidate_limit,
+                    result_limit=limit,
+                )
             parent_count = len({document.embedding.memory_id for document in documents})
             if (
                 parent_count >= limit
@@ -1502,6 +1515,84 @@ class Memory:
         return tuple(
             self._search_hit(memory, score) for memory, score, _confidence, _lexical in visible
         )
+
+    def _deepen_temporal_lexical_candidates(
+        self,
+        candidates: _IndexCandidates,
+        documents: tuple[IndexDocument, ...],
+        *,
+        lexical_query: str,
+        temporal_range: tuple[datetime, datetime] | None,
+        memory_type: MemoryType | None,
+        route_limit: int,
+        result_limit: int,
+    ) -> tuple[_IndexCandidates, tuple[IndexDocument, ...]]:
+        if temporal_range is None or not lexical_query or len(candidates.lexical) < route_limit:
+            return candidates, documents
+        lexical_by_id = {hit.id: hit for hit in candidates.lexical}
+        qualified_parents = {
+            document.embedding.memory_id
+            for document in documents
+            if (hit := lexical_by_id.get(document.embedding.embedding_id)) is not None
+            and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
+            and _overlaps_temporal_range(
+                document.occurred_at,
+                document.occurred_end,
+                temporal_range,
+            )
+        }
+        if len(qualified_parents) >= result_limit:
+            return candidates, documents
+        with (
+            self._trace("mindbridge.storage.temporal_candidates", kind="stage"),
+            _translate_storage_errors("read temporal search candidates"),
+        ):
+            in_range, total = self._store.embedding_ids_in_range(
+                *temporal_range,
+                space_id=self._space_id,
+                task=_DOCUMENT_TASK,
+                memory_type=None if memory_type is None else memory_type.value,
+            )
+        if not in_range:
+            return candidates, documents
+        required = min(result_limit, len(in_range))
+        search_limit = route_limit
+        lexical = candidates.lexical
+        qualified = tuple(
+            hit
+            for hit in lexical
+            if hit.id in in_range
+            and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
+        )
+        while len(qualified) < required and len(lexical) >= search_limit and search_limit < total:
+            search_limit = min(search_limit * 2, total)
+            lexical = self._index_candidates(
+                (),
+                lexical_query=lexical_query,
+                limit=search_limit,
+                memory_type=memory_type,
+            ).lexical
+            qualified = tuple(
+                hit
+                for hit in lexical
+                if hit.id in in_range
+                and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
+            )
+        updated = _IndexCandidates(
+            dense=candidates.dense,
+            lexical=_merge_index_hits(candidates.lexical, qualified[:route_limit]),
+            exhausted=candidates.exhausted,
+        )
+        added_ids = tuple(hit.id for hit in updated.lexical if hit.id not in lexical_by_id)
+        if not added_ids:
+            return updated, documents
+        with (
+            self._trace("mindbridge.storage.hydrate", kind="stage"),
+            _translate_storage_errors("hydrate temporal lexical candidates"),
+        ):
+            added = self._store.read_index_documents(added_ids)
+        by_id = {document.embedding.embedding_id: document for document in (*documents, *added)}
+        return updated, tuple(by_id.values())
 
     def _index_candidates(
         self,
@@ -3388,12 +3479,24 @@ def _temporal_factor(
         return _RANK_FLOOR
     start, until = temporal_range
     event_until = occurred_end or occurred_at + timedelta(microseconds=1)
-    if occurred_at < until and event_until > start:
+    if _overlaps_temporal_range(occurred_at, occurred_end, temporal_range):
         return _RANK_CEILING
     distance = start - event_until if event_until <= start else occurred_at - until
     window = max((until - start).total_seconds(), timedelta(days=1).total_seconds())
     proximity = math.pow(2.0, -distance.total_seconds() / window)
     return _RANK_FLOOR + (_RANK_CEILING - _RANK_FLOOR) * proximity
+
+
+def _overlaps_temporal_range(
+    occurred_at: datetime | None,
+    occurred_end: datetime | None,
+    temporal_range: tuple[datetime, datetime],
+) -> bool:
+    if occurred_at is None:
+        return False
+    start, until = temporal_range
+    event_until = occurred_end or occurred_at + timedelta(microseconds=1)
+    return occurred_at < until and event_until > start
 
 
 def _temporal_range(text: str, reference_at: datetime) -> tuple[datetime, datetime] | None:
@@ -3524,6 +3627,7 @@ def _parse_temporal_range(  # noqa: C901 - ordered phrases are clearer as one pa
         )
 
     years = [int(value) for value in _CALENDAR_YEAR.findall(normalized)]
+    years.extend(int(value) for value in _CJK_CALENDAR_YEAR.findall(normalized))
     if years:
         return (
             _day_start(date(min(years), 1, 1), reference_at),

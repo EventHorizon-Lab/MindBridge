@@ -673,6 +673,15 @@ def test_named_month_and_calendar_year_prefer_event_time(tmp_path: Path) -> None
     relative = memory_module._parse_temporal_range("2024 days ago", reference)
     assert relative is not None
     assert relative[0].date() == reference.date() - timedelta(days=2024)
+    assert memory_module._parse_temporal_range("X2024", reference) is None
+    assert memory_module._parse_temporal_range("resolution 2024p", reference) is None
+    assert memory_module._parse_temporal_range("release_2024", reference) is None
+    assert memory_module._parse_temporal_range("型号X2024年", reference) is None
+    assert memory_module._parse_temporal_range("2024年p", reference) is None
+    assert memory_module._parse_temporal_range("型号X2024年4月", reference) is None
+    assert memory_module._parse_temporal_range("X2024年04月p", reference) is None
+    cjk_year = memory_module._parse_temporal_range("2024年发生了什么?", reference)
+    assert cjk_year is not None and cjk_year[0].year == 2024
 
     with _memory(tmp_path, _FakeModels()) as memory:
         december = memory.add(
@@ -806,6 +815,41 @@ def test_temporal_proximity_is_a_soft_score_not_a_hard_sort_key(tmp_path: Path) 
         assert _FakeIndex.instances[-1].lexical_search_calls == 1
 
     assert [hit.id for hit in hits] == [adjacent.id, exact.id]
+
+
+def test_temporal_search_reads_lexical_evidence_from_authoritative_time_range(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        outside = memory.add_many(
+            tuple(f"shared witness outside {index}" for index in range(130)),
+            occurred_at=(datetime(2026, 1, 1, tzinfo=timezone.utc),) * 130,
+        )
+        weak = memory.add(
+            "shared witness weak",
+            occurred_at=datetime(2024, 5, 1, tzinfo=timezone.utc),
+        )
+        target = memory.add(
+            "shared witness target",
+            occurred_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
+        )
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = ()
+        index.lexical_hits_override = tuple(
+            IndexHit(
+                id=record.id,
+                relevance=0.5 if record.id == weak.id else 1.0,
+                lexical_match=True,
+            )
+            for record in (*outside[:99], weak, *outside[99:], target)
+        )
+        hits = memory.search("shared witness in 2024", limit=1)
+        assert hits and hits[0].id == target.id
+        assert index.lexical_search_calls == 2
+
+        monkeypatch.setattr(memory._store, "read_memories", lambda _memory_ids: ())
+        assert memory.search("shared witness in 2024", limit=1) == ()
 
 
 def test_text_reranking_preserves_negation_and_bounded_scores(tmp_path: Path) -> None:
