@@ -482,6 +482,7 @@ models = OpenAIModels(
     embedding_model="text-embedding-3-small",
     embedding_space=None,
     embedding_dimension=1536,
+    embedding_request_format="input",
     generation_model="gpt-5-mini",
     transcription_model="whisper-1",
     transcription_space=None,
@@ -504,6 +505,14 @@ built into the shared grounded request, so `answer()` and `stream_answer()` alwa
 generation controls. `generation_video_limit` bounds distinct retrieved videos while preserving
 overflow hit text; set it to `None` to disable that count limit. The byte limits still apply. SDK
 clients remain caller-owned.
+
+`embedding_request_format="input"` uses the standard OpenAI Embeddings request field. Set it to
+`"messages"` for OpenAI-compatible servers that implement chat-style embeddings, such as vLLM
+multimodal pooling models. That mode sends ordered text and inline media as top-level chat messages
+through the same `/embeddings` endpoint. The request format is included in the default durable
+`embedding_space`; an explicit space must likewise distinguish recipes that use different formats.
+In `messages` mode, `embedding_dimension` validates returned vectors but is not sent as the
+provider's optional server-side dimension-reduction parameter.
 
 `OpenAIModels.stream_answer()` requests streamed chat completions with final usage enabled.
 `Memory.ask()` selects it automatically to measure first chunk, first token, total generation

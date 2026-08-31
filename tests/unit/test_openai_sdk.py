@@ -114,6 +114,76 @@ def test_multimodal_embedding_preserves_asset_order_and_inlines_media(
     assert result[0] == pytest.approx((0.6, 0.8))
 
 
+def test_messages_embedding_uses_vllm_shape_without_dimensions(tmp_path: Path) -> None:
+    image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"image")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert request.url == "https://sdk.example.test/v1/embeddings"
+        assert "input" not in payload
+        assert payload == {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "remember"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64,aW1hZ2U=",
+                            },
+                        },
+                    ],
+                }
+            ],
+            "model": "embed-model",
+            "encoding_format": "float",
+        }
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [3, 4]}]})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(
+            embedding_client=_sdk_client(client),
+            embedding_model="embed-model",
+            embedding_dimension=2,
+            embedding_request_format="messages",
+            embedding_capabilities=frozenset({Modality.TEXT, Modality.IMAGE}),
+        )
+        result = model.embed((ModelInput(text="remember", assets=(image,)),))
+
+    assert model.embedding_space == "embed-model:2:messages-v1:l2-v1"
+    assert result[0] == pytest.approx((0.6, 0.8))
+
+
+def test_messages_embedding_batches_chat_conversations() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["messages"] == [
+            [{"role": "user", "content": [{"type": "text", "text": "first"}]}],
+            [{"role": "user", "content": [{"type": "text", "text": "second"}]}],
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"index": 1, "embedding": [0, 5]},
+                    {"index": 0, "embedding": [3, 4]},
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(
+            embedding_client=_sdk_client(client),
+            embedding_dimension=2,
+            embedding_request_format="messages",
+        )
+        first, second = model.embed(("first", "second"))
+
+    assert first == pytest.approx((0.6, 0.8))
+    assert second == pytest.approx((0.0, 1.0))
+
+
 def test_answer_maps_native_hit_media_and_abstains_without_hits(tmp_path: Path) -> None:
     image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"image")
     requests: list[httpx.Request] = []
@@ -1182,6 +1252,8 @@ def test_missing_client_and_unsupported_modality_fail_before_http(tmp_path: Path
 
 
 def test_generation_controls_reject_invalid_values() -> None:
+    with pytest.raises(ValidationError, match="embedding_request_format"):
+        OpenAIModels(embedding_request_format=cast(Any, "unknown"))
     with pytest.raises(ValidationError, match="generation_max_tokens"):
         OpenAIModels(generation_max_tokens=0)
     with pytest.raises(ValidationError, match="generation_extra_body"):

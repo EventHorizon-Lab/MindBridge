@@ -66,6 +66,7 @@ class OpenAIModels:
         "_embedding_capabilities",
         "_embedding_dimension",
         "_embedding_model",
+        "_embedding_request_format",
         "_embedding_space",
         "_generation_capabilities",
         "_generation_extra_body",
@@ -89,6 +90,7 @@ class OpenAIModels:
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         embedding_space: str | None = None,
         embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION,
+        embedding_request_format: Literal["input", "messages"] = "input",
         generation_model: str = DEFAULT_GENERATION_MODEL,
         transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL,
         transcription_space: str | None = None,
@@ -110,6 +112,7 @@ class OpenAIModels:
             or embedding_dimension <= 0
         ):
             raise ValidationError("embedding_dimension must be a positive integer")
+        embedding_request_format = _embedding_format(embedding_request_format)
         if generation_seed is not None and (
             isinstance(generation_seed, bool)
             or not isinstance(generation_seed, int)
@@ -152,8 +155,13 @@ class OpenAIModels:
             self._clients["transcription"] = transcription_client
         self._embedding_model = embedding_model
         self._embedding_dimension = embedding_dimension
+        self._embedding_request_format = embedding_request_format
         self._embedding_space = (
-            f"{embedding_model}:{embedding_dimension}:l2-v1"
+            (
+                f"{embedding_model}:{embedding_dimension}:messages-v1:l2-v1"
+                if embedding_request_format == "messages"
+                else f"{embedding_model}:{embedding_dimension}:l2-v1"
+            )
             if embedding_space is None
             else _text(embedding_space, "embedding_space")
         )
@@ -216,7 +224,7 @@ class OpenAIModels:
         inputs: Sequence[ModelInput | str],
         task: EmbedTask = EmbedTask.DOCUMENT,
     ) -> tuple[tuple[float, ...], ...]:
-        """Encode one batch with the standard API shape.
+        """Encode one batch with the configured OpenAI-compatible API shape.
 
         ``task`` is validated but intentionally not serialized: the generic OpenAI embeddings
         contract has no task field. Task-aware providers should implement ``EmbeddingBackend``.
@@ -242,19 +250,36 @@ class OpenAIModels:
         _require_consistent_assets(embedding_assets)
         _require_inline_size(embedding_assets)
 
-        create_embedding = cast(Any, self._client("embedding").embeddings.create)
+        client = self._client("embedding")
         mark_model_requests(1)
         try:
-            response = create_embedding(
-                input=(
-                    [value.text for value in batch]
-                    if all(not value.assets for value in batch)
-                    else _embedding_samples(batch)
-                ),
-                model=self.embedding_model,
-                dimensions=self.embedding_dimension,
-                encoding_format="float",
-            )
+            if self._embedding_request_format == "messages":
+                from openai.types.create_embedding_response import CreateEmbeddingResponse
+
+                samples = _embedding_samples(batch)
+                response = client.post(
+                    "/embeddings",
+                    cast_to=CreateEmbeddingResponse,
+                    body={
+                        "messages": samples[0] if len(samples) == 1 else samples,
+                        "model": self.embedding_model,
+                        # The declared dimension validates output; chat servers may reject it as
+                        # an unsupported Matryoshka truncation request.
+                        "encoding_format": "float",
+                    },
+                )
+            else:
+                create_embedding = cast(Any, client.embeddings.create)
+                response = create_embedding(
+                    input=(
+                        [value.text for value in batch]
+                        if all(not value.assets for value in batch)
+                        else _embedding_samples(batch)
+                    ),
+                    model=self.embedding_model,
+                    dimensions=self.embedding_dimension,
+                    encoding_format="float",
+                )
         except ModelError:
             raise
         except Exception as error:
@@ -772,6 +797,12 @@ def _text(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{name} must be non-empty text")
     return value.strip()
+
+
+def _embedding_format(value: object) -> Literal["input", "messages"]:
+    if not isinstance(value, str) or value not in ("input", "messages"):
+        raise ValidationError("embedding_request_format must be 'input' or 'messages'")
+    return cast(Literal["input", "messages"], value)
 
 
 def _provider_reason(error: Exception) -> str | None:
