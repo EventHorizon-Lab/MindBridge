@@ -12,7 +12,7 @@ physical `data_dir` has exactly one live `Memory` owner.
 
 ## Install
 
-Install the local Jina and FunASR adapters, plus the official OpenAI SDK when grounded answers use
+Install the local Jina and FunASR adapters, plus the official OpenAI SDK when generation or ASR uses
 OpenAI:
 
 ```bash
@@ -139,7 +139,8 @@ The built-in adapters are deliberately thin:
   `encode_document` methods.
 - `FunASRTranscriber` delegates model loading and execution to `funasr.AutoModel`.
 - `OpenCVFaceAnalyzer` delegates explicit local YuNet and SFace models to OpenCV.
-- `OpenAIModels` uses caller-owned official OpenAI SDK clients.
+- `OpenAIModels` uses caller-owned official OpenAI SDK clients for embeddings, generation, and
+  completed-file transcription.
 
 ## Storage and consistency
 

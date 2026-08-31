@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import time
@@ -76,7 +77,10 @@ class OpenAIModels:
         "_generation_temperature",
         "_generation_video_limit",
         "_transcription_capabilities",
+        "_transcription_keywords",
+        "_transcription_languages",
         "_transcription_model",
+        "_transcription_prompt",
         "_transcription_space",
     )
 
@@ -94,6 +98,9 @@ class OpenAIModels:
         generation_model: str = DEFAULT_GENERATION_MODEL,
         transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL,
         transcription_space: str | None = None,
+        transcription_prompt: str | None = None,
+        transcription_keywords: Sequence[str] | None = None,
+        transcription_languages: Sequence[str] | None = None,
         embedding_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
         generation_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
         transcription_capabilities: frozenset[Modality] = frozenset({Modality.AUDIO}),
@@ -106,6 +113,13 @@ class OpenAIModels:
         embedding_model = _text(embedding_model, "embedding_model")
         generation_model = _text(generation_model, "generation_model")
         transcription_model = _text(transcription_model, "transcription_model")
+        transcription_prompt, transcription_keywords, transcription_languages = (
+            _transcription_context(
+                transcription_prompt,
+                transcription_keywords,
+                transcription_languages,
+            )
+        )
         if (
             isinstance(embedding_dimension, bool)
             or not isinstance(embedding_dimension, int)
@@ -167,8 +181,16 @@ class OpenAIModels:
         )
         self._generation_model = generation_model
         self._transcription_model = transcription_model
+        self._transcription_prompt = transcription_prompt
+        self._transcription_keywords = transcription_keywords
+        self._transcription_languages = transcription_languages
         self._transcription_space = (
-            f"{transcription_model}:asr-v1"
+            _default_transcription_space(
+                transcription_model,
+                prompt=transcription_prompt,
+                keywords=transcription_keywords,
+                languages=transcription_languages,
+            )
             if transcription_space is None
             else _text(transcription_space, "transcription_space")
         )
@@ -530,8 +552,13 @@ class OpenAIModels:
                         attempted += 1
                         mark_model_requests(attempted)
                         response = create_transcription(
-                            model=self.transcription_model,
-                            file=(asset.name or path.name, stream, media_type),
+                            **_transcription_request(
+                                self.transcription_model,
+                                (asset.name or path.name, stream, media_type),
+                                prompt=self._transcription_prompt,
+                                keywords=self._transcription_keywords,
+                                languages=self._transcription_languages,
+                            )
                         )
                 except ModelError:
                     raise
@@ -797,6 +824,74 @@ def _text(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{name} must be non-empty text")
     return value.strip()
+
+
+def _text_sequence(value: object, name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValidationError(f"{name} must be a sequence of non-empty strings")
+    values = tuple(value)
+    if any(not isinstance(item, str) or not item.strip() for item in values):
+        raise ValidationError(f"{name} must be a sequence of non-empty strings")
+    return tuple(cast(str, item).strip() for item in values)
+
+
+def _transcription_context(
+    prompt: object,
+    keywords: object,
+    languages: object,
+) -> tuple[str | None, tuple[str, ...], tuple[str, ...]]:
+    normalized_prompt = None if prompt is None else _text(prompt, "transcription_prompt")
+    normalized_keywords = _text_sequence(keywords, "transcription_keywords")
+    normalized_languages = _text_sequence(languages, "transcription_languages")
+    if any(any(character in keyword for character in "<>\r\n") for keyword in normalized_keywords):
+        raise ValidationError(
+            "transcription_keywords must contain one-line text without '<' or '>'"
+        )
+    return normalized_prompt, normalized_keywords, normalized_languages
+
+
+def _transcription_request(
+    model: str,
+    file: object,
+    *,
+    prompt: str | None,
+    keywords: Sequence[str],
+    languages: Sequence[str],
+) -> dict[str, object]:
+    request: dict[str, object] = {"model": model, "file": file}
+    if prompt is not None:
+        request["prompt"] = prompt
+    context = {}
+    if keywords:
+        context["keywords"] = list(keywords)
+    if languages:
+        context["languages"] = list(languages)
+    if context:
+        request["extra_body"] = context
+    return request
+
+
+def _default_transcription_space(
+    model: str,
+    *,
+    prompt: str | None,
+    keywords: Sequence[str],
+    languages: Sequence[str],
+) -> str:
+    context: dict[str, object] = {}
+    if prompt is not None:
+        context["prompt"] = prompt
+    if keywords:
+        context["keywords"] = list(keywords)
+    if languages:
+        context["languages"] = list(languages)
+    if not context:
+        return f"{model}:asr-v1"
+    payload = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(f"openai-transcription-v1:{payload}".encode()).hexdigest()[:16]
+    return f"{model}:asr-v1:{digest}"
 
 
 def _embedding_format(value: object) -> Literal["input", "messages"]:

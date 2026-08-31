@@ -1100,6 +1100,42 @@ def test_transcription_uses_its_own_endpoint_key_and_multipart_file(tmp_path: Pa
     assert result == ("hello there",)
 
 
+def test_gpt_transcribe_sends_context_and_names_its_recipe(tmp_path: Path) -> None:
+    audio = _asset(tmp_path, "audio", Modality.AUDIO, "audio/wav", b"speech")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = request.read()
+        assert b'name="model"\r\n\r\ngpt-transcribe' in body
+        assert b'name="prompt"\r\n\r\nA support call' in body
+        assert body.count(b'name="keywords[]"') == 2
+        assert b'name="keywords[]"\r\n\r\nMindBridge\r\n' in body
+        assert b'name="keywords[]"\r\n\r\nAC-42\r\n' in body
+        assert body.count(b'name="languages[]"') == 2
+        assert b'name="languages[]"\r\n\r\nen\r\n' in body
+        assert b'name="languages[]"\r\n\r\nzh-cn\r\n' in body
+        return httpx.Response(200, json={"text": "context-aware transcript"})
+
+    options: dict[str, Any] = {
+        "transcription_model": "gpt-transcribe",
+        "transcription_prompt": "A support call",
+        "transcription_keywords": ("MindBridge", "AC-42"),
+        "transcription_languages": ("en", "zh-cn"),
+    }
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(transcription_client=_sdk_client(client), **options)
+        result = model.transcribe((audio,))
+
+    assert result == ("context-aware transcript",)
+    assert model.transcription_space.startswith("gpt-transcribe:asr-v1:")
+    assert model.transcription_space == OpenAIModels(**options).transcription_space
+    assert (
+        model.transcription_space
+        != OpenAIModels(
+            **{**options, "transcription_keywords": ("MindBridge",)}
+        ).transcription_space
+    )
+
+
 @pytest.mark.parametrize(
     "data",
     [
@@ -1251,7 +1287,7 @@ def test_missing_client_and_unsupported_modality_fail_before_http(tmp_path: Path
         model.embed((ModelInput(assets=(image,)),))
 
 
-def test_generation_controls_reject_invalid_values() -> None:
+def test_adapter_controls_reject_invalid_values() -> None:
     with pytest.raises(ValidationError, match="embedding_request_format"):
         OpenAIModels(embedding_request_format=cast(Any, "unknown"))
     with pytest.raises(ValidationError, match="generation_max_tokens"):
@@ -1260,6 +1296,12 @@ def test_generation_controls_reject_invalid_values() -> None:
         OpenAIModels(generation_extra_body={"": False})
     with pytest.raises(ValidationError, match="generation_video_limit"):
         OpenAIModels(generation_video_limit=0)
+    with pytest.raises(ValidationError, match="transcription_prompt"):
+        OpenAIModels(transcription_prompt=" ")
+    with pytest.raises(ValidationError, match="transcription_keywords"):
+        OpenAIModels(transcription_keywords=("invalid\nkeyword",))
+    with pytest.raises(ValidationError, match="transcription_languages"):
+        OpenAIModels(transcription_languages=cast(Any, "en"))
 
 
 def test_adapter_does_not_close_the_caller_owned_sdk_client() -> None:
