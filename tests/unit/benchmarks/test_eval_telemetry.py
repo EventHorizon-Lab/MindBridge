@@ -7,6 +7,8 @@ from typing import cast
 import pytest
 
 from mindbridge._telemetry import (
+    GROUNDING_HITS_DROPPED,
+    GROUNDING_MEDIA_ELIDED,
     MODEL_MODULE,
     MODEL_TTFT,
     SPAN_KIND,
@@ -38,6 +40,8 @@ def test_evaluation_telemetry_aggregates_nodes_ttft_and_modal_tokens() -> None:
             ) as span,
         ):
             span.set_attribute(MODEL_TTFT, 0.025)
+            span.set_attribute(GROUNDING_MEDIA_ELIDED, 2)
+            span.set_attribute(GROUNDING_HITS_DROPPED, 1)
             record_model_usage(
                 input_tokens=12,
                 output_tokens=3,
@@ -62,6 +66,7 @@ def test_evaluation_telemetry_aggregates_nodes_ttft_and_modal_tokens() -> None:
     assert usage["average_tokens"] == pytest.approx(7.5)
     assert usage["modality_breakdown_complete"] is True
     assert usage["input_by_modality"] == {"image": 5, "text": 7}
+    assert result["grounding"] == {"dropped_hits": 1, "media_elided_hits": 2}
 
 
 def test_evaluation_telemetry_does_not_turn_missing_usage_into_zero() -> None:

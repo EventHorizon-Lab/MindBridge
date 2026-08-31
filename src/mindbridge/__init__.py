@@ -38,6 +38,7 @@ from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
 from mindbridge.types import (
+    AbstentionReason,
     AnswerResult,
     AssetRef,
     Blob,
@@ -56,6 +57,7 @@ from mindbridge.types import (
 __all__ = [
     "DEFAULT_FUNASR_MODEL_ID",
     "DEFAULT_FUNASR_RECIPE",
+    "AbstentionReason",
     "AnswerResult",
     "AssetRef",
     "AsyncMemory",

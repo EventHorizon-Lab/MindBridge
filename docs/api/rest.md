@@ -262,14 +262,18 @@ Content-Type: application/json
 ```json
 {
   "answer": "I don't know based on the available memories.",
-  "hits": []
+  "hits": [],
+  "abstained": true,
+  "abstention_reason": "no_evidence"
 }
 ```
 
 `memory_type` and `reference_at` have the same semantics as search. `hits` are the exact search
-results used to ground the answer. The outbound generation request includes their content,
-`memory_type`, `occurred_at`, `occurred_end`, `created_at`, metadata, and media. In the built-in model request, a
-distinct question/evidence asset is serialized once even when multiple hits refer to it.
+results used to ground the answer. `abstention_reason` is `no_evidence`,
+`insufficient_evidence`, or `null` when `abstained` is false. The outbound generation request
+includes their content, `memory_type`, `occurred_at`, `occurred_end`, `created_at`, metadata, and
+media. In the built-in model request, a distinct question/evidence asset is serialized once even
+when multiple hits refer to it.
 
 ### Get a memory
 

@@ -52,6 +52,8 @@ class CachedAnswer:
     confidence: float
     memory_ids: tuple[str, ...]
     evidence: tuple[EvidenceInterval, ...] = ()
+    abstained: bool = False
+    abstention_reason: str | None = None
 
 
 class ResponseCache:
@@ -88,6 +90,8 @@ class ResponseCache:
                 "confidence": answer.confidence,
                 "memory_ids": answer.memory_ids,
                 "evidence": tuple(item.json() for item in answer.evidence),
+                "abstained": answer.abstained,
+                "abstention_reason": answer.abstention_reason,
             },
             ensure_ascii=False,
             allow_nan=False,
@@ -152,11 +156,13 @@ def _answer(payload: str) -> CachedAnswer:
     value = json.loads(payload)
     if not isinstance(value, dict):
         raise ValueError("response cache payload must be an object")
-    prediction, confidence, memory_ids, evidence = (
+    prediction, confidence, memory_ids, evidence, abstained, abstention_reason = (
         value.get("prediction"),
         value.get("confidence"),
         value.get("memory_ids"),
         value.get("evidence", []),
+        value.get("abstained", False),
+        value.get("abstention_reason"),
     )
     if (
         not isinstance(prediction, str)
@@ -166,13 +172,23 @@ def _answer(payload: str) -> CachedAnswer:
         or not isinstance(memory_ids, list)
         or any(not isinstance(item, str) for item in memory_ids)
         or not isinstance(evidence, list)
+        or not isinstance(abstained, bool)
+        or (abstention_reason is not None and not isinstance(abstention_reason, str))
+        or abstained != (abstention_reason is not None)
     ):
         raise ValueError("response cache payload is invalid")
     try:
         intervals = tuple(_evidence(item) for item in evidence)
     except (TypeError, ValueError):
         raise ValueError("response cache payload is invalid") from None
-    return CachedAnswer(prediction, float(confidence), tuple(memory_ids), intervals)
+    return CachedAnswer(
+        prediction,
+        float(confidence),
+        tuple(memory_ids),
+        intervals,
+        abstained,
+        abstention_reason,
+    )
 
 
 def _evidence(value: object) -> EvidenceInterval:

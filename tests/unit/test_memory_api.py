@@ -58,7 +58,9 @@ from mindbridge.models.base import (
     SpeechAnalysis,
     SpeechTurn,
 )
+from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.types import (
+    AbstentionReason,
     AnswerResult,
     AssetRef,
     Blob,
@@ -622,6 +624,44 @@ def test_streaming_answer_reports_only_the_hits_the_stream_used(tmp_path: Path) 
     assert len(result.hits) == 1
 
 
+def test_streaming_answer_preserves_structured_abstention(tmp_path: Path) -> None:
+    class AbstainingStreamModels(_FakeModels):
+        def stream_answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+        ) -> Generator[str, None, AnswerResult]:
+            del question
+            yield "unknown"
+            return AnswerResult(
+                answer="unknown",
+                hits=(hits[0],),
+                abstained=True,
+                abstention_reason=AbstentionReason.INSUFFICIENT_EVIDENCE,
+            )
+
+    with _memory(tmp_path, AbstainingStreamModels()) as memory:
+        memory.add("red evidence")
+        result = memory.ask("red")
+
+    assert result.abstained is True
+    assert result.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
+    assert len(result.hits) == 1
+
+
+def test_openai_stream_marks_an_empty_retrieval_as_no_evidence(tmp_path: Path) -> None:
+    with Memory(
+        tmp_path,
+        embedder=_FakeModels(),
+        answerer=OpenAIModels(),
+    ) as memory:
+        result = memory.ask("unknown")
+
+    assert result.abstained is True
+    assert result.abstention_reason is AbstentionReason.NO_EVIDENCE
+    assert result.hits == ()
+
+
 def test_memory_types_are_stable_and_filterable(tmp_path: Path) -> None:
     with _memory(tmp_path, _FakeModels()) as memory:
         semantic = memory.add("shared instruction")
@@ -851,6 +891,47 @@ def test_exact_lexical_evidence_beats_a_weak_dense_neighbor(tmp_path: Path) -> N
         hits = memory.search("obsidian key green drawer", limit=2)
 
     assert [hit.id for hit in hits] == [exact.id, neighbor.id]
+
+
+def test_lexical_candidate_confidence_does_not_decay_with_its_result_rank(
+    tmp_path: Path,
+) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        exact = memory.add("BMVC hotel reservation total cost")
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = ()
+        index.lexical_hits_override = (
+            IndexHit(id=exact.id, relevance=0.2, confidence=0.0, lexical_match=True),
+        )
+
+        hits = memory.search("BMVC accommodation total", limit=1)
+
+    assert [hit.id for hit in hits] == [exact.id]
+
+
+def test_ask_round_robins_modalities_before_filling_grounding_slots(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory:
+        images = tuple(
+            memory.add((f"image evidence {index}", Blob(str(index).encode(), "image/png")))
+            for index in range(4)
+        )
+        texts = tuple(memory.add(f"text evidence {index}") for index in range(2))
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = tuple(
+            IndexHit(id=record.id, relevance=0.99 - rank / 100, confidence=0.9)
+            for rank, record in enumerate((*images, *texts))
+        )
+        index.lexical_hits_override = ()
+
+        result = memory.ask("find evidence", limit=4)
+
+    assert [hit.modality for hit in result.hits] == [
+        Modality.IMAGE,
+        Modality.TEXT,
+        Modality.IMAGE,
+        Modality.TEXT,
+    ]
 
 
 def test_event_span_overlapping_query_day_is_temporally_exact(tmp_path: Path) -> None:

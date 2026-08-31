@@ -254,7 +254,8 @@ provider compatibility layer.
 
 - `MemoryRecord`: stable ID, derived text, modality, memory type, assets, timestamps, metadata.
 - `SearchHit`: the same visible memory fields plus a normalized score.
-- `AnswerResult`: grounded answer text and the accepted hits.
+- `AnswerResult`: grounded answer text, accepted hits, `abstained`, and a machine-readable
+  `abstention_reason` (`no_evidence` or `insufficient_evidence`).
 - `Page`: records and an optional next cursor.
 - `SpeakerSegment`: one timed speech segment and local identity fields.
 
@@ -380,8 +381,9 @@ so URL- or path-shaped text cannot activate media autodetection.
 speech = FunASRTranscriber(device="auto")
 ```
 
-The adapter delegates model, VAD, and speaker execution to `funasr.AutoModel`, then validates and
-maps the result into MindBridge speech values.
+The adapter delegates model, VAD, and optional speaker execution to `funasr.AutoModel`, then
+validates and maps the result into MindBridge speech values. A `FunASRRecipe` with
+`speaker_model=None` returns timed transcript turns without speaker embeddings.
 
 ### OpenCV face analysis
 
@@ -424,6 +426,7 @@ models = OpenAIModels(
     generation_seed=None,
     generation_temperature=None,
     generation_max_tokens=None,
+    generation_video_limit=8,
     generation_extra_body=None,
 )
 ```
@@ -433,7 +436,9 @@ only when their operation is invoked. Media is bounded and sent inline; use a pr
 upload adapter for larger assets. `generation_max_tokens` maps to Chat Completions `max_tokens`;
 `generation_extra_body` passes caller-owned provider extensions through the official SDK. Both are
 built into the shared grounded request, so `answer()` and `stream_answer()` always send identical
-generation controls. SDK clients remain caller-owned.
+generation controls. `generation_video_limit` bounds distinct retrieved videos while preserving
+overflow hit text; set it to `None` to disable that count limit. The byte limits still apply. SDK
+clients remain caller-owned.
 
 `OpenAIModels.stream_answer()` requests streamed chat completions with final usage enabled.
 `Memory.ask()` selects it automatically to measure first chunk, first token, total generation

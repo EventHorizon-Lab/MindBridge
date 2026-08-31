@@ -68,7 +68,8 @@ The bundled `OpenAIModels` generation span also reports what its inline media bu
 `mindbridge.grounding.media_elided_hits` counts retrieved hits with any media that did not fit, and
 `mindbridge.grounding.dropped_hits` counts hits left out of the request entirely. Both are zero on
 a request that sent every retrieved hit intact. `AnswerResult.hits` still returns the retrieved
-hits, so these counters are how a shrunken grounding payload becomes visible.
+hits accepted by the backend as canonical source records, so these counters are how a shrunken
+media payload becomes visible.
 
 `OpenAIModels` implements the optional `StreamingGenerationBackend` protocol. `Memory.ask()`
 consumes its deltas internally and still returns one `AnswerResult`, while the generation span
@@ -95,7 +96,8 @@ remainder is recorded as `.unattributed`. This preserves the exact total without
 or audio split. OpenAI transcription token details are mapped to text/audio; duration-billed
 responses additionally expose `mindbridge.token_usage.audio_seconds`. The bundled local Jina,
 Sentence Transformers, and FunASR adapters are not token-billed and do not synthesize tokenizer
-usage.
+usage. FunASR does report `audio_seconds` through the final timed speech turn for each analyzed
+asset, so local ASR work is visible without inventing tokens.
 
 `mindbridge.model.request_count`, `mindbridge.token_usage.expected_request_count`, and
 `mindbridge.token_usage.reported_request_count` make missing usage visible. A failed request or a
@@ -133,6 +135,10 @@ task row in `results.json` includes:
       "input_by_modality": {"text": 1000, "image": 200},
       "output_by_modality": {"text": 300},
       "by_module": {}
+    },
+    "grounding": {
+      "media_elided_hits": 2,
+      "dropped_hits": 0
     }
   }
 }
@@ -143,3 +149,4 @@ selected question count. Node totals are diagnostic accumulated span time and ca
 concurrency. Token totals include MindBridge model calls and benchmark judge calls. Cached answers
 do not consume new model tokens. `total_tokens` and `average_tokens` are `null` when any
 token-metered response omitted usage; `reported_total_tokens` remains the exact lower bound.
+`grounding` sums the request-level media elision and whole-hit drop counters for the task.

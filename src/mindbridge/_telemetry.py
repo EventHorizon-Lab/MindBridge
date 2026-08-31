@@ -254,7 +254,9 @@ def record_model_usage(
     _record_modalities(span, "output", output_by_modality or {})
 
 
-def record_unmetered_model_usage(*, request_count: int = 1) -> None:
+def record_unmetered_model_usage(
+    *, request_count: int = 1, audio_seconds: float | None = None
+) -> None:
     """Mark successful local inference as not exposing token-billing units."""
     record_model_usage(
         input_tokens=None,
@@ -263,6 +265,7 @@ def record_unmetered_model_usage(*, request_count: int = 1) -> None:
         request_count=request_count,
         expected_requests=0,
         reported_requests=0,
+        audio_seconds=audio_seconds,
     )
 
 

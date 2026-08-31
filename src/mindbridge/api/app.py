@@ -23,6 +23,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mindbridge.api.errors import error_response, error_responses, register_error_handlers
 from mindbridge.types import (
+    AbstentionReason,
     AnswerResult,
     AssetRef,
     Blob,
@@ -203,6 +204,8 @@ class SearchResponse(_ResponseModel):
 class AnswerResponse(_ResponseModel):
     answer: str
     hits: tuple[SearchHitResponse, ...]
+    abstained: bool
+    abstention_reason: AbstentionReason | None
 
 
 class DeleteResponse(_ResponseModel):

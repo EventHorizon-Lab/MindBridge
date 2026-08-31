@@ -488,7 +488,14 @@ def _ask(memory: Memory, arguments: argparse.Namespace) -> _Document:
         memory_type=_optional_memory_type(arguments),
         reference_at=_optional_time(arguments.reference_at, "reference_at"),
     )
-    return {"answer": result.answer, "hits": [_memory_document(hit) for hit in result.hits]}
+    return {
+        "answer": result.answer,
+        "hits": [_memory_document(hit) for hit in result.hits],
+        "abstained": result.abstained,
+        "abstention_reason": (
+            None if result.abstention_reason is None else result.abstention_reason.value
+        ),
+    }
 
 
 def _get(memory: Memory, arguments: argparse.Namespace) -> _Document:

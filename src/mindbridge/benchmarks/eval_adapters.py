@@ -505,7 +505,7 @@ def _m3(
         questions = tuple(
             EvalQuestion(
                 question.question_id,
-                (_free_text_prompt(question.question),),
+                _free_text_parts(question.question),
                 (question.reference_answer,),
                 cutoff_seconds=question.cutoff_seconds,
                 metadata={"question_types": question.question_types},
@@ -617,7 +617,7 @@ def _egolife(
     normalized = tuple(
         EvalQuestion(
             question.question_id,
-            (_choice_prompt(question.question, question.choices),),
+            _choice_parts(question.question, question.choices),
             expected_choice=question.correct_option,
             score_kind="choice",
             cutoff_seconds=question.query_offset_ms / 1_000,
@@ -655,9 +655,10 @@ def _egomem(
             EvalQuestion(
                 question.question_id,
                 (
+                    question.question,
                     EGOMEM_REASON_QUERY_PROMPT.text.format(
                         query_time=question.query_time,
-                        question_with_options=_choice_prompt(question.question, question.choices),
+                        question_with_options=_choice_parts(question.question, question.choices)[1],
                     ),
                 ),
                 score_kind="submission",
@@ -1089,5 +1090,14 @@ def _choice_prompt(question: str, choices: Sequence[str]) -> str:
     )
 
 
+def _choice_parts(question: str, choices: Sequence[str]) -> tuple[str, str]:
+    prompt = _choice_prompt(question, choices)
+    return question, prompt.replace(f"Question: {question}\n", "", 1)
+
+
 def _free_text_prompt(question: str) -> str:
     return f"Answer concisely using only the memories.\nQuestion: {question}\nAnswer:"
+
+
+def _free_text_parts(question: str) -> tuple[str, str]:
+    return question, "Answer concisely using only the memories.\nAnswer:"

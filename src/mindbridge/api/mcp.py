@@ -37,6 +37,7 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.types import (
+    AbstentionReason,
     AssetRef,
     Blob,
     ContentInput,
@@ -218,6 +219,8 @@ class SearchResult(BaseModel):
 class AnswerResponse(BaseModel):
     answer: str
     hits: tuple[SearchHitResult, ...]
+    abstained: bool
+    abstention_reason: AbstentionReason | None
 
 
 class DeleteResult(BaseModel):
@@ -288,6 +291,8 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
         return AnswerResponse(
             answer=result.answer,
             hits=tuple(_search_hit_result(hit) for hit in result.hits),
+            abstained=result.abstained,
+            abstention_reason=result.abstention_reason,
         )
 
     @server.tool(annotations=_READ_ONLY)

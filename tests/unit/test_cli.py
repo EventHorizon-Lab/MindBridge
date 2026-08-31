@@ -34,7 +34,16 @@ from mindbridge.exceptions import MindBridgeError, ValidationError
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.models.funasr import DEFAULT_FUNASR_MODEL_ID
 from mindbridge.models.jina import DEFAULT_JINA_MODEL_ID, DEFAULT_JINA_REVISION
-from mindbridge.types import AssetRef, MemoryRecord, MemoryType, Modality, Page, SearchHit
+from mindbridge.types import (
+    AbstentionReason,
+    AnswerResult,
+    AssetRef,
+    MemoryRecord,
+    MemoryType,
+    Modality,
+    Page,
+    SearchHit,
+)
 
 # The REST content union itself, so the two decoders are compared over one schema.
 _REST_CONTENT: TypeAdapter[rest._Content] = TypeAdapter(rest._Content)
@@ -182,7 +191,7 @@ def _record(**overrides: object) -> MemoryRecord:
 
 
 def test_memory_documents_equal_the_rest_response_models() -> None:
-    from mindbridge.cli import _memory_document
+    from mindbridge.cli import _ask, _memory_document
 
     record = _record()
     assert _memory_document(record) == rest.MemoryResponse.model_validate(record).model_dump(
@@ -209,6 +218,29 @@ def test_memory_documents_equal_the_rest_response_models() -> None:
         "next_cursor": page.next_cursor,
     } == rest.PageResponse.model_validate(page).model_dump(mode="json")
     assert rest.DeleteResponse(deleted=True).model_dump(mode="json") == {"deleted": True}
+
+    answer = AnswerResult(
+        "unknown",
+        hits=(hit,),
+        abstained=True,
+        abstention_reason=AbstentionReason.INSUFFICIENT_EVIDENCE,
+    )
+
+    class AnsweringMemory:
+        def ask(self, *_args: object, **_kwargs: object) -> AnswerResult:
+            return answer
+
+    document = _ask(
+        cast(Memory, AnsweringMemory()),
+        argparse.Namespace(
+            content=["question"],
+            content_json=None,
+            limit=5,
+            memory_type=None,
+            reference_at=None,
+        ),
+    )
+    assert document == rest.AnswerResponse.model_validate(answer).model_dump(mode="json")
 
 
 # ---------------------------------------------------------------------------------------------

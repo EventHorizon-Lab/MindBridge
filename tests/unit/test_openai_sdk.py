@@ -37,7 +37,7 @@ from mindbridge.models.base import (
     TranscriptionBackend,
 )
 from mindbridge.models.openai_sdk import UNKNOWN_ANSWER, OpenAIModels
-from mindbridge.types import AssetRef, Modality, SearchHit
+from mindbridge.types import AbstentionReason, AssetRef, Modality, SearchHit
 
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
 ALL_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
@@ -148,12 +148,39 @@ def test_answer_maps_native_hit_media_and_abstains_without_hits(tmp_path: Path) 
     )
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
         model = _model(_sdk_client(client))
-        assert model.answer(ModelInput(text="Unknown?"), ()).answer == UNKNOWN_ANSWER
+        abstention = model.answer(ModelInput(text="Unknown?"), ())
         result = model.answer(ModelInput(text="Where is the cat?"), (hit,))
 
+    assert abstention.answer == UNKNOWN_ANSWER
+    assert abstention.abstained is True
+    assert abstention.abstention_reason is AbstentionReason.NO_EVIDENCE
     assert result.answer == "The cat is on the sofa."
     assert result.hits == (hit,)
     assert len(requests) == 1
+
+
+def test_answer_marks_the_grounded_unknown_sentinel_as_insufficient_evidence() -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": UNKNOWN_ANSWER},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    hit = SearchHit(id="memory_1", content="partial evidence", score=0.9, created_at=NOW)
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = _model(_sdk_client(client)).answer(ModelInput(text="What?"), (hit,))
+
+    assert result.hits == (hit,)
+    assert result.abstained is True
+    assert result.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
 
 
 def test_answer_serializes_temporal_and_metadata_evidence() -> None:
@@ -346,6 +373,7 @@ def test_stream_answer_records_exact_grounding_and_multimodal_usage(
 
     assert "".join(chunks) == "A greeting is audible."
     assert grounded == (hit,)
+    assert grounded.abstention_reason is None
     attributes = exporter.get_finished_spans()[0].attributes
     assert attributes is not None
     assert attributes["gen_ai.usage.input_tokens"] == 20
@@ -650,6 +678,37 @@ def test_answer_elides_one_oversized_media_item_and_keeps_its_text(
     assert failure.value.reason == "payload_too_large"
 
 
+def test_answer_distinguishes_elided_evidence_from_empty_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    oversized = _asset(tmp_path, "oversized", Modality.IMAGE, "image/png", b"123456")
+    hit = SearchHit(
+        id="memory_1",
+        content="",
+        score=0.9,
+        created_at=NOW,
+        assets=(oversized,),
+        modality=Modality.IMAGE,
+    )
+    monkeypatch.setattr(openai_backend, "_MAX_INLINE_MODEL_ITEM_BYTES", 28)
+
+    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+        pytest.fail("elided evidence must not call the generation provider")
+
+    with httpx.Client(transport=httpx.MockTransport(unexpected_request)) as client:
+        model = _model(_sdk_client(client))
+        result = model.answer(ModelInput(text="What?"), (hit,))
+        stream = model.stream_answer(ModelInput(text="What?"), (hit,))
+        assert next(stream) == UNKNOWN_ANSWER
+        with pytest.raises(StopIteration) as completed:
+            next(stream)
+
+    assert result.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
+    assert result.hits == ()
+    assert completed.value.value.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
+
+
 def test_answer_keeps_small_sibling_of_one_oversized_media_item(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -697,6 +756,49 @@ def test_answer_keeps_small_sibling_of_one_oversized_media_item(
     attributes = exporter.get_finished_spans()[0].attributes
     assert attributes is not None
     assert attributes[GROUNDING_MEDIA_ELIDED] == 1
+
+
+def test_answer_caps_grounding_videos_without_dropping_their_text(tmp_path: Path) -> None:
+    videos = tuple(
+        _asset(tmp_path, f"video_{index}", Modality.VIDEO, "video/mp4", str(index).encode())
+        for index in range(3)
+    )
+    hits = tuple(
+        SearchHit(
+            id=f"memory_{index}",
+            content=f"transcript {index}",
+            score=1.0 - index / 10,
+            created_at=NOW,
+            assets=(video,),
+            modality=Modality.VIDEO,
+        )
+        for index, video in enumerate(videos)
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        assert [part["type"] for part in content].count("video_url") == 2
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "grounded"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = _model(_sdk_client(client), generation_video_limit=2).answer(
+            ModelInput(text="What?"), hits
+        )
+
+    assert [len(hit.assets) for hit in result.hits] == [1, 1, 0]
+    assert result.hits[2].content == "transcript 2"
+    assert result.hits[2].modality is Modality.TEXT
 
 
 def test_inline_media_budget_bounds_encoded_request_bytes(
@@ -1084,6 +1186,8 @@ def test_generation_controls_reject_invalid_values() -> None:
         OpenAIModels(generation_max_tokens=0)
     with pytest.raises(ValidationError, match="generation_extra_body"):
         OpenAIModels(generation_extra_body={"": False})
+    with pytest.raises(ValidationError, match="generation_video_limit"):
+        OpenAIModels(generation_video_limit=0)
 
 
 def test_adapter_does_not_close_the_caller_owned_sdk_client() -> None:
@@ -1099,6 +1203,7 @@ def _model(
     generation_seed: int | None = None,
     generation_temperature: float | None = None,
     generation_max_tokens: int | None = None,
+    generation_video_limit: int | None = 8,
     generation_extra_body: dict[str, object] | None = None,
 ) -> OpenAIModels:
     return OpenAIModels(
@@ -1114,6 +1219,7 @@ def _model(
         generation_seed=generation_seed,
         generation_temperature=generation_temperature,
         generation_max_tokens=generation_max_tokens,
+        generation_video_limit=generation_video_limit,
         generation_extra_body=generation_extra_body,
     )
 

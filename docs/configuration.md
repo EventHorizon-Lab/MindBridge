@@ -74,6 +74,9 @@ models = OpenAIModels(
 Provider-specific Chat Completions fields remain explicit. For example, an OpenAI-compatible Qwen
 endpoint can bound output with `generation_max_tokens=512` and disable its thinking template with
 `generation_extra_body={"chat_template_kwargs": {"enable_thinking": False}}`.
+`generation_video_limit` defaults to eight distinct retrieved videos per answer; overflow videos
+retain their text or transcript evidence. Set a positive integer to calibrate the limit, or `None`
+only when the provider context and latency budget can safely accept every retrieved video.
 
 The SDK may read its own environment variables. MindBridge does not duplicate key lookup, URL
 normalization, proxy support, retry policy, connection pooling, or sync/async conversion.
@@ -152,6 +155,10 @@ Jina delegates query/document inference to Sentence Transformers. FunASR delegat
 device selection to `funasr.AutoModel`. Face analysis delegates local decoding, YuNet detection,
 alignment, and SFace encoding to OpenCV; model files are caller-provided and never downloaded by
 MindBridge.
+
+For transcript-only workloads, copy `DEFAULT_FUNASR_RECIPE` with `speaker_model=None` and
+`speaker_revision=None`. This skips CAM++ and returns timed turns without speaker identities; the
+benchmark runner uses that recipe because its tasks do not score speaker identity.
 
 ## Benchmark-only environment settings
 
