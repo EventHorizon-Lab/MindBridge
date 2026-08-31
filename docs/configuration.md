@@ -95,6 +95,31 @@ models = OpenAIModels(
 
 All clients remain caller-owned and must be closed by the caller.
 
+[vLLM multimodal pooling models](https://github.com/vllm-project/vllm/blob/main/examples/pooling/embed/vision_embedding_online.py)
+extend `/embeddings` with top-level chat `messages`. Select that wire format explicitly so text
+queries and media documents use the same model recipe:
+
+```python
+from openai import OpenAI
+
+from mindbridge import Modality, OpenAIModels
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1")
+embedder = OpenAIModels(
+    embedding_client=client,
+    embedding_model="openai/clip-vit-base-patch32",
+    embedding_dimension=512,
+    embedding_request_format="messages",
+    embedding_capabilities=frozenset({Modality.TEXT, Modality.IMAGE}),
+)
+```
+
+MindBridge still uses the caller-owned official OpenAI SDK client; it does not add a provider
+registry or its own HTTP transport. The `messages` format becomes part of the derived durable
+embedding space, so changing formats against an existing `data_dir` fails rather than mixing
+vectors from different input recipes. `embedding_dimension` declares the model's output size for
+validation; MindBridge does not send it as vLLM's optional Matryoshka truncation control.
+
 ## Explicit capabilities
 
 Adapters declare atomic modalities for each operation. `OpenAIModels` defaults to text embedding,
