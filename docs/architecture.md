@@ -63,6 +63,7 @@ MindBridge does not own:
 - Compatibility registries for model services.
 - REST identity, authorization, TLS, quotas, or audit logging.
 - Remote URL downloading.
+- Sensor capture, stream reconnection, observation segmentation, or turn detection.
 - A second model runtime when Sentence Transformers, FunASR, or a provider SDK already supplies it.
 
 ## Model composition
@@ -125,6 +126,11 @@ storage.
 `AsyncMemory` uses threads around this synchronous embedded core. Provider-specific async APIs are
 not normalized by MindBridge; a custom adapter can use the provider's native client where its
 contract permits.
+
+`add_stream` preserves the same write lifecycle by invoking the ordinary add path once per
+completed observation. `AsyncOmniPrefetch` serializes speculative searches for one turn, replaces
+queued snapshots instead of cancelling synchronous work already running in a thread, and confirms
+the exact final snapshot before returning.
 
 ## Protocol interfaces
 

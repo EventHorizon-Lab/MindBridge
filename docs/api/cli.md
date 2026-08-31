@@ -230,7 +230,7 @@ in `--url` mode exactly as a single `add` refuses one.
 
 ```bash
 mindbridge --embedder jina-omni add-many @import.jsonl
-mindbridge --embedder jina-omni add-stream @observations.jsonl
+mindbridge --embedder jina-omni add-stream @completed-observations.jsonl
 ```
 
 `add-stream` keeps input lazy but collects returned records for the CLI's one-document stdout
@@ -387,6 +387,7 @@ That mirrors the [REST gap](rest.md#operations-without-a-route) honestly rather 
 `speech`, `faces`, identity registration, and `reinforce` are implementation gaps, and `reindex`
 and `optimize` are owner-process maintenance that must not be reachable by an unauthenticated
 client. `add-stream` remains local because REST has no client-streaming route.
+Remote callers submit completed observations with ordinary `add` requests.
 
 ### Backends without a recipe
 
@@ -408,8 +409,8 @@ limits, including the 8 MiB request body. See
 
 No `--format` flag, configuration file, `MINDBRIDGE_*` composition variable, plugin registry,
 backend registration by name, streaming output, interactive prompt, `serve` command, or metadata
-filter. `uvicorn my_application:app` already starts a server, and streaming has no meaning for a
-command that emits a single document.
+filter. `uvicorn my_application:app` already starts a server. `add-stream` still emits one document
+at EOF and is therefore for finite JSONL; use the Python iterator for an unbounded source.
 
 ## Benchmarks
 

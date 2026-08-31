@@ -93,7 +93,7 @@ caller-owned.
 
 ## Content contract
 
-`add`, `search`, and `ask` accept one atom or an ordered sequence of atoms:
+`add`, `add_stream`, `search`, and `ask` use the same atom or ordered sequence contract:
 
 | Value | Meaning |
 | --- | --- |
@@ -139,8 +139,9 @@ for record in memory.add_stream(
 ```
 
 MindBridge does not open cameras or split a live feed; the application supplies bounded text,
-image, video, or audio observations. See the
-[Python stream contract](docs/api/python-sdk.md#stream-input).
+image, video, audio, or combined observations. `AsyncOmniPrefetch` coalesces changing multimodal
+query snapshots without persisting partial input. See the
+[omni streaming and interaction memory](docs/omni-streaming-and-interaction-memory.md).
 
 ## Model boundaries
 

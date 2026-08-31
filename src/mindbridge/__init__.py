@@ -12,7 +12,7 @@ from mindbridge.exceptions import (
     StorageError,
     ValidationError,
 )
-from mindbridge.memory import AsyncMemory, Memory
+from mindbridge.memory import AsyncMemory, AsyncOmniPrefetch, Memory
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
@@ -52,6 +52,7 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     Page,
+    PrefetchResult,
     RetrievalCandidateTrace,
     RetrievalRejection,
     RetrievalTrace,
@@ -68,6 +69,7 @@ __all__ = [
     "AnswerResult",
     "AssetRef",
     "AsyncMemory",
+    "AsyncOmniPrefetch",
     "Blob",
     "ContentAtom",
     "ContentInput",
@@ -100,6 +102,7 @@ __all__ = [
     "OpenAIModels",
     "OpenCVFaceAnalyzer",
     "Page",
+    "PrefetchResult",
     "RetrievalCandidateTrace",
     "RetrievalRejection",
     "RetrievalTrace",

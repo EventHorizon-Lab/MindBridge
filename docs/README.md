@@ -11,6 +11,8 @@ MindBridge is an embedded multimodal memory library for text, image, video, audi
 - [Core concepts](concepts.md) — content, assets, identity, isolation, models, and indexing.
 - [Memory types, time, and decay](memory-types-time-and-decay.md) — cognitive roles, temporal
   retrieval, decay, research basis, and limits.
+- [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) — completed stream
+  ingestion, speculative recall, evidence-backed interaction memory, and the graph evidence gate.
 - [Configuration](configuration.md) — explicit composition, provider ownership, and durable model spaces.
 
 ## APIs

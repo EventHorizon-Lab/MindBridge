@@ -705,6 +705,7 @@ def test_remote_mode_passes_the_cursor_through_unparsed(
 @pytest.mark.parametrize(
     ("command", "operands"),
     (
+        ("add-stream", ("[]",)),
         ("speech", ("memory-1",)),
         ("faces", ("memory-1",)),
         ("register-speaker", ("speaker-1", "Ana")),

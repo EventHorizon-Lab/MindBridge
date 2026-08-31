@@ -98,6 +98,7 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     Page,
+    PrefetchResult,
     RetrievalCandidateTrace,
     RetrievalRejection,
     RetrievalTrace,
@@ -632,7 +633,7 @@ class Memory:
         self,
         contents: Iterable[ContentInput | StreamInput],
     ) -> Iterator[MemoryRecord]:
-        """Add a lazy stream one durable, searchable memory at a time."""
+        """Add a lazy omni stream one durable, searchable observation at a time."""
         if isinstance(contents, (str, bytes, Path, Blob, AssetRef, Mapping)):
             raise ValidationError("contents must be an iterable of memory inputs")
         try:
@@ -3016,7 +3017,7 @@ class AsyncMemory:
         self,
         contents: AsyncIterable[ContentInput | StreamInput],
     ) -> AsyncIterator[MemoryRecord]:
-        """Add an async stream one durable, searchable memory at a time."""
+        """Add an async omni stream one durable, searchable observation at a time."""
         if not isinstance(contents, AsyncIterable):
             raise ValidationError("contents must be an async iterable of memory inputs")
         iterator = aiter(contents)
@@ -3138,6 +3139,112 @@ class AsyncMemory:
         await asyncio.to_thread(self._memory.close)
 
 
+class AsyncOmniPrefetch:
+    """Coalesce evolving omni query snapshots into one in-flight search per turn."""
+
+    def __init__(
+        self,
+        memory: AsyncMemory,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
+    ) -> None:
+        _limit(limit, maximum=100)
+        occurred_from, occurred_until = _search_occurrence_range(
+            occurred_from,
+            occurred_until,
+        )
+        self._memory = memory
+        self._limit = limit
+        self._memory_type = _optional_memory_type(memory_type)
+        self._reference_at = _reference_at(reference_at)
+        self._occurred_from = occurred_from
+        self._occurred_until = occurred_until
+        self._revision = 0
+        self._submitted: tuple[int, ContentInput] | None = None
+        self._pending: tuple[int, ContentInput] | None = None
+        self._latest: PrefetchResult | None = None
+        self._failure: tuple[int, Exception] | None = None
+        self._worker: asyncio.Task[None] | None = None
+        self._closed = False
+
+    @property
+    def latest(self) -> PrefetchResult | None:
+        """Return the newest completed result without waiting."""
+        return self._latest
+
+    def submit(self, query: ContentInput) -> int:
+        """Queue a complete current snapshot, replacing any not-yet-started snapshot."""
+        if self._closed:
+            raise ValidationError("prefetch is closed")
+        loop = asyncio.get_running_loop()
+        snapshot = _snapshot_content(query)
+        if self._submitted is not None and self._submitted[1] == snapshot:
+            failed = self._failure is not None and self._failure[0] == self._submitted[0]
+            if not failed:
+                return self._submitted[0]
+        self._revision += 1
+        revision = self._revision
+        self._submitted = (revision, snapshot)
+        self._pending = self._submitted
+        self._failure = None
+        if self._worker is None:
+            self._worker = loop.create_task(self._run())
+        return revision
+
+    async def finalize(self, query: ContentInput | None = None) -> PrefetchResult:
+        """Finish the turn and return a result for the exact final snapshot."""
+        if self._closed:
+            raise ValidationError("prefetch is closed")
+        if query is None:
+            if self._submitted is None:
+                raise ValidationError("prefetch has no submitted query")
+            target = self._submitted[0]
+        else:
+            target = self.submit(query)
+        self._closed = True
+        worker = self._worker
+        if worker is not None:
+            await asyncio.shield(worker)
+        if self._latest is not None and self._latest.revision == target:
+            return self._latest
+        if self._failure is not None and self._failure[0] == target:
+            raise self._failure[1]
+        raise RuntimeError("prefetch completed without its final revision")
+
+    async def close(self) -> None:
+        """Discard queued snapshots and drain the one search that may already be running."""
+        self._closed = True
+        self._pending = None
+        worker = self._worker
+        if worker is not None:
+            await asyncio.shield(worker)
+
+    async def _run(self) -> None:
+        try:
+            while self._pending is not None:
+                revision, query = self._pending
+                self._pending = None
+                try:
+                    hits = await self._memory.search(
+                        query,
+                        limit=self._limit,
+                        memory_type=self._memory_type,
+                        reference_at=self._reference_at,
+                        occurred_from=self._occurred_from,
+                        occurred_until=self._occurred_until,
+                    )
+                except Exception as error:
+                    self._failure = (revision, error)
+                    continue
+                self._latest = PrefetchResult(revision=revision, hits=hits)
+        finally:
+            self._worker = None
+
+
 @contextmanager
 def _staged(span: AbstractContextManager[Span], stage: str) -> Iterator[Span]:
     """Name the failing stage on public errors so an agent never parses prose to find it.
@@ -3166,6 +3273,13 @@ def _content_atoms(content: ContentInput) -> tuple[ContentAtom, ...]:
     if any(not isinstance(atom, (str, Path, Blob, AssetRef)) for atom in atoms):
         raise ValidationError("content contains an unsupported input value")
     return atoms
+
+
+def _snapshot_content(content: ContentInput) -> ContentInput:
+    atoms = _content_atoms(content)
+    if any(isinstance(atom, Path) for atom in atoms):
+        raise ValidationError("prefetch paths are mutable; use Blob or AssetRef")
+    return atoms[0] if len(atoms) == 1 else atoms
 
 
 def _prepare_memory(

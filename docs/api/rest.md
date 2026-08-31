@@ -413,7 +413,7 @@ route:
 | `reindex` | Owner-process maintenance: it rebuilds the whole index and must not be reachable by an unauthenticated client |
 | `optimize` | Owner-process maintenance, for the same reason |
 
-`speech`, `faces`, identity registration, and `reinforce` are implementation gaps, not a different
+`add_stream`, `speech`, `faces`, identity registration, and `reinforce` are implementation gaps, not a different
 execution model. Use the Python API in the owner process until they ship. See
 [Python SDK](python-sdk.md) for the full inventory.
 

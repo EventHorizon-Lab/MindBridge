@@ -1223,7 +1223,7 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     batch = commands.add_parser("add-many", help="store a JSONL batch in one transaction")
     batch.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
     _memory_type_option(batch, "add_many")
-    stream = commands.add_parser("add-stream", help="store JSONL items incrementally")
+    stream = commands.add_parser("add-stream", help="store completed JSONL items incrementally")
     stream.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
     _memory_type_option(stream, "add")
     for operation in ("search", "search_with_trace", "ask"):

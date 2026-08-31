@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge import IndexQuantization, StreamInput
+from mindbridge import IndexQuantization, PrefetchResult, StreamInput
 from mindbridge.exceptions import (
     RETRYABLE_REASONS,
     IndexUnavailableError,
@@ -64,18 +64,21 @@ def test_memory_record_metadata_is_detached_and_serializable() -> None:
         memory.content = "changed"  # type: ignore[misc]
 
 
-def test_stream_input_carries_per_item_time_and_metadata() -> None:
+def test_stream_input_snapshots_omni_parts_and_metadata() -> None:
+    parts: list[str | Blob] = ["observation", Blob(b"image", "image/png")]
     metadata = {"source": "camera"}
     item = StreamInput(
-        "clip",
+        parts,
         occurred_at=NOW,
         occurred_end=NOW + timedelta(seconds=30),
         metadata=metadata,
         memory_type=MemoryType.EPISODIC,
     )
 
+    parts[0] = "changed"
     metadata["source"] = "changed"
 
+    assert item.content == ("observation", Blob(b"image", "image/png"))
     assert item.metadata == {"source": "camera"}
     assert pickle.loads(pickle.dumps(item)) == item
     with pytest.raises(ValidationError, match="timezone"):
@@ -108,6 +111,9 @@ def test_search_hit_is_flat_and_rejects_invalid_scores() -> None:
             created_at=NOW,
             memory_type="episodic",  # type: ignore[arg-type]
         )
+
+    with pytest.raises(ValidationError, match="positive integer"):
+        PrefetchResult(revision=0, hits=(hit,))
 
 
 def test_retrieval_trace_values_are_immutable_and_bounded() -> None:
