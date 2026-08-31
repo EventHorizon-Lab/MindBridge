@@ -92,6 +92,8 @@ Searches local memories.
 | `limit` | integer from 1 through 100 | no | 10 |
 | `memory_type` | one memory role or null | no | null |
 | `reference_at` | timezone-aware ISO 8601 datetime or null | no | current UTC |
+| `occurred_from` | timezone-aware ISO 8601 datetime or null | no | null |
+| `occurred_until` | timezone-aware ISO 8601 datetime or null | no | null |
 
 The result is `{"hits": [...]}`. Each hit contains memory fields plus `score`. The complete ordered
 query and bounded focused keys from its first text atom and media supply dense candidates; the
@@ -100,7 +102,9 @@ keys to parent memories. Relative temporal expressions resolve against
 `reference_at`; when omitted, a valid English declaration such as `Today is May 2, 2024` replaces
 current UTC, while an explicit value always wins. Search is conservatively marked non-read-only
 because it may drain durable index work or populate transcript caches; it never reinforces a hit
-merely for being returned.
+merely for being returned. `occurred_from` and `occurred_until` hard-filter overlapping event
+intervals using a half-open range. Either bound may be omitted; any bound excludes memories without
+an event time, and two bounds require `occurred_until > occurred_from`.
 
 ### `ask_memory`
 
@@ -230,6 +234,7 @@ The five current tools do not yet cover the complete SDK capability inventory:
 | --- | --- | --- | --- |
 | `add_many` | absent | `POST /v1/memories/batch` | Implementation gap |
 | `list` | absent | `GET /v1/memories` | Implementation gap; **MCP therefore cannot paginate the store** |
+| `search_with_trace` | absent | absent | Python/local-CLI retrieval diagnostics |
 | `speech` | absent | absent | Not implemented on any transport yet |
 | `faces` | absent | absent | Python-only visual identity analysis |
 | `register_speaker` | absent | absent | Not implemented on any transport yet |

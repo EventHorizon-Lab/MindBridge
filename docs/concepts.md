@@ -104,7 +104,7 @@ model endpoint for historical content.
 
 ## Capability-driven model routing
 
-A typical embodied composition has four independent operations:
+A typical multimodal memory composition has four independent operations:
 
 - Local Jina v5 Omni embedding for stored memories and search queries.
 - Generation for grounded answers.
@@ -176,6 +176,13 @@ Weak dense evidence is rejected. An unresolved top-two tie is rejected only for 
 qualified lexical or temporal evidence anchors the winner; larger limits preserve the qualified
 candidates. Each hydrated hit has a score from 0 through 1; scores rank results within a request and
 are not stable global probabilities.
+
+`search_with_trace` runs the same bounded pipeline and returns the same hits plus candidate IDs.
+Ranked candidates include reconstructable dense/lexical score components, gate confidence, rank,
+and terminal rejection reason; candidates rejected before ranking contain the signals available at
+their rejection stage. The trace deliberately omits query and evidence payloads and is neither
+persisted nor exported as telemetry, so failure diagnosis does not turn the memory store or tracing
+backend into a second evidence plane.
 
 `ask` retrieves a bounded ranked candidate pool, fills the requested evidence slots round-robin by
 modality while preserving rank within each modality, and routes those hits, including retained

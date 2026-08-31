@@ -34,6 +34,8 @@ from mindbridge.types import (
 )
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+OCCURRED_FROM = datetime(2026, 8, 27, tzinfo=timezone.utc)
+OCCURRED_UNTIL = datetime(2026, 8, 28, tzinfo=timezone.utc)
 ENVELOPE_FIELDS = {
     "code",
     "reason",
@@ -128,9 +130,21 @@ class FakeMemory:
         limit: int = 10,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
     ) -> tuple[SearchHit, ...]:
         self._fail()
-        self.calls.append(("search", query, limit, memory_type, reference_at))
+        self.calls.append(
+            (
+                "search",
+                query,
+                limit,
+                memory_type,
+                reference_at,
+                occurred_from,
+                occurred_until,
+            )
+        )
         return (_hit(),)
 
     def ask(
@@ -202,6 +216,8 @@ def test_resource_routes_map_the_public_memory_values() -> None:
                 "limit": 3,
                 "memory_type": "episodic",
                 "reference_at": NOW.isoformat(),
+                "occurred_from": OCCURRED_FROM.isoformat(),
+                "occurred_until": OCCURRED_UNTIL.isoformat(),
             },
         )
         answered = client.post(
@@ -250,7 +266,15 @@ def test_resource_routes_map_the_public_memory_values() -> None:
         ),
         ("list", 2, "before"),
         ("get", "memory_1"),
-        ("search", "toolbox", 3, MemoryType.EPISODIC, NOW),
+        (
+            "search",
+            "toolbox",
+            3,
+            MemoryType.EPISODIC,
+            NOW,
+            OCCURRED_FROM,
+            OCCURRED_UNTIL,
+        ),
         ("ask", "What color is it?", 4, MemoryType.PROCEDURAL, NOW),
         ("delete", "memory_1"),
     ]
@@ -435,6 +459,23 @@ def test_request_boundaries_are_strict(
 
     assert response.status_code == 422
     assert field in response.json()["issues"][0]["location"]
+
+
+def test_search_rejects_a_reversed_occurrence_range_before_memory() -> None:
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory)) as client:
+        response = client.post(
+            "/v1/memories/search",
+            json={
+                "query": "memory",
+                "occurred_from": OCCURRED_UNTIL.isoformat(),
+                "occurred_until": OCCURRED_FROM.isoformat(),
+            },
+        )
+
+    assert response.status_code == 422
+    assert "occurred_until must be later than occurred_from" in response.text
+    assert memory.calls == []
 
 
 @pytest.mark.parametrize(

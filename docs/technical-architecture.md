@@ -5,6 +5,7 @@
 ```text
 src/mindbridge/
 ├── memory.py                    # public orchestration and consistency
+├── plugins.py                   # explicit capability and policy composition
 ├── types.py                     # stable values
 ├── exceptions.py                # stable failures
 ├── models/

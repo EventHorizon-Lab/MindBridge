@@ -331,6 +331,22 @@ def test_add_search_get_list_and_delete_round_trip(
     hits = cast(dict[str, list[dict[str, object]]], found)["hits"]
     assert [hit["id"] for hit in hits] == [record["id"]]
 
+    status, traced, _ = _run(
+        capsys,
+        "--app",
+        app,
+        "-q",
+        "search-with-trace",
+        "red wrench",
+    )
+    assert status == 0
+    traced_document = cast(dict[str, object], traced)
+    assert cast(list[dict[str, object]], traced_document["hits"])[0]["id"] == record["id"]
+    trace = cast(dict[str, object], traced_document["trace"])
+    candidate = cast(list[dict[str, object]], trace["candidates"])[0]
+    assert candidate["memory_id"] == record["id"]
+    assert {"lexical_relevance", "lexical_rerank_bonus", "gate_confidence"} <= candidate.keys()
+
     status, page, _ = _run(capsys, "--app", app, "-q", "list", "--limit", "1")
     assert status == 0
     assert cast(dict[str, object], page)["next_cursor"] is None
@@ -615,7 +631,18 @@ def test_remote_mode_posts_to_v1_and_echoes_the_body(
     calls: list[tuple[str, str, object]], capsys: pytest.CaptureFixture[str]
 ) -> None:
     status, document, _ = _run(
-        capsys, "--url", "http://owner:8000/", "-q", "search", "red wrench", "--limit", "3"
+        capsys,
+        "--url",
+        "http://owner:8000/",
+        "-q",
+        "search",
+        "red wrench",
+        "--limit",
+        "3",
+        "--occurred-from",
+        "2026-08-27T00:00:00Z",
+        "--occurred-until",
+        "2026-08-28T00:00:00Z",
     )
     assert status == 0
     assert document == {"hits": []}
@@ -623,7 +650,12 @@ def test_remote_mode_posts_to_v1_and_echoes_the_body(
         (
             "POST",
             "http://owner:8000/v1/memories/search",
-            {"query": "red wrench", "limit": 3},
+            {
+                "query": "red wrench",
+                "limit": 3,
+                "occurred_from": "2026-08-27T00:00:00Z",
+                "occurred_until": "2026-08-28T00:00:00Z",
+            },
         )
     ]
 

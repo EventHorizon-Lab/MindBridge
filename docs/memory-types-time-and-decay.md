@@ -61,6 +61,11 @@ later than the start. `created_at` remains storage time and is not substituted f
 time during temporal matching. A stored interval matches a query interval when they overlap;
 instant events use a one-microsecond internal extent.
 
+`search(..., occurred_from=..., occurred_until=...)` applies that overlap rule as a hard half-open
+filter. Either timezone-aware bound may be omitted. Any bound excludes records without event time,
+and two bounds require `occurred_until > occurred_from`. This explicit filter is separate from
+`reference_at` and from temporal phrases in query text.
+
 `reference_at` resolves relative expressions in its timezone. When omitted, MindBridge uses the
 current UTC time. The deterministic parser recognizes:
 
@@ -71,6 +76,8 @@ current UTC time. The deterministic parser recognizes:
 - `N days ago`, `N 天前`, and rolling `past N days`, `过去 N 天`, or `最近 N 天`.
 
 For a detected temporal expression, Zvec retrieves both an in-range pool and a global pool.
+When explicit event bounds are present, both pools remain inside those bounds; SQLite rechecks the
+filter after hydration because it is authoritative.
 MindBridge collapses them by record, then multiplies semantic relevance by a smooth temporal factor:
 `1.5` inside the range, decaying toward `0.3` with distance outside it. This keeps nearby evidence
 available when event boundaries are noisy without losing in-range recall. `ask` passes the resolved

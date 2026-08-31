@@ -1,7 +1,6 @@
 # MindBridge
 
-MindBridge is an Agentic Native Embodied Memory System: fast, embedded multimodal memory for
-machines that see, hear, and act.
+MindBridge is a local-first, agent-native multimodal memory substrate for embodied systems.
 
 MindBridge owns three things: memory semantics, retrieval orchestration, and durable local
 consistency. Applications construct model adapters explicitly. Provider SDKs and deployment

@@ -35,6 +35,8 @@ from mindbridge.types import (
 )
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+OCCURRED_FROM = datetime(2026, 8, 27, tzinfo=timezone.utc)
+OCCURRED_UNTIL = datetime(2026, 8, 28, tzinfo=timezone.utc)
 ENVELOPE_FIELDS = {
     "code",
     "reason",
@@ -91,9 +93,21 @@ class FakeMemory:
         limit: int = 10,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
     ) -> tuple[SearchHit, ...]:
         self._fail()
-        self.calls.append(("search", query, limit, memory_type, reference_at))
+        self.calls.append(
+            (
+                "search",
+                query,
+                limit,
+                memory_type,
+                reference_at,
+                occurred_from,
+                occurred_until,
+            )
+        )
         return (_hit(),)
 
     def ask(
@@ -141,7 +155,14 @@ async def test_mcp_publishes_only_the_five_flat_local_tools() -> None:
     }
     assert {name: set(tool.input_schema["properties"]) for name, tool in tools.items()} == {
         "add_memory": {"content", "occurred_at", "occurred_end", "metadata", "memory_type"},
-        "search_memories": {"query", "limit", "memory_type", "reference_at"},
+        "search_memories": {
+            "query",
+            "limit",
+            "memory_type",
+            "reference_at",
+            "occurred_from",
+            "occurred_until",
+        },
         "ask_memory": {"question", "limit", "memory_type", "reference_at"},
         "get_memory": {"memory_id"},
         "delete_memory": {"memory_id"},
@@ -178,6 +199,8 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
                 "query": " toolbox ",
                 "memory_type": "episodic",
                 "reference_at": NOW.isoformat(),
+                "occurred_from": OCCURRED_FROM.isoformat(),
+                "occurred_until": OCCURRED_UNTIL.isoformat(),
             },
         )
         answered = await client.call_tool(
@@ -221,7 +244,15 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
             {"room": "workshop"},
             MemoryType.EPISODIC,
         ),
-        ("search", "toolbox", 10, MemoryType.EPISODIC, NOW),
+        (
+            "search",
+            "toolbox",
+            10,
+            MemoryType.EPISODIC,
+            NOW,
+            OCCURRED_FROM,
+            OCCURRED_UNTIL,
+        ),
         ("ask", "What color?", 5, MemoryType.PROCEDURAL, NOW),
         ("get", "memory_1"),
         ("delete", "memory_1"),

@@ -32,6 +32,10 @@ non-global provider. `AsyncMemory` accepts the same argument and preserves conte
 worker thread. No span records memory text, media bytes, asset IDs, paths, metadata, or model
 responses.
 
+Per-candidate retrieval diagnostics are intentionally not span attributes: memory and index IDs
+are high-cardinality identifiers. Use the opt-in Python `search_with_trace()` return value or the
+local `search-with-trace` CLI command when one search needs explanation.
+
 ## Span structure
 
 The operation span is the elapsed time visible to the caller. Child spans identify the work that

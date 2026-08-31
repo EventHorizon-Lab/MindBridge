@@ -20,6 +20,7 @@ import json
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import datetime
 from importlib import import_module
 from importlib.metadata import version
@@ -82,6 +83,7 @@ OPERATIONS: tuple[str, ...] = (
     "add",
     "add_many",
     "search",
+    "search_with_trace",
     "ask",
     "get",
     "speech",
@@ -96,10 +98,15 @@ OPERATIONS: tuple[str, ...] = (
 )
 DOCTOR = "doctor"
 COMMANDS: tuple[str, ...] = (*(name.replace("_", "-") for name in OPERATIONS), DOCTOR)
-# Operations a running owner serves over `/v1`. The other five have no route today; that is a
+# Operations a running owner serves over `/v1`. Other operations have no route today; that is a
 # documented transport gap, reported honestly, not a CLI design choice.
 REMOTE_COMMANDS = frozenset({"add", "add-many", "search", "ask", "get", "list", "delete"})
-_QUERY_METAVAR: Mapping[str, str] = {"add": "TEXT", "search": "QUERY", "ask": "QUESTION"}
+_QUERY_METAVAR: Mapping[str, str] = {
+    "add": "TEXT",
+    "search": "QUERY",
+    "search-with-trace": "QUERY",
+    "ask": "QUESTION",
+}
 _TUNING: tuple[str, ...] = (
     "index_speech",
     "minimum_relevance",
@@ -477,8 +484,25 @@ def _search(memory: Memory, arguments: argparse.Namespace) -> _Document:
         limit=arguments.limit,
         memory_type=_optional_memory_type(arguments),
         reference_at=_optional_time(arguments.reference_at, "reference_at"),
+        occurred_from=_optional_time(arguments.occurred_from, "occurred_from"),
+        occurred_until=_optional_time(arguments.occurred_until, "occurred_until"),
     )
     return {"hits": [_memory_document(hit) for hit in hits]}
+
+
+def _search_with_trace(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    result = memory.search_with_trace(
+        _content_input(arguments),
+        limit=arguments.limit,
+        memory_type=_optional_memory_type(arguments),
+        reference_at=_optional_time(arguments.reference_at, "reference_at"),
+        occurred_from=_optional_time(arguments.occurred_from, "occurred_from"),
+        occurred_until=_optional_time(arguments.occurred_until, "occurred_until"),
+    )
+    return {
+        "hits": [_memory_document(hit) for hit in result.hits],
+        "trace": asdict(result.trace),
+    }
 
 
 def _ask(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -549,6 +573,7 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "add": _add,
     "add-many": _add_many,
     "search": _search,
+    "search-with-trace": _search_with_trace,
     "ask": _ask,
     "get": _get,
     "speech": _speech,
@@ -626,6 +651,9 @@ def _remote_query(field: str, arguments: argparse.Namespace) -> _Document:
     body: _Document = {field: _content_value(arguments), "limit": arguments.limit}
     _put(body, "memory_type", arguments.memory_type)
     _put(body, "reference_at", _remote_time(arguments.reference_at, "reference_at"))
+    if field == "query":
+        _put(body, "occurred_from", _remote_time(arguments.occurred_from, "occurred_from"))
+        _put(body, "occurred_until", _remote_time(arguments.occurred_until, "occurred_until"))
     return body
 
 
@@ -1153,16 +1181,20 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     batch = commands.add_parser("add-many", help="store a JSONL batch in one transaction")
     batch.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
     _memory_type_option(batch, "add_many")
-    for name in ("search", "ask"):
+    for operation in ("search", "search_with_trace", "ask"):
+        name = operation.replace("_", "-")
         command = _content_command(commands, name, f"{name} memories")
         command.add_argument(
             "--limit",
             type=int,
-            default=_default(name, "limit"),
+            default=_default(operation, "limit"),
             help="maximum hits (default: %(default)s)",
         )
-        _memory_type_option(command, name)
+        _memory_type_option(command, operation)
         command.add_argument("--reference-at", metavar="TIME", help="retrieval reference clock")
+        if operation != "ask":
+            command.add_argument("--occurred-from", metavar="TIME", help="event overlap start")
+            command.add_argument("--occurred-until", metavar="TIME", help="event overlap end")
     for name, help_text in (
         ("get", "read one memory"),
         ("speech", "transcribe and identify speakers"),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -8,7 +9,7 @@ import sqlite3
 from collections.abc import Generator, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier, Event, Thread
@@ -21,6 +22,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode
 
 import mindbridge.memory as memory_module
+from mindbridge import MemoryConfig, MemoryPlugins, RetrievalRejection
 from mindbridge._telemetry import (
     MODEL_REQUEST_COUNT,
     MODEL_TTFT,
@@ -680,6 +682,271 @@ def test_memory_types_are_stable_and_filterable(tmp_path: Path) -> None:
             memory.add("invalid type", memory_type="episodic")  # type: ignore[arg-type]
 
 
+def test_explicit_event_range_is_a_strict_overlap_filter(tmp_path: Path) -> None:
+    start = datetime(2026, 8, 17, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 24, tzinfo=timezone.utc)
+    with _memory(tmp_path, _FakeModels()) as memory:
+        memory.add("project review without a time")
+        before = memory.add(
+            "project review before",
+            occurred_at=datetime(2026, 8, 16, tzinfo=timezone.utc),
+        )
+        overlap = memory.add(
+            "project review overlap",
+            occurred_at=datetime(2026, 8, 16, tzinfo=timezone.utc),
+            occurred_end=datetime(2026, 8, 18, tzinfo=timezone.utc),
+        )
+        inside = memory.add(
+            "project review inside",
+            occurred_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
+        )
+        boundary = memory.add(
+            "project review boundary",
+            occurred_at=until,
+        )
+
+        bounded = memory.search(
+            "project review",
+            occurred_from=start,
+            occurred_until=until,
+        )
+        from_only = memory.search("project review", occurred_from=until)
+        until_only = memory.search("project review", occurred_until=start)
+
+    assert {hit.id for hit in bounded} == {overlap.id, inside.id}
+    assert [hit.id for hit in from_only] == [boundary.id]
+    assert {hit.id for hit in until_only} == {before.id, overlap.id}
+
+
+def test_explicit_event_range_stays_strict_after_temporal_fallback(tmp_path: Path) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        outside = memory.add(
+            "project review happened",
+            occurred_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
+        )
+        allowed = memory.add(
+            "project review happened",
+            occurred_at=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        )
+        _FakeIndex.instances[-1].hits_override = (
+            IndexHit(id=outside.id, relevance=0.9, confidence=0.9),
+            IndexHit(id=allowed.id, relevance=0.9, confidence=0.9),
+        )
+
+        result = memory.search_with_trace(
+            "What happened on 2026-08-20?",
+            limit=1,
+            occurred_from=datetime(2026, 8, 22, tzinfo=timezone.utc),
+            occurred_until=datetime(2026, 8, 23, tzinfo=timezone.utc),
+        )
+
+    assert [hit.id for hit in result.hits] == [allowed.id]
+    rejected = {candidate.memory_id: candidate.rejected_by for candidate in result.trace.candidates}
+    assert rejected[outside.id] is RetrievalRejection.OCCURRENCE_RANGE
+    assert rejected[allowed.id] is None
+
+
+@pytest.mark.parametrize(
+    ("occurred_from", "occurred_until", "message"),
+    [
+        (datetime(2026, 8, 20, tzinfo=timezone.utc).replace(tzinfo=None), None, "occurred_from"),
+        (None, datetime(2026, 8, 20, tzinfo=timezone.utc).replace(tzinfo=None), "occurred_until"),
+        (
+            datetime(2026, 8, 21, tzinfo=timezone.utc),
+            datetime(2026, 8, 20, tzinfo=timezone.utc),
+            "later than",
+        ),
+    ],
+)
+def test_explicit_event_range_is_validated_before_embedding(
+    tmp_path: Path,
+    occurred_from: datetime | None,
+    occurred_until: datetime | None,
+    message: str,
+) -> None:
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory, pytest.raises(ValidationError, match=message):
+        memory.search(
+            "project review",
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
+        )
+
+    assert models.embed_batches == []
+
+
+def test_search_with_trace_explains_bounded_candidates_without_evidence_content(
+    tmp_path: Path,
+) -> None:
+    models = _FakeModels()
+    with Memory(
+        tmp_path,
+        embedder=models,
+        minimum_relevance=0.55,
+        ambiguity_margin=0,
+    ) as memory:
+        first = memory.add(
+            ("private-alpha", "atomic child"),
+            metadata={"private": "metadata-secret"},
+        )
+        second = memory.add("private-beta")
+        weak = memory.add("private-weak")
+        first_documents = memory._store.read_memory_index_documents((first.id,))
+        second_documents = memory._store.read_memory_index_documents((second.id,))
+        weak_documents = memory._store.read_memory_index_documents((weak.id,))
+        first_child = first_documents[-1].embedding.embedding_id
+        second_index = second_documents[0].embedding.embedding_id
+        weak_index = weak_documents[0].embedding.embedding_id
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = (
+            IndexHit(id=first_child, relevance=0.95, confidence=0.95),
+            IndexHit(id=second_index, relevance=0.8, confidence=0.8),
+            IndexHit(id=weak_index, relevance=0.9, confidence=0.1),
+            IndexHit(id="stale_candidate", relevance=0.99, confidence=0.99),
+        )
+        index.lexical_hits_override = ()
+
+        result = memory.search_with_trace("private-query", limit=1)
+        ordinary = memory.search("private-query", limit=1)
+
+    assert result.hits == ordinary
+    assert [hit.id for hit in result.hits] == [first.id]
+    by_memory = {
+        candidate.memory_id: candidate
+        for candidate in result.trace.candidates
+        if candidate.memory_id is not None
+    }
+    assert by_memory[first.id].rank == 1
+    assert by_memory[first.id].rejected_by is None
+    assert by_memory[first.id].final_score == result.hits[0].score
+    assert by_memory[first.id].index_ids == (first_child,)
+    assert by_memory[second.id].rejected_by is RetrievalRejection.LIMIT
+    assert by_memory[weak.id].rejected_by is RetrievalRejection.MINIMUM_RELEVANCE
+    stale = next(candidate for candidate in result.trace.candidates if candidate.memory_id is None)
+    assert stale.index_ids == ("stale_candidate",)
+    assert stale.rejected_by is RetrievalRejection.STALE_INDEX
+    considered_ids = [
+        index_id for candidate in result.trace.candidates for index_id in candidate.index_ids
+    ]
+    assert len(considered_ids) == len(set(considered_ids)) == 4
+    serialized = json.dumps(asdict(result.trace))
+    assert all(
+        secret not in serialized
+        for secret in ("private-alpha", "private-beta", "metadata-secret", "private-query")
+    )
+
+
+def test_search_with_trace_exposes_every_lexical_ranking_input(tmp_path: Path) -> None:
+    with Memory(
+        tmp_path,
+        embedder=_FakeModels(),
+        minimum_relevance=0,
+        ambiguity_margin=0,
+    ) as memory:
+        first = memory.add("rare alpha")
+        second = memory.add("rare beta")
+        first_index = memory._store.read_memory_index_documents((first.id,))[
+            0
+        ].embedding.embedding_id
+        second_index = memory._store.read_memory_index_documents((second.id,))[
+            0
+        ].embedding.embedding_id
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = ()
+        index.lexical_hits_override = (
+            IndexHit(
+                id=first_index,
+                relevance=1.0,
+                confidence=0.0,
+                lexical_match=True,
+            ),
+            IndexHit(
+                id=second_index,
+                relevance=0.76,
+                confidence=0.0,
+                lexical_match=True,
+            ),
+        )
+
+        result = memory.search_with_trace("rare")
+
+    by_memory = {
+        candidate.memory_id: candidate
+        for candidate in result.trace.candidates
+        if candidate.memory_id is not None
+    }
+    first_trace = by_memory[first.id]
+    second_trace = by_memory[second.id]
+    assert first_trace.lexical_relevance == pytest.approx(0.6)
+    assert second_trace.lexical_relevance == pytest.approx(0.456)
+    for candidate in (first_trace, second_trace):
+        assert candidate.dense_relevance is not None
+        assert candidate.lexical_relevance is not None
+        assert candidate.lexical_rerank_bonus is not None
+        assert candidate.dense_relevance == 0
+        assert candidate.lexical_rerank_bonus == pytest.approx(0.2)
+        assert candidate.gate_confidence == pytest.approx(0.6)
+        assert candidate.base_relevance == pytest.approx(
+            min(
+                1.0,
+                max(candidate.dense_relevance, candidate.lexical_relevance)
+                + candidate.lexical_rerank_bonus,
+            )
+        )
+    assert first_trace.base_relevance != second_trace.base_relevance
+
+
+def test_search_with_trace_reports_temporal_and_retention_factors(tmp_path: Path) -> None:
+    models = _FakeModels()
+    reference = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
+    with Memory(
+        tmp_path,
+        embedder=models,
+        minimum_relevance=0,
+        ambiguity_margin=0,
+        decay_half_life_days=7,
+    ) as memory:
+        record = memory.add(
+            "project review happened",
+            occurred_at=datetime(2026, 8, 20, 12, tzinfo=timezone.utc),
+        )
+        result = memory.search_with_trace(
+            "What happened on 2026-08-20?",
+            limit=1,
+            reference_at=reference,
+        )
+
+    candidate = next(
+        candidate for candidate in result.trace.candidates if candidate.memory_id == record.id
+    )
+    assert candidate.temporal_factor is not None
+    assert candidate.retention_factor is not None
+    assert candidate.final_score == result.hits[0].score
+
+
+def test_search_with_trace_marks_the_candidates_rejected_by_ambiguity(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with Memory(tmp_path, embedder=models) as memory:
+        first = memory.add("first private scene")
+        second = memory.add("second private scene")
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = (
+            IndexHit(id=first.id, relevance=0.9, confidence=0.9),
+            IndexHit(id=second.id, relevance=0.9, confidence=0.9),
+        )
+        index.lexical_hits_override = ()
+
+        result = memory.search_with_trace("unrelated", limit=1)
+
+    assert result.hits == ()
+    assert result.trace.ambiguous is True
+    assert {
+        candidate.rejected_by
+        for candidate in result.trace.candidates
+        if candidate.memory_id is not None
+    } == {RetrievalRejection.AMBIGUITY}
+
+
 def test_relative_time_prefers_event_time_and_routes_the_reference(tmp_path: Path) -> None:
     reference = datetime(2026, 8, 27, 0, 30, tzinfo=timezone(timedelta(hours=14)))
     models = _FakeModels()
@@ -1111,6 +1378,114 @@ def test_explicit_embedder_owns_embedding_and_models_own_generation(tmp_path: Pa
 def test_memory_requires_an_explicit_embedder(tmp_path: Path) -> None:
     with pytest.raises(TypeError, match="embedder"):
         Memory(tmp_path)  # type: ignore[call-arg]
+
+
+def test_memory_composes_explicit_plugins_and_local_policy(tmp_path: Path) -> None:
+    models = _FakeModels()
+    faces = _FakeFace()
+    plugins = MemoryPlugins(
+        embedder=models,
+        answerer=models,
+        transcriber=models,
+        face_analyzer=faces,
+    )
+    config = MemoryConfig(
+        index_speech=True,
+        index_quantization=IndexQuantization.FP16,
+        minimum_relevance=0,
+        ambiguity_margin=0,
+        decay_half_life_days=7,
+        speaker_similarity=0.7,
+        speaker_margin=0.04,
+        face_similarity=0.3,
+        face_margin=0.03,
+    )
+
+    with Memory.from_plugins(tmp_path, plugins=plugins, config=config) as memory:
+        assert memory.add("red plugin-composed memory")
+        assert memory._embedder is models
+        assert memory._answerer is models
+        assert memory._transcriber is models
+        assert memory._face_analyzer is faces
+        assert _FakeIndex.instances[-1].quantization is IndexQuantization.FP16
+        assert memory._index_speech is True
+        assert memory._minimum_relevance == 0
+        assert memory._ambiguity_margin == 0
+        assert memory._decay_half_life == timedelta(days=7)
+        assert memory._speaker_similarity == 0.7
+        assert memory._speaker_margin == 0.04
+        assert memory._face_similarity == 0.3
+        assert memory._face_margin == 0.03
+
+    assert models.close_calls == 1
+    assert faces.closed is True
+
+
+def test_memory_rejects_invalid_composition_values(tmp_path: Path) -> None:
+    plugins = MemoryPlugins(embedder=_FakeModels())
+    with pytest.raises(ValidationError, match="plugins"):
+        Memory.from_plugins(tmp_path, plugins=object())  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="config"):
+        Memory.from_plugins(tmp_path, plugins=plugins, config=object())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "protocol"),
+    [
+        ("embedder", "EmbeddingBackend"),
+        ("answerer", "GenerationBackend"),
+        ("transcriber", "SpeechBackend or TranscriptionBackend"),
+        ("face_analyzer", "FaceBackend"),
+    ],
+)
+def test_memory_plugins_reject_malformed_adapters_before_opening_storage(
+    tmp_path: Path,
+    field: str,
+    protocol: str,
+) -> None:
+    values: dict[str, object] = {"embedder": _FakeModels(), field: object()}
+    data_dir = tmp_path / field
+
+    with pytest.raises(ValidationError, match=rf"plugins\.{field}.*{protocol}"):
+        Memory.from_plugins(
+            data_dir,
+            plugins=MemoryPlugins(**values),  # type: ignore[arg-type]
+        )
+
+    assert not data_dir.exists()
+
+
+def test_composition_values_require_keywords() -> None:
+    with pytest.raises(TypeError):
+        MemoryPlugins(_FakeModels())  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        MemoryConfig(True)  # type: ignore[call-arg]
+
+
+def test_plugin_composition_stays_in_constructor_parity() -> None:
+    parameters = inspect.signature(Memory).parameters
+    assert parameters == inspect.signature(AsyncMemory).parameters
+    assert (
+        inspect.signature(Memory.search).parameters
+        == inspect.signature(AsyncMemory.search).parameters
+    )
+    assert (
+        inspect.signature(Memory.search_with_trace).parameters
+        == inspect.signature(AsyncMemory.search_with_trace).parameters
+    )
+    assert (
+        inspect.signature(Memory.from_plugins).parameters
+        == inspect.signature(AsyncMemory.from_plugins).parameters
+    )
+
+    composition_fields = (*fields(MemoryPlugins), *fields(MemoryConfig))
+    assert {field.name for field in composition_fields} == set(parameters) - {
+        "data_dir",
+        "tracer",
+    }
+    for field in composition_fields:
+        default = inspect.Parameter.empty if field.default is MISSING else field.default
+        assert parameters[field.name].default == default
 
 
 def test_explicit_speech_is_lazy_and_recognizes_a_speaker_across_recordings(
@@ -2511,7 +2886,7 @@ def test_the_transcript_marker_names_no_modality(tmp_path: Path) -> None:
     # weak-evidence floor, so every word of the marker is a term that makes this memory visible to
     # any query containing it. A marker naming a modality both mislabels a video transcript as
     # audio and hands each media memory a free match on an ordinary English word.
-    assert memory_module._LEXICAL_MATCH_CONFIDENCE > memory_module._DEFAULT_MINIMUM_RELEVANCE
+    assert MemoryConfig().minimum_relevance < memory_module._LEXICAL_MATCH_CONFIDENCE
     assert "spoken red wrench" in indexed
     assert not {"audio", "video"} & set(re.findall(r"\w+", indexed.casefold()))
 
@@ -2958,4 +3333,19 @@ async def test_async_memory_matches_sync_surface(tmp_path: Path) -> None:
 
     assert models.embed_batches == []
     assert embedder.close_calls == 1
+    assert models.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_async_memory_composes_explicit_plugins(tmp_path: Path) -> None:
+    models = _FakeModels()
+    plugins = MemoryPlugins(embedder=models, answerer=models, transcriber=models)
+
+    async with AsyncMemory.from_plugins(tmp_path, plugins=plugins) as memory:
+        record = await memory.add("red async plugin-composed memory")
+        assert (await memory.search("red async plugin"))[0].id == record.id
+        traced = await memory.search_with_trace("red async plugin")
+        assert traced.hits[0].id == record.id
+        assert traced.trace.candidates[0].memory_id == record.id
+
     assert models.close_calls == 1

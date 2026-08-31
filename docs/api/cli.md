@@ -151,6 +151,7 @@ kebab-cased. Nothing is renamed, grouped, or invented.
 | `add` | `mindbridge add [TEXT ...]` | idempotent write |
 | `add_many` | `mindbridge add-many [JSONL]` | idempotent write |
 | `search` | `mindbridge search [QUERY ...]` | read, plus a lazy transcript cache |
+| `search_with_trace` | `mindbridge search-with-trace [QUERY ...]` | read, plus a lazy transcript cache |
 | `ask` | `mindbridge ask [QUESTION ...]` | read, plus a lazy transcript cache |
 | `get` | `mindbridge get MEMORY_ID` | read |
 | `speech` | `mindbridge speech MEMORY_ID` | read, plus a transcript cache |
@@ -171,8 +172,9 @@ Plus exactly one command with no SDK counterpart:
 | `mindbridge doctor` | Resolve the composition, exercise each configured backend's loader, and report — writing nothing |
 
 Per-command options mirror the SDK keywords: `--occurred-at`, `--occurred-end`, `--metadata`, and
-`--memory-type` on `add`; `--limit`, `--memory-type`, and `--reference-at` on `search` and `ask`;
-`--limit` and `--cursor` on `list`.
+`--memory-type` on `add`; `--limit`, `--memory-type`, and `--reference-at` on `search`,
+`search-with-trace`, and `ask`; the two search commands also accept `--occurred-from` and
+`--occurred-until` for strict event-overlap filtering; `--limit` and `--cursor` apply to `list`.
 
 `--cursor` is passed through exactly as it was returned and is never parsed.
 
@@ -240,6 +242,7 @@ field vocabulary covers three surfaces:
 | `add`, `get` | `MemoryResponse` |
 | `add-many` | `{"memories": [MemoryResponse, ...]}` |
 | `search` | `{"hits": [SearchHitResponse, ...]}` |
+| `search-with-trace` | `{"hits": [SearchHitResponse, ...], "trace": RetrievalTrace}` |
 | `ask` | `{"answer": str, "hits": [SearchHitResponse, ...], "abstained": bool, "abstention_reason": str \| null}` |
 | `list` | `{"items": [MemoryResponse, ...], "next_cursor": str \| null}` |
 | `delete` | `{"deleted": bool}` |
@@ -370,7 +373,7 @@ The existing store-metadata guard already fails the first real operation with a 
 
 ### Operations without a remote route
 
-`--url` covers `add`, `add-many`, `search`, `ask`, `get`, `list`, and `delete`. The other seven exit
+`--url` covers `add`, `add-many`, `search`, `ask`, `get`, `list`, and `delete`. The other eight exit
 `10` with `unsupported_in_remote_mode` and name the surfaces that do support them. That mirrors the
 [REST gap](rest.md#operations-without-a-route) honestly rather than hiding it: `speech`, `faces`,
 identity registration, and `reinforce` are implementation gaps, and `reindex` and `optimize` are

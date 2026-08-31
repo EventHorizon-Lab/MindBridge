@@ -78,10 +78,9 @@ Image/video ──> FaceBackend ──> bounded face observations
 ```
 
 One adapter may implement several contracts. `OpenAIModels` does so with caller-owned official SDK
-clients. Local embedding, speech, and face analysis can be composed independently.
-
-No registry or factory is needed: ordinary Python construction is the provider selection
-mechanism.
+clients. Local embedding, speech, and face analysis can be composed independently. Applications may
+pass adapters directly or group them in `MemoryPlugins` and call `Memory.from_plugins`; both use the
+same explicit composition and execution plane. No provider registry or factory is involved.
 
 ## Write consistency
 

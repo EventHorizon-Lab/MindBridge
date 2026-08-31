@@ -229,14 +229,19 @@ Content-Type: application/json
   ],
   "limit": 10,
   "memory_type": "episodic",
-  "reference_at": "2026-08-27T12:00:00Z"
+  "reference_at": "2026-08-27T12:00:00Z",
+  "occurred_from": "2026-08-20T00:00:00Z",
+  "occurred_until": "2026-08-27T00:00:00Z"
 }
 ```
 
 `limit` defaults to 10 and ranges from 1 through 100. `memory_type` optionally filters one role.
 `reference_at` resolves relative date expressions and must include a timezone; current UTC is the
 default unless the query declares a valid English reference date such as
-`Today is May 2, 2024`; an explicit value always wins. Response `200` is `{"hits": [...]}`; each
+`Today is May 2, 2024`; an explicit value always wins. `occurred_from` and `occurred_until` are
+optional timezone-aware hard filters. Stored event intervals must overlap their half-open range;
+either bound may be omitted, records without `occurred_at` are excluded, and two bounds require
+`occurred_until > occurred_from`. Response `200` is `{"hits": [...]}`; each
 hit has the memory fields plus `score`. The complete ordered query and bounded focused keys from
 its first text atom and media supply dense candidates; the focused text also supplies lexical
 candidates. All routes collapse aggregate or atomic document keys to parent memories.
@@ -393,11 +398,12 @@ than caller input.
 ### Operations without a route
 
 REST covers `add`, `add_many`, `search`, `ask`, `get`, `list`, and `delete` with the same defaults,
-field meanings, and error semantics as the Python SDK. Seven documented SDK operations have no
+field meanings, and error semantics as the Python SDK. Eight documented SDK operations have no
 route:
 
 | Operation | Why there is no route |
 | --- | --- |
+| `search_with_trace` | Owner-process diagnostics with high-cardinality memory and index IDs |
 | `speech` | Not implemented on any transport yet |
 | `faces` | Python-only visual identity analysis |
 | `register_speaker` | Not implemented on any transport yet |
