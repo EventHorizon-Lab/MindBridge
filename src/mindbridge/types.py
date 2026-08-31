@@ -130,7 +130,7 @@ ContentInput: TypeAlias = ContentAtom | Sequence[ContentAtom]
 
 @dataclass(frozen=True, slots=True)
 class StreamInput:
-    """One independently durable item from a lazy input stream."""
+    """One independently durable observation from an omni input stream."""
 
     content: ContentInput
     occurred_at: datetime | None = None
@@ -139,13 +139,23 @@ class StreamInput:
     memory_type: MemoryType = MemoryType.SEMANTIC
 
     def __post_init__(self) -> None:
+        content = self.content
+        if not isinstance(content, (str, Path, Blob, AssetRef)):
+            if isinstance(content, bytes) or not isinstance(content, Sequence):
+                raise ValidationError(
+                    "stream content must be text, media, or an ordered sequence of them"
+                )
+            content = tuple(content)
         _require_interval(self.occurred_at, self.occurred_end)
         if not isinstance(self.memory_type, MemoryType):
             raise ValidationError("memory_type is invalid")
-        if self.metadata is not None:
-            if not isinstance(self.metadata, Mapping):
+        metadata = self.metadata
+        if metadata is not None:
+            if not isinstance(metadata, Mapping):
                 raise ValidationError("metadata must be a mapping")
-            object.__setattr__(self, "metadata", dict(self.metadata))
+            metadata = dict(metadata)
+        object.__setattr__(self, "content", content)
+        object.__setattr__(self, "metadata", metadata)
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +391,26 @@ class SearchHit:
             raise ValidationError("memory must contain content or media assets")
         object.__setattr__(self, "metadata", _metadata(self.metadata))
         object.__setattr__(self, "assets", assets)
+
+
+@dataclass(frozen=True, slots=True)
+class PrefetchResult:
+    """The newest completed speculative search for one streaming turn."""
+
+    revision: int
+    hits: tuple[SearchHit, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.revision, bool)
+            or not isinstance(self.revision, int)
+            or self.revision <= 0
+        ):
+            raise ValidationError("prefetch revision must be a positive integer")
+        hits = tuple(self.hits)
+        if any(not isinstance(hit, SearchHit) for hit in hits):
+            raise ValidationError("prefetch hits are invalid")
+        object.__setattr__(self, "hits", hits)
 
 
 class RetrievalRejection(str, Enum):

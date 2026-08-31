@@ -162,8 +162,9 @@ For agents:
 Agent integrations may add optional lifecycle hooks or skills that retrieve context before a turn
 and store outcomes afterward. Such automation must make writes observable, preserve the distinction
 between user statements and agent-generated conclusions, and remain outside the core memory
-semantics. MCP and the `mindbridge` CLI are the implemented agent-native surfaces; lifecycle
-integration packages remain a design target.
+semantics. `AsyncOmniPrefetch` implements the narrow Python-side speculative-recall lifecycle;
+capture, turn detection, derived-memory extraction, and agent prompting remain application work.
+MCP and the `mindbridge` CLI are the implemented transport-facing agent surfaces.
 
 ### Developer-friendly extensibility
 
@@ -276,7 +277,7 @@ revisions must be reproducible before a result guides a default.
 
 | Concern | Current release | Product direction |
 | --- | --- | --- |
-| Input | Ordered text, image, video, and audio through `ContentInput`, including lazy streams of completed observations | More capture formats normalize into the same canonical contract |
+| Input | Ordered text, image, video, and audio through `ContentInput`; lazy completed observations through `StreamInput`/`add_stream`; async speculative omni recall | More capture formats normalize into the same canonical contract |
 | Embedding | Caller explicitly supplies a backend; Jina v5 Omni is the bundled omni adapter | Omni-capable recommended composition with route-specific execution |
 | Generation | Optional caller-supplied backend with explicit capabilities | Omni-capable recommended composition where the deployment supports it |
 | Speech runtime | Built-in FunASR adapter uses `AutoModel` | Additional measured runtime adapters, selected explicitly or by observable policy |

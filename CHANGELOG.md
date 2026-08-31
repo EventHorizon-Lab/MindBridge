@@ -14,6 +14,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `ask`, `get`, `speech`, `faces`, `register_speaker`, `register_identity`, `reinforce`, `list`,
   `delete`, `reindex`, and `optimize`.
 - An `AsyncMemory` facade with the same operations and return values.
+- `AsyncOmniPrefetch`, a per-turn speculative-recall helper that accepts complete text, image,
+  video, audio, or combined snapshots, permits only one real search at a time, coalesces queued
+  revisions, and confirms the exact final snapshot without persisting partial input.
+- An evidence-backed interaction-memory recipe over the existing semantic, episodic, and
+  procedural roles, plus a public-SDK benchmark gate that must justify any future graph projection.
 - Frozen, slotted public content/result types for text, image, video, audio, and omni memories,
   including per-item `StreamInput` provenance, plus a stable `MindBridgeError` exception hierarchy.
 - SQLite as the authoritative local store for records, canonical FP32 embeddings, compatibility

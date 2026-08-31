@@ -187,7 +187,9 @@ Each yielded record is already durable and searchable. The stream is not one tra
 later item fails, earlier records remain committed and the error's `subject` identifies its
 `contents[N]` position. `AsyncMemory.add_stream` accepts an `AsyncIterable` and returns an async
 iterator with the same item semantics. MindBridge consumes completed chunks; the application owns
-camera or microphone capture and chooses chunk boundaries.
+camera or microphone capture and chooses chunk boundaries. Composite observations may combine
+text, image, video, and audio atoms. See
+[omni streaming and interaction memory](../omni-streaming-and-interaction-memory.md).
 
 ### Retrieve and answer
 
@@ -355,6 +357,28 @@ async with AsyncMemory(
 It runs the embedded synchronous consistency core through `asyncio.to_thread`. It is not a
 provider compatibility layer.
 
+### Async omni prefetch
+
+`AsyncOmniPrefetch` is a per-turn Python orchestration helper over `AsyncMemory.search`. Submit the
+complete current multimodal snapshot whenever useful evidence changes, then confirm the final
+snapshot:
+
+```python
+from mindbridge import AsyncOmniPrefetch
+
+prefetch = AsyncOmniPrefetch(memory, limit=8)
+prefetch.submit((partial_text, frame_blob, audio_blob))
+prefetch.submit((newer_text, frame_blob, audio_blob))
+result = await prefetch.finalize((final_text, frame_blob, audio_blob))
+```
+
+One search runs at a time and only the newest queued revision survives. `latest` returns the newest
+completed `PrefetchResult` without waiting. `finalize` returns a result for the exact final value
+and closes the helper; a failed matching speculation is retried as a new revision. Prefetch
+snapshots accept immutable text, `Blob`, and `AssetRef` values, but reject mutable `Path` inputs.
+`close()` abandons queued work and drains the already-running search without attempting ineffective
+thread cancellation. The helper never persists input or reinforces hits.
+
 ## Return values
 
 - `MemoryRecord`: stable ID, derived text, modality, memory type, assets, timestamps, metadata.
@@ -364,7 +388,9 @@ provider compatibility layer.
 - `AnswerResult`: grounded answer text, accepted hits, `abstained`, and a machine-readable
   `abstention_reason` (`no_evidence` or `insufficient_evidence`).
 - `Page`: records and an optional next cursor.
+- `PrefetchResult`: a positive submission revision and immutable search hits.
 - `SpeakerSegment`: one timed speech segment and local identity fields.
+- `StreamInput`: one completed `ContentInput` with per-item time, metadata, and memory type.
 
 All are frozen, slotted dataclasses. Mappings are detached from caller input.
 

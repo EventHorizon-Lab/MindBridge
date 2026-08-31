@@ -52,6 +52,7 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
     names = {
         "Blob",
         "AssetRef",
+        "AsyncOmniPrefetch",
         "ContentAtom",
         "ContentInput",
         "IndexQuantization",
@@ -61,6 +62,7 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "MindBridgeConfig",
         "MemoryPlugins",
         "Modality",
+        "PrefetchResult",
         "RetrievalCandidateTrace",
         "RetrievalRejection",
         "RetrievalTrace",

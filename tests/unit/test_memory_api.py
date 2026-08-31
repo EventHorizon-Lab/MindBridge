@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
@@ -13,7 +14,7 @@ from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier, Event, Thread
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
@@ -51,7 +52,7 @@ from mindbridge.infrastructure.local.store import (
     StoredMemory,
 )
 from mindbridge.infrastructure.local.zvec_index import IndexHit
-from mindbridge.memory import AsyncMemory, Memory
+from mindbridge.memory import AsyncMemory, AsyncOmniPrefetch, Memory
 from mindbridge.models.base import (
     EmbedTask,
     FaceAnalysis,
@@ -2280,6 +2281,79 @@ def test_add_stream_commits_each_input_before_pulling_the_next(tmp_path: Path) -
         assert {item.id for item in memory.list().items} == {first.id, second.id}
 
 
+def test_add_stream_commits_each_omni_observation_before_pulling_the_next(
+    tmp_path: Path,
+) -> None:
+    occurred = datetime(2026, 8, 20, 9, tzinfo=timezone.utc)
+    pulled: list[str] = []
+
+    def contents() -> Iterator[StreamInput | str]:
+        pulled.append("omni")
+        yield StreamInput(
+            (
+                "red workshop observation",
+                Blob(b"image", "image/png", "frame.png"),
+                Blob(b"audio", "audio/wav", "sound.wav"),
+            ),
+            occurred_at=occurred,
+            metadata={"source": "robot"},
+            memory_type=MemoryType.EPISODIC,
+        )
+        pulled.append("invalid")
+        yield "   "
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        stream = memory.add_stream(contents())
+        first = next(stream)
+
+        assert pulled == ["omni"]
+        assert memory.get(first.id) == first
+        assert first.modality is Modality.OMNI
+        assert first.occurred_at == occurred
+        assert first.metadata == {"source": "robot"}
+        assert first.memory_type is MemoryType.EPISODIC
+        with pytest.raises(ValidationError) as failure:
+            next(stream)
+
+        assert failure.value.subject == "contents[1]"
+        assert memory.list().items == (first,)
+
+
+def test_existing_memory_types_form_evidence_separated_interaction_memory(tmp_path: Path) -> None:
+    occurred = datetime(2026, 8, 20, 9, tzinfo=timezone.utc)
+    items = (
+        StreamInput(
+            "The user explicitly says they prefer calm red explanations.",
+            metadata={"basis": "user_statement", "evidence_ids": ["turn-1"]},
+            memory_type=MemoryType.SEMANTIC,
+        ),
+        StreamInput(
+            "The user became tense while discussing the red deadline.",
+            occurred_at=occurred,
+            metadata={"basis": "observed_episode", "evidence_ids": ["turn-2"]},
+            memory_type=MemoryType.EPISODIC,
+        ),
+        StreamInput(
+            "When a red deadline is discussed, acknowledge pressure before proposing steps.",
+            metadata={"basis": "response_feedback", "evidence_ids": ["turn-2"]},
+            memory_type=MemoryType.PROCEDURAL,
+        ),
+    )
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        records = tuple(memory.add_stream(items))
+        recalled = {
+            memory_type: memory.search("red deadline", memory_type=memory_type, limit=1)[0]
+            for memory_type in MemoryType
+        }
+
+    assert {record.memory_type for record in records} == set(MemoryType)
+    assert {memory_type: hit.memory_type for memory_type, hit in recalled.items()} == {
+        memory_type: memory_type for memory_type in MemoryType
+    }
+    assert all(hit.metadata["evidence_ids"] for hit in recalled.values())
+
+
 def test_add_many_hydrates_the_index_outbox_in_batches(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3515,6 +3589,88 @@ async def test_async_add_stream_names_a_source_failure(tmp_path: Path) -> None:
 
         assert failure.value.subject == "contents[1]"
         assert await memory.get(first.id) == first
+
+
+@pytest.mark.asyncio
+async def test_omni_prefetch_coalesces_snapshots_and_confirms_the_final_query() -> None:
+    class SearchMemory:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+            self.active = 0
+            self.maximum_active = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def search(self, query: object, **_options: object) -> tuple[SearchHit, ...]:
+            self.calls.append(query)
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+            try:
+                if len(self.calls) == 1:
+                    self.started.set()
+                    await self.release.wait()
+                return ()
+            finally:
+                self.active -= 1
+
+    search_memory = SearchMemory()
+    prefetch = AsyncOmniPrefetch(cast(AsyncMemory, search_memory))
+    image = Blob(b"image", "image/png", "frame.png")
+    audio = Blob(b"audio", "audio/wav", "sound.wav")
+    partial: list[str | Blob] = ["red partial", image, audio]
+
+    first_revision = prefetch.submit(partial)
+    partial[0] = "mutated after submit"
+    await search_memory.started.wait()
+    prefetch.submit(("red newer", image, audio))
+    search_memory.release.set()
+    result = await prefetch.finalize(("red final", image, audio))
+
+    assert first_revision == 1
+    assert result.revision == 3
+    assert search_memory.calls == [
+        ("red partial", image, audio),
+        ("red final", image, audio),
+    ]
+    assert search_memory.maximum_active == 1
+    assert prefetch.latest == result
+
+
+@pytest.mark.asyncio
+async def test_omni_prefetch_retries_a_failed_final_snapshot() -> None:
+    class SearchMemory:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.failed = asyncio.Event()
+
+        async def search(self, _query: object, **_options: object) -> tuple[SearchHit, ...]:
+            self.calls += 1
+            if self.calls == 1:
+                self.failed.set()
+                raise ModelError("temporary search failure", reason="timeout")
+            return ()
+
+    search_memory = SearchMemory()
+    prefetch = AsyncOmniPrefetch(cast(AsyncMemory, search_memory))
+
+    prefetch.submit("red final")
+    await search_memory.failed.wait()
+    result = await prefetch.finalize("red final")
+
+    assert result.revision == 2
+    assert search_memory.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_omni_prefetch_rejects_mutable_path_snapshots(tmp_path: Path) -> None:
+    class SearchMemory:
+        async def search(self, _query: object, **_options: object) -> tuple[SearchHit, ...]:
+            raise AssertionError("search must not start")
+
+    prefetch = AsyncOmniPrefetch(cast(AsyncMemory, SearchMemory()))
+
+    with pytest.raises(ValidationError, match="use Blob or AssetRef"):
+        prefetch.submit(tmp_path / "frame.jpg")
 
 
 @pytest.mark.asyncio

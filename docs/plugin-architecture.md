@@ -54,6 +54,11 @@ Metadata remains application data, never an execution, isolation, or authorizati
 The optional `server` and `mcp` dependencies are packaging boundaries, not plugins. REST, MCP, and
 the product CLI remain thin transports over the application-composed `Memory`.
 
+`Memory.add_stream` is also not a plugin boundary. It repeats the existing durable `add` operation
+over caller-segmented observations. `AsyncOmniPrefetch` is a thin lifecycle helper over the same
+`AsyncMemory.search`; it neither performs perception nor owns a second execution plane. Capture,
+ASR partials, frame selection, and finality stay with the application.
+
 ## Embodied integration boundary
 
 MindBridge may improve embodied memory representation, retrieval, provenance, temporal validity,
@@ -64,6 +69,11 @@ the product boundary. Procedural memory is evidence and is never executed as cod
 New entity, relation, or spatial projections must remain additive to authoritative records and earn
 their complexity through MindBridge's own measured retrieval results. A paper's architecture or
 benchmark score is not by itself a reason to replace the flat durable representation.
+
+Interaction memory uses the existing semantic, episodic, and procedural roles. Any
+emotion, trait, or response-policy inference stays outside the kernel or behind a future concrete
+typed analysis plugin. Derived records retain evidence provenance and use ordinary `Memory` writes;
+plugins may not write around durability or reinterpret metadata as routing, isolation, or trust.
 
 ## Trade-offs and revisit triggers
 
