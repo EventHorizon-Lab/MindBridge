@@ -27,7 +27,7 @@ from prepare_final_manifests import (
 
 ROOT = Path(__file__).resolve().parent
 PERFORMANCE = ROOT / "performance"
-PERFORMANCE_DATA = Path("/dev/shm/mindbridge-ar-perf-b2d7f2918105")
+PERFORMANCE_DATA = Path("/dev/shm/mindbridge-ar-perf-e806cf3b1dd4")
 REPETITIONS = (1, 2, 3)
 TASKS: dict[str, dict[str, object]] = {
     "locomo": {

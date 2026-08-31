@@ -15,10 +15,10 @@ ROOT = Path(__file__).resolve().parent
 FINAL = ROOT / "final"
 LOCKED_DATA = Path("/dev/shm/mindbridge-ar-locked-b2d7f2918105")
 BASELINE_NAME = "baseline-ba4bcced90b9-locked-v2"
-CURRENT_NAME = "current-b2d7f2918105-locked-v2"
+CURRENT_NAME = "current-e806cf3b1dd4-locked-v3"
 REVISIONS = {
     "baseline": "ba4bcced90b916bf28265576320639b8c1a0218a",
-    "current": "b2d7f291810530b4788d7890deb6302685acb1ab",
+    "current": "e806cf3b1dd49a96fc9c477847b855f42c68c55b",
 }
 EXPECTED_REPOSITORY = {
     "baseline": {
@@ -27,7 +27,7 @@ EXPECTED_REPOSITORY = {
         "uv_lock_blob": "706d6bb754793976ba4821f5574c110032eea356",
     },
     "current": {
-        "product_tree": "2360c99440ac2d4db6568f723330af52be4e8b0e",
+        "product_tree": "3f5ffbfd67d507bb145d23a5e07f9563ffd5124e",
         "pyproject_blob": "774126eaa95deec1c650156a8b8f9c7201b49176",
         "uv_lock_blob": "706d6bb754793976ba4821f5574c110032eea356",
     },
@@ -104,7 +104,7 @@ EXPECTED_RUNS: dict[str, dict[str, object]] = {
         "limit": 50,
         "offset": 50,
         "question_count": 50,
-        "request_concurrency": 8,
+        "request_concurrency": 4,
         "unit_concurrency": 1,
     },
 }

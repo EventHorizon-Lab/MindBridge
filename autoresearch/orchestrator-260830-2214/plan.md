@@ -8,10 +8,10 @@
 - Verify: `uv run --frozen python autoresearch/orchestrator-260830-2214/verify.py --suite dev`
 - Expected output: `0`
 - Guard: `autoresearch/orchestrator-260830-2214/guard.sh`
-- Frozen product candidate: `b2d7f291810530b4788d7890deb6302685acb1ab`
+- Frozen product candidate: `e806cf3b1dd49a96fc9c477847b855f42c68c55b`
 - Frozen baseline: `ba4bcced90b916bf28265576320639b8c1a0218a`
 - Locked namespaces: `baseline-ba4bcced90b9-locked-v2` and
-  `current-b2d7f2918105-locked-v2`
+  `current-e806cf3b1dd4-locked-v3`
 - Offline identity registry SHA-256:
   `481d3c40d3ca3a060fc7cfbab72ab4abaa1f5819d05132a5c540ebee3ad54ccc`
 - Provenance wrapper SHA-256:
@@ -45,6 +45,12 @@ scores from samples, and checks run provenance against the revisions above. Ever
 uses the committed wrapper on GPU `GPU-6fa4d834-e033-e492-66f5-9d2f3792c4dd`; a pre-spawn ledger
 makes a failed or interrupted output path non-reusable. Each quality task is a two-entry
 baseline/current provenance chain.
+
+The first EgoLifeQA baseline attempt used automatic batches up to 32 and exhausted host memory
+before a provenance file could be finalized. Its attempt ledger, log, and partial store are retained
+outside the formal namespace. The sole retry keeps the locked samples, seed, models, and prompts
+unchanged, while both paired sides use batch size 1 and request/judge concurrency 4 to bound peak
+memory. The failed partial output is never admitted to a manifest.
 
 Quality requires no task to lose more than 0.5 percentage points and at least +1 percentage point
 macro gain. Cost requires no task to use over 2% more generation tokens and at least 5% geometric
