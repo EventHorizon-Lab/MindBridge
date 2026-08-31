@@ -17,9 +17,11 @@ from prepare_final_manifests import (
     PAIR_DOCUMENT_FIELDS,
     PAIR_SAMPLE_FIELDS,
     PAIR_TASK_FIELDS,
+    REQUIRED_SAMPLE_FIELDS,
     locked_identities,
     validate_media_manifest,
     validate_provenance,
+    validate_sample_judge_models,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -219,9 +221,10 @@ def _artifact(side: str, repetition: int, slug: str) -> dict[str, Any]:
     _require(len(rows) == question_count, f"{side}/r{repetition}/{slug}: sample count")
     _require(all(isinstance(row, dict) for row in rows), f"{side}/r{repetition}/{slug}: sample row")
     _require(
-        all(all(field in row for field in PAIR_SAMPLE_FIELDS) for row in rows),
+        all(all(field in row for field in REQUIRED_SAMPLE_FIELDS) for row in rows),
         f"{side}/r{repetition}/{slug}: missing sample fields",
     )
+    validate_sample_judge_models(document, rows, f"{side}/r{repetition}/{slug}")
     _require(all(row.get("cached") is False for row in rows), f"{side}/r{repetition}/{slug}: cache")
     _require(
         all(row.get("error_code") is None for row in rows), f"{side}/r{repetition}/{slug}: error"
@@ -398,6 +401,21 @@ def _self_check() -> None:
     assert statistics.median((1.0, 9.0, 2.0)) == 2.0
     assert math.isclose(_geometric([0.5, 2.0]), 1.0)
     assert _percentile([1.0, 2.0, 3.0], 0.5) == 2.0
+    validate_sample_judge_models(
+        {"judge": {"model": "fixture-judge"}},
+        [{"judge_model": None}, {"judge_model": "fixture-judge"}],
+        "fixture",
+    )
+    try:
+        validate_sample_judge_models(
+            {"judge": {"model": "fixture-judge"}},
+            [{"judge_model": "different-judge"}],
+            "fixture",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unconfigured sample judge model was accepted")
 
 
 def main() -> int:

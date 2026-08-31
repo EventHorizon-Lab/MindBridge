@@ -152,7 +152,6 @@ PAIR_SAMPLE_FIELDS = (
     "benchmark",
     "dataset_sha256",
     "evaluation_sha256",
-    "judge_model",
     "metadata",
     "prompt",
     "question_id",
@@ -164,6 +163,7 @@ PAIR_SAMPLE_FIELDS = (
     "task",
     "unit_id",
 )
+REQUIRED_SAMPLE_FIELDS = (*PAIR_SAMPLE_FIELDS, "judge_model")
 
 
 def _finite(value: object, *, positive: bool = False) -> bool:
@@ -239,6 +239,21 @@ def validate_media_manifest(
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
+
+
+def validate_sample_judge_models(
+    document: dict[str, Any], rows: list[dict[str, Any]], label: str
+) -> None:
+    judge = document.get("judge")
+    judge_model = judge.get("model") if isinstance(judge, dict) else None
+    _require(
+        isinstance(judge_model, str) and bool(judge_model.strip()),
+        f"{label}: missing document judge model",
+    )
+    _require(
+        all("judge_model" in row and row["judge_model"] in (None, judge_model) for row in rows),
+        f"{label}: sample judge model is not allowed by the document",
+    )
 
 
 def validate_provenance(
@@ -528,9 +543,10 @@ def _artifact(side: str, slug: str) -> dict[str, Any]:  # noqa: C901 - fail-clos
     _require(len(rows) == question_count, f"{side}/{slug}: sample count mismatch")
     _require(all(isinstance(row, dict) for row in rows), f"{side}/{slug}: non-object sample")
     _require(
-        all(all(field in row for field in PAIR_SAMPLE_FIELDS) for row in rows),
-        f"{side}/{slug}: sample is missing paired fields",
+        all(all(field in row for field in REQUIRED_SAMPLE_FIELDS) for row in rows),
+        f"{side}/{slug}: sample is missing required fields",
     )
+    validate_sample_judge_models(document, rows, f"{side}/{slug}")
     sample_ids = [row.get("sample_id") for row in rows]
     _require(all(isinstance(value, str) for value in sample_ids), f"{side}/{slug}: bad sample_id")
     _require(len(set(sample_ids)) == question_count, f"{side}/{slug}: duplicate sample_id")
