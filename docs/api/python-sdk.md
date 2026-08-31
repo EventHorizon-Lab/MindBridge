@@ -486,6 +486,9 @@ models = OpenAIModels(
     generation_model="gpt-5-mini",
     transcription_model="whisper-1",
     transcription_space=None,
+    transcription_prompt=None,
+    transcription_keywords=None,
+    transcription_languages=None,
     embedding_capabilities=frozenset({Modality.TEXT}),
     generation_capabilities=frozenset({Modality.TEXT}),
     transcription_capabilities=frozenset({Modality.AUDIO}),
@@ -505,6 +508,14 @@ built into the shared grounded request, so `answer()` and `stream_answer()` alwa
 generation controls. `generation_video_limit` bounds distinct retrieved videos while preserving
 overflow hit text; set it to `None` to disable that count limit. The byte limits still apply. SDK
 clients remain caller-owned.
+
+Set `transcription_model="gpt-transcribe"` to use OpenAI Transcribe for completed audio files.
+Optional `transcription_prompt`, `transcription_keywords`, and `transcription_languages` are sent
+through the official SDK. Their normalized values are hashed into the default
+`transcription_space`; supply an explicit space only when the application maintains an equivalent
+stable recipe identity itself. OpenAI Transcribe remains a plain `TranscriptionBackend`; realtime
+audio, timestamps, diarization, and speaker embeddings require their corresponding specialized
+backends.
 
 `embedding_request_format="input"` uses the standard OpenAI Embeddings request field. Set it to
 `"messages"` for OpenAI-compatible servers that implement chat-style embeddings, such as vLLM

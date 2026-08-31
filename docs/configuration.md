@@ -95,6 +95,36 @@ models = OpenAIModels(
 
 All clients remain caller-owned and must be closed by the caller.
 
+### OpenAI Transcribe
+
+Use the existing transcription plugin with OpenAI's completed-file Transcriptions API:
+
+```python
+from openai import OpenAI
+
+from mindbridge import OpenAIModels
+
+client = OpenAI()
+transcriber = OpenAIModels(
+    transcription_client=client,
+    transcription_model="gpt-transcribe",
+    transcription_prompt="A household conversation about reminders and medication.",
+    transcription_keywords=("MindBridge", "AC-42"),
+    transcription_languages=("en", "zh-cn"),
+)
+```
+
+MindBridge sends each resolved audio asset to `/audio/transcriptions` as multipart form data and
+returns the response text through `TranscriptionBackend`. `transcription_prompt` supplies
+unstructured context; `transcription_keywords` and `transcription_languages` map to OpenAI's
+`keywords[]` and `languages[]` fields. See the official
+[file transcription guide](https://developers.openai.com/api/docs/guides/speech-to-text).
+
+The `whisper-1` default remains unchanged for compatibility; select `gpt-transcribe` explicitly.
+When no explicit `transcription_space` is supplied, MindBridge hashes prompt, keyword, and language
+settings into the derived space so stored transcripts from different recipes cannot mix. The hash
+does not expose the prompt or keywords in store metadata.
+
 [vLLM multimodal pooling models](https://github.com/vllm-project/vllm/blob/main/examples/pooling/embed/vision_embedding_online.py)
 extend `/embeddings` with top-level chat `messages`. Select that wire format explicitly so text
 queries and media documents use the same model recipe:
