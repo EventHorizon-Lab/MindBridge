@@ -18,6 +18,7 @@ from prepare_final_manifests import (
     PAIR_SAMPLE_FIELDS,
     PAIR_TASK_FIELDS,
     locked_identities,
+    validate_media_manifest,
     validate_provenance,
 )
 
@@ -241,6 +242,13 @@ def _artifact(side: str, repetition: int, slug: str) -> dict[str, Any]:
     )
     for field in ("dataset_sha256", "evaluation_sha256", "input_sha256"):
         _require(task.get(field) == identity[field], f"{side}/r{repetition}/{slug}: wrong {field}")
+    validate_media_manifest(
+        result_dir,
+        document,
+        str(TASKS[slug]["task"]),
+        identity,
+        f"{side}/r{repetition}/{slug}",
+    )
     ordered_ids_hash = hashlib.sha256("\n".join(sample_ids).encode()).hexdigest()
     _require(
         ordered_ids_hash == identity["ordered_sample_ids_sha256"],

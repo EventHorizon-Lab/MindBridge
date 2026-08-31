@@ -114,7 +114,6 @@ PAIR_DOCUMENT_FIELDS = (
     "environment",
     "judge",
     "limit",
-    "media_manifest_path",
     "media_roots",
     "model",
     "num_fewshot",
@@ -198,6 +197,43 @@ def locked_identities(namespace: str) -> dict[str, dict[str, object]]:
     ):
         raise ValueError(f"invalid {namespace} identity registry")
     return values
+
+
+def validate_media_manifest(
+    result_dir: Path,
+    document: dict[str, Any],
+    task_name: str,
+    identity: dict[str, object],
+    label: str,
+) -> None:
+    _require("media_manifest_path" in document, f"{label}: missing manifest field")
+    input_sha256 = identity.get("input_sha256")
+    if not isinstance(input_sha256, dict):
+        raise ValueError(f"{label}: invalid pinned inputs")
+    expected_hash = input_sha256.get("media_manifest")
+    if expected_hash is None:
+        _require(document.get("media_manifest_path") is None, f"{label}: unexpected manifest")
+        return
+    path = result_dir / "media-manifest.json"
+    _require(
+        document.get("media_manifest_path") == str(path)
+        and path.is_file()
+        and not path.is_symlink(),
+        f"{label}: wrong media manifest path",
+    )
+    manifest = _load(path)
+    tasks = manifest.get("tasks")
+    task_manifest = tasks.get(task_name) if isinstance(tasks, dict) else None
+    if not isinstance(task_manifest, dict):
+        raise ValueError(f"{label}: missing task media manifest")
+    payload = json.dumps(
+        task_manifest,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    _require(hashlib.sha256(payload).hexdigest() == expected_hash, f"{label}: wrong manifest hash")
 
 
 def _require(condition: bool, message: str) -> None:
@@ -398,6 +434,7 @@ def _artifact(side: str, slug: str) -> dict[str, Any]:  # noqa: C901 - fail-clos
     )
     for field in ("dataset_sha256", "evaluation_sha256", "input_sha256"):
         _require(task.get(field) == identity[field], f"{side}/{slug}: wrong {field}")
+    validate_media_manifest(result_dir, document, TASKS[slug], identity, f"{side}/{slug}")
     _require(task.get("score_valid") is True, f"{side}/{slug}: invalid score")
     _require(task.get("error_count") == 0, f"{side}/{slug}: task errors")
     _require(task.get("ingest_failure_count") == 0, f"{side}/{slug}: ingest failures")
