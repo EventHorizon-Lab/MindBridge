@@ -28,7 +28,11 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     Page,
+    RetrievalCandidateTrace,
+    RetrievalRejection,
+    RetrievalTrace,
     SearchHit,
+    TracedSearchResult,
 )
 
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
@@ -83,6 +87,48 @@ def test_search_hit_is_flat_and_rejects_invalid_scores() -> None:
             content="A red screwdriver.",
             created_at=NOW,
             memory_type="episodic",  # type: ignore[arg-type]
+        )
+
+
+def test_retrieval_trace_values_are_immutable_and_bounded() -> None:
+    hit = SearchHit(id="memory_1", content="memory", score=0.9, created_at=NOW)
+    candidate = RetrievalCandidateTrace(
+        memory_id=hit.id,
+        index_ids=("embedding_1",),
+        dense_relevance=0.9,
+        dense_confidence=0.8,
+        lexical_relevance=0.6,
+        lexical_rerank_bonus=0.2,
+        gate_confidence=0.8,
+        base_relevance=0.9,
+        reinforcement_factor=1.0,
+        final_score=hit.score,
+        rank=1,
+    )
+    result = TracedSearchResult(
+        hits=(hit,),
+        trace=RetrievalTrace(
+            candidates=(candidate,),
+            candidate_limit=50,
+            exhaustive=True,
+        ),
+    )
+
+    assert pickle.loads(pickle.dumps(result)) == result
+    assert tuple(reason.value for reason in RetrievalRejection) == (
+        "stale_index",
+        "occurrence_range",
+        "missing_memory",
+        "memory_type",
+        "minimum_relevance",
+        "ambiguity",
+        "limit",
+    )
+    with pytest.raises(ValidationError, match="must not exceed one"):
+        RetrievalCandidateTrace(
+            memory_id=hit.id,
+            index_ids=("embedding_1",),
+            final_score=1.1,
         )
 
 

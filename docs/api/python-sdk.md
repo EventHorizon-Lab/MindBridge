@@ -32,7 +32,7 @@ These bounds are enforced on the Python surface and raise `ValidationError` befo
 | --- | --- | --- |
 | Parts in one `ContentInput` sequence | 128 | `content must not exceed 128 parts` |
 | Characters in one text value | 65,536 after NFC normalization | `... must not exceed 65536 characters` |
-| `limit` for `search`, `ask`, and `list` | 1–100 inclusive | `limit must be between 1 and 100` |
+| `limit` for `search`, `search_with_trace`, `ask`, and `list` | 1–100 inclusive | `limit must be between 1 and 100` |
 
 The transports are stricter than the SDK, not equal to it: REST and MCP cap one request at 16 parts.
 An agent that composes near the Python bound must therefore expect a smaller ceiling over a
@@ -64,6 +64,30 @@ Memory(
 `embedder` is required. `Memory` validates adapter capabilities and durable space identity before
 opening Zvec. It closes supplied adapters when the memory closes; provider clients owned by an
 adapter may remain caller-owned, as documented by that adapter.
+
+Applications with several optional capabilities can keep runtime objects separate from local policy
+with the equivalent grouped entry point:
+
+```python
+from mindbridge import Memory, MemoryConfig, MemoryPlugins
+
+plugins = MemoryPlugins(
+    embedder=embedder,
+    answerer=answerer,
+    transcriber=transcriber,
+    face_analyzer=face_analyzer,
+)
+config = MemoryConfig(index_speech=True)
+
+with Memory.from_plugins("./data/example", plugins=plugins, config=config) as memory:
+    memory.add("Remember this")
+```
+
+`MemoryPlugins` contains already-constructed typed adapters. `MemoryConfig` contains only the local
+policy values accepted by the direct constructor. `AsyncMemory.from_plugins` provides the same
+grouped composition for the async facade. Plugin protocol shape is validated before a local store is
+opened; these entry points then perform the same capability validation and use the same storage,
+routing, lifecycle, and failure behavior. They are not provider discovery.
 
 `tracer` optionally selects a non-global OpenTelemetry provider. With the default `None`,
 MindBridge uses the standard global tracer. See
@@ -134,6 +158,8 @@ hits = memory.search(
     limit=10,
     memory_type=None,
     reference_at=None,
+    occurred_from=None,
+    occurred_until=None,
 )
 result = memory.ask(
     question,
@@ -150,6 +176,13 @@ configured answerer. It raises `ModelError` when no answerer is configured.
 timezone-aware. When omitted, the current UTC time is used unless the query declares a valid
 English reference date such as `Today is May 2, 2024`; an explicit `reference_at` always wins.
 
+`occurred_from` and `occurred_until` are optional timezone-aware hard filters on event time. A
+memory matches when its `[occurred_at, occurred_end)` interval overlaps the half-open query
+interval; an instant event has a one-microsecond extent. Either bound may be omitted. Supplying any
+bound excludes memories without `occurred_at`, and two bounds require
+`occurred_until > occurred_from`. These filters are independent of the soft temporal preference
+inferred from query text.
+
 Composite records are indexed with an aggregate vector and de-duplicated vectors for each text or
 media atom. Text longer than 2,048 characters also receives overlapping contextual retrieval keys;
 the complete record remains the returned evidence. Queries batch their complete aggregate with
@@ -160,6 +193,36 @@ authoritative parent before reranking. English BM25 uses
 case folding, accent folding, and stemming; queries containing Han characters use Jieba. Weak or
 missing evidence can therefore return `()`. With `limit=1`, an unresolved top-two tie can also
 empty `search` or leave `ask` with no hits; larger limits preserve those qualified candidates.
+
+### Trace one search
+
+```python
+result = memory.search_with_trace(
+    query,
+    limit=10,
+    memory_type=None,
+    reference_at=None,
+    occurred_from=None,
+    occurred_until=None,
+)
+```
+
+`result.hits` is exactly the value the same `search` call returns. `result.trace.candidates`
+explains the bounded candidate set actually considered: parent `memory_id`, contributing
+`index_ids`, dense relevance and confidence, effective lexical relevance, lexical rerank bonus,
+gate confidence, reinforcement, temporal and retention factors, final score, rank, and
+`rejected_by`. For a ranked candidate,
+`base_relevance = min(1, max(dense_relevance, lexical_relevance) + lexical_rerank_bonus)`;
+`gate_confidence` is the value compared with `minimum_relevance`. Rejection values are
+`stale_index`, `occurrence_range`, `missing_memory`, `memory_type`, `minimum_relevance`,
+`ambiguity`, and `limit`. A stale index candidate has `memory_id=None`.
+
+The trace never contains the query, memory content, metadata, media, vectors, paths, or model
+output. It is returned only to the caller and is not persisted or emitted through OpenTelemetry.
+`candidate_limit` is the final bounded retrieval width; `exhaustive` means every route returned
+fewer candidates than that width, not that the complete corpus was scanned. This diagnostic is
+available from Python and the local `search-with-trace` CLI command; REST and MCP do not expose it
+in this release.
 
 ### Feedback
 
@@ -254,6 +317,8 @@ provider compatibility layer.
 
 - `MemoryRecord`: stable ID, derived text, modality, memory type, assets, timestamps, metadata.
 - `SearchHit`: the same visible memory fields plus a normalized score.
+- `TracedSearchResult`: search hits plus an immutable `RetrievalTrace` of
+  `RetrievalCandidateTrace` values and stable `RetrievalRejection` reasons.
 - `AnswerResult`: grounded answer text, accepted hits, `abstained`, and a machine-readable
   `abstention_reason` (`no_evidence` or `insufficient_evidence`).
 - `Page`: records and an optional next cursor.

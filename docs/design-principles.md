@@ -1,6 +1,6 @@
 # Product goals and design principles
 
-MindBridge's product position is an **Agentic Native Embodied Memory System**: the memory layer
+MindBridge's product direction is an **Agentic Native Embodied Memory System**: the memory layer
 for agents that perceive and act in the physical world. Its primary product context is a household
 robot for emotional companionship. The same memory contract should also serve desktop robots and
 personal work assistants without requiring a separate architecture.
@@ -11,10 +11,10 @@ search, question, and trace back to evidence.
 
 > This page defines product direction and the criteria for future design decisions. It is not a
 > claim that every target is implemented in the current release. See [architecture](architecture.md)
-> for the implemented system and [extension status](plugin-architecture.md) for today's extension
+> for the implemented system and [plugin architecture](plugin-architecture.md) for today's extension
 > boundary.
 
-## What the position means
+## What the direction means
 
 | Term | Commitment |
 | --- | --- |
@@ -234,8 +234,10 @@ matrix, license and security requirements, performance envelope, and maintenance
 
 The current extension surface consists of the explicit `EmbeddingBackend`, `GenerationBackend`,
 `TranscriptionBackend`, `SpeechBackend`, and `FaceBackend` protocols, plus the optional
-`StreamingGenerationBackend` that an answerer may also implement. Constructor injection is the
-plugin mechanism implemented today; there is no runtime plugin registry.
+`StreamingGenerationBackend` that an answerer may also implement. Applications can pass them
+directly to `Memory` or group them in `MemoryPlugins` and call `Memory.from_plugins` or
+`AsyncMemory.from_plugins`. Explicit construction remains the plugin mechanism; there is no runtime
+plugin registry.
 
 `StreamingGenerationBackend` is the shape a narrow capability should take. It adds one method, stays
 optional, is selected by a structural check rather than a provider name, and leaves the
@@ -246,7 +248,7 @@ OpenCV implementation and end-to-end identity use case. A future public capabili
 analysis must likewise declare accepted modalities, typed output, provenance, configuration,
 resource lifecycle, concurrency behavior, privacy boundary, and failure mapping. It must not create
 provider branches inside `Memory` or treat metadata as an execution or isolation mechanism. See
-[extension status](plugin-architecture.md).
+[plugin architecture](plugin-architecture.md).
 
 ### Preserve evidence, privacy, and durability
 

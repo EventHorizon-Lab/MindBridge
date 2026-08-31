@@ -270,6 +270,20 @@ def _require_interval(start: datetime | None, end: datetime | None) -> None:
         raise ValidationError("occurred_end must be later than occurred_at")
 
 
+def _trace_number(value: object, name: str, *, maximum: float | None = None) -> None:
+    if value is None:
+        return
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(float(value))
+        or value < 0.0
+    ):
+        raise ValidationError(f"trace {name} must be a non-negative finite number")
+    if maximum is not None and value > maximum:
+        raise ValidationError(f"trace {name} must not exceed one")
+
+
 def _assets(value: Sequence[AssetRef], modality: Modality) -> tuple[AssetRef, ...]:
     assets = tuple(value)
     if any(not isinstance(asset, AssetRef) or not asset.is_resolved for asset in assets):
@@ -345,6 +359,120 @@ class SearchHit:
             raise ValidationError("memory must contain content or media assets")
         object.__setattr__(self, "metadata", _metadata(self.metadata))
         object.__setattr__(self, "assets", assets)
+
+
+class RetrievalRejection(str, Enum):
+    """Why one bounded retrieval candidate did not become a search hit."""
+
+    STALE_INDEX = "stale_index"
+    OCCURRENCE_RANGE = "occurrence_range"
+    MISSING_MEMORY = "missing_memory"
+    MEMORY_TYPE = "memory_type"
+    MINIMUM_RELEVANCE = "minimum_relevance"
+    AMBIGUITY = "ambiguity"
+    LIMIT = "limit"
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalCandidateTrace:
+    """Effective score components and final disposition for one considered parent memory."""
+
+    memory_id: str | None
+    index_ids: tuple[str, ...]
+    dense_relevance: float | None = None
+    dense_confidence: float | None = None
+    lexical_relevance: float | None = None
+    lexical_rerank_bonus: float | None = None
+    lexical_match: bool = False
+    gate_confidence: float | None = None
+    base_relevance: float | None = None
+    reinforcement_factor: float | None = None
+    temporal_factor: float | None = None
+    retention_factor: float | None = None
+    final_score: float | None = None
+    rank: int | None = None
+    rejected_by: RetrievalRejection | None = None
+
+    def __post_init__(self) -> None:
+        if self.memory_id is not None:
+            _text(self.memory_id, "trace memory_id")
+        index_ids = tuple(self.index_ids)
+        if not index_ids or len(set(index_ids)) != len(index_ids):
+            raise ValidationError("trace index_ids must be non-empty and unique")
+        for index_id in index_ids:
+            _text(index_id, "trace index_id")
+        for name in (
+            "dense_relevance",
+            "dense_confidence",
+            "lexical_relevance",
+            "lexical_rerank_bonus",
+            "gate_confidence",
+            "base_relevance",
+            "reinforcement_factor",
+            "temporal_factor",
+            "retention_factor",
+            "final_score",
+        ):
+            _trace_number(getattr(self, name), name)
+        for name in (
+            "dense_relevance",
+            "dense_confidence",
+            "lexical_relevance",
+            "lexical_rerank_bonus",
+            "gate_confidence",
+            "base_relevance",
+            "final_score",
+        ):
+            _trace_number(getattr(self, name), name, maximum=1.0)
+        if not isinstance(self.lexical_match, bool):
+            raise ValidationError("trace lexical_match must be a boolean")
+        if self.rank is not None and (
+            isinstance(self.rank, bool) or not isinstance(self.rank, int) or self.rank <= 0
+        ):
+            raise ValidationError("trace rank must be a positive integer")
+        if self.rejected_by is not None and not isinstance(self.rejected_by, RetrievalRejection):
+            raise ValidationError("trace rejected_by is invalid")
+        object.__setattr__(self, "index_ids", index_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalTrace:
+    """Bounded candidate trace for one explicit traced search."""
+
+    candidates: tuple[RetrievalCandidateTrace, ...]
+    candidate_limit: int
+    exhaustive: bool
+    ambiguous: bool = False
+
+    def __post_init__(self) -> None:
+        candidates = tuple(self.candidates)
+        if any(not isinstance(candidate, RetrievalCandidateTrace) for candidate in candidates):
+            raise ValidationError("trace candidates are invalid")
+        if (
+            isinstance(self.candidate_limit, bool)
+            or not isinstance(self.candidate_limit, int)
+            or self.candidate_limit <= 0
+        ):
+            raise ValidationError("trace candidate_limit must be a positive integer")
+        if not isinstance(self.exhaustive, bool) or not isinstance(self.ambiguous, bool):
+            raise ValidationError("trace exhaustive and ambiguous must be booleans")
+        object.__setattr__(self, "candidates", candidates)
+
+
+@dataclass(frozen=True, slots=True)
+class TracedSearchResult:
+    """Search hits paired with their opt-in retrieval trace."""
+
+    hits: tuple[SearchHit, ...]
+    trace: RetrievalTrace
+
+    def __post_init__(self) -> None:
+        hits = tuple(self.hits)
+        if any(not isinstance(hit, SearchHit) for hit in hits):
+            raise ValidationError("traced search hits are invalid")
+        if not isinstance(self.trace, RetrievalTrace):
+            raise ValidationError("traced search trace is invalid")
+        object.__setattr__(self, "hits", hits)
 
 
 @dataclass(frozen=True, slots=True)

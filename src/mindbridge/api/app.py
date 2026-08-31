@@ -155,6 +155,18 @@ class QueryRequest(_RequestModel):
     limit: _Limit = 10
     memory_type: MemoryType | None = None
     reference_at: AwareDatetime | None = None
+    occurred_from: AwareDatetime | None = None
+    occurred_until: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def validate_occurrence_range(self) -> QueryRequest:
+        if (
+            self.occurred_from is not None
+            and self.occurred_until is not None
+            and self.occurred_until <= self.occurred_from
+        ):
+            raise ValueError("occurred_until must be later than occurred_from")
+        return self
 
 
 class AnswerRequest(_RequestModel):
@@ -249,6 +261,8 @@ class _Memory(Protocol):
         limit: int = 10,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
     ) -> tuple[SearchHit, ...]: ...
 
     def ask(
@@ -409,6 +423,8 @@ def create_app(
                     limit=request.limit,
                     memory_type=request.memory_type,
                     reference_at=request.reference_at,
+                    occurred_from=request.occurred_from,
+                    occurred_until=request.occurred_until,
                 )
             }
         )

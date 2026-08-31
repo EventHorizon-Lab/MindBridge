@@ -95,7 +95,16 @@ _DELETE = ToolAnnotations(
 )
 _TOOL_ARGUMENTS = {
     "add_memory": frozenset({"content", "occurred_at", "occurred_end", "metadata", "memory_type"}),
-    "search_memories": frozenset({"query", "limit", "memory_type", "reference_at"}),
+    "search_memories": frozenset(
+        {
+            "query",
+            "limit",
+            "memory_type",
+            "reference_at",
+            "occurred_from",
+            "occurred_until",
+        }
+    ),
     "ask_memory": frozenset({"question", "limit", "memory_type", "reference_at"}),
     "get_memory": frozenset({"memory_id"}),
     "delete_memory": frozenset({"memory_id"}),
@@ -263,6 +272,8 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
         limit: _Limit = 10,
         memory_type: MemoryType | None = None,
         reference_at: AwareDatetime | None = None,
+        occurred_from: AwareDatetime | None = None,
+        occurred_until: AwareDatetime | None = None,
     ) -> SearchResult:
         """Find the most relevant local memories."""
         hits = memory.search(
@@ -270,6 +281,8 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
             limit=limit,
             memory_type=memory_type,
             reference_at=reference_at,
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
         )
         return SearchResult(hits=tuple(_search_hit_result(hit) for hit in hits))
 

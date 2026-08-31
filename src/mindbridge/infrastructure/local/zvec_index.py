@@ -951,6 +951,8 @@ def _filter_expression(
         clauses.append(f"{_TASK_FIELD} = {_filter_literal(task, _TASK_FIELD)}")
     if memory_type is not None:
         clauses.append(f"{_MEMORY_TYPE_FIELD} = {_filter_literal(memory_type, _MEMORY_TYPE_FIELD)}")
+    if occurred_from is not None or occurred_until is not None:
+        clauses.append(f"{_OCCURRED_AT_FIELD} > {_MISSING_OCCURRED_AT}")
     if occurred_from is not None:
         clauses.append(f"{_OCCURRED_END_FIELD} > {_timestamp(occurred_from)}")
     if occurred_until is not None:

@@ -24,8 +24,8 @@ MindBridge is an embedded multimodal memory library for text, image, video, audi
 
 - [Architecture](architecture.md) — components, model routing, and consistency.
 - [Technical architecture](technical-architecture.md) — SQLite, CAS, Zvec, trust boundaries, and concurrency.
-- [Extension status](plugin-architecture.md) — current composition boundary and criteria for future
-  capability plugins.
+- [Plugin architecture](plugin-architecture.md) — current composition boundary and criteria for
+  future capability plugins.
 - [Deployment](deployment.md) — one-process embedded and REST deployment.
 - [Operations](operations.md) — backup, restore, rebuild, and observability.
 - [Performance and token observability](observability.md) — end-to-end traces, node latency, TTFT,

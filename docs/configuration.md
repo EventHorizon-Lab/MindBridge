@@ -1,7 +1,8 @@
 # Configuration and composition
 
-MindBridge has no product-wide provider configuration object. Construct model clients and adapters
-where the application already manages dependencies and secrets.
+MindBridge has no product-wide provider configuration object. `MemoryConfig` is only the value-based
+local policy for one instance; it contains no providers, credentials, or discovery rules. Construct
+model clients and adapters where the application already manages dependencies and secrets.
 
 ## Memory settings
 

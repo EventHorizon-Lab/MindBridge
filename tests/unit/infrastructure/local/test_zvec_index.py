@@ -158,8 +158,8 @@ def test_lexical_search_preserves_relative_bm25_score_and_all_filters() -> None:
         "topk": 2,
         "filter": (
             "space_id = 'workspace' AND task = 'document' AND "
-            "memory_type = 'episodic' AND occurred_end > 1000000 AND "
-            "occurred_at < 2000000"
+            "memory_type = 'episodic' AND occurred_at > -9223372036854775808 AND "
+            "occurred_end > 1000000 AND occurred_at < 2000000"
         ),
         "include_vector": False,
         "output_fields": [],
@@ -463,6 +463,12 @@ def test_type_and_event_time_filters_apply_to_every_search_mode(tmp_path: Path) 
             (1.0, 0.0),
             occurred_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
         ),
+        _document(
+            "episodic_without_time",
+            "project review",
+            (1.0, 0.0),
+            memory_type="episodic",
+        ),
     ]
     with ZvecIndex(tmp_path / "index", dimension=2) as index:
         index.upsert(documents)
@@ -479,9 +485,22 @@ def test_type_and_event_time_filters_apply_to_every_search_mode(tmp_path: Path) 
             occurred_from=start,
             occurred_until=until,
         )
+        until_only_dense = index.search(
+            (1.0, 0.0),
+            memory_type="episodic",
+            occurred_until=until,
+            exact=True,
+        )
+        until_only_lexical = index.lexical_search(
+            "project review",
+            memory_type="episodic",
+            occurred_until=until,
+        )
 
     assert {hit.id for hit in dense} == {"episodic_match", "episodic_overlap"}
     assert {hit.id for hit in lexical} == {"episodic_match", "episodic_overlap"}
+    assert {hit.id for hit in until_only_dense} == {"episodic_match", "episodic_overlap"}
+    assert {hit.id for hit in until_only_lexical} == {"episodic_match", "episodic_overlap"}
 
 
 def test_open_rejects_an_incompatible_schema(tmp_path: Path) -> None:
