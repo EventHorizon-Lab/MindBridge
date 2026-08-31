@@ -101,6 +101,8 @@ EXPECTED_RUNS: dict[str, dict[str, object]] = {
     },
     "egolife-q50-99": {
         "allow_unverified_data": False,
+        "batch_size": 1,
+        "judge_concurrency": 4,
         "limit": 50,
         "offset": 50,
         "question_count": 50,
@@ -418,6 +420,13 @@ def _artifact(side: str, slug: str) -> dict[str, Any]:  # noqa: C901 - fail-clos
         raise ValueError(f"{side}/{slug}: missing model config")
     for field, expected in EXPECTED_MODEL.items():
         _require(model.get(field) == expected, f"{side}/{slug}: wrong model {field}")
+    expected_judge_concurrency = EXPECTED_RUNS[slug].get("judge_concurrency")
+    if expected_judge_concurrency is not None:
+        judge = document.get("judge")
+        _require(
+            isinstance(judge, dict) and judge.get("concurrency") == expected_judge_concurrency,
+            f"{side}/{slug}: wrong judge concurrency",
+        )
     for field, expected in {
         "bootstrap_samples": 2000,
         "num_fewshot": 0,
@@ -441,6 +450,12 @@ def _artifact(side: str, slug: str) -> dict[str, Any]:  # noqa: C901 - fail-clos
     if not isinstance(tasks, list) or len(tasks) != 1:
         raise ValueError(f"{side}/{slug}: expected one task")
     task = tasks[0]
+    expected_batch_size = EXPECTED_RUNS[slug].get("batch_size")
+    if expected_batch_size is not None:
+        _require(
+            isinstance(task, dict) and task.get("batch_size") == expected_batch_size,
+            f"{side}/{slug}: wrong batch size",
+        )
     if not isinstance(task, dict) or task.get("task") != TASKS[slug]:
         raise ValueError(f"{side}/{slug}: wrong task")
     _require(
