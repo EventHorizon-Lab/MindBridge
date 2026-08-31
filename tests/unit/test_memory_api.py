@@ -817,6 +817,41 @@ def test_temporal_proximity_is_a_soft_score_not_a_hard_sort_key(tmp_path: Path) 
     assert [hit.id for hit in hits] == [adjacent.id, exact.id]
 
 
+def test_temporal_search_reads_lexical_evidence_from_authoritative_time_range(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        outside = memory.add_many(
+            tuple(f"shared witness outside {index}" for index in range(130)),
+            occurred_at=(datetime(2026, 1, 1, tzinfo=timezone.utc),) * 130,
+        )
+        weak = memory.add(
+            "shared witness weak",
+            occurred_at=datetime(2024, 5, 1, tzinfo=timezone.utc),
+        )
+        target = memory.add(
+            "shared witness target",
+            occurred_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
+        )
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = ()
+        index.lexical_hits_override = tuple(
+            IndexHit(
+                id=record.id,
+                relevance=0.5 if record.id == weak.id else 1.0,
+                lexical_match=True,
+            )
+            for record in (*outside[:99], weak, *outside[99:], target)
+        )
+        hits = memory.search("shared witness in 2024", limit=1)
+        assert hits and hits[0].id == target.id
+        assert index.lexical_search_calls == 2
+
+        monkeypatch.setattr(memory._store, "read_memories", lambda _memory_ids: ())
+        assert memory.search("shared witness in 2024", limit=1) == ()
+
+
 def test_text_reranking_preserves_negation_and_bounded_scores(tmp_path: Path) -> None:
     with _memory(tmp_path, _FakeModels()) as memory:
         negated = memory.add(
@@ -1300,6 +1335,38 @@ def test_retrieval_projection_is_stable_across_opaque_speaker_ids(tmp_path: Path
     assert "spoken red wrench" in indexed[0][0]
     assert '"speaker_id":"speaker_1"' in indexed[0][0]
     assert '"speaker_id":"identity_' not in indexed[0][0]
+
+
+def test_retrieval_projection_covers_atomic_embeddings_during_migration(tmp_path: Path) -> None:
+    original = _FakeModels()
+    with Memory(
+        tmp_path,
+        embedder=original,
+        transcriber=_FakeSpeech(),
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"same speech", "audio/wav", "speech.wav"))
+        speaker_id = memory.speech(record.id)[0].speaker_id
+    assert speaker_id is not None
+    with LocalStore(tmp_path) as store:
+        store.set_metadata(
+            "index.recipe",
+            "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
+            "context-keys-v8:quantization-none",
+        )
+
+    migrated = _FakeModels()
+    with Memory(
+        tmp_path,
+        embedder=migrated,
+        transcriber=_FakeSpeech(),
+        index_speech=True,
+    ):
+        pass
+
+    migrated_text = tuple(value.text for batch in migrated.embed_inputs for value in batch)
+    assert any('"speaker_id":"speaker_1"' in text for text in migrated_text)
+    assert all(speaker_id not in text for text in migrated_text)
 
 
 def test_retrieval_projection_preserves_user_marker_text(tmp_path: Path) -> None:

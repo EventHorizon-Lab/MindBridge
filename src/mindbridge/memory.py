@@ -1425,6 +1425,16 @@ class Memory:
                 _translate_storage_errors("hydrate search candidates"),
             ):
                 documents = self._store.read_index_documents(index_ids)
+            with _translate_index_errors("search memories"):
+                candidates, documents = self._deepen_temporal_lexical_candidates(
+                    candidates,
+                    documents,
+                    lexical_query=lexical_query,
+                    temporal_range=temporal_range,
+                    memory_type=memory_type,
+                    route_limit=candidate_limit,
+                    result_limit=limit,
+                )
             parent_count = len({document.embedding.memory_id for document in documents})
             if (
                 parent_count >= limit
@@ -1508,6 +1518,84 @@ class Memory:
         return tuple(
             self._search_hit(memory, score) for memory, score, _confidence, _lexical in visible
         )
+
+    def _deepen_temporal_lexical_candidates(
+        self,
+        candidates: _IndexCandidates,
+        documents: tuple[IndexDocument, ...],
+        *,
+        lexical_query: str,
+        temporal_range: tuple[datetime, datetime] | None,
+        memory_type: MemoryType | None,
+        route_limit: int,
+        result_limit: int,
+    ) -> tuple[_IndexCandidates, tuple[IndexDocument, ...]]:
+        if temporal_range is None or not lexical_query or len(candidates.lexical) < route_limit:
+            return candidates, documents
+        lexical_by_id = {hit.id: hit for hit in candidates.lexical}
+        qualified_parents = {
+            document.embedding.memory_id
+            for document in documents
+            if (hit := lexical_by_id.get(document.embedding.embedding_id)) is not None
+            and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
+            and _overlaps_temporal_range(
+                document.occurred_at,
+                document.occurred_end,
+                temporal_range,
+            )
+        }
+        if len(qualified_parents) >= result_limit:
+            return candidates, documents
+        with (
+            self._trace("mindbridge.storage.temporal_candidates", kind="stage"),
+            _translate_storage_errors("read temporal search candidates"),
+        ):
+            in_range, total = self._store.embedding_ids_in_range(
+                *temporal_range,
+                space_id=self._space_id,
+                task=_DOCUMENT_TASK,
+                memory_type=None if memory_type is None else memory_type.value,
+            )
+        if not in_range:
+            return candidates, documents
+        required = min(result_limit, len(in_range))
+        search_limit = route_limit
+        lexical = candidates.lexical
+        qualified = tuple(
+            hit
+            for hit in lexical
+            if hit.id in in_range
+            and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
+        )
+        while len(qualified) < required and len(lexical) >= search_limit and search_limit < total:
+            search_limit = min(search_limit * 2, total)
+            lexical = self._index_candidates(
+                (),
+                lexical_query=lexical_query,
+                limit=search_limit,
+                memory_type=memory_type,
+            ).lexical
+            qualified = tuple(
+                hit
+                for hit in lexical
+                if hit.id in in_range
+                and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
+            )
+        updated = _IndexCandidates(
+            dense=candidates.dense,
+            lexical=_merge_index_hits(candidates.lexical, qualified[:route_limit]),
+            exhausted=candidates.exhausted,
+        )
+        added_ids = tuple(hit.id for hit in updated.lexical if hit.id not in lexical_by_id)
+        if not added_ids:
+            return updated, documents
+        with (
+            self._trace("mindbridge.storage.hydrate", kind="stage"),
+            _translate_storage_errors("hydrate temporal lexical candidates"),
+        ):
+            added = self._store.read_index_documents(added_ids)
+        by_id = {document.embedding.embedding_id: document for document in (*documents, *added)}
+        return updated, tuple(by_id.values())
 
     def _index_candidates(
         self,
@@ -3040,11 +3128,15 @@ def _without_speech_identities(text: str, asset_ids: Sequence[str]) -> str:
 def _retrieval_content(prepared: _PreparedContent) -> _PreparedContent:
     if "[speech identities:" not in prepared.text:
         return prepared
+    asset_ids = frozenset(asset.asset_id for asset in prepared.assets)
     return replace(
         prepared,
-        text=_retrieval_text(
-            prepared.text,
-            frozenset(asset.asset_id for asset in prepared.assets),
+        text=_retrieval_text(prepared.text, asset_ids),
+        canonical_parts=tuple(
+            (kind, _retrieval_text(value, asset_ids))
+            if kind == "text" and "[speech identities:" in value
+            else (kind, value)
+            for kind, value in prepared.canonical_parts
         ),
     )
 
