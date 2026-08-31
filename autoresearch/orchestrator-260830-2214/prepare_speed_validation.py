@@ -19,6 +19,7 @@ from prepare_final_manifests import (
     PAIR_TASK_FIELDS,
     REQUIRED_SAMPLE_FIELDS,
     locked_identities,
+    media_manifest_identity_sha256,
     validate_media_manifest,
     validate_provenance,
     validate_sample_judge_models,
@@ -401,6 +402,17 @@ def _self_check() -> None:
     assert statistics.median((1.0, 9.0, 2.0)) == 2.0
     assert math.isclose(_geometric([0.5, 2.0]), 1.0)
     assert _percentile([1.0, 2.0, 3.0], 0.5) == 2.0
+    legacy_manifest = {"unit": []}
+    expected_manifest_hash = hashlib.sha256(b'{"unit":[]}').hexdigest()
+    assert media_manifest_identity_sha256(legacy_manifest) == expected_manifest_hash
+    assert media_manifest_identity_sha256({"units": legacy_manifest}) == expected_manifest_hash
+    for invalid_manifest in ([], {"units": []}):
+        try:
+            media_manifest_identity_sha256(invalid_manifest)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a non-object task media manifest was accepted")
     validate_sample_judge_models(
         {"judge": {"model": "fixture-judge"}},
         [{"judge_model": None}, {"judge_model": "fixture-judge"}],

@@ -199,6 +199,22 @@ def locked_identities(namespace: str) -> dict[str, dict[str, object]]:
     return values
 
 
+def media_manifest_identity_sha256(task_manifest: object) -> str:
+    if not isinstance(task_manifest, dict):
+        raise ValueError("media manifest task must be an object")
+    units = task_manifest.get("units", task_manifest)
+    if not isinstance(units, dict):
+        raise ValueError("media manifest task units must be an object")
+    payload = json.dumps(
+        units,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 def validate_media_manifest(
     result_dir: Path,
     document: dict[str, Any],
@@ -226,14 +242,10 @@ def validate_media_manifest(
     task_manifest = tasks.get(task_name) if isinstance(tasks, dict) else None
     if not isinstance(task_manifest, dict):
         raise ValueError(f"{label}: missing task media manifest")
-    payload = json.dumps(
-        task_manifest,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    _require(hashlib.sha256(payload).hexdigest() == expected_hash, f"{label}: wrong manifest hash")
+    _require(
+        media_manifest_identity_sha256(task_manifest) == expected_hash,
+        f"{label}: wrong manifest hash",
+    )
 
 
 def _require(condition: bool, message: str) -> None:
