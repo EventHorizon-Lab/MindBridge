@@ -50,6 +50,8 @@ can be optimized independently:
 
 End-to-end operation spans contain their stage and model spans, so those levels are intentionally
 not additive. Material stage spans are siblings; compare them directly when locating a bottleneck.
+Each `add_stream` item produces an ordinary `mindbridge.add` span; an unbounded source does not hold
+one artificial lifetime span open.
 
 Model spans use OpenTelemetry GenAI attributes where the ecosystem defines them:
 

@@ -398,11 +398,12 @@ than caller input.
 ### Operations without a route
 
 REST covers `add`, `add_many`, `search`, `ask`, `get`, `list`, and `delete` with the same defaults,
-field meanings, and error semantics as the Python SDK. Eight documented SDK operations have no
+field meanings, and error semantics as the Python SDK. Nine documented SDK operations have no
 route:
 
 | Operation | Why there is no route |
 | --- | --- |
+| `add_stream` | A Python iterator is process-local; clients send completed chunks through `POST /v1/memories` |
 | `search_with_trace` | Owner-process diagnostics with high-cardinality memory and index IDs |
 | `speech` | Not implemented on any transport yet |
 | `faces` | Python-only visual identity analysis |

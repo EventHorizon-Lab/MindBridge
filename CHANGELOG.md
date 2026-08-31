@@ -10,12 +10,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
-- A direct `Memory()` API with `add`, `add_many`, `search`, `search_with_trace`, `ask`, `get`,
-  `speech`, `faces`, `register_speaker`, `register_identity`, `reinforce`, `list`, `delete`,
-  `reindex`, and `optimize`.
+- A direct `Memory()` API with `add`, `add_many`, `add_stream`, `search`, `search_with_trace`,
+  `ask`, `get`, `speech`, `faces`, `register_speaker`, `register_identity`, `reinforce`, `list`,
+  `delete`, `reindex`, and `optimize`.
 - An `AsyncMemory` facade with the same operations and return values.
 - Frozen, slotted public content/result types for text, image, video, audio, and omni memories,
-  plus a stable `MindBridgeError` exception hierarchy.
+  including per-item `StreamInput` provenance, plus a stable `MindBridgeError` exception hierarchy.
 - SQLite as the authoritative local store for records, canonical FP32 embeddings, compatibility
   metadata, and a durable Zvec outbox.
 - Content-addressed local media storage with safe `Path`/`Blob` ingestion, MIME validation, and
@@ -99,12 +99,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `mindbridge.grounding.media_elided_hits` and `mindbridge.grounding.dropped_hits` recording the
   retrieved evidence the OpenAI adapter's inline budget removed.
 - A `mindbridge` product console script over the shared `Memory` execution plane. Its commands are
-  the SDK operations kebab-cased — `add`, `add-many`, `search`, `search-with-trace`, `ask`, `get`,
-  `speech`, `faces`, `register-speaker`, `register-identity`, `reinforce`, `list`, `delete`,
-  `reindex`, `optimize` — plus one command with no SDK counterpart, `doctor`. Output is one JSON
-  document per invocation on stdout in the REST field vocabulary, diagnostics and the shared error
-  envelope go to stderr, and exit statuses are stable, one per error code, so an agent branches on
-  `$?` without parsing anything.
+  the SDK operations kebab-cased — `add`, `add-many`, `add-stream`, `search`, `search-with-trace`,
+  `ask`, `get`, `speech`, `faces`, `register-speaker`, `register-identity`, `reinforce`, `list`,
+  `delete`, `reindex`, `optimize` — plus one command with no SDK counterpart, `doctor`. Output is
+  one JSON document per invocation on stdout in the REST field vocabulary, diagnostics and the
+  shared error envelope go to stderr, and exit statuses are stable, one per error code, so an agent
+  branches on `$?` without parsing anything.
 - Three explicit CLI composition paths, of which exactly one is required per invocation and none is
   a default: `--app MODULE:ATTR` for any application-composed `Memory`, `--embedder NAME` for the
   bundled backends, and `--url URL` to address a running owner over `/v1`. There is no environment
@@ -120,7 +120,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   (`weights`, `client`, or `import`) so the result never overstates the check.
 - CLI input forms that carry generated content without shell quoting: ordered positional atoms with
   `@PATH` for a local file and `@@TEXT` for a literal `@`, `-` for standard input, `--content-json`
-  for the same discriminated parts array REST and MCP accept, and JSONL on `add-many`. The CLI adds
+  for the same discriminated parts array REST and MCP accept, and JSONL on `add-many` or
+  `add-stream`. The CLI adds
   exactly one part type to that union, `{"type": "input_file", "path": "..."}`, valid in local mode
   only and refused in `--url` mode.
 - A published `mindbridge[all]` extra containing the exact union of every optional dependency.
@@ -323,5 +324,6 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - The CLI has no `--format` flag, configuration file, `MINDBRIDGE_*` composition variable, plugin
   registry, backend registration by name, streaming output, interactive prompt, `serve` command, or
   named `SentenceTransformersEmbedder` recipe. `--url` mode covers only the seven operations REST
-  routes; the other eight exit 10 and name the surfaces that do support them. Each invocation opens
-  and closes one `Memory`, which makes it the wrong tool for a loop.
+  routes; the other nine CLI commands exit 10 and name the surfaces that do support them.
+  `add-stream` reads finite JSONL lazily but collects return records until EOF to preserve the
+  one-document stdout contract; unbounded sources use the Python SDK.

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge import IndexQuantization
+from mindbridge import IndexQuantization, StreamInput
 from mindbridge.exceptions import (
     RETRYABLE_REASONS,
     IndexUnavailableError,
@@ -62,6 +62,26 @@ def test_memory_record_metadata_is_detached_and_serializable() -> None:
     assert pickle.loads(pickle.dumps(memory)) == memory
     with pytest.raises(FrozenInstanceError):
         memory.content = "changed"  # type: ignore[misc]
+
+
+def test_stream_input_carries_per_item_time_and_metadata() -> None:
+    metadata = {"source": "camera"}
+    item = StreamInput(
+        "clip",
+        occurred_at=NOW,
+        occurred_end=NOW + timedelta(seconds=30),
+        metadata=metadata,
+        memory_type=MemoryType.EPISODIC,
+    )
+
+    metadata["source"] = "changed"
+
+    assert item.metadata == {"source": "camera"}
+    assert pickle.loads(pickle.dumps(item)) == item
+    with pytest.raises(ValidationError, match="timezone"):
+        StreamInput("clip", occurred_at=NOW.replace(tzinfo=None))
+    with pytest.raises(ValidationError, match="timezone"):
+        StreamInput("clip", occurred_at="2026-08-31T09:00:00Z")  # type: ignore[arg-type]
 
 
 def test_search_hit_is_flat_and_rejects_invalid_scores() -> None:
