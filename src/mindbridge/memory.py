@@ -101,7 +101,7 @@ from mindbridge.types import (
 
 _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
 _INDEX_RECIPE_PREFIX = (
-    "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:context-keys-v8"
+    "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:context-keys-v9"
 )
 _LEGACY_INDEX_RECIPES = frozenset(
     {
@@ -109,12 +109,13 @@ _LEGACY_INDEX_RECIPES = frozenset(
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:single-vector-v3",
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:multi-vector-v4",
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:multi-vector-v5",
-    }
-)
-_LEGACY_INDEX_ONLY_RECIPES = frozenset(
-    {
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:context-keys-v6",
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:grouped-range:context-keys-v7",
+        *(
+            "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
+            f"context-keys-v8:quantization-{mode.value}"
+            for mode in IndexQuantization
+        ),
     }
 )
 _OUTBOX_BATCH_SIZE = 256
@@ -1240,6 +1241,7 @@ class Memory:
         *,
         maximum_keys: int = _MAX_RETRIEVAL_KEYS,
     ) -> tuple[ModelInput, ...]:
+        prepared = _retrieval_content(prepared)
         aggregate = self._route_embedding(prepared)
         text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
         if prepared.text and prepared.text != "\n\n".join(text_parts):
@@ -1392,7 +1394,8 @@ class Memory:
                         memory_type=memory_type,
                     )
                 else:
-                    # Filtered Zvec FTS is unstable; deepen global FTS against SQLite time IDs.
+                    # Zvec range-filtered FTS is unstable after dense queries; the global
+                    # fallback below still contributes the same lexical route.
                     preferred = self._index_candidates(
                         vectors,
                         lexical_query="",
@@ -1409,7 +1412,7 @@ class Memory:
                     )
                     candidates = _IndexCandidates(
                         dense=_merge_index_hits(preferred.dense, fallback.dense),
-                        lexical=fallback.lexical,
+                        lexical=_merge_index_hits(preferred.lexical, fallback.lexical),
                         exhausted=preferred.exhausted and fallback.exhausted,
                     )
             index_ids = tuple(
@@ -1422,16 +1425,6 @@ class Memory:
                 _translate_storage_errors("hydrate search candidates"),
             ):
                 documents = self._store.read_index_documents(index_ids)
-            with _translate_index_errors("search memories"):
-                candidates, documents = self._deepen_temporal_lexical_candidates(
-                    candidates,
-                    documents,
-                    lexical_query=lexical_query,
-                    temporal_range=temporal_range,
-                    memory_type=memory_type,
-                    route_limit=candidate_limit,
-                    result_limit=limit,
-                )
             parent_count = len({document.embedding.memory_id for document in documents})
             if (
                 parent_count >= limit
@@ -1515,84 +1508,6 @@ class Memory:
         return tuple(
             self._search_hit(memory, score) for memory, score, _confidence, _lexical in visible
         )
-
-    def _deepen_temporal_lexical_candidates(
-        self,
-        candidates: _IndexCandidates,
-        documents: tuple[IndexDocument, ...],
-        *,
-        lexical_query: str,
-        temporal_range: tuple[datetime, datetime] | None,
-        memory_type: MemoryType | None,
-        route_limit: int,
-        result_limit: int,
-    ) -> tuple[_IndexCandidates, tuple[IndexDocument, ...]]:
-        if temporal_range is None or not lexical_query or len(candidates.lexical) < route_limit:
-            return candidates, documents
-        lexical_by_id = {hit.id: hit for hit in candidates.lexical}
-        qualified_parents = {
-            document.embedding.memory_id
-            for document in documents
-            if (hit := lexical_by_id.get(document.embedding.embedding_id)) is not None
-            and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
-            and _overlaps_temporal_range(
-                document.occurred_at,
-                document.occurred_end,
-                temporal_range,
-            )
-        }
-        if len(qualified_parents) >= result_limit:
-            return candidates, documents
-        with (
-            self._trace("mindbridge.storage.temporal_candidates", kind="stage"),
-            _translate_storage_errors("read temporal search candidates"),
-        ):
-            in_range, total = self._store.embedding_ids_in_range(
-                *temporal_range,
-                space_id=self._space_id,
-                task=_DOCUMENT_TASK,
-                memory_type=None if memory_type is None else memory_type.value,
-            )
-        if not in_range:
-            return candidates, documents
-        required = min(result_limit, len(in_range))
-        search_limit = route_limit
-        lexical = candidates.lexical
-        qualified = tuple(
-            hit
-            for hit in lexical
-            if hit.id in in_range
-            and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
-        )
-        while len(qualified) < required and len(lexical) >= search_limit and search_limit < total:
-            search_limit = min(search_limit * 2, total)
-            lexical = self._index_candidates(
-                (),
-                lexical_query=lexical_query,
-                limit=search_limit,
-                memory_type=memory_type,
-            ).lexical
-            qualified = tuple(
-                hit
-                for hit in lexical
-                if hit.id in in_range
-                and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
-            )
-        updated = _IndexCandidates(
-            dense=candidates.dense,
-            lexical=_merge_index_hits(candidates.lexical, qualified[:route_limit]),
-            exhausted=candidates.exhausted,
-        )
-        added_ids = tuple(hit.id for hit in updated.lexical if hit.id not in lexical_by_id)
-        if not added_ids:
-            return updated, documents
-        with (
-            self._trace("mindbridge.storage.hydrate", kind="stage"),
-            _translate_storage_errors("hydrate temporal lexical candidates"),
-        ):
-            added = self._store.read_index_documents(added_ids)
-        by_id = {document.embedding.embedding_id: document for document in (*documents, *added)}
-        return updated, tuple(by_id.values())
 
     def _index_candidates(
         self,
@@ -2458,9 +2373,27 @@ class Memory:
                 hydrated = self._store.read_index_documents(
                     tuple(operation.embedding_id for operation in current)
                 )
+                identity_memory_ids = tuple(
+                    dict.fromkeys(
+                        document.embedding.memory_id
+                        for document in hydrated
+                        if "[speech identities:" in document.content
+                    )
+                )
+                memories = self._store.read_memories(identity_memory_ids)
             by_id = {document.embedding.embedding_id: document for document in hydrated}
+            asset_ids = {
+                memory.memory_id: frozenset(asset.asset_id for asset in memory.assets)
+                for memory in memories
+            }
             documents = [
-                by_id[operation.embedding_id]
+                _retrieval_document(
+                    by_id[operation.embedding_id],
+                    asset_ids.get(
+                        by_id[operation.embedding_id].embedding.memory_id,
+                        frozenset(),
+                    ),
+                )
                 for operation in current
                 if operation.embedding_id in by_id
             ]
@@ -2488,9 +2421,19 @@ class Memory:
                 memories = self._store.list_memories(limit=_REINDEX_PAGE_SIZE, after=after)
             if not memories:
                 return
+            asset_ids = {
+                memory.memory_id: frozenset(asset.asset_id for asset in memory.assets)
+                for memory in memories
+            }
             with _translate_storage_errors("hydrate memories for reindexing"):
-                yield from self._store.read_memory_index_documents(
-                    tuple(memory.memory_id for memory in memories)
+                yield from (
+                    _retrieval_document(
+                        document,
+                        asset_ids[document.embedding.memory_id],
+                    )
+                    for document in self._store.read_memory_index_documents(
+                        tuple(memory.memory_id for memory in memories)
+                    )
                 )
             last = memories[-1]
             after = (last.created_at, last.memory_id)
@@ -3094,6 +3037,69 @@ def _without_speech_identities(text: str, asset_ids: Sequence[str]) -> str:
     return "\n\n".join(section for section in text.split("\n\n") if not section.startswith(markers))
 
 
+def _retrieval_content(prepared: _PreparedContent) -> _PreparedContent:
+    if "[speech identities:" not in prepared.text:
+        return prepared
+    return replace(
+        prepared,
+        text=_retrieval_text(
+            prepared.text,
+            frozenset(asset.asset_id for asset in prepared.assets),
+        ),
+    )
+
+
+def _retrieval_document(
+    document: IndexDocument,
+    asset_ids: frozenset[str],
+) -> IndexDocument:
+    if "[speech identities:" not in document.content:
+        return document
+    return replace(document, content=_retrieval_text(document.content, asset_ids))
+
+
+def _retrieval_text(text: str, asset_ids: frozenset[str]) -> str:
+    sections = []
+    for section in text.split("\n\n"):
+        marker, separator, payload = section.partition("\n")
+        if separator and marker.startswith("[speech identities:") and marker.endswith("]"):
+            asset_id = marker.removeprefix("[speech identities:").removesuffix("]")
+            if asset_id in asset_ids:
+                projected = _speech_retrieval_text(payload, asset_id)
+                if projected is not None:
+                    sections.append(f"{marker}\n{projected}")
+                    continue
+        sections.append(section)
+    return "\n\n".join(sections)
+
+
+def _speech_retrieval_text(payload: str, asset_id: str) -> str | None:
+    try:
+        evidence = json.loads(payload)
+        if not isinstance(evidence, dict) or evidence.get("asset_id") != asset_id:
+            return None
+        segments = evidence["segments"]
+        if not isinstance(segments, list):
+            return None
+        aliases: dict[str, str] = {}
+        normalized = []
+        changed = False
+        for segment in segments:
+            if not isinstance(segment, dict) or "speaker_id" not in segment:
+                return None
+            speaker_id = segment.get("speaker_id")
+            if isinstance(speaker_id, str) and speaker_id.startswith("identity_"):
+                speaker_id = aliases.setdefault(speaker_id, f"speaker_{len(aliases) + 1}")
+                changed = True
+            normalized.append({**segment, "speaker_id": speaker_id})
+        if not changed:
+            return payload
+        evidence = {**evidence, "segments": normalized}
+        return json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _open_store(data_dir: Path) -> LocalStore:
     try:
         return LocalStore(data_dir)
@@ -3299,9 +3305,7 @@ def _known_metadata_upgrade(
     if key == _STORE_METADATA_KEYS["space"] and stored in legacy_embedding_spaces:
         return True
     if key == _STORE_METADATA_KEYS["index"] and stored in (
-        _LEGACY_INDEX_RECIPES
-        | _LEGACY_INDEX_ONLY_RECIPES
-        | {_index_recipe(mode) for mode in IndexQuantization}
+        _LEGACY_INDEX_RECIPES | {_index_recipe(mode) for mode in IndexQuantization}
     ):
         return stored in _LEGACY_INDEX_RECIPES
     return None

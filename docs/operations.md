@@ -59,11 +59,11 @@ Configured face embedding and analysis spaces have the same fail-fast guard.
 
 A recognized legacy retrieval-key recipe is different from a missing Zvec directory: startup
 re-embeds authoritative records, commits the new recipe marker, and rebuilds Zvec. Schema-only
-upgrades from the context-key v6 or grouped-range v7 recipes reuse stored vectors and rebuild only
-the disposable Zvec projection. The bundled Jina v3, v4, and v5 input-recipe upgrades to v6 load
-the model and re-embed every authoritative record before committing the new embedding-space
-marker. Back up the directory first and budget model memory, elapsed time, and free disk for the
-rewritten SQLite and Zvec state.
+upgrades from context-key v6, grouped-range v7, and context-key v8 to v9 re-embed records so opaque
+identity IDs no longer enter dense or lexical retrieval. The bundled Jina v3, v4, and v5
+input-recipe upgrades to v6 likewise load the model and re-embed every authoritative record before
+committing the new embedding-space marker. Back up the directory first and budget model memory,
+elapsed time, and free disk for the rewritten SQLite and Zvec state.
 
 ## Rebuild and optimize
 

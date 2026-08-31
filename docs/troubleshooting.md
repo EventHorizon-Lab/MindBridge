@@ -102,9 +102,11 @@ HTTP 500, and needs a different MindBridge version or a new directory.
 The directory was opened with a different embedding model, embedding space, dimension,
 transcription space, or unknown index recipe. Known older retrieval-key recipes migrate by
 re-embedding automatically, as do the bundled Jina v3, v4, and v5 input-recipe upgrades to v6.
-Those upgrades load the model and re-embed every record, so back up the directory and budget model
-memory, elapsed time, and free disk before startup. Other mismatches require the original adapter
-or a new directory. `reindex()` itself cannot change stored vectors or transcripts.
+The context-key v6, grouped-range v7, and context-key v8 upgrades to v9 also re-embed records to
+remove opaque identity IDs from retrieval text. Those upgrades load the model and re-embed every
+record, so back up the directory and budget model memory, elapsed time, and free disk before
+startup. Other mismatches require the original adapter or a new directory. `reindex()` itself
+cannot change stored vectors or transcripts.
 
 ## Missing or damaged Zvec index
 

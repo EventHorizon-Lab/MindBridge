@@ -817,41 +817,6 @@ def test_temporal_proximity_is_a_soft_score_not_a_hard_sort_key(tmp_path: Path) 
     assert [hit.id for hit in hits] == [adjacent.id, exact.id]
 
 
-def test_temporal_search_reads_lexical_evidence_from_authoritative_time_range(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    with _memory(tmp_path, _FakeModels()) as memory:
-        outside = memory.add_many(
-            tuple(f"shared witness outside {index}" for index in range(130)),
-            occurred_at=(datetime(2026, 1, 1, tzinfo=timezone.utc),) * 130,
-        )
-        weak = memory.add(
-            "shared witness weak",
-            occurred_at=datetime(2024, 5, 1, tzinfo=timezone.utc),
-        )
-        target = memory.add(
-            "shared witness target",
-            occurred_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
-        )
-        index = _FakeIndex.instances[-1]
-        index.dense_hits_override = ()
-        index.lexical_hits_override = tuple(
-            IndexHit(
-                id=record.id,
-                relevance=0.5 if record.id == weak.id else 1.0,
-                lexical_match=True,
-            )
-            for record in (*outside[:99], weak, *outside[99:], target)
-        )
-        hits = memory.search("shared witness in 2024", limit=1)
-        assert hits and hits[0].id == target.id
-        assert index.lexical_search_calls == 2
-
-        monkeypatch.setattr(memory._store, "read_memories", lambda _memory_ids: ())
-        assert memory.search("shared witness in 2024", limit=1) == ()
-
-
 def test_text_reranking_preserves_negation_and_bounded_scores(tmp_path: Path) -> None:
     with _memory(tmp_path, _FakeModels()) as memory:
         negated = memory.add(
@@ -1304,6 +1269,51 @@ def test_opt_in_speech_indexing_makes_registered_names_retrievable(
             1,
             2,
         }
+        assert all(
+            "Alicia" in document.content and speaker_id not in document.content
+            for document in index.documents.values()
+        )
+
+
+def test_retrieval_projection_is_stable_across_opaque_speaker_ids(tmp_path: Path) -> None:
+    embedded = []
+    indexed = []
+    stored = []
+    for name in ("first", "second"):
+        models = _FakeModels()
+        with Memory(
+            tmp_path / name,
+            embedder=models,
+            transcriber=_FakeSpeech(),
+            index_speech=True,
+        ) as memory:
+            record = memory.add(Blob(b"same speech", "audio/wav", "speech.wav"))
+            stored.append(record.content)
+            embedded.append(tuple(value.text for value in models.embed_inputs[0]))
+            indexed.append(
+                tuple(document.content for document in _FakeIndex.instances[-1].documents.values())
+            )
+
+    assert stored[0] != stored[1]
+    assert embedded[0] == embedded[1]
+    assert indexed[0] == indexed[1]
+    assert "spoken red wrench" in indexed[0][0]
+    assert '"speaker_id":"speaker_1"' in indexed[0][0]
+    assert '"speaker_id":"identity_' not in indexed[0][0]
+
+
+def test_retrieval_projection_preserves_user_marker_text(tmp_path: Path) -> None:
+    asset_id = "a" * 64
+    text = f'[speech identities:{asset_id}]\n{{"asset_id":"{asset_id}","segments":[]}}'
+    models = _FakeModels()
+
+    with _memory(tmp_path, models) as memory:
+        record = memory.add(text)
+        document = _FakeIndex.instances[-1].documents[record.id]
+
+    assert record.content == text
+    assert models.embed_inputs[0][0].text == text
+    assert document.content == text
 
 
 def test_generation_deduplicates_indexed_speech_evidence(tmp_path: Path) -> None:
@@ -1943,6 +1953,9 @@ def test_missing_index_checkpoint_precedes_collection_creation(
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:single-vector-v3",
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:multi-vector-v4",
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:multi-vector-v5",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:context-keys-v6",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:grouped-range:context-keys-v7",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:context-keys-v8:quantization-none",
     ),
 )
 def test_legacy_index_recipe_is_rebuilt_from_sqlite(tmp_path: Path, recipe: str) -> None:
@@ -1996,29 +2009,6 @@ def test_failed_embedding_space_upgrade_keeps_legacy_marker(tmp_path: Path) -> N
 
     with LocalStore(tmp_path) as store:
         assert store.get_metadata("embedding.space_id") == legacy_space
-
-
-@pytest.mark.parametrize(
-    "legacy",
-    (
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:context-keys-v6",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:grouped-range:context-keys-v7",
-    ),
-)
-def test_schema_recipe_rebuilds_only_the_disposable_index(
-    tmp_path: Path,
-    legacy: str,
-) -> None:
-    with _memory(tmp_path, _FakeModels()) as memory:
-        record = memory.add("preserved memory")
-    with LocalStore(tmp_path) as store:
-        store.set_metadata("index.recipe", legacy)
-
-    reopened_models = _FakeModels()
-    with _memory(tmp_path, reopened_models):
-        assert record.id in _FakeIndex.instances[-1].documents
-
-    assert reopened_models.embed_inputs == []
 
 
 def test_index_quantization_change_rebuilds_without_reembedding(tmp_path: Path) -> None:
