@@ -77,10 +77,11 @@ Audio/video ──> SpeechBackend ──> timed turns + speakers
 Image/video ──> FaceBackend ──> bounded face observations
 ```
 
-One adapter may implement several contracts. `OpenAIModels` does so with caller-owned official SDK
-clients. Local embedding, speech, and face analysis can be composed independently. Applications may
-pass adapters directly or group them in `MemoryPlugins` and call `Memory.from_plugins`; both use the
-same explicit composition and execution plane. No provider registry or factory is involved.
+One adapter may implement several contracts. `OpenAIModels` does so with official SDK clients. Local
+embedding, speech, and face analysis can be composed independently. `Memory.from_config` resolves a
+closed catalog of bundled adapters; direct construction accepts custom adapter objects. Both
+converge on `Memory.from_plugins` and the same execution plane. Provider names never reach the
+kernel, and there is no global runtime plugin registry.
 
 ## Write consistency
 

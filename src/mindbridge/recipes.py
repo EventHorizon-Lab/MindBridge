@@ -161,28 +161,96 @@ class _OwnedClientModels(OpenAIModels):
     even after closing everything the recipe handed back.
     """
 
-    __slots__ = ("_owned_client",)
+    __slots__ = ("_owned_client", "_owned_client_closed")
 
     def __init__(
         self,
         client: OpenAI,
         *,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        embedding_space: str | None = None,
+        embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION,
         generation_model: str = DEFAULT_GENERATION_MODEL,
         transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL,
+        transcription_space: str | None = None,
+        generation_seed: int | None = None,
+        generation_temperature: float | None = None,
+        generation_max_tokens: int | None = None,
+        generation_video_limit: int | None = 8,
+        generation_extra_body: Mapping[str, object] | None = None,
     ) -> None:
         super().__init__(
             client,
             embedding_model=embedding_model,
+            embedding_space=embedding_space,
+            embedding_dimension=embedding_dimension,
             generation_model=generation_model,
             transcription_model=transcription_model,
+            transcription_space=transcription_space,
+            generation_seed=generation_seed,
+            generation_temperature=generation_temperature,
+            generation_max_tokens=generation_max_tokens,
+            generation_video_limit=generation_video_limit,
+            generation_extra_body=generation_extra_body,
         )
         self._owned_client = client
+        self._owned_client_closed = False
 
     def close(self) -> None:
         """Close the backend, then the SDK client the recipe created to build it."""
+        if self._owned_client_closed:
+            return
+        self._owned_client_closed = True
         super().close()
         self._owned_client.close()
+
+
+def _owned_openai_models(
+    *,
+    base_url: str | None = None,
+    timeout: float | None = None,
+    max_retries: int | None = None,
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    embedding_space: str | None = None,
+    embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION,
+    generation_model: str = DEFAULT_GENERATION_MODEL,
+    transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL,
+    transcription_space: str | None = None,
+    generation_seed: int | None = None,
+    generation_temperature: float | None = None,
+    generation_max_tokens: int | None = None,
+    generation_video_limit: int | None = 8,
+    generation_extra_body: Mapping[str, object] | None = None,
+) -> OpenAIModels:
+    """Build the SDK adapter and own the client created for declarative composition."""
+    connection = {
+        key: value
+        for key, value in {
+            "base_url": base_url,
+            "timeout": timeout,
+            "max_retries": max_retries,
+        }.items()
+        if value is not None
+    }
+    client = _openai_client(**connection) if connection else _openai_client()
+    try:
+        return _OwnedClientModels(
+            client,
+            embedding_model=embedding_model,
+            embedding_space=embedding_space,
+            embedding_dimension=embedding_dimension,
+            generation_model=generation_model,
+            transcription_model=transcription_model,
+            transcription_space=transcription_space,
+            generation_seed=generation_seed,
+            generation_temperature=generation_temperature,
+            generation_max_tokens=generation_max_tokens,
+            generation_video_limit=generation_video_limit,
+            generation_extra_body=generation_extra_body,
+        )
+    except BaseException:
+        client.close()
+        raise
 
 
 def _build(name: str, *, slot: Slot, load: bool) -> object:
@@ -207,8 +275,8 @@ def _build(name: str, *, slot: Slot, load: bool) -> object:
     return _OwnedClientModels(client, transcription_model=selected)
 
 
-def _openai_client() -> OpenAI:
-    return cast("OpenAI", import_module("openai").OpenAI())
+def _openai_client(**config: object) -> OpenAI:
+    return cast("OpenAI", import_module("openai").OpenAI(**config))
 
 
 def _split(name: str) -> tuple[str, str | None]:

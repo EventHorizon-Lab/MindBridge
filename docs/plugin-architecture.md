@@ -13,29 +13,28 @@ inference, but it cannot own or bypass those rules.
 ## Implemented composition
 
 The supported plugins are the narrow `EmbeddingBackend`, `GenerationBackend`,
-`TranscriptionBackend`, `SpeechBackend`, and `FaceBackend` protocols. Applications may pass them
-directly to `Memory` or group already-constructed adapters separately from local policy:
+`TranscriptionBackend`, `SpeechBackend`, and `FaceBackend` protocols. The declarative entry point
+constructs bundled implementations without exposing those runtime details:
 
 ```python
-from mindbridge import Memory, MemoryConfig, MemoryPlugins
+from mindbridge import Memory
 
-plugins = MemoryPlugins(
-    embedder=embedder,
-    answerer=answerer,
-    transcriber=transcriber,
-    face_analyzer=face_analyzer,
-)
-config = MemoryConfig(index_speech=True)
-
-with Memory.from_plugins("./data", plugins=plugins, config=config) as memory:
+with Memory.from_config(
+    {
+        "data_dir": "./data",
+        "embedding": {"provider": "jina-omni"},
+        "speech": {"provider": "funasr"},
+        "settings": {"index_speech": True},
+    }
+) as memory:
     memory.add("Remember this")
 ```
 
-`Memory.from_plugins` and `AsyncMemory.from_plugins` delegate to the same constructors and execution
-plane. The bundle validates plugin protocol shape before opening a local store; the kernel then
-validates capabilities and durable identities before inference and closes each distinct adapter
-once. Omitting an optional plugin adds no model call or optional dependency. Reusing one object for
-several protocols is supported.
+`Memory.from_config` validates a closed catalog of bundled providers, constructs owned adapters, and
+then delegates through `Memory.from_plugins` to the normal constructor. Custom and third-party
+implementations remain explicit object injection. All paths share capability validation, durable
+identity checks, storage, and execution. Omitting an optional plugin adds no model call or optional
+dependency. Reusing one object for several protocols is supported by the object API.
 
 Composition is fixed for one `Memory` lifetime. Changing an adapter requires closing and reopening
 the instance; changing the embedder also requires a compatible durable space or a new directory.
@@ -68,9 +67,9 @@ benchmark score is not by itself a reason to replace the flat durable representa
 
 ## Trade-offs and revisit triggers
 
-Explicit construction keeps dependencies, cost, lifecycle, privacy, and hardware selection visible.
-The accepted cost is that applications compose adapters themselves and reopen `Memory` to change the
-composition.
+Typed declarative construction makes bundled adapters concise; explicit construction keeps custom
+dependencies, lifecycle, privacy, and hardware selection visible. Both require reopening `Memory`
+to change composition.
 
 Add package entry-point discovery only when an independently distributed plugin requires it. Add a
 new public capability only with a concrete adapter plus lifecycle, failure, privacy, provenance, and

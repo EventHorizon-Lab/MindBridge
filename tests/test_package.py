@@ -57,6 +57,8 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "IndexQuantization",
         "MemoryType",
         "MemoryConfig",
+        "MemorySettings",
+        "MindBridgeConfig",
         "MemoryPlugins",
         "Modality",
         "RetrievalCandidateTrace",

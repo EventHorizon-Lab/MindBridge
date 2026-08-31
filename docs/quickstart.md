@@ -9,10 +9,32 @@ uv add "mindbridge[local]"
 The `local` extra supplies the pinned Jina embedding adapter and FunASR speech adapter. Add
 `face`, `openai`, `server`, or `mcp` only when the application uses those surfaces.
 
+## Open a configured memory
+
+The shortest supported path validates a pure-data configuration, constructs the bundled adapters,
+and closes every resource with the memory:
+
+```python
+from mindbridge import Memory
+
+with Memory.from_config(
+    {
+        "data_dir": "./data/assistant",
+        "embedding": {"provider": "jina-omni"},
+    }
+) as memory:
+    memory.add("The spare key is in the blue toolbox.")
+    print(memory.search("Where is the spare key?"))
+```
+
+Configuration supports bundled adapters. Direct object injection remains the plugin API for custom
+models and caller-owned SDK clients.
+
 ## Choose an embedding backend
 
-`Memory` requires an explicit `embedder` and never selects a provider or reads provider
-credentials. Every example below uses `JinaOmniEmbedder()`, the pinned multimodal default.
+Every memory requires an embedding capability. Declarative configuration selects a bundled
+provider; direct construction accepts any `EmbeddingBackend`. Neither path makes the kernel read
+provider credentials. Every example below uses the pinned multimodal Jina adapter.
 
 > **The pinned Jina weights are licensed CC BY-NC 4.0 — non-commercial use only.** That licence
 > covers the model, not MindBridge. Commercial deployments must inject a backend whose weights they
@@ -150,16 +172,20 @@ uv add "mindbridge[face,local]"
 ```python
 from pathlib import Path
 
-from mindbridge import FunASRTranscriber, JinaOmniEmbedder, Memory, OpenCVFaceAnalyzer
+from mindbridge import Memory
 
-with Memory(
-    "./data/identity",
-    embedder=JinaOmniEmbedder(),
-    transcriber=FunASRTranscriber(),
-    face_analyzer=OpenCVFaceAnalyzer(
-        "./models/face_detection_yunet.onnx",
-        "./models/face_recognition_sface.onnx",
-    ),
+with Memory.from_config(
+    {
+        "data_dir": "./data/identity",
+        "embedding": {"provider": "jina-omni"},
+        "speech": {"provider": "funasr", "device": "cuda"},
+        "face": {
+            "provider": "opencv",
+            "detector_model": "./models/face_detection_yunet.onnx",
+            "recognizer_model": "./models/face_recognition_sface.onnx",
+        },
+        "settings": {"index_speech": True},
+    }
 ) as memory:
     record = memory.add(Path("./introduction.mp4"))
     face = memory.faces(record.id)[0]

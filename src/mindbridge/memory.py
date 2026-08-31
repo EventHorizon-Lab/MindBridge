@@ -40,6 +40,7 @@ from mindbridge._telemetry import (
     operation_span,
     traced_span,
 )
+from mindbridge.configuration import MindBridgeConfig, _resolve_config
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -489,6 +490,26 @@ class Memory:
             face_margin=config.face_margin,
             tracer=tracer,
         )
+
+    @classmethod
+    def from_config(
+        cls,
+        config: MindBridgeConfig | Mapping[str, object],
+        *,
+        tracer: Tracer | None = None,
+    ) -> Memory:
+        """Open memory from validated declarative configuration."""
+        resolved = _resolve_config(config)
+        try:
+            return cls.from_plugins(
+                resolved.data_dir,
+                plugins=resolved.plugins,
+                config=resolved.settings,
+                tracer=tracer,
+            )
+        except BaseException:
+            resolved.close()
+            raise
 
     def __enter__(self) -> Memory:
         self._require_open()
@@ -2888,6 +2909,26 @@ class AsyncMemory:
             face_margin=config.face_margin,
             tracer=tracer,
         )
+
+    @classmethod
+    def from_config(
+        cls,
+        config: MindBridgeConfig | Mapping[str, object],
+        *,
+        tracer: Tracer | None = None,
+    ) -> AsyncMemory:
+        """Open async memory from validated declarative configuration."""
+        resolved = _resolve_config(config)
+        try:
+            return cls.from_plugins(
+                resolved.data_dir,
+                plugins=resolved.plugins,
+                config=resolved.settings,
+                tracer=tracer,
+            )
+        except BaseException:
+            resolved.close()
+            raise
 
     async def __aenter__(self) -> AsyncMemory:
         return self

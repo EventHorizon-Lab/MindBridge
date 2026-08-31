@@ -1,12 +1,71 @@
 # Configuration and composition
 
-MindBridge has no product-wide provider configuration object. `MemoryConfig` is only the value-based
-local policy for one instance; it contains no providers, credentials, or discovery rules. Construct
-model clients and adapters where the application already manages dependencies and secrets.
+MindBridge offers two composition paths over the same memory kernel:
+
+- `Memory.from_config` validates pure data and constructs bundled adapters.
+- `Memory(...)` accepts already-constructed protocol implementations for custom models and
+  caller-owned SDK clients.
+
+Provider names exist only in the declarative composition layer. The kernel continues to depend on
+typed capabilities rather than provider branches.
+
+## Declarative composition
+
+```python
+from mindbridge import Memory
+
+config = {
+    "data_dir": "./data/assistant",
+    "embedding": {
+        "provider": "openai",
+        "model": "text-embedding-3-small",
+    },
+    "generation": {
+        "provider": "openai",
+        "model": "gpt-5-mini",
+        "temperature": 0.1,
+    },
+    "speech": {
+        "provider": "funasr",
+        "device": "cuda",
+    },
+    "face": {
+        "provider": "opencv",
+        "detector_model": "./models/yunet.onnx",
+        "recognizer_model": "./models/sface.onnx",
+    },
+    "settings": {
+        "index_speech": True,
+        "minimum_relevance": 0.55,
+    },
+}
+
+with Memory.from_config(config) as memory:
+    memory.add("Remember this")
+```
+
+The same input can be validated ahead of time with `MindBridgeConfig.model_validate(config)`.
+Unknown providers, unknown fields, invalid ranges, and missing required values raise a field-specific
+error before storage opens. `AsyncMemory.from_config` accepts the same configuration.
+
+Supported declarative slots are intentionally small:
+
+| Slot | Bundled providers |
+| --- | --- |
+| `embedding` | `openai`, `jina-omni`, `sentence-transformers` |
+| `generation` | `openai` |
+| `speech` | `openai`, `funasr` |
+| `face` | `opencv` |
+
+OpenAI slots accept `base_url`, `timeout`, and `max_retries`; the official SDK resolves its standard
+credentials. Use direct injection for secret managers, existing clients, proxies, custom modality
+declarations, or third-party providers. MindBridge owns and closes clients created by
+`from_config`.
 
 ## Memory settings
 
-`Memory` accepts only local semantic and consistency settings:
+`MemorySettings` is the readable name for the value-only local policy; `MemoryConfig` remains a
+compatible alias. The `settings` section accepts these values:
 
 ```python
 Memory(
@@ -51,7 +110,7 @@ Memory(
 - `tracer` optionally injects an OpenTelemetry tracer; `None` uses the global no-op or
   application-configured provider.
 
-## Provider clients
+## Explicit provider clients
 
 Use the provider SDK directly:
 
