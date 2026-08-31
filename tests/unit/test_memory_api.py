@@ -21,6 +21,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 
+import mindbridge.configuration as configuration_module
 import mindbridge.memory as memory_module
 from mindbridge import MemoryConfig, MemoryPlugins, RetrievalRejection
 from mindbridge._telemetry import (
@@ -1421,6 +1422,107 @@ def test_memory_composes_explicit_plugins_and_local_policy(tmp_path: Path) -> No
     assert faces.closed is True
 
 
+def test_memory_from_config_uses_the_same_kernel_and_closes_resolved_backends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedder = _FakeEmbedder()
+    answerer = _FakeModels()
+    speech = _FakeSpeech()
+    faces = _FakeFace()
+    monkeypatch.setattr(configuration_module, "_build_embedding", lambda _spec: embedder)
+    monkeypatch.setattr(configuration_module, "_build_generation", lambda _spec: answerer)
+    monkeypatch.setattr(configuration_module, "_build_speech", lambda _spec: speech)
+    monkeypatch.setattr(configuration_module, "_build_face", lambda _spec: faces)
+
+    config = {
+        "data_dir": tmp_path,
+        "embedding": {"provider": "jina-omni"},
+        "generation": {"provider": "openai", "model": "gpt-5-mini"},
+        "speech": {"provider": "funasr"},
+        "face": {
+            "provider": "opencv",
+            "detector_model": tmp_path / "yunet.onnx",
+            "recognizer_model": tmp_path / "sface.onnx",
+        },
+        "settings": {
+            "index_speech": True,
+            "index_quantization": "fp16",
+            "minimum_relevance": 0,
+        },
+    }
+
+    with Memory.from_config(config) as memory:
+        record = memory.add("red declarative memory")
+        assert memory.search("red declarative")[0].id == record.id
+        assert memory._embedder is embedder
+        assert memory._answerer is answerer
+        assert memory._transcriber is speech
+        assert memory._face_analyzer is faces
+        assert memory._index_speech is True
+        assert memory._minimum_relevance == 0
+        assert _FakeIndex.instances[-1].quantization is IndexQuantization.FP16
+
+    assert embedder.close_calls == 1
+    assert answerer.close_calls == 1
+    assert speech.closed is True
+    assert faces.closed is True
+
+
+def test_memory_from_config_reports_the_invalid_field_before_opening_storage(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "store"
+    with pytest.raises(ValidationError, match=r"config\.embedding\.provider"):
+        Memory.from_config(
+            {
+                "data_dir": data_dir,
+                "embedding": {"provider": "unknown"},
+            }
+        )
+
+    assert not data_dir.exists()
+
+
+def test_memory_from_config_validates_settings_before_building_backends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_build(_spec: object) -> object:
+        pytest.fail("backend construction must follow settings validation")
+
+    monkeypatch.setattr(configuration_module, "_build_embedding", unexpected_build)
+
+    with pytest.raises(ValidationError, match=r"config\.settings\.minimum_relevance"):
+        Memory.from_config(
+            {
+                "embedding": {"provider": "jina-omni"},
+                "settings": {"minimum_relevance": 2},
+            }
+        )
+
+
+def test_config_resolution_closes_an_earlier_backend_when_a_later_one_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedder = _FakeEmbedder()
+    monkeypatch.setattr(configuration_module, "_build_embedding", lambda _spec: embedder)
+
+    def fail(_spec: object) -> object:
+        raise ValidationError("generation config failed")
+
+    monkeypatch.setattr(configuration_module, "_build_generation", fail)
+
+    with pytest.raises(ValidationError, match="generation config failed"):
+        Memory.from_config(
+            {
+                "embedding": {"provider": "jina-omni"},
+                "generation": {"provider": "openai"},
+            }
+        )
+
+    assert embedder.close_calls == 1
+
+
 def test_memory_rejects_invalid_composition_values(tmp_path: Path) -> None:
     plugins = MemoryPlugins(embedder=_FakeModels())
     with pytest.raises(ValidationError, match="plugins"):
@@ -1476,6 +1578,10 @@ def test_plugin_composition_stays_in_constructor_parity() -> None:
     assert (
         inspect.signature(Memory.from_plugins).parameters
         == inspect.signature(AsyncMemory.from_plugins).parameters
+    )
+    assert (
+        inspect.signature(Memory.from_config).parameters
+        == inspect.signature(AsyncMemory.from_config).parameters
     )
 
     composition_fields = (*fields(MemoryPlugins), *fields(MemoryConfig))
@@ -3349,3 +3455,24 @@ async def test_async_memory_composes_explicit_plugins(tmp_path: Path) -> None:
         assert traced.trace.candidates[0].memory_id == record.id
 
     assert models.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_async_memory_from_config_uses_the_same_composition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedder = _FakeEmbedder()
+    monkeypatch.setattr(configuration_module, "_build_embedding", lambda _spec: embedder)
+
+    async with AsyncMemory.from_config(
+        {
+            "data_dir": tmp_path,
+            "embedding": {"provider": "jina-omni"},
+            "settings": {"minimum_relevance": 0},
+        }
+    ) as memory:
+        record = await memory.add("red async configured memory")
+        assert (await memory.search("red configured"))[0].id == record.id
+
+    assert embedder.close_calls == 1

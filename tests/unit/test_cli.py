@@ -491,9 +491,11 @@ class _SdkClient:
 
     def __init__(self) -> None:
         self.closed = False
+        self.close_calls = 0
 
     def close(self) -> None:
         self.closed = True
+        self.close_calls += 1
 
 
 @pytest.mark.parametrize("slot", ("embedder", "answerer", "transcriber"))
@@ -511,10 +513,12 @@ def test_a_recipe_closes_the_sdk_client_it_constructed(
     assert [client.closed for client in clients] == [False]
 
     backend.close()
+    backend.close()
 
     # `OpenAIModels.close()` leaves a caller-supplied client open; a recipe-built one is the
     # recipe's, so the connection pool goes when the returned backend does.
     assert [client.closed for client in clients] == [True]
+    assert [client.close_calls for client in clients] == [1]
 
 
 @pytest.mark.parametrize(

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Annotated
+
+from pydantic import Field
 
 from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import (
@@ -13,6 +16,10 @@ from mindbridge.models.base import (
     TranscriptionBackend,
 )
 from mindbridge.types import IndexQuantization
+
+_StrictBool = Annotated[bool, Field(strict=True)]
+_UnitInterval = Annotated[float, Field(strict=True, ge=0, le=1)]
+_PositiveFloat = Annotated[float, Field(strict=True, gt=0)]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -44,12 +51,16 @@ class MemoryPlugins:
 class MemoryConfig:
     """Value-only local policy kept separate from runtime capability objects."""
 
-    index_speech: bool = False
+    index_speech: _StrictBool = False
     index_quantization: IndexQuantization = IndexQuantization.NONE
-    minimum_relevance: float = 0.55
-    ambiguity_margin: float = 0.01
-    decay_half_life_days: float | None = None
-    speaker_similarity: float = 0.78
-    speaker_margin: float = 0.05
-    face_similarity: float = 0.363
-    face_margin: float = 0.05
+    minimum_relevance: _UnitInterval = 0.55
+    ambiguity_margin: _UnitInterval = 0.01
+    decay_half_life_days: _PositiveFloat | None = None
+    speaker_similarity: _UnitInterval = 0.78
+    speaker_margin: _UnitInterval = 0.05
+    face_similarity: _UnitInterval = 0.363
+    face_margin: _UnitInterval = 0.05
+
+
+# Clearer name for new code; keep the original public value intact for compatibility.
+MemorySettings = MemoryConfig

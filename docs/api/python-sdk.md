@@ -65,29 +65,31 @@ Memory(
 opening Zvec. It closes supplied adapters when the memory closes; provider clients owned by an
 adapter may remain caller-owned, as documented by that adapter.
 
-Applications with several optional capabilities can keep runtime objects separate from local policy
-with the equivalent grouped entry point:
+Bundled adapters can be selected without constructing runtime objects:
 
 ```python
-from mindbridge import Memory, MemoryConfig, MemoryPlugins
+from mindbridge import Memory
 
-plugins = MemoryPlugins(
-    embedder=embedder,
-    answerer=answerer,
-    transcriber=transcriber,
-    face_analyzer=face_analyzer,
-)
-config = MemoryConfig(index_speech=True)
-
-with Memory.from_plugins("./data/example", plugins=plugins, config=config) as memory:
+with Memory.from_config(
+    {
+        "data_dir": "./data/example",
+        "embedding": {"provider": "jina-omni"},
+        "speech": {"provider": "funasr"},
+        "settings": {"index_speech": True},
+    }
+) as memory:
     memory.add("Remember this")
 ```
 
-`MemoryPlugins` contains already-constructed typed adapters. `MemoryConfig` contains only the local
-policy values accepted by the direct constructor. `AsyncMemory.from_plugins` provides the same
-grouped composition for the async facade. Plugin protocol shape is validated before a local store is
-opened; these entry points then perform the same capability validation and use the same storage,
-routing, lifecycle, and failure behavior. They are not provider discovery.
+`Memory.from_config` accepts a `MindBridgeConfig` or mapping. It strictly validates bundled provider
+fields, owns the adapters and SDK clients it constructs, and reports invalid fields before opening
+storage. `AsyncMemory.from_config` accepts the same input. See
+[configuration and composition](../configuration.md) for providers and fields.
+
+Direct `Memory(...)` construction remains the stable plugin API. The compatibility
+`MemoryPlugins`/`Memory.from_plugins` bundle is also supported for applications that already group
+runtime objects separately from `MemoryConfig` local policy. Every entry point performs the same
+capability validation and uses the same storage, routing, lifecycle, and failure behavior.
 
 `tracer` optionally selects a non-global OpenTelemetry provider. With the default `None`,
 MindBridge uses the standard global tracer. See

@@ -1,5 +1,6 @@
 """Fast local multimodal memory for Python agents."""
 
+from mindbridge.configuration import MindBridgeConfig
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -37,7 +38,7 @@ from mindbridge.models.jina import JinaOmniEmbedder
 from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
-from mindbridge.plugins import MemoryConfig, MemoryPlugins
+from mindbridge.plugins import MemoryConfig, MemoryPlugins, MemorySettings
 from mindbridge.types import (
     AbstentionReason,
     AnswerResult,
@@ -87,7 +88,9 @@ __all__ = [
     "MemoryNotFoundError",
     "MemoryPlugins",
     "MemoryRecord",
+    "MemorySettings",
     "MemoryType",
+    "MindBridgeConfig",
     "MindBridgeError",
     "Modality",
     "ModelError",

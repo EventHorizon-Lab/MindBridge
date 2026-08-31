@@ -235,9 +235,9 @@ matrix, license and security requirements, performance envelope, and maintenance
 The current extension surface consists of the explicit `EmbeddingBackend`, `GenerationBackend`,
 `TranscriptionBackend`, `SpeechBackend`, and `FaceBackend` protocols, plus the optional
 `StreamingGenerationBackend` that an answerer may also implement. Applications can pass them
-directly to `Memory` or group them in `MemoryPlugins` and call `Memory.from_plugins` or
-`AsyncMemory.from_plugins`. Explicit construction remains the plugin mechanism; there is no runtime
-plugin registry.
+directly to `Memory`; `Memory.from_config` provides a typed convenience layer for bundled
+implementations and delegates to the same constructor. Explicit objects remain the third-party
+plugin mechanism; there is no global runtime plugin registry.
 
 `StreamingGenerationBackend` is the shape a narrow capability should take. It adds one method, stays
 optional, is selected by a structural check rather than a provider name, and leaves the
