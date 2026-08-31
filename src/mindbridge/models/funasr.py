@@ -40,7 +40,7 @@ class FunASRRecipe:
 
     model_id: str
     vad_model: str
-    speaker_model: str
+    speaker_model: str | None
     model_revision: str | None = None
     vad_revision: str | None = None
     speaker_revision: str | None = None
@@ -51,12 +51,13 @@ class FunASRRecipe:
     trust_remote_code: bool = False
 
     def __post_init__(self) -> None:
-        required = (self.model_id, self.vad_model, self.speaker_model, self.hub)
+        required = (self.model_id, self.vad_model, self.hub)
         if any(not isinstance(value, str) or not value.strip() for value in required):
             raise ValidationError("FunASR recipe model and hub values must not be blank")
         optional = (
             self.model_revision,
             self.vad_revision,
+            self.speaker_model,
             self.speaker_revision,
             self.punctuation_model,
             self.punctuation_revision,
@@ -76,18 +77,18 @@ class FunASRRecipe:
         values: dict[str, object] = {
             "model": self.model_id,
             "vad_model": self.vad_model,
-            "spk_model": self.speaker_model,
             "hub": self.hub,
         }
         optional = {
             "model_revision": self.model_revision,
             "vad_model_revision": self.vad_revision,
+            "spk_model": self.speaker_model,
             "spk_model_revision": self.speaker_revision,
             "punc_model": self.punctuation_model,
             "punc_model_revision": self.punctuation_revision,
         }
         values.update((key, value) for key, value in optional.items() if value is not None)
-        if self.punctuation_model is None:
+        if self.speaker_model is not None and self.punctuation_model is None:
             values["spk_mode"] = "vad_segment"
         if self.vad_max_single_segment_ms is not None:
             values["vad_kwargs"] = {"max_single_segment_time": self.vad_max_single_segment_ms}
@@ -170,8 +171,22 @@ class FunASRTranscriber:
             if self._closed:
                 raise ModelError("FunASR transcriber is closed")
             pipeline = self._load()
-            analyses, calls = self._analyze_many(pipeline, batch)
-        record_unmetered_model_usage(request_count=calls)
+            analyses, calls = self._analyze_many(
+                pipeline,
+                batch,
+                speaker_analysis=self._recipe.speaker_model is not None,
+                sentence_timestamp=(
+                    self._recipe.speaker_model is not None
+                    or self._recipe.punctuation_model is not None
+                ),
+            )
+        record_unmetered_model_usage(
+            request_count=calls,
+            audio_seconds=sum(
+                max((turn.end_ms for turn in analysis.turns), default=0) / 1_000
+                for analysis in analyses
+            ),
+        )
         return analyses
 
     def close(self) -> None:
@@ -211,13 +226,23 @@ class FunASRTranscriber:
     def _analyze_many(
         pipeline: _Pipeline,
         assets: Sequence[AssetRef],
+        *,
+        speaker_analysis: bool = True,
+        sentence_timestamp: bool = True,
     ) -> tuple[tuple[SpeechAnalysis, ...], int]:
         """Analyze one official batch, returning the analyses and the AutoModel calls made."""
         paths = tuple(_speech_path(asset) for asset in assets)
-        output = _pipeline_output(pipeline, list(paths) if len(paths) > 1 else paths[0])
+        output = _pipeline_output(
+            pipeline,
+            list(paths) if len(paths) > 1 else paths[0],
+            speaker_analysis=speaker_analysis,
+            sentence_timestamp=sentence_timestamp,
+        )
         if isinstance(output, list) and all(isinstance(result, dict) for result in output):
             if len(output) == len(paths):
-                return tuple(_analysis(result) for result in output), 1
+                return tuple(
+                    _analysis(result, speaker_analysis=speaker_analysis) for result in output
+                ), 1
             keys = tuple(result.get("key") for result in output)
             path_keys = tuple(Path(path).stem for path in paths)
             if (
@@ -228,20 +253,52 @@ class FunASRTranscriber:
                 and all(key in path_keys for key in keys)
             ):
                 keyed = dict(zip(keys, output, strict=True))
-                return tuple(_analysis(keyed.get(key, {"text": ""})) for key in path_keys), 1
+                return tuple(
+                    _analysis(
+                        keyed.get(key, {"text": ""}),
+                        speaker_analysis=speaker_analysis,
+                    )
+                    for key in path_keys
+                ), 1
         if len(assets) > 1:
-            analyses = tuple(FunASRTranscriber._analyze_one(pipeline, asset) for asset in assets)
+            analyses = tuple(
+                FunASRTranscriber._analyze_one(
+                    pipeline,
+                    asset,
+                    speaker_analysis=speaker_analysis,
+                    sentence_timestamp=sentence_timestamp,
+                )
+                for asset in assets
+            )
             return analyses, 1 + len(assets)
-        return (FunASRTranscriber._analyze_one(pipeline, assets[0]),), 2
+        return (
+            FunASRTranscriber._analyze_one(
+                pipeline,
+                assets[0],
+                speaker_analysis=speaker_analysis,
+                sentence_timestamp=sentence_timestamp,
+            ),
+        ), 2
 
     @staticmethod
-    def _analyze_one(pipeline: _Pipeline, asset: AssetRef) -> SpeechAnalysis:
-        output = _pipeline_output(pipeline, _speech_path(asset))
+    def _analyze_one(
+        pipeline: _Pipeline,
+        asset: AssetRef,
+        *,
+        speaker_analysis: bool = True,
+        sentence_timestamp: bool = True,
+    ) -> SpeechAnalysis:
+        output = _pipeline_output(
+            pipeline,
+            _speech_path(asset),
+            speaker_analysis=speaker_analysis,
+            sentence_timestamp=sentence_timestamp,
+        )
         if output == []:
             return SpeechAnalysis(turns=(), speakers=())
         if not isinstance(output, list) or len(output) != 1 or not isinstance(output[0], dict):
             raise ModelError("FunASR returned an invalid transcription batch")
-        return _analysis(output[0])
+        return _analysis(output[0], speaker_analysis=speaker_analysis)
 
 
 def _speech_path(asset: AssetRef) -> str:
@@ -254,28 +311,41 @@ def _speech_path(asset: AssetRef) -> str:
         raise ValidationError("speech asset path does not exist") from None
 
 
-def _pipeline_output(pipeline: _Pipeline, value: str | list[str]) -> object:
+def _pipeline_output(
+    pipeline: _Pipeline,
+    value: str | list[str],
+    *,
+    speaker_analysis: bool = True,
+    sentence_timestamp: bool = True,
+) -> object:
     try:
         return pipeline.generate(
             input=value,
             batch_size_s=300,
             return_raw_text=True,
-            sentence_timestamp=True,
-            return_spk_res=True,
-            return_spk_center=True,
+            sentence_timestamp=sentence_timestamp,
+            return_spk_res=speaker_analysis,
+            return_spk_center=speaker_analysis,
             disable_pbar=True,
         )
     except Exception as error:
         raise ModelError("FunASR failed to analyze speech") from error
 
 
-def _analysis(result: dict[str, object]) -> SpeechAnalysis:
+def _analysis(
+    result: dict[str, object],
+    *,
+    speaker_analysis: bool = True,
+) -> SpeechAnalysis:
     text = result.get("text")
     if not isinstance(text, str):
         raise ModelError("FunASR returned invalid transcription text")
     if not _SPECIAL_TOKEN.sub("", text).strip():
         return SpeechAnalysis(turns=(), speakers=())
-    turns = _turns(result.get("sentence_info"))
+    sentence_info = result.get("sentence_info")
+    turns = () if sentence_info is None else _turns(sentence_info)
+    if not turns and not speaker_analysis:
+        turns = _untagged_turns(result, text)
     if not turns:
         raise ModelError("FunASR returned text without timed speaker turns")
     speakers = _speakers(result.get("spk_embedding_center"))
@@ -283,6 +353,79 @@ def _analysis(result: dict[str, object]) -> SpeechAnalysis:
     if labels - {speaker.speaker_label for speaker in speakers}:
         raise ModelError("FunASR returned a speaker label without a CAM++ centroid")
     return SpeechAnalysis(turns=turns, speakers=speakers)
+
+
+def _untagged_turns(result: Mapping[str, object], text: str) -> tuple[SpeechTurn, ...]:
+    """Map timestamp-only ASR output when speaker diarization is disabled."""
+    value = result.get("timestamp") or result.get("timestamps")
+    if not isinstance(value, list) or not value:
+        return ()
+    bounds: list[tuple[float, float]] = []
+    for item in value:
+        if isinstance(item, Mapping):
+            start, end = item.get("start_time"), item.get("end_time")
+            scale = 1_000
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            start, end = item[:2]
+            scale = 1
+        else:
+            raise ModelError("FunASR returned invalid transcription timestamps")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int | float)
+            or isinstance(end, bool)
+            or not isinstance(end, int | float)
+            or not math.isfinite(start)
+            or not math.isfinite(end)
+            or start < 0
+            or end <= start
+        ):
+            raise ModelError("FunASR returned invalid transcription timestamps")
+        bounds.append((start * scale, end * scale))
+    if any(current[0] < previous[0] for previous, current in pairwise(bounds)):
+        raise ModelError("FunASR transcription timestamps are not chronological")
+    chunks = _turn_text_chunks(text)
+    if len(chunks) > _MAX_TURNS:
+        raise ModelError("FunASR returned too many transcription turns")
+    total = sum(len(chunk) for chunk in chunks)
+    consumed = 0
+    turns = []
+    for index, chunk in enumerate(chunks):
+        start_index = min(len(bounds) - 1, len(bounds) * consumed // total)
+        consumed += len(chunk)
+        end_index = (
+            len(bounds)
+            if index == len(chunks) - 1
+            else max(start_index + 1, len(bounds) * consumed // total)
+        )
+        turn = _turn(
+            {
+                "start": bounds[start_index][0],
+                "end": bounds[min(len(bounds), end_index) - 1][1],
+                "text": chunk,
+            }
+        )
+        if turn is None:
+            raise ModelError("FunASR returned invalid transcription text")
+        turns.append(turn)
+    return tuple(turns)
+
+
+def _turn_text_chunks(text: str) -> tuple[str, ...]:
+    remaining = _SPECIAL_TOKEN.sub("", text).strip()
+    chunks = []
+    while len(remaining) > _MAX_TURN_CHARACTERS:
+        boundary = max(
+            remaining.rfind(separator, 0, _MAX_TURN_CHARACTERS + 1)
+            for separator in (" ", "\n", "\t")
+        )
+        if boundary <= 0:
+            boundary = _MAX_TURN_CHARACTERS
+        chunks.append(remaining[:boundary].strip())
+        remaining = remaining[boundary:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return tuple(chunks)
 
 
 def _turns(value: object) -> tuple[SpeechTurn, ...]:

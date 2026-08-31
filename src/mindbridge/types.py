@@ -35,6 +35,13 @@ class MemoryType(str, Enum):
     PROCEDURAL = "procedural"
 
 
+class AbstentionReason(str, Enum):
+    """Why an answer backend declined to answer from retrieved evidence."""
+
+    NO_EVIDENCE = "no_evidence"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+
+
 class IndexQuantization(str, Enum):
     """Explicit compression applied only to the rebuildable vector index."""
 
@@ -346,9 +353,19 @@ class AnswerResult:
 
     answer: str
     hits: tuple[SearchHit, ...] = ()
+    abstained: bool = False
+    abstention_reason: AbstentionReason | None = None
 
     def __post_init__(self) -> None:
         _text(self.answer, "answer")
+        if not isinstance(self.abstained, bool):
+            raise ValidationError("abstained must be a boolean")
+        if self.abstention_reason is not None and not isinstance(
+            self.abstention_reason, AbstentionReason
+        ):
+            raise ValidationError("abstention_reason is invalid")
+        if self.abstained != (self.abstention_reason is not None):
+            raise ValidationError("abstained and abstention_reason must agree")
 
 
 @dataclass(frozen=True, slots=True)

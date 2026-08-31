@@ -240,7 +240,7 @@ field vocabulary covers three surfaces:
 | `add`, `get` | `MemoryResponse` |
 | `add-many` | `{"memories": [MemoryResponse, ...]}` |
 | `search` | `{"hits": [SearchHitResponse, ...]}` |
-| `ask` | `{"answer": str, "hits": [SearchHitResponse, ...]}` |
+| `ask` | `{"answer": str, "hits": [SearchHitResponse, ...], "abstained": bool, "abstention_reason": str \| null}` |
 | `list` | `{"items": [MemoryResponse, ...], "next_cursor": str \| null}` |
 | `delete` | `{"deleted": bool}` |
 | `speech` | `{"segments": [SpeakerSegment, ...]}` |

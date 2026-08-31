@@ -27,7 +27,7 @@ from mindbridge._telemetry import (
 )
 from mindbridge.exceptions import ModelError, ModelOutputTruncatedError, ValidationError
 from mindbridge.models.base import EmbedTask, ModelInput, _modalities
-from mindbridge.types import AnswerResult, AssetRef, Modality, SearchHit
+from mindbridge.types import AbstentionReason, AnswerResult, AssetRef, Modality, SearchHit
 
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_GENERATION_MODEL = "gpt-5-mini"
@@ -73,6 +73,7 @@ class OpenAIModels:
         "_generation_model",
         "_generation_seed",
         "_generation_temperature",
+        "_generation_video_limit",
         "_transcription_capabilities",
         "_transcription_model",
         "_transcription_space",
@@ -97,6 +98,7 @@ class OpenAIModels:
         generation_seed: int | None = None,
         generation_temperature: float | None = None,
         generation_max_tokens: int | None = None,
+        generation_video_limit: int | None = 8,
         generation_extra_body: Mapping[str, object] | None = None,
     ) -> None:
         embedding_model = _text(embedding_model, "embedding_model")
@@ -127,6 +129,12 @@ class OpenAIModels:
             or generation_max_tokens <= 0
         ):
             raise ValidationError("generation_max_tokens must be a positive integer")
+        if generation_video_limit is not None and (
+            isinstance(generation_video_limit, bool)
+            or not isinstance(generation_video_limit, int)
+            or generation_video_limit <= 0
+        ):
+            raise ValidationError("generation_video_limit must be a positive integer")
         if generation_extra_body is not None and (
             not isinstance(generation_extra_body, Mapping)
             or any(not isinstance(key, str) or not key.strip() for key in generation_extra_body)
@@ -162,6 +170,7 @@ class OpenAIModels:
         self._generation_seed = generation_seed
         self._generation_temperature = generation_temperature
         self._generation_max_tokens = generation_max_tokens
+        self._generation_video_limit = generation_video_limit
         self._generation_extra_body = (
             None if generation_extra_body is None else dict(generation_extra_body)
         )
@@ -271,9 +280,13 @@ class OpenAIModels:
         """Answer only from supplied hits, preserving native media content parts."""
         mark_model_requests(0, token_usage_expected=0)
         prepared = self._answer_request(question, hits)
-        if prepared is None:
+        if isinstance(prepared, AbstentionReason):
             mark_model_requests(0, token_usage_expected=0)
-            return AnswerResult(answer=UNKNOWN_ANSWER)
+            return AnswerResult(
+                answer=UNKNOWN_ANSWER,
+                abstained=True,
+                abstention_reason=prepared,
+            )
         request, grounded, modalities = prepared
         create_completion = cast(Any, self._client("generation").chat.completions.create)
         mark_model_requests(1)
@@ -293,7 +306,7 @@ class OpenAIModels:
             output_modalities=frozenset({Modality.TEXT}),
         )
         answer = _answer_text(response)
-        return AnswerResult(answer=answer, hits=grounded)
+        return _answer_result(answer, grounded)
 
     def stream_answer(  # noqa: C901 - stream validation and usage share one response lifecycle
         self,
@@ -303,10 +316,10 @@ class OpenAIModels:
         """Yield grounded text deltas while recording first-token and final usage data."""
         mark_model_requests(0, token_usage_expected=0)
         prepared = self._answer_request(question, hits)
-        if prepared is None:
+        if isinstance(prepared, AbstentionReason):
             mark_model_requests(0, token_usage_expected=0)
             yield UNKNOWN_ANSWER
-            return ()
+            return _GroundedHits((), prepared)
         request, grounded, modalities = prepared
         create_completion = cast(Any, self._client("generation").chat.completions.create)
         mark_model_requests(1)
@@ -320,6 +333,7 @@ class OpenAIModels:
             )
             finish_reason: object = None
             emitted = False
+            answer_parts = []
             first_chunk = False
             for response in responses:
                 elapsed = time.perf_counter() - started
@@ -358,6 +372,7 @@ class OpenAIModels:
                     if not emitted:
                         span.set_attribute(MODEL_TTFT, elapsed)
                     emitted = True
+                    answer_parts.append(content)
                     yield content
         except ModelError:
             raise
@@ -381,13 +396,13 @@ class OpenAIModels:
             raise ModelError(
                 "generation response was invalid", reason="response_invalid", stage="generate"
             )
-        return grounded
+        return _GroundedHits(grounded, _abstention_reason("".join(answer_parts)))
 
     def _answer_request(
         self,
         question: ModelInput | str,
         hits: Sequence[SearchHit],
-    ) -> tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]] | None:
+    ) -> tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]] | AbstentionReason:
         question_input = ModelInput(text=question) if isinstance(question, str) else question
         if not isinstance(question_input, ModelInput):
             raise ValidationError("question must be a ModelInput value")
@@ -396,10 +411,18 @@ class OpenAIModels:
         retrieved = tuple(hits)
         if any(not isinstance(hit, SearchHit) for hit in retrieved):
             raise ValidationError("hits must contain SearchHit values")
-        grounded = _fit_grounding_media(question_input, retrieved)
+        grounded = _fit_grounding_media(
+            question_input,
+            retrieved,
+            video_limit=self._generation_video_limit,
+        )
         _record_grounding_fit(retrieved, grounded)
         if not grounded:
-            return None
+            return (
+                AbstentionReason.NO_EVIDENCE
+                if not retrieved
+                else AbstentionReason.INSUFFICIENT_EVIDENCE
+            )
 
         assets = question_input.assets + tuple(asset for hit in grounded for asset in hit.assets)
         text_parts = (
@@ -536,6 +559,21 @@ class _ModelUsage:
     cached_input_tokens: int | None = None
     reasoning_output_tokens: int | None = None
     audio_seconds: float | None = None
+
+
+class _GroundedHits(tuple[SearchHit, ...]):
+    """Keep the stream completion tuple-compatible while carrying abstention status."""
+
+    abstention_reason: AbstentionReason | None
+
+    def __new__(
+        cls,
+        hits: Sequence[SearchHit],
+        abstention_reason: AbstentionReason | None,
+    ) -> _GroundedHits:
+        value = super().__new__(cls, hits)
+        value.abstention_reason = abstention_reason
+        return value
 
 
 def _record_openai_usage(
@@ -965,15 +1003,24 @@ def _require_consistent_assets(assets: Sequence[AssetRef]) -> tuple[AssetRef, ..
 def _fit_grounding_media(
     question: ModelInput,
     hits: Sequence[SearchHit],
+    *,
+    video_limit: int | None,
 ) -> tuple[SearchHit, ...]:
     seen = {asset.id for asset in question.assets}
     used = sum(_encoded_size(cast(int, asset.size_bytes)) for asset in question.assets)
+    videos = 0
     selected = []
     for hit in hits:
         assets = []
         for asset in hit.assets:
             if asset.id in seen:
                 assets.append(asset)
+                continue
+            if (
+                asset.modality is Modality.VIDEO
+                and video_limit is not None
+                and videos >= video_limit
+            ):
                 continue
             size = cast(int, asset.size_bytes)
             encoded_size = _encoded_size(size)
@@ -985,6 +1032,8 @@ def _fit_grounding_media(
             assets.append(asset)
             seen.add(asset.id)
             used += encoded_size
+            if asset.modality is Modality.VIDEO:
+                videos += 1
         if assets:
             admitted = tuple(assets)
             selected.append(
@@ -999,6 +1048,20 @@ def _fit_grounding_media(
         elif hit.content.strip():
             selected.append(replace(hit, assets=(), modality=Modality.TEXT))
     return tuple(selected)
+
+
+def _answer_result(answer: str, hits: tuple[SearchHit, ...]) -> AnswerResult:
+    reason = _abstention_reason(answer)
+    return AnswerResult(
+        answer=answer,
+        hits=hits,
+        abstained=reason is not None,
+        abstention_reason=reason,
+    )
+
+
+def _abstention_reason(answer: str) -> AbstentionReason | None:
+    return AbstentionReason.INSUFFICIENT_EVIDENCE if answer.strip() == UNKNOWN_ANSWER else None
 
 
 def _record_grounding_fit(

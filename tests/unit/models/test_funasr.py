@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,10 +9,11 @@ import pytest
 
 import mindbridge.models.funasr as funasr_module
 from mindbridge.exceptions import ModelError
-from mindbridge.models.base import SpeechBackend
+from mindbridge.models.base import SpeechBackend, SpeechTurn
 from mindbridge.models.funasr import (
     DEFAULT_FUNASR_MODEL_ID,
     DEFAULT_FUNASR_MODEL_REVISION,
+    DEFAULT_FUNASR_RECIPE,
     DEFAULT_FUNASR_SPEAKER_MODEL_ID,
     DEFAULT_FUNASR_VAD_MODEL_ID,
     FunASRTranscriber,
@@ -26,6 +28,7 @@ def test_funasr_delegates_execution_to_official_automodel_and_maps_speech(
     audio = tmp_path / "voice.wav"
     audio.write_bytes(b"fake wav")
     calls: list[dict[str, object]] = []
+    usage: list[dict[str, object]] = []
 
     class _Pipeline:
         def generate(self, **kwargs: object) -> list[dict[str, object]]:
@@ -53,6 +56,11 @@ def test_funasr_delegates_execution_to_official_automodel_and_maps_speech(
         raise ImportError(name)
 
     monkeypatch.setattr(funasr_module, "import_module", import_module)
+    monkeypatch.setattr(
+        funasr_module,
+        "record_unmetered_model_usage",
+        lambda **kwargs: usage.append(kwargs),
+    )
     transcriber = FunASRTranscriber()
     digest = sha256(audio.read_bytes()).hexdigest()
     asset = AssetRef(
@@ -78,15 +86,100 @@ def test_funasr_delegates_execution_to_official_automodel_and_maps_speech(
     assert arguments["vad_model"] == DEFAULT_FUNASR_VAD_MODEL_ID
     assert arguments["spk_model"] == DEFAULT_FUNASR_SPEAKER_MODEL_ID
     assert arguments["spk_mode"] == "vad_segment"
+    assert "punc_model" not in arguments
     expected_space = f"{DEFAULT_FUNASR_MODEL_ID}:speech:b47a175e755dea61"
     assert transcriber.transcription_space == expected_space
     assert "device" not in arguments
     assert "trust_remote_code" not in arguments
     assert len(calls) == 2
+    assert usage == [
+        {"request_count": 1, "audio_seconds": 0.7},
+        {"request_count": 1, "audio_seconds": 0.7},
+    ]
 
     transcriber.close()
     with pytest.raises(ModelError, match="closed"):
         transcriber.analyze((asset,))
+
+
+def test_funasr_supports_timestamp_only_transcription_without_speaker_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    audio = tmp_path / "voice.wav"
+    audio.write_bytes(b"fake wav")
+    arguments: dict[str, object] = {}
+    calls: list[dict[str, object]] = []
+
+    class _Pipeline:
+        def generate(self, **kwargs: object) -> list[dict[str, object]]:
+            calls.append(kwargs)
+            return [{"text": "hello.", "timestamp": [[100, 400], [500, 900]]}]
+
+    def auto_model(**kwargs: object) -> _Pipeline:
+        arguments.update(kwargs)
+        return _Pipeline()
+
+    monkeypatch.setattr(
+        funasr_module,
+        "import_module",
+        lambda _name: SimpleNamespace(AutoModel=auto_model),
+    )
+    recipe = replace(
+        DEFAULT_FUNASR_RECIPE,
+        speaker_model=None,
+        speaker_revision=None,
+    )
+    transcriber = FunASRTranscriber(recipe=recipe)
+    digest = sha256(audio.read_bytes()).hexdigest()
+    result = transcriber.analyze(
+        (
+            AssetRef(
+                digest,
+                modality=Modality.AUDIO,
+                media_type="audio/wav",
+                size_bytes=audio.stat().st_size,
+                sha256=digest,
+                path=audio,
+            ),
+        )
+    )[0]
+
+    assert "spk_model" not in arguments
+    assert "spk_mode" not in arguments
+    assert calls[0]["sentence_timestamp"] is False
+    assert calls[0]["return_spk_res"] is False
+    assert result.turns == (SpeechTurn(100, 900, "hello.", None),)
+    assert result.speakers == ()
+
+
+def test_funasr_splits_long_timestamp_only_transcripts_into_bounded_turns() -> None:
+    text = " ".join(f"word{index}" for index in range(1_000))
+    timestamps = [[index * 10, (index + 1) * 10] for index in range(1_000)]
+
+    result = funasr_module._analysis(
+        {"text": text, "timestamp": timestamps},
+        speaker_analysis=False,
+    )
+
+    assert len(result.turns) > 1
+    assert " ".join(turn.text for turn in result.turns) == text
+    assert all(len(turn.text) <= 4_096 for turn in result.turns)
+    assert result.turns[0].start_ms == 0
+    assert result.turns[-1].end_ms == 10_000
+
+
+def test_funasr_does_not_hide_missing_speaker_turns_with_timestamp_fallback() -> None:
+    with pytest.raises(ModelError, match="timed speaker turns"):
+        funasr_module._analysis(
+            {
+                "text": "hello",
+                "timestamp": [[0, 500]],
+                "sentence_info": [],
+                "spk_embedding_center": [[1.0, 0.0]],
+            },
+            speaker_analysis=True,
+        )
 
 
 def test_funasr_maps_an_empty_vad_result_to_silence(tmp_path: Path) -> None:

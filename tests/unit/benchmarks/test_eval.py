@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 from argparse import ArgumentTypeError
 from collections.abc import Sequence
 from dataclasses import replace
@@ -16,12 +18,14 @@ import pytest
 
 import mindbridge.benchmarks.eval as eval_module
 from mindbridge import (
+    AbstentionReason,
     AnswerResult,
     AssetRef,
     AsyncMemory,
     IndexUnavailableError,
     MemoryType,
     Modality,
+    ModelError,
     SearchHit,
 )
 from mindbridge.benchmarks.eval import (
@@ -46,6 +50,8 @@ from mindbridge.benchmarks.eval_adapters import (
     LoadedTask,
     MediaResolver,
     MemoryItem,
+    _choice_parts,
+    _free_text_parts,
     _gallery_memory,
     _query_parts,
     load_task,
@@ -62,7 +68,7 @@ from mindbridge.benchmarks.model_config import ModelConfig
 from mindbridge.benchmarks.official_scorers import scorer_protocol
 from mindbridge.benchmarks.task_catalog import TASKS, TaskSpec, expand
 from mindbridge.benchmarks.video_mme_v2 import score_group_answers
-from mindbridge.models.base import SpeechAnalysis
+from mindbridge.models.base import SpeechAnalysis, SpeechBackend
 
 
 def _egomem_sample(example_id: int, answer: str | None = None) -> SampleResult:
@@ -86,6 +92,21 @@ def _egomem_sample(example_id: int, answer: str | None = None) -> SampleResult:
         metadata={"example_id": example_id, "choices": ("a", "b", "c", "d")},
         scorer_protocol=scorer_protocol("egomemreason"),
     )
+
+
+def test_samples_report_structured_abstentions() -> None:
+    abstained = replace(
+        _egomem_sample(1),
+        abstained=True,
+        abstention_reason="insufficient_evidence",
+    )
+
+    assert abstained.json()["abstention_reason"] == "insufficient_evidence"
+    assert eval_module._abstentions((abstained, _egomem_sample(2))) == {
+        "count": 1,
+        "rate": 0.5,
+        "reasons": {"insufficient_evidence": 1},
+    }
 
 
 def test_query_parts_and_gallery_image_id_preserve_retrieval_evidence(tmp_path: Path) -> None:
@@ -120,6 +141,12 @@ def test_query_parts_and_gallery_image_id_preserve_retrieval_evidence(tmp_path: 
         "Where is it?",
         format_constraint="Answer briefly.",
     ) == ("Where is it?", "Instruction", "Answer briefly.")
+    assert _free_text_parts("Where is it?")[0] == "Where is it?"
+    assert _choice_parts("Where is it?", ("Desk", "Shelf")) == (
+        "Where is it?",
+        "Select the best answer using only the memories. Reply with one letter (A, B).\n"
+        "A. Desk\nB. Shelf\nAnswer:",
+    )
 
 
 def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
@@ -452,10 +479,30 @@ def test_benchmark_speech_backend_skips_video_without_an_audio_stream(
     assert skipped_request_counts == [0]
 
 
+def test_benchmark_speech_backend_satisfies_the_runtime_protocol() -> None:
+    class Backend:
+        transcription_capabilities = frozenset({Modality.AUDIO, Modality.VIDEO})
+        transcription_model = "speech-model"
+        transcription_space = "speech-space"
+
+        def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+            return tuple(SpeechAnalysis((), ()) for _asset in assets)
+
+        def close(self) -> None:
+            return None
+
+    backend = _BorrowedSpeechBackend(Backend())
+
+    assert isinstance(backend, SpeechBackend)
+    assert backend.transcription_capabilities == frozenset({Modality.AUDIO, Modality.VIDEO})
+    assert backend.transcription_model == "speech-model"
+    assert backend.transcription_space == "speech-space"
+
+
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v8"
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v9"
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(device=None, seed=7, gen_kwargs="{}", recall_limit=8),
@@ -465,6 +512,65 @@ def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch.setattr(eval_module, "EVAL_RUNNER_VERSION", "next-runner-recipe")
 
     assert _cache_namespace(arguments, ModelConfig(), {"text": 1}) != before
+
+
+def test_benchmark_device_lock_serializes_separate_processes(tmp_path: Path) -> None:
+    script = """
+import sys
+from pathlib import Path
+from mindbridge.benchmarks.eval import _benchmark_device_lock
+
+print("waiting", flush=True)
+with _benchmark_device_lock("cuda", enabled=True, quiet=True, lock_root=Path(sys.argv[1])):
+    print("acquired", flush=True)
+"""
+    with eval_module._benchmark_device_lock("cuda", enabled=True, quiet=True, lock_root=tmp_path):
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(tmp_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert process.stdout is not None
+        assert process.stdout.readline() == "waiting\n"
+        with pytest.raises(subprocess.TimeoutExpired):
+            process.wait(timeout=0.1)
+    stdout, stderr = process.communicate(timeout=5)
+
+    assert stdout == "acquired\n"
+    assert stderr == ""
+
+
+def test_benchmark_device_lock_uses_the_physical_cuda_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        eval_module,
+        "_nvidia_device_uuids",
+        lambda: {0: "GPU-zero", 1: "GPU-one"},
+    )
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1,0")
+    masked = eval_module._physical_cuda_identity("cuda:0")
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES")
+    unmasked = eval_module._physical_cuda_identity("cuda:1")
+
+    assert masked == unmasked == "gpu-one"
+
+
+def test_benchmark_device_lock_skips_auto_when_cuda_is_hidden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+
+    assert eval_module._physical_cuda_identity("auto") is None
+
+
+def test_benchmark_device_lock_can_be_disabled_for_manual_scheduling(tmp_path: Path) -> None:
+    with (
+        eval_module._benchmark_device_lock("cuda", enabled=True, quiet=True, lock_root=tmp_path),
+        eval_module._benchmark_device_lock("cuda", enabled=False, quiet=True, lock_root=tmp_path),
+    ):
+        pass
 
 
 def test_model_base_url_override_replaces_environment_operation_urls(
@@ -789,6 +895,70 @@ async def test_ingest_bisects_a_failed_batch_without_losing_items() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ingest_records_the_failed_source_and_stable_error_detail() -> None:
+    class Memory(_FakeMemory):
+        async def add_many(
+            self, contents: Sequence[object], **_kwargs: object
+        ) -> tuple[object, ...]:
+            del contents
+            raise ModelError(
+                "speech failed",
+                reason="unsupported_backend",
+                stage="analyze",
+            ) from TypeError("protocol mismatch")
+
+        async def add(self, content: object, **_kwargs: object) -> object:
+            del content
+            raise ModelError(
+                "speech failed",
+                reason="unsupported_backend",
+                stage="analyze",
+            ) from TypeError("protocol mismatch")
+
+    failures: list[eval_module.FailureDetail] = []
+
+    count = await _ingest(
+        cast(AsyncMemory, Memory([])),
+        (MemoryItem("clip-7", ("content",)),),
+        batch_size=1,
+        on_failure=failures.append,
+    )
+
+    assert count == 1
+    assert failures == [
+        eval_module.FailureDetail(
+            source_id="clip-7",
+            code="model_error",
+            reason="unsupported_backend",
+            stage="analyze",
+            cause_type="TypeError",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_judge_skips_samples_with_ingest_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    sample = replace(_egomem_sample(1), ingest_failure_count=1)
+    calls = 0
+
+    def unexpected_plan(*_args: object, **_kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(eval_module, "judge_plan", unexpected_plan)
+
+    result = await eval_module._apply_judges(
+        (),
+        (sample,),
+        arguments=cast(eval_module._Arguments, SimpleNamespace(quiet=True)),
+        config=eval_module._JudgeConfig("judge", "https://judge.example/v1"),
+    )
+
+    assert result == (sample,)
+    assert calls == 0
+
+
+@pytest.mark.asyncio
 async def test_runner_records_index_failure_without_recursive_ingest(tmp_path: Path) -> None:
     calls = 0
 
@@ -1025,3 +1195,34 @@ async def test_answer_many_reports_each_completed_answer_immediately() -> None:
 
     release_slow.set()
     await pending
+
+
+@pytest.mark.asyncio
+async def test_answer_many_preserves_structured_abstention() -> None:
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            del question, limit, reference_at
+            return AnswerResult(
+                "unknown",
+                abstained=True,
+                abstention_reason=AbstentionReason.INSUFFICIENT_EVIDENCE,
+            )
+
+    outcome = (
+        await _answer_many(
+            cast(AsyncMemory, Memory([])),
+            (EvalQuestion("q", ("question",), references=("A",)),),
+            request_concurrency=1,
+            recall_limit=1,
+        )
+    )[0]
+
+    assert isinstance(outcome, eval_module._AnswerOutcome)
+    assert outcome.abstained is True
+    assert outcome.abstention_reason == "insufficient_evidence"

@@ -227,6 +227,8 @@ def test_resource_routes_map_the_public_memory_values() -> None:
     assert found.json()["id"] == "memory_1"
     assert searched.json()["hits"][0]["score"] == 0.9
     assert answered.json()["answer"] == "The toolbox is blue."
+    assert answered.json()["abstained"] is False
+    assert answered.json()["abstention_reason"] is None
     assert deleted.status_code == 200
     assert deleted.json() == {"deleted": True}
     assert memory.calls == [

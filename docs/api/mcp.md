@@ -113,10 +113,11 @@ Answers only from retrieved local memories.
 | `memory_type` | one memory role or null | no | null |
 | `reference_at` | timezone-aware ISO 8601 datetime or null | no | current UTC |
 
-The result contains `answer` and the exact grounding `hits`. Like search, the tool is marked
-non-read-only because retrieval may maintain local caches/index state. The built-in outbound answer
-request serializes each distinct question/evidence asset once even if several hits refer to it. It
-reserves the raw-media budget for question assets, keeps ranked evidence media that fits, and
+The result contains `answer`, the exact grounding `hits`, `abstained`, and
+`abstention_reason` (`no_evidence`, `insufficient_evidence`, or null). Like search, the tool is
+marked non-read-only because retrieval may maintain local caches/index state. The built-in outbound
+answer request serializes each distinct question/evidence asset once even if several hits refer to
+it. It reserves the raw-media budget for question assets, keeps ranked evidence media that fits, and
 retains overflow hits as text when possible. It also sends each hit's content, `memory_type`,
 `occurred_at`, `occurred_end`, `created_at`, and metadata to the configured generation endpoint.
 

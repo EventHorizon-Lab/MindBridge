@@ -177,15 +177,19 @@ qualified lexical or temporal evidence anchors the winner; larger limits preserv
 candidates. Each hydrated hit has a score from 0 through 1; scores rank results within a request and
 are not stable global probabilities.
 
-`ask` retrieves evidence first and routes those hits, including retained media, to generation. A
+`ask` retrieves a bounded ranked candidate pool, fills the requested evidence slots round-robin by
+modality while preserving rank within each modality, and routes those hits, including retained
+media, to generation. `search` itself remains globally score ordered. A
 configured `SpeechBackend` caches complete identity analysis and adds each segment's timing, text,
 stable ID, optional registered name, and match score to the model-only grounding context; returned
 source hits remain unchanged. Generation-time analysis does not rewrite an existing record's
 `content`. `AnswerResult` contains the canonical source hits that the generation backend reports it
-used, filtering any unknown IDs, for display or grounding audits. The built-in backend sends one
+used, filtering any unknown IDs, for display or grounding audits, plus structured abstention status.
+The built-in backend sends one
 binary content part per distinct asset in an answer request, even when the question or several hits
 refer to it. Each encoded item is limited to 20 MiB. The adapter reserves the 64 MiB aggregate
-budget for question assets, then admits ranked hit assets until full. Oversized or overflow assets
+budget for question assets, then admits ranked hit assets until full, with a configurable default
+ceiling of eight distinct retrieved videos. Oversized or overflow assets
 are removed individually, so fitting siblings from the same hit remain; a hit with no admitted
 media remains as text evidence when it has text.
 

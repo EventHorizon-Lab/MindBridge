@@ -207,6 +207,8 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
     assert searched.structured_content["hits"][0]["score"] == 0.9
     assert answered.structured_content is not None
     assert answered.structured_content["answer"] == "The toolbox is blue."
+    assert answered.structured_content["abstained"] is False
+    assert answered.structured_content["abstention_reason"] is None
     assert found.structured_content is not None
     assert found.structured_content["id"] == "memory_1"
     assert deleted.structured_content == {"deleted": True}

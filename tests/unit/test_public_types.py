@@ -20,6 +20,7 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.types import (
+    AbstentionReason,
     AnswerResult,
     AssetRef,
     Blob,
@@ -162,6 +163,14 @@ def test_answer_and_page_reuse_the_public_values() -> None:
     hit = SearchHit(id=memory.id, content=memory.content, score=0.9, created_at=memory.created_at)
 
     assert AnswerResult(answer="It is in the toolbox.", hits=(hit,)).hits == (hit,)
+    abstention = AnswerResult(
+        answer="unknown",
+        abstained=True,
+        abstention_reason=AbstentionReason.INSUFFICIENT_EVIDENCE,
+    )
+    assert abstention.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
+    with pytest.raises(ValidationError, match="must agree"):
+        AnswerResult(answer="unknown", abstained=True)
     assert Page(items=(memory,), next_cursor="cursor_1").items == (memory,)
 
 

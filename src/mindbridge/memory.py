@@ -12,7 +12,7 @@ import os
 import re
 import shutil
 import unicodedata
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, suppress
@@ -84,6 +84,7 @@ from mindbridge.models.base import (
     _modalities,
 )
 from mindbridge.types import (
+    AbstentionReason,
     AnswerResult,
     AssetRef,
     Blob,
@@ -621,7 +622,7 @@ class Memory:
             search = partial(
                 self._search_prepared,
                 prepared,
-                limit=limit,
+                limit=min(100, limit * 3),
                 operation=assets,
                 memory_type=_optional_memory_type(memory_type),
                 reference_at=reference,
@@ -646,6 +647,7 @@ class Memory:
                 if speech_assets:
                     self._recognize_speech(speech_assets, assets)
                 hits = search()
+            hits = _grounding_hits(hits, limit)
             routed_question = self._route_generation(
                 (
                     _with_reference_time(prepared, reference)
@@ -663,6 +665,8 @@ class Memory:
             return AnswerResult(
                 answer=result.answer,
                 hits=tuple(hit for hit in hits if hit.id in used_ids),
+                abstained=result.abstained,
+                abstention_reason=result.abstention_reason,
             )
 
     def get(self, memory_id: str) -> MemoryRecord:
@@ -1466,8 +1470,11 @@ class Memory:
                                 temporal_range=temporal_range,
                                 decay_half_life=self._decay_half_life,
                             ),
-                            max(dense_confidence.get(memory_id, 0.0), lexical_score),
-                            lexical_score > 0.0,
+                            max(
+                                dense_confidence.get(memory_id, 0.0),
+                                _LEXICAL_MATCH_CONFIDENCE if lexical_match else 0.0,
+                            ),
+                            lexical_match,
                         )
                     )
                 ranked = [item for item in ranked if item[2] >= self._minimum_relevance]
@@ -2187,15 +2194,31 @@ class Memory:
                     answer = "".join(parts)
                     if not answer.strip():
                         raise ModelError("generation model returned an invalid answer")
-                    if used_hits is None:
+                    if isinstance(used_hits, AnswerResult):
+                        if used_hits.answer != answer:
+                            raise ModelError("generation model returned an invalid answer")
+                        result = used_hits
+                    elif used_hits is None:
                         grounded = tuple(hits)
                     elif isinstance(used_hits, tuple) and all(
                         isinstance(hit, SearchHit) for hit in used_hits
                     ):
                         grounded = used_hits
+                        abstention_reason = getattr(used_hits, "abstention_reason", None)
+                        if abstention_reason is not None and not isinstance(
+                            abstention_reason, AbstentionReason
+                        ):
+                            raise ModelError("generation model returned invalid abstention status")
                     else:
                         raise ModelError("generation model returned invalid grounding hits")
-                    result = AnswerResult(answer=answer, hits=grounded)
+                    if not isinstance(used_hits, AnswerResult):
+                        reason = abstention_reason if isinstance(used_hits, tuple) else None
+                        result = AnswerResult(
+                            answer=answer,
+                            hits=grounded,
+                            abstained=reason is not None,
+                            abstention_reason=reason,
+                        )
                 else:
                     result = self._answerer.answer(question, hits)
             except MindBridgeError:
@@ -3225,6 +3248,21 @@ def _batch_values(
 def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _PreparedContent:
     note = f"Reference time for relative dates: {reference_at.isoformat(timespec='microseconds')}"
     return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
+
+
+def _grounding_hits(hits: Sequence[SearchHit], limit: int) -> tuple[SearchHit, ...]:
+    queues: dict[Modality, deque[SearchHit]] = {}
+    for hit in hits:
+        queues.setdefault(hit.modality, deque()).append(hit)
+    selected: list[SearchHit] = []
+    while queues and len(selected) < limit:
+        for modality in tuple(queues):
+            selected.append(queues[modality].popleft())
+            if not queues[modality]:
+                del queues[modality]
+            if len(selected) == limit:
+                break
+    return tuple(selected)
 
 
 def _merge_index_hits(*groups: Sequence[IndexHit]) -> tuple[IndexHit, ...]:
