@@ -81,6 +81,28 @@ EGOTEMPO_QUERY_PROMPT = PromptSpec(
     ),
 )
 
+OPENEQA_QUERY_PROMPT = PromptSpec(
+    name="openeqa_query",
+    version="openeqa_query_v1",
+    purpose="Apply the official OpenEQA EM-EQA baseline instruction.",
+    used_by="mindbridge.benchmarks.eval_adapters._openeqa",
+    # Transcribed from `prompts/gpt4v.txt`, which OpenEQA ships byte-identically
+    # as `claude3-vision.txt` and `gemini-pro-vision.txt`: one shared wording for
+    # every EM-EQA vision baseline. The second line describes that baseline's
+    # input medium -- a set of images pasted into one request -- and is kept
+    # verbatim anyway, because the published wording is what makes a number
+    # comparable with the leaderboard. MindBridge instead retrieves the episode's
+    # own stored observations.
+    text=(
+        "You are an intelligent question answering agent. I will ask you questions about an "
+        "indoor space and you must provide an answer.\n"
+        "You will be shown a set of images that have been collected from a single location.\n"
+        "Given a user query, you must output `text` to answer to the question asked by the "
+        "user.\n"
+        "User Query: {question}"
+    ),
+)
+
 ATM_BENCH_QUERY_PROMPT = PromptSpec(
     name="atm_bench_query",
     version="atm_bench_query_v1",
@@ -305,6 +327,7 @@ BENCHMARK_PROMPTS = (
     VIDEO_MME_QUERY_PROMPT,
     VIDEO_MME_V2_QUERY_PROMPT,
     EGOTEMPO_QUERY_PROMPT,
+    OPENEQA_QUERY_PROMPT,
     ATM_BENCH_QUERY_PROMPT,
     ATM_BENCH_NUMBER_FORMAT_PROMPT,
     ATM_BENCH_LIST_RECALL_FORMAT_PROMPT,

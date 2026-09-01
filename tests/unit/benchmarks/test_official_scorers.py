@@ -20,7 +20,10 @@ from mindbridge.benchmarks.official_scorers import (
     judge_model_is_official,
     judge_plan,
     local_scores,
+    official_judge_model,
     parse_judge_response,
+    task_family,
+    task_primary_metric,
 )
 from mindbridge.benchmarks.task_catalog import TaskSpec
 
@@ -688,3 +691,69 @@ def test_personamem_scores_exactly_the_reproducible_task_types() -> None:
             )
             is not None
         ), task_type
+
+
+def test_openeqa_llm_match_selects_its_prompt_and_trims_the_prediction() -> None:
+    plain = judge_plan(
+        "openeqa-hm3d",
+        question="What color is the rug?",
+        references=("tan with pink and blue",),
+        # `evaluate-predictions.py` cuts after the last period when that period
+        # is not already the final character, so the judge never sees the
+        # trailing unterminated sentence.
+        prediction="brown with pink and blue. I think it",
+        metadata={"category": "attribute recognition"},
+    )
+    assert plain is not None
+    prompt = plain.calls[0][0].content
+    assert prompt.endswith("Response: brown with pink and blue.\n")
+    assert "Extra Answers:" not in prompt
+    # `openai_max_tokens=32` in `get_llm_match_score`.
+    assert plain.max_tokens == 32
+    assert len(plain.calls) == 1
+
+    extra = judge_plan(
+        "openeqa-scannet",
+        question="Where is the mirror?",
+        references=("Next to the staircase",),
+        prediction="by the stairs",
+        metadata={"extra_answers": ("On the wall", "")},
+    )
+    assert extra is not None
+    extra_prompt = extra.calls[0][0].content
+    # Upstream renders the list with `str()`, so the judge sees a Python repr
+    # including the one blank entry the release ships.
+    assert "Extra Answers: ['On the wall', '']" in extra_prompt
+    assert "extra answers that are also correct" in extra_prompt
+
+    assert task_family("openeqa-hm3d") == "openeqa"
+    assert task_primary_metric("openeqa-scannet") == "llm_match"
+    assert official_judge_model("openeqa-hm3d") == "gpt-4-1106-preview"
+    # No deterministic half: LLM-Match is the whole protocol.
+    assert _scores("openeqa-hm3d", "brown", "tan", {}) == {}
+
+
+def test_openeqa_marks_scale_and_clip_exactly_as_upstream() -> None:
+    plan = JudgePlan("p", "openeqa", ((JudgeMessage("user", "prompt"),),))
+
+    assert parse_judge_response(plan, "1") == {"llm_match": 0.0, "llm_match_score_1_5": 1.0}
+    assert parse_judge_response(plan, "3") == {"llm_match": 0.5, "llm_match_score_1_5": 3.0}
+    assert parse_judge_response(plan, "5") == {"llm_match": 1.0, "llm_match_score_1_5": 5.0}
+    # The tagged branch reads only up to the next newline, so a judge that
+    # explains itself afterwards still parses.
+    assert parse_judge_response(plan, "Your mark: 4\nbecause the color matches") == {
+        "llm_match": 0.75,
+        "llm_match_score_1_5": 4.0,
+    }
+    # `evaluate-predictions.py` clips instead of validating: 0 is upstream's own
+    # sentinel for a missing prediction and scores zero points, and an
+    # overshooting judge is capped rather than discarding the question.
+    assert parse_judge_response(plan, "0") == {"llm_match": 0.0, "llm_match_score_1_5": 1.0}
+    assert parse_judge_response(plan, "9") == {"llm_match": 1.0, "llm_match_score_1_5": 5.0}
+    with pytest.raises(ValueError, match="Invalid output string"):
+        parse_judge_response(plan, "the response is good")
+
+    assert combine_judge_scores(plan, (parse_judge_response(plan, "5"),)) == {
+        "llm_match": 1.0,
+        "llm_match_score_1_5": 5.0,
+    }

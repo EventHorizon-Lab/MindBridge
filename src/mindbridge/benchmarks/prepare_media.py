@@ -28,6 +28,15 @@ _VIDEO_FILTER = (
     "force_original_aspect_ratio=decrease:force_divisible_by=2"
 )
 _EGOLIFE_NAME = re.compile(r"^DAY([1-9][0-9]*)_[^_]+_[^_]+_([0-9]{8})$")
+# OpenEQA episode histories are directories of RGB frames with no published
+# video encoding for evaluation -- upstream's `data/frames2videos.py` writes at
+# 30 fps into `viewer/static/videos` for its web viewer, not for scoring. One
+# frame per second is the rate that loses nothing: `_VIDEO_FILTER` resamples
+# every prepared segment to `fps=1`, so encoding the sequence at 1 fps makes
+# that resample an identity step and keeps every extracted frame, where 30 fps
+# would silently discard 29 of every 30. Raise it only to deliberately thin a
+# scene's history.
+_OPENEQA_FRAME_RATE = 1
 _T = TypeVar("_T")
 Limit: TypeAlias = int | float | None
 
@@ -96,6 +105,10 @@ def _prepared_manifest(
         return {
             "units": _lifelong_manifest(spec, media_root, cache, announce),
         }
+    if spec.name.startswith("openeqa-"):
+        return {
+            "units": _openeqa_manifest(spec, dataset, media_root, cache, limit, offset, announce)
+        }
     if spec.name == "supermemory-vqa":
         return {
             "units": _supermemory_manifest(
@@ -120,6 +133,8 @@ def _acquire_selected(
         _acquire_youtube(spec, dataset, root, patterns, download, announce)
     elif source.acquirer == "ego4d":
         _acquire_ego4d(spec, dataset, root, patterns, download, announce)
+    elif source.acquirer in {"open-eqa-hm3d-frames", "scannet"}:
+        _acquire_openeqa(spec, root, patterns)
     else:
         acquire_media(
             spec,
@@ -172,6 +187,22 @@ def _selected_patterns(spec: TaskSpec, dataset: Path, limit: Limit, offset: int)
         )
     if name.startswith("mm-lifelong-"):
         return (f"videos/{str(spec.variant).split('_', 1)[0]}/*",)
+    if name.startswith("openeqa-"):
+        from mindbridge.benchmarks.openeqa import FRAME_GLOB, load_openeqa
+
+        split = str(spec.variant)
+        return tuple(
+            f"data/frames/{split}/{episode}/{FRAME_GLOB}"
+            for episode in _selected(
+                tuple(
+                    dict.fromkeys(
+                        question.episode_name for question in load_openeqa(dataset, split=split)
+                    )
+                ),
+                limit,
+                offset,
+            )
+        )
     if name == "supermemory-vqa":
         questions = _supermemory_questions(dataset, limit, offset)
         horizon = max(question.question_ended_at.timestamp() for question in questions)
@@ -306,6 +337,138 @@ def _lifelong_manifest(
             )
         timeline += segments[-1][1]
     return {str(spec.variant): parts}
+
+
+def _openeqa_manifest(
+    spec: TaskSpec,
+    dataset: Path,
+    media_root: Path,
+    cache: Path,
+    limit: Limit,
+    offset: int,
+    announce: Callable[[str], None] | None,
+) -> dict[str, list[dict[str, object]]]:
+    from mindbridge.benchmarks.openeqa import load_openeqa
+
+    split = str(spec.variant)
+    episodes = _selected(
+        tuple(
+            dict.fromkeys(question.episode_name for question in load_openeqa(dataset, split=split))
+        ),
+        limit,
+        offset,
+    )
+    return {
+        episode: _video_parts(
+            episode,
+            _openeqa_video(_openeqa_episode(media_root, split, episode), cache, announce),
+            cache / _component(episode),
+            announce,
+        )
+        for episode in episodes
+    }
+
+
+def _openeqa_episode(media_root: Path, split: str, episode: str) -> Path:
+    """Locate one episode history under either `frames/<split>` or `frames`."""
+    for candidate in (media_root / episode, media_root / split / episode):
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(
+        f"OpenEQA episode history does not exist: {media_root / episode} "
+        f"(nor {media_root / split / episode})"
+    )
+
+
+def _openeqa_video(
+    episode: Path,
+    cache: Path,
+    announce: Callable[[str], None] | None,
+) -> Path:
+    """Encode one episode's official frame order into a cached 1 fps video."""
+    from mindbridge.benchmarks.openeqa import episode_frames
+
+    frames = episode_frames(episode)
+    unquotable = tuple(frame for frame in frames if "'" in str(frame) or "\n" in str(frame))
+    if unquotable:
+        raise ValueError(f"OpenEQA frame path is not safe to encode: {unquotable[0]}")
+    key = hashlib.sha256(
+        json.dumps(
+            [
+                "openeqa-frames-v1",
+                str(episode.resolve()),
+                len(frames),
+                frames[0].name,
+                frames[-1].name,
+                sum(frame.stat().st_size for frame in frames),
+                _OPENEQA_FRAME_RATE,
+                _ffmpeg_id(),
+            ],
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()[:20]
+    target = cache / f"episode-{key}.mp4"
+    if target.is_file() and target.stat().st_size:
+        return target.resolve()
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if announce is not None:
+        announce(f"encoding {len(frames)} frames from {episode.name} at {_OPENEQA_FRAME_RATE} fps")
+    seconds = 1 / _OPENEQA_FRAME_RATE
+    # The concat demuxer takes the frame order this adapter resolved rather than
+    # ffmpeg's own globbing. The usual "repeat the final entry" workaround is
+    # not applied: with `-r` forcing a constant rate, the last `duration` line
+    # is honoured, and repeating it measurably adds a phantom frame (76 encoded
+    # from 75 extracted).
+    listing = "ffconcat version 1.0\n" + "".join(
+        f"file '{frame.resolve()}'\nduration {seconds:.6f}\n" for frame in frames
+    )
+    working = Path(mkdtemp(prefix=f".{key}.", dir=target.parent))
+    temporary: Path | None = working
+    try:
+        index = working / "frames.ffconcat"
+        index.write_text(listing, encoding="utf-8")
+        output = working / target.name
+        _run_ffmpeg(
+            (
+                _executable("ffmpeg"),
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(index),
+                "-r",
+                str(_OPENEQA_FRAME_RATE),
+                # Frame extractions are not guaranteed to have even dimensions,
+                # which `yuv420p` requires.
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-map_metadata",
+                "-1",
+                str(output),
+            ),
+            episode,
+        )
+        if not output.stat().st_size:
+            raise RuntimeError(f"ffmpeg wrote an empty episode video for {episode}")
+        os.replace(output, target)
+    finally:
+        if temporary is not None:
+            shutil.rmtree(temporary, ignore_errors=True)
+    return target.resolve()
 
 
 def _video_parts(
@@ -595,6 +758,29 @@ def _acquire_youtube(
             or not _has_audio(target)
         ):
             raise RuntimeError(f"yt-dlp could not acquire M3-Bench web video {video_id}")
+
+
+def _acquire_openeqa(spec: TaskSpec, root: Path, patterns: Sequence[str]) -> None:
+    """Accept episode histories an operator already extracted, and fetch nothing.
+
+    There is nothing here to download: HM3D frames are a tarball the upstream
+    `data/README.md` links from a third-party host, and ScanNet requires its own
+    signed terms of use. What this does do is let frames extracted into the
+    catalog's own media root count, so `--media-root` is a convenience rather
+    than the only way to run the task.
+    """
+    source = spec.media_source
+    if source is None:
+        raise ValueError(f"{spec.name} has no media source")
+    release = root / source.release
+    missing = tuple(pattern for pattern in patterns if not tuple(release.glob(pattern)))
+    if not missing:
+        return
+    raise FileNotFoundError(
+        f"{spec.name} needs {len(missing)} of {len(patterns)} selected episode histories its "
+        f"{source.acquirer} acquirer supplies; extract them under {release} or pass "
+        f"--media-root {spec.name}=DIR. Absent: {missing[0]}"
+    )
 
 
 def _acquire_ego4d(

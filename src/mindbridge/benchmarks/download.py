@@ -21,6 +21,7 @@ _GITHUB_REPOSITORIES = frozenset(
         "ByteDance-Seed/m3-agent",
         "google-research-datasets/egotempo",
         "mohammadtavakoli78/BEAM",
+        "facebookresearch/open-eqa",
     }
 )
 

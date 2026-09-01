@@ -30,6 +30,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - `AsyncOmniPrefetch`, a per-turn speculative-recall helper that accepts complete text, image,
   video, audio, or combined snapshots, permits only one real search at a time, coalesces queued
   revisions, and confirms the exact final snapshot without persisting partial input.
+- An OpenEQA (EM-EQA) benchmark task pair, `openeqa-hm3d` and `openeqa-scannet`, scored with
+  the official LLM-Match protocol. Episode histories are operator-supplied and are prepared by
+  encoding each episode's official frame order at one frame per second.
 - An evidence-backed interaction-memory recipe over the existing semantic, episodic, and
   procedural roles, plus a public-SDK benchmark gate that must justify any future graph projection.
 - Frozen, slotted public content/result types for text, image, video, audio, and omni memories,

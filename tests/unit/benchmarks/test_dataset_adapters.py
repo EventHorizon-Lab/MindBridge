@@ -1,4 +1,4 @@
-"""Regression checks for the LongMemEval, CL-Bench, BEAM and PersonaMem-v3 adapters.
+"""Regression checks for the LongMemEval, CL-Bench, BEAM, PersonaMem-v3 and OpenEQA adapters.
 
 Each case pins a shape the pinned releases actually contain and an earlier
 version of these loaders rejected or mishandled.
@@ -19,6 +19,7 @@ from mindbridge.benchmarks.clbench import (
 )
 from mindbridge.benchmarks.download import _patterns
 from mindbridge.benchmarks.longmemeval import load_longmemeval
+from mindbridge.benchmarks.openeqa import OPENEQA_SPLITS, episode_frames, load_openeqa
 from mindbridge.benchmarks.personamem_v3 import (
     load_personamem_v3,
     render_candidates,
@@ -645,3 +646,125 @@ def test_text_memories_split_passages_the_product_would_reject() -> None:
     # Nothing is dropped.
     rebuilt = "".join(text for item in parts for text in item.content if isinstance(text, str))
     assert rebuilt.replace("\n\n", " ").split() == long_turn.split()
+
+
+def _openeqa_question(**overrides: object) -> dict[str, object]:
+    question: dict[str, object] = {
+        "question_id": "q1",
+        "episode_history": "hm3d-v0/000-hm3d-BFRyYbPCCPE",
+        "category": "object recognition",
+        "question": "What is the white object on the wall above the TV?",
+        "answer": "Air conditioning unit",
+    }
+    question.update(overrides)
+    return question
+
+
+def test_openeqa_distinguishes_absent_from_empty_extra_answers(tmp_path: Path) -> None:
+    dataset = _write(
+        tmp_path / "open-eqa-v0.json",
+        [
+            _openeqa_question(question_id="plain"),
+            _openeqa_question(
+                question_id="extra",
+                episode_history="scannet-v0/142-scannet-scene0653_01",
+                # The pinned release ships exactly one question whose extra
+                # answers include a blank entry, and upstream renders the list
+                # into the judge prompt with `str()`, blank included.
+                extra_answers=["on top of the cabinet", ""],
+            ),
+        ],
+    )
+
+    questions = {question.question_id: question for question in load_openeqa(dataset)}
+
+    # Absent must stay absent: `get_llm_match_score` selects `mmbench-extra`
+    # over `mmbench` on `extra_answers is not None`, so collapsing an absent key
+    # into an empty tuple would switch 1,373 of 1,636 questions to the wrong
+    # judge prompt.
+    assert questions["plain"].extra_answers is None
+    assert questions["extra"].extra_answers == ("on top of the cabinet", "")
+    assert questions["plain"].split == "hm3d-v0"
+    assert questions["extra"].episode_name == "142-scannet-scene0653_01"
+
+    # The third state the release never contains is refused rather than treated
+    # as either of the two it does.
+    empty = _write(tmp_path / "empty.json", [_openeqa_question(extra_answers=[])])
+    with pytest.raises(ValueError, match="absent or non-empty"):
+        load_openeqa(empty)
+
+
+def test_openeqa_splits_scene_sources_and_rejects_broken_episodes(tmp_path: Path) -> None:
+    dataset = _write(
+        tmp_path / "open-eqa-v0.json",
+        [
+            _openeqa_question(question_id="a"),
+            _openeqa_question(question_id="b", episode_history="hm3d-v0/001-hm3d-TPhiubUHKcP"),
+            _openeqa_question(
+                question_id="c", episode_history="scannet-v0/002-scannet-scene0709_00"
+            ),
+        ],
+    )
+
+    assert len(load_openeqa(dataset)) == 3
+    assert {question.question_id for question in load_openeqa(dataset, split="hm3d-v0")} == {
+        "a",
+        "b",
+    }
+    assert {question.question_id for question in load_openeqa(dataset, split="scannet-v0")} == {"c"}
+    assert OPENEQA_SPLITS == ("hm3d-v0", "scannet-v0")
+
+    with pytest.raises(ValueError, match="unknown OpenEQA split"):
+        load_openeqa(dataset, split="hm3d")
+
+    # A-EQA is not adapted, so a third split would be a silently wrong task
+    # rather than a new one.
+    unknown = _write(
+        tmp_path / "unknown.json", [_openeqa_question(episode_history="mp3d-v0/000-mp3d-x")]
+    )
+    with pytest.raises(ValueError, match="unknown OpenEQA split"):
+        load_openeqa(unknown)
+
+    flat = _write(tmp_path / "flat.json", [_openeqa_question(episode_history="000-hm3d-x")])
+    with pytest.raises(ValueError, match="invalid OpenEQA episode_history"):
+        load_openeqa(flat)
+
+    duplicated = _write(tmp_path / "duplicated.json", [_openeqa_question(), _openeqa_question()])
+    with pytest.raises(ValueError, match="duplicate question IDs"):
+        load_openeqa(duplicated)
+
+
+def test_openeqa_frames_use_the_official_lexicographic_order(tmp_path: Path) -> None:
+    episode = tmp_path / "000-hm3d-BFRyYbPCCPE"
+    episode.mkdir()
+    for name in ("00002", "00010", "00001"):
+        (episode / f"{name}-rgb.png").write_bytes(b"")
+    # Not a frame: the RGB-D extraction writes depth and pose beside the frames.
+    (episode / "00001-depth.png").write_bytes(b"")
+
+    # Every upstream baseline reads `sorted(folder.glob("*-rgb.png"))`, so that
+    # lexicographic order is the protocol rather than a numeric sort.
+    assert [path.name for path in episode_frames(episode)] == [
+        "00001-rgb.png",
+        "00002-rgb.png",
+        "00010-rgb.png",
+    ]
+
+    with pytest.raises(FileNotFoundError, match=r"has no \*-rgb\.png frames"):
+        episode_frames(tmp_path / "empty")
+
+
+def test_openeqa_catalog_pins_one_release_for_both_scene_splits() -> None:
+    hm3d, scannet = TASKS["openeqa-hm3d"], TASKS["openeqa-scannet"]
+
+    # One question file covers both splits; only the variant and the media tree
+    # differ, and neither split's frames are downloadable from here.
+    assert hm3d.dataset == scannet.dataset == "openeqa/data/open-eqa-v0.json"
+    assert hm3d.digest == scannet.digest is not None
+    assert (hm3d.variant, scannet.variant) == OPENEQA_SPLITS
+    assert hm3d.media == "openeqa/data/frames/hm3d-v0"
+    assert scannet.media == "openeqa/data/frames/scannet-v0"
+    assert hm3d.media_source is not None and scannet.media_source is not None
+    assert hm3d.media_source.acquirer == "open-eqa-hm3d-frames"
+    assert scannet.media_source.acquirer == "scannet"
+    assert hm3d.repository == "facebookresearch/open-eqa"
