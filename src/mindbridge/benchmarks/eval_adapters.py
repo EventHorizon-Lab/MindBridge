@@ -1010,6 +1010,12 @@ def _query_parts(template: str, question: str, **values: str) -> tuple[str, ...]
 # all. Blocks are built well under the cap so that each one is also a usable
 # retrieval unit rather than one opaque record per task.
 _TEXT_BLOCK_CHARACTERS = 8_000
+
+# Recorded in place of a reference answer where a release publishes none.
+# 857 of PersonaMem-v3's queries -- almost all of them sycophancy rows --
+# have no `example_response`, and none of its metrics reads a reference, so
+# the slot would otherwise repeat the question back as its own gold answer.
+_NO_REFERENCE = "(no reference answer published for this row)"
 _MAX_PART_CHARACTERS = 60_000
 
 
@@ -1044,6 +1050,38 @@ def _text_blocks(text: str, limit: int) -> tuple[str, ...]:
     return tuple(blocks)
 
 
+def _text_memories(
+    source_id: str,
+    text: str,
+    *,
+    occurred_at: datetime | None = None,
+    end_seconds: float | None = None,
+) -> tuple[MemoryItem, ...]:
+    """Store one passage as memories that each fit the product's part limit.
+
+    An oversized part is not merely dropped. `memory.add` rejects it, the
+    runner records an ingest failure for the unit, and `_apply_judges` then
+    skips **every** question in that unit -- so one long turn silently voids a
+    whole conversation. Measured on the pinned releases: BEAM turns reach
+    348,864 characters and 7 of the 10 conversations in its 10M tier hold one,
+    which would have left 70% of that tier unjudged; LongMemEval has one turn
+    of 76,594. Text under the block size is stored unchanged, so only the long
+    passages are split.
+    """
+    blocks = _text_blocks(text, _TEXT_BLOCK_CHARACTERS)
+    if len(blocks) == 1:
+        return (MemoryItem(source_id, blocks, occurred_at=occurred_at, end_seconds=end_seconds),)
+    return tuple(
+        MemoryItem(
+            f"{source_id}_B{index:04d}",
+            (block,),
+            occurred_at=occurred_at,
+            end_seconds=end_seconds,
+        )
+        for index, block in enumerate(blocks)
+    )
+
+
 def _longmemeval(
     _spec: TaskSpec,
     dataset: Path,
@@ -1057,14 +1095,15 @@ def _longmemeval(
     units = []
     for question in _selected(load_longmemeval(dataset), limit, offset):
         memories = tuple(
-            MemoryItem(
-                turn.turn_id,
-                (f"[{session.occurred_at.isoformat()}] {turn.role}: {turn.content}",),
-                occurred_at=session.occurred_at,
-            )
+            item
             for session in question.sessions
             for turn in session.turns
             if turn.content.strip()
+            for item in _text_memories(
+                turn.turn_id,
+                f"[{session.occurred_at.isoformat()}] {turn.role}: {turn.content}",
+                occurred_at=session.occurred_at,
+            )
         )
         units.append(
             EvalUnit(
@@ -1107,9 +1146,7 @@ def _clbench(
     units = []
     for task in _selected(load_clbench(dataset), limit, offset):
         memories = tuple(
-            MemoryItem(f"{turn.turn_id}_B{index:04d}", (block,))
-            for turn in task.turns
-            for index, block in enumerate(_text_blocks(turn.content, _TEXT_BLOCK_CHARACTERS))
+            item for turn in task.turns for item in _text_memories(turn.turn_id, turn.content)
         )
         prompt = CLBENCH_QUERY_PROMPT.text.format(
             system_prompt=task.system_prompt.strip(), question=task.question
@@ -1155,18 +1192,17 @@ def _beam(
     units = []
     for conversation in _selected(load_beam(dataset, tier), limit, offset):
         memories = tuple(
-            MemoryItem(
+            item
+            for turn in conversation.turns
+            for item in _text_memories(
                 turn.turn_id,
                 (
-                    (
-                        f"{turn.role}: {turn.content}"
-                        if turn.occurred_at is None
-                        else f"[{turn.occurred_at.date().isoformat()}] {turn.role}: {turn.content}"
-                    ),
+                    f"{turn.role}: {turn.content}"
+                    if turn.occurred_at is None
+                    else f"[{turn.occurred_at.date().isoformat()}] {turn.role}: {turn.content}"
                 ),
                 occurred_at=turn.occurred_at,
             )
-            for turn in conversation.turns
         )
         questions = tuple(
             EvalQuestion(
@@ -1212,16 +1248,17 @@ def _personamem_v3(
     units = []
     for persona in _selected(load_personamem_v3(dataset), limit, offset):
         memories = tuple(
-            MemoryItem(
-                event.event_id,
-                (render_event(event),),
-                # `end_seconds` carries the event's moment so the runner's
-                # cutoff loop ingests only what happened before each query --
-                # the causal mask the release requires.
-                end_seconds=float(event.timestamp),
-                occurred_at=event.occurred_at,
-            )
+            item
             for event in persona.events
+            # `end_seconds` carries the event's moment so the runner's cutoff
+            # loop ingests only what happened before each query -- the causal
+            # mask the release requires.
+            for item in _text_memories(
+                event.event_id,
+                render_event(event),
+                occurred_at=event.occurred_at,
+                end_seconds=float(event.timestamp),
+            )
         )
         questions = tuple(
             _personamem_question(
@@ -1257,7 +1294,7 @@ def _personamem_question(
     return EvalQuestion(
         query.query_id,
         _split_parts(prompt),
-        (query.example_response or query.user_query,),
+        (query.example_response or query.groundtruth_preference or _NO_REFERENCE,),
         # Strictly before the query's moment: `_run_unit` ingests memories whose
         # end is `<=` the cutoff, and the release masks events at or after the
         # query. `nextafter` is the exact float below it.

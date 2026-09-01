@@ -70,6 +70,12 @@ class BeamTurn(ContractModel):
     """One conversation turn, timestamped only where an anchor was published."""
 
     turn_id: Identifier
+    # The turn's own published `id`. It is not unique within a conversation --
+    # 4 of the 35 conversations in the 1M tier restart the counter partway
+    # through, so `id` 0 appears twice with different content -- which is why
+    # `turn_id` is derived from document position instead. It is kept because
+    # the probing questions' `source_chat_ids` cite these values.
+    source_id: int = Field(ge=0)
     role: Literal["user", "assistant"]
     # A bare `str` guarded below: assistant turns run past the 2,048-character
     # cap that `NonEmptyString` imposes.
@@ -169,14 +175,15 @@ def _directory_key(path: Path) -> tuple[int, int, str]:
 def _conversation(directory: Path, tier: BeamTier) -> BeamConversation:
     conversation_id = directory.name
     turns = tuple(
-        _turn(conversation_id, raw)
-        for batch in _batches(directory / _CHAT_RELATIVE)
-        for pair in batch.turns
-        for raw in pair
-        if raw.content.strip()
+        _turn(conversation_id, position, raw)
+        for position, raw in enumerate(
+            raw
+            for batch in _batches(directory / _CHAT_RELATIVE)
+            for pair in batch.turns
+            for raw in pair
+            if raw.content.strip()
+        )
     )
-    if len({turn.turn_id for turn in turns}) != len(turns):
-        raise ValueError(f"BEAM conversation {tier}/{conversation_id} has duplicate turn IDs")
     return BeamConversation(
         tier=tier,
         conversation_id=conversation_id,
@@ -212,9 +219,11 @@ def _batches(chat_path: Path) -> tuple[_RawBatch, ...]:
     return tuple(_BATCHES.validate_python(flattened))
 
 
-def _turn(conversation_id: str, raw: _RawTurn) -> BeamTurn:
+def _turn(conversation_id: str, position: int, raw: _RawTurn) -> BeamTurn:
     return BeamTurn(
-        turn_id=f"{conversation_id}_T{raw.id:06d}",
+        # Document position, not the published `id`: see `BeamTurn.source_id`.
+        turn_id=f"{conversation_id}_T{position:06d}",
+        source_id=raw.id,
         role=_role(raw.role),
         # The generation harness left a literal "->-> 1,1" index marker on some
         # early turns. It is kept verbatim: it is part of what the official

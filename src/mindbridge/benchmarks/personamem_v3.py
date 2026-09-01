@@ -106,8 +106,10 @@ class PersonaMemQuery(ContractModel):
     persona_id: Identifier
     task_family: NonEmptyString
     task_type: NonEmptyString
-    query_kind: NonEmptyString
-    expected_behavior: NonEmptyString
+    # Blank on the alternate row shape described in `_RawQuery`, which
+    # publishes neither.
+    query_kind: str = ""
+    expected_behavior: str = ""
     timestamp: int
     asked_at: AwareDatetime
     # A bare `str` guarded below: some queries carry a long scenario body.
@@ -259,15 +261,29 @@ class _RawPreference(BaseModel):
 
 
 class _RawQuery(BaseModel):
+    """One `test.json` row, in either shape the release publishes.
+
+    Six of the 15,791 rows -- all `over_personalization_sensitive_event`, all
+    on one persona -- use a flattened spelling: `query_text` for the question,
+    `instance_json` holding the instance as a JSON *string* rather than an
+    object, `expected_response_kind` in place of `expected_behavior`, no
+    `query_kind` at all, and semicolon-joined instead of listed rubric tags.
+    Rejecting them failed the whole task, so both spellings are accepted.
+    """
+
     model_config = ConfigDict(extra="ignore")
 
     query_id: str
     task_family: str
     task_type: str
-    query_kind: str
-    expected_behavior: str
+    query_kind: str = ""
+    expected_behavior: str = ""
+    expected_response_kind: str | None = None
     ts: int
-    user_query: str
+    # Present-but-null on some rows, absent on the alternate shape; either way
+    # the question is resolved through the fallback chain in `_query`.
+    user_query: str | None = None
+    query_text: str | None = None
     prior_conversation: list[_RawTurn] | None = None
     example_response: str | None = None
     groundtruth_preference: str | None = None
@@ -276,6 +292,7 @@ class _RawQuery(BaseModel):
     # which publish the bare tag string `"sycophancy_resistance"`.
     rubric_tags: str | list[str] = Field(default_factory=list)
     instance_full: dict[str, object] | None = None
+    instance_json: str | None = None
 
 
 _EVENTS = TypeAdapter(list[_RawEvent])
@@ -318,9 +335,7 @@ def _persona(directory: Path) -> PersonaMemPersona | None:
 def _queries(directory: Path) -> tuple[PersonaMemQuery, ...]:
     raw_queries = _QUERIES.validate_json((directory / _TEST_FILE).read_bytes())
     queries = tuple(
-        _query(directory.name, raw)
-        for raw in raw_queries
-        if raw.task_type not in CLUSTER_TASK_TYPES and raw.user_query.strip()
+        query for query in (_query(directory.name, raw) for raw in raw_queries) if query is not None
     )
     if len({query.query_id for query in queries}) != len(queries):
         raise ValueError(f"PersonaMem-v3 persona {directory.name} has duplicate query IDs")
@@ -344,19 +359,35 @@ _EVIDENCE_EXCLUDED = frozenset(
 )
 
 
-def _query(persona_id: str, raw: _RawQuery) -> PersonaMemQuery:
-    payload = raw.instance_full or {}
+def _query(persona_id: str, raw: _RawQuery) -> PersonaMemQuery | None:
+    """Build one query, or drop the row.
+
+    A row is dropped when its task type is cluster-scored, or when no spelling
+    carries question text -- some rows publish `user_query` as null and hold
+    the question in the instance instead, and a few carry none at all.
+    """
+    if raw.task_type in CLUSTER_TASK_TYPES:
+        return None
+    payload = raw.instance_full if raw.instance_full is not None else _instance_json(raw)
     instance = _RawInstance.model_validate(payload)
+    user_query = (
+        raw.user_query
+        or raw.query_text
+        or _text_field(payload, "user_query")
+        or _text_field(payload, "query_text")
+    )
+    if not user_query.strip():
+        return None
     return PersonaMemQuery(
         query_id=raw.query_id,
         persona_id=persona_id,
         task_family=raw.task_family,
         task_type=raw.task_type,
         query_kind=raw.query_kind,
-        expected_behavior=raw.expected_behavior,
+        expected_behavior=raw.expected_behavior or raw.expected_response_kind or "",
         timestamp=raw.ts,
         asked_at=_moment(raw.ts),
-        user_query=raw.user_query,
+        user_query=user_query,
         prior_conversation=tuple(
             PersonaMemTurn(role=turn.role, content=turn.content)
             for turn in raw.prior_conversation or ()
@@ -391,8 +422,25 @@ def _indexes(held_out: int | None, *groups: list[int]) -> tuple[int, ...]:
 
 
 def _rubric_tags(value: str | list[str]) -> tuple[str, ...]:
-    tags = (value,) if isinstance(value, str) else tuple(value)
-    return tuple(tag.strip() for tag in tags if tag.strip())
+    """Normalise the three published spellings: a list, a bare tag, or a
+    semicolon-joined string."""
+    listed = [value] if isinstance(value, str) else list(value)
+    return tuple(tag.strip() for item in listed for tag in item.split(";") if tag.strip())
+
+
+def _instance_json(raw: _RawQuery) -> dict[str, object]:
+    """Parse the alternate shape's JSON-string instance."""
+    if not raw.instance_json:
+        return {}
+    parsed = json.loads(raw.instance_json)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"PersonaMem-v3 query {raw.query_id} has a non-object instance")
+    return parsed
+
+
+def _text_field(payload: Mapping[str, object], key: str) -> str:
+    value = payload.get(key)
+    return value if isinstance(value, str) else ""
 
 
 def _event(raw: _RawEvent, app: str) -> PersonaMemEvent:

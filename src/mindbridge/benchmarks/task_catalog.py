@@ -356,16 +356,15 @@ TASKS: dict[str, TaskSpec] = {
                 f"beam/chats/{tier}",
                 "beam_official_v1",
                 _BEAM,
-                # Only the 100K tier is pinned by digest: it is the one whose
-                # files were downloaded and hashed here. A directory digest
-                # covers exactly the files `dataset_patterns` fetches, so
-                # publishing an unverified one for the other tiers would turn
-                # a first download into a spurious mismatch.
-                digest=(
-                    "436b683f25e5f678f2735dd993513ec119edc2d3d2a391cc497e9849dcaa5f59"
-                    if tier == "100K"
-                    else None
-                ),
+                # A directory digest covers exactly the files
+                # `dataset_patterns` fetches, and each was computed from a
+                # completed download of that tier.
+                digest={
+                    "100K": "436b683f25e5f678f2735dd993513ec119edc2d3d2a391cc497e9849dcaa5f59",
+                    "500K": "f313b8c94256a90845b03d282cb47ca0685c16a0ecc8c105040434f3dcccaaa0",
+                    "1M": "8d9dd349a305fe15b5e87c760604e56d08def185eb34e3f1b3446c33b03160a1",
+                    "10M": "27e40a17304def64bc864d182e147b990cbb4a125b941c306eabe61a2675cd84",
+                }[tier],
                 variant=tier,
                 dataset_patterns=(
                     f"chats/{tier}/*/chat.json",
@@ -380,7 +379,7 @@ TASKS: dict[str, TaskSpec] = {
             "personamem-v3/backend",
             "personamem_v3_official_v1",
             _PERSONAMEM_V3,
-            digest=None,
+            digest="57d2c06fa5d7d65d2b2472ab8bbf0512eb6e4d4265c85ee5b980283e6b174443",
             # `persona.html` is a 4.6 MB self-contained browsable rendering of
             # the JSON beside it -- 465 MB across the cohort that no loader
             # opens. `profile.json` is excluded for a different reason: it is
