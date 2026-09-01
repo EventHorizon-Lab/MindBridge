@@ -38,6 +38,12 @@ class TaskSpec:
     auxiliary: tuple[str, ...] = ()
     media: str | None = None
     media_source: MediaSource | None = None
+    # Glob patterns, relative to the release root, that a directory dataset
+    # downloads. Without them a directory input is fetched whole, which for
+    # PersonaMem-v3 means 465 MB of `persona.html` no loader opens, and for
+    # BEAM means a `.pickle` beside every JSON the loader reads. Empty means
+    # "fetch the whole directory", which is what every other task wants.
+    dataset_patterns: tuple[str, ...] = ()
 
     def dataset_path(self, root: Path) -> Path:
         return root / self.dataset
@@ -70,6 +76,13 @@ _SUPERMEMORY = (
 )
 _ATM = ("Jingbiao/ATM-Bench", "78e826dc07e97466b2f54443831ef9a83ab8b27c")
 _GALLERY = ("Ethan-Bei/Mem-Gallery", "af912daba984e896e253016b7c7e334ef92c2a6f")
+_LONGMEMEVAL = ("xiaowu0162/longmemeval", "2ec2a557f339b6c0369619b1ed5793734cc87533")
+_CLBENCH = ("tencent/CL-bench", "b28a5832a09b0d96c0cf4c22e90d7c60ede25b80")
+_BEAM = ("mohammadtavakoli78/BEAM", "3e12035532eb85768f1a7cd779832b650c4b2ef9")
+_PERSONAMEM_V3 = (
+    "bowen-upenn/PersonaMem-v3",
+    "7b00a090b35b7293e6efeeb19494207f32b5a9ee",
+)
 
 _M3_ROBOT_MEDIA = MediaSource(
     "m3-bench",
@@ -104,6 +117,7 @@ def _task(
     auxiliary: tuple[str, ...] = (),
     media: str | None = None,
     media_source: MediaSource | None = None,
+    dataset_patterns: tuple[str, ...] = (),
 ) -> TaskSpec:
     return TaskSpec(
         name,
@@ -117,6 +131,7 @@ def _task(
         auxiliary,
         media,
         media_source,
+        dataset_patterns,
     )
 
 
@@ -318,6 +333,71 @@ TASKS: dict[str, TaskSpec] = {
             for split in ("main", "hard")
         ),
         _task(
+            "longmemeval-s",
+            "LongMemEval",
+            "longmemeval/longmemeval_s",
+            "longmemeval_official_v1",
+            _LONGMEMEVAL,
+            digest="08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894",
+            variant="s",
+        ),
+        _task(
+            "clbench",
+            "CL-Bench",
+            "clbench/CL-bench.jsonl",
+            "clbench_official_v1",
+            _CLBENCH,
+            digest="d5fc88d4b2eea75c61dd40862021b6ae2fba26bd21b58e8c5e18377a763943be",
+        ),
+        *(
+            _task(
+                f"beam-{tier.casefold()}",
+                "BEAM",
+                f"beam/chats/{tier}",
+                "beam_official_v1",
+                _BEAM,
+                # Only the 100K tier is pinned by digest: it is the one whose
+                # files were downloaded and hashed here. A directory digest
+                # covers exactly the files `dataset_patterns` fetches, so
+                # publishing an unverified one for the other tiers would turn
+                # a first download into a spurious mismatch.
+                digest=(
+                    "436b683f25e5f678f2735dd993513ec119edc2d3d2a391cc497e9849dcaa5f59"
+                    if tier == "100K"
+                    else None
+                ),
+                variant=tier,
+                dataset_patterns=(
+                    f"chats/{tier}/*/chat.json",
+                    f"chats/{tier}/*/probing_questions/probing_questions.json",
+                ),
+            )
+            for tier in ("100K", "500K", "1M", "10M")
+        ),
+        _task(
+            "personamem-v3",
+            "PersonaMem-v3",
+            "personamem-v3/backend",
+            "personamem_v3_official_v1",
+            _PERSONAMEM_V3,
+            digest=None,
+            # `persona.html` is a 4.6 MB self-contained browsable rendering of
+            # the JSON beside it -- 465 MB across the cohort that no loader
+            # opens. `profile.json` is excluded for a different reason: it is
+            # the scorer-side ground-truth persona the release states is never
+            # shown to the evaluated agent, and leaving it out of the download
+            # keeps it out of reach of the memory path by construction.
+            dataset_patterns=(
+                "backend/*/instagram.json",
+                "backend/*/facebook.json",
+                "backend/*/threads.json",
+                "backend/*/chatbot.json",
+                "backend/*/ai_studio.json",
+                "backend/*/calendar.json",
+                "backend/*/test.json",
+            ),
+        ),
+        _task(
             "mem-gallery",
             "Mem-Gallery",
             "mem-gallery/data/dialog",
@@ -335,6 +415,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "memlens": tuple(name for name in TASKS if name.startswith("memlens-")),
     "mm-lifelong": tuple(name for name in TASKS if name.startswith("mm-lifelong-")),
     "atm-bench": tuple(name for name in TASKS if name.startswith("atm-bench-")),
+    "beam": tuple(name for name in TASKS if name.startswith("beam-")),
     "all": tuple(TASKS),
 }
 
@@ -353,6 +434,11 @@ ALIASES = {
     "atm-hard": "atm-bench-hard",
     "atm-main-sgm": "atm-bench-main-sgm",
     "atm-hard-sgm": "atm-bench-hard-sgm",
+    "longmemeval": "longmemeval-s",
+    "longmemeval-small": "longmemeval-s",
+    "cl-bench": "clbench",
+    "personamem": "personamem-v3",
+    "personamem-v3-backend": "personamem-v3",
 }
 
 

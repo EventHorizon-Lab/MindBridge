@@ -159,14 +159,18 @@ def test_query_parts_and_gallery_image_id_preserve_retrieval_evidence(tmp_path: 
 def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
     assert {task.benchmark for task in TASKS.values()} == {
         "ATM-Bench",
+        "BEAM",
+        "CL-Bench",
         "EgoLifeQA",
         "EgoMemReason",
         "EgoTempo",
         "LoCoMo-Refined",
+        "LongMemEval",
         "M3-Bench",
         "MM-Lifelong",
         "Mem-Gallery",
         "MemLens",
+        "PersonaMem-v3",
         "SuperMemory-VQA",
         "Video-MME",
         "Video-MME-v2",

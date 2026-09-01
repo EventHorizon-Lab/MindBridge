@@ -26,13 +26,15 @@ mindbridge-bench eval --list-tasks
 ```
 
 The catalog currently covers LoCoMo-Refined, M3-Bench, Video-MME and Video-MME-v2,
-EgoLifeQA, EgoMemReason, EgoTempo, MemLens, MM-Lifelong, SuperMemory-VQA, ATM-Bench, and
-Mem-Gallery. Use the listing command instead of copying task names from this page; it is generated
-from the catalog used by the runner.
+EgoLifeQA, EgoMemReason, EgoTempo, MemLens, MM-Lifelong, SuperMemory-VQA, ATM-Bench,
+Mem-Gallery, LongMemEval, CL-Bench, BEAM, and PersonaMem-v3. Use the listing command instead of
+copying task names from this page; it is generated from the catalog used by the runner.
 
 Review each printed repository and revision before downloading data. Upstream terms vary:
-LoCoMo-Refined is CC BY-NC 4.0, while MM-Lifelong is academic-only and restricts redistribution or
-modification without prior approval. MindBridge's license does not replace those terms; see the
+LoCoMo-Refined and PersonaMem-v3 are CC BY-NC 4.0, MM-Lifelong is academic-only and restricts
+redistribution or modification without prior approval, and CL-Bench carries an evaluation-only
+license that forbids training, fine-tuning or distilling on the corpus. MindBridge's license does
+not replace those terms; see the
 [scorer notices](../src/mindbridge/benchmarks/_official/NOTICE.md).
 
 ## Run an evaluation
@@ -100,6 +102,50 @@ the runner ingests only observations ending at or before the question cutoff. Re
 resolved from the manifest file. When the runner prepares media itself, it writes
 `OUTPUT/media-manifest.json`; use that generated file as the format reference before supplying an
 operator-authored replacement.
+
+## Text-only memory benchmarks
+
+Four tasks read no media, so they need neither `ffmpeg` nor a preparation pass:
+
+| Task | Unit | Corpus | Official headline |
+| --- | --- | --- | --- |
+| `longmemeval-s` | one question | its own 50-session haystack | `accuracy`, the yes/no answer-check judge |
+| `clbench` | one task | the reference document behind its question | `solving_rate`, the binary rubric judge |
+| `beam-100k` … `beam-10m` | one conversation | the whole transcript | `llm_judge_score`, mean over rubric items |
+| `personamem-v3` | one persona | five engagement logs plus a calendar stream | `personamem_score`, 0-1 |
+
+Three of them need a note before a number is quoted:
+
+- **CL-Bench publishes no `question` field.** Each record's final turn mixes a reference document
+  -- up to ~150,000 characters -- with the query in one string, and the loader splits it at the
+  last blank-line paragraph break. 1,322 of the 1,899 records split cleanly (median question 434
+  characters); 130 end up with a question of 2,000 characters or more and carry
+  `question_unsliced` in their metadata. Filter on that field before reporting.
+- **BEAM's `event_ordering` category loses part of its official metric.** Upstream combines the
+  per-rubric judge score with `tau_norm x f1`, whose alignment step is a second, differently
+  shaped model call the runner does not issue. The per-rubric `llm_judge_score` is reported and
+  the composite is left absent rather than approximated.
+- **PersonaMem-v3 is scored on the families the pinned release supports.** Its evaluation
+  repository has drifted from the released data -- the repository's slate scorer reads a `slate`
+  and `origin_by_idx` the release does not publish -- so the reproduced protocols read only
+  released fields: the unified personalization rubric (13 task types), the four task-specific
+  judges, and the deterministic ranking family. The proactive decision judge, the two
+  repetition-fatigue cluster tasks, `new_suggestions_chatbot`, `local_recommendation_geo_shift`
+  and `active_mistake_prevention` are answered and reported but carry no official headline; the
+  cluster rows are dropped at load because their runner threads each response into the next
+  prompt. The rubric judge's evidence block is also narrower than upstream's `build_source_a`,
+  which queries the persona backend for the same-day avoid slice and the privacy flags, so
+  hard-rule checks that depend on those under-fire relative to a full-harness run.
+
+PersonaMem-v3 masks history causally: each query is answered against only the events that happened
+strictly before its timestamp, which the runner applies through the same cutoff machinery the
+causal video tasks use. `profile.json` is the scorer-side ground-truth persona and is neither
+downloaded nor read as memory.
+
+`ScriptMem` is deliberately absent. Its public release ships questions, gold answers and a scorer,
+but every `conversation` field holds only a `format_example` placeholder -- the four source scripts
+are withheld for copyright -- so there is nothing for a memory system to retrieve and an offline
+number would measure the generator's prior knowledge of the scripts rather than its memory.
 
 ## Results and reproducibility
 
