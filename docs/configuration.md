@@ -172,5 +172,14 @@ caller-supplied SDK client open, so the outer client context remains the applica
 responsibility. Credentials, retries, timeouts, proxies, and connection pooling also remain SDK
 configuration.
 
+Two capability slots are reachable only this way, or through `MemoryPlugins`; no declarative
+provider selects either implicitly:
+
+- `former=` takes a `FormationBackend`, which proposes typed memories after a raw observation
+  commits. Configuring the declarative `generation` slot never enables automatic formation.
+- `vision_describer=` takes a `VisionDescriptionBackend`. `AsyncVisionStream` calls it at
+  finality only when the embedder lacks native image support and no external `VisionPartial`
+  is available.
+
 For every constructor and protocol field, see the [Python API](api/python-sdk.md). For benchmark
 environment variables, see [benchmarking](benchmarking.md).

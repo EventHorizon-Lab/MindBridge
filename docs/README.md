@@ -30,6 +30,8 @@ owns the fact you need.
 - [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) — completed
   observations, speculative recall, and derived records.
 - [Benchmarking](benchmarking.md) — reproducible evaluation and local-index measurement.
+- [Competitive memory-system review](competitive-memory-systems.md) — source audit of ABot,
+  M3-Agent, VoiceMem, eMEM, MIRIX, Graphiti, Mem0, and TeleMem, plus the resulting gap roadmap.
 
 For repository setup and quality gates, see [CONTRIBUTING.md](../CONTRIBUTING.md).
 When a fact changes, update its owning page and link to it instead of copying it into another guide.

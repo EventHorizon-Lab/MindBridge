@@ -362,6 +362,55 @@ def test_add_search_get_list_and_delete_round_trip(
     assert cast(dict[str, object], envelope[0])["code"] == "memory_not_found"
 
 
+def test_typed_context_and_scope_round_trip(app: str, capsys: pytest.CaptureFixture[str]) -> None:
+    spatial = {
+        "frame_id": "room",
+        "anchor": "subject",
+        "x": 1.0,
+        "y": 2.0,
+        "position_uncertainty_m": 0.25,
+    }
+    context = {
+        "basis": "user_statement",
+        "source_id": "turn-7",
+        "confidence": 0.9,
+        "valid_from": "2026-08-01T00:00:00Z",
+        "spatial": spatial,
+    }
+    status, added, _ = _run(
+        capsys,
+        "--app",
+        app,
+        "-q",
+        "add",
+        "a red wrench on the bench",
+        "--context",
+        json.dumps(context),
+    )
+    assert status == 0
+    stored_context = cast(dict[str, object], cast(dict[str, object], added)["context"])
+    assert stored_context["source_id"] == "turn-7"
+    assert stored_context["spatial"] == {**spatial, "z": 0.0, "orientation_xyzw": None}
+
+    scope = {
+        "valid_at": "2026-08-02T00:00:00Z",
+        "near": {**spatial, "position_uncertainty_m": 0.0},
+        "radius_m": 0.5,
+    }
+    status, found, _ = _run(
+        capsys,
+        "--app",
+        app,
+        "-q",
+        "search",
+        "red wrench",
+        "--scope",
+        json.dumps(scope),
+    )
+    assert status == 0
+    assert len(cast(dict[str, list[object]], found)["hits"]) == 1
+
+
 def test_quiet_suppresses_only_the_banner(app: str, capsys: pytest.CaptureFixture[str]) -> None:
     _status, quiet_stdout, quiet_stderr = _run(capsys, "--app", app, "-q", "add", "a red wrench")
     assert quiet_stderr == []
@@ -396,7 +445,13 @@ def test_add_many_reads_jsonl_with_per_item_time_and_metadata(
         "\n".join(
             (
                 json.dumps({"content": "a red wrench", "metadata": {"n": 1}}),
-                json.dumps({"content": "a blue toolbox", "occurred_at": "2026-01-01T00:00:00Z"}),
+                json.dumps(
+                    {
+                        "content": "a blue toolbox",
+                        "occurred_at": "2026-01-01T00:00:00Z",
+                        "context": {"source_id": "camera-1", "confidence": 0.8},
+                    }
+                ),
             )
         ),
         encoding="utf-8",
@@ -406,6 +461,7 @@ def test_add_many_reads_jsonl_with_per_item_time_and_metadata(
     memories = cast(dict[str, list[dict[str, object]]], document)["memories"]
     assert [item["metadata"] for item in memories] == [{"n": 1}, {}]
     assert memories[1]["occurred_at"] == "2026-01-01T00:00:00Z"
+    assert cast(dict[str, object], memories[1]["context"])["source_id"] == "camera-1"
 
 
 def test_add_stream_commits_before_reading_a_later_invalid_line(
@@ -684,6 +740,8 @@ def test_remote_mode_posts_to_v1_and_echoes_the_body(
         "2026-08-27T00:00:00Z",
         "--occurred-until",
         "2026-08-28T00:00:00Z",
+        "--scope",
+        json.dumps({"valid_at": "2026-08-27T12:00:00Z"}),
     )
     assert status == 0
     assert document == {"hits": []}
@@ -696,9 +754,43 @@ def test_remote_mode_posts_to_v1_and_echoes_the_body(
                 "limit": 3,
                 "occurred_from": "2026-08-27T00:00:00Z",
                 "occurred_until": "2026-08-28T00:00:00Z",
+                "scope": {
+                    "valid_at": "2026-08-27T12:00:00Z",
+                    "known_at": None,
+                    "near": None,
+                    "radius_m": None,
+                },
             },
         )
     ]
+
+
+def test_remote_mode_serializes_typed_observation_context(
+    calls: list[tuple[str, str, object]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    context = {
+        "basis": "observation",
+        "source_id": "microphone-2",
+        "confidence": 0.7,
+        "valid_from": "2026-08-27T00:00:00Z",
+    }
+    status, _document, _ = _run(
+        capsys,
+        "--url",
+        "http://owner:8000",
+        "-q",
+        "add",
+        "door closed",
+        "--context",
+        json.dumps(context),
+    )
+    assert status == 0
+    body = cast(dict[str, object], calls[0][2])
+    assert body["context"] == {
+        **context,
+        "valid_until": None,
+        "spatial": None,
+    }
 
 
 def test_remote_mode_passes_the_cursor_through_unparsed(

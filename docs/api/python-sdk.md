@@ -55,7 +55,9 @@ Memory(
     embedder: EmbeddingBackend,
     answerer: GenerationBackend | None = None,
     transcriber: SpeechBackend | TranscriptionBackend | None = None,
+    vision_describer: VisionDescriptionBackend | None = None,
     face_analyzer: FaceBackend | None = None,
+    former: FormationBackend | None = None,
     index_speech: bool = False,
     index_quantization: IndexQuantization = IndexQuantization.NONE,
     minimum_relevance: float = 0.55,
@@ -78,6 +80,10 @@ the supported provider configuration fields live in [configuration](../configura
 
 A plain `TranscriptionBackend` transcribes supported audio/video during `add` regardless of
 `index_speech`; `SpeechBackend` analysis and identity resolution stay behind the explicit flag.
+
+`vision_describer` and `former` have no declarative provider and are reachable only through
+direct construction or `MemoryPlugins`. `former` proposes typed memories after a source
+observation commits; omitting it keeps ordinary add behavior and makes no formation model call.
 
 Turn `index_speech` on for any corpus whose memories carry speech. Without it a video memory's
 indexed document is whatever text the caller supplied, which for clip-shaped ingestion is often a
@@ -116,8 +122,8 @@ resolve_memory_config(
 ) -> MemoryComposition
 ```
 
-`MemoryPlugins` contains `embedder`, optional `answerer`, optional `transcriber`, and optional
-`face_analyzer`. `MemoryConfig` contains the value-only settings from the constructor;
+`MemoryPlugins` contains `embedder`, optional `answerer`, optional `transcriber`, optional
+`vision_describer`, optional `face_analyzer`, and optional `former`. `MemoryConfig` contains the value-only settings from the constructor;
 `MemorySettings` is its public alias. `MemoryComposition` contains `data_dir`, `plugins`, and
 `settings`; call `close()` unless its plugins have been transferred to a `Memory`.
 
@@ -167,6 +173,7 @@ add(
     occurred_end: datetime | None = None,
     metadata: Mapping[str, object] | None = None,
     memory_type: MemoryType = MemoryType.SEMANTIC,
+    context: ObservationContext | None = None,
 ) -> MemoryRecord
 
 add_many(
@@ -176,6 +183,7 @@ add_many(
     occurred_end: Sequence[datetime | None] | None = None,
     metadata: Sequence[Mapping[str, object] | None] | None = None,
     memory_type: MemoryType = MemoryType.SEMANTIC,
+    context: Sequence[ObservationContext | None] | None = None,
 ) -> tuple[MemoryRecord, ...]
 
 add_stream(
@@ -198,6 +206,7 @@ search(
     reference_at: datetime | None = None,
     occurred_from: datetime | None = None,
     occurred_until: datetime | None = None,
+    scope: RetrievalScope | None = None,
 ) -> tuple[SearchHit, ...]
 
 search_with_trace(
@@ -208,6 +217,7 @@ search_with_trace(
     reference_at: datetime | None = None,
     occurred_from: datetime | None = None,
     occurred_until: datetime | None = None,
+    scope: RetrievalScope | None = None,
 ) -> TracedSearchResult
 
 ask(
@@ -216,6 +226,7 @@ ask(
     limit: int = 5,
     memory_type: MemoryType | None = None,
     reference_at: datetime | None = None,
+    scope: RetrievalScope | None = None,
 ) -> AnswerResult
 ```
 
@@ -223,6 +234,12 @@ ask(
 used when it is omitted. `occurred_from` and `occurred_until` are optional timezone-aware,
 half-open event-overlap filters; either may be omitted, and two bounds require
 `occurred_until > occurred_from`. Records without `occurred_at` do not match a bounded search.
+
+`scope` adds the bitemporal and spatial filters. `valid_at` selects world validity, `known_at`
+selects the transaction version known then, and `near` with a non-negative `radius_m` restricts
+results to one matching coordinate frame and anchor. SQLite reapplies every scope filter after
+candidate retrieval; see
+[valid time and transaction time](../memory-types-time-and-decay.md#valid-time-and-transaction-time).
 
 `search_with_trace(...).hits` equals the corresponding `search(...)` result. Its bounded trace
 contains identifiers, score components, ranks, and rejection reasons, but no query, content,
@@ -298,13 +315,26 @@ The principal immutable values are:
 | --- | --- |
 | `Blob` | `data`, `media_type`, `name` |
 | `AssetRef` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name`, `path`; `is_resolved` property |
-| `StreamInput` | `content`, `occurred_at`, `occurred_end`, `metadata`, `memory_type` |
-| `MemoryRecord` | `id`, `content`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `assets`, `modality`, `memory_type` |
+| `StreamInput` | `content`, `occurred_at`, `occurred_end`, `metadata`, `memory_type`, `context`, `transcript`, `description` |
+| `MemoryRecord` | `id`, `content`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `assets`, `modality`, `memory_type`, `context` |
 | `SearchHit` | all visible memory fields plus `score` |
 | `AnswerResult` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `Page` | `items`, `next_cursor` |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
 | `FaceObservation` | `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
+| `SpatialContext` | `frame_id`, `anchor`, `x`, `y`, `z`, `orientation_xyzw`, `position_uncertainty_m` |
+| `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial` |
+| `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `spatial`, `cue_modality`, `valence`, `arousal` |
+| `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m` |
+| `StreamEvent` | `phase`, `item`, `stream_id` |
+| `StreamCommit` | `record`, `prefetch`, `retrieval_error`, `stream_id` |
+| `PCMChunk` | `data`, `sample_rate_hz`, `channels`, `sample_width_bytes`, `stream_id`, `occurred_at` |
+| `VADPacket` | `active`, `stream_id`, `occurred_at` |
+| `ASRPartial` | `text`, `stream_id`, `occurred_at` |
+| `AcousticBoundary` | `boundary`, `stream_id`, `occurred_at` |
+| `VisionFrame` | `image`, `stream_id`, `occurred_at` |
+| `VisionPartial` | `text`, `stream_id`, `occurred_at` |
+| `SceneBoundary` | `boundary`, `stream_id`, `occurred_at` |
 | `PrefetchResult` | positive `revision`, `hits` |
 | `TracedSearchResult` | `hits`, `trace` |
 | `RetrievalTrace` | `candidates`, `candidate_limit`, `exhaustive`, `ambiguous` |
@@ -326,6 +356,12 @@ Enum values are:
 | `AbstentionReason` | `no_evidence`, `insufficient_evidence` |
 | `RetrievalRejection` | `stale_index`, `occurrence_range`, `missing_memory`, `memory_type`, `minimum_relevance`, `ambiguity`, `limit` |
 | `EmbedTask` | `retrieval.query`, `retrieval.document` |
+| `MemoryKind` | `observation`, `entity`, `event`, `state`, `relation`, `affect`, `trait`, `response_policy` |
+| `EvidenceBasis` | `observation`, `user_statement`, `model_inference`, `response_feedback` |
+| `SpatialAnchor` | `observer`, `subject` |
+| `StreamPhase` | `update`, `final`, `cancel` |
+| `AudioBoundary` | `start`, `end`, `cancel` |
+| `VisionBoundary` | `start`, `end`, `cancel` |
 
 ### Backend protocols
 
@@ -358,13 +394,27 @@ SpeechBackend.analyze(
 FaceBackend.analyze(
     assets: Sequence[AssetRef],
 ) -> tuple[FaceAnalysis, ...]
+
+VisionDescriptionBackend.describe(
+    inputs: Sequence[ModelInput],
+) -> tuple[str, ...]
+
+FormationBackend.form(
+    inputs: Sequence[FormationInput],
+) -> tuple[tuple[FormationProposal, ...], ...]
 ```
 
 Required properties are `embedding_capabilities`, `embedding_model`, `embedding_space`, and
 `embedding_dimension` for embedding; `transcription_capabilities`, `transcription_model`, and
 `transcription_space` for transcription and speech; `face_capabilities`, `face_model`,
-`face_space`, and `face_analysis_space` for faces; and `generation_capabilities` for generation.
-Every base protocol except the optional streaming extension implements `close()`.
+`face_space`, and `face_analysis_space` for faces; `vision_capabilities` and `vision_model` for
+visual description; `formation_capabilities`, `formation_model`, and `formation_space` for
+formation; and `generation_capabilities` for generation. Every base protocol except the optional
+streaming extension implements `close()`.
+
+`form` receives one `FormationInput` per committed source and returns one proposal tuple per
+input, in the same order. A former never writes storage: the kernel validates each proposal
+against the source modality and spatial frame, assigns identity, links evidence, and commits.
 
 `ModelInput` contains normalized `text` and resolved `assets`. Speech adapters return
 `SpeechAnalysis(turns, speakers)` using `SpeechTurn` and `SpeakerEmbedding`; face adapters return
@@ -378,6 +428,8 @@ Every base protocol except the optional streaming extension implements `close()`
 | `SpeechAnalysis` | `turns`, `speakers` |
 | `FaceEmbedding` | `face_label`, `values`, `bounding_box`, `observed_at_ms` |
 | `FaceAnalysis` | `faces` |
+| `FormationInput` | `memory_id`, `content`, `context` |
+| `FormationProposal` | `kind`, `content`, `basis`, `subject`, `predicate`, `value`, `confidence`, `valid_from`, `valid_until`, `spatial`, `cue_modality`, `valence`, `arousal` |
 
 ### Bundled adapters
 

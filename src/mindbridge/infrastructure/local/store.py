@@ -12,15 +12,24 @@ import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, NoReturn
 
 from mindbridge.infrastructure.local._lock import DataDirectoryLock
 from mindbridge.models.base import FaceAnalysis, SpeechAnalysis
-from mindbridge.types import FaceObservation, SpeakerSegment
+from mindbridge.types import (
+    EvidenceBasis,
+    FaceObservation,
+    MemoryContext,
+    MemoryKind,
+    Modality,
+    SpatialAnchor,
+    SpatialContext,
+    SpeakerSegment,
+)
 
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 _SQLITE_PARAMETER_BATCH = 900
 _FACE_EXEMPLAR_LIMIT = 10
 _VOICE_EXEMPLAR_LIMIT = 20
@@ -47,6 +56,10 @@ _REQUIRED_TABLES = frozenset(
         "speech_analyses",
         "speech_segments",
         "store_metadata",
+        "formation_runs",
+        "memory_evidence",
+        "memory_semantics",
+        "memory_versions",
     }
 )
 _ASSET_SCHEMA = """
@@ -220,7 +233,103 @@ CREATE TABLE face_observations (
 CREATE INDEX face_observations_identity_idx ON face_observations (identity_id);
 """
 
-_SCHEMA_V7 = f"""
+_SEMANTIC_SCHEMA = """
+CREATE TABLE memory_semantics (
+    memory_id TEXT PRIMARY KEY REFERENCES memory_records (memory_id) ON DELETE CASCADE,
+    lineage_id TEXT NOT NULL CHECK (length(trim(lineage_id)) > 0),
+    kind TEXT NOT NULL CHECK (
+        kind IN (
+            'observation', 'entity', 'event', 'state', 'relation',
+            'affect', 'trait', 'response_policy'
+        )
+    ),
+    basis TEXT NOT NULL CHECK (
+        basis IN ('observation', 'user_statement', 'model_inference', 'response_feedback')
+    ),
+    source_id TEXT,
+    subject TEXT,
+    predicate TEXT,
+    value TEXT,
+    model_id TEXT,
+    recipe TEXT,
+    cue_modality TEXT CHECK (
+        cue_modality IS NULL OR cue_modality IN ('text', 'image', 'video', 'audio')
+    ),
+    valence REAL CHECK (valence IS NULL OR (valence >= -1.0 AND valence <= 1.0)),
+    arousal REAL CHECK (arousal IS NULL OR (arousal >= 0.0 AND arousal <= 1.0)),
+    spatial_frame_id TEXT,
+    spatial_anchor TEXT CHECK (
+        spatial_anchor IS NULL OR spatial_anchor IN ('observer', 'subject')
+    ),
+    spatial_x REAL,
+    spatial_y REAL,
+    spatial_z REAL,
+    spatial_qx REAL,
+    spatial_qy REAL,
+    spatial_qz REAL,
+    spatial_qw REAL,
+    spatial_uncertainty_m REAL CHECK (
+        spatial_uncertainty_m IS NULL OR spatial_uncertainty_m >= 0.0
+    ),
+    CHECK (
+        (spatial_frame_id IS NULL AND spatial_anchor IS NULL
+         AND spatial_x IS NULL AND spatial_y IS NULL AND spatial_z IS NULL)
+        OR
+        (spatial_frame_id IS NOT NULL AND spatial_anchor IS NOT NULL
+         AND spatial_x IS NOT NULL AND spatial_y IS NOT NULL AND spatial_z IS NOT NULL)
+    )
+);
+
+CREATE INDEX memory_semantics_lineage_idx
+    ON memory_semantics (lineage_id, memory_id);
+CREATE INDEX memory_semantics_spatial_idx
+    ON memory_semantics (spatial_frame_id, spatial_anchor, memory_id);
+
+CREATE TABLE memory_versions (
+    memory_id TEXT NOT NULL REFERENCES memory_semantics (memory_id) ON DELETE CASCADE,
+    version INTEGER NOT NULL CHECK (version > 0),
+    confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    valid_from TEXT,
+    valid_until TEXT CHECK (
+        valid_until IS NULL OR (valid_from IS NOT NULL AND valid_until > valid_from)
+    ),
+    recorded_at TEXT NOT NULL,
+    retired_at TEXT CHECK (retired_at IS NULL OR retired_at > recorded_at),
+    visible INTEGER NOT NULL DEFAULT 1 CHECK (visible IN (0, 1)),
+    supersedes_id TEXT REFERENCES memory_records (memory_id) ON DELETE SET NULL,
+    PRIMARY KEY (memory_id, version)
+);
+
+CREATE INDEX memory_versions_current_idx
+    ON memory_versions (memory_id, retired_at, recorded_at, version);
+
+CREATE TABLE memory_evidence (
+    memory_id TEXT NOT NULL REFERENCES memory_semantics (memory_id) ON DELETE CASCADE,
+    source_memory_id TEXT NOT NULL,
+    source_group_id TEXT NOT NULL CHECK (length(trim(source_group_id)) > 0),
+    position INTEGER NOT NULL CHECK (position >= 0),
+    confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    recorded_at TEXT NOT NULL,
+    retired_at TEXT CHECK (retired_at IS NULL OR retired_at > recorded_at),
+    PRIMARY KEY (memory_id, position),
+    CHECK (memory_id <> source_memory_id)
+);
+
+CREATE INDEX memory_evidence_source_idx
+    ON memory_evidence (source_memory_id, retired_at, memory_id);
+CREATE UNIQUE INDEX memory_evidence_current_idx
+    ON memory_evidence (memory_id, source_memory_id)
+    WHERE retired_at IS NULL;
+
+CREATE TABLE formation_runs (
+    source_memory_id TEXT NOT NULL REFERENCES memory_records (memory_id) ON DELETE CASCADE,
+    recipe TEXT NOT NULL CHECK (length(trim(recipe)) > 0),
+    completed_at TEXT NOT NULL,
+    PRIMARY KEY (source_memory_id, recipe)
+);
+"""
+
+_SCHEMA_V8 = f"""
 BEGIN IMMEDIATE;
 
 CREATE TABLE memory_records (
@@ -261,6 +370,7 @@ CREATE INDEX embeddings_memory_idx ON embeddings (memory_id);
 
 {_ASSET_SCHEMA}
 {_IDENTITY_SCHEMA}
+{_SEMANTIC_SCHEMA}
 
 CREATE TABLE store_metadata (
     key TEXT PRIMARY KEY CHECK (length(trim(key)) > 0),
@@ -280,7 +390,14 @@ CREATE INDEX search_index_queue_order_idx
 
 {_INDEX_TRIGGERS}
 
-PRAGMA user_version = 7;
+PRAGMA user_version = 8;
+COMMIT;
+"""
+
+_MIGRATE_V7_TO_V8 = f"""
+BEGIN IMMEDIATE;
+{_SEMANTIC_SCHEMA}
+PRAGMA user_version = 8;
 COMMIT;
 """
 
@@ -533,6 +650,7 @@ class StoredMemory:
     assets: tuple[StoredAsset, ...] = ()
     last_accessed_at: datetime | None = None
     access_count: int = 0
+    context: MemoryContext | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.memory_id, "memory_id")
@@ -559,6 +677,8 @@ class StoredMemory:
         if self.last_accessed_at is not None:
             _require_aware(self.last_accessed_at, "last_accessed_at")
         _access_count(self.access_count)
+        if self.context is not None and not isinstance(self.context, MemoryContext):
+            raise ValueError("context must be a MemoryContext or None")
         if self.updated_at < self.created_at:
             raise ValueError("updated_at must not precede created_at")
 
@@ -725,17 +845,90 @@ class LocalStore:
         if not supplied_memories:
             return ()
         with self._transaction() as connection:
-            created_flags = tuple(
+            transaction_memory_ids: set[str] = set()
+            created_flags = []
+            for memory in supplied_memories:
+                created_flags.append(
+                    self._write_memory(
+                        connection,
+                        memory,
+                        supplied_embedding_ids=supplied_by_memory[memory.memory_id],
+                        transaction_memory_ids=transaction_memory_ids,
+                    )
+                )
+                transaction_memory_ids.add(memory.memory_id)
+            for embedding in supplied_embeddings:
+                self._write_embedding(connection, embedding)
+        return tuple(created_flags)
+
+    def apply_formation(
+        self,
+        memories: Iterable[StoredMemory],
+        embeddings: Iterable[StoredEmbedding],
+        *,
+        evidence: Sequence[tuple[str, str, float]],
+        source_memory_ids: Sequence[str],
+        recipe: str,
+        completed_at: datetime,
+    ) -> bool:
+        """Commit derived records, evidence, and source completion in one transaction."""
+        supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
+            memories,
+            embeddings,
+        )
+        sources = tuple(dict.fromkeys(source_memory_ids))
+        for source_memory_id in sources:
+            _require_identifier(source_memory_id, "source_memory_id")
+        _require_identifier(recipe, "recipe")
+        _require_aware(completed_at, "completed_at")
+        for memory_id, source_memory_id, confidence in evidence:
+            _require_identifier(memory_id, "memory_id")
+            _require_identifier(source_memory_id, "source_memory_id")
+            if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                raise ValueError("confidence must be between zero and one")
+        with self._transaction() as connection:
+            if any(
+                connection.execute(
+                    """
+                    SELECT 1 FROM formation_runs
+                    WHERE source_memory_id = ? AND recipe = ?
+                    """,
+                    (source_memory_id, recipe),
+                ).fetchone()
+                is not None
+                for source_memory_id in sources
+            ):
+                return False
+            transaction_memory_ids: set[str] = set()
+            for memory in supplied_memories:
                 self._write_memory(
                     connection,
                     memory,
                     supplied_embedding_ids=supplied_by_memory[memory.memory_id],
+                    transaction_memory_ids=transaction_memory_ids,
                 )
-                for memory in supplied_memories
-            )
+                transaction_memory_ids.add(memory.memory_id)
             for embedding in supplied_embeddings:
                 self._write_embedding(connection, embedding)
-        return created_flags
+            for memory_id, source_memory_id, confidence in evidence:
+                _add_memory_evidence(
+                    connection,
+                    memory_id,
+                    source_memory_id,
+                    confidence=confidence,
+                    recorded_at=completed_at,
+                )
+            connection.executemany(
+                """
+                INSERT INTO formation_runs (source_memory_id, recipe, completed_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    (source_memory_id, recipe, _datetime_text(completed_at))
+                    for source_memory_id in sources
+                ),
+            )
+        return True
 
     def replace_memory_embeddings(
         self,
@@ -757,6 +950,65 @@ class LocalStore:
                 supplied_by_memory,
             )
 
+    def formation_completed(self, source_memory_id: str, recipe: str) -> bool:
+        """Return whether one source was successfully formed with this recipe."""
+        _require_identifier(source_memory_id, "source_memory_id")
+        _require_identifier(recipe, "recipe")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM formation_runs
+                WHERE source_memory_id = ? AND recipe = ?
+                """,
+                (source_memory_id, recipe),
+            ).fetchone()
+        return row is not None
+
+    def mark_formation_completed(
+        self,
+        source_memory_id: str,
+        recipe: str,
+        *,
+        completed_at: datetime,
+    ) -> None:
+        """Durably mark an idempotent automatic formation run as complete."""
+        _require_identifier(source_memory_id, "source_memory_id")
+        _require_identifier(recipe, "recipe")
+        _require_aware(completed_at, "completed_at")
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO formation_runs (
+                    source_memory_id, recipe, completed_at
+                ) VALUES (?, ?, ?)
+                """,
+                (source_memory_id, recipe, _datetime_text(completed_at)),
+            )
+
+    def add_memory_evidence(
+        self,
+        memory_id: str,
+        source_memory_id: str,
+        *,
+        confidence: float,
+        recorded_at: datetime,
+    ) -> bool:
+        """Attach independent evidence and version the derived confidence projection."""
+        _require_identifier(memory_id, "memory_id")
+        _require_identifier(source_memory_id, "source_memory_id")
+        _require_aware(recorded_at, "recorded_at")
+        if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+            raise ValueError("confidence must be between zero and one")
+        with self._transaction() as connection:
+            return _add_memory_evidence(
+                connection,
+                memory_id,
+                source_memory_id,
+                confidence=float(confidence),
+                recorded_at=recorded_at,
+            )
+
     def read_memory(self, memory_id: str) -> StoredMemory | None:
         """Return one memory, or none when it does not exist."""
         _require_identifier(memory_id, "memory_id")
@@ -774,9 +1026,23 @@ class LocalStore:
             assets = (
                 () if row is None else self._read_memory_assets(connection, (memory_id,))[memory_id]
             )
-        return None if row is None else _memory_from_row(row, assets=assets)
+            contexts, _semantic_ids = _read_memory_contexts(connection, (memory_id,))
+        return (
+            None
+            if row is None
+            else _memory_from_row(row, assets=assets, context=contexts.get(memory_id))
+        )
 
-    def read_memories(self, memory_ids: Sequence[str]) -> tuple[StoredMemory, ...]:
+    def read_memories(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        valid_at: datetime | None = None,
+        known_at: datetime | None = None,
+        near: SpatialContext | None = None,
+        radius_m: float | None = None,
+        active_only: bool = False,
+    ) -> tuple[StoredMemory, ...]:
         """Hydrate existing memories with one query and preserve input ranking."""
         if not memory_ids:
             return ()
@@ -800,12 +1066,30 @@ class LocalStore:
                     ).fetchall()
                 )
             assets_by_memory = self._read_memory_assets(connection, tuple(memory_ids))
+            contexts, semantic_ids = _read_memory_contexts(
+                connection,
+                tuple(memory_ids),
+                valid_at=valid_at,
+                known_at=known_at,
+                near=near,
+                radius_m=radius_m,
+                active_only=active_only,
+            )
         by_id = {
             _row_text(row, "memory_id"): _memory_from_row(
                 row,
                 assets=assets_by_memory.get(_row_text(row, "memory_id"), ()),
+                context=contexts.get(_row_text(row, "memory_id")),
             )
             for row in rows
+            if not active_only
+            or (
+                valid_at is None
+                and near is None
+                and _row_text(row, "memory_id") not in semantic_ids
+                and (known_at is None or _parse_datetime(_row_text(row, "created_at")) <= known_at)
+            )
+            or _row_text(row, "memory_id") in contexts
         }
         return tuple(by_id[memory_id] for memory_id in memory_ids if memory_id in by_id)
 
@@ -900,10 +1184,12 @@ class LocalStore:
             ).fetchall()
             memory_ids = tuple(_row_text(row, "memory_id") for row in rows)
             assets_by_memory = self._read_memory_assets(connection, memory_ids)
+            contexts, _semantic_ids = _read_memory_contexts(connection, memory_ids)
         return tuple(
             _memory_from_row(
                 row,
                 assets=assets_by_memory.get(_row_text(row, "memory_id"), ()),
+                context=contexts.get(_row_text(row, "memory_id")),
             )
             for row in rows
         )
@@ -946,20 +1232,114 @@ class LocalStore:
         """Delete one memory and return its assets that no remaining memory references."""
         _require_identifier(memory_id, "memory_id")
         with self._transaction() as connection:
-            linked_ids = tuple(
-                dict.fromkeys(
-                    _row_text(row, "asset_id")
+            linked_ids = [
+                _row_text(row, "asset_id")
+                for row in connection.execute(
+                    "SELECT asset_id FROM memory_assets WHERE memory_id = ? ORDER BY position",
+                    (memory_id,),
+                ).fetchall()
+            ]
+            target_semantic = connection.execute(
+                """
+                SELECT lineage_id, kind, basis
+                FROM memory_semantics WHERE memory_id = ?
+                """,
+                (memory_id,),
+            ).fetchone()
+            reconciled: set[tuple[str, str]] = set()
+            if target_semantic is not None and (
+                _row_text(target_semantic, "kind") == MemoryKind.STATE.value
+                or (
+                    _row_text(target_semantic, "kind") == MemoryKind.TRAIT.value
+                    and _row_text(target_semantic, "basis") == EvidenceBasis.USER_STATEMENT.value
+                )
+            ):
+                reconciled.add(
+                    (
+                        _row_text(target_semantic, "lineage_id"),
+                        _row_text(target_semantic, "kind"),
+                    )
+                )
+            dependent_rows = connection.execute(
+                """
+                SELECT e.memory_id, e.recorded_at, s.lineage_id, s.kind, s.basis
+                FROM memory_evidence AS e
+                JOIN memory_semantics AS s ON s.memory_id = e.memory_id
+                WHERE e.source_memory_id = ? AND e.retired_at IS NULL
+                ORDER BY e.memory_id
+                """,
+                (memory_id,),
+            ).fetchall()
+            for dependent in dependent_rows:
+                if _row_text(dependent, "kind") == MemoryKind.STATE.value or (
+                    _row_text(dependent, "kind") == MemoryKind.TRAIT.value
+                    and _row_text(dependent, "basis") == EvidenceBasis.USER_STATEMENT.value
+                ):
+                    reconciled.add(
+                        (
+                            _row_text(dependent, "lineage_id"),
+                            _row_text(dependent, "kind"),
+                        )
+                    )
+            affected_ids = [_row_text(row, "memory_id") for row in dependent_rows]
+            for lineage_id, kind in reconciled:
+                affected_ids.extend(
+                    _row_text(row, "memory_id")
                     for row in connection.execute(
-                        "SELECT asset_id FROM memory_assets WHERE memory_id = ? ORDER BY position",
-                        (memory_id,),
+                        """
+                        SELECT memory_id FROM memory_semantics
+                        WHERE lineage_id = ? AND kind = ?
+                        """,
+                        (lineage_id, kind),
                     ).fetchall()
                 )
+            changed_at = _next_semantic_transaction_time(
+                connection,
+                datetime.now(timezone.utc),
+                affected_ids,
             )
+            connection.execute(
+                """
+                UPDATE memory_evidence SET retired_at = ?
+                WHERE source_memory_id = ? AND retired_at IS NULL
+                """,
+                (_datetime_text(changed_at), memory_id),
+            )
+            for dependent in dependent_rows:
+                dependent_id = _row_text(dependent, "memory_id")
+                evidence_count, _confidence = _evidence_summary(connection, dependent_id)
+                if evidence_count:
+                    _refresh_evidence_projection(connection, dependent_id, changed_at)
+                    continue
+                linked_ids.extend(
+                    _row_text(row, "asset_id")
+                    for row in connection.execute(
+                        """
+                        SELECT asset_id FROM memory_assets
+                        WHERE memory_id = ? ORDER BY position
+                        """,
+                        (dependent_id,),
+                    ).fetchall()
+                )
+                connection.execute(
+                    "DELETE FROM memory_records WHERE memory_id = ?",
+                    (dependent_id,),
+                )
             cursor = connection.execute(
                 "DELETE FROM memory_records WHERE memory_id = ?",
                 (memory_id,),
             )
-            unreferenced = self._read_unreferenced_assets(connection, linked_ids)
+            for lineage_id, kind in sorted(reconciled):
+                _rebuild_reconciled_lineage(
+                    connection,
+                    lineage_id,
+                    kind,
+                    changed_at=changed_at,
+                )
+            unreferenced = self._read_unreferenced_assets(
+                connection,
+                tuple(dict.fromkeys(linked_ids)),
+            )
         return cursor.rowcount > 0, unreferenced
 
     def read_asset(self, asset_id: str) -> StoredAsset | None:
@@ -1900,7 +2280,7 @@ class LocalStore:
             cursor = connection.execute("DELETE FROM store_metadata WHERE key = ?", (key,))
         return cursor.rowcount > 0
 
-    def _initialize_schema(self) -> None:
+    def _initialize_schema(self) -> None:  # noqa: C901 - sequential migrations stay explicit
         with self._connection() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
@@ -1923,6 +2303,9 @@ class LocalStore:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version == 6:
                 _migrate_v6(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 7:
+                _migrate_v7(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
@@ -2041,6 +2424,7 @@ class LocalStore:
         memory: StoredMemory,
         *,
         supplied_embedding_ids: set[str],
+        transaction_memory_ids: set[str] | None = None,
     ) -> bool:
         existing = connection.execute(
             """
@@ -2085,7 +2469,7 @@ class LocalStore:
                 metadata_json = excluded.metadata_json,
                 occurred_at = excluded.occurred_at,
                 occurred_end = excluded.occurred_end,
-                updated_at = excluded.updated_at
+                updated_at = MAX(memory_records.updated_at, excluded.updated_at)
             """,
             (
                 memory.memory_id,
@@ -2123,6 +2507,13 @@ class LocalStore:
                 connection,
                 memory.memory_id,
                 exclude=supplied_embedding_ids,
+            )
+        if memory.context is not None:
+            _write_memory_context(
+                connection,
+                memory.memory_id,
+                memory.context,
+                transaction_memory_ids=transaction_memory_ids,
             )
         return existing is None
 
@@ -2560,7 +2951,7 @@ def _create_schema(
     if existing_tables:
         raise UnsupportedSchemaError("local data directory contains an unversioned SQLite schema")
     try:
-        connection.executescript(_SCHEMA_V7)
+        connection.executescript(_SCHEMA_V8)
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -2658,10 +3049,647 @@ def _migrate_v6(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_v7(connection: sqlite3.Connection) -> None:
+    try:
+        semantic_tables = {
+            "formation_runs",
+            "memory_evidence",
+            "memory_semantics",
+            "memory_versions",
+        }
+        existing = semantic_tables & _table_names(connection)
+        if existing == semantic_tables:
+            connection.execute("PRAGMA user_version = 8")
+            return
+        if existing:
+            names = ", ".join(sorted(semantic_tables - existing))
+            raise UnsupportedSchemaError(
+                f"local schema has an incomplete v8 semantic projection; missing: {names}"
+            )
+        connection.executescript(_MIGRATE_V7_TO_V8)
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def _write_memory_context(
+    connection: sqlite3.Connection,
+    memory_id: str,
+    context: MemoryContext,
+    *,
+    transaction_memory_ids: set[str] | None = None,
+) -> None:
+    existing = connection.execute(
+        "SELECT 1 FROM memory_semantics WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()
+    if existing is not None:
+        for source_memory_id in context.evidence_ids:
+            _add_memory_evidence(
+                connection,
+                memory_id,
+                source_memory_id,
+                confidence=context.confidence,
+                recorded_at=context.recorded_at,
+            )
+        return
+
+    lineage_id = context.lineage_id or memory_id
+    recorded_at = _next_lineage_transaction_time(
+        connection,
+        context.recorded_at,
+        lineage_id=lineage_id,
+        kind=context.kind.value,
+        transaction_memory_ids=transaction_memory_ids,
+    )
+    valid_from = context.valid_from
+    valid_until = context.valid_until
+    spatial = context.spatial
+    orientation = None if spatial is None else spatial.orientation_xyzw
+    connection.execute(
+        """
+        INSERT INTO memory_semantics (
+            memory_id, lineage_id, kind, basis, source_id,
+            subject, predicate, value, model_id, recipe,
+            cue_modality, valence, arousal,
+            spatial_frame_id, spatial_anchor, spatial_x, spatial_y, spatial_z,
+            spatial_qx, spatial_qy, spatial_qz, spatial_qw, spatial_uncertainty_m
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        """,
+        (
+            memory_id,
+            lineage_id,
+            context.kind.value,
+            context.basis.value,
+            context.source_id,
+            context.subject,
+            context.predicate,
+            context.value,
+            context.model_id,
+            context.recipe,
+            None if context.cue_modality is None else context.cue_modality.value,
+            context.valence,
+            context.arousal,
+            None if spatial is None else spatial.frame_id,
+            None if spatial is None else spatial.anchor.value,
+            None if spatial is None else spatial.x,
+            None if spatial is None else spatial.y,
+            None if spatial is None else spatial.z,
+            None if orientation is None else orientation[0],
+            None if orientation is None else orientation[1],
+            None if orientation is None else orientation[2],
+            None if orientation is None else orientation[3],
+            None if spatial is None else spatial.position_uncertainty_m,
+        ),
+    )
+    for source_memory_id in context.evidence_ids:
+        _insert_memory_evidence(
+            connection,
+            memory_id,
+            source_memory_id,
+            confidence=context.confidence,
+            recorded_at=recorded_at,
+        )
+
+    supersedes_id = context.supersedes_id
+    reconcile_lineage = context.kind is MemoryKind.STATE or (
+        context.kind is MemoryKind.TRAIT and context.basis is EvidenceBasis.USER_STATEMENT
+    )
+    if reconcile_lineage:
+        old_rows = connection.execute(
+            """
+            SELECT
+                s.memory_id, v.version, v.confidence, v.valid_from, v.valid_until,
+                v.recorded_at, v.visible, v.supersedes_id
+            FROM memory_semantics AS s
+            JOIN memory_versions AS v ON v.memory_id = s.memory_id
+            WHERE s.lineage_id = ? AND s.kind = ?
+              AND s.memory_id <> ? AND v.retired_at IS NULL
+            ORDER BY v.recorded_at, s.memory_id, v.version
+            """,
+            (lineage_id, context.kind.value, memory_id),
+        ).fetchall()
+        for old in old_rows:
+            old_from = _optional_datetime_from_row(old, "valid_from")
+            old_until = _optional_datetime_from_row(old, "valid_until")
+            old_recorded = _parse_datetime(_row_text(old, "recorded_at"))
+            # Independent assertions in one storage batch remain conflicting. Wall-clock equality
+            # alone cannot identify a batch on low-resolution or frozen clocks.
+            if (
+                transaction_memory_ids is not None
+                and _row_text(old, "memory_id") in transaction_memory_ids
+            ) or not _intervals_overlap(
+                valid_from,
+                valid_until,
+                old_from,
+                old_until,
+            ):
+                continue
+            tx_time = max(recorded_at, old_recorded + timedelta(microseconds=1))
+            recorded_at = tx_time
+            connection.execute(
+                """
+                UPDATE memory_versions
+                SET retired_at = ?
+                WHERE memory_id = ? AND version = ? AND retired_at IS NULL
+                """,
+                (
+                    _datetime_text(tx_time),
+                    _row_text(old, "memory_id"),
+                    int(old["version"]),
+                ),
+            )
+            if valid_from is not None and (old_from is None or old_from < valid_from):
+                _carry_memory_version(
+                    connection,
+                    old,
+                    valid_from=old_from,
+                    valid_until=valid_from,
+                    recorded_at=tx_time,
+                )
+            if valid_until is not None and (old_until is None or valid_until < old_until):
+                _carry_memory_version(
+                    connection,
+                    old,
+                    valid_from=valid_until,
+                    valid_until=old_until,
+                    recorded_at=tx_time,
+                )
+            supersedes_id = supersedes_id or _row_text(old, "memory_id")
+
+    evidence_count, _confidence = _evidence_summary(connection, memory_id)
+    visible = _semantic_visibility(
+        connection,
+        memory_id=memory_id,
+        lineage_id=lineage_id,
+        kind=context.kind.value,
+        basis=context.basis.value,
+        evidence_count=evidence_count,
+        valid_from=valid_from,
+        valid_until=valid_until,
+    )
+    connection.execute(
+        """
+        INSERT INTO memory_versions (
+            memory_id, version, confidence, valid_from, valid_until,
+            recorded_at, retired_at, visible, supersedes_id
+        ) VALUES (?, 1, ?, ?, ?, ?, NULL, ?, ?)
+        """,
+        (
+            memory_id,
+            context.confidence,
+            _optional_datetime_text(valid_from),
+            _optional_datetime_text(valid_until),
+            _datetime_text(recorded_at),
+            int(visible),
+            supersedes_id,
+        ),
+    )
+
+
+def _intervals_overlap(
+    left_from: datetime | None,
+    left_until: datetime | None,
+    right_from: datetime | None,
+    right_until: datetime | None,
+) -> bool:
+    return not (
+        (left_until is not None and right_from is not None and left_until <= right_from)
+        or (right_until is not None and left_from is not None and right_until <= left_from)
+    )
+
+
+def _carry_memory_version(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    valid_from: datetime | None,
+    valid_until: datetime | None,
+    recorded_at: datetime,
+) -> None:
+    memory_id = _row_text(row, "memory_id")
+    latest = connection.execute(
+        "SELECT COALESCE(MAX(version), 0) AS version FROM memory_versions WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()
+    if latest is None:
+        raise RuntimeError("failed to allocate a memory version")
+    connection.execute(
+        """
+        INSERT INTO memory_versions (
+            memory_id, version, confidence, valid_from, valid_until,
+            recorded_at, retired_at, visible, supersedes_id
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+        """,
+        (
+            memory_id,
+            int(latest["version"]) + 1,
+            float(row["confidence"]),
+            _optional_datetime_text(valid_from),
+            _optional_datetime_text(valid_until),
+            _datetime_text(recorded_at),
+            int(row["visible"]),
+            _optional_row_text(row, "supersedes_id"),
+        ),
+    )
+
+
+def _next_semantic_transaction_time(
+    connection: sqlite3.Connection,
+    proposed: datetime,
+    memory_ids: Iterable[str],
+) -> datetime:
+    unique_ids = tuple(dict.fromkeys(memory_ids))
+    latest = proposed
+    for offset in range(0, len(unique_ids), _SQLITE_PARAMETER_BATCH):
+        batch = unique_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+        placeholders = ", ".join("?" for _memory_id in batch)
+        for table in ("memory_versions", "memory_evidence"):
+            row = connection.execute(
+                f"""
+                SELECT MAX(recorded_at) AS recorded_at, MAX(retired_at) AS retired_at
+                FROM {table} WHERE memory_id IN ({placeholders})
+                """,
+                batch,
+            ).fetchone()
+            if row is None:
+                continue
+            for field in ("recorded_at", "retired_at"):
+                value = _optional_row_text(row, field)
+                if value is not None:
+                    latest = max(latest, _parse_datetime(value) + timedelta(microseconds=1))
+    return latest
+
+
+def _next_lineage_transaction_time(
+    connection: sqlite3.Connection,
+    proposed: datetime,
+    *,
+    lineage_id: str,
+    kind: str,
+    transaction_memory_ids: set[str] | None,
+) -> datetime:
+    current_batch = transaction_memory_ids or set()
+    memory_ids = tuple(
+        _row_text(row, "memory_id")
+        for row in connection.execute(
+            "SELECT memory_id FROM memory_semantics WHERE lineage_id = ? AND kind = ?",
+            (lineage_id, kind),
+        ).fetchall()
+        if _row_text(row, "memory_id") not in current_batch
+    )
+    return _next_semantic_transaction_time(connection, proposed, memory_ids)
+
+
+def _insert_memory_evidence(
+    connection: sqlite3.Connection,
+    memory_id: str,
+    source_memory_id: str,
+    *,
+    confidence: float,
+    recorded_at: datetime,
+) -> bool:
+    if (
+        connection.execute(
+            """
+        SELECT 1 FROM memory_evidence
+        WHERE memory_id = ? AND source_memory_id = ? AND retired_at IS NULL
+        """,
+            (memory_id, source_memory_id),
+        ).fetchone()
+        is not None
+    ):
+        return False
+    source = connection.execute(
+        """
+        SELECT COALESCE(s.source_id, r.memory_id) AS source_group_id
+        FROM memory_records AS r
+        LEFT JOIN memory_semantics AS s
+          ON s.memory_id = r.memory_id AND s.kind = 'observation'
+        WHERE r.memory_id = ?
+        """,
+        (source_memory_id,),
+    ).fetchone()
+    if source is None:
+        raise sqlite3.IntegrityError("evidence source memory does not exist")
+    position_row = connection.execute(
+        """
+        SELECT COALESCE(MAX(position) + 1, 0) AS position
+        FROM memory_evidence
+        WHERE memory_id = ?
+        """,
+        (memory_id,),
+    ).fetchone()
+    if position_row is None:
+        raise RuntimeError("failed to allocate an evidence position")
+    connection.execute(
+        """
+        INSERT INTO memory_evidence (
+            memory_id, source_memory_id, source_group_id, position,
+            confidence, recorded_at, retired_at
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+        """,
+        (
+            memory_id,
+            source_memory_id,
+            _row_text(source, "source_group_id"),
+            int(position_row["position"]),
+            confidence,
+            _datetime_text(recorded_at),
+        ),
+    )
+    return True
+
+
+def _add_memory_evidence(
+    connection: sqlite3.Connection,
+    memory_id: str,
+    source_memory_id: str,
+    *,
+    confidence: float,
+    recorded_at: datetime,
+) -> bool:
+    previous_count, previous_confidence = _evidence_summary(connection, memory_id)
+    tx_time = _next_semantic_transaction_time(connection, recorded_at, (memory_id,))
+    if not _insert_memory_evidence(
+        connection,
+        memory_id,
+        source_memory_id,
+        confidence=confidence,
+        recorded_at=tx_time,
+    ):
+        return False
+    evidence_count, combined = _evidence_summary(connection, memory_id)
+    if evidence_count == previous_count and combined == previous_confidence:
+        return True
+    _refresh_evidence_projection(connection, memory_id, tx_time)
+    return True
+
+
+def _evidence_summary(
+    connection: sqlite3.Connection,
+    memory_id: str,
+) -> tuple[int, float]:
+    rows = connection.execute(
+        """
+        SELECT MAX(e.confidence) AS confidence
+        FROM memory_evidence AS e
+        WHERE e.memory_id = ? AND e.retired_at IS NULL
+        GROUP BY e.source_group_id
+        """,
+        (memory_id,),
+    ).fetchall()
+    combined = 0.0
+    for row in rows:
+        combined = 1.0 - (1.0 - combined) * (1.0 - float(row["confidence"]))
+    return len(rows), combined
+
+
+def _semantic_visibility(
+    connection: sqlite3.Connection,
+    *,
+    memory_id: str,
+    lineage_id: str,
+    kind: str,
+    basis: str,
+    evidence_count: int,
+    valid_from: datetime | None,
+    valid_until: datetime | None,
+    explicit_intervals: Sequence[tuple[datetime | None, datetime | None]] | None = None,
+) -> bool:
+    if kind != MemoryKind.TRAIT.value or basis == EvidenceBasis.USER_STATEMENT.value:
+        return True
+    if evidence_count < 2:
+        return False
+    if explicit_intervals is None:
+        rows = connection.execute(
+            """
+            SELECT v.valid_from, v.valid_until
+            FROM memory_semantics AS s
+            JOIN memory_versions AS v ON v.memory_id = s.memory_id
+            WHERE s.lineage_id = ? AND s.kind = ? AND s.basis = ?
+              AND s.memory_id <> ? AND v.retired_at IS NULL
+            """,
+            (
+                lineage_id,
+                MemoryKind.TRAIT.value,
+                EvidenceBasis.USER_STATEMENT.value,
+                memory_id,
+            ),
+        ).fetchall()
+        explicit_intervals = tuple(
+            (
+                _optional_datetime_from_row(row, "valid_from"),
+                _optional_datetime_from_row(row, "valid_until"),
+            )
+            for row in rows
+        )
+    return not any(
+        _intervals_overlap(valid_from, valid_until, explicit_from, explicit_until)
+        for explicit_from, explicit_until in explicit_intervals
+    )
+
+
+def _refresh_evidence_projection(
+    connection: sqlite3.Connection,
+    memory_id: str,
+    changed_at: datetime,
+) -> None:
+    evidence_count, confidence = _evidence_summary(connection, memory_id)
+    rows = connection.execute(
+        """
+        SELECT v.*, s.lineage_id, s.kind, s.basis
+        FROM memory_versions AS v
+        JOIN memory_semantics AS s ON s.memory_id = v.memory_id
+        WHERE v.memory_id = ? AND v.retired_at IS NULL
+        ORDER BY v.version
+        """,
+        (memory_id,),
+    ).fetchall()
+    for row in rows:
+        recorded_at = _parse_datetime(_row_text(row, "recorded_at"))
+        tx_time = max(changed_at, recorded_at + timedelta(microseconds=1))
+        connection.execute(
+            """
+            UPDATE memory_versions SET retired_at = ?
+            WHERE memory_id = ? AND version = ? AND retired_at IS NULL
+            """,
+            (_datetime_text(tx_time), memory_id, int(row["version"])),
+        )
+        visible = _semantic_visibility(
+            connection,
+            memory_id=memory_id,
+            lineage_id=_row_text(row, "lineage_id"),
+            kind=_row_text(row, "kind"),
+            basis=_row_text(row, "basis"),
+            evidence_count=evidence_count,
+            valid_from=_optional_datetime_from_row(row, "valid_from"),
+            valid_until=_optional_datetime_from_row(row, "valid_until"),
+        )
+        _carry_memory_version(
+            connection,
+            row,
+            valid_from=_optional_datetime_from_row(row, "valid_from"),
+            valid_until=_optional_datetime_from_row(row, "valid_until"),
+            recorded_at=tx_time,
+        )
+        latest = connection.execute(
+            """
+            SELECT MAX(version) AS version FROM memory_versions WHERE memory_id = ?
+            """,
+            (memory_id,),
+        ).fetchone()
+        if latest is None:
+            raise RuntimeError("failed to update evidence projection")
+        connection.execute(
+            """
+            UPDATE memory_versions SET confidence = ?, visible = ?
+            WHERE memory_id = ? AND version = ?
+            """,
+            (confidence, int(visible), memory_id, int(latest["version"])),
+        )
+
+
+def _rebuild_reconciled_lineage(  # noqa: C901 - replay order is the state contract
+    connection: sqlite3.Connection,
+    lineage_id: str,
+    kind: str,
+    *,
+    changed_at: datetime,
+) -> None:
+    assertions = connection.execute(
+        """
+        SELECT v.*, s.kind, s.basis
+        FROM memory_semantics AS s
+        JOIN memory_versions AS v ON v.memory_id = s.memory_id AND v.version = 1
+        WHERE s.lineage_id = ? AND s.kind = ?
+          AND EXISTS (
+              SELECT 1 FROM memory_evidence AS e
+              WHERE e.memory_id = s.memory_id AND e.retired_at IS NULL
+          )
+        ORDER BY v.recorded_at, s.memory_id
+        """,
+        (lineage_id, kind),
+    ).fetchall()
+    current = connection.execute(
+        """
+        SELECT v.*
+        FROM memory_semantics AS s
+        JOIN memory_versions AS v ON v.memory_id = s.memory_id
+        WHERE s.lineage_id = ? AND s.kind = ? AND v.retired_at IS NULL
+        ORDER BY s.memory_id, v.version
+        """,
+        (lineage_id, kind),
+    ).fetchall()
+    tx_time = changed_at
+    for row in current:
+        tx_time = max(
+            tx_time,
+            _parse_datetime(_row_text(row, "recorded_at")) + timedelta(microseconds=1),
+        )
+    for row in current:
+        connection.execute(
+            """
+            UPDATE memory_versions SET retired_at = ?
+            WHERE memory_id = ? AND version = ? AND retired_at IS NULL
+            """,
+            (
+                _datetime_text(tx_time),
+                _row_text(row, "memory_id"),
+                int(row["version"]),
+            ),
+        )
+
+    # ponytail: replay is O(assertions²); add a compacted assertion ledger only if long-lived
+    # lineages make deletion latency measurable.
+    segments: list[tuple[sqlite3.Row, datetime | None, datetime | None]] = []
+    offset = 0
+    while offset < len(assertions):
+        recorded_at = _row_text(assertions[offset], "recorded_at")
+        group: list[tuple[sqlite3.Row, datetime | None, datetime | None]] = []
+        while (
+            offset < len(assertions) and _row_text(assertions[offset], "recorded_at") == recorded_at
+        ):
+            row = assertions[offset]
+            group.append(
+                (
+                    row,
+                    _optional_datetime_from_row(row, "valid_from"),
+                    _optional_datetime_from_row(row, "valid_until"),
+                )
+            )
+            offset += 1
+        for cut_owner, cut_from, cut_until in group:
+            if (
+                kind == MemoryKind.TRAIT.value
+                and _row_text(cut_owner, "basis") != EvidenceBasis.USER_STATEMENT.value
+            ):
+                continue
+            remaining: list[tuple[sqlite3.Row, datetime | None, datetime | None]] = []
+            for owner, valid_from, valid_until in segments:
+                if not _intervals_overlap(valid_from, valid_until, cut_from, cut_until):
+                    remaining.append((owner, valid_from, valid_until))
+                    continue
+                if cut_from is not None and (valid_from is None or valid_from < cut_from):
+                    remaining.append((owner, valid_from, cut_from))
+                if cut_until is not None and (valid_until is None or cut_until < valid_until):
+                    remaining.append((owner, cut_until, valid_until))
+            segments = remaining
+        segments.extend(group)
+
+    explicit_intervals = tuple(
+        (valid_from, valid_until)
+        for row, valid_from, valid_until in segments
+        if _row_text(row, "basis") == EvidenceBasis.USER_STATEMENT.value
+    )
+    summaries: dict[str, tuple[int, float]] = {}
+    for row, valid_from, valid_until in segments:
+        memory_id = _row_text(row, "memory_id")
+        evidence_count, confidence = summaries.setdefault(
+            memory_id,
+            _evidence_summary(connection, memory_id),
+        )
+        visible = _semantic_visibility(
+            connection,
+            memory_id=memory_id,
+            lineage_id=lineage_id,
+            kind=kind,
+            basis=_row_text(row, "basis"),
+            evidence_count=evidence_count,
+            valid_from=valid_from,
+            valid_until=valid_until,
+            explicit_intervals=explicit_intervals,
+        )
+        _carry_memory_version(
+            connection,
+            row,
+            valid_from=valid_from,
+            valid_until=valid_until,
+            recorded_at=tx_time,
+        )
+        latest = connection.execute(
+            "SELECT MAX(version) AS version FROM memory_versions WHERE memory_id = ?",
+            (memory_id,),
+        ).fetchone()
+        if latest is None:
+            raise RuntimeError("failed to rebuild a reconciled memory lineage")
+        connection.execute(
+            """
+            UPDATE memory_versions SET confidence = ?, visible = ?
+            WHERE memory_id = ? AND version = ?
+            """,
+            (confidence, int(visible), memory_id, int(latest["version"])),
+        )
+
+
 def _memory_from_row(
     row: sqlite3.Row,
     *,
     assets: tuple[StoredAsset, ...] = (),
+    context: MemoryContext | None = None,
 ) -> StoredMemory:
     return StoredMemory(
         memory_id=_row_text(row, "memory_id"),
@@ -2676,7 +3704,179 @@ def _memory_from_row(
         access_count=int(row["access_count"]),
         created_at=_parse_datetime(_row_text(row, "created_at")),
         updated_at=_parse_datetime(_row_text(row, "updated_at")),
+        context=context,
     )
+
+
+def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydration pass
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+    *,
+    valid_at: datetime | None = None,
+    known_at: datetime | None = None,
+    near: SpatialContext | None = None,
+    radius_m: float | None = None,
+    active_only: bool = False,
+) -> tuple[dict[str, MemoryContext], frozenset[str]]:
+    if not memory_ids:
+        return {}, frozenset()
+    if (near is None) != (radius_m is None):
+        raise ValueError("near and radius_m must be supplied together")
+    if near is not None and not isinstance(near, SpatialContext):
+        raise ValueError("near must be a SpatialContext")
+    if radius_m is not None and (
+        isinstance(radius_m, bool)
+        or not isinstance(radius_m, int | float)
+        or not math.isfinite(float(radius_m))
+        or radius_m < 0
+    ):
+        raise ValueError("radius_m must be a non-negative finite number")
+    if valid_at is not None:
+        _require_aware(valid_at, "valid_at")
+    if known_at is not None:
+        _require_aware(known_at, "known_at")
+    query_valid_at = valid_at or datetime.now(timezone.utc)
+    query_known_at = known_at or datetime.now(timezone.utc)
+
+    rows: list[sqlite3.Row] = []
+    evidence: dict[str, list[str]] = {}
+    for offset in range(0, len(memory_ids), _SQLITE_PARAMETER_BATCH):
+        batch = memory_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+        placeholders = ", ".join("?" for _memory_id in batch)
+        rows.extend(
+            connection.execute(
+                f"""
+                SELECT
+                    s.memory_id AS semantic_memory_id,
+                    s.lineage_id, s.kind, s.basis, s.source_id,
+                    s.subject, s.predicate, s.value, s.model_id, s.recipe,
+                    s.cue_modality, s.valence, s.arousal,
+                    s.spatial_frame_id, s.spatial_anchor,
+                    s.spatial_x, s.spatial_y, s.spatial_z,
+                    s.spatial_qx, s.spatial_qy, s.spatial_qz, s.spatial_qw,
+                    s.spatial_uncertainty_m,
+                    v.version, v.confidence, v.valid_from, v.valid_until,
+                    v.recorded_at, v.retired_at, v.visible, v.supersedes_id
+                FROM memory_semantics AS s
+                JOIN memory_versions AS v ON v.memory_id = s.memory_id
+                WHERE s.memory_id IN ({placeholders})
+                ORDER BY s.memory_id, v.recorded_at DESC, v.version DESC
+                """,
+                tuple(batch),
+            ).fetchall()
+        )
+        evidence_time = (
+            "retired_at IS NULL"
+            if known_at is None
+            else "recorded_at <= ? AND (retired_at IS NULL OR retired_at > ?)"
+        )
+        evidence_parameters: tuple[object, ...] = tuple(batch)
+        if known_at is not None:
+            known_text = _datetime_text(known_at)
+            evidence_parameters += (known_text, known_text)
+        for row in connection.execute(
+            f"""
+            SELECT memory_id, source_memory_id
+            FROM memory_evidence
+            WHERE memory_id IN ({placeholders}) AND {evidence_time}
+            ORDER BY memory_id, position
+            """,
+            evidence_parameters,
+        ).fetchall():
+            evidence.setdefault(_row_text(row, "memory_id"), []).append(
+                _row_text(row, "source_memory_id")
+            )
+
+    semantic_ids = frozenset(_row_text(row, "semantic_memory_id") for row in rows)
+    selected: dict[str, sqlite3.Row] = {}
+    for row in rows:
+        memory_id = _row_text(row, "semantic_memory_id")
+        if memory_id in selected:
+            continue
+        recorded_at = _parse_datetime(_row_text(row, "recorded_at"))
+        retired_at = _optional_datetime_from_row(row, "retired_at")
+        row_valid_from = _optional_datetime_from_row(row, "valid_from")
+        row_valid_until = _optional_datetime_from_row(row, "valid_until")
+        if active_only and (
+            recorded_at > query_known_at
+            or (retired_at is not None and retired_at <= query_known_at)
+            or (row_valid_from is not None and row_valid_from > query_valid_at)
+            or (row_valid_until is not None and row_valid_until <= query_valid_at)
+            or not bool(int(row["visible"]))
+        ):
+            continue
+        selected[memory_id] = row
+
+    contexts: dict[str, MemoryContext] = {}
+    for memory_id, row in selected.items():
+        spatial: SpatialContext | None = None
+        if row["spatial_frame_id"] is not None:
+            orientation = None
+            if row["spatial_qx"] is not None:
+                orientation = (
+                    float(row["spatial_qx"]),
+                    float(row["spatial_qy"]),
+                    float(row["spatial_qz"]),
+                    float(row["spatial_qw"]),
+                )
+            spatial = SpatialContext(
+                frame_id=_row_text(row, "spatial_frame_id"),
+                anchor=SpatialAnchor(_row_text(row, "spatial_anchor")),
+                x=float(row["spatial_x"]),
+                y=float(row["spatial_y"]),
+                z=float(row["spatial_z"]),
+                orientation_xyzw=orientation,
+                position_uncertainty_m=(
+                    None
+                    if row["spatial_uncertainty_m"] is None
+                    else float(row["spatial_uncertainty_m"])
+                ),
+            )
+        if near is not None:
+            assert radius_m is not None
+            if (
+                spatial is None
+                or spatial.frame_id != near.frame_id
+                or spatial.anchor is not near.anchor
+            ):
+                continue
+            distance = math.sqrt(
+                (spatial.x - near.x) ** 2 + (spatial.y - near.y) ** 2 + (spatial.z - near.z) ** 2
+            )
+            tolerance = radius_m
+            tolerance += spatial.position_uncertainty_m or 0.0
+            tolerance += near.position_uncertainty_m or 0.0
+            if distance > tolerance:
+                continue
+        retired_at = _optional_datetime_from_row(row, "retired_at")
+        if known_at is not None and retired_at is not None and known_at < retired_at:
+            retired_at = None
+        contexts[memory_id] = MemoryContext(
+            kind=MemoryKind(_row_text(row, "kind")),
+            basis=EvidenceBasis(_row_text(row, "basis")),
+            confidence=float(row["confidence"]),
+            valid_from=_optional_datetime_from_row(row, "valid_from"),
+            valid_until=_optional_datetime_from_row(row, "valid_until"),
+            recorded_at=_parse_datetime(_row_text(row, "recorded_at")),
+            visible=bool(int(row["visible"])),
+            retired_at=retired_at,
+            lineage_id=_row_text(row, "lineage_id"),
+            source_id=_optional_row_text(row, "source_id"),
+            subject=_optional_row_text(row, "subject"),
+            predicate=_optional_row_text(row, "predicate"),
+            value=_optional_row_text(row, "value"),
+            evidence_ids=tuple(evidence.get(memory_id, ())),
+            supersedes_id=_optional_row_text(row, "supersedes_id"),
+            model_id=_optional_row_text(row, "model_id"),
+            recipe=_optional_row_text(row, "recipe"),
+            spatial=spatial,
+            cue_modality=(
+                None if row["cue_modality"] is None else Modality(_row_text(row, "cue_modality"))
+            ),
+            valence=None if row["valence"] is None else float(row["valence"]),
+            arousal=None if row["arousal"] is None else float(row["arousal"]),
+        )
+    return contexts, semantic_ids
 
 
 def _access_count(value: object) -> int:
@@ -2742,6 +3942,10 @@ def _row_text(row: sqlite3.Row, column: str) -> str:
     if not isinstance(value, str):
         raise RuntimeError(f"stored {column} is not text")
     return value
+
+
+def _optional_row_text(row: sqlite3.Row, column: str) -> str | None:
+    return None if row[column] is None else _row_text(row, column)
 
 
 def _row_blob(row: sqlite3.Row, column: str) -> bytes:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +18,7 @@ from mindbridge.benchmarks.mem_gallery import (
     MemGalleryRound,
     MemGallerySession,
 )
+from mindbridge.benchmarks.personamem_v3 import PersonaMemQuery
 from mindbridge.benchmarks.supermemory_vqa import SuperMemoryQuestion
 from mindbridge.benchmarks.task_catalog import TaskSpec
 
@@ -1003,6 +1004,297 @@ def _query_parts(template: str, question: str, **values: str) -> tuple[str, ...]
     )
 
 
+# MindBridge caps one memory or query part at 65,536 characters
+# (`mindbridge.memory._MAX_TEXT_CHARACTERS`). CL-Bench reference documents run
+# past 150,000, so a task's corpus has to be split before it can be stored at
+# all. Blocks are built well under the cap so that each one is also a usable
+# retrieval unit rather than one opaque record per task.
+_TEXT_BLOCK_CHARACTERS = 8_000
+_MAX_PART_CHARACTERS = 60_000
+
+
+def _text_blocks(text: str, limit: int) -> tuple[str, ...]:
+    """Group a document into blocks of at most `limit` characters.
+
+    Paragraphs are kept whole and packed greedily; a single paragraph longer
+    than the limit is cut on the limit, because some records are one unbroken
+    table or bibliography with no paragraph structure to key off.
+    """
+    blocks: list[str] = []
+    current = ""
+    for paragraph in text.split("\n\n"):
+        chunk = paragraph.strip()
+        if not chunk:
+            continue
+        while len(chunk) > limit:
+            if current:
+                blocks.append(current)
+                current = ""
+            blocks.append(chunk[:limit])
+            chunk = chunk[limit:]
+        if not current:
+            current = chunk
+        elif len(current) + len(chunk) + 2 <= limit:
+            current = f"{current}\n\n{chunk}"
+        else:
+            blocks.append(current)
+            current = chunk
+    if current:
+        blocks.append(current)
+    return tuple(blocks)
+
+
+def _longmemeval(
+    _spec: TaskSpec,
+    dataset: Path,
+    _media: MediaResolver,
+    _root: Path,
+    limit: Limit,
+    offset: int,
+) -> tuple[EvalUnit, ...]:
+    from mindbridge.benchmarks.longmemeval import load_longmemeval
+
+    units = []
+    for question in _selected(load_longmemeval(dataset), limit, offset):
+        memories = tuple(
+            MemoryItem(
+                turn.turn_id,
+                (f"[{session.occurred_at.isoformat()}] {turn.role}: {turn.content}",),
+                occurred_at=session.occurred_at,
+            )
+            for session in question.sessions
+            for turn in session.turns
+            if turn.content.strip()
+        )
+        units.append(
+            EvalUnit(
+                question.question_id,
+                memories,
+                (
+                    EvalQuestion(
+                        question.question_id,
+                        (_free_text_prompt(question.question),),
+                        (question.reference_answer,),
+                        metadata={
+                            "question_type": question.question_type,
+                            "abstention": question.abstention,
+                            "answer_session_ids": tuple(
+                                session.session_id
+                                for session in question.sessions
+                                if session.is_answer_session
+                            ),
+                        },
+                        reference_at=question.question_date,
+                        source_question=question.question,
+                    ),
+                ),
+            )
+        )
+    return tuple(units)
+
+
+def _clbench(
+    _spec: TaskSpec,
+    dataset: Path,
+    _media: MediaResolver,
+    _root: Path,
+    limit: Limit,
+    offset: int,
+) -> tuple[EvalUnit, ...]:
+    from mindbridge.benchmarks.clbench import load_clbench
+    from mindbridge.benchmarks.prompts import CLBENCH_QUERY_PROMPT
+
+    units = []
+    for task in _selected(load_clbench(dataset), limit, offset):
+        memories = tuple(
+            MemoryItem(f"{turn.turn_id}_B{index:04d}", (block,))
+            for turn in task.turns
+            for index, block in enumerate(_text_blocks(turn.content, _TEXT_BLOCK_CHARACTERS))
+        )
+        prompt = CLBENCH_QUERY_PROMPT.text.format(
+            system_prompt=task.system_prompt.strip(), question=task.question
+        ).strip()
+        units.append(
+            EvalUnit(
+                task.task_id,
+                memories,
+                (
+                    EvalQuestion(
+                        task.task_id,
+                        _split_parts(prompt),
+                        # CL-Bench publishes no gold answer at all: its judge
+                        # grades the response against the rubric list, so the
+                        # rubrics are the reference material.
+                        task.rubrics,
+                        metadata={
+                            "context_id": task.context_id,
+                            "context_category": task.context_category,
+                            "sub_category": task.sub_category,
+                            "question_unsliced": task.question_unsliced,
+                        },
+                        source_question=task.question[:_MAX_PART_CHARACTERS],
+                    ),
+                ),
+            )
+        )
+    return tuple(units)
+
+
+def _beam(
+    spec: TaskSpec,
+    dataset: Path,
+    _media: MediaResolver,
+    _root: Path,
+    limit: Limit,
+    offset: int,
+) -> tuple[EvalUnit, ...]:
+    from mindbridge.benchmarks.beam import BeamTier, load_beam
+    from mindbridge.benchmarks.prompts import BEAM_QUERY_PROMPT
+
+    tier = cast("BeamTier", spec.variant)
+    units = []
+    for conversation in _selected(load_beam(dataset, tier), limit, offset):
+        memories = tuple(
+            MemoryItem(
+                turn.turn_id,
+                (
+                    (
+                        f"{turn.role}: {turn.content}"
+                        if turn.occurred_at is None
+                        else f"[{turn.occurred_at.date().isoformat()}] {turn.role}: {turn.content}"
+                    ),
+                ),
+                occurred_at=turn.occurred_at,
+            )
+            for turn in conversation.turns
+        )
+        questions = tuple(
+            EvalQuestion(
+                question.question_id,
+                (BEAM_QUERY_PROMPT.text.format(question=question.question),),
+                # The rubric is the reference material: two of the ten
+                # categories publish no gold answer, and the official judge
+                # never reads one -- it scores the response against each rubric
+                # item in turn.
+                question.rubric,
+                metadata={
+                    "category": question.category,
+                    "difficulty": question.difficulty,
+                    "reference_answer": question.reference_answer,
+                },
+                source_question=question.question,
+            )
+            for question in conversation.questions
+        )
+        units.append(EvalUnit(f"{tier}-{conversation.conversation_id}", memories, questions))
+    return tuple(units)
+
+
+def _personamem_v3(
+    _spec: TaskSpec,
+    dataset: Path,
+    _media: MediaResolver,
+    _root: Path,
+    limit: Limit,
+    offset: int,
+) -> tuple[EvalUnit, ...]:
+    from mindbridge.benchmarks.personamem_v3 import (
+        RANKING_TASK_TYPES,
+        load_personamem_v3,
+        render_candidates,
+        render_event,
+    )
+    from mindbridge.benchmarks.prompts import (
+        PERSONAMEM_V3_QUERY_PROMPT,
+        PERSONAMEM_V3_RANKING_PROMPT,
+    )
+
+    units = []
+    for persona in _selected(load_personamem_v3(dataset), limit, offset):
+        memories = tuple(
+            MemoryItem(
+                event.event_id,
+                (render_event(event),),
+                # `end_seconds` carries the event's moment so the runner's
+                # cutoff loop ingests only what happened before each query --
+                # the causal mask the release requires.
+                end_seconds=float(event.timestamp),
+                occurred_at=event.occurred_at,
+            )
+            for event in persona.events
+        )
+        questions = tuple(
+            _personamem_question(
+                query,
+                RANKING_TASK_TYPES,
+                render_candidates,
+                PERSONAMEM_V3_RANKING_PROMPT.text,
+                PERSONAMEM_V3_QUERY_PROMPT.text,
+            )
+            for query in persona.queries
+        )
+        units.append(EvalUnit(persona.persona_id, memories, questions))
+    return tuple(units)
+
+
+def _personamem_question(
+    query: PersonaMemQuery,
+    ranking_task_types: frozenset[str],
+    render_candidates: Callable[[Sequence[Mapping[str, object]]], str],
+    ranking_template: str,
+    query_template: str,
+) -> EvalQuestion:
+    history = "\n".join(f"{turn.role}: {turn.content}" for turn in query.prior_conversation)
+    question = query.user_query if not history else f"{history}\n\n{query.user_query}"
+    if query.task_type in ranking_task_types and query.candidates:
+        prompt = ranking_template.format(
+            query=query.user_query,
+            slate=render_candidates(query.candidates),
+            count=len(query.candidates),
+        )
+    else:
+        prompt = query_template.format(question=question)
+    return EvalQuestion(
+        query.query_id,
+        _split_parts(prompt),
+        (query.example_response or query.user_query,),
+        # Strictly before the query's moment: `_run_unit` ingests memories whose
+        # end is `<=` the cutoff, and the release masks events at or after the
+        # query. `nextafter` is the exact float below it.
+        cutoff_seconds=math.nextafter(float(query.timestamp), -math.inf),
+        metadata={
+            "task_family": query.task_family,
+            "task_type": query.task_type,
+            "query_kind": query.query_kind,
+            "expected_behavior": query.expected_behavior,
+            "rubric_tags": query.rubric_tags,
+            "groundtruth_preference": query.groundtruth_preference,
+            "distractor_preferences": query.distractor_preferences,
+            "candidate_count": len(query.candidates),
+            "positive_indexes": query.positive_indexes,
+            "negative_indexes": query.negative_indexes,
+            "judge_evidence": query.judge_evidence,
+        },
+        reference_at=query.asked_at,
+        source_question=query.user_query[:_MAX_PART_CHARACTERS],
+    )
+
+
+def _split_parts(text: str) -> tuple[str, ...]:
+    """Split one prompt into parts MindBridge will accept.
+
+    A CL-Bench record whose question could not be sliced off its reference
+    document runs past the 65,536-character limit on a single part. Splitting
+    keeps the whole question rather than truncating it away.
+    """
+    if len(text) <= _MAX_PART_CHARACTERS:
+        return (text,)
+    return tuple(
+        text[offset : offset + _MAX_PART_CHARACTERS]
+        for offset in range(0, len(text), _MAX_PART_CHARACTERS)
+    )
+
+
 _LOADERS = {
     "locomo-refined": _locomo,
     "m3-bench-robot": _m3,
@@ -1026,6 +1318,13 @@ _LOADERS = {
     "atm-bench-main-sgm": _atm,
     "atm-bench-hard-sgm": _atm,
     "mem-gallery": _mem_gallery,
+    "longmemeval-s": _longmemeval,
+    "clbench": _clbench,
+    "beam-100k": _beam,
+    "beam-500k": _beam,
+    "beam-1m": _beam,
+    "beam-10m": _beam,
+    "personamem-v3": _personamem_v3,
 }
 
 

@@ -146,7 +146,7 @@ Spans use `mindbridge.span.kind` to distinguish three levels:
 | --- | --- |
 | Operation | Public operations such as `mindbridge.add`, `mindbridge.search`, `mindbridge.ask`, `mindbridge.delete`, `mindbridge.reindex`, and `mindbridge.optimize` |
 | Stage | `mindbridge.content.prepare`, `mindbridge.storage.*`, `mindbridge.index.*`, and `mindbridge.retrieval.rank` |
-| Model | `mindbridge.model.embedding`, `.transcription`, `.face`, and `.generation` |
+| Model | `mindbridge.model.embedding`, `.transcription`, `.face`, `.generation`, `.formation`, and `.vision` |
 
 Each `add_stream` item produces an ordinary `mindbridge.add` operation. `search_with_trace` and
 speculative prefetch use ordinary `mindbridge.search` operations. `AsyncMemory` preserves tracing

@@ -59,6 +59,7 @@ from mindbridge.models.base import (
     EmbedTask,
     FaceAnalysis,
     FaceEmbedding,
+    FormationInput,
     ModelInput,
     SpeakerEmbedding,
     SpeechAnalysis,
@@ -70,11 +71,17 @@ from mindbridge.types import (
     AnswerResult,
     AssetRef,
     Blob,
+    FormationProposal,
     IndexQuantization,
+    MemoryKind,
     MemoryRecord,
     MemoryType,
     Modality,
+    ObservationContext,
+    RetrievalScope,
     SearchHit,
+    SpatialAnchor,
+    SpatialContext,
     StreamInput,
 )
 
@@ -1175,8 +1182,65 @@ def test_temporal_search_reads_lexical_evidence_from_authoritative_time_range(
         assert hits and hits[0].id == target.id
         assert index.lexical_search_calls == 2
 
-        monkeypatch.setattr(memory._store, "read_memories", lambda _memory_ids: ())
+        monkeypatch.setattr(memory._store, "read_memories", lambda _memory_ids, **_scope: ())
         assert memory.search("shared witness in 2024", limit=1) == ()
+
+
+def test_scope_filter_expands_past_unscoped_top_k_candidates(tmp_path: Path) -> None:
+    wrong = SpatialContext(
+        frame_id="wrong-map",
+        anchor=SpatialAnchor.SUBJECT,
+        x=0,
+        y=0,
+    )
+    near = SpatialContext(
+        frame_id="home-map",
+        anchor=SpatialAnchor.SUBJECT,
+        x=1,
+        y=1,
+    )
+    with _memory(tmp_path, _FakeModels()) as memory:
+        distractors = tuple(
+            memory.add(
+                f"distractor {index}",
+                context=ObservationContext(spatial=wrong),
+            )
+            for index in range(140)
+        )
+        target = memory.add("scoped target", context=ObservationContext(spatial=near))
+        index = _FakeIndex.instances[-1]
+        aggregate_ids = {
+            document.embedding.memory_id: document.embedding.embedding_id
+            for document in index.documents.values()
+            if document.embedding.object_part == 0
+        }
+        index.dense_hits_override = tuple(
+            IndexHit(id=aggregate_ids[record.id], relevance=0.99)
+            for record in (*distractors[:120], target, *distractors[120:])
+        )
+        index.lexical_hits_override = ()
+
+        hits = memory.search(
+            "scoped target",
+            limit=1,
+            scope=RetrievalScope(near=near, radius_m=0.1),
+        )
+
+        assert [hit.id for hit in hits] == [target.id]
+        assert index.dense_search_calls >= 2
+
+        bounded = memory.search_with_trace(
+            "scoped target",
+            limit=1,
+            scope=RetrievalScope(
+                near=replace(near, frame_id="missing-map"),
+                radius_m=0.1,
+            ),
+        )
+
+        assert bounded.hits == ()
+        assert bounded.trace.candidate_limit == 129
+        assert bounded.trace.exhaustive is False
 
 
 def test_text_reranking_preserves_negation_and_bounded_scores(tmp_path: Path) -> None:
@@ -1726,6 +1790,7 @@ def test_memory_rejects_invalid_composition_values(tmp_path: Path) -> None:
         ("embedder", "EmbeddingBackend"),
         ("answerer", "GenerationBackend"),
         ("transcriber", "SpeechBackend or TranscriptionBackend"),
+        ("vision_describer", "VisionDescriptionBackend"),
         ("face_analyzer", "FaceBackend"),
     ],
 )
@@ -2951,6 +3016,62 @@ def test_interrupted_reindex_is_completed_from_durable_sqlite(tmp_path: Path) ->
 
     with _memory(tmp_path, _FakeModels()):
         assert set(_FakeIndex.instances[-1].documents) == {record.id for record in records}
+
+
+def test_formation_marker_commits_with_derived_sqlite_before_index_flush(tmp_path: Path) -> None:
+    class FlushFailingFormer:
+        formation_capabilities = frozenset({Modality.TEXT})
+        formation_model = "formation-test"
+        formation_space = "formation-test:atomic-v1"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def form(
+            self,
+            inputs: Sequence[FormationInput],
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            self.calls += 1
+            _FakeIndex.instances[-1].fail_next_flush = True
+            return tuple(
+                (
+                    FormationProposal(
+                        kind=MemoryKind.STATE,
+                        content="The lamp is on",
+                        subject="lamp",
+                        predicate="power",
+                        value="on",
+                        confidence=0.9,
+                    ),
+                )
+                for _value in inputs
+            )
+
+        def close(self) -> None:
+            pass
+
+    former = FlushFailingFormer()
+    occurred = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    context = ObservationContext(source_id="turn-1", valid_from=occurred)
+    with Memory(
+        tmp_path,
+        embedder=_FakeModels(),
+        former=former,
+        minimum_relevance=0,
+    ) as memory:
+        with pytest.raises(IndexUnavailableError):
+            memory.add("the lamp is on", occurred_at=occurred, context=context)
+
+        source = memory.add("the lamp is on", occurred_at=occurred, context=context)
+        states = [
+            hit
+            for hit in memory.search("lamp power", limit=10)
+            if hit.context is not None and hit.context.kind is MemoryKind.STATE
+        ]
+
+        assert former.calls == 1
+        assert states and states[0].context is not None
+        assert states[0].context.evidence_ids == (source.id,)
 
 
 def test_delete_recreate_coalesces_outbox_and_stale_hits_are_filtered(tmp_path: Path) -> None:

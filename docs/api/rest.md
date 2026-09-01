@@ -6,6 +6,10 @@ The optional FastAPI adapter exposes seven `Memory` operations under `/v1`. It v
 input, calls the injected synchronous memory, and serializes the public SDK values; it is not a
 separate storage or retrieval implementation.
 
+REST accepts finalized media. Live audio packets, vision frames, partials, and scene boundaries
+have no client-streaming route; run `AsyncAudioStream`, `AsyncVisionStream`, or
+`AsyncCaptureStream` in the application that owns the connection.
+
 The generated FastAPI schema is the machine-readable contract. A running application serves it at
 `/openapi.json`, with Swagger UI at `/docs` and ReDoc at `/redoc`.
 
@@ -124,10 +128,10 @@ Request fields and defaults are:
 
 | Request | Fields |
 | --- | --- |
-| `MemoryCreate` | required `content`; optional `occurred_at`, `occurred_end`, `metadata`; `memory_type="semantic"` |
-| `MemoryBatchCreate` | `contents` with 1–100 items; optional per-item arrays `occurred_at`, `occurred_end`, `metadata`; `memory_type="semantic"` for the complete batch |
-| `QueryRequest` | required `query`; `limit=10`; optional `memory_type`, `reference_at`, `occurred_from`, `occurred_until` |
-| `AnswerRequest` | required `question`; `limit=5`; optional `memory_type`, `reference_at` |
+| `MemoryCreate` | required `content`; optional `occurred_at`, `occurred_end`, `metadata`, `context`; `memory_type="semantic"` |
+| `MemoryBatchCreate` | `contents` with 1–100 items; optional per-item arrays `occurred_at`, `occurred_end`, `metadata`, `context`; `memory_type="semantic"` for the complete batch |
+| `QueryRequest` | required `query`; `limit=10`; optional `memory_type`, `reference_at`, `occurred_from`, `occurred_until`, `scope` |
+| `AnswerRequest` | required `question`; `limit=5`; optional `memory_type`, `reference_at`, `scope` |
 | List query | `limit=100`; optional opaque `cursor` |
 
 All timestamps must include a timezone. An event end requires a start and must be later than it.
@@ -136,6 +140,37 @@ bounds are a half-open overlap filter; two bounds require `occurred_until > occu
 records without `occurred_at` do not match. Pass `next_cursor` back unchanged to continue listing.
 Time and role behavior is defined in
 [memory types, time, and decay](../memory-types-time-and-decay.md).
+
+An input `context` is an optional typed observation. `scope` is an optional retrieval filter:
+`valid_at` and `known_at` are timezone-aware world-time and transaction-time instants, while
+`near` and a non-negative `radius_m` must appear together and restrict results to the same
+coordinate frame and observer/subject anchor. SQLite authoritatively reapplies every scope filter
+after candidate retrieval.
+
+```json
+{
+  "context": {
+    "basis": "observation",
+    "source_id": "camera-1:frame-42",
+    "confidence": 0.94,
+    "valid_from": "2026-08-27T09:00:00Z",
+    "spatial": {
+      "frame_id": "home/map",
+      "anchor": "subject",
+      "x": 2.0,
+      "y": 1.0,
+      "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+      "position_uncertainty_m": 0.08
+    }
+  },
+  "scope": {
+    "valid_at": "2026-08-26T12:00:00Z",
+    "known_at": "2026-08-27T12:00:00Z",
+    "near": {"frame_id": "home/map", "anchor": "subject", "x": 2.0, "y": 1.0},
+    "radius_m": 0.75
+  }
+}
+```
 
 Creation is content-addressed and idempotent. Batch results preserve input order. Deletion is also
 idempotent: `deleted` reports whether a record existed. `ask` requires an answerer configured in
@@ -146,7 +181,7 @@ the injected memory.
 | Object | Fields |
 | --- | --- |
 | `AssetResponse` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name` |
-| `MemoryResponse` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata` |
+| `MemoryResponse` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context` |
 | `SearchHitResponse` | all memory fields plus `score` from 0 through 1 |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResponse` | `items`, `next_cursor` |
@@ -154,8 +189,11 @@ the injected memory.
 `modality` is `text`, `image`, `video`, `audio`, or `omni`. `memory_type` is `semantic`,
 `episodic`, or `procedural`. `abstention_reason` is `no_evidence`, `insufficient_evidence`, or
 `null`. `abstained` reports that the answerer returned the exact sentence reserved for having no
-usable evidence, not that the model declined to answer in its own words. Asset filesystem paths are
-never serialized.
+usable evidence, not that the model declined to answer in its own words. A response `context` is
+the authoritative `MemoryContext`: typed kind and basis, confidence, valid and transaction time,
+visibility, lineage/source/evidence/supersession IDs, model recipe, optional
+subject/predicate/value, spatial pose, and affect cue fields. It is `null` on a raw record formed
+without typed context. Asset filesystem paths are never serialized.
 
 ## Errors and limits
 
@@ -254,7 +292,7 @@ Use the [Python SDK](python-sdk.md) in the owning process for those operations.
 | `file_id` or `filename` | 255 characters |
 
 `file_data` is bounded by the complete HTTP body. A data URL is also bounded by the 8,192-character
-source field. The transport has no local-path input, remote fetch, upload endpoint, logical scope,
-or authentication policy. The owner-side Python input ceiling is 512 MiB per asset, but configured
+source field. The transport has no local-path input, remote fetch, upload endpoint, client-streaming capture
+route, coordinate-frame transform, logical scope, or authentication policy. The owner-side Python input ceiling is 512 MiB per asset, but configured
 backends may be lower; the [OpenAI adapter](python-sdk.md#bundled-adapters) has smaller inline
 request budgets.

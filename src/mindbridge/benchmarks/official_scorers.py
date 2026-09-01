@@ -15,14 +15,33 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Literal, Protocol, cast
 
+from mindbridge.benchmarks._official import personamem_v3_scoring as pm3
 from mindbridge.benchmarks._official.atm_score import (
     deterministic_accuracy as atm_deterministic_accuracy,
 )
 from mindbridge.benchmarks._official.atm_score import list_jaccard_score
+from mindbridge.benchmarks._official.beam_judge import build_rubric_item_prompt as build_beam_prompt
+from mindbridge.benchmarks._official.beam_judge import parse_rubric_item_score as parse_beam_item
+from mindbridge.benchmarks._official.clbench_judge import (
+    build_grading_prompt as build_clbench_prompt,
+)
+from mindbridge.benchmarks._official.clbench_judge import (
+    build_rubrics_text as build_clbench_rubrics,
+)
+from mindbridge.benchmarks._official.clbench_judge import (
+    parse_grading_response as parse_clbench,
+)
+from mindbridge.benchmarks._official.longmemeval_prompts import (
+    build_answer_check_prompt as build_longmemeval_prompt,
+)
+from mindbridge.benchmarks._official.longmemeval_prompts import (
+    parse_answer_check as parse_longmemeval,
+)
 from mindbridge.benchmarks._official.memlens_prompts import (
     build_judge_prompt as build_memlens_prompt,
 )
 from mindbridge.benchmarks._official.memlens_prompts import get_task_key
+from mindbridge.benchmarks.personamem_v3 import RANKING_TASK_TYPES
 
 SCORER_VERSION = "official_scorers_v2"
 
@@ -44,7 +63,19 @@ class JudgePlan:
     """The exact upstream judge calls and parser for one answer."""
 
     protocol: str
-    parser: Literal["locomo", "m3", "egotempo", "memlens", "mm_lifelong", "atm", "gallery"]
+    parser: Literal[
+        "locomo",
+        "m3",
+        "egotempo",
+        "memlens",
+        "mm_lifelong",
+        "atm",
+        "gallery",
+        "longmemeval",
+        "clbench",
+        "beam",
+        "personamem_v3",
+    ]
     calls: tuple[tuple[JudgeMessage, ...], ...]
     max_tokens: int | None = None
     extra_body: Mapping[str, object] | None = None
@@ -65,6 +96,10 @@ _PROTOCOLS = {
     "supermemory-vqa": "supermemory_vqa_metrics_1d228e0f1004",
     "atm-bench": "atm_bench_scorer_ef4e5dff1a47_minimal_v1",
     "mem-gallery": "mem_gallery_scorer_a93959e1e978",
+    "longmemeval": "longmemeval_anscheck_2ec2a557f339",
+    "clbench": "clbench_binary_rubric_b28a5832a09b",
+    "beam": "beam_unified_rubric_3e12035532eb",
+    "personamem-v3": "personamem_v3_rubric_7b00a090b35b",
 }
 
 _OFFICIAL_JUDGE_MODELS = {
@@ -75,6 +110,15 @@ _OFFICIAL_JUDGE_MODELS = {
     "mm-lifelong": "gpt-5",
     "atm-bench": "gpt-5-mini",
     "mem-gallery": "qwen2.5-72b-instruct",
+    # `evaluate_qa.py`'s `model_zoo` offers three metric models; the released
+    # results are the GPT-4o ones.
+    "longmemeval": "gpt-4o-2024-08-06",
+    # `eval.py --judge-model` default.
+    "clbench": "gpt-5.1",
+    # `src/llm.py: gpt_llm_obj`, the client every `evaluate_*` is handed.
+    "beam": "gpt-4.1-mini",
+    # `EVAL.md`: "the judge is a QueryLLM client on Azure gpt-5.5".
+    "personamem-v3": "gpt-5.5",
 }
 
 _JUDGE_METRICS = {
@@ -85,7 +129,28 @@ _JUDGE_METRICS = {
     "mm-lifelong": frozenset({"answer_accuracy", "judge_score_0_5"}),
     "atm-bench": frozenset({"accuracy"}),
     "mem-gallery": frozenset({"llm_judge"}),
+    "longmemeval": frozenset({"accuracy"}),
+    "clbench": frozenset({"solving_rate", "requirement_ratio"}),
+    "beam": frozenset({"llm_judge_score"}),
+    "personamem-v3": frozenset({"personamem_score"}),
 }
+
+# PersonaMem-v3 headline per task type, and the divisor that maps it onto the
+# 0-1 `personamem_score` its aggregator compares across tasks
+# (`evaluation/task_registry.py: PRIMARY_METRIC`).
+_PERSONAMEM_HEADLINES: dict[str, tuple[str, float]] = {
+    "chatbot_personalized_response": ("pr_preference_alignment_score_gated", 10.0),
+    "over_personalization_sycophancy": ("sycophancy_resistance_0_10", 10.0),
+    "preference_shift_followthrough": ("preference_shift_consistency", 10.0),
+    "personal_qa_hallucination": ("abstention_quality_0_10", 10.0),
+    "hidden_persona_implicit_qa": ("deep_motivation_alignment", 3.0),
+}
+_PERSONAMEM_RUBRIC_HEADLINE = ("pr_combined_personalization_score", 10.0)
+# `compute_ranking_metrics` labels `recall@1` "Headline accuracy = simple
+# top-1: did the agent pick the held-out?".
+_PERSONAMEM_RANKING_HEADLINE = ("recall@1", 1.0)
+_RANKED_INDEXES = re.compile(r"ranked[ _]index(?:es|ices)?\s*[:=]?\s*\[([^\]]*)\]", re.IGNORECASE)
+_RANKED_JSON = re.compile(r'"ranked_indices"\s*:\s*\[([^\]]*)\]')
 
 _LOCOMO_TOKEN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 _ATM_MEDIA_ID = re.compile(r"\b(\d{8}_\d{6})\b")
@@ -116,6 +181,10 @@ def task_primary_metric(task: str) -> str:
         "supermemory-vqa": "qa_accuracy",
         "atm-bench": "accuracy",
         "mem-gallery": "f1",
+        "longmemeval": "accuracy",
+        "clbench": "solving_rate",
+        "beam": "llm_judge_score",
+        "personamem-v3": "personamem_score",
     }[family]
 
 
@@ -212,6 +281,8 @@ def local_scores(  # noqa: C901 - direct task dispatch mirrors official scorer f
             scores = {}
         scores.update(_atm_retrieval(metadata, evidence_source_ids))
         return finalize_scores(task, scores)
+    if family == "personamem-v3":
+        return _personamem_local(prediction, metadata)
     if family == "mem-gallery":
         reference = references[0]
         scores = {
@@ -255,6 +326,12 @@ def judge_plan(  # noqa: C901 - direct task dispatch keeps official protocols au
     if family == "m3-bench" and not prediction:
         return None
     if family == "atm-bench" and metadata.get("qtype") != "open_end":
+        return None
+    if family == "personamem-v3" and not _personamem_judged(metadata):
+        return None
+    if family == "clbench" and not prediction.strip():
+        # `process_single_item` scores an empty output 0 without calling the
+        # judge at all.
         return None
     if family == "memlens" and len(_memlens_prediction(prediction).split()) > 500:
         return None
@@ -351,6 +428,31 @@ def judge_plan(  # noqa: C901 - direct task dispatch keeps official protocols au
             .replace("{{prediction}}", prediction)
         )
         return JudgePlan(protocol, "atm", ((JudgeMessage("user", prompt),),), 600)
+    if family == "longmemeval":
+        prompt = build_longmemeval_prompt(
+            str(metadata.get("question_type", "")),
+            question,
+            references[0],
+            prediction,
+            abstention=bool(metadata.get("abstention")),
+        )
+        return JudgePlan(protocol, "longmemeval", ((JudgeMessage("user", prompt),),), 10)
+    if family == "clbench":
+        prompt = build_clbench_prompt(build_clbench_rubrics(references), prediction)
+        return JudgePlan(protocol, "clbench", ((JudgeMessage("user", prompt),),))
+    if family == "beam":
+        category = str(metadata.get("category", ""))
+        return JudgePlan(
+            protocol,
+            "beam",
+            # One call per rubric item, exactly as every `evaluate_*` loops.
+            tuple(
+                (JudgeMessage("user", build_beam_prompt(item, prediction)),) for item in references
+            ),
+            details={"category": category},
+        )
+    if family == "personamem-v3":
+        return _personamem_plan(protocol, question, metadata, prediction)
     if family == "mem-gallery":
         prompt = (
             _GALLERY_PROMPT.replace("{{question}}", question)
@@ -405,6 +507,15 @@ def parse_judge_response(  # noqa: C901 - mirrors seven incompatible upstream pa
         return {"answer_accuracy": mapped, "judge_score_0_5": float(raw)}
     if plan.parser == "atm":
         return {"accuracy": float(_atm_judge_accuracy(response))}
+    if plan.parser == "longmemeval":
+        return {"accuracy": float(parse_longmemeval(response))}
+    if plan.parser == "clbench":
+        score, ratio = parse_clbench(response)
+        return {"solving_rate": score, "requirement_ratio": ratio}
+    if plan.parser == "beam":
+        return {"llm_judge_score": parse_beam_item(response, plan.details.get("category", ""))}
+    if plan.parser == "personamem_v3":
+        return _personamem_judge_scores(plan, response)
     if plan.parser == "gallery":
         score = _gallery_judge_score(response)
         return {"llm_judge": 0.0 if score < 0.25 else 0.5 if score < 0.75 else 1.0}
@@ -429,10 +540,196 @@ def combine_judge_scores(
             ),
         )
         return {**plan.candidate_metrics[selected], **scores[selected]}
+    if plan.parser == "beam":
+        # Every `evaluate_*` divides the accumulated per-item scores by the
+        # number of rubric items, so the category score is their mean.
+        values = [score["llm_judge_score"] for score in scores]
+        return {"llm_judge_score": sum(values) / len(values)}
     if len(scores) == 1:
         return dict(scores[0])
     names = set().union(*(score.keys() for score in scores))
     return {name: max(score[name] for score in scores if name in score) for name in names}
+
+
+def _personamem_metric(task_type: str) -> tuple[str, float] | None:
+    """Return one task type's headline metric and the divisor onto 0-1, if any.
+
+    Keyed on EVAL.md's headline table rather than on the rubric's applicability
+    map: upstream runs the rubric on several more task types but keeps its
+    output as a diagnostic beside a headline it computes a different way (a
+    leak-set composite, fatigue counters, a paired-row delta). A task type this
+    returns `None` for is answered and reported without a `personamem_score`,
+    so it stays out of the aggregate rather than entering it under a number
+    upstream does not publish.
+    """
+    if task_type in _PERSONAMEM_HEADLINES:
+        return _PERSONAMEM_HEADLINES[task_type]
+    if task_type in pm3.RUBRIC_HEADLINE_TASK_TYPES:
+        return _PERSONAMEM_RUBRIC_HEADLINE
+    if task_type in RANKING_TASK_TYPES:
+        return _PERSONAMEM_RANKING_HEADLINE
+    return None
+
+
+def _personamem_judged(metadata: Mapping[str, object]) -> bool:
+    """Report whether one row's headline needs -- and can have -- a judge call.
+
+    Ranking rows are scored deterministically against their frozen slate, so
+    they are excluded here even though they do have a headline.
+    """
+    task_type = str(metadata.get("task_type", ""))
+    return task_type not in RANKING_TASK_TYPES and _personamem_metric(task_type) is not None
+
+
+def _personamem_plan(
+    protocol: str,
+    question: str,
+    metadata: Mapping[str, object],
+    prediction: str,
+) -> JudgePlan:
+    task_type = str(metadata.get("task_type", ""))
+    evidence = metadata.get("judge_evidence")
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    if task_type in pm3.OWN_JUDGE_TASK_TYPES:
+        prompt = pm3.build_own_judge_prompt(task_type, evidence, prediction)
+    else:
+        prompt = pm3.build_unified_rubric_prompt(
+            task_type,
+            _personamem_evidence(question, metadata),
+            prediction,
+            pm3.positive_dims(task_type),
+            pm3.hard_rule_dims(task_type),
+            pm3.penalty_dims(task_type),
+            query_text=question,
+        )
+    return JudgePlan(
+        protocol,
+        "personamem_v3",
+        ((JudgeMessage("user", prompt),),),
+        details={"task_type": task_type},
+    )
+
+
+def _personamem_evidence(question: str, metadata: Mapping[str, object]) -> str:
+    """Serialise the evidence block the unified rubric judge reads.
+
+    Upstream assembles this with `personalization_rubric.build_source_a`, which
+    queries the persona's backend for the same-day avoid slice, the privacy
+    flags and the contradiction set. Those queries need the backend, not the
+    question, so this block carries the evidence the released row itself
+    publishes: the held-out preference, its distractors, and the row's rubric
+    tags. It is narrower than upstream's, which makes the hard-rule checks that
+    depend on the avoid slice under-fire relative to a full-harness run.
+    """
+    payload = {
+        "query_text": question,
+        "held_out_preference": metadata.get("groundtruth_preference", ""),
+        "distractor_preferences": list(_metadata_values(metadata, "distractor_preferences")),
+        "rubric_tags": list(_metadata_values(metadata, "rubric_tags")),
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _personamem_judge_scores(plan: JudgePlan, response: str) -> dict[str, float]:
+    task_type = plan.details.get("task_type", "")
+    payload = pm3_json(response)
+    if task_type in pm3.OWN_JUDGE_TASK_TYPES:
+        scores = pm3.parse_own_judge(task_type, payload)
+    else:
+        scores = pm3.score_unified_rubric(task_type, payload)
+    return _personamem_headline(task_type, scores)
+
+
+def _personamem_headline(task_type: str, scores: Mapping[str, float]) -> dict[str, float]:
+    """Add the 0-1 value the upstream aggregator compares across task types."""
+    result = dict(scores)
+    metric = _personamem_metric(task_type)
+    if metric is None:
+        return result
+    name, scale = metric
+    if name in result:
+        result["personamem_score"] = min(1.0, max(0.0, result[name] / scale))
+    return result
+
+
+def pm3_json(response: str) -> Mapping[str, object]:
+    """Extract the judge's JSON object the way upstream's helper does."""
+    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", response, re.DOTALL)
+    candidate = match.group(1).strip() if match else response.strip()
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        start, end = candidate.find("{"), candidate.rfind("}")
+        if start == -1 or end <= start:
+            raise ValueError("PersonaMem-v3 judge did not return a JSON object") from None
+        payload = json.loads(candidate[start : end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("PersonaMem-v3 judge did not return a JSON object")
+    return payload
+
+
+def _personamem_local(prediction: str, metadata: Mapping[str, object]) -> dict[str, float]:
+    """Score a ranking row deterministically against its frozen slate."""
+    if str(metadata.get("task_type", "")) not in RANKING_TASK_TYPES:
+        return {}
+    count = metadata.get("candidate_count")
+    if not isinstance(count, int) or count <= 0:
+        return {}
+    positives = {
+        index for index in _index_values(metadata, "positive_indexes") if 0 <= index < count
+    }
+    if not positives:
+        return {}
+    ranked = _parse_ranking(prediction, count)
+    negatives = {
+        index for index in _index_values(metadata, "negative_indexes") if 0 <= index < count
+    }
+    # `slate_ranking.ORIGIN_GAIN`: the held-out target is gain 3.0 and every
+    # other origin -- hard negatives, carve-outs and fillers alike -- is 0.0.
+    # `task_registry` describes a +2/-2/+1 scheme for one ranking task, but it
+    # belongs to a `_graded_ndcg_at_k` the release's fields cannot reconstruct,
+    # and negative gains make nDCG itself negative. Hard negatives keep their
+    # own reported diagnostics below instead.
+    gains = [3.0 if index in positives else 0.0 for index in ranked]
+    scores = {
+        "recall@1": pm3.recall_at_k(ranked, positives, 1),
+        "recall@3": pm3.recall_at_k(ranked, positives, 3),
+        "recall@5": pm3.recall_at_k(ranked, positives, 5),
+        "hit@1": pm3.hit_at_k(ranked, positives, 1),
+        "hit@3": pm3.hit_at_k(ranked, positives, 3),
+        "mrr": pm3.mrr(ranked, positives),
+        "ndcg_graded@5": pm3.ndcg_at_k(gains, 5),
+        "negative_in_top1": float(bool(ranked) and ranked[0] in negatives),
+        "negative_in_top3": float(any(index in negatives for index in ranked[:3])),
+    }
+    return _personamem_headline(str(metadata.get("task_type", "")), scores)
+
+
+def _parse_ranking(prediction: str, count: int) -> tuple[int, ...]:
+    """Read a ranking out of an answer, in either published shape.
+
+    The pinned release's own `example_response` is `Ranked indexes: [...]`; the
+    evaluation repository's current prompt asks for a fenced-JSON
+    `ranked_indices`. Both are accepted. A reply that is not a permutation of
+    the slate falls back to the identity order, which is what
+    `slate_ranking.run_task_a` does.
+    """
+    match = _RANKED_JSON.search(prediction) or _RANKED_INDEXES.search(prediction)
+    if match is not None:
+        try:
+            ranked = [int(part) for part in match.group(1).replace(",", " ").split()]
+        except ValueError:
+            ranked = []
+        if sorted(ranked) == list(range(count)):
+            return tuple(ranked)
+    return tuple(range(count))
+
+
+def _index_values(metadata: Mapping[str, object], key: str) -> tuple[int, ...]:
+    value = metadata.get(key)
+    if not isinstance(value, Sequence) or isinstance(value, str):
+        return ()
+    return tuple(item for item in value if isinstance(item, int) and not isinstance(item, bool))
 
 
 def _family(task: str) -> str:

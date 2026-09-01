@@ -4,7 +4,9 @@
 
 The optional MCP adapter exposes exactly six typed tools over one injected synchronous `Memory`.
 It validates tool input, calls the matching SDK operation, and returns structured public values.
-It does not own storage, provider selection, or the injected memory.
+It does not own storage, provider selection, or the injected memory. Finalized media arrives
+through ordinary content parts; live audio and vision packet ingestion, and `StreamEvent`
+reduction, stay Python-only because a tool call is a finite request.
 
 ## Invocation
 
@@ -59,9 +61,9 @@ rejected. The MCP-specific media bounds are listed below.
 
 | Tool | Arguments and defaults | Structured result | Annotation |
 | --- | --- | --- | --- |
-| `add_memory` | required `content`; `occurred_at=None`; `occurred_end=None`; `metadata=None`; `memory_type="semantic"` | `MemoryResult` | idempotent write |
-| `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None` | `{"hits":[SearchHitResult,...]}` | retrieval |
-| `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None` | `AnswerResponse` | retrieval |
+| `add_memory` | required `content`; `occurred_at=None`; `occurred_end=None`; `metadata=None`; `memory_type="semantic"`; `context=None` | `MemoryResult` | idempotent write |
+| `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None` | `{"hits":[SearchHitResult,...]}` | retrieval |
+| `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None` | `AnswerResponse` | retrieval |
 | `get_memory` | required `memory_id` | `MemoryResult` | read-only |
 | `list_memories` | `limit=100`; `cursor=None` | `PageResult` | read-only |
 | `delete_memory` | required `memory_id` | `{"deleted":bool}` | destructive, idempotent |
@@ -70,6 +72,12 @@ All timestamps must be timezone-aware. An event end requires a start and must be
 Search event bounds are a half-open overlap filter; two bounds require
 `occurred_until > occurred_from`. `memory_type` is `semantic`, `episodic`, or `procedural`.
 Pagination cursors are opaque and must be passed back unchanged.
+
+`context` carries typed observation basis, source ID, confidence, validity, and optional spatial
+pose. `scope.valid_at` selects world validity and `scope.known_at` selects the transaction
+version known then; `scope.near` and `scope.radius_m` must appear together, and their frame ID
+and observer/subject anchor must match the stored spatial context. SQLite reapplies both filters
+after candidate retrieval.
 
 `add_memory` is content-addressed. `delete_memory` reports whether a record existed. Search and
 answer are not marked read-only because their SDK path may persist lazy transcript caches; they are
@@ -84,7 +92,7 @@ Successful calls populate MCP `structuredContent`:
 | Object | Fields |
 | --- | --- |
 | `AssetResult` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name` |
-| `MemoryResult` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata` |
+| `MemoryResult` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context` |
 | `SearchHitResult` | all memory fields plus `score` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResult` | `items`, `next_cursor` |
@@ -163,6 +171,7 @@ cursor contract as `Memory.list`.
 | `file_id` or `filename` | 255 characters |
 
 MCP has no aggregate framing budget, but each inline media value is bounded before model or storage
-work. It has no local-path input, remote fetch, large-file upload tool, logical scope, or separate
-authentication policy; the MCP host owns transport access control. Configured model backends may
+work. It has no local-path input, remote fetch, large-file upload tool, capture-stream tool,
+coordinate-frame transform, logical scope, or separate authentication policy; the MCP host owns
+transport access control. Configured model backends may
 impose a smaller aggregate budget, including the [OpenAI inline limits](python-sdk.md#bundled-adapters).

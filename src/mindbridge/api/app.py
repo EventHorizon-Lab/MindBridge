@@ -28,10 +28,13 @@ from mindbridge.types import (
     AssetRef,
     Blob,
     ContentInput,
+    MemoryContext,
     MemoryRecord,
     MemoryType,
     Modality,
+    ObservationContext,
     Page,
+    RetrievalScope,
     SearchHit,
 )
 
@@ -140,6 +143,7 @@ class MemoryCreate(_RequestModel):
     occurred_end: AwareDatetime | None = None
     metadata: dict[str, JsonValue] | None = None
     memory_type: MemoryType = MemoryType.SEMANTIC
+    context: ObservationContext | None = None
 
 
 class MemoryBatchCreate(_RequestModel):
@@ -148,6 +152,7 @@ class MemoryBatchCreate(_RequestModel):
     occurred_end: list[AwareDatetime | None] | None = None
     metadata: list[dict[str, JsonValue] | None] | None = None
     memory_type: MemoryType = MemoryType.SEMANTIC
+    context: list[ObservationContext | None] | None = None
 
 
 class QueryRequest(_RequestModel):
@@ -157,6 +162,7 @@ class QueryRequest(_RequestModel):
     reference_at: AwareDatetime | None = None
     occurred_from: AwareDatetime | None = None
     occurred_until: AwareDatetime | None = None
+    scope: RetrievalScope | None = None
 
     @model_validator(mode="after")
     def validate_occurrence_range(self) -> QueryRequest:
@@ -174,6 +180,7 @@ class AnswerRequest(_RequestModel):
     limit: _Limit = 5
     memory_type: MemoryType | None = None
     reference_at: AwareDatetime | None = None
+    scope: RetrievalScope | None = None
 
 
 class _ResponseModel(BaseModel):
@@ -199,6 +206,7 @@ class MemoryResponse(_ResponseModel):
     occurred_at: AwareDatetime | None = None
     occurred_end: AwareDatetime | None = None
     metadata: dict[str, JsonValue]
+    context: MemoryContext | None = None
 
 
 class SearchHitResponse(MemoryResponse):
@@ -242,6 +250,7 @@ class _Memory(Protocol):
         occurred_end: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: ObservationContext | None = None,
     ) -> MemoryRecord: ...
 
     def add_many(
@@ -252,6 +261,7 @@ class _Memory(Protocol):
         occurred_end: Sequence[datetime | None] | None = None,
         metadata: Sequence[Mapping[str, object] | None] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: Sequence[ObservationContext | None] | None = None,
     ) -> tuple[MemoryRecord, ...]: ...
 
     def search(
@@ -263,6 +273,7 @@ class _Memory(Protocol):
         reference_at: datetime | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> tuple[SearchHit, ...]: ...
 
     def ask(
@@ -272,6 +283,7 @@ class _Memory(Protocol):
         limit: int = 5,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> AnswerResult: ...
 
     def get(self, memory_id: str) -> MemoryRecord: ...
@@ -374,6 +386,7 @@ def create_app(
             occurred_end=request.occurred_end,
             metadata=request.metadata,
             memory_type=request.memory_type,
+            context=request.context,
         )
         return MemoryResponse.model_validate(record)
 
@@ -393,6 +406,7 @@ def create_app(
                     occurred_end=request.occurred_end,
                     metadata=request.metadata,
                     memory_type=request.memory_type,
+                    context=request.context,
                 )
             }
         )
@@ -425,6 +439,7 @@ def create_app(
                     reference_at=request.reference_at,
                     occurred_from=request.occurred_from,
                     occurred_until=request.occurred_until,
+                    scope=request.scope,
                 )
             }
         )
@@ -460,6 +475,7 @@ def create_app(
                 limit=request.limit,
                 memory_type=request.memory_type,
                 reference_at=request.reference_at,
+                scope=request.scope,
             )
         )
 

@@ -82,12 +82,12 @@ the recipe.
 
 | Command | Operands and options | JSON result | `--url` |
 | --- | --- | --- | --- |
-| `add` | content; `--occurred-at`; `--occurred-end`; `--metadata`; `--memory-type` | memory object | yes |
+| `add` | content; `--occurred-at`; `--occurred-end`; `--metadata`; `--memory-type`; `--context` | memory object | yes |
 | `add-many` | optional JSONL source; `--memory-type` | `{"memories":[...]}` | yes |
 | `add-stream` | optional JSONL source; `--memory-type` | `{"memories":[...]}` | no |
-| `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
+| `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
 | `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | no |
-| `ask` | content; `--limit`; `--memory-type`; `--reference-at` | answer object | yes |
+| `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope` | answer object | yes |
 | `get` | `MEMORY_ID` | memory object | yes |
 | `speech` | `MEMORY_ID` | `{"segments":[...]}` | no |
 | `faces` | `MEMORY_ID` | `{"observations":[...]}` | no |
@@ -129,10 +129,19 @@ Local `--content-json` adds one part source to the REST union:
 `input_file.path` and positional `@PATH` are rejected with `--url`; send base64 media accepted by
 the [REST content contract](rest.md#content-input).
 
-`--metadata` on `add` accepts a literal JSON object, `@PATH`, or `-`. `add-many` and `add-stream`
-read non-empty JSONL from a literal value, `@PATH`, or stdin. Each non-blank line is an object with
-required `content` and optional `occurred_at`, `occurred_end`, and `metadata`; unknown fields are
-rejected. `--memory-type` applies to every line.
+`--metadata` and `--context` on `add`, and `--scope` on the retrieval commands, each accept a
+literal JSON object, `@PATH`, or `-`. `add-many` and `add-stream` read non-empty JSONL from a
+literal value, `@PATH`, or stdin. Each non-blank line is an object with required `content` and
+optional `occurred_at`, `occurred_end`, `metadata`, and `context`; unknown fields are rejected.
+`--memory-type` applies to every line.
+
+```bash
+mindbridge --embedder jina-omni add "The mug is on the table" \
+  --context '{"basis":"observation","source_id":"camera-1:42","confidence":0.94}'
+
+mindbridge --embedder jina-omni search "Where is the mug?" \
+  --scope '{"near":{"frame_id":"home/map","anchor":"subject","x":2,"y":1},"radius_m":0.75}'
+```
 
 `add-many` collects all lines for one model batch and one SQLite transaction. `add-stream` commits
 and makes each line searchable before reading the next, but collects returned records for the
@@ -144,7 +153,9 @@ CLI's single-document stdout result. It is therefore for finite JSONL; use
 On success, stdout contains one JSON document and a trailing newline. Local results use the same
 memory, hit, answer, page, and deletion field vocabulary as [REST response objects](rest.md#response-objects).
 `search-with-trace` serializes the [Python retrieval trace](python-sdk.md#public-values).
-`SpeakerSegment` and `FaceObservation` use their public Python fields.
+`SpeakerSegment` and `FaceObservation` use their public Python fields. Memory and hit documents
+carry `context` when typed semantics exist, identically in local and `--url` mode, with enum
+values as JSON strings and datetimes as ISO 8601.
 
 Unless `--quiet` is set, commands write the resolved composition as one JSON document on stderr
 before executing. `--url` forwards successful owner response objects unchanged. Runtime
@@ -209,5 +220,8 @@ content parts and the 8 MiB request body. Local JSONL has no separate item-count
 `add-many` is capped at 100 items by REST.
 
 There is no configuration file, `MINDBRIDGE_*` composition variable, plugin registry, interactive
-prompt, streaming stdout, output-format switch, or `serve` command. Use the Python configuration
-boundary and an ASGI server instead of a second CLI configuration or server implementation.
+prompt, streaming stdout, output-format switch, `serve` command, capture-event reducer, or
+coordinate-frame transform. Use the Python configuration boundary and an ASGI server instead of a
+second CLI configuration or server implementation. `add-stream` is for finite finalized JSONL;
+use `AsyncAudioStream`, `AsyncVisionStream`, or `AsyncCaptureStream` in Python for live sensor
+packets and associated update/final/cancel capture events.

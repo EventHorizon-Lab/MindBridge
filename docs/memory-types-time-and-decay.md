@@ -1,8 +1,10 @@
 # Memory types, time, and decay
 
-MindBridge stores semantic, episodic, and procedural roles on the same durable record. Event time,
-type filtering, optional temporal parsing, and optional decay all use the ordinary SQLite and Zvec
-path; they do not create separate stores or scopes.
+MindBridge stores semantic, episodic, and procedural roles on the same durable record. An optional
+typed context refines that record into observations, entities, events, state, relations, affect,
+traits, and response policies carrying source evidence, confidence, and their own validity and
+transaction time. Event time, type filtering, optional temporal parsing, and optional decay all
+use the ordinary SQLite and Zvec path; they do not create separate stores or scopes.
 
 | Control | Effect |
 | --- | --- |
@@ -20,7 +22,8 @@ path; they do not create separate stores or scopes.
 | `MemoryType.PROCEDURAL` | Instructions or reusable routines | Retrieved as evidence; never executed by MindBridge. |
 
 The caller classifies content. MindBridge does not extract facts, segment episodes, or promote one
-type into another. Type is part of stable identity, so otherwise identical semantic, episodic, and
+type into another unless an explicit `FormationBackend` is configured, and even then formation
+proposes a separate typed record rather than rewriting the caller's role. Type is part of stable identity, so otherwise identical semantic, episodic, and
 procedural records have different IDs. `search` and `ask` accept an optional exact type filter.
 
 ```python
@@ -49,6 +52,34 @@ with Memory("./data/agent", embedder=JinaOmniEmbedder()) as memory:
 Metadata remains application data. A type or metadata value is not an authorization or isolation
 boundary.
 
+## Typed context and formation
+
+Attach source context to an observation without leaving the common path:
+
+```python
+from mindbridge import EvidenceBasis, ObservationContext
+
+source = memory.add(
+    "The mug is on the kitchen table.",
+    context=ObservationContext(
+        basis=EvidenceBasis.OBSERVATION,
+        source_id="camera-1:frame-42",
+        confidence=0.94,
+    ),
+)
+```
+
+The source commits before any typed proposal is formed, so a formation model error leaves the
+observation durable and the formation retryable. Two kinds carry extra visibility rules:
+
+- `MemoryKind.AFFECT` records a situated cue together with the source modality it came from, so a
+  model cannot claim an audio cue for a source that has no audio.
+- `MemoryKind.TRAIT` stays hidden from active retrieval until two independent sources support the
+  same typed claim, combining their independent confidence with a noisy-OR projection.
+
+See [omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) for the
+formation, affect, and spatial examples that arrive from capture streams.
+
 ## Event time and strict filters
 
 `occurred_at` is an event start; `occurred_end` is an optional exclusive end and must be later than
@@ -63,6 +94,46 @@ authoritative.
 An instant event is treated internally as a one-microsecond interval. A stored interval matches
 when it overlaps the requested range; an event ending exactly at `occurred_from`, or starting
 exactly at `occurred_until`, does not match.
+
+## Valid time and transaction time
+
+Raw occurrence and typed assertion time answer different questions:
+
+| Field | Meaning |
+| --- | --- |
+| `occurred_at` / `occurred_end` | When the captured episode happened |
+| `MemoryContext.valid_from` / `valid_until` | When a formed assertion is true in the represented world |
+| `MemoryContext.recorded_at` / `retired_at` | When MindBridge knew that assertion version |
+
+`RetrievalScope(valid_at=..., known_at=...)` combines the last two axes. `valid_at` selects an
+assertion whose half-open world interval contains that instant; `known_at` selects the transaction
+version active then. Supplying either excludes records without the corresponding typed semantic
+version, and excludes raw records created after `known_at`. Evidence links carry the same
+recorded/retired bounds, so a historical result never exposes support added later. Each evidence
+change and its semantic projection share one monotonically allocated transaction instant even when
+the device wall clock repeats.
+
+```python
+from mindbridge import RetrievalScope
+
+what_we_believed_then = memory.search(
+    "What drink did Alex prefer?",
+    scope=RetrievalScope(valid_at=event_time, known_at=audit_time),
+)
+```
+
+Overlapping state assertions share a deterministic lineage keyed by kind, normalized subject,
+predicate, and spatial frame/anchor. A later assertion retires the previous transaction version and
+splits any unaffected before/after validity segments into carry-forward versions, which is what
+supports bounded backfill and A to B to A evolution. Assertions conflict only within one SQLite
+write batch; equal wall-clock timestamps in separate transactions are still ordered.
+
+`get` and `list` expose the latest typed context even when it is retired or hidden, while default
+search uses only active visible versions. Forgetting is evidence-aware: deleting evidence
+recalculates derived confidence and visibility, and removing the last evidence removes the
+unsupported derived record. Removing a superseding source, or deleting a derived assertion, rebuilds
+current validity segments from the remaining supported assertions. Source records are deleted only
+by an explicit caller action.
 
 ## Temporal phrases
 

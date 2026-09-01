@@ -29,7 +29,9 @@ from mindbridge.types import (
     MemoryRecord,
     MemoryType,
     Modality,
+    ObservationContext,
     Page,
+    RetrievalScope,
     SearchHit,
 )
 
@@ -72,6 +74,7 @@ class FakeMemory:
         occurred_end: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: ObservationContext | None = None,
     ) -> MemoryRecord:
         self._fail()
         copied_metadata = dict(metadata or {})
@@ -95,6 +98,7 @@ class FakeMemory:
         occurred_end: Sequence[datetime | None] | None = None,
         metadata: Sequence[Mapping[str, object] | None] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: Sequence[ObservationContext | None] | None = None,
     ) -> tuple[MemoryRecord, ...]:
         self._fail()
         copied = tuple(contents)
@@ -132,6 +136,7 @@ class FakeMemory:
         reference_at: datetime | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> tuple[SearchHit, ...]:
         self._fail()
         self.calls.append(
@@ -154,6 +159,7 @@ class FakeMemory:
         limit: int = 5,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> AnswerResult:
         self._fail()
         self.calls.append(("ask", question, limit, memory_type, reference_at))
