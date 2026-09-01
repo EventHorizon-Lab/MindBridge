@@ -16,6 +16,7 @@ from mindbridge.benchmarks.eval_adapters import EvalQuestion, EvalUnit, LoadedTa
 from mindbridge.benchmarks.official_scorers import (
     JudgeMessage,
     JudgePlan,
+    combine_judge_scores,
     judge_model_is_official,
     judge_plan,
     local_scores,
@@ -399,3 +400,227 @@ async def test_unified_eval_applies_and_records_the_official_judge(
     assert judged[0].judge_response == '["{\\"label\\":\\"CORRECT\\"}"]'
     assert calls[0]["temperature"] == 0.0
     assert calls[0]["extra_body"] == {"enable_thinking": False}
+
+
+def _judged(
+    task: str,
+    *,
+    question: str,
+    references: tuple[str, ...],
+    prediction: str,
+    metadata: dict[str, object],
+    replies: tuple[str, ...],
+) -> tuple[JudgePlan, dict[str, float]]:
+    plan = judge_plan(
+        task,
+        question=question,
+        references=references,
+        prediction=prediction,
+        metadata=metadata,
+    )
+    assert plan is not None
+    assert len(plan.calls) == len(replies)
+    outcomes = tuple(parse_judge_response(plan, reply) for reply in replies)
+    return plan, combine_judge_scores(plan, outcomes)
+
+
+def test_longmemeval_judge_picks_the_template_its_question_type_names() -> None:
+    plan, scores = _judged(
+        "longmemeval-s",
+        question="What degree did I graduate with?",
+        references=("Business Administration",),
+        prediction="Business Administration.",
+        metadata={"question_type": "temporal-reasoning", "abstention": False},
+        replies=("Yes.",),
+    )
+    # Only the temporal template forgives off-by-one day counts.
+    assert "do not penalize off-by-one errors" in plan.calls[0][0].content
+    assert scores == {"accuracy": 1.0}
+
+    plan, scores = _judged(
+        "longmemeval-s",
+        question="Which gate?",
+        references=("The itinerary never states it.",),
+        prediction="I cannot tell from our conversations.",
+        metadata={"question_type": "multi-session", "abstention": True},
+        replies=("no",),
+    )
+    # Abstention swaps in a different template keyed off the `_abs` question ID.
+    assert "unanswerable" in plan.calls[0][0].content
+    assert scores == {"accuracy": 0.0}
+
+    # The verdict is read as upstream reads it -- `"yes" in lowered` -- which a
+    # reply mentioning both words resolves differently from any "no" test.
+    _, mixed = _judged(
+        "longmemeval-s",
+        question="What degree did I graduate with?",
+        references=("Business Administration",),
+        prediction="Business Administration.",
+        metadata={"question_type": "multi-session", "abstention": False},
+        replies=("Yes, no doubt about it.",),
+    )
+    assert mixed == {"accuracy": 1.0}
+
+
+def test_clbench_judge_is_binary_and_skips_an_empty_answer() -> None:
+    _, scores = _judged(
+        "clbench",
+        question="What do Sighting cards do?",
+        references=("Define a Sighting card.", "Name its trigger.", "State the Myth award."),
+        prediction="They award Myth and can move Humans.",
+        metadata={},
+        replies=(
+            '{"Grading Rationale": "r", '
+            '"List of Requirement Satisfaction Status": ["yes", "no", "yes"], '
+            '"Overall Score": 1}',
+        ),
+    )
+    assert scores["solving_rate"] == 1.0
+    assert scores["requirement_ratio"] == pytest.approx(2 / 3)
+
+    # `process_single_item` scores an empty output 0 without calling the judge.
+    assert (
+        judge_plan(
+            "clbench",
+            question="q",
+            references=("r",),
+            prediction="   ",
+            metadata={},
+        )
+        is None
+    )
+
+
+def test_beam_judges_each_rubric_item_and_truncates_partial_credit() -> None:
+    rubric = ("first", "second", "third", "fourth")
+    replies = ('{"score": 1.0}', '{"score": 0.5}', '{"score": 0.0}', '{"score": 1.0}')
+    plan, scores = _judged(
+        "beam-100k",
+        question="Summarise the project",
+        references=rubric,
+        prediction="A summary.",
+        metadata={"category": "summarization"},
+        replies=replies,
+    )
+    # One call per rubric item, and the prompt keeps upstream's unsubstituted
+    # `<question>` placeholder.
+    assert len(plan.calls) == len(rubric)
+    assert "<question>" in plan.calls[0][0].content
+    assert "first" in plan.calls[0][0].content
+    # Nine categories accumulate with `int(score)`, so 0.5 truncates to 0.
+    assert scores == {"llm_judge_score": 0.5}
+
+    _, ordering = _judged(
+        "beam-100k",
+        question="Order the events",
+        references=("first", "second"),
+        prediction="An ordering.",
+        metadata={"category": "event_ordering"},
+        replies=('{"score": 0.5}', '{"score": 1.0}'),
+    )
+    # `event_ordering` alone accumulates with `float(score)`.
+    assert ordering == {"llm_judge_score": 0.75}
+
+
+def test_personamem_rubric_applies_the_official_deterministic_aggregation() -> None:
+    metadata: dict[str, object] = {
+        "task_type": "chatbot_personalized_response",
+        "groundtruth_preference": "Enjoys affectionate couple-life content.",
+        "distractor_preferences": ("Interested in DIY nursery projects",),
+        "rubric_tags": ("(+) Reflect the user's relevant preferences.",),
+        "judge_evidence": {},
+    }
+    clean = (
+        '{"preference_alignment": 9, "telegraph_avoidance": 4, "avoid_leak_violated": false, '
+        '"privacy_leak_violated": false, "stale_preference_use_violated": false}'
+    )
+    plan, scores = _judged(
+        "personamem-v3",
+        question="what should i cook tonight",
+        references=("pepper stew",),
+        prediction="A pepper stew bowl.",
+        metadata=metadata,
+        replies=(clean,),
+    )
+    # This task has one positive dim, so the prompt states the single-target
+    # wording rather than the 80/20 split, and the judge returns per-dimension
+    # scores only -- the arithmetic is applied in code.
+    prompt = plan.calls[0][0].content
+    assert "The MAIN SCORE for this task is **preference_alignment** alone" in prompt
+    assert "what should i cook tonight" in prompt
+    assert "Enjoys affectionate couple-life content." in prompt
+    # main 9 - 0.5 x (10 - 4) telegraph deduction = 6.
+    assert scores["pr_combined_personalization_score"] == 6.0
+    # This task's headline excludes the telegraph deduction.
+    assert scores["pr_preference_alignment_score_gated"] == 9.0
+    assert scores["personamem_score"] == pytest.approx(0.9)
+
+    leaked = clean.replace('"privacy_leak_violated": false', '"privacy_leak_violated": true')
+    _, violated = _judged(
+        "personamem-v3",
+        question="what should i cook tonight",
+        references=("pepper stew",),
+        prediction="A pepper stew bowl.",
+        metadata=metadata,
+        replies=(leaked,),
+    )
+    # A hard rule is one-strike: it zeroes the row whatever the dims say.
+    assert violated["pr_combined_personalization_score"] == 0.0
+    assert violated["personamem_score"] == 0.0
+
+
+def test_personamem_ranking_is_deterministic_and_reads_both_answer_shapes() -> None:
+    metadata: dict[str, object] = {
+        "task_type": "personalized_recommendation",
+        "candidate_count": 5,
+        "positive_indexes": (2,),
+        "negative_indexes": (0, 1),
+    }
+    # Ranking rows never reach a judge.
+    assert (
+        judge_plan(
+            "personamem-v3",
+            question="rank",
+            references=("gold",),
+            prediction="Ranked indexes: [2, 3, 4, 1, 0]",
+            metadata=metadata,
+        )
+        is None
+    )
+    hit = _scores("personamem-v3", "Ranked indexes: [2, 3, 4, 1, 0]", "gold", dict(metadata))
+    assert hit["recall@1"] == 1.0
+    assert hit["personamem_score"] == 1.0
+    assert hit["negative_in_top3"] == 0.0
+
+    # The evaluation repository's current prompt asks for this shape instead.
+    # The order is deliberately not the identity one, so failing to read it
+    # cannot be mistaken for the fallback below.
+    reversed_json = '```json\n{"ranked_indices": [4, 3, 2, 1, 0]}\n```'
+    miss = _scores("personamem-v3", reversed_json, "gold", dict(metadata))
+    assert miss["recall@1"] == 0.0
+    assert miss["mrr"] == pytest.approx(1 / 3)
+    assert miss["negative_in_top1"] == 0.0
+
+    # A reply that is not a permutation of the slate is unusable, and so is an
+    # answer with no ranking in it. Both fall back to the identity order, which
+    # is what `slate_ranking.run_task_a` does.
+    identity = _scores("personamem-v3", "no idea", "gold", dict(metadata))
+    assert identity["recall@1"] == 0.0
+    assert identity["negative_in_top1"] == 1.0
+    assert _scores("personamem-v3", "Ranked indexes: [2, 2, 3]", "gold", dict(metadata)) == identity
+    assert _scores("personamem-v3", "Ranked indexes: [2, 0]", "gold", dict(metadata)) == identity
+
+
+def test_personamem_leaves_families_it_cannot_reproduce_unscored() -> None:
+    metadata: dict[str, object] = {"task_type": "proactive_close_friend_update"}
+    assert _scores("personamem-v3", "I would stay quiet.", "gold", dict(metadata)) == {}
+    assert (
+        judge_plan(
+            "personamem-v3",
+            question="react?",
+            references=("gold",),
+            prediction="I would stay quiet.",
+            metadata=metadata,
+        )
+        is None
+    )

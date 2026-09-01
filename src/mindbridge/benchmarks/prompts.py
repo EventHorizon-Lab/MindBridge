@@ -221,6 +221,84 @@ def mem_gallery_format_constraint(point: str) -> str:
     return f"\n\n{prompt.text}" if prompt is not None else ""
 
 
+CLBENCH_QUERY_PROMPT = PromptSpec(
+    name="clbench_query",
+    version="clbench_query_v1",
+    purpose="Carry the CL-Bench record's own system prompt alongside its question.",
+    used_by="mindbridge.benchmarks.eval_adapters._clbench",
+    # CL-Bench publishes no answer-generation prompt: `infer.py` posts the
+    # record's `messages` unchanged, so the system turn is the only instruction
+    # the graded model ever sees. Its rubrics grade formatting and style rules
+    # stated there, so dropping it would fail rubric items the response never
+    # had a chance to satisfy. The reference document travels through memory
+    # instead of through this prompt.
+    text="{system_prompt}\n\n{question}",
+)
+
+BEAM_QUERY_PROMPT = PromptSpec(
+    name="beam_query",
+    version="beam_query_v1",
+    purpose="Apply BEAM's official retrieval-answer instruction.",
+    used_by="mindbridge.benchmarks.eval_adapters._beam",
+    # `src/prompts.py: answer_generation_for_rag`, minus its `CONTEXT:\n<context>`
+    # block. That slot is where BEAM's own harness pastes the passages its
+    # retriever returned; MindBridge answers from its own recall, and pasting an
+    # empty context section would tell the model to answer from nothing. Every
+    # instruction that shapes the answer -- answer only from context, do not use
+    # internal knowledge, be direct and concise, output only the answer -- is
+    # kept verbatim, because the rubric judge grades against them.
+    text=(
+        "You are an assistant that MUST answer questions using ONLY the information provided "
+        "in the context below. \n\n"
+        "STRICT INSTRUCTIONS:\n"
+        "1. Answer ONLY based on the provided context\n"
+        "2. Do NOT use your internal knowledge\n\n"
+        "QUESTION:\n{question}\n\n"
+        "ANSWER REQUIREMENTS:\n"
+        "- Be direct and concise\n"
+        "- Only output the answer to the question without any explanation \n\n"
+        "RESPONSE:"
+    ),
+)
+
+PERSONAMEM_V3_RANKING_PROMPT = PromptSpec(
+    name="personamem_v3_ranking",
+    version="personamem_v3_ranking_v1",
+    purpose="Ask a PersonaMem-v3 slate question in the release's own answer format.",
+    used_by="mindbridge.benchmarks.eval_adapters._personamem_v3",
+    # The answer format is taken from the pinned release rather than from the
+    # evaluation repository: every ranking row's `example_response` is
+    # `"Ranked indexes: [13, 5, ...]"`, while the repository's current
+    # `slate_ranking_prompt` asks for a fenced-JSON `ranked_indices`. The two
+    # have drifted; the released gold is what the released data can be scored
+    # against. The scorer accepts either shape, so a model that answers in the
+    # repository's format is not penalised.
+    text=(
+        "{query}\n\n"
+        "## Candidate slate (order is random)\n{slate}\n\n"
+        "## Your job\n"
+        "Rank the {count} candidates from most to least likely that **this specific user**, at "
+        "this moment, would positively engage with, using only the memories. Penalize "
+        "candidates the user has disliked or would find irrelevant right now.\n\n"
+        "## Output\n"
+        "Reply with one line and nothing else, listing every index exactly once:\n"
+        "Ranked indexes: [<idx>, <idx>, ...]"
+    ),
+)
+
+PERSONAMEM_V3_QUERY_PROMPT = PromptSpec(
+    name="personamem_v3_query",
+    version="personamem_v3_query_v1",
+    purpose="Ask a non-ranking PersonaMem-v3 query as the released row states it.",
+    used_by="mindbridge.benchmarks.eval_adapters._personamem_v3",
+    # PersonaMem-v3's runners build a different prompt per task family, and the
+    # released rows carry the already-rendered `user_query` those runners hand
+    # to the model -- including the bracketed scenario labels the proactive and
+    # ranking rows use. It is passed through unchanged; only the prior
+    # conversation, where a row has one, is prepended as context.
+    text="{question}",
+)
+
 BENCHMARK_PROMPTS = (
     EGOMEM_REASON_QUERY_PROMPT,
     MEMLENS_QUERY_PROMPT,
@@ -235,4 +313,8 @@ BENCHMARK_PROMPTS = (
     MEM_GALLERY_REFUSAL_PROMPT,
     MEM_GALLERY_CONFLICT_PROMPT,
     MEM_GALLERY_SEARCH_PROMPT,
+    CLBENCH_QUERY_PROMPT,
+    BEAM_QUERY_PROMPT,
+    PERSONAMEM_V3_RANKING_PROMPT,
+    PERSONAMEM_V3_QUERY_PROMPT,
 )

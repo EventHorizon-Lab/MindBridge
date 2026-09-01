@@ -8,6 +8,9 @@ described below.
 - MEMLENS, copyright 2026 Xiyu Ren, Zhaowei Wang, and the MemLens Authors.
 - ATM-Bench, copyright 2026 Jingbiao Mei.
 - Mem-Gallery, copyright 2026 Yuanchen Bei.
+- LongMemEval, copyright 2024 Di Wu.
+- BEAM, copyright 2025 Mohammad Tavakoli.
+- PersonaMem-v3 evaluation code, copyright 2026 The PersonaMem-v3 Authors.
 
 Those components are provided under the MIT License:
 
@@ -53,6 +56,27 @@ separate permission.
 Source: `mem-eval-suite/LoCoMo_refined@887091190789e8d6760e70b9edd696539923dc4f`.
 
 ## Restricted evaluator material
+
+The CL-Bench grading prompt is copied from
+`Tencent-Hunyuan/CL-bench@main/eval.py`, and the dataset it grades is
+`tencent/CL-bench@b28a5832a09b0d96c0cf4c22e90d7c60ede25b80`. The release is
+distributed under a custom evaluation-only license: it permits use, copying,
+modification, publication and distribution **solely for evaluating, testing
+and benchmarking models**, and forbids training, fine-tuning, calibrating,
+distilling, adapting, or any other parameter updating on the dataset or any
+part of it. Do not route this corpus into anything that writes model weights.
+
+PersonaMem-v3's *data* is licensed separately from its code: the personas
+derive from `facebook/gistbench` and inherit
+[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) --
+attribution, non-commercial. The evaluation code the scoring here is
+transcribed from is MIT (above). Source:
+`bowen-upenn/PersonaMem-v3@7b00a090b35b7293e6efeeb19494207f32b5a9ee`.
+
+Each `backend/{persona_id}/profile.json` is the scorer-side ground-truth
+persona, which the release states is never shown to the evaluated agent. The
+catalog task does not download it and no loader reads it; keep it out of any
+memory path if you fetch it by hand.
 
 The MM-Lifelong scorer instruction is copied from
 `MM-Lifelong/MM-Lifelong@248aa82039a574e63a2e524746a7cd8f32330443/eval_acc.py`. The pinned

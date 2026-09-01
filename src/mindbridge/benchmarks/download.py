@@ -7,6 +7,7 @@ import shutil
 import stat
 import zipfile
 from collections.abc import Callable, Sequence
+from fnmatch import fnmatchcase
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -19,6 +20,7 @@ _GITHUB_REPOSITORIES = frozenset(
         "mem-eval-suite/LoCoMo_refined",
         "ByteDance-Seed/m3-agent",
         "google-research-datasets/egotempo",
+        "mohammadtavakoli78/BEAM",
     }
 )
 
@@ -28,24 +30,44 @@ def acquire_inputs(spec: TaskSpec, root: Path, *, include_dataset: bool = True) 
     inputs = (
         spec.input_paths(root) if include_dataset else tuple(root / path for path in spec.auxiliary)
     )
-    wanted = tuple(
-        path
-        for path in inputs
-        if not path.exists() or (spec.repository not in _GITHUB_REPOSITORIES and path.is_dir())
-    )
+    # A directory input is always re-resolved: it can exist while still missing
+    # files, and the fetch is a no-op once every file is present.
+    wanted = tuple(path for path in inputs if not path.exists() or path.is_dir())
     if not wanted:
         return
     release_root = root / Path(spec.dataset).parts[0]
-    relative = tuple(path.relative_to(release_root).as_posix() for path in wanted)
+    dataset = spec.dataset_path(root)
     if spec.repository in _GITHUB_REPOSITORIES:
-        for name, destination in zip(relative, wanted, strict=True):
-            _github_file(spec, name, destination)
-        return
-    patterns = tuple(name if Path(name).suffix else f"{name}/*" for name in relative)
-    _snapshot(spec.repository, spec.revision, patterns, release_root)
+        for path in wanted:
+            name = path.relative_to(release_root).as_posix()
+            if Path(name).suffix:
+                _github_file(spec, name, path)
+            else:
+                _github_directory(spec, _patterns(spec, path, dataset, name), release_root)
+    else:
+        patterns = tuple(
+            pattern
+            for path in wanted
+            for pattern in _patterns(spec, path, dataset, path.relative_to(release_root).as_posix())
+        )
+        _snapshot(spec.repository, spec.revision, patterns, release_root)
     absent = tuple(path for path in wanted if not path.exists())
     if absent:
         raise FileNotFoundError(f"download did not produce: {', '.join(map(str, absent))}")
+
+
+def _patterns(spec: TaskSpec, path: Path, dataset: Path, name: str) -> tuple[str, ...]:
+    """Return the release-relative globs that fetch one catalog input.
+
+    A task may pin exactly which files under a directory input it reads. A
+    suffix-less input is offered under both spellings because a suffix is not
+    evidence of anything: `longmemeval_s` is a 278 MB JSON file with no
+    extension, and asking only for `longmemeval_s/*` matched nothing while the
+    download still reported success.
+    """
+    if spec.dataset_patterns and path == dataset:
+        return spec.dataset_patterns
+    return (name,) if Path(name).suffix else (name, f"{name}/*")
 
 
 def acquire_media(
@@ -158,6 +180,38 @@ def _extract_zip(
             finally:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
+
+
+def _github_directory(spec: TaskSpec, patterns: Sequence[str], release_root: Path) -> None:
+    """Fetch every pinned-revision blob matching `patterns` under a directory.
+
+    GitHub serves no recursive raw endpoint, so the revision's tree is listed
+    once and each matching blob is fetched individually. Restricting to the
+    task's own patterns matters: BEAM ships a `.pickle` next to every JSON its
+    loader reads, and its 10M tier is a gigabyte of chat transcripts.
+    """
+    url = f"https://api.github.com/repos/{spec.repository}/git/trees/{spec.revision}"
+    response = httpx.get(url, params={"recursive": "1"}, follow_redirects=True, timeout=120.0)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("truncated"):
+        raise RuntimeError(f"{spec.repository}@{spec.revision[:12]} tree listing was truncated")
+    names = tuple(
+        str(entry["path"])
+        for entry in payload.get("tree", ())
+        if entry.get("type") == "blob"
+        and any(fnmatchcase(str(entry["path"]), pattern) for pattern in patterns)
+    )
+    if not names:
+        raise FileNotFoundError(
+            f"{spec.name} matched no files under {spec.repository}@{spec.revision[:12]}: "
+            f"{', '.join(patterns)}"
+        )
+    for name in names:
+        destination = release_root / name
+        if destination.is_file():
+            continue
+        _github_file(spec, name, destination)
 
 
 def _github_file(spec: TaskSpec, name: str, destination: Path) -> None:
