@@ -182,6 +182,29 @@ non-empty text delta. Providers may report `gen_ai.response.time_to_first_chunk`
 `mindbridge.grounding.media_elided_hits` and `mindbridge.grounding.dropped_hits` when request limits
 shrink retrieved evidence.
 
+### Identity recognition yield
+
+Face and speaker recognition report what each asset actually produced, so a recognizer that runs
+and finds nothing is distinguishable from one that was never configured. A detection threshold
+tuned for another domain is the common cause: it costs full analysis time and yields zero faces
+silently.
+
+| Attribute | Meaning |
+| --- | --- |
+| `mindbridge.identity.observations` | Face detections, or speaker segments, for the asset. Recorded when zero. |
+| `mindbridge.identity.identities` | Distinct identities those observations resolved to. |
+| `mindbridge.identity.matched_existing` | Observations that matched an identity already on file. |
+| `mindbridge.identity.created` | Identities this asset introduced. |
+| `mindbridge.identity.cached` | True when the counts were re-read from a stored analysis. |
+| `mindbridge.identity.evidence_assets` | Distinct assets in which this voice-and-face pair has co-occurred. |
+| `mindbridge.identity.evidence_required` | Co-occurrences required before the pair merges. |
+| `mindbridge.identity.linked` | Whether this asset's co-occurrence completed a merge. |
+
+A steady `created` with a near-zero `matched_existing` means the recognizer is not re-identifying
+anyone across assets, so every sighting becomes a new person. Compare the two before adjusting any
+similarity threshold: when a recognizer cannot separate people on the material at hand, no
+threshold value helps, and lowering one converts fragmentation into wrong merges.
+
 Spans do not record memory text, media bytes, paths, asset or memory IDs, metadata, model responses,
 or exception details. Failed spans receive only error status. For one retrieval investigation, use
 the opt-in `search_with_trace()` result or the local `search-with-trace` CLI command; candidate IDs

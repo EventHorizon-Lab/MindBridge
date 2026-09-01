@@ -20,7 +20,7 @@ import pytest
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.trace import StatusCode
+from opentelemetry.trace import StatusCode, Tracer
 
 import mindbridge.configuration as configuration_module
 import mindbridge.memory as memory_module
@@ -70,6 +70,7 @@ from mindbridge.types import (
     AssetRef,
     Blob,
     FormationProposal,
+    IdentityProfile,
     IndexQuantization,
     MemoryKind,
     MemoryType,
@@ -1774,15 +1775,17 @@ def test_face_and_voice_recognition_share_one_durable_identity(tmp_path: Path) -
         first = memory.add(Blob(b"first video", "video/mp4", "first.mp4"))
         second = memory.add(Blob(b"second video", "video/mp4", "second.mp4"))
 
-        first_face = memory.faces(first.id)[0]
-        first_speaker = memory.speech(first.id)[0]
-        second_face = memory.faces(second.id)[0]
-        second_speaker = memory.speech(second.id)[0]
+        # One asset's co-occurrence does not yet claim one person.
+        assert memory.faces(first.id)[0].identity_id != memory.speech(first.id)[0].speaker_id
 
-        assert first_face.identity_id == first_speaker.speaker_id
-        assert second_face.identity_id == first_face.identity_id
-        assert second_speaker.speaker_id == first_face.identity_id
-        memory.register_identity(first_face.identity_id, "Alice")
+        # The second asset corroborates the same pair, so the two identities become one.
+        memory.faces(second.id)
+        identity_id = memory.faces(first.id)[0].identity_id
+        assert identity_id == memory.speech(first.id)[0].speaker_id
+        assert memory.faces(second.id)[0].identity_id == identity_id
+        assert memory.speech(second.id)[0].speaker_id == identity_id
+
+        memory.register_identity(identity_id, "Alice")
         assert memory.faces(first.id)[0].identity_name == "Alice"
         assert memory.speech(second.id)[0].speaker_name == "Alice"
         with pytest.raises(IdentityNotFoundError):
@@ -1790,6 +1793,188 @@ def test_face_and_voice_recognition_share_one_durable_identity(tmp_path: Path) -
 
     assert faces.closed is True
     assert speech.closed is True
+
+
+def _linked_identity(memory: Memory) -> str:
+    """Drive one corroborated face-and-voice merge and return the surviving identity ID."""
+    record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+    identity_id = memory.faces(record.id)[0].identity_id
+    assert identity_id == memory.speech(record.id)[0].speaker_id
+    return identity_id
+
+
+def test_identity_registration_round_trips_a_relationship(tmp_path: Path) -> None:
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=1,
+    ) as memory:
+        identity_id = _linked_identity(memory)
+        assert memory.identity(identity_id) == IdentityProfile(identity_id=identity_id)
+
+        memory.register_identity(identity_id, "Alice", relationship="sister")
+        assert memory.identity(identity_id) == IdentityProfile(
+            identity_id=identity_id, name="Alice", relationship="sister"
+        )
+
+        # Renaming without naming a relationship must not discard the recorded one.
+        memory.register_identity(identity_id, "Alicia")
+        assert memory.identity(identity_id) == IdentityProfile(
+            identity_id=identity_id, name="Alicia", relationship="sister"
+        )
+
+        assert memory.identity("identity_missing") is None
+
+
+def test_identity_resolves_a_merged_away_id_to_the_surviving_person(tmp_path: Path) -> None:
+    """A caller holding an observation from before a merge must still reach the person."""
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+    ) as memory:
+        first = memory.add(Blob(b"first video", "video/mp4", "first.mp4"))
+        face_id = memory.faces(first.id)[0].identity_id
+        voice_id = memory.speech(first.id)[0].speaker_id
+        assert voice_id is not None and face_id != voice_id
+
+        second = memory.add(Blob(b"second video", "video/mp4", "second.mp4"))
+        memory.faces(second.id)
+        survivor = memory.faces(first.id)[0].identity_id
+        merged_away = face_id if survivor == voice_id else voice_id
+
+        memory.register_identity(survivor, "Alice", relationship="sister")
+        assert memory.identity(merged_away) == IdentityProfile(
+            identity_id=survivor, name="Alice", relationship="sister"
+        )
+
+
+def test_unlink_identity_reverses_a_corroborated_merge(tmp_path: Path) -> None:
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+    ) as memory:
+        first = memory.add(Blob(b"first video", "video/mp4", "first.mp4"))
+        face_id = memory.faces(first.id)[0].identity_id
+        voice_id = memory.speech(first.id)[0].speaker_id
+        assert voice_id is not None
+
+        second = memory.add(Blob(b"second video", "video/mp4", "second.mp4"))
+        memory.faces(second.id)
+        survivor = memory.faces(first.id)[0].identity_id
+        merged_away = face_id if survivor == voice_id else voice_id
+        memory.register_identity(survivor, "Alice", relationship="sister")
+
+        assert memory.unlink_identity(merged_away) == merged_away
+
+        # Two identities again, and the survivor keeps its registration while the restored
+        # half carries none, because the name was asserted about the merged person.
+        assert memory.faces(first.id)[0].identity_id != memory.speech(first.id)[0].speaker_id
+        assert memory.identity(survivor) == IdentityProfile(
+            identity_id=survivor, name="Alice", relationship="sister"
+        )
+        assert memory.identity(merged_away) == IdentityProfile(identity_id=merged_away)
+
+        assert memory.unlink_identity("identity_missing") is None
+
+
+@pytest.mark.parametrize("value", ["x" * 256, "bad\nline", ""])
+def test_identity_relationship_rejects_unusable_text(tmp_path: Path, value: str) -> None:
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=1,
+    ) as memory:
+        identity_id = _linked_identity(memory)
+        with pytest.raises(ValidationError):
+            memory.register_identity(identity_id, "Alice", relationship=value)
+
+
+def test_a_merged_pair_stops_accumulating_link_evidence(tmp_path: Path) -> None:
+    """An identity co-occurring with itself is not evidence and must not accumulate.
+
+    Without a guard every later asset of an already-merged person writes one more row that no
+    plan can ever consume, so the table grows for the lifetime of the store.
+    """
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=2,
+    ) as memory:
+        for index in range(5):
+            record = memory.add(Blob(f"video {index}".encode(), "video/mp4", f"v{index}.mp4"))
+            memory.faces(record.id)
+
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        total = connection.execute("SELECT COUNT(*) FROM identity_link_evidence").fetchone()[0]
+        self_pairs = connection.execute(
+            "SELECT COUNT(*) FROM identity_link_evidence WHERE voice_id = face_id"
+        ).fetchone()[0]
+
+    assert self_pairs == 0
+    assert total == 0
+
+
+def test_new_identity_operations_refuse_a_closed_memory(tmp_path: Path) -> None:
+    """Both must enter the operation guard that every other public operation uses."""
+    memory = Memory(tmp_path, embedder=_FakeEmbedder())
+    memory.close()
+
+    with pytest.raises(StorageError, match="Memory is closed"):
+        memory.identity("identity_missing")
+    with pytest.raises(StorageError, match="Memory is closed"):
+        memory.unlink_identity("identity_missing")
+
+
+def test_cross_modal_identity_link_requires_corroboration_across_assets(tmp_path: Path) -> None:
+    """A voice and a face merge only once the same pair recurs in another asset.
+
+    A single clip cannot separate "this face spoke" from "this face was listening to an
+    off-camera speaker", which is the ordinary case in egocentric capture: the wearer talks
+    while someone else fills the frame. Binding on one asset therefore attaches the wearer's
+    voice to whoever happens to be visible, permanently and invisibly.
+    """
+
+    def bound_per_asset(threshold: int) -> list[bool]:
+        with Memory(
+            tmp_path / f"threshold{threshold}",
+            embedder=_FakeEmbedder(),
+            transcriber=_FakeSpeech(),
+            face_analyzer=_FakeFace(),
+            identity_link_min_assets=threshold,
+        ) as memory:
+            bound = []
+            for index in range(3):
+                record = memory.add(Blob(f"video {index}".encode(), "video/mp4", f"v{index}.mp4"))
+                face = memory.faces(record.id)[0].identity_id
+                voice = memory.speech(record.id)[0].speaker_id
+                bound.append(face == voice)
+            return bound
+
+    assert bound_per_asset(1) == [True, True, True]
+    assert bound_per_asset(2) == [False, True, True]
+    assert bound_per_asset(3) == [False, False, True]
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "2", None])
+def test_identity_link_min_assets_rejects_non_positive_integers(
+    tmp_path: Path, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        Memory(
+            tmp_path,
+            embedder=_FakeEmbedder(),
+            identity_link_min_assets=cast(int, value),
+        )
 
 
 def test_face_voice_merge_atomically_refreshes_speech_index_and_keeps_alias(
@@ -1814,6 +1999,9 @@ def test_face_voice_merge_atomically_refreshes_speech_index_and_keeps_alias(
         transcriber=_FakeSpeech(),
         face_analyzer=_FakeFace(),
         index_speech=True,
+        # Exercises merge mechanics, not the corroboration policy: bind on the first asset
+        # so this test's own subject stays the only variable.
+        identity_link_min_assets=1,
     ) as memory:
         image = memory.add(Blob(b"known face", "image/png", "face.png"))
         face_id = memory.faces(image.id)[0].identity_id
@@ -1876,6 +2064,241 @@ def test_face_embedding_recipe_change_fails_fast(tmp_path: Path) -> None:
         Memory(tmp_path, embedder=_FakeEmbedder(), face_analyzer=incompatible)
 
 
+class _BlindFace(_FakeFace):
+    """A configured face backend whose detection threshold finds nothing."""
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[FaceAnalysis, ...]:
+        batch = tuple(assets)
+        self.calls.append(batch)
+        return tuple(FaceAnalysis(()) for _asset in batch)
+
+
+class _RepeatedFace(_FakeFace):
+    """One person detected in two sampled frames of the same video."""
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[FaceAnalysis, ...]:
+        batch = tuple(assets)
+        self.calls.append(batch)
+        return tuple(
+            FaceAnalysis(
+                (
+                    FaceEmbedding("face-0", (0.0, 1.0), (0.1, 0.1, 0.4, 0.5), 100),
+                    FaceEmbedding("face-1", (0.0, 1.0), (0.1, 0.1, 0.4, 0.5), 200),
+                )
+            )
+            for _asset in batch
+        )
+
+
+def _identity_attributes(
+    exporter: InMemorySpanExporter,
+    name: str,
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        dict(span.attributes or {}) for span in exporter.get_finished_spans() if span.name == name
+    )
+
+
+def _identity_recorder() -> tuple[TracerProvider, InMemorySpanExporter]:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider, exporter
+
+
+def test_face_recognition_records_new_then_matched_identity_counts(tmp_path: Path) -> None:
+    provider, exporter = _identity_recorder()
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        face_analyzer=_FakeFace(),
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        first = memory.add(Blob(b"first face", "image/png", "first.png"))
+        second = memory.add(Blob(b"second face", "image/png", "second.png"))
+        first_identity = memory.faces(first.id)[0].identity_id
+        second_identity = memory.faces(second.id)[0].identity_id
+    provider.shutdown()
+
+    assert first_identity == second_identity
+    created, matched = _identity_attributes(exporter, "mindbridge.identity.faces")
+    assert created == {
+        "mindbridge.span.kind": "stage",
+        "mindbridge.identity.observations": 1,
+        "mindbridge.identity.identities": 1,
+        "mindbridge.identity.matched_existing": 0,
+        "mindbridge.identity.created": 1,
+        "mindbridge.identity.cached": False,
+    }
+    assert matched == {
+        "mindbridge.span.kind": "stage",
+        "mindbridge.identity.observations": 1,
+        "mindbridge.identity.identities": 1,
+        "mindbridge.identity.matched_existing": 1,
+        "mindbridge.identity.created": 0,
+        "mindbridge.identity.cached": False,
+    }
+
+
+def test_face_recognition_counts_observations_apart_from_identities(tmp_path: Path) -> None:
+    provider, exporter = _identity_recorder()
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        face_analyzer=_RepeatedFace(),
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        record = memory.add(Blob(b"one person twice", "video/mp4", "person.mp4"))
+        observations = memory.faces(record.id)
+    provider.shutdown()
+
+    assert len({observation.identity_id for observation in observations}) == 1
+    (recorded,) = _identity_attributes(exporter, "mindbridge.identity.faces")
+    assert recorded == {
+        "mindbridge.span.kind": "stage",
+        "mindbridge.identity.observations": 2,
+        "mindbridge.identity.identities": 1,
+        "mindbridge.identity.matched_existing": 1,
+        "mindbridge.identity.created": 1,
+        "mindbridge.identity.cached": False,
+    }
+
+
+def test_face_recognition_records_zero_detections(tmp_path: Path) -> None:
+    provider, exporter = _identity_recorder()
+    analyzer = _BlindFace()
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        face_analyzer=analyzer,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        record = memory.add(Blob(b"crowd without frontal faces", "image/png", "crowd.png"))
+        assert memory.faces(record.id) == ()
+    provider.shutdown()
+
+    assert len(analyzer.calls) == 1
+    recorded = _identity_attributes(exporter, "mindbridge.identity.faces")
+    assert len(recorded) == 1
+    assert recorded[0] == {
+        "mindbridge.span.kind": "stage",
+        "mindbridge.identity.observations": 0,
+        "mindbridge.identity.identities": 0,
+        "mindbridge.identity.matched_existing": 0,
+        "mindbridge.identity.created": 0,
+        "mindbridge.identity.cached": False,
+    }
+
+
+def test_cached_face_analysis_reports_counts_and_is_marked_cached(tmp_path: Path) -> None:
+    provider, exporter = _identity_recorder()
+    analyzer = _FakeFace()
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        face_analyzer=analyzer,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        record = memory.add(Blob(b"one face", "image/png", "face.png"))
+        analyzed = memory.faces(record.id)
+        assert memory.faces(record.id) == analyzed
+    provider.shutdown()
+
+    assert len(analyzer.calls) == 1
+    fresh, cached = _identity_attributes(exporter, "mindbridge.identity.faces")
+    assert fresh["mindbridge.identity.cached"] is False
+    assert cached == {
+        "mindbridge.span.kind": "stage",
+        "mindbridge.identity.observations": 1,
+        "mindbridge.identity.identities": 1,
+        "mindbridge.identity.matched_existing": 0,
+        "mindbridge.identity.created": 1,
+        "mindbridge.identity.cached": True,
+    }
+
+
+def test_speaker_recognition_records_new_then_matched_identity_counts(tmp_path: Path) -> None:
+    provider, exporter = _identity_recorder()
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        first = memory.add(Blob(b"first speech", "audio/wav", "first.wav"))
+        second = memory.add(Blob(b"second speech", "audio/wav", "second.wav"))
+        first_speaker = memory.speech(first.id)[0].speaker_id
+        second_speaker = memory.speech(second.id)[0].speaker_id
+    provider.shutdown()
+
+    assert first_speaker is not None and first_speaker == second_speaker
+    created, matched = _identity_attributes(exporter, "mindbridge.identity.speakers")
+    assert created == {
+        "mindbridge.span.kind": "stage",
+        "mindbridge.identity.observations": 1,
+        "mindbridge.identity.identities": 1,
+        "mindbridge.identity.matched_existing": 0,
+        "mindbridge.identity.created": 1,
+        "mindbridge.identity.cached": False,
+    }
+    assert matched == {
+        "mindbridge.span.kind": "stage",
+        "mindbridge.identity.observations": 1,
+        "mindbridge.identity.identities": 1,
+        "mindbridge.identity.matched_existing": 1,
+        "mindbridge.identity.created": 0,
+        "mindbridge.identity.cached": False,
+    }
+
+
+def test_identity_instrumentation_leaves_recognition_results_unchanged(tmp_path: Path) -> None:
+    provider, _exporter = _identity_recorder()
+
+    def recognize(root: Path, tracer: Tracer | None) -> tuple[object, ...]:
+        with Memory(
+            root,
+            embedder=_FakeEmbedder(),
+            transcriber=_FakeSpeech(),
+            face_analyzer=_FakeFace(),
+            tracer=tracer,
+            # Compares against pre-instrumentation behavior, which bound on one asset.
+            identity_link_min_assets=1,
+        ) as memory:
+            record = memory.add(Blob(b"one person speaking", "video/mp4", "person.mp4"))
+            faces = memory.faces(record.id)
+            segments = memory.speech(record.id)
+            memory.register_identity(faces[0].identity_id, "Alice")
+            named = memory.faces(record.id)
+            # Identity IDs are random per store, so compare everything else exactly and the
+            # linkage between the face and voice identity by equality instead of by value.
+            return (
+                tuple(
+                    (face.asset_id, face.bounding_box, face.identity_name, face.identity_score)
+                    for face in faces
+                ),
+                tuple(
+                    (
+                        segment.asset_id,
+                        segment.start_ms,
+                        segment.end_ms,
+                        segment.text,
+                        segment.speaker_name,
+                        segment.identity_score,
+                    )
+                    for segment in segments
+                ),
+                tuple(face.identity_name for face in named),
+                faces[0].identity_id == segments[0].speaker_id,
+            )
+
+    untraced = recognize(tmp_path / "untraced", None)
+    traced = recognize(tmp_path / "traced", provider.get_tracer("test"))
+    provider.shutdown()
+
+    assert traced == untraced
+    assert untraced[3] is True
+
+
 def test_answer_generation_receives_linked_face_and_voice_identity_evidence(
     tmp_path: Path,
 ) -> None:
@@ -1886,6 +2309,8 @@ def test_answer_generation_receives_linked_face_and_voice_identity_evidence(
         answerer=models,
         transcriber=_FakeSpeech(),
         face_analyzer=_FakeFace(),
+        # Subject is the answer prompt's evidence, not the corroboration policy.
+        identity_link_min_assets=1,
     ) as memory:
         record = memory.add(Blob(b"red person video", "video/mp4", "person.mp4"))
         identity_id = memory.faces(record.id)[0].identity_id

@@ -21,6 +21,7 @@ from mindbridge.models.base import FaceAnalysis, SpeechAnalysis
 from mindbridge.types import (
     EvidenceBasis,
     FaceObservation,
+    IdentityProfile,
     MemoryContext,
     MemoryKind,
     Modality,
@@ -29,7 +30,7 @@ from mindbridge.types import (
     SpeakerSegment,
 )
 
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 _SQLITE_PARAMETER_BATCH = 900
 _FACE_EXEMPLAR_LIMIT = 10
 _VOICE_EXEMPLAR_LIMIT = 20
@@ -53,6 +54,7 @@ _REQUIRED_TABLES = frozenset(
         "identities",
         "identity_aliases",
         "identity_exemplars",
+        "identity_link_evidence",
         "speech_analyses",
         "speech_segments",
         "store_metadata",
@@ -153,10 +155,27 @@ CREATE TABLE speech_segments (
 CREATE INDEX speech_segments_speaker_idx ON speech_segments (speaker_id);
 """
 
-_IDENTITY_SCHEMA = """
+_IDENTITY_LINK_EVIDENCE_DDL = (
+    """CREATE TABLE identity_link_evidence (
+    voice_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE CASCADE,
+    face_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE CASCADE,
+    asset_id TEXT NOT NULL REFERENCES media_assets (asset_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (voice_id, face_id, asset_id)
+)""",
+    "CREATE INDEX identity_link_evidence_face_idx ON identity_link_evidence (face_id)",
+    "CREATE INDEX identity_link_evidence_asset_idx ON identity_link_evidence (asset_id)",
+)
+
+_IDENTITY_LINK_EVIDENCE_SCHEMA = "".join(
+    f"{statement};\n" for statement in _IDENTITY_LINK_EVIDENCE_DDL
+)
+
+_IDENTITY_SCHEMA = f"""
 CREATE TABLE identities (
     identity_id TEXT PRIMARY KEY CHECK (length(trim(identity_id)) > 0),
     name TEXT CHECK (name IS NULL OR length(trim(name)) > 0),
+    relationship TEXT CHECK (relationship IS NULL OR length(trim(relationship)) > 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL CHECK (updated_at >= created_at)
 );
@@ -165,10 +184,15 @@ CREATE TABLE identity_aliases (
     alias_id TEXT PRIMARY KEY CHECK (length(trim(alias_id)) > 0),
     identity_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE CASCADE,
     created_at TEXT NOT NULL,
+    contributed_modality TEXT CHECK (
+        contributed_modality IS NULL OR contributed_modality IN ('face', 'voice')
+    ),
     CHECK (alias_id <> identity_id)
 );
 
 CREATE INDEX identity_aliases_identity_idx ON identity_aliases (identity_id);
+
+{_IDENTITY_LINK_EVIDENCE_SCHEMA}
 
 CREATE TABLE identity_exemplars (
     identity_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE CASCADE,
@@ -329,7 +353,7 @@ CREATE TABLE formation_runs (
 );
 """
 
-_SCHEMA_V8 = f"""
+_SCHEMA_V9 = f"""
 BEGIN IMMEDIATE;
 
 CREATE TABLE memory_records (
@@ -390,7 +414,7 @@ CREATE INDEX search_index_queue_order_idx
 
 {_INDEX_TRIGGERS}
 
-PRAGMA user_version = 8;
+PRAGMA user_version = 9;
 COMMIT;
 """
 
@@ -1685,7 +1709,14 @@ class LocalStore:
         minimum_margin: float = 0.05,
         preferred_identity: str | None = None,
     ) -> tuple[FaceObservation, ...]:
-        """Persist detected faces and match them against durable identity exemplars."""
+        """Persist detected faces and match them against durable identity exemplars.
+
+        ``preferred_identity`` lets a caller enroll this modality into an identity that lacks it,
+        for a single unambiguous observation. The product write path deliberately does not use it:
+        adopting an asset's lone voice for its lone face is a cross-modal claim made from one
+        asset, which `Memory` instead routes through corroborated linking so that it is recorded,
+        observable, and reversible. Pass it only where that claim is already established.
+        """
         _sha256(asset_id)
         _require_identifier(model_id, "face model_id")
         _require_identifier(space_id, "face space_id")
@@ -1856,12 +1887,20 @@ class LocalStore:
         identity_id: str,
         name: str,
         *,
+        relationship: str | None = None,
         memories: Iterable[StoredMemory] = (),
         embeddings: Iterable[StoredEmbedding] = (),
     ) -> bool:
-        """Assign a display name and atomically replace affected indexed memories."""
+        """Assign a display name and atomically replace affected indexed memories.
+
+        A None relationship keeps whatever relationship is already recorded, so
+        renaming an identity never silently drops it.
+        """
         _require_identifier(identity_id, "identity_id")
         normalized_name = _identity_name(name)
+        normalized_relationship = (
+            None if relationship is None else _identity_name(relationship, "relationship")
+        )
         supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
             memories,
             embeddings,
@@ -1874,10 +1913,12 @@ class LocalStore:
             cursor = connection.execute(
                 """
                 UPDATE identities
-                SET name = ?, updated_at = ?
+                SET name = ?,
+                    relationship = COALESCE(?, relationship),
+                    updated_at = ?
                 WHERE identity_id = ?
                 """,
-                (normalized_name, now, resolved_id),
+                (normalized_name, normalized_relationship, now, resolved_id),
             )
             if cursor.rowcount == 0:
                 return False
@@ -1889,12 +1930,96 @@ class LocalStore:
             )
         return cursor.rowcount > 0
 
-    def identity_link_plan(self, first_id: str, second_id: str) -> IdentityLink | None:
-        """Return the currently valid merge plan for two complementary identities."""
+    def identity_profile(self, identity_id: str) -> IdentityProfile | None:
+        """Return one identity's profile, or None when it does not exist.
+
+        A merged identity resolves through its alias, like every other identity read, and the
+        returned profile carries the canonical ID so a caller never has to resolve it twice.
+        """
+        _require_identifier(identity_id, "identity_id")
+        with self._connection() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            if resolved_id is None:
+                return None
+            row = connection.execute(
+                "SELECT name, relationship FROM identities WHERE identity_id = ?",
+                (resolved_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return IdentityProfile(
+            identity_id=resolved_id,
+            name=_optional_row_text(row, "name"),
+            relationship=_optional_row_text(row, "relationship"),
+        )
+
+    def record_identity_link_evidence(self, voice_id: str, face_id: str, asset_id: str) -> int:
+        """Record one voice-and-face co-occurrence and count the pair's distinct assets.
+
+        Recording the same triple again is idempotent. Returns zero when either
+        identity is unknown, or when both resolve to the same identity because the pair has
+        already merged, so a caller can accumulate corroboration across assets before it
+        commits an irreversible cross-modal merge.
+        """
+        _require_identifier(voice_id, "voice identity_id")
+        _require_identifier(face_id, "face identity_id")
+        _sha256(asset_id)
+        now = _datetime_text(datetime.now(timezone.utc))
+        with self._transaction() as connection:
+            voice = _resolve_identity_id(connection, voice_id)
+            face = _resolve_identity_id(connection, face_id)
+            if voice is None or face is None or voice == face:
+                return 0
+            if (
+                connection.execute(
+                    "SELECT 1 FROM media_assets WHERE asset_id = ?",
+                    (asset_id,),
+                ).fetchone()
+                is None
+            ):
+                raise ValueError("identity link evidence requires a stored media asset")
+            connection.execute(
+                """
+                INSERT INTO identity_link_evidence (voice_id, face_id, asset_id, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (voice_id, face_id, asset_id) DO NOTHING
+                """,
+                (voice, face, asset_id, now),
+            )
+            row = connection.execute(
+                """
+                SELECT COUNT(DISTINCT asset_id) AS assets
+                FROM identity_link_evidence
+                WHERE voice_id = ? AND face_id = ?
+                """,
+                (voice, face),
+            ).fetchone()
+        return int(row["assets"])
+
+    def identity_link_plan(
+        self,
+        first_id: str,
+        second_id: str,
+        *,
+        allow_shared_modality: bool = False,
+    ) -> IdentityLink | None:
+        """Return the currently valid merge plan for two complementary identities.
+
+        With allow_shared_modality a shared modality no longer blocks the plan, so an
+        established identity can re-absorb a single-modality fragment instead of that
+        fragment staying orphaned forever. Two identities that each hold face and
+        voice stay refused even then: that merge fuses two complete people and is not
+        recoverable in bulk.
+        """
         _require_identifier(first_id, "first identity_id")
         _require_identifier(second_id, "second identity_id")
         with self._connection() as connection:
-            return self._identity_link_plan(connection, first_id, second_id)
+            return self._identity_link_plan(
+                connection,
+                first_id,
+                second_id,
+                allow_shared_modality=allow_shared_modality,
+            )
 
     def link_identities(
         self,
@@ -1902,10 +2027,14 @@ class LocalStore:
         second_id: str,
         *,
         expected: IdentityLink | None = None,
+        allow_shared_modality: bool = False,
         memories: Iterable[StoredMemory] = (),
         embeddings: Iterable[StoredEmbedding] = (),
     ) -> str | None:
-        """Merge a disjoint face-only and voice-only identity, returning the stable ID."""
+        """Merge two identities under one stable ID, recording a reversible alias.
+
+        Pass allow_shared_modality to commit a plan obtained with the same intent.
+        """
         _require_identifier(first_id, "first identity_id")
         _require_identifier(second_id, "second identity_id")
         if expected is not None and not isinstance(expected, IdentityLink):
@@ -1915,7 +2044,12 @@ class LocalStore:
             embeddings,
         )
         with self._transaction() as connection:
-            plan = self._identity_link_plan(connection, first_id, second_id)
+            plan = self._identity_link_plan(
+                connection,
+                first_id,
+                second_id,
+                allow_shared_modality=allow_shared_modality,
+            )
             if plan is None:
                 first = _resolve_identity_id(connection, first_id)
                 second = _resolve_identity_id(connection, second_id)
@@ -1923,6 +2057,7 @@ class LocalStore:
             if expected is not None and plan != expected:
                 return None
             target, source = plan.target_id, plan.source_id
+            contributed = _sole_identity_modality(connection, source)
             now = _datetime_text(datetime.now(timezone.utc))
             connection.execute(
                 "UPDATE speech_segments SET speaker_id = ? WHERE speaker_id = ?",
@@ -1932,10 +2067,7 @@ class LocalStore:
                 "UPDATE face_observations SET identity_id = ? WHERE identity_id = ?",
                 (target, source),
             )
-            connection.execute(
-                "UPDATE identity_exemplars SET identity_id = ? WHERE identity_id = ?",
-                (target, source),
-            )
+            _merge_identity_exemplars(connection, target, source)
             connection.execute(
                 """
                 UPDATE identities
@@ -1953,12 +2085,36 @@ class LocalStore:
                 "UPDATE identity_aliases SET identity_id = ? WHERE identity_id = ?",
                 (target, source),
             )
+            # Re-point accumulated evidence by copying it onto the target first: the
+            # same asset may already carry a row for the target, and the primary key
+            # would reject a plain UPDATE.
             connection.execute(
                 """
-                INSERT INTO identity_aliases (alias_id, identity_id, created_at)
-                VALUES (?, ?, ?)
+                INSERT INTO identity_link_evidence (voice_id, face_id, asset_id, created_at)
+                SELECT CASE WHEN voice_id = ? THEN ? ELSE voice_id END,
+                       CASE WHEN face_id = ? THEN ? ELSE face_id END,
+                       asset_id,
+                       created_at
+                FROM identity_link_evidence
+                WHERE voice_id = ? OR face_id = ?
+                ON CONFLICT (voice_id, face_id, asset_id) DO NOTHING
                 """,
-                (source, target, now),
+                (source, target, source, target, source, source),
+            )
+            connection.execute(
+                "DELETE FROM identity_link_evidence WHERE voice_id = ? OR face_id = ?",
+                (source, source),
+            )
+            # Re-pointing turns this pair's own evidence into voice_id = face_id rows, which
+            # describe an identity co-occurring with itself and can never yield a plan.
+            connection.execute("DELETE FROM identity_link_evidence WHERE voice_id = face_id")
+            connection.execute(
+                """
+                INSERT INTO identity_aliases (
+                    alias_id, identity_id, created_at, contributed_modality
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (source, target, now, contributed),
             )
             connection.execute("DELETE FROM identities WHERE identity_id = ?", (source,))
             self._replace_memory_embeddings(
@@ -1969,11 +2125,96 @@ class LocalStore:
             )
             return target
 
+    def unlink_identity(self, alias_id: str) -> str | None:
+        """Reverse one recorded merge, restoring alias_id as an independent identity.
+
+        Returns the restored identity_id, or None when alias_id is not a reversible
+        alias: an unknown alias, an alias whose source held both modalities, and an
+        alias merged before this schema recorded the contributed modality all have no
+        recorded split point. Also returns None, changing nothing, when the target no
+        longer holds the other modality, because the split would leave it with no
+        exemplars at all.
+
+        The restored identity gets no name and no relationship: a merge keeps only one
+        profile and the target keeps it, so name the restored identity again if it
+        needs one. Every exemplar and observation of the contributed modality moves
+        back, not only the rows the source originally supplied, so unlinking a
+        re-absorbed fragment also hands over what the target learned in that modality.
+
+        Unlinking clears the pair's accumulated link evidence but does not suppress the
+        pair, so continued ingestion can corroborate and merge them again. Treat this as
+        resetting the evidence, not as recording that a human rejected the merge.
+        """
+        _require_identifier(alias_id, "alias_id")
+        now = _datetime_text(datetime.now(timezone.utc))
+        with self._transaction() as connection:
+            alias = connection.execute(
+                """
+                SELECT identity_id, created_at, contributed_modality
+                FROM identity_aliases
+                WHERE alias_id = ?
+                """,
+                (alias_id,),
+            ).fetchone()
+            if alias is None or alias["contributed_modality"] is None:
+                return None
+            target = _row_text(alias, "identity_id")
+            modality = _identity_modality(alias["contributed_modality"])
+            modalities = {
+                _identity_modality(row["modality"])
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT modality
+                    FROM identity_exemplars
+                    WHERE identity_id = ?
+                    """,
+                    (target,),
+                ).fetchall()
+            }
+            if modalities != {"face", "voice"}:
+                return None
+            connection.execute(
+                """
+                INSERT INTO identities (identity_id, name, relationship, created_at, updated_at)
+                VALUES (?, NULL, NULL, ?, ?)
+                """,
+                (alias_id, _row_text(alias, "created_at"), now),
+            )
+            connection.execute(
+                """
+                UPDATE identity_exemplars
+                SET identity_id = ?
+                WHERE identity_id = ? AND modality = ?
+                """,
+                (alias_id, target, modality),
+            )
+            if modality == "face":
+                connection.execute(
+                    "UPDATE face_observations SET identity_id = ? WHERE identity_id = ?",
+                    (alias_id, target),
+                )
+            else:
+                connection.execute(
+                    "UPDATE speech_segments SET speaker_id = ? WHERE speaker_id = ?",
+                    (alias_id, target),
+                )
+            connection.execute("DELETE FROM identity_aliases WHERE alias_id = ?", (alias_id,))
+            connection.execute(
+                """
+                DELETE FROM identity_link_evidence
+                WHERE voice_id IN (?, ?) AND face_id IN (?, ?)
+                """,
+                (target, alias_id, target, alias_id),
+            )
+            return alias_id
+
     @staticmethod
     def _identity_link_plan(
         connection: sqlite3.Connection,
         first_id: str,
         second_id: str,
+        *,
+        allow_shared_modality: bool = False,
     ) -> IdentityLink | None:
         first = _resolve_identity_id(connection, first_id)
         second = _resolve_identity_id(connection, second_id)
@@ -2005,11 +2246,14 @@ class LocalStore:
             }
             for identity_id in identities
         }
-        if (
-            not modalities[first]
-            or not modalities[second]
-            or modalities[first] & modalities[second]
-        ):
+        if not modalities[first] or not modalities[second]:
+            return None
+        # A shared modality only stops blocking the plan while one side is still a
+        # single-modality fragment being re-absorbed. Two identities that both hold
+        # face and voice stay refused: fusing two complete people is worse than
+        # leaving a fragment orphaned.
+        fragment = min(len(modalities[first]), len(modalities[second])) == 1
+        if modalities[first] & modalities[second] and not (allow_shared_modality and fragment):
             return None
         names = {
             _row_text(row, "identity_id"): (None if row["name"] is None else _row_text(row, "name"))
@@ -2306,6 +2550,9 @@ class LocalStore:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version == 7:
                 _migrate_v7(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 8:
+                _migrate_v8(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
@@ -2951,7 +3198,7 @@ def _create_schema(
     if existing_tables:
         raise UnsupportedSchemaError("local data directory contains an unversioned SQLite schema")
     try:
-        connection.executescript(_SCHEMA_V8)
+        connection.executescript(_SCHEMA_V9)
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -3067,6 +3314,46 @@ def _migrate_v7(connection: sqlite3.Connection) -> None:
                 f"local schema has an incomplete v8 semantic projection; missing: {names}"
             )
         connection.executescript(_MIGRATE_V7_TO_V8)
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def _migrate_v8(connection: sqlite3.Connection) -> None:
+    try:
+        identity_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(identities)")
+        }
+        alias_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(identity_aliases)")
+        }
+        has_evidence = "identity_link_evidence" in _table_names(connection)
+        connection.execute("BEGIN IMMEDIATE")
+        if "relationship" not in identity_columns:
+            connection.execute(
+                """
+                ALTER TABLE identities
+                ADD COLUMN relationship TEXT
+                    CHECK (relationship IS NULL OR length(trim(relationship)) > 0)
+                """
+            )
+        if "contributed_modality" not in alias_columns:
+            connection.execute(
+                """
+                ALTER TABLE identity_aliases
+                ADD COLUMN contributed_modality TEXT
+                    CHECK (
+                        contributed_modality IS NULL
+                        OR contributed_modality IN ('face', 'voice')
+                    )
+                """
+            )
+        if not has_evidence:
+            for statement in _IDENTITY_LINK_EVIDENCE_DDL:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 9")
+        connection.commit()
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -3968,6 +4255,59 @@ def _resolve_identity_id(connection: sqlite3.Connection, identity_id: str) -> st
     return None if row is None else _row_text(row, "identity_id")
 
 
+def _sole_identity_modality(
+    connection: sqlite3.Connection,
+    identity_id: str,
+) -> Literal["face", "voice"] | None:
+    """Return the only modality an identity holds, or None when it holds several."""
+    rows = connection.execute(
+        "SELECT DISTINCT modality FROM identity_exemplars WHERE identity_id = ?",
+        (identity_id,),
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    return _identity_modality(rows[0]["modality"])
+
+
+def _merge_identity_exemplars(
+    connection: sqlite3.Connection,
+    target: str,
+    source: str,
+) -> None:
+    """Move every exemplar of one identity onto another, keeping each bound intact.
+
+    A shared-modality merge would collide on (identity_id, modality, position), so the
+    source's exemplars are appended after the positions the target already holds.
+    """
+    for modality, limit in (("face", _FACE_EXEMPLAR_LIMIT), ("voice", _VOICE_EXEMPLAR_LIMIT)):
+        offset = connection.execute(
+            """
+            SELECT COALESCE(MAX(position), -1) + 1
+            FROM identity_exemplars
+            WHERE identity_id = ? AND modality = ?
+            """,
+            (target, modality),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            UPDATE identity_exemplars
+            SET identity_id = ?, position = position + ?
+            WHERE identity_id = ? AND modality = ?
+            """,
+            (target, int(offset), source, modality),
+        )
+        # ponytail: an overflowing merge keeps the target's exemplars by position rather
+        # than re-running the diversity selection; the next observation of this identity
+        # re-selects within the bound anyway.
+        connection.execute(
+            """
+            DELETE FROM identity_exemplars
+            WHERE identity_id = ? AND modality = ? AND position >= ?
+            """,
+            (target, modality, limit),
+        )
+
+
 def _pack_vector(values: tuple[float, ...]) -> bytes:
     return struct.pack(f"<{len(values)}f", *values)
 
@@ -4171,12 +4511,12 @@ def _require_identifier(value: str, name: str) -> None:
         raise ValueError(f"{name} must be non-empty and trimmed")
 
 
-def _identity_name(value: str) -> str:
+def _identity_name(value: str, field: str = "name") -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ValueError("identity name must be non-empty text")
+        raise ValueError(f"identity {field} must be non-empty text")
     normalized = value.strip()
     if len(normalized) > 255 or not normalized.isprintable():
-        raise ValueError("identity name must be at most 255 printable characters")
+        raise ValueError(f"identity {field} must be at most 255 printable characters")
     return normalized
 
 

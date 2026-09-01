@@ -736,6 +736,26 @@ class SpeakerSegment:
 
 
 @dataclass(frozen=True, slots=True)
+class IdentityProfile:
+    """What a caller has registered about one recognized person."""
+
+    identity_id: str
+    name: str | None = None
+    relationship: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        for label in ("name", "relationship"):
+            value = getattr(self, label)
+            if value is None:
+                continue
+            text = _text(value, f"identity {label}")
+            if len(text) > 255 or not text.isprintable():
+                raise ValidationError(f"identity {label} must be at most 255 printable characters")
+            object.__setattr__(self, label, text)
+
+
+@dataclass(frozen=True, slots=True)
 class FaceObservation:
     """One detected face linked to a stable local multimodal identity."""
 

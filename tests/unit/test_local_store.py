@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge import EvidenceBasis, MemoryContext, MemoryKind
+from mindbridge import EvidenceBasis, IdentityProfile, MemoryContext, MemoryKind
 from mindbridge.infrastructure.local import (
     DataDirectoryInUseError,
     LocalStore,
@@ -202,6 +202,52 @@ def _install_legacy_identity_schema(
     )
 
 
+def _video_asset(store: LocalStore, label: str) -> StoredAsset:
+    """Write one memory that owns one fresh video asset."""
+    asset = _asset(
+        f"{label} frames".encode(),
+        modality="video",
+        mime_type="video/mp4",
+        name=f"{label}.mp4",
+    )
+    store.write_memory(replace(_memory(label), content="", modality="video", assets=(asset,)))
+    return asset
+
+
+def _face_identity(store: LocalStore, asset: StoredAsset, vector: tuple[float, float]) -> str:
+    return store.write_faces(
+        asset.asset_id,
+        FaceAnalysis((FaceEmbedding("face-0", vector, (0.1, 0.1, 0.4, 0.5)),)),
+        model_id="sface",
+        space_id="sface:test",
+        minimum_similarity=0.99,
+    )[0].identity_id
+
+
+def _voice_identity(store: LocalStore, asset: StoredAsset, vector: tuple[float, float]) -> str:
+    speaker_id = store.write_speech(
+        asset.asset_id,
+        SpeechAnalysis(
+            turns=(SpeechTurn(0, 500, "hello", "0"),),
+            speakers=(SpeakerEmbedding("0", vector),),
+        ),
+        model_id="cam++",
+        space_id="cam++:test",
+        minimum_similarity=0.99,
+    )[0].speaker_id
+    assert speaker_id is not None
+    return speaker_id
+
+
+def _full_identity(store: LocalStore, asset: StoredAsset, vector: tuple[float, float]) -> str:
+    """Merge one face-only and one voice-only identity into a face-and-voice identity."""
+    face_id = _face_identity(store, asset, vector)
+    voice_id = _voice_identity(store, asset, vector)
+    linked = store.link_identities(face_id, voice_id)
+    assert linked is not None
+    return linked
+
+
 def test_data_directory_has_one_process_owner(tmp_path: Path) -> None:
     first_path = tmp_path / "first"
     second_path = tmp_path / "second"
@@ -240,7 +286,7 @@ def test_schema_is_local_and_enforces_foreign_keys(tmp_path: Path) -> None:
                     "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
                 )
             )
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
             assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert "tenant" not in schema.casefold()
@@ -307,7 +353,7 @@ def test_schema_v1_is_migrated_atomically_with_text_modality(tmp_path: Path) -> 
         assert legacy.access_count == 0
         assert legacy.assets == ()
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -331,7 +377,7 @@ def test_schema_v2_is_migrated_without_losing_memories(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         assert store.read_memory("preserved") is not None
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -350,7 +396,7 @@ def test_schema_v3_adds_optional_speaker_names(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         with closing(sqlite3.connect(store.database_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(identities)")}
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
         assert "name" in columns
 
 
@@ -370,7 +416,7 @@ def test_schema_v5_adds_optional_event_end(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         with closing(sqlite3.connect(store.database_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(memory_records)")}
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
         assert "occurred_end" in columns
 
 
@@ -461,7 +507,43 @@ def test_schema_v7_adds_transactional_evidence_without_losing_records(tmp_path: 
 
     assert preserved is not None and preserved.content == "A red tool is in drawer two"
     assert {"source_group_id", "recorded_at", "retired_at"} <= columns
-    assert version == 8
+    assert version == 9
+
+
+@pytest.mark.skipif(sqlite3.sqlite_version_info < (3, 35), reason="DROP COLUMN needs SQLite 3.35")
+def test_schema_v8_adds_identity_profiles_and_link_evidence(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        face_id = _face_identity(store, clip, (1.0, 0.0))
+        voice_id = _voice_identity(store, clip, (1.0, 0.0))
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.executescript(
+            """
+            DROP TABLE identity_link_evidence;
+            ALTER TABLE identities DROP COLUMN relationship;
+            ALTER TABLE identity_aliases DROP COLUMN contributed_modality;
+            PRAGMA user_version = 8;
+            """
+        )
+
+    with LocalStore(tmp_path) as store:
+        faces = store.read_faces(clip.asset_id, space_id="sface:test")
+        profile = store.identity_profile(face_id)
+        recorded = store.record_identity_link_evidence(voice_id, face_id, clip.asset_id)
+        assert store.register_identity(face_id, "Alice", relationship="neighbour") is True
+        named = store.identity_profile(face_id)
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            alias_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(identity_aliases)")
+            }
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert faces is not None and faces[0].identity_id == face_id
+    assert profile == IdentityProfile(identity_id=face_id)
+    assert recorded == 1
+    assert named == IdentityProfile(identity_id=face_id, name="Alice", relationship="neighbour")
+    assert "contributed_modality" in alias_columns
+    assert version == 9
 
 
 def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
@@ -1039,6 +1121,257 @@ def test_linked_identity_keeps_the_source_id_as_an_alias(tmp_path: Path) -> None
     assert speech is not None
     assert speech[0].speaker_id == face_id
     assert speech[0].speaker_name == "Alicia"
+
+
+def test_identity_link_evidence_counts_one_row_per_distinct_asset(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        other = _video_asset(store, "other")
+        face_id = _face_identity(store, clip, (1.0, 0.0))
+        voice_id = _voice_identity(store, clip, (0.0, 1.0))
+
+        assert store.record_identity_link_evidence(voice_id, face_id, clip.asset_id) == 1
+        assert store.record_identity_link_evidence(voice_id, face_id, clip.asset_id) == 1
+        assert store.record_identity_link_evidence(voice_id, face_id, other.asset_id) == 2
+        assert store.record_identity_link_evidence(voice_id, "identity_missing", clip.asset_id) == 0
+        with pytest.raises(ValueError, match="stored media asset"):
+            store.record_identity_link_evidence(
+                voice_id,
+                face_id,
+                sha256(b"never stored").hexdigest(),
+            )
+
+
+def test_merging_identities_repoints_link_evidence_onto_the_target(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        left = _video_asset(store, "left")
+        right = _video_asset(store, "right")
+        face_id = _face_identity(store, clip, (1.0, 0.0))
+        first_voice_id = _voice_identity(store, clip, (1.0, 0.0))
+        second_voice_id = _voice_identity(store, right, (0.0, 1.0))
+        assert store.record_identity_link_evidence(first_voice_id, face_id, clip.asset_id) == 1
+        assert store.record_identity_link_evidence(first_voice_id, face_id, left.asset_id) == 2
+        assert store.record_identity_link_evidence(second_voice_id, face_id, clip.asset_id) == 1
+        assert store.record_identity_link_evidence(second_voice_id, face_id, right.asset_id) == 2
+
+        plan = store.identity_link_plan(
+            first_voice_id,
+            second_voice_id,
+            allow_shared_modality=True,
+        )
+        assert plan is not None
+        target = store.link_identities(
+            first_voice_id,
+            second_voice_id,
+            expected=plan,
+            allow_shared_modality=True,
+        )
+        assert target == plan.target_id
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT voice_id, face_id, asset_id
+                FROM identity_link_evidence
+                ORDER BY voice_id, face_id, asset_id
+                """
+            ).fetchall()
+        # The collided clip row survives once and both plain rows follow the target.
+        assert rows == sorted(
+            [
+                (target, face_id, clip.asset_id),
+                (target, face_id, left.asset_id),
+                (target, face_id, right.asset_id),
+            ]
+        )
+        assert store.record_identity_link_evidence(plan.source_id, face_id, clip.asset_id) == 3
+
+
+def test_identity_link_plan_refuses_a_shared_modality_by_default(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        fragment = _video_asset(store, "fragment")
+        full_id = _full_identity(store, clip, (1.0, 0.0))
+        fragment_id = _face_identity(store, fragment, (0.0, 1.0))
+
+        assert store.identity_link_plan(full_id, fragment_id) is None
+        assert store.link_identities(full_id, fragment_id) is None
+        assert store.resolve_identity_id(fragment_id) == fragment_id
+
+
+def test_shared_modality_link_absorbs_a_face_fragment_into_a_full_identity(
+    tmp_path: Path,
+) -> None:
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        fragment = _video_asset(store, "fragment")
+        full_id = _full_identity(store, clip, (1.0, 0.0))
+        assert store.register_identity(full_id, "Alice") is True
+        fragment_id = _face_identity(store, fragment, (0.0, 1.0))
+
+        plan = store.identity_link_plan(full_id, fragment_id, allow_shared_modality=True)
+        assert plan is not None and plan.target_id == full_id and plan.source_id == fragment_id
+        linked = store.link_identities(
+            full_id,
+            fragment_id,
+            expected=plan,
+            allow_shared_modality=True,
+        )
+        faces = store.read_faces(fragment.asset_id, space_id="sface:test")
+        profile = store.identity_profile(fragment_id)
+
+    assert linked == full_id
+    assert faces is not None and faces[0].identity_id == full_id
+    assert profile == IdentityProfile(identity_id=full_id, name="Alice")
+
+
+def test_shared_modality_link_still_refuses_two_full_identities(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        first = _video_asset(store, "first")
+        second = _video_asset(store, "second")
+        first_id = _full_identity(store, first, (1.0, 0.0))
+        second_id = _full_identity(store, second, (0.0, 1.0))
+
+        assert store.identity_link_plan(first_id, second_id, allow_shared_modality=True) is None
+        assert store.link_identities(first_id, second_id, allow_shared_modality=True) is None
+        assert store.resolve_identity_id(second_id) == second_id
+
+
+def test_shared_modality_link_still_refuses_a_conflicting_name(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        fragment = _video_asset(store, "fragment")
+        full_id = _full_identity(store, clip, (1.0, 0.0))
+        assert store.register_identity(full_id, "Alice") is True
+        fragment_id = _face_identity(store, fragment, (0.0, 1.0))
+        assert store.register_identity(fragment_id, "Bruno") is True
+
+        assert store.identity_link_plan(full_id, fragment_id, allow_shared_modality=True) is None
+        assert store.link_identities(full_id, fragment_id, allow_shared_modality=True) is None
+        assert store.resolve_identity_id(fragment_id) == fragment_id
+
+
+def test_link_evidence_refuses_a_pair_that_is_already_one_identity(tmp_path: Path) -> None:
+    """An identity co-occurring with itself is not evidence, so it is never recorded."""
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        face_id = _face_identity(store, clip, (1.0, 0.0))
+        voice_id = _voice_identity(store, clip, (1.0, 0.0))
+
+        assert store.record_identity_link_evidence(voice_id, face_id, clip.asset_id) == 1
+        assert store.record_identity_link_evidence(face_id, face_id, clip.asset_id) == 0
+        assert store.link_identities(face_id, voice_id) == face_id
+        # Both arguments now resolve through the alias to one identity.
+        assert store.record_identity_link_evidence(voice_id, face_id, clip.asset_id) == 0
+
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            self_pairs = connection.execute(
+                "SELECT COUNT(*) FROM identity_link_evidence WHERE voice_id = face_id"
+            ).fetchone()[0]
+
+    assert self_pairs == 0
+
+
+def test_unlink_identity_returns_only_the_contributed_modality(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        face_id = _face_identity(store, clip, (1.0, 0.0))
+        assert store.register_identity(face_id, "Alice", relationship="sister") is True
+        voice_id = _voice_identity(store, clip, (1.0, 0.0))
+        assert store.record_identity_link_evidence(voice_id, face_id, clip.asset_id) == 1
+        assert store.link_identities(face_id, voice_id) == face_id
+        # Merging folds this pair's evidence into one identity paired with itself, which is
+        # meaningless and is dropped, so a merged pair records nothing further.
+        assert store.record_identity_link_evidence(voice_id, face_id, clip.asset_id) == 0
+
+        assert store.unlink_identity(voice_id) == voice_id
+        speech = store.read_speech(clip.asset_id, space_id="cam++:test")
+        faces = store.read_faces(clip.asset_id, space_id="sface:test")
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            exemplars = connection.execute(
+                "SELECT identity_id, modality FROM identity_exemplars"
+            ).fetchall()
+            aliases = connection.execute("SELECT COUNT(*) FROM identity_aliases").fetchone()[0]
+            evidence = connection.execute("SELECT COUNT(*) FROM identity_link_evidence").fetchone()[
+                0
+            ]
+        profile = store.identity_profile(voice_id)
+
+    assert set(exemplars) == {(face_id, "face"), (voice_id, "voice")}
+    assert speech is not None and speech[0].speaker_id == voice_id
+    assert speech[0].speaker_name is None
+    assert faces is not None and faces[0].identity_id == face_id
+    assert faces[0].identity_name == "Alice"
+    assert profile == IdentityProfile(identity_id=voice_id)
+    assert aliases == 0
+    assert evidence == 0
+
+
+def test_unlink_identity_refuses_an_alias_without_a_recorded_modality(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        face_id = _face_identity(store, clip, (1.0, 0.0))
+        voice_id = _voice_identity(store, clip, (1.0, 0.0))
+        assert store.link_identities(face_id, voice_id) == face_id
+        assert store.unlink_identity("identity_missing") is None
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.execute("UPDATE identity_aliases SET contributed_modality = NULL")
+        connection.commit()
+
+    with LocalStore(tmp_path) as store:
+        assert store.unlink_identity(voice_id) is None
+        assert store.resolve_identity_id(voice_id) == face_id
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            exemplars = connection.execute(
+                "SELECT identity_id, modality FROM identity_exemplars"
+            ).fetchall()
+
+    assert set(exemplars) == {(face_id, "face"), (face_id, "voice")}
+
+
+def test_unlink_identity_refuses_to_strip_the_target_of_every_exemplar(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        first = _video_asset(store, "first")
+        second = _video_asset(store, "second")
+        first_id = _face_identity(store, first, (1.0, 0.0))
+        second_id = _face_identity(store, second, (0.0, 1.0))
+        target = store.link_identities(first_id, second_id, allow_shared_modality=True)
+        assert target is not None
+        source = second_id if target == first_id else first_id
+
+        assert store.unlink_identity(source) is None
+        assert store.resolve_identity_id(source) == target
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            exemplars = connection.execute(
+                "SELECT DISTINCT identity_id FROM identity_exemplars"
+            ).fetchall()
+
+    assert exemplars == [(target,)]
+
+
+def test_identity_relationship_is_stored_and_validated(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        face_id = _face_identity(store, clip, (1.0, 0.0))
+
+        assert store.identity_profile(face_id) == IdentityProfile(identity_id=face_id)
+        assert store.identity_profile("identity_missing") is None
+        assert store.register_identity(face_id, "Alice", relationship="sister") is True
+        assert store.identity_profile(face_id) == IdentityProfile(
+            identity_id=face_id, name="Alice", relationship="sister"
+        )
+        assert store.register_identity(face_id, "Alicia") is True
+        assert store.identity_profile(face_id) == IdentityProfile(
+            identity_id=face_id, name="Alicia", relationship="sister"
+        )
+        for invalid in ("x" * 256, "side\nkick"):
+            with pytest.raises(ValueError, match="identity relationship must be at most 255"):
+                store.register_identity(face_id, "Alice", relationship=invalid)
+        with pytest.raises(ValueError, match="identity relationship must be non-empty"):
+            store.register_identity(face_id, "Alice", relationship="   ")
+        assert store.identity_profile(face_id) == IdentityProfile(
+            identity_id=face_id, name="Alicia", relationship="sister"
+        )
 
 
 def test_memory_hydration_uses_one_wal_snapshot(

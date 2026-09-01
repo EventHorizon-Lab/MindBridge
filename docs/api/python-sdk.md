@@ -234,8 +234,10 @@ retrieved hits the answerer actually used.
 get(memory_id: str) -> MemoryRecord
 speech(memory_id: str) -> tuple[SpeakerSegment, ...]
 faces(memory_id: str) -> tuple[FaceObservation, ...]
-register_speaker(speaker_id: str, name: str) -> None
-register_identity(identity_id: str, name: str) -> None
+register_speaker(speaker_id: str, name: str, *, relationship: str | None = None) -> None
+register_identity(identity_id: str, name: str, *, relationship: str | None = None) -> None
+identity(identity_id: str) -> IdentityProfile | None
+unlink_identity(alias_id: str) -> str | None
 reinforce(memory_ids: Sequence[str]) -> int
 list(*, limit: int = 100, cursor: str | None = None) -> Page
 delete(memory_id: str) -> bool
@@ -246,12 +248,35 @@ close() -> None
 
 `get` raises `MemoryNotFoundError` for an unknown ID. `speech` and `faces` return `()` when the
 record has no relevant media and require their respective configured backend otherwise.
-Registration assigns or replaces a printable name for an existing local identity. `reinforce`
+Registration assigns or replaces a printable name, and optionally a relationship, for an
+existing local identity; both raise `IdentityNotFoundError` for an unknown ID. There is no
+enrollment call that creates a person from a photograph or a voice sample. Register an identity
+the recognizers have already observed instead: add the media, read `faces()` or `speech()` for its
+`identity_id`, then name it. Omitting `relationship` on a later call leaves any recorded
+relationship intact, so renaming never silently discards it, and there is deliberately no way to
+clear one. `identity` resolves an ID through any merge alias and returns what has been registered,
+so an observation captured before a merge still reaches the surviving person. `unlink_identity`
+reverses one face-and-voice merge, returning the restored ID or `None` when the merge is not
+reversible; it resets the pair's accumulated evidence rather than suppressing the pair, so a voice
+and face that keep co-occurring are corroborated and merged again. `reinforce`
 records explicit positive feedback and returns the number of existing distinct memories updated.
 `list` uses an opaque keyset cursor. `delete` is idempotent and reports whether the record existed.
 `reindex` rebuilds Zvec from authoritative SQLite embeddings without calling the embedder and
 returns the number of memories rebuilt. `optimize` merges and flushes staged index vectors.
 Repeated `close()` calls are harmless.
+
+### Cross-modal identity binding
+
+A face and a voice become one identity only after the same pair co-occurs in
+`identity_link_min_assets` distinct assets (default `2`). A single asset cannot separate "this
+face spoke" from "this face was listening to someone off camera", which is the ordinary case in
+egocentric capture: the wearer talks while somebody else fills the frame. Binding on one asset
+therefore attaches the wearer's voice to whoever happened to be visible. Set
+`identity_link_min_assets=1` to bind on first co-occurrence.
+
+Binding is recorded, not guessed at read time, so it is durable and reversible through
+`unlink_identity`. Recognizer yield per asset is reported under the `mindbridge.identity.*` span
+attributes, including when nothing was detected.
 
 ### AsyncMemory
 

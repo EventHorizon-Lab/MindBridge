@@ -8,9 +8,9 @@ import subprocess
 import sys
 from argparse import ArgumentTypeError
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timezone
-from inspect import getattr_static
+from inspect import getattr_static, signature
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -26,6 +26,7 @@ from mindbridge import (
     FaceAnalysis,
     FaceBackend,
     IndexUnavailableError,
+    Memory,
     MemoryConfig,
     MemoryPlugins,
     MemoryType,
@@ -1626,3 +1627,52 @@ async def test_answer_many_preserves_structured_abstention() -> None:
     assert isinstance(outcome, eval_module._AnswerOutcome)
     assert outcome.abstained is True
     assert outcome.abstention_reason == "insufficient_evidence"
+
+
+def test_backend_pool_forwards_every_memory_config_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every declared local policy field must reach the constructed store.
+
+    A field missing from the forwarding list runs the benchmark on the default while
+    results.json reports the configured value, so the omission is invisible in the output.
+    """
+    settings = MemoryConfig(
+        index_speech=True,
+        minimum_relevance=0.61,
+        ambiguity_margin=0.02,
+        decay_half_life_days=7.0,
+        speaker_similarity=0.81,
+        speaker_margin=0.06,
+        face_similarity=0.4,
+        face_margin=0.07,
+    )
+    declared = {entry.name for entry in fields(MemoryConfig)}
+    for constructor in (Memory.__init__, AsyncMemory.__init__):
+        accepted = set(signature(constructor).parameters)
+        unaccepted = declared - accepted
+        assert not unaccepted, f"{constructor.__qualname__} has no keyword for {sorted(unaccepted)}"
+
+    recorded: dict[str, object] = {}
+
+    def recorder(_data_dir: Path, **kwargs: object) -> AsyncMemory:
+        recorded.update(kwargs)
+        return cast(AsyncMemory, SimpleNamespace())
+
+    monkeypatch.setattr(eval_module, "AsyncMemory", recorder)
+    pool = cast(
+        eval_module._BackendPool,
+        SimpleNamespace(
+            _embedder=None,
+            _answerer=None,
+            _transcriber=None,
+            _face_analyzer=None,
+            _tracer=None,
+            _settings=settings,
+        ),
+    )
+    eval_module._BackendPool.memory(pool, Path("unused"))
+
+    dropped = declared - set(recorded)
+    assert not dropped, f"_BackendPool.memory does not forward {sorted(dropped)}"
+    assert all(recorded[name] == getattr(settings, name) for name in declared)

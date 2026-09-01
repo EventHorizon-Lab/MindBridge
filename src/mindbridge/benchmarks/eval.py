@@ -538,6 +538,9 @@ class _BackendPool:
         self._settings = MemoryConfig(index_speech=self._transcriber is not None)
 
     def memory(self, data_dir: Path) -> AsyncMemory:
+        # Every MemoryConfig field must appear here. A missing one silently runs the default
+        # while the recorded configuration reports the configured value, which is invisible in
+        # results.json; test_backend_pool_forwards_every_memory_config_field guards the set.
         settings = self._settings
         return AsyncMemory(
             data_dir,
@@ -554,6 +557,7 @@ class _BackendPool:
             speaker_margin=settings.speaker_margin,
             face_similarity=settings.face_similarity,
             face_margin=settings.face_margin,
+            identity_link_min_assets=settings.identity_link_min_assets,
             tracer=self._tracer,
         )
 

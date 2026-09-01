@@ -125,6 +125,7 @@ alias):
 | `speaker_margin` | `0.05` | Voice identity ambiguity margin |
 | `face_similarity` | `0.363` | Face identity match threshold |
 | `face_margin` | `0.05` | Face identity ambiguity margin |
+| `identity_link_min_assets` | `2` | Distinct assets a voice-and-face pair must share before they merge |
 
 Thresholds and margins accept values from `0` through `1`. `minimum_relevance=0` disables the
 weak-evidence floor; a zero ambiguity margin disables the corresponding tie rejection. A zero

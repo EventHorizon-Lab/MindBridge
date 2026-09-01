@@ -22,6 +22,7 @@ from mindbridge.types import IndexQuantization
 _StrictBool = Annotated[bool, Field(strict=True)]
 _UnitInterval = Annotated[float, Field(strict=True, ge=0, le=1)]
 _PositiveFloat = Annotated[float, Field(strict=True, gt=0)]
+_PositiveInt = Annotated[int, Field(strict=True, ge=1)]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -73,6 +74,7 @@ class MemoryConfig:
     speaker_margin: _UnitInterval = 0.05
     face_similarity: _UnitInterval = 0.363
     face_margin: _UnitInterval = 0.05
+    identity_link_min_assets: _PositiveInt = 2
 
 
 # Clearer name for new code; keep the original public value intact for compatibility.
