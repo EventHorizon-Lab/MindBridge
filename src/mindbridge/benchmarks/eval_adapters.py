@@ -93,10 +93,16 @@ class EvalQuestion:
     metadata: Mapping[str, object] = field(default_factory=dict)
     reference_at: datetime | None = None
     source_question: str | None = None
+    # Set when this task's own query prompt mandates a refusal wording of its own. The product
+    # reports `abstained` for its own refusal sentence, which it cannot do for a wording the task
+    # substituted; without this the run reports zero refusals while the model refuses.
+    refusal: str | None = None
 
     def __post_init__(self) -> None:
         if not self.question_id.strip() or not self.content:
             raise ValueError("evaluation questions need an ID and content")
+        if self.refusal is not None and not self.refusal.strip():
+            raise ValueError("a declared refusal must not be blank")
         if self.score_kind == "choice" and (
             self.expected_choice is None or self.expected_choice not in "ABCDEFGHIJ"
         ):
@@ -815,6 +821,7 @@ def _memlens(
                         },
                         reference_at=question.question_date,
                         source_question=question.question,
+                        refusal=MEMLENS_QUERY_PROMPT.refusal,
                     ),
                 ),
             )

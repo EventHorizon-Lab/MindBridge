@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 from mindbridge import (
     DEFAULT_FUNASR_MODEL_ID,
     DEFAULT_FUNASR_RECIPE,
+    AbstentionReason,
     AnswerResult,
     AssetRef,
     AsyncMemory,
@@ -1233,6 +1234,13 @@ def _cache_outcome(
     )
 
 
+def _declined(answer: str, question: EvalQuestion) -> bool:
+    """Report a refusal a task worded itself, which the product cannot recognise."""
+    return question.refusal is not None and answer.strip().rstrip(".") == (
+        question.refusal.strip().rstrip(".")
+    )
+
+
 async def _ingest(
     memory: AsyncMemory,
     items: Sequence[MemoryItem],
@@ -1323,9 +1331,15 @@ async def _answer_many(
                     max((hit.score for hit in result.hits), default=0.0),
                     tuple(hit.id for hit in result.hits),
                     tuple(_evidence(hit) for hit in result.hits),
-                    abstained=result.abstained,
+                    abstained=result.abstained or _declined(result.answer, question),
                     abstention_reason=(
-                        None if result.abstention_reason is None else result.abstention_reason.value
+                        result.abstention_reason.value
+                        if result.abstention_reason is not None
+                        else (
+                            AbstentionReason.INSUFFICIENT_EVIDENCE.value
+                            if _declined(result.answer, question)
+                            else None
+                        )
                     ),
                 )
         if on_answer is not None:

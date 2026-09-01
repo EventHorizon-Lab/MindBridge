@@ -1900,3 +1900,62 @@ def test_metric_breakdowns_cover_every_catalog_task(tmp_path: Path) -> None:
 
 def _breakdown_arguments() -> SimpleNamespace:
     return SimpleNamespace(seed=1234, bootstrap_samples=8)
+
+
+def test_a_task_worded_refusal_counts_as_an_abstention() -> None:
+    # `AnswerResult.abstained` recognises the product's own refusal sentence, which it cannot do
+    # for a wording the task substituted. MEMLENS mandates "Insufficient information", so a real
+    # dev run reported 0 abstentions where 16 of 59 answers were refusals.
+    question = EvalQuestion(
+        "q1",
+        ("Where did she go?",),
+        ("the market",),
+        refusal="Insufficient information",
+    )
+
+    assert eval_module._declined("Insufficient information", question)
+    assert eval_module._declined("Insufficient information.", question)
+    assert not eval_module._declined("She went to the market.", question)
+    # A task that mandates nothing must not have refusals invented for it.
+    assert not eval_module._declined("Insufficient information", replace(question, refusal=None))
+
+
+def test_memlens_questions_declare_the_refusal_their_own_prompt_mandates(tmp_path: Path) -> None:
+    # Loading the real task, not the helper in isolation: a declaration the loader never attaches
+    # returns the reported refusal rate to zero while the model keeps refusing, and a test of the
+    # helper alone stays green through exactly that.
+    from mindbridge.benchmarks.prompts import MEMLENS_QUERY_PROMPT
+
+    dataset = tmp_path / "memlens.json"
+    dataset.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "q1",
+                    "question_type": "preference",
+                    "question": "What is my favorite color?",
+                    "answer": "Blue.",
+                    "question_date": "2025/01/15 (Wed) 10:00",
+                    "haystack_dates": ["2025/01/14 (Tue) 09:00"],
+                    "haystack_sessions": [
+                        [{"role": "user", "content": "My favorite color is blue."}]
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    auxiliary = tmp_path / "memlens" / "agent_subset_195.json"
+    auxiliary.parent.mkdir()
+    auxiliary.write_text(json.dumps({"n_questions": 1, "question_ids": ["q1"]}), encoding="utf-8")
+
+    loaded = load_task(
+        TASKS["memlens-32k"], root=tmp_path, dataset_path=dataset, verify_digest=False
+    )
+    question = loaded.units[0].questions[0]
+
+    assert MEMLENS_QUERY_PROMPT.refusal is not None
+    # Tied to the prompt text, so changing the mandated wording without the declaration fails.
+    assert f'"{MEMLENS_QUERY_PROMPT.refusal}"' in MEMLENS_QUERY_PROMPT.text
+    assert question.refusal == MEMLENS_QUERY_PROMPT.refusal
+    assert eval_module._declined(MEMLENS_QUERY_PROMPT.refusal, question)
