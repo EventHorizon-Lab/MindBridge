@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from inspect import getattr_static
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -170,6 +170,7 @@ def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
         "MM-Lifelong",
         "Mem-Gallery",
         "MemLens",
+        "OpenEQA",
         "PersonaMem-v3",
         "SuperMemory-VQA",
         "Video-MME",
@@ -182,6 +183,8 @@ def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
         "atm-bench-main",
     )
     assert expand(("video-*",)) == ("video-mme", "video-mme-v2")
+    assert expand(("open-eqa",)) == ("openeqa-hm3d", "openeqa-scannet")
+    assert expand(("openeqa-scannet-v0",)) == ("openeqa-scannet",)
     assert all(
         task.media_source.revision is None or len(task.media_source.revision) == 40
         for task in TASKS.values()
@@ -1626,3 +1629,191 @@ async def test_answer_many_preserves_structured_abstention() -> None:
     assert isinstance(outcome, eval_module._AnswerOutcome)
     assert outcome.abstained is True
     assert outcome.abstention_reason == "insufficient_evidence"
+
+
+def _openeqa_dataset(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "q1",
+                    "episode_history": "hm3d-v0/000-hm3d-BFRyYbPCCPE",
+                    "category": "object recognition",
+                    "question": "What is above the TV?",
+                    "answer": "Air conditioning unit",
+                },
+                {
+                    "question_id": "q2",
+                    "episode_history": "hm3d-v0/000-hm3d-BFRyYbPCCPE",
+                    "category": "object localization",
+                    "question": "Where is the mirror?",
+                    "answer": "Next to the staircase",
+                    "extra_answers": ["by the stairs"],
+                },
+                {
+                    "question_id": "q3",
+                    "episode_history": "hm3d-v0/001-hm3d-TPhiubUHKcP",
+                    "category": "spatial understanding",
+                    "question": "Is the door open?",
+                    "answer": "open",
+                },
+                {
+                    "question_id": "q4",
+                    "episode_history": "scannet-v0/002-scannet-scene0709_00",
+                    "category": "world knowledge",
+                    "question": "What room is this?",
+                    "answer": "an office",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _openeqa_manifest(task_name: str, *units: str) -> dict[str, object]:
+    return {
+        "tasks": {
+            task_name: {
+                "units": {
+                    unit: [
+                        {
+                            "text": f"prepared segment of {unit}",
+                            "source_id": f"{unit}-00000",
+                            "start_seconds": 0,
+                            "end_seconds": 30,
+                        }
+                    ]
+                    for unit in units
+                }
+            }
+        }
+    }
+
+
+def test_openeqa_limit_counts_episodes_and_keeps_all_their_questions(tmp_path: Path) -> None:
+    dataset = _openeqa_dataset(tmp_path / "open-eqa-v0.json")
+    spec = TASKS["openeqa-hm3d"]
+
+    loaded = load_task(
+        spec,
+        root=tmp_path,
+        dataset_path=dataset,
+        media_manifest=_openeqa_manifest(spec.name, "000-hm3d-BFRyYbPCCPE"),
+        limit=1,
+        verify_digest=False,
+    )
+
+    # One episode is one physically isolated store fed by hundreds of frames,
+    # so `--limit 1` bounds episodes; half an episode's questions would answer
+    # against the same fully ingested scene anyway.
+    assert [unit.unit_id for unit in loaded.units] == ["000-hm3d-BFRyYbPCCPE"]
+    assert [question.question_id for question in loaded.units[0].questions] == ["q1", "q2"]
+
+    question = loaded.units[0].questions[0]
+    assert question.score_kind == "text"
+    assert question.references == ("Air conditioning unit",)
+    assert question.source_question == "What is above the TV?"
+    # The official EM-EQA instruction reaches the model as its own query part,
+    # leaving the question text unpolluted for retrieval.
+    assert question.content[0] == "What is above the TV?"
+    assert "You are an intelligent question answering agent." in str(question.content[1])
+    assert question.metadata["category"] == "object recognition"
+    assert question.metadata["episode_history"] == "hm3d-v0/000-hm3d-BFRyYbPCCPE"
+    # Absent versus present decides the judge prompt, so it must survive the
+    # loader as a missing key rather than an empty one.
+    assert "extra_answers" not in question.metadata
+    assert loaded.units[0].questions[1].metadata["extra_answers"] == ("by the stairs",)
+
+
+def test_openeqa_tasks_answer_only_their_own_scene_split(tmp_path: Path) -> None:
+    dataset = _openeqa_dataset(tmp_path / "open-eqa-v0.json")
+
+    scannet = load_task(
+        TASKS["openeqa-scannet"],
+        root=tmp_path,
+        dataset_path=dataset,
+        media_manifest=_openeqa_manifest("openeqa-scannet", "002-scannet-scene0709_00"),
+        verify_digest=False,
+    )
+    assert [unit.unit_id for unit in scannet.units] == ["002-scannet-scene0709_00"]
+
+    hm3d = load_task(
+        TASKS["openeqa-hm3d"],
+        root=tmp_path,
+        dataset_path=dataset,
+        media_manifest=_openeqa_manifest(
+            "openeqa-hm3d", "000-hm3d-BFRyYbPCCPE", "001-hm3d-TPhiubUHKcP"
+        ),
+        verify_digest=False,
+    )
+    assert [unit.unit_id for unit in hm3d.units] == [
+        "000-hm3d-BFRyYbPCCPE",
+        "001-hm3d-TPhiubUHKcP",
+    ]
+
+    # An episode history is a directory of frames, not a file the resolver can
+    # match, so a run without prepared media must say so instead of indexing
+    # every PNG under a 12-62 GB tree.
+    media = tmp_path / "frames"
+    media.mkdir()
+    with pytest.raises(FileNotFoundError, match="has no media for unit"):
+        load_task(
+            TASKS["openeqa-hm3d"],
+            root=tmp_path,
+            dataset_path=dataset,
+            media_root=media,
+            verify_digest=False,
+        )
+
+
+def test_metric_breakdowns_cover_every_catalog_task(tmp_path: Path) -> None:
+    """One family table, not two.
+
+    `_metric_breakdowns` used to resolve families from a list local to
+    `eval.py`, which had drifted from the scorer registry: it raised
+    `unknown benchmark task` for `longmemeval-s`, `clbench`, `beam-*` and
+    `personamem-v3`, so summarising a finished run of any of them crashed.
+    """
+    for name, spec in TASKS.items():
+        task = LoadedTask(
+            spec,
+            tmp_path / "dataset.json",
+            "0" * 64,
+            (
+                EvalUnit(
+                    "unit",
+                    (),
+                    (
+                        EvalQuestion(
+                            "q1",
+                            ("question",),
+                            ("reference",),
+                            metadata={"category": "object recognition"},
+                        ),
+                    ),
+                ),
+            ),
+        )
+        breakdowns = eval_module._metric_breakdowns(task, (), cast(Any, _breakdown_arguments()))
+        assert isinstance(breakdowns, dict), name
+
+    openeqa = LoadedTask(
+        TASKS["openeqa-hm3d"],
+        tmp_path / "dataset.json",
+        "0" * 64,
+        (EvalUnit("unit", (), (EvalQuestion("q1", ("q",), ("r",)),)),),
+    )
+    sample = replace(
+        _egomem_sample(1),
+        task="openeqa-hm3d",
+        score=1.0,
+        metadata={"category": "object recognition"},
+    )
+    grouped = eval_module._metric_breakdowns(openeqa, (sample,), cast(Any, _breakdown_arguments()))
+    assert "category" in grouped
+    assert "object recognition" in cast(dict[str, object], grouped["category"])
+
+
+def _breakdown_arguments() -> SimpleNamespace:
+    return SimpleNamespace(seed=1234, bootstrap_samples=8)

@@ -27,8 +27,9 @@ mindbridge-bench eval --list-tasks
 
 The catalog currently covers LoCoMo-Refined, M3-Bench, Video-MME and Video-MME-v2,
 EgoLifeQA, EgoMemReason, EgoTempo, MemLens, MM-Lifelong, SuperMemory-VQA, ATM-Bench,
-Mem-Gallery, LongMemEval, CL-Bench, BEAM, and PersonaMem-v3. Use the listing command instead of
-copying task names from this page; it is generated from the catalog used by the runner.
+Mem-Gallery, LongMemEval, CL-Bench, BEAM, PersonaMem-v3, and OpenEQA. Use the listing command
+instead of copying task names from this page; it is generated from the catalog used by the
+runner.
 
 Review each printed repository and revision before downloading data. Upstream terms vary:
 LoCoMo-Refined and PersonaMem-v3 are CC BY-NC 4.0, MM-Lifelong is academic-only and restricts
@@ -81,7 +82,8 @@ By default, the runner downloads missing pinned inputs and verifies published di
 available. The `all` group can require hundreds of gigabytes; start with one task and `--limit`.
 Long videos are prepared as deterministic bounded clips and cached under `.benchmarks/.prepared/`.
 Preparation requires `ffmpeg` and `ffprobe`; M3-Bench web media also uses `yt-dlp`. EgoTempo
-requires prior Ego4D authorization and AWS credentials.
+requires prior Ego4D authorization and AWS credentials, and OpenEQA requires operator-supplied
+episode histories.
 
 Use `--no-download` for a fully offline run. Operator-managed inputs require explicit task paths:
 
@@ -102,6 +104,53 @@ the runner ingests only observations ending at or before the question cutoff. Re
 resolved from the manifest file. When the runner prepares media itself, it writes
 `OUTPUT/media-manifest.json`; use that generated file as the format reference before supplying an
 operator-authored replacement.
+
+## OpenEQA episode histories
+
+`openeqa-hm3d` and `openeqa-scannet` read one pinned question file --
+`data/open-eqa-v0.json`, 1,636 questions over 152 episodes -- but its episode histories are
+published separately and are not downloadable from here. Extract them into the catalog's own
+location, `.benchmarks/openeqa/data/frames/<split>/`, and the task runs with no extra flag;
+otherwise point at them:
+
+```bash
+mindbridge-bench eval \
+  --tasks openeqa-hm3d \
+  --media-root openeqa-hm3d=/datasets/open-eqa/data/frames/hm3d-v0 \
+  --limit 1
+```
+
+A partial extraction fails rather than scoring the episodes that happen to be present, and the
+message names how many of the selected episodes are absent.
+
+| Task | Episodes | Questions | Episode histories |
+| --- | --- | --- | --- |
+| `openeqa-hm3d` | 63 | 557 | 12 GB of RGB frames from the tarball the upstream `data/README.md` links, or re-extracted from HM3D with the Habitat simulator |
+| `openeqa-scannet` | 89 | 1,079 | ScanNet's own signed terms of use, then `data/scannet/extract-frames.py` for 62 GB and roughly eight hours |
+
+Either layout is accepted: the split directory itself, or the parent `data/frames` the upstream
+README documents.
+
+Four choices decide whether a number here is comparable with the leaderboard:
+
+- **Only EM-EQA is adapted.** A-EQA scores an agent that navigates the scene to gather its own
+  history, which a memory system answering from a fixed episode cannot express. Its 184-question
+  subset is entirely HM3D and is not registered as a task.
+- **The frame sequence is encoded at one frame per second.** OpenEQA publishes no video encoding
+  for evaluation -- upstream's `data/frames2videos.py` writes at 30 fps for its web viewer, not
+  for scoring -- so the adapter chooses one, and 1 fps is the rate at which preparation's own
+  `fps=1` resample keeps every extracted frame. Each episode then becomes 30-second segments
+  through the same pipeline the video tasks use. `_OPENEQA_FRAME_RATE` in
+  `benchmarks/prepare_media.py` is the knob for deliberately thinning a scene's history.
+- **`--limit` counts episodes, not questions.** One episode is one physically isolated store fed
+  by hundreds of frames, and every question over it answers against the same ingested scene.
+- **The headline is `llm_match`, reported 0-1.** It is the official LLM-Match protocol: the
+  `mmbench` prompt, or `mmbench-extra` for the 263 questions that publish `extra_answers`, judged
+  by `gpt-4-1106-preview` for a mark of 1-5. The raw mark is kept beside it as
+  `llm_match_score_1_5`. Upstream prints the same quantity multiplied by 100. Two upstream
+  behaviours are reproduced rather than corrected: a prediction is cut after its last period when
+  that period is not already its final character, and a mark outside 1-5 is clipped instead of
+  rejected.
 
 ## Text-only memory benchmarks
 

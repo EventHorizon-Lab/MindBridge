@@ -11,6 +11,7 @@ described below.
 - LongMemEval, copyright 2024 Di Wu.
 - BEAM, copyright 2025 Mohammad Tavakoli.
 - PersonaMem-v3 evaluation code, copyright 2026 The PersonaMem-v3 Authors.
+- OpenEQA, copyright Meta Platforms, Inc. and affiliates.
 
 Those components are provided under the MIT License:
 
@@ -84,6 +85,13 @@ release permits academic research only, prohibits commercial use, and restricts 
 publication, copying, dissemination, and modification without prior approval. This notice grants
 no additional permission; confirm authorization from the rights holder before redistributing the
 instruction or a package that contains it.
+
+OpenEQA's own release -- questions, prompts and evaluator -- is MIT (above); source:
+`facebookresearch/open-eqa@cfa3fce4595c1622bb2f8a38ae2ca9aae9eb685b`. Its episode histories are
+not part of that release and carry their own terms: HM3D frames come from
+[Habitat-Matterport 3D](https://aihabitat.org/datasets/hm3d) under its own agreement, and ScanNet
+frames require ScanNet's signed terms of use. MindBridge downloads neither. Confirm your own
+authorization for whichever scene source you supply.
 
 ## Apache evaluator material
 

@@ -18,6 +18,7 @@ from mindbridge.benchmarks.mem_gallery import (
     MemGalleryRound,
     MemGallerySession,
 )
+from mindbridge.benchmarks.openeqa import OpenEqaQuestion
 from mindbridge.benchmarks.personamem_v3 import PersonaMemQuery
 from mindbridge.benchmarks.supermemory_vqa import SuperMemoryQuestion
 from mindbridge.benchmarks.task_catalog import TaskSpec
@@ -710,6 +711,59 @@ def _egotempo(
     )
 
 
+def _openeqa(
+    spec: TaskSpec,
+    dataset: Path,
+    media: MediaResolver,
+    _root: Path,
+    limit: Limit,
+    offset: int,
+) -> tuple[EvalUnit, ...]:
+    from mindbridge.benchmarks.openeqa import load_openeqa
+    from mindbridge.benchmarks.prompts import OPENEQA_QUERY_PROMPT
+
+    grouped: dict[str, list[OpenEqaQuestion]] = {}
+    for question in load_openeqa(dataset, split=str(spec.variant)):
+        grouped.setdefault(question.episode_name, []).append(question)
+    # `limit` selects episodes rather than questions: one episode is one
+    # physically isolated store fed by hundreds of RGB frames, so the cost this
+    # knob has to bound is per-episode, and half an episode's questions would
+    # answer against the same fully ingested scene anyway.
+    return tuple(
+        EvalUnit(
+            episode_name,
+            # No `source_ids` fallback: an episode history is a directory of
+            # frames, not a file the resolver can match, and asking it to look
+            # would index every PNG under a 12-62 GB tree before failing. The
+            # frames reach the runner as prepared per-episode video, so the
+            # manifest is the only path.
+            media.parts(episode_name),
+            tuple(
+                EvalQuestion(
+                    question.question_id,
+                    _query_parts(OPENEQA_QUERY_PROMPT.text, question.question),
+                    (question.reference_answer,),
+                    metadata={
+                        "category": question.category,
+                        "episode_history": question.episode_history,
+                        # Absent, not empty, when the release publishes none:
+                        # `get_llm_match_score` selects its judge prompt on
+                        # exactly this distinction.
+                        **(
+                            {}
+                            if question.extra_answers is None
+                            else {"extra_answers": question.extra_answers}
+                        ),
+                    },
+                    source_question=question.question,
+                )
+                for question in questions
+            ),
+        )
+        for episode_name, questions in _selected(tuple(grouped.items()), limit, offset)
+    )
+
+
 def _memlens(
     spec: TaskSpec,
     dataset: Path,
@@ -1304,6 +1358,8 @@ _LOADERS = {
     "egolifeqa": _egolife,
     "egomemreason": _egomem,
     "egotempo": _egotempo,
+    "openeqa-hm3d": _openeqa,
+    "openeqa-scannet": _openeqa,
     "memlens-32k": _memlens,
     "memlens-64k": _memlens,
     "memlens-128k": _memlens,

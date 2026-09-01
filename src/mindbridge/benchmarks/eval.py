@@ -93,6 +93,7 @@ from mindbridge.benchmarks.official_scorers import (
     parse_judge_response,
     sample_primary_metric,
     scorer_protocol,
+    task_family,
     task_primary_metric,
 )
 from mindbridge.benchmarks.prepare_media import _has_audio, prepare_task_media
@@ -2128,6 +2129,7 @@ def _metric_breakdowns(
     samples: Sequence[SampleResult],
     arguments: _Arguments,
 ) -> dict[str, object]:
+    family = task_family(task.spec.name)
     fields = {
         "locomo-refined": ("category",),
         "m3-bench": ("question_types",),
@@ -2140,7 +2142,8 @@ def _metric_breakdowns(
         "supermemory-vqa": ("skill",),
         "atm-bench": ("qtype",),
         "mem-gallery": ("point",),
-    }.get(_task_family(task.spec.name), ())
+        "openeqa": ("category",),
+    }.get(family or "", ())
     result: dict[str, object] = {}
     for field_name in fields:
         grouped: dict[str, list[ScoredValue]] = {}
@@ -2168,26 +2171,6 @@ def _metric_breakdowns(
                 for label, rows in sorted(grouped.items())
             }
     return result
-
-
-def _task_family(task: str) -> str:
-    for family in (
-        "supermemory-vqa",
-        "video-mme-v2",
-        "locomo-refined",
-        "mm-lifelong",
-        "mem-gallery",
-        "egomemreason",
-        "egolifeqa",
-        "egotempo",
-        "memlens",
-        "atm-bench",
-        "m3-bench",
-        "video-mme",
-    ):
-        if task == family or task.startswith(f"{family}-"):
-            return family
-    raise ValueError(f"unknown benchmark task: {task}")
 
 
 def _video_mme_metrics(

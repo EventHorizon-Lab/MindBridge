@@ -41,6 +41,21 @@ from mindbridge.benchmarks._official.memlens_prompts import (
     build_judge_prompt as build_memlens_prompt,
 )
 from mindbridge.benchmarks._official.memlens_prompts import get_task_key
+from mindbridge.benchmarks._official.openeqa_llm_match import (
+    MAX_SCORE as OPENEQA_MAX_SCORE,
+)
+from mindbridge.benchmarks._official.openeqa_llm_match import (
+    MIN_SCORE as OPENEQA_MIN_SCORE,
+)
+from mindbridge.benchmarks._official.openeqa_llm_match import (
+    build_llm_match_prompt as build_openeqa_prompt,
+)
+from mindbridge.benchmarks._official.openeqa_llm_match import (
+    parse_llm_match_score as parse_openeqa_score,
+)
+from mindbridge.benchmarks._official.openeqa_llm_match import (
+    truncate_prediction as truncate_openeqa_prediction,
+)
 from mindbridge.benchmarks.personamem_v3 import RANKING_TASK_TYPES
 
 SCORER_VERSION = "official_scorers_v2"
@@ -75,6 +90,7 @@ class JudgePlan:
         "clbench",
         "beam",
         "personamem_v3",
+        "openeqa",
     ]
     calls: tuple[tuple[JudgeMessage, ...], ...]
     max_tokens: int | None = None
@@ -100,6 +116,7 @@ _PROTOCOLS = {
     "clbench": "clbench_binary_rubric_b28a5832a09b",
     "beam": "beam_unified_rubric_3e12035532eb",
     "personamem-v3": "personamem_v3_rubric_7b00a090b35b",
+    "openeqa": "openeqa_llm_match_cfa3fce4595c",
 }
 
 _OFFICIAL_JUDGE_MODELS = {
@@ -119,6 +136,9 @@ _OFFICIAL_JUDGE_MODELS = {
     "beam": "gpt-4.1-mini",
     # `EVAL.md`: "the judge is a QueryLLM client on Azure gpt-5.5".
     "personamem-v3": "gpt-5.5",
+    # `llm_match.get_llm_match_score`'s `openai_model` default, which
+    # `evaluate-predictions.py` never overrides.
+    "openeqa": "gpt-4-1106-preview",
 }
 
 _JUDGE_METRICS = {
@@ -133,6 +153,7 @@ _JUDGE_METRICS = {
     "clbench": frozenset({"solving_rate", "requirement_ratio"}),
     "beam": frozenset({"llm_judge_score"}),
     "personamem-v3": frozenset({"personamem_score"}),
+    "openeqa": frozenset({"llm_match", "llm_match_score_1_5"}),
 }
 
 # PersonaMem-v3 headline per task type, and the divisor that maps it onto the
@@ -155,6 +176,11 @@ _RANKED_JSON = re.compile(r'"ranked_indices"\s*:\s*\[([^\]]*)\]')
 _LOCOMO_TOKEN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 _ATM_MEDIA_ID = re.compile(r"\b(\d{8}_\d{6})\b")
 _ATM_EMAIL_ID = re.compile(r"\b(email\d+)\b", re.IGNORECASE)
+
+
+def task_family(task: str) -> str | None:
+    """Return the benchmark family one task name belongs to, if it has one."""
+    return _family_or_none(task)
 
 
 def scorer_protocol(task: str) -> str:
@@ -185,6 +211,7 @@ def task_primary_metric(task: str) -> str:
         "clbench": "solving_rate",
         "beam": "llm_judge_score",
         "personamem-v3": "personamem_score",
+        "openeqa": "llm_match",
     }[family]
 
 
@@ -453,6 +480,35 @@ def judge_plan(  # noqa: C901 - direct task dispatch keeps official protocols au
         )
     if family == "personamem-v3":
         return _personamem_plan(protocol, question, metadata, prediction)
+    if family == "openeqa":
+        declared = metadata.get("extra_answers")
+        extra = (
+            None
+            if declared is None
+            else tuple(str(value) for value in cast(Sequence[object], declared))
+        )
+        return JudgePlan(
+            protocol,
+            "openeqa",
+            (
+                (
+                    JudgeMessage(
+                        "user",
+                        build_openeqa_prompt(
+                            question,
+                            reference,
+                            # `evaluate-predictions.py` trims the prediction
+                            # before scoring it, so the judge never sees the
+                            # trailing unterminated sentence.
+                            truncate_openeqa_prediction(prediction),
+                            extra,
+                        ),
+                    ),
+                ),
+            ),
+            # `openai_max_tokens=32` in `get_llm_match_score`.
+            32,
+        )
     if family == "mem-gallery":
         prompt = (
             _GALLERY_PROMPT.replace("{{question}}", question)
@@ -516,6 +572,16 @@ def parse_judge_response(  # noqa: C901 - mirrors seven incompatible upstream pa
         return {"llm_judge_score": parse_beam_item(response, plan.details.get("category", ""))}
     if plan.parser == "personamem_v3":
         return _personamem_judge_scores(plan, response)
+    if plan.parser == "openeqa":
+        # Upstream clips rather than validating: `evaluate-predictions.py` maps
+        # every mark through `np.clip(scores, 1, 5)`, so a judge that answers 0
+        # -- its own sentinel for a missing prediction -- scores zero points and
+        # one that overshoots is capped instead of discarding the question.
+        clipped = min(max(parse_openeqa_score(response), OPENEQA_MIN_SCORE), OPENEQA_MAX_SCORE)
+        return {
+            "llm_match": (clipped - OPENEQA_MIN_SCORE) / (OPENEQA_MAX_SCORE - OPENEQA_MIN_SCORE),
+            "llm_match_score_1_5": float(clipped),
+        }
     if plan.parser == "gallery":
         score = _gallery_judge_score(response)
         return {"llm_judge": 0.0 if score < 0.25 else 0.5 if score < 0.75 else 1.0}

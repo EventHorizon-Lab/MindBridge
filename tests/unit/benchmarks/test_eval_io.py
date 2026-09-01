@@ -8,6 +8,7 @@ import stat
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -17,10 +18,14 @@ from mindbridge.benchmarks.eval import _cache_task
 from mindbridge.benchmarks.eval_adapters import MediaResolver, load_task
 from mindbridge.benchmarks.eval_cache import CachedAnswer, EvidenceInterval, ResponseCache
 from mindbridge.benchmarks.prepare_media import (
+    _OPENEQA_FRAME_RATE,
     _lifelong_manifest,
     _m3_manifest,
+    _openeqa_episode,
+    _openeqa_video,
     _segment_video,
     _selected_patterns,
+    prepare_task_media,
 )
 from mindbridge.benchmarks.task_catalog import TASKS, MediaSource, TaskSpec
 
@@ -338,3 +343,237 @@ def test_supermemory_download_keeps_the_whole_causal_subject_history(tmp_path: P
         "data/video/Person_1/Person_1_session_earlier.mp4",
         "data/video/Person_1/Person_1_session_later.mp4",
     )
+
+
+def _openeqa_episode_frames(episode: Path, *names: str) -> Path:
+    episode.mkdir(parents=True)
+    for name in names:
+        (episode / f"{name}-rgb.png").write_bytes(b"frame")
+    return episode
+
+
+def test_openeqa_encodes_episode_frames_at_one_frame_per_second(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    episode = _openeqa_episode_frames(
+        tmp_path / "frames" / "hm3d-v0" / "000-hm3d-BFRyYbPCCPE", "00010", "00001", "00002"
+    )
+    (episode / "00001-depth.png").write_bytes(b"depth")
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
+    commands: list[tuple[str, ...]] = []
+    listings: list[str] = []
+
+    def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
+        commands.append(tuple(command))
+        # Read the concat list while it still exists: it lives in a working
+        # directory the encoder removes once the output is in place.
+        listings.append(Path(command[command.index("-i") + 1]).read_text(encoding="utf-8"))
+        Path(command[-1]).write_bytes(b"episode")
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._run_ffmpeg", run)
+
+    video = _openeqa_video(episode, tmp_path / "cache", None)
+
+    assert video.read_bytes() == b"episode"
+    command = commands[0]
+    # Upstream publishes no evaluation encoding; 1 fps is the rate at which the
+    # segmenter's own `fps=1` filter becomes an identity step.
+    assert _OPENEQA_FRAME_RATE == 1
+    assert command[command.index("-r") + 1] == "1"
+    # Frame extractions are not guaranteed to have even dimensions, which
+    # `yuv420p` requires.
+    assert command[command.index("-vf") + 1] == "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    assert command[command.index("-f") + 1] == "concat"
+
+    listing = listings[0]
+    entries = [line for line in listing.splitlines() if line.startswith("file ")]
+    # The official frame order is `sorted(glob("*-rgb.png"))`, depth maps
+    # excluded, and the final entry is not repeated: with `-r` forcing a
+    # constant rate its `duration` is honoured, and repeating it measurably
+    # encodes 76 frames from 75 extracted.
+    assert [Path(entry[6:-1]).name for entry in entries] == [
+        "00001-rgb.png",
+        "00002-rgb.png",
+        "00010-rgb.png",
+    ]
+    assert listing.count("duration 1.000000") == 3
+
+    # A second call reuses the encode rather than paying for it again.
+    assert _openeqa_video(episode, tmp_path / "cache", None) == video
+    assert len(commands) == 1
+
+    # Adding a frame changes the cache key, because the extraction changed.
+    (episode / "00011-rgb.png").write_bytes(b"frame")
+    assert _openeqa_video(episode, tmp_path / "cache", None) != video
+    assert len(commands) == 2
+
+
+def test_openeqa_media_root_accepts_either_frames_layout(tmp_path: Path) -> None:
+    split_root = tmp_path / "frames" / "hm3d-v0"
+    _openeqa_episode_frames(split_root / "000-hm3d-BFRyYbPCCPE", "00001")
+
+    # `--media-root .../frames/hm3d-v0`, which the catalog's own media path is.
+    assert _openeqa_episode(split_root, "hm3d-v0", "000-hm3d-BFRyYbPCCPE").is_dir()
+    # `--media-root .../frames`, the layout upstream's own README documents.
+    assert _openeqa_episode(tmp_path / "frames", "hm3d-v0", "000-hm3d-BFRyYbPCCPE").is_dir()
+
+    with pytest.raises(FileNotFoundError, match="episode history does not exist"):
+        _openeqa_episode(split_root, "hm3d-v0", "001-hm3d-TPhiubUHKcP")
+
+
+def test_openeqa_refuses_frame_paths_it_cannot_quote(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    episode = _openeqa_episode_frames(tmp_path / "it's-a-scene", "00001")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
+
+    # An operator-supplied media root reaches ffmpeg's concat list verbatim, so
+    # a quote there would silently truncate the frame list.
+    with pytest.raises(ValueError, match="not safe to encode"):
+        _openeqa_video(episode, tmp_path / "cache", None)
+
+
+def test_openeqa_selected_patterns_name_the_frames_an_operator_must_supply(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "open-eqa-v0.json"
+    dataset.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "q1",
+                    "episode_history": "hm3d-v0/000-hm3d-BFRyYbPCCPE",
+                    "category": "object recognition",
+                    "question": "What is above the TV?",
+                    "answer": "Air conditioning unit",
+                },
+                {
+                    "question_id": "q2",
+                    "episode_history": "hm3d-v0/000-hm3d-BFRyYbPCCPE",
+                    "category": "object localization",
+                    "question": "Where is the mirror?",
+                    "answer": "Next to the staircase",
+                },
+                {
+                    "question_id": "q3",
+                    "episode_history": "hm3d-v0/001-hm3d-TPhiubUHKcP",
+                    "category": "spatial understanding",
+                    "question": "Is the door open?",
+                    "answer": "open",
+                },
+                {
+                    "question_id": "q4",
+                    "episode_history": "scannet-v0/002-scannet-scene0709_00",
+                    "category": "world knowledge",
+                    "question": "What room is this?",
+                    "answer": "an office",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # Deduplicated per episode, narrowed to the task's split, and bounded by
+    # the same episode-counting limit the loader uses.
+    assert _selected_patterns(TASKS["openeqa-hm3d"], dataset, 1, 0) == (
+        "data/frames/hm3d-v0/000-hm3d-BFRyYbPCCPE/*-rgb.png",
+    )
+    assert _selected_patterns(TASKS["openeqa-scannet"], dataset, None, 0) == (
+        "data/frames/scannet-v0/002-scannet-scene0709_00/*-rgb.png",
+    )
+
+    # Neither split's frames are downloadable from here, so the failure names
+    # the acquirer an operator has to satisfy instead of trying a fetch.
+    with pytest.raises(ValueError, match="requires its open-eqa-hm3d-frames acquirer"):
+        acquire_media(TASKS["openeqa-hm3d"], tmp_path, patterns=("data/frames/hm3d-v0/x/*",))
+    with pytest.raises(ValueError, match="requires its scannet acquirer"):
+        acquire_media(TASKS["openeqa-scannet"], tmp_path, patterns=("data/frames/scannet-v0/x/*",))
+
+
+@pytest.mark.parametrize(
+    ("task_name", "split", "episodes"),
+    (
+        ("openeqa-hm3d", "hm3d-v0", ("000-hm3d-BFRyYbPCCPE", "001-hm3d-TPhiubUHKcP")),
+        (
+            "openeqa-scannet",
+            "scannet-v0",
+            ("002-scannet-scene0709_00", "142-scannet-scene0653_01"),
+        ),
+    ),
+)
+def test_openeqa_accepts_episode_histories_already_in_the_managed_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    task_name: str,
+    split: str,
+    episodes: tuple[str, str],
+) -> None:
+    spec = TASKS[task_name]
+    dataset = tmp_path / "open-eqa-v0.json"
+    dataset.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": f"q{index}",
+                    "episode_history": f"{split}/{episode}",
+                    "category": "object recognition",
+                    "question": "What is above the TV?",
+                    "answer": "Air conditioning unit",
+                }
+                for index, episode in enumerate(episodes)
+            ]
+        ),
+        encoding="utf-8",
+    )
+    frames = tmp_path / "openeqa" / "data" / "frames" / split
+
+    def prepare() -> object:
+        return prepare_task_media(
+            spec,
+            root=tmp_path,
+            dataset_path=dataset,
+            media_root=None,
+            manifest=None,
+            limit=None,
+            offset=0,
+            download=False,
+        )
+
+    # Nothing extracted yet. Going through `prepare_task_media` rather than the
+    # acquirer directly is the point: an earlier version reached
+    # `acquire_media`, which refuses any acquirer-declared source outright, so a
+    # correctly extracted tree was rejected too. `FileNotFoundError` rather than
+    # that `ValueError` is what proves the dispatch is wired up.
+    with pytest.raises(FileNotFoundError, match="acquirer supplies") as absent:
+        prepare()
+    assert f"--media-root {task_name}=DIR" in str(absent.value)
+    assert "2 of 2" in str(absent.value)
+
+    _openeqa_episode_frames(frames / episodes[0], "00001", "00002")
+
+    # A partial extraction is still a failure, and says how much is absent: half
+    # a scene set silently scored as a full run is the outcome worth refusing.
+    with pytest.raises(FileNotFoundError, match="1 of 2"):
+        prepare()
+
+    _openeqa_episode_frames(frames / episodes[1], "00001", "00002")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._run_ffmpeg",
+        lambda command, _source: Path(command[-1]).write_bytes(b"episode"),
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._segments",
+        lambda source, cache, announce: ((0.0, 2.0, source),),
+    )
+
+    # Frames extracted into the catalog's own media root are enough on their
+    # own, so `--media-root` is a convenience rather than the only way to run.
+    manifest = prepare()
+    assert isinstance(manifest, dict)
+    units = cast(dict[str, object], manifest["units"])
+    assert list(units) == list(episodes)

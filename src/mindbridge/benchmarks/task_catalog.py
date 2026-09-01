@@ -8,6 +8,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 
 from mindbridge.benchmarks.atm_bench import ATM_BENCH_ADAPTER_VERSION
+from mindbridge.benchmarks.openeqa import OPENEQA_ADAPTER_VERSION, OPENEQA_SPLITS
 
 DEFAULT_BENCHMARKS_ROOT = Path(".benchmarks")
 
@@ -83,6 +84,10 @@ _PERSONAMEM_V3 = (
     "bowen-upenn/PersonaMem-v3",
     "7b00a090b35b7293e6efeeb19494207f32b5a9ee",
 )
+_OPENEQA = (
+    "facebookresearch/open-eqa",
+    "cfa3fce4595c1622bb2f8a38ae2ca9aae9eb685b",
+)
 
 _M3_ROBOT_MEDIA = MediaSource(
     "m3-bench",
@@ -103,6 +108,13 @@ _ATM_MEDIA = MediaSource(
     ("data/raw_memory/image/*", "data/raw_memory/video/*"),
 )
 _GALLERY_MEDIA = MediaSource("mem-gallery", *_GALLERY, ("data/image/*",))
+# OpenEQA publishes questions but no episode histories. HM3D frames are a 12 GB
+# tarball the upstream README links from Dropbox; ScanNet frames need its own
+# signed terms of use and ~8 hours of local extraction. Both are named as
+# acquirers so the failure says which one, and `--media-root` takes an
+# operator-extracted `data/frames/<split>` tree.
+_OPENEQA_HM3D_MEDIA = MediaSource("openeqa", acquirer="open-eqa-hm3d-frames")
+_OPENEQA_SCANNET_MEDIA = MediaSource("openeqa", acquirer="scannet")
 
 
 def _task(
@@ -397,6 +409,22 @@ TASKS: dict[str, TaskSpec] = {
                 "backend/*/test.json",
             ),
         ),
+        *(
+            _task(
+                f"openeqa-{'hm3d' if split == 'hm3d-v0' else 'scannet'}",
+                "OpenEQA",
+                "openeqa/data/open-eqa-v0.json",
+                OPENEQA_ADAPTER_VERSION,
+                _OPENEQA,
+                digest="a64dd101133213fa3b5ca31e5af8216662471aa34894b443d803f497757557ee",
+                variant=split,
+                media=f"openeqa/data/frames/{split}",
+                media_source=(
+                    _OPENEQA_HM3D_MEDIA if split == "hm3d-v0" else _OPENEQA_SCANNET_MEDIA
+                ),
+            )
+            for split in OPENEQA_SPLITS
+        ),
         _task(
             "mem-gallery",
             "Mem-Gallery",
@@ -416,6 +444,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "mm-lifelong": tuple(name for name in TASKS if name.startswith("mm-lifelong-")),
     "atm-bench": tuple(name for name in TASKS if name.startswith("atm-bench-")),
     "beam": tuple(name for name in TASKS if name.startswith("beam-")),
+    "openeqa": tuple(name for name in TASKS if name.startswith("openeqa-")),
     "all": tuple(TASKS),
 }
 
@@ -438,6 +467,10 @@ ALIASES = {
     "longmemeval-small": "longmemeval-s",
     "cl-bench": "clbench",
     "personamem": "personamem-v3",
+    "open-eqa": "openeqa",
+    "em-eqa": "openeqa",
+    "openeqa-hm3d-v0": "openeqa-hm3d",
+    "openeqa-scannet-v0": "openeqa-scannet",
     "personamem-v3-backend": "personamem-v3",
 }
 
