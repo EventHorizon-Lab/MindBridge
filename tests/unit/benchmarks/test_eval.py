@@ -8,7 +8,7 @@ import subprocess
 import sys
 from argparse import ArgumentTypeError
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timezone
 from inspect import getattr_static
 from pathlib import Path
@@ -648,6 +648,34 @@ def test_backend_pool_warms_query_embedding_before_evaluation(
     pool.close()
 
     assert calls == [((ModelInput(text="MindBridge benchmark warmup"),), EmbedTask.QUERY)]
+
+
+def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hand-written forwarding list drops new policy silently, which is worse than crashing:
+    the run measures the default while the artifact reports the configured value."""
+    captured: dict[str, object] = {}
+
+    class Recorder:
+        def __init__(self, _data_dir: object, **values: object) -> None:
+            captured.update(values)
+
+    monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
+    pool = object.__new__(eval_module._BackendPool)
+    settings = MemoryConfig(evidence_budget_chars=4_242, minimum_relevance=0.11)
+    for name, value in (
+        ("_settings", settings),
+        ("_embedder", None),
+        ("_answerer", None),
+        ("_transcriber", None),
+        ("_face_analyzer", None),
+        ("_tracer", None),
+    ):
+        setattr(pool, name, value)
+
+    pool.memory(Path("unused"))
+
+    for entry in fields(MemoryConfig):
+        assert captured[entry.name] == getattr(settings, entry.name), entry.name
 
 
 def test_implementation_identity_tracks_editable_source_changes(

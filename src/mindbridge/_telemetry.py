@@ -24,8 +24,12 @@ TOKEN_AUDIO_SECONDS = "mindbridge.token_usage.audio_seconds"
 MODEL_TTFT = "mindbridge.model.time_to_first_token"
 GEN_AI_TTFC = "gen_ai.response.time_to_first_chunk"
 GEN_AI_FINISH_REASONS = "gen_ai.response.finish_reasons"
+EMBEDDING_PARTS_ELIDED = "mindbridge.embedding.elided_parts"
+EMBEDDING_VIDEO_SAMPLED = "mindbridge.embedding.video_sampled_inputs"
 GROUNDING_MEDIA_ELIDED = "mindbridge.grounding.media_elided_hits"
 GROUNDING_HITS_DROPPED = "mindbridge.grounding.dropped_hits"
+IDENTITY_OBSERVATIONS = "mindbridge.identity.observations"
+IDENTITY_MATCHED = "mindbridge.identity.matched_existing"
 
 TOKEN_MODALITIES = ("text", "image", "video", "audio", "unattributed")
 

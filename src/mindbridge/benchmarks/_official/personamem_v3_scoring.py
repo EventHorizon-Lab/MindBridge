@@ -25,8 +25,9 @@ deliberately absent because they do not:
   response into the next prompt, which a harness that answers questions
   independently cannot reconstruct;
 * `new_suggestions_chatbot` -- a leak-set plus judge composite;
-* `local_recommendation_geo_shift` and `active_mistake_prevention` -- paired
-  scorers whose headline is a delta across two rows, not a per-row value.
+* `local_recommendation_geo_shift`, `active_mistake_prevention` and
+  `short_vs_long_term_lifecycle` -- paired scorers whose headline is a delta
+  across two rows, not a per-row value.
 
 Rows of those types are still answered and reported; they carry no official
 headline metric.

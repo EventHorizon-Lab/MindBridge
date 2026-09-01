@@ -25,6 +25,7 @@ from functools import partial
 from pathlib import Path
 from threading import Condition, RLock
 from time import perf_counter
+from types import MappingProxyType
 from typing import Protocol, TypeVar, cast
 
 from opentelemetry import trace
@@ -32,6 +33,9 @@ from opentelemetry.trace import Span, Tracer
 from opentelemetry.util.types import AttributeValue
 
 from mindbridge._telemetry import (
+    EMBEDDING_PARTS_ELIDED,
+    IDENTITY_MATCHED,
+    IDENTITY_OBSERVATIONS,
     MODEL_MODULE,
     MODEL_TTFT,
     SPAN_KIND,
@@ -159,10 +163,34 @@ _RERANK_CANDIDATES = 100
 _RANK_FLOOR = 0.3
 _RANK_CEILING = 1.5
 _DEFAULT_CONFIG = MemoryConfig()
+# Confidence a full-text match earns on its own, which is what the `minimum_relevance` gate reads.
 _LEXICAL_MATCH_CONFIDENCE = 0.6
 _DECAY_REINFORCEMENT_LIMIT = 20
 _CONFIRMATION_WEIGHT = 0.05
-_MAX_LEXICAL_RERANK_BONUS = 0.2
+# What a full-text match contributes to the *ranking* score. It is deliberately far below the
+# confidence above: `lexical_relevance_by_rank` is a reciprocal rank, not a similarity, so at 0.6
+# the top full-text hit outranked every dense candidate under 0.6 cosine no matter how weak its
+# match actually was. Measured on ranked candidates replayed from two benchmark corpora, gold
+# recall at eight rose from 0.8239 to 0.8920 on Mem-Gallery and from 0.8194 to 0.9306 on
+# ATM-Bench when the rank proxy stopped winning that comparison. The floor is still non-zero so a
+# memory only the full-text route can reach stays orderable.
+_LEXICAL_RANK_RELEVANCE = 0.24
+# Covering every distinctive query term is evidence in a way that ranking first in the full-text
+# index is not, so a complete match ranks as near-certain rather than through the demoted rank
+# proxy, and a memory quoting the whole question cannot be buried by an unrelated dense neighbour.
+# The threshold leaves slack for summation order; the coverage ratio is otherwise exactly one.
+# Across both replayed corpora two candidates in more than twenty thousand reached full coverage,
+# so this rescues the exact-phrase case without moving the measurement at all. The value sits
+# between the two behaviours the search tests pin: after the coverage lift it must clear a
+# mediocre dense neighbour and must still lose to strong semantic evidence, because a memory that
+# merely echoes the question back is a complete term match and is not the answer.
+_LEXICAL_FULL_COVERAGE = 0.999
+_LEXICAL_FULL_COVERAGE_RELEVANCE = 0.75
+# Weight on the IDF-weighted query-term coverage, which unlike the rank proxy is a normalised
+# score, so it is the term that actually combines the two routes. It is applied as a lift toward
+# one across the remaining headroom rather than as an addition, because a clamped sum turns every
+# strong candidate into exactly 1.0 and loses the ordering among them.
+_MAX_LEXICAL_RERANK_BONUS = 0.3
 _NEGATION_WEIGHT = 6.0
 _LEXICAL_NOISE_TERMS = frozenset(
     {
@@ -218,6 +246,21 @@ _TEXT_KEY_CHARACTERS = 2_048
 _TEXT_KEY_OVERLAP = 256
 _TEXT_KEY_CONTEXT = 256
 _MAX_RETRIEVAL_KEYS = 128
+# The reason an embedding backend reports when media does not fit one inline request.
+_PAYLOAD_TOO_LARGE = "payload_too_large"
+# Text-equivalent cost of one grounded media part, at the usual four characters per token. The
+# modalities are an order of magnitude apart in what a model charges for them: an image part
+# measured near five hundred tokens against this stack where a ten-second video part measured
+# near three thousand, so one flat number would either starve text or overrun on video. These
+# are coarse by design; the budget is the caller's knob, not these constants.
+_ASSET_EVIDENCE_CHARS: Mapping[Modality, int] = MappingProxyType(
+    {
+        Modality.IMAGE: 2_000,
+        Modality.AUDIO: 4_000,
+        Modality.VIDEO: 12_000,
+    }
+)
+_DEFAULT_ASSET_EVIDENCE_CHARS = 4_000
 _MAX_QUERY_RETRIEVAL_KEYS = 7
 _MAX_INDEX_SEARCH_WORKERS = 4
 _TODAY_ISO_DATE = re.compile(r"\btoday\s+is\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
@@ -422,6 +465,7 @@ class Memory:
         index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
         minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
         ambiguity_margin: float = _DEFAULT_CONFIG.ambiguity_margin,
+        evidence_budget_chars: int | None = _DEFAULT_CONFIG.evidence_budget_chars,
         decay_half_life_days: float | None = _DEFAULT_CONFIG.decay_half_life_days,
         speaker_similarity: float = _DEFAULT_CONFIG.speaker_similarity,
         speaker_margin: float = _DEFAULT_CONFIG.speaker_margin,
@@ -450,6 +494,7 @@ class Memory:
         self._index_speech = index_speech
         self._minimum_relevance = _unit_interval(minimum_relevance, "minimum_relevance")
         self._ambiguity_margin = _unit_interval(ambiguity_margin, "ambiguity_margin")
+        self._evidence_budget = _evidence_budget(evidence_budget_chars)
         self._decay_half_life = _decay_half_life(decay_half_life_days)
 
         self._store = _open_store(self.data_dir)
@@ -559,6 +604,7 @@ class Memory:
             index_quantization=config.index_quantization,
             minimum_relevance=config.minimum_relevance,
             ambiguity_margin=config.ambiguity_margin,
+            evidence_budget_chars=config.evidence_budget_chars,
             decay_half_life_days=config.decay_half_life_days,
             speaker_similarity=config.speaker_similarity,
             speaker_margin=config.speaker_margin,
@@ -917,7 +963,12 @@ class Memory:
             search = partial(
                 self._search_prepared,
                 prepared,
-                limit=min(100, limit * 3),
+                # Without a budget the answer grounds on `limit` hits, so ranking three times
+                # that is enough headroom for the modality round robin. With one, the budget is
+                # what decides depth, so the whole rerank pool has to be ranked for it to spend.
+                limit=(
+                    _RERANK_CANDIDATES if self._evidence_budget is not None else min(100, limit * 3)
+                ),
                 operation=assets,
                 memory_type=_optional_memory_type(memory_type),
                 reference_at=reference,
@@ -946,7 +997,7 @@ class Memory:
                 if speech_assets:
                     self._recognize_speech(speech_assets, assets)
                 hits = search().hits
-            hits = _grounding_hits(hits, limit)
+            hits = _grounding_hits(hits, limit, budget_chars=self._evidence_budget)
             routed_question = self._route_generation(
                 (
                     _with_reference_time(prepared, reference)
@@ -1443,10 +1494,7 @@ class Memory:
                         self._embedding_inputs(memory.content)
                     )
                 )
-                vectors = self._embed(
-                    tuple(model_input for _memory, _part, model_input in embedding_parts),
-                    task=EmbedTask.DOCUMENT,
-                )
+                vectors, embedding_parts = self._embed_document_parts(embedding_parts)
                 now = datetime.now(timezone.utc)
                 stored_memories = tuple(
                     StoredMemory(
@@ -2098,15 +2146,18 @@ class Memory:
                     lexical_strength = (
                         lexical_relevance.get(memory_id, 0.0) if lexical_match else 0.0
                     )
-                    lexical_score = _LEXICAL_MATCH_CONFIDENCE * lexical_relevance_by_rank.get(
-                        memory_id, 0.0
+                    lexical_floor = (
+                        _LEXICAL_FULL_COVERAGE_RELEVANCE
+                        if lexical_strength >= _LEXICAL_FULL_COVERAGE
+                        else _LEXICAL_RANK_RELEVANCE
                     )
-                    lexical_rerank_bonus = lexical_strength * _MAX_LEXICAL_RERANK_BONUS
-                    relevance = min(
-                        1.0,
-                        max(dense_relevance.get(memory_id, 0.0), lexical_score)
-                        + lexical_rerank_bonus,
+                    lexical_score = lexical_floor * lexical_relevance_by_rank.get(memory_id, 0.0)
+                    base = max(dense_relevance.get(memory_id, 0.0), lexical_score)
+                    relevance = _bounded_scale(
+                        base,
+                        1.0 + _MAX_LEXICAL_RERANK_BONUS * lexical_strength,
                     )
+                    lexical_rerank_bonus = relevance - base
                     gate_confidence = max(
                         dense_confidence.get(memory_id, 0.0),
                         _LEXICAL_MATCH_CONFIDENCE if lexical_match else 0.0,
@@ -2584,6 +2635,15 @@ class Memory:
                         minimum_margin=self._face_margin,
                         preferred_identity=preferred,
                     )
+                written = tuple(
+                    observation
+                    for asset in missing
+                    for observation in operation.face_observations[asset.asset_id]
+                )
+                _record_identity_matching(
+                    len(written),
+                    sum(1 for item in written if item.identity_score is not None),
+                )
         with self._write_lock, _translate_storage_errors("link face and voice identities"):
             for asset in face_assets:
                 self._link_asset_identity(asset.asset_id, operation)
@@ -2795,6 +2855,15 @@ class Memory:
                             minimum_margin=self._speaker_margin,
                         )
                     operation.speech_segments[asset.asset_id] = segments
+                written = tuple(
+                    segment
+                    for asset in missing
+                    for segment in operation.speech_segments[asset.asset_id]
+                )
+                _record_identity_matching(
+                    len(written),
+                    sum(1 for item in written if item.identity_score is not None),
+                )
         for asset in speech_assets:
             segments = operation.speech_segments[asset.asset_id]
             operation.transcripts[asset.asset_id] = "\n".join(segment.text for segment in segments)
@@ -2932,6 +3001,63 @@ class Memory:
             text=prepared.text,
             assets=tuple(self._asset_ref(asset) for asset in prepared.assets),
         )
+
+    def _embed_document_parts(
+        self,
+        parts: Sequence[tuple[_PreparedMemory, int, ModelInput]],
+    ) -> tuple[tuple[tuple[float, ...], ...], tuple[tuple[_PreparedMemory, int, ModelInput], ...]]:
+        """Embed one write's retrieval keys, degrading a key the model cannot carry.
+
+        A memory whose media exceeds what the embedding model accepts inline used to fail the
+        whole write, which discards the memory rather than the route that could not take it.
+        `_embedding_inputs` already produces one key per atomic part, so the oversized key can be
+        dropped while the rest of the memory is stored and stays retrievable. A memory left with
+        no key at all still fails, because then nothing would find it.
+        """
+        parts = tuple(parts)
+        try:
+            return self._embed(
+                tuple(model_input for _memory, _part, model_input in parts),
+                task=EmbedTask.DOCUMENT,
+            ), parts
+        except ModelError as error:
+            if error.reason != _PAYLOAD_TOO_LARGE or len(parts) < 2:
+                raise
+        vectors: builtins.list[tuple[float, ...]] = []
+        kept: builtins.list[tuple[_PreparedMemory, int, ModelInput]] = []
+        for entry in parts:
+            try:
+                vectors.extend(self._embed((entry[2],), task=EmbedTask.DOCUMENT))
+            except ModelError as error:
+                if error.reason != _PAYLOAD_TOO_LARGE:
+                    raise
+                continue
+            kept.append(entry)
+        # The index carries a memory's full-text document on its `object_part == 0` row alone,
+        # and part 0 is the aggregate key -- the one holding every asset, so the one an oversized
+        # asset elides. Leaving the gap stores a memory with no lexical document at all, which is
+        # a silent retrieval hole rather than the degradation this promises. Renumbering restores
+        # the invariant; the part index orders a memory's keys and is not a handle on any input.
+        renumbered: builtins.list[tuple[_PreparedMemory, int, ModelInput]] = []
+        next_part: dict[str, int] = {}
+        for memory, _dropped_part, model_input in kept:
+            position = next_part.get(memory.memory_id, 0)
+            next_part[memory.memory_id] = position + 1
+            renumbered.append((memory, position, model_input))
+        kept = renumbered
+        embedded = {entry[0].memory_id for entry in kept}
+        unreachable = tuple(
+            entry[0].memory_id for entry in parts if entry[0].memory_id not in embedded
+        )
+        if unreachable:
+            raise ModelError(
+                "every retrieval key for this memory exceeds what the embedding model accepts "
+                "inline; supply smaller media or an embedding backend that uploads it",
+                reason=_PAYLOAD_TOO_LARGE,
+                subject=unreachable[0],
+            )
+        _record_elided_parts(len(parts) - len(kept))
+        return tuple(vectors), tuple(kept)
 
     def _describe_vision(self, images: Sequence[Blob]) -> tuple[str, ...]:
         if self._vision_describer is None:
@@ -3515,6 +3641,7 @@ class AsyncMemory:
         index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
         minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
         ambiguity_margin: float = _DEFAULT_CONFIG.ambiguity_margin,
+        evidence_budget_chars: int | None = _DEFAULT_CONFIG.evidence_budget_chars,
         decay_half_life_days: float | None = _DEFAULT_CONFIG.decay_half_life_days,
         speaker_similarity: float = _DEFAULT_CONFIG.speaker_similarity,
         speaker_margin: float = _DEFAULT_CONFIG.speaker_margin,
@@ -3534,6 +3661,7 @@ class AsyncMemory:
             index_quantization=index_quantization,
             minimum_relevance=minimum_relevance,
             ambiguity_margin=ambiguity_margin,
+            evidence_budget_chars=evidence_budget_chars,
             decay_half_life_days=decay_half_life_days,
             speaker_similarity=speaker_similarity,
             speaker_margin=speaker_margin,
@@ -3570,6 +3698,7 @@ class AsyncMemory:
             index_quantization=config.index_quantization,
             minimum_relevance=config.minimum_relevance,
             ambiguity_margin=config.ambiguity_margin,
+            evidence_budget_chars=config.evidence_budget_chars,
             decay_half_life_days=config.decay_half_life_days,
             speaker_similarity=config.speaker_similarity,
             speaker_margin=config.speaker_margin,
@@ -5390,7 +5519,40 @@ def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _
     return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
 
 
-def _grounding_hits(hits: Sequence[SearchHit], limit: int) -> tuple[SearchHit, ...]:
+def _record_elided_parts(count: int) -> None:
+    """Publish how many retrieval keys the embedding model could not carry, so no loss is silent."""
+    if count <= 0:
+        return
+    span = trace.get_current_span()
+    if span.is_recording():
+        span.set_attribute(EMBEDDING_PARTS_ELIDED, count)
+
+
+def _record_identity_matching(observed: int, matched: int) -> None:
+    """Publish how many identity observations joined an identity that already existed.
+
+    A recognizer whose similarities do not separate the people in front of it still
+    returns an identity for every observation, so face and speaker analysis reports
+    success while each memory quietly meets a stranger. Nothing else in the write path
+    distinguishes that from recognition working, and the difference only shows up much
+    later as an answer that cannot follow one person across two memories.
+
+    Zero observations is recorded rather than skipped: a detector whose confidence threshold
+    suits posed photographs finds no face at all in wide-angle or egocentric footage, and that
+    silence is otherwise indistinguishable from having configured no analyzer.
+    """
+    span = trace.get_current_span()
+    if span.is_recording():
+        span.set_attribute(IDENTITY_OBSERVATIONS, observed)
+        span.set_attribute(IDENTITY_MATCHED, matched)
+
+
+def _grounding_hits(
+    hits: Sequence[SearchHit],
+    limit: int,
+    *,
+    budget_chars: int | None = None,
+) -> tuple[SearchHit, ...]:
     queues: dict[Modality, deque[SearchHit]] = {}
     for hit in hits:
         queues.setdefault(hit.modality, deque()).append(hit)
@@ -5402,7 +5564,46 @@ def _grounding_hits(hits: Sequence[SearchHit], limit: int) -> tuple[SearchHit, .
                 del queues[modality]
             if len(selected) == limit:
                 break
-    return tuple(selected)
+    if budget_chars is None:
+        return tuple(selected)
+    return (*selected, *_budgeted_hits(hits, selected, budget_chars))
+
+
+def _budgeted_hits(
+    hits: Sequence[SearchHit],
+    selected: Sequence[SearchHit],
+    budget_chars: int,
+) -> tuple[SearchHit, ...]:
+    """Extend a grounding set down the ranking while the evidence fits one budget.
+
+    The guaranteed hits are never dropped, so this only ever widens what the answer sees. Media
+    is charged per modality because an image or video part costs the model far more than its
+    record's text; the provider adapter still enforces its own byte ceiling.
+    """
+    taken = {hit.id for hit in selected}
+    used = sum(_evidence_cost(hit) for hit in selected)
+    extra: list[SearchHit] = []
+    for hit in hits:
+        if hit.id in taken:
+            continue
+        cost = _evidence_cost(hit)
+        if used + cost > budget_chars:
+            break
+        used += cost
+        extra.append(hit)
+    return tuple(extra)
+
+
+def _evidence_cost(hit: SearchHit) -> int:
+    # `AssetRef.modality` is optional on the public type; an unresolved asset is charged the
+    # default rather than being treated as free.
+    charges = (
+        _DEFAULT_ASSET_EVIDENCE_CHARS
+        if asset.modality is None
+        else _ASSET_EVIDENCE_CHARS.get(asset.modality, _DEFAULT_ASSET_EVIDENCE_CHARS)
+        for asset in hit.assets
+    )
+    return len(hit.content) + sum(charges)
 
 
 def _merge_index_hits(*groups: Sequence[IndexHit]) -> tuple[IndexHit, ...]:
@@ -5465,7 +5666,7 @@ def _early_candidate_trace(
         index_ids=index_ids,
         dense_relevance=dense_relevance.get(memory_id, 0.0),
         dense_confidence=dense_confidence.get(memory_id, 0.0),
-        lexical_relevance=(_LEXICAL_MATCH_CONFIDENCE * lexical_index_relevance.get(memory_id, 0.0)),
+        lexical_relevance=(_LEXICAL_RANK_RELEVANCE * lexical_index_relevance.get(memory_id, 0.0)),
         lexical_match=lexical_match,
         gate_confidence=max(
             dense_confidence.get(memory_id, 0.0),
@@ -6003,6 +6204,14 @@ def _date_range(first: date, last: date, reference_at: datetime) -> tuple[dateti
 def _shift_month(value: datetime, months: int) -> datetime:
     year, month = divmod(value.year * 12 + value.month - 1 + months, 12)
     return value.replace(year=year, month=month + 1)
+
+
+def _evidence_budget(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValidationError("evidence_budget_chars must be a positive integer")
+    return value
 
 
 def _decay_half_life(days: float | None) -> timedelta | None:

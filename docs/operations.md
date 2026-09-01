@@ -182,6 +182,22 @@ non-empty text delta. Providers may report `gen_ai.response.time_to_first_chunk`
 `mindbridge.grounding.media_elided_hits` and `mindbridge.grounding.dropped_hits` when request limits
 shrink retrieved evidence.
 
+Two write-path counters make silent degradation visible. `mindbridge.embedding.elided_parts` counts
+retrieval keys an `add` could not embed because their media exceeds what the embedding model accepts
+inline; the memory is still stored and reachable through its remaining keys, and a write whose every
+key is refused fails instead. `mindbridge.embedding.video_sampled_inputs` counts embedding inputs
+whose video reached the model as four ordered stills because the model declared the prompt longer
+than its context — the memory keeps its video, only the vector behind it is built from stills.
+
+Face and speaker writes report `mindbridge.identity.observations` and
+`mindbridge.identity.matched_existing` on their `mindbridge.storage.write` span, one per modality.
+Analysis reports success whether or not the recognizer can tell people apart, so these two numbers
+are what separate recognition from its two silent failures. Zero observations means the detector ran
+and found nobody — usually a confidence threshold suited to posed photographs applied to wide-angle
+or egocentric footage. Many observations with almost no matches means the embeddings do not separate
+the people in the footage, and every memory has met a stranger; the identities are real rows, and
+nothing later in the pipeline reports a problem.
+
 Spans do not record memory text, media bytes, paths, asset or memory IDs, metadata, model responses,
 or exception details. Failed spans receive only error status. For one retrieval investigation, use
 the opt-in `search_with_trace()` result or the local `search-with-trace` CLI command; candidate IDs
