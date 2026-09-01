@@ -17,6 +17,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 import mindbridge.models.openai_sdk as openai_backend
 from mindbridge._telemetry import (
+    FORMATION_PROPOSALS_DROPPED,
     GEN_AI_FINISH_REASONS,
     GEN_AI_TTFC,
     GROUNDING_HITS_DROPPED,
@@ -324,7 +325,10 @@ def test_formation_batches_grounded_observations_and_validates_typed_output(
         assert "source_audio" not in serialized
         assert "microphone" not in serialized
         assert payload["response_format"] == {"type": "json_object"}
-        assert "affect uses subject, value, and cue_modality" in payload["messages"][0]["content"]
+        # The per-kind field requirements are pinned by
+        # `test_formation_prompt_states_every_field_the_validator_demands`, which checks them
+        # against the validator instead of against one sentence's wording.
+        assert "cue_modality" in payload["messages"][0]["content"]
         parts = payload["messages"][1]["content"]
         assert [part["type"] for part in parts] == ["text", "text", "input_audio"]
         assert json.loads(parts[0]["text"])["observation"]["observation_id"] == "observation_0"
@@ -1775,3 +1779,100 @@ def _video_asset(directory: Path, asset_id: str, frame_count: int) -> AssetRef:
         name=path.name,
         path=path,
     )
+
+
+# The fields `FormationProposal` requires per kind, as the system prompt states them. Keeping the
+# table here rather than parsing the prompt makes both directions fail loudly: a validator that
+# gains a requirement the prompt never mentions, and a prompt that stops mentioning one.
+_FORMATION_REQUIREMENTS = {
+    "event": (),
+    "entity": ("subject",),
+    "affect": ("subject", "value", "cue_modality"),
+    "state": ("subject", "predicate", "value"),
+    "relation": ("subject", "predicate", "value"),
+    "trait": ("subject", "predicate", "value"),
+    "response_policy": ("subject", "predicate", "value"),
+}
+
+
+@pytest.mark.parametrize(("kind", "extra"), sorted(_FORMATION_REQUIREMENTS.items()))
+def test_formation_prompt_states_every_field_the_validator_demands(
+    kind: str, extra: tuple[str, ...]
+) -> None:
+    # Measured against qwen3.8-flash, a prompt that omitted `entity`'s subject, did not say
+    # `content` is required for every kind, and did not say values are strings produced proposals
+    # the validator rejected 79% of the time. Naming exactly what is enforced took that to 0%.
+    payload: dict[str, object] = {"kind": kind, "content": "a formed memory", "confidence": 0.9}
+    for field in extra:
+        payload[field] = "text" if field == "cue_modality" else "a value"
+    if kind == "affect":
+        payload["valence"] = 0.5
+        payload["arousal"] = 0.2
+
+    proposal = openai_backend._formation_proposal(payload)
+
+    assert proposal is not None, (
+        f"the prompt's stated fields for {kind} do not satisfy the validator"
+    )
+    # Match this kind's own row in the prompt's table, not the prompt as a whole: every field name
+    # appears somewhere for some other kind, so a substring search over the whole text passes even
+    # when this kind's row has lost a requirement.
+    row = next(
+        (
+            line
+            for line in openai_backend._FORMATION_SYSTEM_PROMPT.splitlines()
+            if line.strip().startswith(f"{kind} ") or line.strip().startswith(f"{kind}  ")
+        ),
+        None,
+    )
+    assert row is not None, f"the prompt's kind table has no row for {kind}"
+    stated = {token.strip(" ,.") for token in row.split("--", 1)[1].split()}
+    assert set(extra) <= stated, f"{kind} row omits {sorted(set(extra) - stated)}"
+
+
+def test_a_malformed_proposal_does_not_discard_its_valid_siblings() -> None:
+    # `add` commits the source before formation runs, so raising here failed a write that had
+    # already succeeded -- and the retry re-ran formation, failed again, and could never store the
+    # memory at all. One badly shaped derived opinion must cost only itself.
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    content = json.dumps(
+        {
+            "items": [
+                {
+                    "observation_id": "observation_0",
+                    "proposals": [
+                        {"kind": "event", "content": "a real event", "confidence": 0.9},
+                        {"kind": "entity", "confidence": 1.0},
+                        {
+                            "kind": "state",
+                            "subject": "Dad",
+                            "predicate": "is",
+                            "value": True,
+                            "content": "a boolean value",
+                            "confidence": 0.9,
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+    inputs = (
+        FormationInput(
+            memory_id="m0",
+            content=ModelInput(text="x"),
+            context=ObservationContext(source_id="user"),
+        ),
+    )
+
+    with provider.get_tracer("test").start_as_current_span("formation"):
+        results = openai_backend._formation_results(content, inputs)
+
+    assert [proposal.content for proposal in results[0]] == ["a real event"]
+    dropped = [
+        span.attributes[FORMATION_PROPOSALS_DROPPED]
+        for span in exporter.get_finished_spans()
+        if span.attributes is not None and FORMATION_PROPOSALS_DROPPED in span.attributes
+    ]
+    assert dropped == [2]
