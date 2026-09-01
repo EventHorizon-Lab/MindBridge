@@ -189,14 +189,34 @@ key is refused fails instead. `mindbridge.embedding.video_sampled_inputs` counts
 whose video reached the model as four ordered stills because the model declared the prompt longer
 than its context — the memory keeps its video, only the vector behind it is built from stills.
 
-Face and speaker writes report `mindbridge.identity.observations` and
-`mindbridge.identity.matched_existing` on their `mindbridge.storage.write` span, one per modality.
-Analysis reports success whether or not the recognizer can tell people apart, so these two numbers
-are what separate recognition from its two silent failures. Zero observations means the detector ran
-and found nobody — usually a confidence threshold suited to posed photographs applied to wide-angle
-or egocentric footage. Many observations with almost no matches means the embeddings do not separate
-the people in the footage, and every memory has met a stranger; the identities are real rows, and
+### Identity recognition yield
+
+Face and speaker recognition each emit one `mindbridge.identity.faces` or
+`mindbridge.identity.speakers` span per asset, so a recognizer that runs and finds nothing is
+distinguishable from one that was never configured, and a cached re-read is distinguishable from
+both.
+
+| Attribute | Meaning |
+| --- | --- |
+| `mindbridge.identity.observations` | Face detections, or speaker segments, for the asset. Recorded when zero. |
+| `mindbridge.identity.identities` | Distinct identities those observations resolved to. |
+| `mindbridge.identity.matched_existing` | Observations that matched an identity already on file. |
+| `mindbridge.identity.created` | Identities this asset introduced. |
+| `mindbridge.identity.cached` | True when the counts were re-read from a stored analysis. |
+| `mindbridge.identity.evidence_assets` | Distinct assets in which this voice-and-face pair has co-occurred. |
+| `mindbridge.identity.evidence_required` | Co-occurrences required before the pair merges. |
+| `mindbridge.identity.linked` | Whether this asset's co-occurrence completed a merge. |
+
+Analysis reports success whether or not the recognizer can tell people apart, so these numbers are
+what separate recognition from its two silent failures. Zero observations means the detector ran and
+found nobody, usually a confidence threshold suited to posed photographs applied to wide-angle or
+egocentric footage. Many observations with almost no matches means the embeddings do not separate
+the people in the footage and every memory has met a stranger; the identities are real rows, and
 nothing later in the pipeline reports a problem.
+
+Compare `created` against `matched_existing` before adjusting any similarity threshold. When a
+recognizer cannot separate people on the material at hand, no threshold value helps: lowering one
+converts fragmentation into wrong merges, and raising it turns every sighting into a new person.
 
 Spans do not record memory text, media bytes, paths, asset or memory IDs, metadata, model responses,
 or exception details. Failed spans receive only error status. For one retrieval investigation, use

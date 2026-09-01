@@ -145,6 +145,19 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   exactly one part type to that union, `{"type": "input_file", "path": "..."}`, valid in local mode
   only and refused in `--url` mode.
 - A published `mindbridge[all]` extra containing the exact union of every optional dependency.
+- `identity(identity_id)`, which resolves an identity ID through any merge alias and returns the
+  registered `IdentityProfile`, and `unlink_identity(alias_id)`, which reverses one face-and-voice
+  merge and returns the restored ID. Both are on `Memory`, `AsyncMemory`, and the CLI as `identity`
+  and `unlink-identity`. Unlinking resets the pair's accumulated evidence; it does not suppress
+  the pair, so a voice and face that keep co-occurring are corroborated and merged again.
+- An optional `relationship` on `register_speaker` and `register_identity`, stored beside the name
+  and readable through `identity()`. Omitting it leaves a recorded relationship intact, so renaming
+  a person never discards it.
+- `identity_link_min_assets`, the number of distinct assets a voice-and-face pair must co-occur in
+  before they merge into one identity.
+- `mindbridge.identity.*` span attributes reporting per-asset recognizer yield, including
+  observation counts of zero, so a recognizer that runs and detects nothing is distinguishable from
+  one that was never configured.
 
 ### Changed
 
@@ -170,7 +183,16 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   eight rose from 0.8239 to 0.8920 on a Mem-Gallery slice and from 0.8194 to 0.9306 on an
   ATM-Bench slice. `SearchHit.score` values change, and a strong candidate is no longer clamped
   to exactly `1.0`.
-
+- A face and a voice now merge into one identity only after the pair co-occurs in
+  `identity_link_min_assets` distinct assets, default `2`, instead of on first co-occurrence within
+  a single asset. One asset cannot separate "this face spoke" from "this face was listening to
+  someone off camera", which is the ordinary case in egocentric capture, where the previous
+  behaviour bound the wearer's voice to whoever was visible. The undocumented shortcut that let an
+  asset's lone face adopt its lone voice inside the store write has been removed, leaving exactly
+  one cross-modal entrance. Set `identity_link_min_assets=1` for the previous behaviour.
+- The local schema is version 9. Version 8 directories upgrade in place, adding identity link
+  evidence, an identity `relationship`, and the merge record that makes `unlink_identity` possible.
+  Merges recorded before the upgrade have no such record and are therefore not reversible.
 - Composite searches now batch the complete aggregate with bounded focused aggregate and atomic
   keys derived from the first text atom and query media. Later answer-format or instruction atoms
   remain in the complete aggregate but cannot become independent dense queries.

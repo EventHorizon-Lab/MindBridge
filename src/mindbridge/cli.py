@@ -99,6 +99,8 @@ OPERATIONS: tuple[str, ...] = (
     "faces",
     "register_speaker",
     "register_identity",
+    "identity",
+    "unlink_identity",
     "reinforce",
     "list",
     "delete",
@@ -578,13 +580,38 @@ def _faces(memory: Memory, arguments: argparse.Namespace) -> _Document:
 
 
 def _register_speaker(memory: Memory, arguments: argparse.Namespace) -> _Document:
-    memory.register_speaker(arguments.speaker_id, arguments.name)
+    memory.register_speaker(
+        arguments.speaker_id,
+        arguments.name,
+        relationship=arguments.relationship,
+    )
     return {}
 
 
 def _register_identity(memory: Memory, arguments: argparse.Namespace) -> _Document:
-    memory.register_identity(arguments.identity_id, arguments.name)
+    memory.register_identity(
+        arguments.identity_id,
+        arguments.name,
+        relationship=arguments.relationship,
+    )
     return {}
+
+
+def _identity_profile(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    profile = memory.identity(arguments.identity_id)
+    if profile is None:
+        return {"identity": None}
+    return {
+        "identity": {
+            "identity_id": profile.identity_id,
+            "name": profile.name,
+            "relationship": profile.relationship,
+        }
+    }
+
+
+def _unlink_identity(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {"restored_identity_id": memory.unlink_identity(arguments.alias_id)}
 
 
 def _reinforce(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -624,6 +651,8 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "faces": _faces,
     "register-speaker": _register_speaker,
     "register-identity": _register_identity,
+    "identity": _identity_profile,
+    "unlink-identity": _unlink_identity,
     "reinforce": _reinforce,
     "list": _list,
     "delete": _delete,
@@ -1455,9 +1484,15 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     speaker = commands.add_parser("register-speaker", help="name one recognized speaker")
     speaker.add_argument("speaker_id", metavar="SPEAKER_ID")
     speaker.add_argument("name", metavar="NAME")
+    speaker.add_argument("--relationship", help="how this person relates to the owner")
     identity = commands.add_parser("register-identity", help="name one face/voice identity")
     identity.add_argument("identity_id", metavar="IDENTITY_ID")
     identity.add_argument("name", metavar="NAME")
+    identity.add_argument("--relationship", help="how this person relates to the owner")
+    profile = commands.add_parser("identity", help="read one identity's name and relationship")
+    profile.add_argument("identity_id", metavar="IDENTITY_ID")
+    unlink = commands.add_parser("unlink-identity", help="reverse one face/voice merge")
+    unlink.add_argument("alias_id", metavar="ALIAS_ID")
     reinforce = commands.add_parser("reinforce", help="record positive feedback")
     reinforce.add_argument("memory_ids", nargs="+", metavar="MEMORY_ID")
     listing = commands.add_parser("list", help="list newest memories")

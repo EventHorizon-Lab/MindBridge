@@ -91,8 +91,10 @@ the recipe.
 | `get` | `MEMORY_ID` | memory object | yes |
 | `speech` | `MEMORY_ID` | `{"segments":[...]}` | no |
 | `faces` | `MEMORY_ID` | `{"observations":[...]}` | no |
-| `register-speaker` | `SPEAKER_ID NAME` | `{}` | no |
-| `register-identity` | `IDENTITY_ID NAME` | `{}` | no |
+| `register-speaker` | `SPEAKER_ID NAME`; `--relationship` | `{}` | no |
+| `register-identity` | `IDENTITY_ID NAME`; `--relationship` | `{}` | no |
+| `identity` | `IDENTITY_ID` | `{"identity":{...}}` or `{"identity":null}` | no |
+| `unlink-identity` | `ALIAS_ID` | `{"restored_identity_id":...}` | no |
 | `reinforce` | one or more `MEMORY_ID` values | `{"reinforced":int}` | no |
 | `list` | `--limit`; `--cursor` | `{"items":[...],"next_cursor":...}` | yes |
 | `delete` | `MEMORY_ID` | `{"deleted":bool}` | yes |

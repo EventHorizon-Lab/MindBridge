@@ -30,6 +30,12 @@ GROUNDING_MEDIA_ELIDED = "mindbridge.grounding.media_elided_hits"
 GROUNDING_HITS_DROPPED = "mindbridge.grounding.dropped_hits"
 IDENTITY_OBSERVATIONS = "mindbridge.identity.observations"
 IDENTITY_MATCHED = "mindbridge.identity.matched_existing"
+IDENTITY_IDENTITIES = "mindbridge.identity.identities"
+IDENTITY_CREATED = "mindbridge.identity.created"
+IDENTITY_CACHED = "mindbridge.identity.cached"
+IDENTITY_EVIDENCE_ASSETS = "mindbridge.identity.evidence_assets"
+IDENTITY_EVIDENCE_REQUIRED = "mindbridge.identity.evidence_required"
+IDENTITY_LINKED = "mindbridge.identity.linked"
 
 TOKEN_MODALITIES = ("text", "image", "video", "audio", "unattributed")
 

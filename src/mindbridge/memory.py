@@ -34,6 +34,12 @@ from opentelemetry.util.types import AttributeValue
 
 from mindbridge._telemetry import (
     EMBEDDING_PARTS_ELIDED,
+    IDENTITY_CACHED,
+    IDENTITY_CREATED,
+    IDENTITY_EVIDENCE_ASSETS,
+    IDENTITY_EVIDENCE_REQUIRED,
+    IDENTITY_IDENTITIES,
+    IDENTITY_LINKED,
     IDENTITY_MATCHED,
     IDENTITY_OBSERVATIONS,
     MODEL_MODULE,
@@ -64,6 +70,7 @@ from mindbridge.infrastructure.local.assets import (
     AssetTooLargeError,
 )
 from mindbridge.infrastructure.local.store import (
+    IdentityLink,
     IndexDocument,
     LocalStore,
     SpeechRollback,
@@ -108,6 +115,7 @@ from mindbridge.types import (
     EvidenceBasis,
     FaceObservation,
     FormationProposal,
+    IdentityProfile,
     IndexQuantization,
     MemoryContext,
     MemoryKind,
@@ -471,6 +479,7 @@ class Memory:
         speaker_margin: float = _DEFAULT_CONFIG.speaker_margin,
         face_similarity: float = _DEFAULT_CONFIG.face_similarity,
         face_margin: float = _DEFAULT_CONFIG.face_margin,
+        identity_link_min_assets: int = _DEFAULT_CONFIG.identity_link_min_assets,
         tracer: Tracer | None = None,
     ) -> None:
         self.data_dir = Path(data_dir).expanduser().resolve()
@@ -489,6 +498,9 @@ class Memory:
         self._speaker_margin = _unit_interval(speaker_margin, "speaker_margin")
         self._face_similarity = _unit_interval(face_similarity, "face_similarity")
         self._face_margin = _unit_interval(face_margin, "face_margin")
+        self._identity_link_min_assets = _positive_int(
+            identity_link_min_assets, "identity_link_min_assets"
+        )
         if not isinstance(index_speech, bool):
             raise ValidationError("index_speech must be a boolean")
         self._index_speech = index_speech
@@ -610,6 +622,7 @@ class Memory:
             speaker_margin=config.speaker_margin,
             face_similarity=config.face_similarity,
             face_margin=config.face_margin,
+            identity_link_min_assets=config.identity_link_min_assets,
             tracer=tracer,
         )
 
@@ -1100,18 +1113,82 @@ class Memory:
                 for observation in operation.face_observations[asset.asset_id]
             )
 
-    def register_speaker(self, speaker_id: str, name: str) -> None:
+    def register_speaker(
+        self,
+        speaker_id: str,
+        name: str,
+        *,
+        relationship: str | None = None,
+    ) -> None:
         """Assign or replace a human-readable name for one recognized speaker."""
-        self._register_identity(speaker_id, name, speaker=True)
+        self._register_identity(speaker_id, name, relationship=relationship, speaker=True)
 
-    def register_identity(self, identity_id: str, name: str) -> None:
-        """Assign or replace a name shared by one face-and-voice identity."""
-        self._register_identity(identity_id, name, speaker=False)
+    def register_identity(
+        self,
+        identity_id: str,
+        name: str,
+        *,
+        relationship: str | None = None,
+    ) -> None:
+        """Assign or replace the name, and optionally the relationship, of one identity.
 
-    def _register_identity(self, identity_id: str, name: str, *, speaker: bool) -> None:
+        Omitting ``relationship`` leaves any recorded relationship intact, so renaming a person
+        never silently discards it. There is deliberately no way to clear one here.
+        """
+        self._register_identity(identity_id, name, relationship=relationship, speaker=False)
+
+    def identity(self, identity_id: str) -> IdentityProfile | None:
+        """Return one identity's recorded name and relationship, or None when it does not exist.
+
+        Face and speech observations carry an ``identity_id``; this resolves that id, following
+        a merge alias, to whatever a caller has registered for the person.
+        """
+        with (
+            self._trace("mindbridge.identity", kind="operation"),
+            self._operation(),
+            self._write_lock,
+        ):
+            requested_id = _identifier(identity_id, "identity_id")
+            with _translate_storage_errors("read identity profile"):
+                return self._store.identity_profile(requested_id)
+
+    def unlink_identity(self, alias_id: str) -> str | None:
+        """Reverse one recorded face-and-voice merge, restoring ``alias_id`` as its own identity.
+
+        Cross-modal binding infers that one voice and one face belong to the same person from
+        their co-occurrence, which corroboration makes unlikely to be wrong but cannot make
+        impossible. Returns the restored identity ID, or None when the merge is not reversible
+        because no record names which modality was contributed. The restored identity keeps no
+        name or relationship; the identity it was merged into keeps both.
+
+        This resets the pair's accumulated evidence; it does not suppress the pair. If the same
+        voice and face keep co-occurring, they will be corroborated and merged again.
+        """
+        with (
+            self._trace("mindbridge.unlink_identity", kind="operation"),
+            self._operation(),
+            self._write_lock,
+        ):
+            requested_id = _identifier(alias_id, "alias_id")
+            with _translate_storage_errors("unlink identity"):
+                restored = self._store.unlink_identity(requested_id)
+            self._drain_outbox()
+            return restored
+
+    def _register_identity(
+        self,
+        identity_id: str,
+        name: str,
+        *,
+        relationship: str | None = None,
+        speaker: bool,
+    ) -> None:
         id_label = "speaker_id" if speaker else "identity_id"
         requested_id = _identifier(identity_id, id_label)
         normalized_name = _identity_name(name)
+        normalized_relationship = (
+            None if relationship is None else _identity_relationship(relationship)
+        )
         operation_name = "register_speaker" if speaker else "register_identity"
         with (
             self._trace(f"mindbridge.{operation_name}", kind="operation"),
@@ -1161,6 +1238,7 @@ class Memory:
                 registered = self._store.register_identity(
                     normalized_id,
                     normalized_name,
+                    relationship=normalized_relationship,
                     memories=memories,
                     embeddings=embeddings,
                 )
@@ -2619,12 +2697,10 @@ class Memory:
                 for asset, analysis in zip(missing, analyses, strict=True):
                     self._store.write_asset(asset)
                     operation.persisted.add(asset.asset_id)
-                    speaker_ids = {
-                        segment.speaker_id
-                        for segment in operation.speech_segments.get(asset.asset_id, ())
-                        if segment.speaker_id is not None
-                    }
-                    preferred = next(iter(speaker_ids)) if len(speaker_ids) == 1 else None
+                    # Deliberately no preferred_identity. That shortcut adopted the asset's
+                    # lone voice identity for its lone face with no corroboration at all, a
+                    # second cross-modal door that bypassed the evidence gate in
+                    # _link_asset_identity. Cross-modal binding now has exactly one entrance.
                     operation.face_observations[asset.asset_id] = self._store.write_faces(
                         asset.asset_id,
                         analysis,
@@ -2633,20 +2709,79 @@ class Memory:
                         analysis_space_id=self._face_analysis_space,
                         minimum_similarity=self._face_similarity,
                         minimum_margin=self._face_margin,
-                        preferred_identity=preferred,
                     )
-                written = tuple(
-                    observation
-                    for asset in missing
-                    for observation in operation.face_observations[asset.asset_id]
-                )
-                _record_identity_matching(
-                    len(written),
-                    sum(1 for item in written if item.identity_score is not None),
-                )
+        analyzed = {asset.asset_id for asset in missing}
         with self._write_lock, _translate_storage_errors("link face and voice identities"):
             for asset in face_assets:
                 self._link_asset_identity(asset.asset_id, operation)
+        # Linking re-points these observations to the surviving identity, but every counted
+        # value here is merge-invariant: one face identity maps to one surviving identity, and
+        # `identity_score` is carried through unchanged, so the counts do not depend on whether
+        # this runs before or after the link. The link decision has its own span.
+        for asset in face_assets:
+            self._trace_identity_yield(
+                "mindbridge.identity.faces",
+                tuple(
+                    (observation.identity_id, observation.identity_score)
+                    for observation in operation.face_observations[asset.asset_id]
+                ),
+                cached=asset.asset_id not in analyzed,
+            )
+
+    def _identity_link_is_corroborated(
+        self,
+        speaker_id: str,
+        face_id: str,
+        asset_id: str,
+    ) -> bool:
+        """Record this asset's voice-and-face co-occurrence and report whether it is enough.
+
+        One asset's co-occurrence is not evidence that one person produced both. Egocentric
+        capture is the adversarial case: the wearer speaks while a different person's face
+        fills the frame, so a single clip would bind the listener's face to the wearer's voice
+        and nothing downstream could tell. Requiring the same pair across distinct assets
+        separates the two, because a wearer's voice pairs with many different faces and no
+        single pair accumulates, while a genuine speaker's pair recurs.
+        """
+        observed = self._store.record_identity_link_evidence(speaker_id, face_id, asset_id)
+        corroborated = observed >= self._identity_link_min_assets
+        with self._trace("mindbridge.identity.link", kind="stage") as span:
+            span.set_attribute(IDENTITY_EVIDENCE_ASSETS, observed)
+            span.set_attribute(IDENTITY_EVIDENCE_REQUIRED, self._identity_link_min_assets)
+            span.set_attribute(IDENTITY_LINKED, corroborated)
+        return corroborated
+
+    def _relabelled_speaker_index(
+        self,
+        plan: IdentityLink,
+        speaker_id: str,
+        operation: _OperationAssets,
+    ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
+        """Re-embed the merged speaker's indexed memories so the merge stays atomic."""
+        if not (self._index_speech and plan.source_id == speaker_id):
+            return (), ()
+        memory_ids = self._store.speaker_memory_ids(plan.source_id)
+        if not memory_ids:
+            return (), ()
+        indexed = tuple(
+            memory
+            for memory in self._store.read_memories(memory_ids)
+            if any(
+                f"[speech identities:{asset.asset_id}]\n" in memory.content
+                for asset in memory.assets
+                if asset.modality in {"audio", "video"}
+            )
+        )
+        if not indexed:
+            return (), ()
+        return self._refresh_speaker_memories(
+            indexed,
+            speaker_id=plan.target_id,
+            speaker_name=plan.name,
+            previous_speaker_id=plan.source_id,
+            update_operation=False,
+            operation=operation,
+        )
 
     def _link_asset_identity(self, asset_id: str, operation: _OperationAssets) -> None:
         speaker_ids = {
@@ -2660,38 +2795,24 @@ class Memory:
         if len(speaker_ids) != 1 or len(face_ids) != 1:
             return
         speaker_id, face_id = next(iter(speaker_ids)), next(iter(face_ids))
-        plan = self._store.identity_link_plan(speaker_id, face_id)
+        if speaker_id == face_id:
+            # Already one identity. Recording this would store an identity co-occurring with
+            # itself, once per asset forever, and no such pair can ever yield a plan.
+            return
+        if not self._identity_link_is_corroborated(speaker_id, face_id, asset_id):
+            return
+        # A fragment may legitimately rejoin an identity that already holds this modality; the
+        # store still refuses to fuse two identities that each hold both.
+        plan = self._store.identity_link_plan(speaker_id, face_id, allow_shared_modality=True)
         if plan is None:
             return
-        memories: tuple[StoredMemory, ...] = ()
-        embeddings: tuple[StoredEmbedding, ...] = ()
-        if self._index_speech and plan.source_id == speaker_id:
-            memory_ids = self._store.speaker_memory_ids(plan.source_id)
-            if memory_ids:
-                stored = self._store.read_memories(memory_ids)
-                indexed = tuple(
-                    memory
-                    for memory in stored
-                    if any(
-                        f"[speech identities:{asset.asset_id}]\n" in memory.content
-                        for asset in memory.assets
-                        if asset.modality in {"audio", "video"}
-                    )
-                )
-                if indexed:
-                    memories, embeddings = self._refresh_speaker_memories(
-                        indexed,
-                        speaker_id=plan.target_id,
-                        speaker_name=plan.name,
-                        previous_speaker_id=plan.source_id,
-                        update_operation=False,
-                        operation=operation,
-                    )
+        memories, embeddings = self._relabelled_speaker_index(plan, speaker_id, operation)
         if (
             self._store.link_identities(
                 speaker_id,
                 face_id,
                 expected=plan,
+                allow_shared_modality=True,
                 memories=memories,
                 embeddings=embeddings,
             )
@@ -2855,18 +2976,50 @@ class Memory:
                             minimum_margin=self._speaker_margin,
                         )
                     operation.speech_segments[asset.asset_id] = segments
-                written = tuple(
-                    segment
-                    for asset in missing
-                    for segment in operation.speech_segments[asset.asset_id]
-                )
-                _record_identity_matching(
-                    len(written),
-                    sum(1 for item in written if item.identity_score is not None),
-                )
+        analyzed = {asset.asset_id for asset in missing}
         for asset in speech_assets:
             segments = operation.speech_segments[asset.asset_id]
             operation.transcripts[asset.asset_id] = "\n".join(segment.text for segment in segments)
+            self._trace_identity_yield(
+                "mindbridge.identity.speakers",
+                tuple((segment.speaker_id, segment.identity_score) for segment in segments),
+                cached=asset.asset_id not in analyzed,
+            )
+
+    def _trace_identity_yield(
+        self,
+        name: str,
+        resolved: Sequence[tuple[str | None, float | None]],
+        *,
+        cached: bool,
+    ) -> None:
+        """Record one asset's recognizer yield under stable ``mindbridge.identity.*`` names.
+
+        ``resolved`` pairs every observation's identity with its match score. All five attributes
+        are emitted even for an empty asset: a recognizer whose detection threshold suits another
+        domain runs, costs time, and yields nothing, which is otherwise indistinguishable from
+        having configured no recognizer at all. ``cached`` separates re-read observations from a
+        fresh analysis so that cheap-because-cached never reads as cheap-because-empty.
+
+        ``observations`` and ``matched_existing`` count observations; ``identities`` and ``created``
+        count distinct identities. The store reports ``identity_score`` only where an observation
+        matched an existing identity by similarity, so its absence is the only available signal for
+        a new identity. A cross-modal adoption, where one asset's lone face takes the identity of
+        its lone voice, also arrives without a score and therefore counts as created here.
+        """
+        identities = {identity for identity, _ in resolved if identity is not None}
+        created = {
+            identity for identity, score in resolved if identity is not None and score is None
+        }
+        with self._trace(name, kind="stage") as span:
+            span.set_attribute(IDENTITY_OBSERVATIONS, len(resolved))
+            span.set_attribute(IDENTITY_IDENTITIES, len(identities))
+            span.set_attribute(
+                IDENTITY_MATCHED,
+                sum(1 for _, score in resolved if score is not None),
+            )
+            span.set_attribute(IDENTITY_CREATED, len(created))
+            span.set_attribute(IDENTITY_CACHED, cached)
 
     def _with_audio_transcripts(
         self,
@@ -3647,6 +3800,7 @@ class AsyncMemory:
         speaker_margin: float = _DEFAULT_CONFIG.speaker_margin,
         face_similarity: float = _DEFAULT_CONFIG.face_similarity,
         face_margin: float = _DEFAULT_CONFIG.face_margin,
+        identity_link_min_assets: int = _DEFAULT_CONFIG.identity_link_min_assets,
         tracer: Tracer | None = None,
     ) -> None:
         self._memory = Memory(
@@ -3667,6 +3821,7 @@ class AsyncMemory:
             speaker_margin=speaker_margin,
             face_similarity=face_similarity,
             face_margin=face_margin,
+            identity_link_min_assets=identity_link_min_assets,
             tracer=tracer,
         )
 
@@ -3704,6 +3859,7 @@ class AsyncMemory:
             speaker_margin=config.speaker_margin,
             face_similarity=config.face_similarity,
             face_margin=config.face_margin,
+            identity_link_min_assets=config.identity_link_min_assets,
             tracer=tracer,
         )
 
@@ -3877,11 +4033,43 @@ class AsyncMemory:
     async def faces(self, memory_id: str) -> tuple[FaceObservation, ...]:
         return await asyncio.to_thread(self._memory.faces, memory_id)
 
-    async def register_speaker(self, speaker_id: str, name: str) -> None:
-        await asyncio.to_thread(self._memory.register_speaker, speaker_id, name)
+    async def register_speaker(
+        self,
+        speaker_id: str,
+        name: str,
+        *,
+        relationship: str | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            partial(
+                self._memory.register_speaker,
+                speaker_id,
+                name,
+                relationship=relationship,
+            )
+        )
 
-    async def register_identity(self, identity_id: str, name: str) -> None:
-        await asyncio.to_thread(self._memory.register_identity, identity_id, name)
+    async def register_identity(
+        self,
+        identity_id: str,
+        name: str,
+        *,
+        relationship: str | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            partial(
+                self._memory.register_identity,
+                identity_id,
+                name,
+                relationship=relationship,
+            )
+        )
+
+    async def identity(self, identity_id: str) -> IdentityProfile | None:
+        return await asyncio.to_thread(self._memory.identity, identity_id)
+
+    async def unlink_identity(self, alias_id: str) -> str | None:
+        return await asyncio.to_thread(self._memory.unlink_identity, alias_id)
 
     async def reinforce(self, memory_ids: Sequence[str]) -> int:
         return await asyncio.to_thread(self._memory.reinforce, memory_ids)
@@ -5310,6 +5498,12 @@ def _positive_dimension(value: object, name: str) -> int:
     return value
 
 
+def _positive_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValidationError(f"{name} must be a positive integer")
+    return value
+
+
 def _unit_interval(value: object, name: str) -> float:
     if (
         isinstance(value, bool)
@@ -5526,25 +5720,6 @@ def _record_elided_parts(count: int) -> None:
     span = trace.get_current_span()
     if span.is_recording():
         span.set_attribute(EMBEDDING_PARTS_ELIDED, count)
-
-
-def _record_identity_matching(observed: int, matched: int) -> None:
-    """Publish how many identity observations joined an identity that already existed.
-
-    A recognizer whose similarities do not separate the people in front of it still
-    returns an identity for every observation, so face and speaker analysis reports
-    success while each memory quietly meets a stranger. Nothing else in the write path
-    distinguishes that from recognition working, and the difference only shows up much
-    later as an answer that cannot follow one person across two memories.
-
-    Zero observations is recorded rather than skipped: a detector whose confidence threshold
-    suits posed photographs finds no face at all in wide-angle or egocentric footage, and that
-    silence is otherwise indistinguishable from having configured no analyzer.
-    """
-    span = trace.get_current_span()
-    if span.is_recording():
-        span.set_attribute(IDENTITY_OBSERVATIONS, observed)
-        span.set_attribute(IDENTITY_MATCHED, matched)
 
 
 def _grounding_hits(
@@ -6240,6 +6415,13 @@ def _embedding_id(memory_id: str, object_part: int) -> str:
     if object_part == 0:
         return memory_id
     return hashlib.sha256(f"mindbridge-embedding:{memory_id}:{object_part}".encode()).hexdigest()
+
+
+def _identity_relationship(value: object) -> str:
+    relationship = _text(value, "identity relationship")
+    if len(relationship) > 255 or not relationship.isprintable():
+        raise ValidationError("identity relationship must be at most 255 printable characters")
+    return relationship
 
 
 def _identity_name(value: object) -> str:

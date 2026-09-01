@@ -10,7 +10,7 @@ from argparse import ArgumentTypeError
 from collections.abc import Sequence
 from dataclasses import fields, replace
 from datetime import datetime, timezone
-from inspect import getattr_static
+from inspect import getattr_static, signature
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -26,6 +26,7 @@ from mindbridge import (
     FaceAnalysis,
     FaceBackend,
     IndexUnavailableError,
+    Memory,
     MemoryConfig,
     MemoryPlugins,
     MemoryType,
@@ -673,6 +674,12 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
 
     for entry in fields(MemoryConfig):
         assert captured[entry.name] == getattr(settings, entry.name), entry.name
+    # Deriving the forwarding from the dataclass is only safe while every declared field names
+    # a real constructor keyword; a field added without one would raise at call time instead.
+    declared = {entry.name for entry in fields(MemoryConfig)}
+    for constructor in (Memory.__init__, AsyncMemory.__init__):
+        unaccepted = declared - set(signature(constructor).parameters)
+        assert not unaccepted, f"{constructor.__qualname__} has no keyword for {sorted(unaccepted)}"
 
 
 def test_implementation_identity_tracks_editable_source_changes(

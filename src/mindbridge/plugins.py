@@ -80,6 +80,7 @@ class MemoryConfig:
     speaker_margin: _UnitInterval = 0.05
     face_similarity: _UnitInterval = 0.363
     face_margin: _UnitInterval = 0.05
+    identity_link_min_assets: _PositiveInt = 2
 
 
 # Clearer name for new code; keep the original public value intact for compatibility.
