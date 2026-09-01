@@ -175,7 +175,7 @@ def _server() -> None:
 
 
 def _mcp() -> None:
-    """Build the real MCP server and resolve the five supported tool schemas."""
+    """Build the real MCP server and resolve the six supported tool schemas."""
     import asyncio
 
     from mindbridge import Memory
@@ -192,6 +192,7 @@ def _mcp() -> None:
         "ask_memory",
         "delete_memory",
         "get_memory",
+        "list_memories",
         "search_memories",
     }
 
