@@ -4598,3 +4598,32 @@ def test_identity_matching_reports_a_detector_that_found_nothing(tmp_path: Path)
         if span.attributes is not None and IDENTITY_OBSERVATIONS in span.attributes
     ]
     assert [attributes[IDENTITY_OBSERVATIONS] for attributes in recorded] == [0]
+
+
+def test_ranking_does_not_hydrate_stored_embedding_vectors(tmp_path: Path) -> None:
+    # Ranking reads index scores and event times; the stored FP32 vector and the memory content
+    # are never consulted. Hydrating them anyway unpacked and revalidated one vector per
+    # candidate, which measured at twenty-one times the cost of the query that produced the row.
+    # Failing the full-document read proves ranking reaches the projection instead: reverting the
+    # search path to `read_index_documents` turns this red.
+    with Memory(tmp_path, embedder=_FakeEmbedder()) as memory:
+        memory.add("a stored fact about winter")
+        memory.add("an unrelated fact about summer")
+        # `add` drains the search-index outbox, which legitimately needs whole documents. Only
+        # the ranking path that follows is under test.
+        store = memory._store
+        calls: list[int] = []
+        original = store.read_index_documents
+
+        def _refuse(embedding_ids: Sequence[str]) -> tuple[IndexDocument, ...]:
+            calls.append(len(embedding_ids))
+            raise AssertionError("ranking hydrated whole index documents")
+
+        store.read_index_documents = _refuse  # type: ignore[method-assign]
+        try:
+            hits = memory.search("winter", limit=5)
+        finally:
+            store.read_index_documents = original  # type: ignore[method-assign]
+
+    assert calls == []
+    assert [hit.content for hit in hits][:1] == ["a stored fact about winter"]

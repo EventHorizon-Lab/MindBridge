@@ -71,6 +71,7 @@ from mindbridge.infrastructure.local.assets import (
 )
 from mindbridge.infrastructure.local.store import (
     IdentityLink,
+    IndexCandidate,
     IndexDocument,
     LocalStore,
     SpeechRollback,
@@ -2099,7 +2100,7 @@ class Memory:
                 self._trace("mindbridge.storage.hydrate", kind="stage"),
                 _translate_storage_errors("hydrate search candidates"),
             ):
-                hydrated_documents = self._store.read_index_documents(index_ids)
+                hydrated_documents = self._store.read_index_candidates(index_ids)
             with _translate_index_errors("search memories"):
                 candidates, hydrated_documents = self._deepen_temporal_lexical_candidates(
                     candidates,
@@ -2126,7 +2127,7 @@ class Memory:
                     )
                 )
             candidate_parent_ids = tuple(
-                dict.fromkeys(document.embedding.memory_id for document in documents)
+                dict.fromkeys(document.memory_id for document in documents)
             )
             with _translate_storage_errors("apply search scope"):
                 active_count = len(
@@ -2326,21 +2327,21 @@ class Memory:
     def _deepen_temporal_lexical_candidates(
         self,
         candidates: _IndexCandidates,
-        documents: tuple[IndexDocument, ...],
+        documents: tuple[IndexCandidate, ...],
         *,
         lexical_query: str,
         temporal_range: tuple[datetime, datetime] | None,
         memory_type: MemoryType | None,
         route_limit: int,
         result_limit: int,
-    ) -> tuple[_IndexCandidates, tuple[IndexDocument, ...]]:
+    ) -> tuple[_IndexCandidates, tuple[IndexCandidate, ...]]:
         if temporal_range is None or not lexical_query or len(candidates.lexical) < route_limit:
             return candidates, documents
         lexical_by_id = {hit.id: hit for hit in candidates.lexical}
         qualified_parents = {
-            document.embedding.memory_id
+            document.memory_id
             for document in documents
-            if (hit := lexical_by_id.get(document.embedding.embedding_id)) is not None
+            if (hit := lexical_by_id.get(document.embedding_id)) is not None
             and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
             and _overlaps_temporal_range(
                 document.occurred_at,
@@ -2397,8 +2398,8 @@ class Memory:
             self._trace("mindbridge.storage.hydrate", kind="stage"),
             _translate_storage_errors("hydrate temporal lexical candidates"),
         ):
-            added = self._store.read_index_documents(added_ids)
-        by_id = {document.embedding.embedding_id: document for document in (*documents, *added)}
+            added = self._store.read_index_candidates(added_ids)
+        by_id = {document.embedding_id: document for document in (*documents, *added)}
         return updated, tuple(by_id.values())
 
     def _index_candidates(
@@ -5819,10 +5820,10 @@ def _search_outcome(
     return _SearchOutcome(hits=tuple(hits), trace=trace)
 
 
-def _parent_index_ids(documents: Sequence[IndexDocument]) -> dict[str, tuple[str, ...]]:
+def _parent_index_ids(documents: Sequence[IndexCandidate]) -> dict[str, tuple[str, ...]]:
     grouped: dict[str, builtins.list[str]] = {}
     for document in documents:
-        grouped.setdefault(document.embedding.memory_id, []).append(document.embedding.embedding_id)
+        grouped.setdefault(document.memory_id, []).append(document.embedding_id)
     return {memory_id: tuple(index_ids) for memory_id, index_ids in grouped.items()}
 
 
@@ -5855,8 +5856,8 @@ def _extend_hydration_traces(
     target: builtins.list[RetrievalCandidateTrace] | None,
     candidates: _IndexCandidates,
     index_ids: Sequence[str],
-    hydrated_documents: Sequence[IndexDocument],
-    accepted_documents: Sequence[IndexDocument],
+    hydrated_documents: Sequence[IndexCandidate],
+    accepted_documents: Sequence[IndexCandidate],
     index_ids_by_memory: Mapping[str, tuple[str, ...]],
 ) -> None:
     if target is None:
@@ -5869,7 +5870,7 @@ def _extend_hydration_traces(
     ) = _parent_index_signals(candidates, hydrated_documents)
     dense_by_id = {hit.id: hit for hit in candidates.dense}
     lexical_by_id = {hit.id: hit for hit in candidates.lexical}
-    hydrated_ids = {document.embedding.embedding_id for document in hydrated_documents}
+    hydrated_ids = {document.embedding_id for document in hydrated_documents}
     for index_id in index_ids:
         if index_id in hydrated_ids:
             continue
@@ -5895,7 +5896,7 @@ def _extend_hydration_traces(
                 rejected_by=RetrievalRejection.STALE_INDEX,
             )
         )
-    accepted_parent_ids = {document.embedding.memory_id for document in accepted_documents}
+    accepted_parent_ids = {document.memory_id for document in accepted_documents}
     for memory_id, parent_index_ids in index_ids_by_memory.items():
         if memory_id in accepted_parent_ids:
             continue
@@ -6051,7 +6052,7 @@ def _extend_ranked_traces(
 
 def _parent_index_signals(
     candidates: _IndexCandidates,
-    documents: Sequence[IndexDocument],
+    documents: Sequence[IndexCandidate],
 ) -> tuple[dict[str, float], dict[str, float], dict[str, float], set[str]]:
     dense_by_id = {hit.id: hit for hit in candidates.dense}
     lexical_by_id = {hit.id: hit for hit in candidates.lexical}
@@ -6060,8 +6061,8 @@ def _parent_index_signals(
     lexical_relevance: dict[str, float] = {}
     lexical_matches: set[str] = set()
     for document in documents:
-        memory_id = document.embedding.memory_id
-        embedding_id = document.embedding.embedding_id
+        memory_id = document.memory_id
+        embedding_id = document.embedding_id
         dense_hit = dense_by_id.get(embedding_id)
         if dense_hit is not None:
             dense_relevance[memory_id] = max(

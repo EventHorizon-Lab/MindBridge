@@ -1613,3 +1613,27 @@ def test_evidence_and_projection_share_one_transaction_time(tmp_path: Path) -> N
     assert before_retraction.confidence == pytest.approx(0.96)
     assert retracted.context.evidence_ids == (first.memory_id,)
     assert retracted.context.confidence == pytest.approx(0.8)
+
+
+def test_index_candidates_project_the_columns_ranking_reads(tmp_path: Path) -> None:
+    with LocalStore(tmp_path / "state.sqlite3") as store:
+        store.write_memories(
+            (_memory("first", content="winter"), _memory("second", content="summer")),
+            (
+                _embedding("embedding-first", "first"),
+                _embedding("embedding-second", "second"),
+            ),
+        )
+        # Input order is the ranking order, so the projection has to preserve it rather than
+        # return whatever order SQLite chose, and an unknown id has to drop out silently the way
+        # the full-document read does.
+        candidates = store.read_index_candidates(
+            ("embedding-second", "embedding-missing", "embedding-first")
+        )
+        documents = store.read_index_documents(("embedding-first",))
+
+    assert [candidate.memory_id for candidate in candidates] == ["second", "first"]
+    # The projection has to agree with the read it replaces on every column ranking consults.
+    assert candidates[1].embedding_id == documents[0].embedding.embedding_id
+    assert candidates[1].occurred_at == documents[0].occurred_at
+    assert candidates[1].occurred_end == documents[0].occurred_end
