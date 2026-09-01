@@ -883,23 +883,28 @@ def test_search_with_trace_exposes_every_lexical_ranking_input(tmp_path: Path) -
     }
     first_trace = by_memory[first.id]
     second_trace = by_memory[second.id]
-    assert first_trace.lexical_relevance == pytest.approx(0.6)
-    assert second_trace.lexical_relevance == pytest.approx(0.456)
+    # Both memories contain the whole one-term query, so both take the full-coverage floor and
+    # stay ordered by their full-text rank underneath it.
+    assert first_trace.lexical_relevance == pytest.approx(0.75)
+    assert second_trace.lexical_relevance == pytest.approx(0.75 * 0.76)
     for candidate in (first_trace, second_trace):
         assert candidate.dense_relevance is not None
         assert candidate.lexical_relevance is not None
         assert candidate.lexical_rerank_bonus is not None
         assert candidate.dense_relevance == 0
-        assert candidate.lexical_rerank_bonus == pytest.approx(0.2)
         assert candidate.gate_confidence == pytest.approx(0.6)
-        assert candidate.base_relevance == pytest.approx(
-            min(
-                1.0,
-                max(candidate.dense_relevance, candidate.lexical_relevance)
-                + candidate.lexical_rerank_bonus,
-            )
-        )
+        # The coverage bonus is a lift across the remaining headroom, never a clamped sum, so the
+        # recorded bonus shrinks as the base rises and no candidate can reach exactly 1.0.
+        base = max(candidate.dense_relevance, candidate.lexical_relevance)
+        relevance = candidate.base_relevance
+        assert relevance is not None
+        assert relevance == pytest.approx(base + (1.0 - base) * 0.3)
+        assert candidate.lexical_rerank_bonus == pytest.approx(relevance - base)
+        assert 0.0 < relevance < 1.0
     assert first_trace.base_relevance != second_trace.base_relevance
+    assert first_trace.lexical_rerank_bonus is not None
+    assert second_trace.lexical_rerank_bonus is not None
+    assert first_trace.lexical_rerank_bonus < second_trace.lexical_rerank_bonus
 
 
 def test_search_with_trace_reports_temporal_and_retention_factors(tmp_path: Path) -> None:

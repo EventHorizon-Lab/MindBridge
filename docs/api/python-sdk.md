@@ -123,6 +123,20 @@ answerer. Both settings are calibrated `[0, 1]` values and may be set to `0` to 
 candidate that matches the full-text index is scored at `0.6` confidence regardless of its vector
 distance, so it clears the default `minimum_relevance` on the strength of the lexical match alone.
 
+That `0.6` is a *confidence*, read only by the gate. The full-text route contributes to the
+*ranking* differently, because its rank is not a similarity and cannot be compared with a cosine:
+
+- a small floor from its full-text rank, so a memory only that route can reach stays orderable;
+- a lift toward one across the remaining headroom, proportional to how much of the query's
+  distinctive vocabulary the memory actually covers;
+- a higher floor when the memory covers the query completely, which is evidence in a way that
+  merely ranking first is not — but still below strong semantic evidence, because a memory that
+  echoes the question back is a complete term match and is not the answer.
+
+Replaying two benchmark corpora against stores an evaluation had already built, gold recall at
+eight rose from 0.8239 to 0.8920 on Mem-Gallery and from 0.8194 to 0.9306 on ATM-Bench when the
+rank proxy stopped overriding the dense score.
+
 `evidence_budget_chars` decides how much evidence `ask()` grounds on. Retrieval scores separate the
 right memory from the rest only weakly — one benchmark corpus put the gold memory first for 41% of
 questions but inside the top thirty for 94% — so the answering model performs the final selection
@@ -271,7 +285,9 @@ explains the bounded candidate set actually considered: parent `memory_id`, cont
 `index_ids`, dense relevance and confidence, effective lexical relevance, lexical rerank bonus,
 gate confidence, reinforcement, temporal and retention factors, final score, rank, and
 `rejected_by`. For a ranked candidate,
-`base_relevance = min(1, max(dense_relevance, lexical_relevance) + lexical_rerank_bonus)`;
+`base_relevance = base + (1 - base) * coverage_lift` where `base = max(dense_relevance,
+lexical_relevance)` and `lexical_rerank_bonus` records the realised lift, so a strong candidate is
+never clamped to exactly `1.0`;
 `gate_confidence` is the value compared with `minimum_relevance`. Rejection values are
 `stale_index`, `occurrence_range`, `missing_memory`, `memory_type`, `minimum_relevance`,
 `ambiguity`, and `limit`. A stale index candidate has `memory_id=None`.

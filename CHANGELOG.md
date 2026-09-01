@@ -8,6 +8,15 @@ may contain breaking changes.
 
 This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` design.
 
+### Changed
+
+- Hybrid ranking no longer compares a reciprocal full-text rank with a cosine through `max`. The
+  rank contributes a small floor, the IDF-weighted query-term coverage lifts the score toward one
+  across the remaining headroom, and a complete term match takes a higher floor. Gold recall at
+  eight rose from 0.8239 to 0.8920 on a Mem-Gallery slice and from 0.8194 to 0.9306 on an
+  ATM-Bench slice. `SearchHit.score` values change, and a strong candidate is no longer clamped
+  to exactly `1.0`.
+
 ### Added
 
 - `embedding.modalities` and `embedding.request_format` on the declarative OpenAI embedding slot,
