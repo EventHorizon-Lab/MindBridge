@@ -278,7 +278,7 @@ revisions must be reproducible before a result guides a default.
 | Concern | Current release | Product direction |
 | --- | --- | --- |
 | Input | Ordered text, image, video, and audio through `ContentInput`; lazy completed observations through `StreamInput`/`add_stream`; async speculative omni recall | More capture formats normalize into the same canonical contract |
-| Embedding | Caller explicitly supplies a backend; Jina v5 Omni is the bundled omni adapter | Omni-capable recommended composition with route-specific execution |
+| Embedding | Caller explicitly supplies a backend; Jina v5 Omni is the bundled omni adapter, and the declarative OpenAI slot declares the modalities and request shape a self-hosted multimodal embedding server accepts | Omni-capable recommended composition with route-specific execution |
 | Generation | Optional caller-supplied backend with explicit capabilities | Omni-capable recommended composition where the deployment supports it |
 | Speech runtime | Built-in FunASR adapter uses `AutoModel` | Additional measured runtime adapters, selected explicitly or by observable policy |
 | Extensions | Five explicit model protocols and one optional streaming-generation protocol; no registry | Optional domain capabilities after a real implementation establishes the contract |
