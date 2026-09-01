@@ -31,6 +31,7 @@ from opentelemetry.trace import Span, Tracer
 from opentelemetry.util.types import AttributeValue
 
 from mindbridge._telemetry import (
+    EMBEDDING_PARTS_ELIDED,
     MODEL_MODULE,
     MODEL_TTFT,
     SPAN_KIND,
@@ -221,6 +222,8 @@ _MAX_RETRIEVAL_KEYS = 128
 # measured near five hundred tokens against this stack where a ten-second video part measured
 # near three thousand, so one flat number would either starve text or overrun on video. These
 # are coarse by design; the budget is the caller's knob, not these constants.
+# The reason an embedding backend reports when media does not fit one inline request.
+_PAYLOAD_TOO_LARGE = "payload_too_large"
 _ASSET_EVIDENCE_CHARS: Mapping[Modality, int] = MappingProxyType(
     {
         Modality.IMAGE: 2_000,
@@ -1350,10 +1353,7 @@ class Memory:
                         self._embedding_inputs(memory.content)
                     )
                 )
-                vectors = self._embed(
-                    tuple(model_input for _memory, _part, model_input in embedding_parts),
-                    task=EmbedTask.DOCUMENT,
-                )
+                vectors, embedding_parts = self._embed_document_parts(embedding_parts)
                 now = datetime.now(timezone.utc)
                 stored_memories = tuple(
                     StoredMemory(
@@ -2556,6 +2556,51 @@ class Memory:
             text=prepared.text,
             assets=tuple(self._asset_ref(asset) for asset in prepared.assets),
         )
+
+    def _embed_document_parts(
+        self,
+        parts: Sequence[tuple[_PreparedMemory, int, ModelInput]],
+    ) -> tuple[tuple[tuple[float, ...], ...], tuple[tuple[_PreparedMemory, int, ModelInput], ...]]:
+        """Embed one write's retrieval keys, degrading a key the model cannot carry.
+
+        A memory whose media exceeds what the embedding model accepts inline used to fail the
+        whole write, which discards the memory rather than the route that could not take it.
+        `_embedding_inputs` already produces one key per atomic part, so the oversized key can be
+        dropped while the rest of the memory is stored and stays retrievable. A memory left with
+        no key at all still fails, because then nothing would find it.
+        """
+        parts = tuple(parts)
+        try:
+            return self._embed(
+                tuple(model_input for _memory, _part, model_input in parts),
+                task=EmbedTask.DOCUMENT,
+            ), parts
+        except ModelError as error:
+            if error.reason != _PAYLOAD_TOO_LARGE or len(parts) < 2:
+                raise
+        vectors: builtins.list[tuple[float, ...]] = []
+        kept: builtins.list[tuple[_PreparedMemory, int, ModelInput]] = []
+        for entry in parts:
+            try:
+                vectors.extend(self._embed((entry[2],), task=EmbedTask.DOCUMENT))
+            except ModelError as error:
+                if error.reason != _PAYLOAD_TOO_LARGE:
+                    raise
+                continue
+            kept.append(entry)
+        embedded = {entry[0].memory_id for entry in kept}
+        unreachable = tuple(
+            entry[0].memory_id for entry in parts if entry[0].memory_id not in embedded
+        )
+        if unreachable:
+            raise ModelError(
+                "every retrieval key for this memory exceeds what the embedding model accepts "
+                "inline; supply smaller media or an embedding backend that uploads it",
+                reason=_PAYLOAD_TOO_LARGE,
+                subject=unreachable[0],
+            )
+        _record_elided_parts(len(parts) - len(kept))
+        return tuple(vectors), tuple(kept)
 
     def _embed(
         self,
@@ -4062,6 +4107,15 @@ def _batch_values(
 def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _PreparedContent:
     note = f"Reference time for relative dates: {reference_at.isoformat(timespec='microseconds')}"
     return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
+
+
+def _record_elided_parts(count: int) -> None:
+    """Publish how many retrieval keys the embedding model could not carry, so no loss is silent."""
+    if count <= 0:
+        return
+    span = trace.get_current_span()
+    if span.is_recording():
+        span.set_attribute(EMBEDDING_PARTS_ELIDED, count)
 
 
 def _grounding_hits(

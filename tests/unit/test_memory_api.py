@@ -106,6 +106,8 @@ class _FakeModels:
         self.transcription_space = transcription_space
         self.embedding_dimension = 2
         self.fail_embedding = False
+        # Asset ids the model refuses to carry inline, mirroring a provider's per-item size limit.
+        self.oversized_assets: frozenset[str] = frozenset()
         selected = capabilities or _Capabilities(
             embedding=ALL_INPUT_MODALITIES,
             generation=ALL_INPUT_MODALITIES,
@@ -125,6 +127,11 @@ class _FakeModels:
         if self.fail_embedding:
             raise RuntimeError("simulated embedding failure")
         batch = tuple(inputs)
+        if any(asset.id in self.oversized_assets for value in batch for asset in value.assets):
+            raise ModelError(
+                "encoded inline model media item exceeds the limit",
+                reason="payload_too_large",
+            )
         self.embed_inputs.append(batch)
         self.embed_batches.append(tuple(value.text for value in batch))
         self.embed_tasks.append(task)
@@ -1294,6 +1301,44 @@ def _hundred_character_records(memory: Memory, count: int) -> tuple[MemoryRecord
     records = tuple(f"evidence {index}".ljust(100, "x") for index in range(count))
     assert {len(record) for record in records} == {100}
     return tuple(memory.add(record) for record in records)
+
+
+def test_media_the_embedder_cannot_carry_degrades_the_key_not_the_memory(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory:
+        record = memory.add(("the kitchen at dusk", Blob(b"oversized-clip", "video/mp4")))
+        oversized = record.assets[0].id
+        memory.delete(record.id)
+        models.oversized_assets = frozenset({oversized})
+        models.embed_inputs.clear()
+
+        stored = memory.add(("the kitchen at dusk", Blob(b"oversized-clip", "video/mp4")))
+
+        # The memory is stored with its media and stays reachable through the text key the model
+        # could carry; only the key holding the clip is dropped.
+        assert memory.get(stored.id).assets[0].id == oversized
+        assert [hit.id for hit in memory.search("kitchen at dusk")] == [stored.id]
+        embedded = {
+            asset.id for batch in models.embed_inputs for value in batch for asset in value.assets
+        }
+        assert oversized not in embedded
+
+
+def test_a_memory_with_no_carriable_key_still_fails(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory:
+        record = memory.add(Blob(b"oversized-clip", "video/mp4"))
+        oversized = record.assets[0].id
+        memory.delete(record.id)
+        models.oversized_assets = frozenset({oversized})
+
+        # A batch where one memory is nothing but the clip. Degrading its only key would store a
+        # memory no query could ever reach, so the write fails even though its neighbour embedded.
+        with pytest.raises(ModelError) as failure:
+            memory.add_many(("a note that embeds fine", Blob(b"oversized-clip", "video/mp4")))
+
+    assert failure.value.reason == "payload_too_large"
+    assert "every retrieval key" in str(failure.value)
 
 
 def test_evidence_budget_widens_grounding_without_ever_narrowing_it(tmp_path: Path) -> None:

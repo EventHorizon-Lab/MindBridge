@@ -114,6 +114,12 @@ accuracy from 0.2086 to 0.3583 (paired mean +0.1497, 95% CI [+0.0857, +0.2123], 
 and lowered the abstention rate from 49.2% to 27.3%. Generation token usage was unchanged, because
 the inlined media dominates the prompt either way.
 
+Media the embedding model will not accept inline degrades the retrieval key rather than the
+memory: `add` drops the key holding the oversized asset, stores the memory with its media, and
+keeps it reachable through the keys that did embed, recording
+`mindbridge.embedding.elided_parts` on the operation span. A memory whose every key is refused
+still fails, because nothing would find it.
+
 A `TranscriptionBackend` needs no flag. `add` transcribes every asset whose modality that backend
 declares and stores the transcript in the record, so a media memory has retrievable text next to
 its native media vector; the media is never replaced. `SpeechBackend` analysis stays behind

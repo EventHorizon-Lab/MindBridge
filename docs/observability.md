@@ -72,6 +72,11 @@ token-metered request supplied a usable total; request counters and known modali
 available as an exact lower bound when it is false.
 
 The bundled `OpenAIModels` generation span also reports what its inline media budget removed:
+`mindbridge.embedding.elided_parts` counts retrieval keys an `add` could not embed because their
+media exceeds what the embedding model accepts inline. The memory is still stored and stays
+reachable through its remaining keys; the attribute is what keeps that degradation visible. It is
+absent when nothing was dropped, and a write whose every key is refused fails instead.
+
 `mindbridge.grounding.media_elided_hits` counts retrieved hits with any media that did not fit, and
 `mindbridge.grounding.dropped_hits` counts hits left out of the request entirely. Both are zero on
 a request that sent every retrieved hit intact. If a provider explicitly rejects a grounded video

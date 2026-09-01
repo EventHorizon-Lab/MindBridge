@@ -10,6 +10,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- Media the embedding model cannot accept inline now degrades the retrieval key instead of the
+  whole write. `add` drops the oversized key, stores the memory with its media, keeps it reachable
+  through its remaining keys, and records `mindbridge.embedding.elided_parts` on the span. A memory
+  left with no key at all still fails. On an ATM-Bench slice this recovers 21 of 7 612 memories
+  that previously failed with `payload_too_large`, which is what invalidated the whole task's score.
 - Hybrid ranking no longer compares a reciprocal full-text rank with a cosine through `max`. The
   rank contributes a small floor, the IDF-weighted query-term coverage lifts the score toward one
   across the remaining headroom, and a complete term match takes a higher floor. Gold recall at

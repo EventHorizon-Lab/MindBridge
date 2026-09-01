@@ -24,6 +24,7 @@ TOKEN_AUDIO_SECONDS = "mindbridge.token_usage.audio_seconds"
 MODEL_TTFT = "mindbridge.model.time_to_first_token"
 GEN_AI_TTFC = "gen_ai.response.time_to_first_chunk"
 GEN_AI_FINISH_REASONS = "gen_ai.response.finish_reasons"
+EMBEDDING_PARTS_ELIDED = "mindbridge.embedding.elided_parts"
 GROUNDING_MEDIA_ELIDED = "mindbridge.grounding.media_elided_hits"
 GROUNDING_HITS_DROPPED = "mindbridge.grounding.dropped_hits"
 
