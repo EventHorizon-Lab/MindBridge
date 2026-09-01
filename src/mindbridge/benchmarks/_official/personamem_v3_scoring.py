@@ -411,6 +411,34 @@ SECONDARY_WEIGHT = 0.2
 RUBRIC_TASK_TYPES = frozenset(APPLICABILITY)
 
 
+# The 13 task types whose headline IS the unified rubric, from EVAL.md's "Full
+# metric set per judged task type" table. `APPLICABILITY` is wider than this on
+# purpose: it also lists tasks whose `pr_*` output upstream keeps as a
+# *diagnostic* beside a different headline -- `new_suggestions_*` score on
+# their own `alignment_score`, the repetition pair on fatigue counters,
+# `local_recommendation_geo_shift` on `geo_shift_correctness` -- plus three
+# retired types kept so historical rows still parse. Emitting a rubric headline
+# for any of those would put a number upstream does not publish into the
+# aggregate, so the judged set is this table, not the applicability map.
+RUBRIC_HEADLINE_TASK_TYPES = frozenset(
+    {
+        "agentic_auto_reply",
+        "agentic_community_post",
+        "agentic_cross_app_repost",
+        "agentic_dm_digest",
+        "agentic_group_dm_summary",
+        "agentic_proactive_daily_catchup",
+        "agentic_send_post",
+        "agentic_trending_alert",
+        "agentic_vague_refind",
+        "chatbot_personalized_response",
+        "over_personalization_chatbot_text",
+        "over_personalization_context_shift",
+        "over_personalization_sensitive_event",
+    }
+)
+
+
 def dim_definition(dim: str) -> tuple[str, str, str]:
     """Resolve one dimension's `(scale, question, polarity)`, honouring aliases."""
     spec = DIM_DEFS.get(dim) or DIM_DEFS.get(DIM_DEF_ALIAS.get(dim, ""))

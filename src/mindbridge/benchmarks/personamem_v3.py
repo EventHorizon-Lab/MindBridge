@@ -87,6 +87,12 @@ class PersonaMemEvent(ContractModel):
     hashtags: tuple[str, ...] = ()
     conversation: tuple[PersonaMemTurn, ...] = ()
     location: str = ""
+    # Calendar only: when the appointment is scheduled for, which is a
+    # different moment from `occurred_at` -- that is when the calendar was
+    # edited. `details` carries a removal reason or a rendered field diff.
+    scheduled_start: AwareDatetime | None = None
+    scheduled_end: AwareDatetime | None = None
+    details: str = ""
     author: str = ""
     is_dm: bool = False
     is_ad: bool = False
@@ -210,6 +216,8 @@ class _RawCalendarEntry(BaseModel):
     title: str | None = None
     type: str | None = None
     start_ts: int | None = None
+    end_ts: int | None = None
+    location: _RawLocation | None = None
 
 
 class _RawCalendarModification(BaseModel):
@@ -221,6 +229,10 @@ class _RawCalendarModification(BaseModel):
     action: str
     entry: _RawCalendarEntry | None = None
     removal_reason: str | None = None
+    # `updated` modifications carry no `entry` at all -- only the entry ID and
+    # a per-field `{"from": ..., "to": ...}` diff.
+    entry_id: str | None = None
+    diff: dict[str, object] = Field(default_factory=dict)
 
 
 class _RawCalendar(BaseModel):
@@ -421,26 +433,59 @@ def _calendar_events(path: Path) -> tuple[PersonaMemEvent, ...]:
 
     The release stores calendar state as an append-only `added` / `updated` /
     `removed` stream. Folding it into a snapshot would need a moment to fold
-    to, and each query has a different one, so each modification is kept as
-    its own timestamped memory and the fold falls out of the causal cutoff.
+    to, and each query has a different one, so each modification is kept as its
+    own timestamped memory and the fold falls out of the causal cutoff.
+
+    Every part of an entry that describes the appointment is kept. The
+    scheduled window is not derivable from the modification's own timestamp --
+    an appointment can be booked well before it starts, and the entry's
+    duration appears nowhere else -- and an `updated` modification carries only
+    a field diff, so rendering just its action word would store a memory with
+    no content in it.
     """
     if not path.is_file():
         return ()
     calendar = _RawCalendar.model_validate_json(path.read_bytes())
-    return tuple(
-        PersonaMemEvent(
-            event_id=f"calendar:{modification.mod_id}",
-            app="Calendar",
-            timestamp=modification.ts,
-            occurred_at=_moment(modification.ts),
-            formatted_timestamp=modification.formatted_timestamp,
-            action_label=modification.action,
-            title=(modification.entry.title if modification.entry else None) or "",
-            content_type=(modification.entry.type if modification.entry else None) or "",
-            caption=modification.removal_reason or "",
-        )
-        for modification in calendar.modifications
+    return tuple(_calendar_event(modification) for modification in calendar.modifications)
+
+
+def _calendar_event(modification: _RawCalendarModification) -> PersonaMemEvent:
+    entry = modification.entry or _RawCalendarEntry()
+    return PersonaMemEvent(
+        event_id=f"calendar:{modification.mod_id}",
+        app="Calendar",
+        timestamp=modification.ts,
+        occurred_at=_moment(modification.ts),
+        formatted_timestamp=modification.formatted_timestamp,
+        action_label=modification.action,
+        title=entry.title or modification.entry_id or "",
+        content_type=entry.type or "",
+        location=_location(entry.location),
+        scheduled_start=None if entry.start_ts is None else _moment(entry.start_ts),
+        scheduled_end=None if entry.end_ts is None else _moment(entry.end_ts),
+        details=_calendar_details(modification),
     )
+
+
+def _calendar_details(modification: _RawCalendarModification) -> str:
+    """Describe what a modification changed, in one line."""
+    if modification.removal_reason:
+        return modification.removal_reason
+    changes = []
+    for field, change in modification.diff.items():
+        if isinstance(change, Mapping) and {"from", "to"} <= set(change):
+            before, after = _diff_value(field, change["from"]), _diff_value(field, change["to"])
+            changes.append(f"{field} {before} -> {after}")
+        else:
+            changes.append(f"{field} {_diff_value(field, change)}")
+    return "; ".join(changes)
+
+
+def _diff_value(field: str, value: object) -> str:
+    """Render a diff value, resolving epoch fields to a readable moment."""
+    if field.endswith("_ts") and isinstance(value, int) and not isinstance(value, bool):
+        return _moment(value).isoformat()
+    return "(none)" if value in ("", None) else str(value)
 
 
 def _location(location: _RawLocation | None) -> str:
@@ -467,6 +512,10 @@ def render_event(event: PersonaMemEvent) -> str:
         header = f"{header} ({event.interaction_type})"
     lines = [header]
     for label, value in (
+        # `content_type` is `image` / `short_video` / `text` on a feed event and
+        # the appointment kind on a calendar one; it is parsed for every event,
+        # so it is rendered for every event too.
+        ("Type", event.content_type),
         ("Title", event.title),
         ("Caption", event.caption),
         ("Media", event.media_description),
@@ -474,9 +523,15 @@ def render_event(event: PersonaMemEvent) -> str:
         ("User message", event.user_message),
         ("Location", event.location),
         ("Author", event.author),
+        ("Details", event.details),
     ):
         if value:
             lines.append(f"{label}: {value}")
+    if event.scheduled_start is not None:
+        window = event.scheduled_start.isoformat()
+        if event.scheduled_end is not None:
+            window = f"{window} to {event.scheduled_end.isoformat()}"
+        lines.append(f"Scheduled: {window}")
     if event.hashtags:
         lines.append("Hashtags: " + " ".join(event.hashtags))
     flags = tuple(

@@ -41,6 +41,7 @@ from mindbridge.benchmarks._official.memlens_prompts import (
     build_judge_prompt as build_memlens_prompt,
 )
 from mindbridge.benchmarks._official.memlens_prompts import get_task_key
+from mindbridge.benchmarks.personamem_v3 import RANKING_TASK_TYPES
 
 SCORER_VERSION = "official_scorers_v2"
 
@@ -550,9 +551,34 @@ def combine_judge_scores(
     return {name: max(score[name] for score in scores if name in score) for name in names}
 
 
+def _personamem_metric(task_type: str) -> tuple[str, float] | None:
+    """Return one task type's headline metric and the divisor onto 0-1, if any.
+
+    Keyed on EVAL.md's headline table rather than on the rubric's applicability
+    map: upstream runs the rubric on several more task types but keeps its
+    output as a diagnostic beside a headline it computes a different way (a
+    leak-set composite, fatigue counters, a paired-row delta). A task type this
+    returns `None` for is answered and reported without a `personamem_score`,
+    so it stays out of the aggregate rather than entering it under a number
+    upstream does not publish.
+    """
+    if task_type in _PERSONAMEM_HEADLINES:
+        return _PERSONAMEM_HEADLINES[task_type]
+    if task_type in pm3.RUBRIC_HEADLINE_TASK_TYPES:
+        return _PERSONAMEM_RUBRIC_HEADLINE
+    if task_type in RANKING_TASK_TYPES:
+        return _PERSONAMEM_RANKING_HEADLINE
+    return None
+
+
 def _personamem_judged(metadata: Mapping[str, object]) -> bool:
+    """Report whether one row's headline needs -- and can have -- a judge call.
+
+    Ranking rows are scored deterministically against their frozen slate, so
+    they are excluded here even though they do have a headline.
+    """
     task_type = str(metadata.get("task_type", ""))
-    return task_type in pm3.RUBRIC_TASK_TYPES or task_type in pm3.OWN_JUDGE_TASK_TYPES
+    return task_type not in RANKING_TASK_TYPES and _personamem_metric(task_type) is not None
 
 
 def _personamem_plan(
@@ -617,12 +643,10 @@ def _personamem_judge_scores(plan: JudgePlan, response: str) -> dict[str, float]
 def _personamem_headline(task_type: str, scores: Mapping[str, float]) -> dict[str, float]:
     """Add the 0-1 value the upstream aggregator compares across task types."""
     result = dict(scores)
-    if task_type in _PERSONAMEM_HEADLINES:
-        name, scale = _PERSONAMEM_HEADLINES[task_type]
-    elif task_type in pm3.RUBRIC_TASK_TYPES:
-        name, scale = _PERSONAMEM_RUBRIC_HEADLINE
-    else:
-        name, scale = _PERSONAMEM_RANKING_HEADLINE
+    metric = _personamem_metric(task_type)
+    if metric is None:
+        return result
+    name, scale = metric
     if name in result:
         result["personamem_score"] = min(1.0, max(0.0, result[name] / scale))
     return result
@@ -646,6 +670,8 @@ def pm3_json(response: str) -> Mapping[str, object]:
 
 def _personamem_local(prediction: str, metadata: Mapping[str, object]) -> dict[str, float]:
     """Score a ranking row deterministically against its frozen slate."""
+    if str(metadata.get("task_type", "")) not in RANKING_TASK_TYPES:
+        return {}
     count = metadata.get("candidate_count")
     if not isinstance(count, int) or count <= 0:
         return {}

@@ -294,8 +294,35 @@ def test_personamem_v3_reads_every_released_row_shape(tmp_path: Path) -> None:
                     "mod_id": "mod_001",
                     "ts": 1_200,
                     "action": "added",
-                    "entry": {"title": "Grant review", "type": "work"},
-                }
+                    "entry": {
+                        "title": "Grant review",
+                        "type": "work",
+                        # Booked before it starts, so the scheduled window is
+                        # not derivable from the modification's own timestamp.
+                        "start_ts": 9_000,
+                        "end_ts": 16_200,
+                        "location": {"city": "Osaka", "country": "Japan"},
+                    },
+                },
+                # An `updated` modification carries no `entry` at all, only the
+                # entry ID and a per-field diff.
+                {
+                    "mod_id": "mod_002",
+                    "ts": 1_300,
+                    "action": "updated",
+                    "entry_id": "cal_006",
+                    "diff": {
+                        "end_ts": {"from": 16_200, "to": 18_000},
+                        "notes": {"from": "", "to": "Ran long."},
+                    },
+                },
+                {
+                    "mod_id": "mod_003",
+                    "ts": 1_400,
+                    "action": "removed",
+                    "entry_id": "cal_017",
+                    "removal_reason": "canceled: organizer moved it",
+                },
             ]
         },
     )
@@ -339,11 +366,12 @@ def test_personamem_v3_reads_every_released_row_shape(tmp_path: Path) -> None:
     assert [event.event_id for event in events] == [
         "instagram:a",
         "calendar:mod_001",
+        "calendar:mod_002",
+        "calendar:mod_003",
         "instagram:dm",
     ]
-    assert events[2].conversation[0].role == "friend_5"
-    assert "friend_5: your kind of vibe" in render_event(events[2])
-    assert "Grant review" in render_event(events[1])
+    assert events[4].conversation[0].role == "friend_5"
+    assert "friend_5: your kind of vibe" in render_event(events[4])
 
     queries = {query.query_id: query for query in personas[0].queries}
     assert "8:0003:rep" not in queries
@@ -358,6 +386,79 @@ def test_personamem_v3_reads_every_released_row_shape(tmp_path: Path) -> None:
     assert "title='A'" in slate
     # `profile.json` is scorer-side and is never read as memory.
     assert not any(event.app == "Profile" for event in events)
+
+
+def test_personamem_v3_keeps_what_each_calendar_modification_says(tmp_path: Path) -> None:
+    """A calendar memory has to carry the appointment, not just the edit."""
+    persona = tmp_path / "backend" / "8"
+    _write(persona / "instagram.json", [_personamem_event("a", 1_000)])
+    _write(
+        persona / "calendar.json",
+        {
+            "modifications": [
+                {
+                    "mod_id": "mod_001",
+                    "ts": 1_200,
+                    "action": "added",
+                    "entry": {
+                        "title": "Grant review",
+                        "type": "work",
+                        "start_ts": 9_000,
+                        "end_ts": 16_200,
+                        "location": {"city": "Osaka", "country": "Japan"},
+                    },
+                },
+                {
+                    "mod_id": "mod_002",
+                    "ts": 1_300,
+                    "action": "updated",
+                    "entry_id": "cal_006",
+                    "diff": {
+                        "end_ts": {"from": 16_200, "to": 18_000},
+                        "notes": {"from": "", "to": "Ran long."},
+                    },
+                },
+                {
+                    "mod_id": "mod_003",
+                    "ts": 1_400,
+                    "action": "removed",
+                    "entry_id": "cal_017",
+                    "removal_reason": "canceled: organizer moved it",
+                },
+            ]
+        },
+    )
+    _write(persona / "test.json", [_personamem_query()])
+
+    events = {
+        event.event_id: event
+        for event in load_personamem_v3(tmp_path / "backend")[0].events
+        if event.app == "Calendar"
+    }
+
+    added = events["calendar:mod_001"]
+    # The appointment's window is a different moment from the edit's, and the
+    # duration appears nowhere else, so neither is recoverable from `ts`.
+    assert added.occurred_at.isoformat() == "1970-01-01T00:20:00+00:00"
+    assert added.scheduled_start is not None
+    assert added.scheduled_start.isoformat() == "1970-01-01T02:30:00+00:00"
+    assert added.scheduled_end is not None
+    assert added.scheduled_end.isoformat() == "1970-01-01T04:30:00+00:00"
+    rendered = render_event(added)
+    assert "Scheduled: 1970-01-01T02:30:00+00:00 to 1970-01-01T04:30:00+00:00" in rendered
+    assert "Location: Osaka, Japan" in rendered
+    assert "Type: work" in rendered
+
+    # An `updated` modification has no `entry`; without its diff the memory
+    # would be a bare header line with nothing retrievable in it.
+    updated = render_event(events["calendar:mod_002"])
+    assert "end_ts 1970-01-01T04:30:00+00:00 -> 1970-01-01T05:00:00+00:00" in updated
+    assert "notes (none) -> Ran long." in updated
+    assert "cal_006" in updated
+
+    assert "canceled: organizer moved it" in render_event(events["calendar:mod_003"])
+    # No calendar memory may be a header line on its own.
+    assert all(len(render_event(event).splitlines()) > 1 for event in events.values())
 
 
 def test_download_patterns_cover_extensionless_files_and_pinned_directories() -> None:

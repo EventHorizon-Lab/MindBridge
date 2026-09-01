@@ -611,9 +611,36 @@ def test_personamem_ranking_is_deterministic_and_reads_both_answer_shapes() -> N
     assert _scores("personamem-v3", "Ranked indexes: [2, 0]", "gold", dict(metadata)) == identity
 
 
-def test_personamem_leaves_families_it_cannot_reproduce_unscored() -> None:
-    metadata: dict[str, object] = {"task_type": "proactive_close_friend_update"}
-    assert _scores("personamem-v3", "I would stay quiet.", "gold", dict(metadata)) == {}
+@pytest.mark.parametrize(
+    "task_type",
+    [
+        # No judge family at all.
+        "proactive_close_friend_update",
+        "proactive_trending_feed_react",
+        "restraint_sensitive_event_silence",
+        "proactive_overactive_check",
+        "active_mistake_prevention",
+        # In the rubric's applicability map, but upstream keeps that output as
+        # a diagnostic and computes the headline a different way: a leak-set
+        # composite, fatigue counters, or a paired-row delta.
+        "new_suggestions_chatbot",
+        "new_suggestions_recsys",
+        "local_recommendation_geo_shift",
+        "over_personalization_repetition_chatbot",
+        "over_personalization_repetition_recsys",
+    ],
+)
+def test_personamem_leaves_families_it_cannot_reproduce_unscored(task_type: str) -> None:
+    metadata: dict[str, object] = {
+        "task_type": task_type,
+        # Slate fields are supplied so a row cannot be left unscored merely for
+        # want of a candidate list.
+        "candidate_count": 4,
+        "positive_indexes": (1,),
+        "negative_indexes": (0,),
+        "judge_evidence": {},
+    }
+    assert _scores("personamem-v3", "Ranked indexes: [1, 0, 2, 3]", "gold", dict(metadata)) == {}
     assert (
         judge_plan(
             "personamem-v3",
@@ -624,3 +651,27 @@ def test_personamem_leaves_families_it_cannot_reproduce_unscored() -> None:
         )
         is None
     )
+
+
+def test_personamem_scores_exactly_the_reproducible_task_types() -> None:
+    """The judged set is EVAL.md's headline table, not the applicability map."""
+    from mindbridge.benchmarks._official.personamem_v3_scoring import (
+        APPLICABILITY,
+        OWN_JUDGE_TASK_TYPES,
+        RUBRIC_HEADLINE_TASK_TYPES,
+    )
+
+    assert RUBRIC_HEADLINE_TASK_TYPES.issubset(APPLICABILITY)
+    assert set(APPLICABILITY) - RUBRIC_HEADLINE_TASK_TYPES
+    assert len(RUBRIC_HEADLINE_TASK_TYPES) == 13
+    for task_type in RUBRIC_HEADLINE_TASK_TYPES | OWN_JUDGE_TASK_TYPES:
+        assert (
+            judge_plan(
+                "personamem-v3",
+                question="q",
+                references=("gold",),
+                prediction="answer",
+                metadata={"task_type": task_type, "judge_evidence": {}},
+            )
+            is not None
+        ), task_type
