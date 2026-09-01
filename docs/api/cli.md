@@ -1,221 +1,139 @@
-# Command-line reference
+# Command-line API
 
-MindBridge ships two console scripts. Together they are one documented CLI surface.
+## Purpose
 
-| Script | Entry point | Purpose |
-| --- | --- | --- |
-| `mindbridge` | `mindbridge.cli:main` | Product memory operations over one composed `Memory` |
-| `mindbridge-bench` | `mindbridge.benchmarks.cli:main` | Benchmark harnesses over the public SDK |
+`mindbridge` runs one product operation in one process and emits one JSON result. Local commands
+dispatch to the corresponding `Memory` method, except for the diagnostic `doctor`; remote commands
+forward to a running owner's `/v1` route. The CLI owns argument decoding, composition selection,
+JSON projection, and exit-code mapping, not storage or retrieval policy.
 
-They are two scripts rather than one command tree for a reason worth knowing before anyone tries to
-merge them. `tests/test_package.py` walks the AST of every non-benchmark module under
-`src/mindbridge` and fails on any reference to the benchmark package — including a bare string
-constant. A single dispatcher could not reach the benchmark family even through a lazy
-`import_module("mindbridge.benchmarks.cli")`, because the string itself trips the guard. The guard is
-deliberate: product modules must not import benchmark modules. So `mindbridge` never names the
-benchmark package in any form, and the two families stay in two entry points.
+Benchmark commands belong to the separate `mindbridge-bench` surface documented in
+[benchmarking](../benchmarking.md).
 
-`mindbridge` is a per-invocation process: it composes one `Memory`, runs one operation, and closes
-it. Opening a `Memory` acquires the directory lock, opens SQLite and the index, drains the outbox,
-and — for a local model recipe — loads weights. **That makes it the wrong tool for a loop.** Use the
-[Python SDK](python-sdk.md) in-process, or run one owner and address it with `--url`.
+## Invocation
 
-## Composition
-
-A CLI cannot accept Python objects, and `Memory` requires `embedder` as a keyword with no default.
-Exactly one of three flags supplies it. There is **no default composition and no environment
-variable that selects a backend**; a `MINDBRIDGE_*` variable that quietly picked a model would be
-exactly the hidden provider construction
-[the design principles forbid](../design-principles.md#prefer-explicit-configuration-and-observable-automation).
-
-```bash
-mindbridge add "The spare key is in the blue toolbox."
+```text
+mindbridge [GLOBAL_OPTIONS] COMMAND [COMMAND_OPTIONS]
 ```
 
-fails with exit `10` and names all three paths.
+The console entry point calls
+`mindbridge.cli.main(argv: Sequence[str] | None = None) -> int`.
 
-### `--app MODULE:ATTR`
-
-The primary path, and the only extensible one.
+Choose exactly one composition on every invocation:
 
 ```bash
 mindbridge --app my_application:build_memory search "where is the spare key"
-```
-
-`ATTR` is a `Memory` instance or a zero-argument callable returning one. This is the same
-`module:attr` convention as `uvicorn my_application:app`, and the same application composition the
-SDK, REST, and MCP already use. The working directory is placed on `sys.path`, as `uvicorn` does.
-
-**Any backend MindBridge does not bundle is reached this way.** There is deliberately no plugin
-registry, no entry-point discovery, and no way to register a backend by name.
-
-The application owns the data directory and the backends it built, so `--data-dir`, `--answerer`,
-`--transcriber`, and the tuning options are refused with `--app` rather than silently ignored.
-
-### `--embedder NAME`
-
-A closed table over the bundled backends, published as `mindbridge.recipes` so the CLI has no
-private path into the package:
-
-```python
-from mindbridge import recipes
-
-recipes.names()  # ("funasr", "jina-omni", "openai")
-recipes.describe("jina-omni")  # static identity; constructs nothing
-embedder = recipes.embedder("jina-omni")  # the object, which the caller now owns
-```
-
-| Recipe | Fills | Model identity | Extra |
-| --- | --- | --- | --- |
-| `jina-omni` | `--embedder` | `DEFAULT_JINA_MODEL_ID` at `DEFAULT_JINA_REVISION`, 1024 dimensions | `local` |
-| `funasr` | `--transcriber` | `DEFAULT_FUNASR_RECIPE`, pinned model and component revisions | `local` |
-| `openai` | `--embedder`, `--answerer`, `--transcriber` | `text-embedding-3-small`, `gpt-5-mini`, `whisper-1` | `openai` |
-
-`openai:<model>` selects a different model for the slot it fills, for example
-`--answerer openai:gpt-5-mini`.
-
-```bash
 mindbridge --embedder jina-omni add "The spare key is in the blue toolbox."
-mindbridge --embedder jina-omni --answerer openai:gpt-5-mini ask "where is the spare key"
+mindbridge --url http://127.0.0.1:8000 list
 ```
 
-**The pinned `jina-omni` weights are licensed CC BY-NC 4.0 — non-commercial use only.** That licence
-covers the model, not MindBridge. `mindbridge --embedder jina-omni --explain <command>` prints it,
-and so does `doctor`.
+Global options precede the command.
+Use `mindbridge COMMAND --help` for the command-specific flags summarized below.
 
-This is not hidden construction, on each of the four counts that would make it so:
-
-| Property of hidden construction | Why it does not hold |
+| Option | Meaning |
 | --- | --- |
-| The caller did not name what was built | The recipe name is typed on every invocation. There is no default and no environment fallback. |
-| The caller cannot obtain the object | `recipes.embedder(name)` returns it. Call it, print it, wrap it, or ignore it and build your own. |
-| The choice can drift | The table is closed, versioned with the package, and pins model ID and revision to constants in the source. No discovery, no network lookup, no third-party registration. |
-| It happens as a side effect | It happens only when the flag is passed, and the resolved identity is echoed to stderr on every run. |
+| `--app MODULE:ATTR` | `Memory` instance or zero-argument callable returning one |
+| `--embedder NAME` | construct a bundled embedding recipe |
+| `--url URL` | address a running owner over `/v1` |
+| `--data-dir PATH` | local directory for `--embedder`; default `.mindbridge` |
+| `--timeout SECONDS` | positive finite remote timeout for `--url`; default `30` |
+| `--answerer NAME` | generation recipe for `--embedder` |
+| `--transcriber NAME` | speech recipe for `--embedder` |
+| `--index-speech` | index transcripts on add for `--embedder` |
+| `--minimum-relevance FLOAT` | relevance floor; default `0.55` |
+| `--ambiguity-margin FLOAT` | top-two gate when `limit=1`; default `0.01` |
+| `--decay-half-life-days FLOAT` | optional positive recency half-life; default none |
+| `--explain` | print resolved composition and execute no operation |
+| `-q`, `--quiet` | suppress the composition banner on stderr |
+| `-V`, `--version` | print the installed version |
 
-MindBridge never reads a credential. `--answerer openai:gpt-5-mini` constructs `OpenAI()`, and the
-official SDK performs its own documented `OPENAI_API_KEY` lookup. The CLI reports the *source* of the
-key and never its value.
+`--data-dir`, backend options, and tuning options apply only to `--embedder`; `--timeout` applies
+only to `--url`. Inapplicable options fail instead of being ignored. `--app` follows the same
+`MODULE:ATTR` convention as Uvicorn and adds the working directory to `sys.path`. The CLI closes
+the resulting local `Memory` after the command.
 
-Changing `--embedder` against an existing `--data-dir` cannot silently migrate an embedding space:
-the recorded `embedding_model`, `embedding_space`, and `embedding_dimension` are re-checked on open
-and force a rebuild.
+The listed flags are the complete direct-composition surface. Use `--app` for index quantization,
+face analysis, speaker/face thresholds, a custom backend, or any other `Memory` setting.
 
-### `--url URL`
+Composition, model identity, credentials, and settings are documented once in
+[configuration](../configuration.md). One physical directory still has one live owner; see
+[architecture](../architecture.md).
 
-Address a running owner over `/v1`. One physical directory has one live owner, so a CLI that finds
-the directory already taken must reach that owner through a supported transport rather than opening
-a second `Memory`.
+## Contract
 
-```bash
-mindbridge --url http://127.0.0.1:8000 search "where is the spare key"
-```
+### Bundled recipes
 
-In this mode the CLI constructs no backends at all: it sends JSON to `/v1` and echoes the response
-body unchanged. HTTP uses `urllib.request` from the standard library. Each blocking remote operation
-has a 30-second timeout by default; set another positive finite value with `--timeout SECONDS`.
-This bounds the CLI connection/read wait and does not change the owner's model-provider timeouts.
-A timeout exits `7` with `storage_error`, `reason="timeout"`, `stage="request"`, and
-`retryable=true`. The resolved timeout appears in the normal composition banner and `--explain`
-output as `timeout_seconds`.
-
-Exit `9` from a local composition means another process owns the directory — retry with `--url`.
-
-## Global options
-
-```text
---data-dir PATH          local memory directory (default: .mindbridge)
---app MODULE:ATTR      }
---embedder NAME        }  exactly one is required
---url URL              }
---timeout SECONDS        remote request timeout with --url (default: 30)
---answerer NAME          generation recipe, with --embedder
---transcriber NAME       speech recipe, with --embedder
---index-speech           index transcripts and speaker identities on add
---minimum-relevance F    weak-evidence floor (default: 0.55)
---ambiguity-margin F     top-two gate when limit=1 (default: 0.01)
---decay-half-life-days F opt-in recency decay (default: none)
---explain                print the resolved composition to stdout and execute nothing
--q, --quiet              suppress the stderr composition banner
--V, --version            print the installed version
-```
-
-Every default above is read from the `Memory` signature it is passed to, so `--help` shows the real
-value and the CLI cannot drift from it. Global options precede the command:
-`mindbridge --embedder jina-omni -q add "..."`.
-
-There is **no `--format` flag and no configuration file**. Output is always JSON, and a second
-configuration system is out of scope.
-
-## Commands
-
-Derived mechanically from the SDK: each public `Memory` operation is the command of the same name,
-kebab-cased. Nothing is renamed, grouped, or invented.
-
-| SDK operation | Command | Writes? |
+| Recipe | Allowed slot | Default identity |
 | --- | --- | --- |
-| `add` | `mindbridge add [TEXT ...]` | idempotent write |
-| `add_many` | `mindbridge add-many [JSONL]` | idempotent write |
-| `add_stream` | `mindbridge add-stream [JSONL]` | incremental idempotent writes |
-| `search` | `mindbridge search [QUERY ...]` | read, plus a lazy transcript cache |
-| `search_with_trace` | `mindbridge search-with-trace [QUERY ...]` | read, plus a lazy transcript cache |
-| `ask` | `mindbridge ask [QUESTION ...]` | read, plus a lazy transcript cache |
-| `get` | `mindbridge get MEMORY_ID` | read |
-| `speech` | `mindbridge speech MEMORY_ID` | read, plus a transcript cache |
-| `faces` | `mindbridge faces MEMORY_ID` | read, plus a face-analysis cache |
-| `register_speaker` | `mindbridge register-speaker SPEAKER_ID NAME` | write |
-| `register_identity` | `mindbridge register-identity IDENTITY_ID NAME` | write |
-| `reinforce` | `mindbridge reinforce MEMORY_ID ...` | write |
-| `list` | `mindbridge list` | read |
-| `delete` | `mindbridge delete MEMORY_ID` | destructive, idempotent |
-| `reindex` | `mindbridge reindex` | maintenance |
-| `optimize` | `mindbridge optimize` | maintenance |
-| `close` | — | lifecycle: one invocation opens and closes one `Memory` |
+| `jina-omni` | `--embedder` | pinned Jina Omni model, revision, and 1024 dimensions |
+| `funasr` | `--transcriber` | pinned FunASR model and component revisions |
+| `openai` | `--embedder`, `--answerer`, `--transcriber` | `text-embedding-3-small`, `gpt-5-mini`, `whisper-1` |
 
-Plus exactly one command with no SDK counterpart:
+Only `openai` accepts a model suffix, for example `--answerer openai:gpt-5-mini`. Recipe names form
+a closed table; other backends use `--app`. The pinned Jina weights are CC BY-NC 4.0. The OpenAI
+recipe constructs the official SDK client, which performs its own `OPENAI_API_KEY` lookup;
+MindBridge never reads or prints the credential.
 
-| Command | Purpose |
-| --- | --- |
-| `mindbridge doctor` | Resolve the composition, exercise each configured backend's loader, and report — writing nothing |
+The Jina recipe executes upstream model code with `trust_remote_code=True`; its model and code
+revisions are both pinned. Review that code and the non-commercial weight license before selecting
+the recipe.
 
-Per-command options mirror the SDK keywords: `--occurred-at`, `--occurred-end`, `--metadata`,
-`--memory-type`, and `--context` on `add`; `--memory-type` on `add-many` and `add-stream`; `--limit`,
-`--memory-type`, `--reference-at`, and `--scope` on `search`, `search-with-trace`, and `ask`; the two
-search commands also accept `--occurred-from` and `--occurred-until` for strict event-overlap
-filtering; `--limit` and `--cursor` apply to `list`.
+### Commands
 
-`--cursor` is passed through exactly as it was returned and is never parsed.
+| Command | Operands and options | JSON result | `--url` |
+| --- | --- | --- | --- |
+| `add` | content; `--occurred-at`; `--occurred-end`; `--metadata`; `--memory-type`; `--context` | memory object | yes |
+| `add-many` | optional JSONL source; `--memory-type` | `{"memories":[...]}` | yes |
+| `add-stream` | optional JSONL source; `--memory-type` | `{"memories":[...]}` | no |
+| `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
+| `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | no |
+| `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope` | answer object | yes |
+| `get` | `MEMORY_ID` | memory object | yes |
+| `speech` | `MEMORY_ID` | `{"segments":[...]}` | no |
+| `faces` | `MEMORY_ID` | `{"observations":[...]}` | no |
+| `register-speaker` | `SPEAKER_ID NAME` | `{}` | no |
+| `register-identity` | `IDENTITY_ID NAME` | `{}` | no |
+| `reinforce` | one or more `MEMORY_ID` values | `{"reinforced":int}` | no |
+| `list` | `--limit`; `--cursor` | `{"items":[...],"next_cursor":...}` | yes |
+| `delete` | `MEMORY_ID` | `{"deleted":bool}` | yes |
+| `reindex` | none | `{"memories":int}` | no |
+| `optimize` | none | `{}` | no |
+| `doctor` | none | composition and loader report | yes |
 
-## Input
+Defaults match the SDK: `add`, `add-many`, and `add-stream` use `memory_type=semantic`; search uses
+`limit=10`; ask uses `limit=5`; list uses `limit=100`; optional retrieval roles and timestamps are
+unset. Timestamps must be timezone-aware ISO 8601 values. Cursors are opaque and passed through
+unchanged. `ask`, `speech`, and `faces` require the selected composition to supply their matching
+capabilities.
 
-Three forms, chosen so generated input never needs shell quoting.
+### Content and JSONL input
 
-**Positional atoms.** A bare argument is text, `@PATH` is a local file, and `@@TEXT` is text with a
-literal leading `@`. Order is preserved and becomes the ordered `ContentInput` sequence:
+Content commands (`add`, `search`, `search-with-trace`, and `ask`) accept exactly one of these
+forms:
 
-```bash
-mindbridge --embedder jina-omni add "Inspection evidence" @panel.png @note.wav
+- Positional atoms: bare values are text, `@PATH` is a local file, `@@TEXT` is text beginning with
+  a literal `@`, and `-` reads stdin. Order is preserved.
+- `--content-json VALUE`: a JSON string or a REST-shaped content-parts array. `VALUE` is literal
+  JSON, `@PATH` to a UTF-8 JSON file, or `-` for stdin. Local mode applies the Python size bounds.
+
+Passing positional atoms and `--content-json` together returns `validation_error` before any
+backend is composed or request is sent. Missing positional content reads stdin as one text atom;
+stdin may be claimed only once per invocation.
+
+Local `--content-json` adds one part source to the REST union:
+
+```json
+{"type":"input_file","path":"/srv/media/panel.png"}
 ```
 
-**Standard input.** A missing positional, or `-` in the atom list, reads all of stdin as one text
-atom. Stdin can be read once per invocation.
+`input_file.path` and positional `@PATH` are rejected with `--url`; send base64 media accepted by
+the [REST content contract](rest.md#content-input).
 
-```bash
-printf 'The spare key is in the blue toolbox.' | mindbridge --embedder jina-omni add
-```
-
-**`--content-json`.** Reads the same parts array REST and MCP accept — the identical
-`input_text` / `input_image` / `input_file` union, documented in
-[Content input](rest.md#content-input). The value is `-` for stdin, `@PATH` for a file, or the JSON
-itself. `--metadata`, `--context`, and `--scope` accept the same three forms.
-
-```bash
-mindbridge --embedder jina-omni add --content-json - <<'JSON'
-[{"type": "input_text", "text": "Inspection evidence"},
- {"type": "input_file", "path": "/srv/media/panel.png"}]
-JSON
-```
-
-Typed observation and retrieval examples:
+`--metadata` and `--context` on `add`, and `--scope` on the retrieval commands, each accept a
+literal JSON object, `@PATH`, or `-`. `add-many` and `add-stream` read non-empty JSONL from a
+literal value, `@PATH`, or stdin. Each non-blank line is an object with required `content` and
+optional `occurred_at`, `occurred_end`, `metadata`, and `context`; unknown fields are rejected.
+`--memory-type` applies to every line.
 
 ```bash
 mindbridge --embedder jina-omni add "The mug is on the table" \
@@ -225,224 +143,85 @@ mindbridge --embedder jina-omni search "Where is the mug?" \
   --scope '{"near":{"frame_id":"home/map","anchor":"subject","x":2,"y":1},"radius_m":0.75}'
 ```
 
-`--content-json` and the positional atoms are two ways to supply the **same** operand, not two
-halves of one, so passing both is refused with exit `3` during argument validation — before any
-backend is composed and before any request is sent. Preferring either would store a memory missing
-what the caller typed, or run a different query than the one that was asked.
+`add-many` collects all lines for one model batch and one SQLite transaction. `add-stream` commits
+and makes each line searchable before reading the next, but collects returned records for the
+CLI's single-document stdout result. It is therefore for finite JSONL; use
+[`Memory.add_stream`](python-sdk.md#memory-operations) for an unbounded source.
 
-The CLI adds exactly one part type to that union, `{"type": "input_file", "path": "..."}`. It is
-valid in local mode only, because the CLI runs on the same machine as the data directory and the SDK
-already accepts a `pathlib.Path` atom. REST and MCP refuse local paths on purpose, so in `--url`
-mode both this part type and `@PATH` are rejected with `unsupported_in_remote_mode`; send base64
-media in a data URL instead.
+### Output
 
-`add-many` and `add-stream` read JSONL, one object per line, each with `content` plus optional
-`occurred_at`, `occurred_end`, `metadata`, and `context`. `--memory-type` applies to every item.
-`add-many` collects the finite input into one embedding batch and one SQLite transaction.
-`add-stream` parses and commits one line before reading the next; a later failure leaves the
-committed prefix in the store. Each line's `content` is the same union, checked by the same rule, so
-a local path is refused in `--url` mode exactly as a single `add` refuses one.
+On success, stdout contains one JSON document and a trailing newline. Local results use the same
+memory, hit, answer, page, and deletion field vocabulary as [REST response objects](rest.md#response-objects).
+`search-with-trace` serializes the [Python retrieval trace](python-sdk.md#public-values).
+`SpeakerSegment` and `FaceObservation` use their public Python fields. Memory and hit documents
+carry `context` when typed semantics exist, identically in local and `--url` mode, with enum
+values as JSON strings and datetimes as ISO 8601.
 
-```bash
-mindbridge --embedder jina-omni add-many @import.jsonl
-mindbridge --embedder jina-omni add-stream @completed-observations.jsonl
-```
+Unless `--quiet` is set, commands write the resolved composition as one JSON document on stderr
+before executing. `--url` forwards successful owner response objects unchanged. Runtime
+failures write one [shared error envelope](rest.md#error-envelope) to stderr and nothing to stdout;
+remote envelopes, including `trace_id`, are forwarded unchanged.
 
-`add-stream` keeps input lazy but collects returned records for the CLI's one-document stdout
-contract, so it is for finite JSONL. Use Python `Memory.add_stream` or `AsyncMemory.add_stream` for
-an unbounded source.
+### Doctor and explain
 
-## Output
+`--explain` resolves and prints the selected composition without running the command. A command is
+still syntactically required.
 
-**One JSON document per invocation on stdout, and nothing else.** Diagnostics — the composition
-banner, warnings — are JSON on stderr. On failure, stdout is empty.
+`doctor` returns the installed MindBridge and Python versions plus composition-specific checks:
 
-Shapes are the REST response shapes, projected from the same values REST projects them from, so one
-field vocabulary covers three surfaces:
+- `--embedder` constructs each configured recipe, exercises its published loader probe, closes it,
+  and reports the data-directory state without writing memory data.
+- `--app` imports and resolves the target but does not call a factory, because that could open the
+  store.
+- `--url` calls the owner's `GET /healthz` with the configured timeout.
 
-| Command | stdout |
-| --- | --- |
-| `add`, `get` | `MemoryResponse` |
-| `add-many`, `add-stream` | `{"memories": [MemoryResponse, ...]}` |
-| `search` | `{"hits": [SearchHitResponse, ...]}` |
-| `search-with-trace` | `{"hits": [SearchHitResponse, ...], "trace": RetrievalTrace}` |
-| `ask` | `{"answer": str, "hits": [SearchHitResponse, ...], "abstained": bool, "abstention_reason": str \| null}` |
-| `list` | `{"items": [MemoryResponse, ...], "next_cursor": str \| null}` |
-| `delete` | `{"deleted": bool}` |
-| `speech` | `{"segments": [SpeakerSegment, ...]}` |
-| `faces` | `{"observations": [FaceObservation, ...]}` |
-| `reinforce` | `{"reinforced": int}` |
-| `reindex` | `{"memories": int}` |
-| `register-speaker`, `register-identity`, `optimize` | `{}` |
-| `doctor`, `--explain` | the composition document below |
+Loader failures are reported inside the successful doctor document so all configured slots can be
+inspected together. Operational diagnosis is covered in [operations](../operations.md).
 
-Memory and hit documents include `context` when typed semantics exist. The shape is identical in
-local and `--url` modes; enum values are JSON strings and datetimes are ISO 8601.
+## Errors and limits
 
-`SpeakerSegment` has no REST or MCP precedent, because `speech` has no route and no tool. Its fields
-are the public [`SpeakerSegment`](python-sdk.md) dataclass: `asset_id`, `start_ms`, `end_ms`, `text`,
-`speaker_id`, `speaker_name`, `identity_score`. When `speech` gains a route, the route must adopt
-this shape rather than inventing a second one.
+### Exit codes
 
-`FaceObservation` likewise follows the public dataclass fields: `asset_id`, `observed_at_ms`,
-normalized `bounding_box`, `identity_id`, `identity_name`, and `identity_score`.
+| Exit | `code` | Meaning |
+| --- | --- | --- |
+| 0 | — | success |
+| 1 | `internal_error` or an unmapped code | unexpected failure |
+| 2 | — | argparse syntax or type error |
+| 3 | `validation_error` | input rejected |
+| 4 | `memory_not_found` | memory does not exist |
+| 5 | `speaker_not_found` | speaker does not exist |
+| 6 | `model_error` | inspect `reason` and `retryable` |
+| 7 | `storage_error` | storage or remote request failure |
+| 8 | `index_unavailable` | vector index unavailable |
+| 9 | `storage_error/data_dir_in_use` | another live process owns the directory; use `--url` |
+| 10 | `configuration_error` | composition or remote-capability failure |
+| 11 | `model_output_truncated` | generation hit its output limit |
+| 12 | `identity_not_found` | face/voice identity does not exist |
+| 130 | — | interrupted |
 
-Every run echoes the resolved composition to stderr before executing, so a log records which model
-identity produced which write. `-q` suppresses it.
-
-```json
-{"source": "--embedder jina-omni", "data_dir": "/srv/assistant/.mindbridge",
- "embedder": {"recipe": "jina-omni", "class": "mindbridge.models.jina.JinaOmniEmbedder",
-              "slots": ["embedder"], "models": {"embedder": "jinaai/jina-embeddings-v5-omni-small-retrieval"},
-              "revision": "e3ae4b6e…", "embedding_dimension": 1024,
-              "license": "CC BY-NC 4.0", "extra": "local"},
- "answerer": null, "transcriber": null}
-```
-
-## Exit codes
-
-Stable, one per error code, so an agent can branch on `$?` without parsing anything.
-
-| Exit | `code` | Meaning | Retry? |
-| --- | --- | --- | --- |
-| 0 | — | Success | — |
-| 1 | `internal_error` | Unexpected failure; a bug | no |
-| 2 | — | Argument parsing; argparse's own status | no |
-| 3 | `validation_error` | Input rejected | no |
-| 4 | `memory_not_found` | | no |
-| 5 | `speaker_not_found` | | no |
-| 6 | `model_error` | See `reason` and `retryable` | conditional |
-| 7 | `storage_error` | See `reason` | conditional |
-| 8 | `index_unavailable` | | usually |
-| 9 | `storage_error` + `data_dir_in_use` | Another process owns `--data-dir`; **retry with `--url`** | yes |
-| 10 | `configuration_error` | No composition, unknown recipe, missing extra, an option the chosen composition does not own, or an operation with no `/v1` route in `--url` mode | no |
-| 11 | `model_output_truncated` | Generation stopped at an output token limit | no |
-| 12 | `identity_not_found` | Face/voice identity does not exist | no |
-| 130 | — | Interrupted | — |
-
-Exit `9` is the one status selected by `reason` rather than `code`, because it is the CLI's single
-transport decision. Exit `10` is the CLI's own: `configuration_error` is not an SDK exception, and
-none was added for it — the composition layer is the one policy the CLI owns.
-
-On failure the CLI writes the [shared error envelope](rest.md#error-envelope) to **stderr** as JSON
-and nothing to stdout. In `--url` mode the owner's envelope is forwarded verbatim, `trace_id` and
-all, and its `code` selects the exit status.
-
-Unlike REST, the CLI fills `subject` for every code. It runs as the invoking user on the machine
-that owns `data_dir`, so a local path or a failing batch position is information the caller already
-holds; over an unauthenticated HTTP API it would be server state.
-
-## `mindbridge doctor`
-
-Resolves the composition, exercises each configured backend's loader, and reports — without writing
-anything.
-
-```bash
-mindbridge --embedder jina-omni --transcriber funasr --data-dir /srv/assistant/.mindbridge doctor
-```
-
-```json
-{
-  "version": "0.2.0",
-  "python": "3.12.7",
-  "data_dir": "/srv/assistant/.mindbridge",
-  "data_dir_state": "free",
-  "composition": {
-    "source": "--embedder jina-omni",
-    "embedder": {
-      "recipe": "jina-omni",
-      "class": "mindbridge.models.jina.JinaOmniEmbedder",
-      "models": {"embedder": "jinaai/jina-embeddings-v5-omni-small-retrieval"},
-      "revision": "e3ae4b6e…",
-      "license": "CC BY-NC 4.0",
-      "extra": "local",
-      "probe": "weights",
-      "loader": "ok",
-      "embedding_model": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-      "embedding_space": "…",
-      "embedding_dimension": 1024,
-      "embedding_modalities": ["audio", "image", "text", "video"]
-    },
-    "answerer": null,
-    "transcriber": {
-      "recipe": "funasr",
-      "class": "mindbridge.models.funasr.FunASRTranscriber",
-      "probe": "import",
-      "loader": "failed",
-      "reason": "missing_dependency",
-      "detail": "torchaudio"
-    }
-  }
-}
-```
-
-`loader` is the point of the command: an under-declared dependency becomes one line before the first
-write instead of a run of silent ingestion failures. `probe` says how deep the check reached, so the
-report never overstates it:
-
-| `probe` | What `doctor` ran |
-| --- | --- |
-| `weights` | Constructed the backend and loaded its pinned weights |
-| `client` | Constructed the official SDK client, which resolves its own credentials |
-| `import` | Imported the deferred runtime. `FunASRTranscriber` publishes no loader, so this is the deepest check available without reaching into it |
-
-`data_dir_state` is `absent`, `free`, or `in use by another process`, determined without creating
-anything: with no lock file there is no live owner. With `--app` it is `owned by the application`,
-and the composition is resolved but **not called**, because calling the factory would open the
-store.
-
-`doctor` does not report the store's recorded embedding space. Reading it means either opening a
-`Memory` — which may re-embed, and so is a write — or duplicating the on-disk schema inside the CLI.
-The existing store-metadata guard already fails the first real operation with a clear error.
-
-## Current limits
+`configuration_error` reasons are `composition_missing`, `option_not_applicable`, `app_invalid`,
+`missing_dependency`, `composition_failed`, and `unsupported_in_remote_mode`. Exit 9 is selected by
+`reason` rather than outer code. Runtime errors use the JSON envelope; argparse exit 2 and interrupt
+exit 130 use their conventional plain stderr diagnostics.
 
 ### Operations without a remote route
 
-`--url` covers `add`, `add-many`, `search`, `ask`, `get`, `list`, and `delete`. The other nine CLI
-commands exit `10` with `unsupported_in_remote_mode` and name the surfaces that do support them.
-That mirrors the [REST gap](rest.md#operations-without-a-route) honestly rather than hiding it:
-`speech`, `faces`, identity registration, and `reinforce` are implementation gaps, and `reindex`
-and `optimize` are owner-process maintenance that must not be reachable by an unauthenticated
-client. `add-stream` remains local because REST has no client-streaming route.
-Remote callers submit completed observations with ordinary `add` requests.
-
-### Backends without a recipe
-
-`SentenceTransformersEmbedder` and `OpenCVFaceAnalyzer` have no named recipes. Their contracts
-require explicit model identities and, for OpenCV, explicit YuNet and SFace weight paths.
-`SentenceTransformersEmbedder` requires an explicit 40-character
-commit hash, and the choice of model is the application's; a recipe would have to pin one on the
-caller's behalf. Use `--app`, or the two-line composition in
-[Choosing an embedding backend](../quickstart.md#choose-an-embedding-backend).
+With `--url`, only `add`, `add-many`, `search`, `ask`, `get`, `list`, `delete`, and `doctor` are
+available. Other commands exit 10 with `unsupported_in_remote_mode`; their SDK operations have no
+REST route. The complete route boundary is listed in
+[REST operations without a route](rest.md#operations-without-a-route).
 
 ### Input limits
 
-Local mode applies the Python limits: 128 content parts per operation, 65,536 characters per text
-part, `limit` between 1 and 100, and media bounded only by disk. `--url` mode applies the REST
-limits, including the 8 MiB request body. See
-[REST input limits](rest.md#input-limits).
+Local `--app` and `--embedder` mode applies the Python bounds: at most 128 content parts, 65,536
+combined normalized text characters, 262,144 UTF-8 metadata bytes, 512 MiB per local asset, and
+search, answer, or page limits from 1 through 100. `--url` applies the REST bounds, including 16
+content parts and the 8 MiB request body. Local JSONL has no separate item-count cap; remote
+`add-many` is capped at 100 items by REST.
 
-### Absent features
-
-No `--format` flag, configuration file, `MINDBRIDGE_*` composition variable, plugin registry,
-backend registration by name, capture-event reducer, streaming output, interactive prompt, `serve`
-command, coordinate-frame transform, or metadata filter. `uvicorn my_application:app` already
-starts a server. `add-stream` still emits one document at EOF and is therefore for finite finalized
-JSONL; use `AsyncAudioStream`, `AsyncVisionStream`, or `AsyncCaptureStream` in Python for live
-sensor packets and associated partial/final/cancel capture events.
-
-## Benchmarks
-
-The benchmark family is unchanged:
-
-```bash
-mindbridge-bench --help
-mindbridge-bench eval --tasks list
-mindbridge-bench locomo-refined --help
-mindbridge-bench local-index --help
-```
-
-Benchmark commands exercise the public SDK and never define an alternate product path. Every
-benchmark unit receives a separate physical directory. See
-[the benchmark guide](../benchmarking.md).
+There is no configuration file, `MINDBRIDGE_*` composition variable, plugin registry, interactive
+prompt, streaming stdout, output-format switch, `serve` command, capture-event reducer, or
+coordinate-frame transform. Use the Python configuration boundary and an ASGI server instead of a
+second CLI configuration or server implementation. `add-stream` is for finite finalized JSONL;
+use `AsyncAudioStream`, `AsyncVisionStream`, or `AsyncCaptureStream` in Python for live sensor
+packets and associated update/final/cancel capture events.

@@ -1,189 +1,132 @@
 # Troubleshooting
 
-## `embedder` is required
-
-`Memory` does not choose a model. Construct an `EmbeddingBackend` explicitly:
+Start with the structured error instead of matching its message:
 
 ```python
-memory = Memory("./data", embedder=JinaOmniEmbedder())
-```
+from mindbridge import MindBridgeError
 
-Install `mindbridge[local]` for the built-in local adapter, or supply another implementation.
-
-## Provider client is not configured
-
-`OpenAIModels` accepts caller-owned clients per operation. Supply the client used by the failing
-operation:
-
-```python
-models = OpenAIModels(generation_client=client)
-```
-
-Configure keys, base URL, proxy, timeout, and retries on `client`, not on MindBridge.
-
-## Reading a MindBridge error
-
-Every exception deriving from `MindBridgeError` carries four attributes beside its stable `code`:
-
-```python
 try:
-    memory.ask("what happened yesterday?")
+    result = memory.ask("What happened yesterday?")
 except MindBridgeError as error:
-    error.code  # stable outer taxonomy, for example "model_error"
-    error.reason  # closed sub-vocabulary, for example "rate_limited"; may be None
-    error.stage  # which pipeline stage failed, for example "generate"; may be None
-    error.subject  # asset ID, memory ID, or batch position; may be None
-    error.retryable  # bool derived from reason, never a guess
+    print(error.code, error.reason, error.stage, error.subject, error.retryable)
 ```
 
-All four are optional and default to an unclassified, non-retryable failure, so existing handlers
-keep working. REST and MCP serialize the same five values; see
-[the REST error contract](api/rest.md#codes-and-reasons) for the vocabularies.
+`code` is the stable error family. `reason` narrows the cause, `stage` identifies the failed
+pipeline step, `subject` identifies the affected item when available, and `retryable` says whether
+the same request can succeed later. CLI, REST, and MCP envelopes return the same classification
+fields and add a `trace_id`; see the [REST error contract](api/rest.md#codes-and-reasons).
 
-## Provider request failed
+For composition failures, run the same selection through `mindbridge ... doctor`: bundled recipes
+exercise their loader, `--url` checks `/healthz`, and `--app` verifies the import without calling a
+factory that could open the store.
 
-MindBridge returns a `ModelError` whose message is an author-written literal, never the provider's
-response. The provider's own exception survives as `__cause__`, so a local traceback still shows the
-root cause, and `reason` classifies it from the official SDK's exception classes:
+## Memory does not open
 
-| `reason` | Provider condition | Retry |
-| --- | --- | --- |
-| `auth_failed` | `openai.AuthenticationError` | Never; fix the credential |
-| `rate_limited` | `openai.RateLimitError` with any other `code` | Yes, after a delay |
-| `quota_exhausted` | `openai.RateLimitError` whose `code` is `insufficient_quota` | Never; the account is out of quota |
-| `timeout` | `openai.APITimeoutError` | Yes |
-| `connection_failed` | `openai.APIConnectionError` | Yes |
-| `request_rejected` | `openai.BadRequestError` | Never; the request itself is wrong |
-| unset | Anything else | Treated as permanent |
+### Data directory is already in use
 
-The SDK raises `RateLimitError` for every `429`, exhausted billing included, so the two rows above
-are separated by the provider's own `APIError.code` rather than by its message. Only
-`rate_limited` reaches `503` with a `Retry-After`; `quota_exhausted` is a `502`, because an agent
-that retries an exhausted account never stops.
+`reason="data_dir_in_use"` means another live `Memory` or process owns the directory. Close that
+owner, address it through its REST interface, or choose a different directory. Do not add a tenant
+field to share one directory: physical directories are the isolation boundary.
 
-Check `error.retryable` instead of inspecting the message. It is `False` unless `reason` is one of
-the transient values above, because failing to retry a transient error costs one call while retrying
-a permanent one never terminates. The provider SDK still owns its own retry and network behavior.
+The error is retryable because the current owner may exit. Python, CLI, and MCP errors retain the
+local path in `subject`; unauthenticated REST redacts storage, index, and internal subjects. Treat
+MCP envelopes as sensitive when the host uses a network transport.
 
-## The operation says which stage failed
+### Store metadata mismatch
 
-Every public error carries `stage`: `open`, `content.prepare`, `embed`, `form`, `transcribe`,
-`recognize`, `generate`, `storage.write`, `storage.hydrate`, `storage.lookup`, `index.search`,
-`index.sync`, `retrieval.rank`, or `close`. These are the same names the OpenTelemetry spans use, so
-a failure and its trace agree. `stage` is `null` when MindBridge cannot attribute the failure to one
-stage.
+The directory was created with a different embedding model, vector space, dimension,
+transcription space, face-analysis recipe, or index recipe. Reopen it with the original
+configuration, or create a new directory and ingest the source content with the new model.
 
-## A batch failed and I do not know which item
+MindBridge performs only recognized bundled recipe upgrades automatically. `reindex()` cannot
+convert embeddings or transcripts; it rebuilds the Zvec projection from the durable values already
+in SQLite.
 
-`add_many` writes in one transaction, so one bad item fails the whole batch. The raised error's
-`subject` names the position, for example `contents[7]`. Fix that item and resubmit the batch.
+### Schema is unsupported
 
-## Answering returns 501 rather than 502
+`reason="schema_unsupported"` means this MindBridge version cannot read the SQLite schema. Use a
+version that supports the store. Do not edit `state.sqlite3` by hand.
 
-`ask` without an `answerer` is a permanent misconfiguration, not an upstream failure, so REST reports
-`501` with `reason: "backend_not_configured"`. Construct `Memory` with a generation backend. A `502`
-means a real upstream failure that will not succeed on retry; only `503` invites one.
+### Zvec is missing or damaged
 
-## Remote URL is rejected
+A missing `zvec/` directory is rebuilt on the next open without calling the embedding model for
+stored records. If the directory is damaged, close its owner, move only `zvec/` aside, and reopen
+MindBridge. Keep the moved directory until a known search succeeds. Never move `state.sqlite3` or
+`assets/`; they are authoritative.
 
-HTTP(S) URLs are not content atoms and REST/MCP do not download them. Fetch the resource with the
-application's HTTP stack, then pass `Blob(data, media_type, name)` or a local `Path`.
+For backup and recovery procedures, see [operations](operations.md).
 
-## Data directory is already in use
+## Search returns no hits
 
-Exactly one live `Memory` owns a directory. Stop the other process or select another physical
-directory. Do not add a logical tenant or request field to work around the lock. This failure is
-`storage_error` with `reason: "data_dir_in_use"` and is the one storage failure that is retryable;
-the directory travels in `subject` rather than in the message, so an unauthenticated REST client
-never sees the local path. `reason: "schema_unsupported"` is its opposite: it is permanent, reports
-HTTP 500, and needs a different MindBridge version or a new directory.
+An empty tuple is a valid search result. Candidates below `minimum_relevance` are rejected; an
+unresolved top-two tie may also be withheld when `limit=1`.
 
-## Store metadata mismatch
+Before lowering thresholds:
 
-The directory was opened with a different embedding model, embedding space, dimension,
-transcription space, or unknown index recipe. Known older retrieval-key recipes migrate by
-re-embedding automatically, as do the bundled Jina v3, v4, and v5 input-recipe upgrades to v6.
-The context-key v6, grouped-range v7, and context-key v8 upgrades to v9 also re-embed records to
-remove opaque identity IDs from retrieval text. Those upgrades load the model and re-embed every
-record, so back up the directory and budget model memory, elapsed time, and free disk before
-startup. Other mismatches require the original adapter or a new directory. `reindex()` itself
-cannot change stored vectors or transcripts.
+1. Confirm the query and stored content use modalities supported by the embedder.
+2. Confirm the expected record exists with `get()` or `list()`.
+3. Run `search_with_trace()` and inspect each candidate's terminal rejection reason.
+4. Check event-time and memory-type filters.
 
-## Missing or damaged Zvec index
+The defaults and valid ranges are in [local memory settings](configuration.md#local-memory-settings).
 
-Close the owner and remove only the `zvec/` subdirectory if it is damaged. Reopening the same
-directory rebuilds the projection from SQLite without re-embedding content. Do not remove
-`state.sqlite3` or `assets/`.
+## A model operation fails
 
-## Missing local model dependency
+### Backend is not configured
 
-Install the matching optional extra:
+Every memory requires an embedder. `ask()` additionally requires an answerer; `speech()` and
+`faces()` require their matching capabilities. Add the missing declarative slot or inject the
+corresponding backend. See [configuration](configuration.md).
 
-```bash
-uv add "mindbridge[local]"
-```
+### Optional dependency is missing
 
-Jina also needs its pinned remote code and media processors. FunASR is loaded only when speech
-analysis is first requested.
+Install the narrow extra for the selected adapter: `local`, `openai`, or `face`. REST and MCP need
+their own `server` and `mcp` extras. The [extras table](configuration.md#install-only-the-surfaces-you-use)
+lists each surface.
 
-## Unsupported modality
+### Modality is unsupported
 
-Adapter capabilities are explicit. Either select a model that supports the modality or configure
-a transcriber for audio fallback. MindBridge does not silently remove image or video evidence.
+Adapters declare the media they accept. Select a model with that capability or configure a
+transcriber for supported audio fallback. MindBridge does not silently drop unsupported image or
+video evidence.
 
-## Media exceeds an inline model limit
+### Provider request fails
 
-The OpenAI adapter bounds the media the request actually carries. Media travels base64-encoded, so
-the limits are 20 MiB per item and 64 MiB per call on the wire, roughly 15 MiB per file and 48 MiB
-in aggregate on disk. Answer generation removes oversized or overflow evidence assets individually,
-keeps fitting siblings from the same hit, and falls back to its text when no media fits; an
-oversized question asset or embedding input still fails.
-`mindbridge.grounding.media_elided_hits` and
-`mindbridge.grounding.dropped_hits` on the generation span count the retrieved evidence the budget
-removed, so a shrunken payload is never silent.
-Use a provider-specific adapter that uploads or streams large assets through that provider's SDK.
-MindBridge does not expose local `file://` paths as a compatibility transport.
+MindBridge preserves the provider exception as `__cause__` and classifies known SDK failures in
+`reason`. Retry only when `error.retryable` is true. Configure credentials, base URL, timeout,
+proxy, and provider retry policy on the provider SDK or declarative OpenAI slot.
 
-## A provider rejects a short video
+If `code="model_output_truncated"`, generation reached its output-token limit. Increase the
+adapter's generation limit or reduce the `ask()` evidence limit; retrying the identical request is
+not a fix.
 
-When the provider documents a minimum duration and accepts images, configure that boundary as
-`generation_min_video_seconds` on `OpenAIModels`. A shorter local video is then represented by four
-ordered JPEG stills before the first request, subject to the same inline media budget. This retains
-visual order but not native motion or audio, so leave it disabled unless the provider requires it.
+Provider-specific constructor controls and media limits are documented in the
+[Python adapter reference](api/python-sdk.md#bundled-adapters) and
+[REST input limits](api/rest.md#input-limits).
 
-If an OpenAI-compatible provider explicitly reports that a grounded video is too short, the
-adapter retries once using each hit's text and non-video media. It never removes a video supplied
-as part of the question. Inspect `mindbridge.grounding.media_elided_hits` and
-`mindbridge.model.request_count`; the retry is observable and its token total is deliberately
-marked incomplete because the rejected request reports no usage. Other bad requests still fail
-without discarding evidence.
+## Content is rejected or not fetched
 
-## Answers fail with `model_output_truncated`
+MindBridge never fetches HTTP(S) content. In Python, a URL-shaped string is application text;
+download media with the application's HTTP client, then pass `Blob` or a local `Path`. REST and MCP
+reject network URLs and server filesystem paths.
 
-Generation reached an output token limit before it finished, so MindBridge refused the partial
-answer instead of returning it. This is deterministic; retrying changes nothing. Raise
-`generation_max_tokens` on the adapter, or lower the `ask` limit so less evidence competes for the
-model's output budget. `gen_ai.response.finish_reasons` on `mindbridge.model.generation` records
-the provider's stop reason for every call, truncated or not.
+REST media validation failures return `422`. Use the ordered content-part formats in the
+[REST reference](api/rest.md); do not send a local path from the client machine.
 
-## REST returns 422 for media
+## REST or MCP cannot share the store
 
-REST accepts base64 data URLs, `file_data`, or a stored `file_id`. It rejects remote URLs and local
-paths. Decode failures, MIME mismatches, ambiguous sources, and unknown fields are validation
-errors.
+The Python application, a REST process, and an MCP process cannot open the same `data_dir`
+concurrently. Pass one constructed `Memory` into the transport running in that process, address the
+existing REST owner, or allocate a separate directory.
 
-## REST has no authentication
+The REST app and network-hosted MCP server have no MindBridge authentication. Put them behind the
+access controls described in [deployment](deployment.md); stdio MCP inherits the host process
+principal.
 
-This is the intended boundary. Add authentication middleware or deploy behind an authenticated
-gateway. Do not place the bare app on an untrusted network.
+## Async operations are unexpectedly slow
 
-## MCP cannot open the directory
+`AsyncMemory` runs the synchronous embedded core in worker threads. Provider adapters must still
+be thread-safe and control their own network timeouts and concurrency. Tune or replace the adapter;
+do not open a second owner on the same directory.
 
-The Python application, REST process, and MCP process cannot share a directory concurrently.
-Either expose MCP from the existing owner or assign a separate physical memory domain.
-
-## Async calls block unexpectedly
-
-`AsyncMemory` moves the synchronous embedded core to worker threads. Provider adapters still need
-to be thread-safe. Tune or replace the provider adapter rather than adding a second retry or async
-compatibility layer inside MindBridge.
+For spans, model latency, and token accounting, see [telemetry](operations.md#telemetry).

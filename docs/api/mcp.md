@@ -1,190 +1,116 @@
 # MCP API
 
-The optional MCP adapter currently exposes six typed tools over one local `Memory` through stdio.
-It is a schema and dispatch surface over the SDK execution plane, not a separate memory service.
-It accepts finalized media through existing content parts. Live audio and vision packet ingestion,
-plus associated `StreamEvent` reduction, remain Python-only because MCP tool calls are finite
-requests.
+## Purpose
 
-## Install and run
+The optional MCP adapter exposes exactly six typed tools over one injected synchronous `Memory`.
+It validates tool input, calls the matching SDK operation, and returns structured public values.
+It does not own storage, provider selection, or the injected memory. Finalized media arrives
+through ordinary content parts; live audio and vision packet ingestion, and `StreamEvent`
+reduction, stay Python-only because a tool call is a finite request.
+
+## Invocation
+
+Install the MCP extra together with the extras required by the chosen backends, then host the
+server in the application that owns `Memory`:
 
 ```bash
-uv add "mindbridge[local,mcp,openai]"
+uv add "mindbridge[local,mcp]"
 ```
-
-Host the adapter in application code so provider clients and their lifecycle remain explicit:
 
 ```python
-from openai import OpenAI
-
-from mindbridge import JinaOmniEmbedder, Memory, OpenAIModels
+from mindbridge import Memory
 from mindbridge.api.mcp import build_mcp_server
 
-with OpenAI() as client:
-    with Memory(
-        "/var/lib/mindbridge/assistant",
-        embedder=JinaOmniEmbedder(),
-        answerer=OpenAIModels(generation_client=client),
-    ) as memory:
-        build_mcp_server(memory).run("stdio")
-```
-
-The application owns the provider client and `Memory`. Do not run REST, another MCP process, or a
-second Python `Memory` against the same path concurrently.
-
-## Multimodal content
-
-`content`, `query`, and `question` accept a non-blank string or 1 through 16 ordered parts:
-
-- `{"type":"input_text","text":"..."}`
-- `{"type":"input_image","image_url":"data:image/png;base64,..."}`
-- `{"type":"input_image","file_id":"..."}`
-- `{"type":"input_file","file_url":"data:video/mp4;base64,..."}`
-- `{"type":"input_file","file_data":"<base64>","media_type":"audio/wav"}`
-- `{"type":"input_file","file_id":"..."}`
-
-Source fields are mutually exclusive. Inline base64 is length-checked before decoding and
-byte-checked afterward; `file_data` has an 8 MiB decoded ceiling, while data URL strings have a
-tighter 8,192-character schema limit. Remote URLs, local paths, `file:` URLs, unknown nested
-fields, and `input_image.detail` are rejected. Fetch remote media in the host application or use
-the Python API for direct `Path` input.
-
-## Tools
-
-### `add_memory`
-
-Stores one stable text or multimodal record.
-
-| Argument | Type | Required | Default |
-| --- | --- | --- | --- |
-| `content` | string or ordered content parts | yes | — |
-| `occurred_at` | timezone-aware ISO 8601 datetime or null | no | null |
-| `occurred_end` | timezone-aware ISO 8601 datetime or null | no | null |
-| `metadata` | JSON object or null | no | null |
-| `memory_type` | `semantic`, `episodic`, or `procedural` | no | `semantic` |
-| `context` | typed observation context or null | no | null |
-
-The structured result contains `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`,
-`occurred_at`, `occurred_end`, `metadata`, and optional typed `context`. An event end requires a
-start and must be later than it. Input context carries basis, source ID, confidence, validity, and
-optional spatial pose. Asset results contain safe metadata but never a local path. Repeating
-canonical input returns the existing record. The tool is marked as a non-destructive, idempotent
-write.
-
-Example arguments:
-
-```json
-{
-  "content": [
-    {"type": "input_text", "text": "Design review recording"},
+with Memory.from_config(
     {
-      "type": "input_file",
-      "file_data": "AAAA",
-      "media_type": "video/mp4"
+        "data_dir": "./data/assistant",
+        "embedding": {"provider": "jina-omni"},
     }
-  ],
-  "memory_type": "episodic",
-  "metadata": {"source": "review"},
-  "context": {
-    "basis": "observation",
-    "source_id": "camera-1:frame-42",
-    "confidence": 0.94
-  }
-}
+) as memory:
+    build_mcp_server(memory).run("stdio")
 ```
 
-### `search_memories`
+The example uses the pinned Jina recipe; review its upstream code and license boundary in
+[configuration](../configuration.md#embedding-choices).
 
-Searches local memories.
+```text
+build_mcp_server(memory: Memory) -> MCPServer[None]
+```
 
-| Argument | Type | Required | Default |
+`build_mcp_server` neither opens nor closes the supplied memory. Do not run another `Memory`, REST
+process, or MCP process against the same `data_dir`. Composition and process ownership are defined
+in [architecture](../architecture.md) and [configuration](../configuration.md).
+
+MindBridge adds no authentication to any MCP transport. Stdio inherits local process permissions;
+an SSE or streamable-HTTP host must add authentication, authorization, TLS, request limits, and
+rate limits. MCP error `subject` is unredacted and may contain an owner-local path.
+
+## Contract
+
+### Content input
+
+`content`, `query`, and `question` use the same strict `input_text`, `input_image`, and `input_file`
+union as [REST content input](rest.md#content-input): a non-blank string or 1 through 16 ordered
+parts. Source fields are mutually exclusive. Data URLs must contain base64 media; `file_data`
+requires a concrete image, video, or audio MIME type.
+
+Remote URLs, local paths, `file:` URLs, unknown nested fields, and `input_image.detail` are
+rejected. The MCP-specific media bounds are listed below.
+
+### Tools
+
+| Tool | Arguments and defaults | Structured result | Annotation |
 | --- | --- | --- | --- |
-| `query` | string or ordered content parts | yes | — |
-| `limit` | integer from 1 through 100 | no | 10 |
-| `memory_type` | one memory role or null | no | null |
-| `reference_at` | timezone-aware ISO 8601 datetime or null | no | current UTC |
-| `occurred_from` | timezone-aware ISO 8601 datetime or null | no | null |
-| `occurred_until` | timezone-aware ISO 8601 datetime or null | no | null |
-| `scope` | valid/known time and optional same-frame radius scope, or null | no | null |
+| `add_memory` | required `content`; `occurred_at=None`; `occurred_end=None`; `metadata=None`; `memory_type="semantic"`; `context=None` | `MemoryResult` | idempotent write |
+| `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None` | `{"hits":[SearchHitResult,...]}` | retrieval |
+| `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None` | `AnswerResponse` | retrieval |
+| `get_memory` | required `memory_id` | `MemoryResult` | read-only |
+| `list_memories` | `limit=100`; `cursor=None` | `PageResult` | read-only |
+| `delete_memory` | required `memory_id` | `{"deleted":bool}` | destructive, idempotent |
 
-The result is `{"hits": [...]}`. Each hit contains memory fields plus `score`. The complete ordered
-query and bounded focused keys from its first text atom and media supply dense candidates; the
-focused text also supplies lexical candidates. All routes collapse aggregate or atomic document
-keys to parent memories. Relative temporal expressions resolve against
-`reference_at`; when omitted, a valid English declaration such as `Today is May 2, 2024` replaces
-current UTC, while an explicit value always wins. Absolute months and years such as
-`December 2023`, `2024年4月`, or `in 2025` select the matching event-time range. Search is
-conservatively marked non-read-only because it may drain durable index work or populate transcript
-caches; it never reinforces a hit merely for being returned. `occurred_from` and `occurred_until`
-hard-filter overlapping event intervals using a half-open range. Either bound may be omitted; any
-bound excludes memories without an event time, and two bounds require
-`occurred_until > occurred_from`.
+All timestamps must be timezone-aware. An event end requires a start and must be later than it.
+Search event bounds are a half-open overlap filter; two bounds require
+`occurred_until > occurred_from`. `memory_type` is `semantic`, `episodic`, or `procedural`.
+Pagination cursors are opaque and must be passed back unchanged.
 
-`scope.valid_at` selects world validity and `scope.known_at` selects the transaction version known
-then. `scope.near` and `scope.radius_m` must appear together; frame ID and observer/subject anchor
-must match stored spatial context. SQLite reapplies the filter after candidate retrieval.
+`context` carries typed observation basis, source ID, confidence, validity, and optional spatial
+pose. `scope.valid_at` selects world validity and `scope.known_at` selects the transaction
+version known then; `scope.near` and `scope.radius_m` must appear together, and their frame ID
+and observer/subject anchor must match the stored spatial context. SQLite reapplies both filters
+after candidate retrieval.
 
-### `ask_memory`
+`add_memory` is content-addressed. `delete_memory` reports whether a record existed. Search and
+answer are not marked read-only because their SDK path may persist lazy transcript caches; they are
+also not advertised as idempotent. Every tool has `open_world_hint=false`.
+`ask_memory` requires an answerer in the injected memory; without one it returns
+`model_error/backend_not_configured`.
 
-Answers only from retrieved local memories.
+### Result objects
 
-| Argument | Type | Required | Default |
-| --- | --- | --- | --- |
-| `question` | string or ordered content parts | yes | — |
-| `limit` | integer from 1 through 100 | no | 5 |
-| `memory_type` | one memory role or null | no | null |
-| `reference_at` | timezone-aware ISO 8601 datetime or null | no | current UTC |
-| `scope` | valid/known time and optional same-frame radius scope, or null | no | null |
+Successful calls populate MCP `structuredContent`:
 
-The result contains `answer`, the exact grounding `hits`, `abstained`, and
-`abstention_reason` (`no_evidence`, `insufficient_evidence`, or null). Like search, the tool is
-marked non-read-only because retrieval may maintain local caches/index state. The built-in outbound
-answer request serializes each distinct question/evidence asset once even if several hits refer to
-it. It reserves the raw-media budget for question assets, keeps ranked evidence media that fits, and
-retains overflow hits as text when possible. It also sends each hit's content, `memory_type`,
-metadata, and one primary timestamp to the configured generation endpoint: `occurred_at` when the
-event time is known, otherwise `created_at`. An `occurred_end` is included when present.
+| Object | Fields |
+| --- | --- |
+| `AssetResult` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name` |
+| `MemoryResult` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context` |
+| `SearchHitResult` | all memory fields plus `score` |
+| `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
+| `PageResult` | `items`, `next_cursor` |
 
-### `get_memory`
+These fields have the same meanings as the [REST response objects](rest.md#response-objects).
+Successful result objects never serialize filesystem paths; error `subject` is the exception
+described above.
 
-Reads one record by stable ID.
+## Errors and limits
 
-| Argument | Type | Required |
-| --- | --- | --- |
-| `memory_id` | non-blank, trimmed string | yes |
+### Validation and errors
 
-The structured result is one memory record. The tool is read-only.
+Only the six documented names and their exact top-level arguments are accepted. An unknown tool or
+top-level argument returns `validation_error/unknown_field`; schema and SDK input failures return
+`validation_error/input_invalid`. Unknown values are not echoed.
 
-### `list_memories`
-
-Lists newest memories with the SDK's opaque stable keyset cursor.
-
-| Argument | Type | Required | Default |
-| --- | --- | --- | --- |
-| `limit` | integer from 1 through 100 | no | 100 |
-| `cursor` | non-empty opaque string or null | no | null |
-
-The result is `{"items":[...],"next_cursor":"..."}`. Each item has the same fields as
-`get_memory`. Omit `cursor` for the first page, then pass `next_cursor` back unchanged until it is
-`null`. The tool is read-only.
-
-### `delete_memory`
-
-Idempotently deletes one record.
-
-| Argument | Type | Required |
-| --- | --- | --- |
-| `memory_id` | non-blank, trimmed string | yes |
-
-The result is `{"deleted":true}` or `{"deleted":false}`. The tool is marked destructive and
-idempotent.
-
-## Validation and errors
-
-Only the six documented tool names and their exact top-level arguments are accepted. Unknown,
-tenant, user, and run fields are rejected rather than silently ignored.
-
-Tool failures expose the same JSON envelope the REST adapter returns, in the MCP error result:
+Failed tool calls set `isError` and carry the same JSON envelope as
+[REST](rest.md#error-envelope) in their text content:
 
 ```json
 {
@@ -194,7 +120,7 @@ Tool failures expose the same JSON envelope the REST adapter returns, in the MCP
   "stage": null,
   "subject": null,
   "message": "tool arguments contain unknown fields",
-  "trace_id": "trace_0123456789abcdef",
+  "trace_id": "trace_0123456789abcdef0123456789abcdef",
   "issues": [
     {
       "location": ["arguments", "run_id"],
@@ -205,92 +131,47 @@ Tool failures expose the same JSON envelope the REST adapter returns, in the MCP
 }
 ```
 
-Stable codes are `validation_error`, `memory_not_found`, `speaker_not_found`,
-`identity_not_found`, `model_error`, `model_output_truncated`, `storage_error`,
-`index_unavailable`, `mindbridge_error`, and `internal_error`. `model_output_truncated` is the
-deterministic subset of `model_error`: generation stopped at an output token limit, so the same
-request fails the same way again.
+Stable SDK codes are `mindbridge_error`, `validation_error`, `memory_not_found`,
+`speaker_not_found`, `identity_not_found`, `model_error`, `model_output_truncated`,
+`storage_error`, and `index_unavailable`; unexpected failures use `internal_error`. Reasons and
+retryability use the [shared vocabulary](rest.md#codes-and-reasons).
 
-`reason`, `stage`, `subject`, `retryable`, and `issues` carry the same meanings and the same closed
-vocabularies as [the REST error contract](rest.md#codes-and-reasons); `retryable` is a lookup on
-`reason`, never a guess. `trace_id` correlates one failure with server logs across surfaces.
-
-Unlike REST, MCP forwards `subject` for every code: an MCP server runs in the owner process as the
-same user, so a subject naming local state is already visible to the caller. Provider responses,
-credentials, and native-index details are still never included.
-
-## Agent consumption contract
-
-MCP is MindBridge's current agent-native surface. An agent can select and call every exposed
-operation from the tool name, description, annotations, and JSON schema; human-oriented output is
-not part of the contract.
-
-- Tool schemas are strict. Unknown arguments fail instead of being guessed or ignored.
-- Successful calls return structured records, hits, answers, or deletion state with stable IDs.
-- Failures use stable codes, so recovery does not depend on matching prose.
-- Read, idempotency, and destructive annotations disclose side effects before a call.
-- Search and answer limits are bounded; exact grounding hits remain available for audit or a later
-  agent step.
-- Tool names, argument schemas, result schemas, annotations, and error codes are public contracts;
-  changing one requires the same compatibility treatment as changing the Python or REST API.
-- MCP capabilities are derived from the SDK. A tool validates transport input, calls the matching
-  `Memory` operation, and serializes its result; it must not duplicate memory policy.
-
-An integration may search before a turn or add a result afterward, but that lifecycle policy is not
-hidden inside the MCP server. Automated writes must remain observable and preserve whether content
-came from a user, an agent, or source evidence.
-
-## Programmatic adapter
-
-Applications embedding MCP pass an existing synchronous memory:
-
-```python
-from mindbridge import JinaOmniEmbedder, Memory
-from mindbridge.api.mcp import build_mcp_server
-
-with Memory("./data/agent", embedder=JinaOmniEmbedder()) as memory:
-    server = build_mcp_server(memory)
-    server.run("stdio")
-```
-
-`build_mcp_server` does not take ownership of the supplied instance.
-The MCP SDK runs these synchronous tool functions in its AnyIO worker pool; MindBridge does not
-maintain a second sync/async dispatch layer.
-
-## Current limits
+Unlike unauthenticated REST, the MCP adapter retains `subject` for every SDK code to support owner
+diagnostics. That is safe only for trusted clients; a network host must protect or redact the error
+envelope at its outer boundary. Provider exceptions, credentials, and unexpected implementation
+details are still never serialized.
 
 ### Operations without a tool
 
-The six current tools do not yet cover the complete SDK capability inventory:
+The following Python operations have no MCP tool:
 
-| Operation | MCP | REST | Note |
-| --- | --- | --- | --- |
-| `add_many` | absent | `POST /v1/memories/batch` | Implementation gap |
-| `add_stream` | absent | absent | Python iterators are process-local; call `add_memory` per completed chunk |
-| `search_with_trace` | absent | absent | Python/local-CLI retrieval diagnostics |
-| `speech` | absent | absent | Not implemented on any transport yet |
-| `faces` | absent | absent | Python-only visual identity analysis |
-| `register_speaker` | absent | absent | Not implemented on any transport yet |
-| `register_identity` | absent | absent | Python-only face/voice identity naming |
-| `reinforce` | absent | absent | Not implemented on any transport yet |
-| `reindex` | absent | absent | Owner-process maintenance |
-| `optimize` | absent | absent | Owner-process maintenance |
+| Operation | Boundary |
+| --- | --- |
+| `add_many` | Call `add_memory` per item or use the REST batch route |
+| `add_stream` | Call `add_memory` for each completed observation |
+| `search_with_trace` | Python and local-CLI diagnostics |
+| `speech`, `faces` | Owner-process media analysis |
+| `register_speaker`, `register_identity` | Owner-process identity naming |
+| `reinforce` | Owner-process feedback |
+| `reindex`, `optimize` | Owner-process index maintenance |
 
-These are implementation gaps, not a separate MCP execution model. Additive tools must map to the
-existing SDK operations and carry appropriate read, idempotency, and destructive annotations.
+`list_memories` is part of the six-tool surface and supports the same default page size and opaque
+cursor contract as `Memory.list`.
 
 ### Input limits
 
-MCP accepts up to 16 content parts, 65,536 characters per text part, and 8 MiB of inline media per
-part. It has no total request budget, because stdio framing has no equivalent of an HTTP body limit;
-REST caps a whole request at 8 MiB instead. The Python API accepts up to 128 parts. See the
-[REST limits table](rest.md#input-limits) for the three side by side.
+| Bound | MCP value |
+| --- | --- |
+| Content parts | 1 through 16 |
+| One data-URL source string | 8,192 characters |
+| One decoded `file_data` value | 8 MiB |
+| Normalized text, including combined text parts | 65,536 characters |
+| Search, answer, or page `limit` | 1 through 100 |
+| Serialized metadata | 262,144 UTF-8 bytes |
+| `file_id` or `filename` | 255 characters |
 
-### Absent features
-
-There is no large-file upload tool, local-path input, capture-stream tool, coordinate-frame
-transform, chunking option, per-asset vector control, or learned reranker option. The OpenAI adapter
-inlines at most 20 MiB per encoded media item and 64 MiB per embedding or generation call, roughly
-15 MiB per file and 48 MiB in aggregate on disk; generation admits ranked evidence within those
-budgets. Answer text evidence is limited to 4 MiB. Use a provider-specific upload adapter for larger
-media.
+MCP has no aggregate framing budget, but each inline media value is bounded before model or storage
+work. It has no local-path input, remote fetch, large-file upload tool, capture-stream tool,
+coordinate-frame transform, logical scope, or separate authentication policy; the MCP host owns
+transport access control. Configured model backends may
+impose a smaller aggregate budget, including the [OpenAI inline limits](python-sdk.md#bundled-adapters).

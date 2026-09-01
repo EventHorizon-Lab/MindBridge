@@ -1,62 +1,60 @@
-# Memory types, temporal reasoning, and decay
+# Memory types, time, and decay
 
-MindBridge supports semantic, episodic, and procedural memory as explicit roles on the same
-durable record. A typed context can further identify observations, entities, events, state,
-relations, affect, traits, and response policies with source evidence, confidence, validity, and
-transaction time. Event-time retrieval and optional, non-destructive decay share the existing
-SQLite and Zvec path; they do not create separate stores, workers, or logical account scopes.
+MindBridge stores semantic, episodic, and procedural roles on the same durable record. An optional
+typed context refines that record into observations, entities, events, state, relations, affect,
+traits, and response policies carrying source evidence, confidence, and their own validity and
+transaction time. Event time, type filtering, optional temporal parsing, and optional decay all
+use the ordinary SQLite and Zvec path; they do not create separate stores or scopes.
 
-## Support boundary
+| Control | Effect |
+| --- | --- |
+| `memory_type` | Hard exact-role filter when supplied. |
+| `occurred_from` / `occurred_until` | Hard event-overlap filter. |
+| Temporal phrases in query text | Soft ranking signal relative to `reference_at`. |
+| Decay and reinforcement | Soft ranking signals; they never delete or rewrite content. |
 
-| Capability | Current support | Deliberate boundary |
+## Memory types
+
+| Type | Intended content | Kernel behavior |
 | --- | --- | --- |
-| Semantic memory | `MemoryType.SEMANTIC`, the default; optional entity/state/relation/trait context | Automatic extraction runs only when an explicit `FormationBackend` is configured |
-| Episodic memory | `MemoryType.EPISODIC` plus event/affect context and optional `occurred_at`/`occurred_end` | Capture adapters still own episode segmentation and finality |
-| Procedural memory | `MemoryType.PROCEDURAL` for instructions and reusable routines | Stored procedures are evidence, not executable code |
-| Temporal reasoning | ISO dates and common English/Chinese relative calendar expressions | No unrestricted natural-language temporal theorem prover |
-| Bitemporal state | Valid-time intervals plus recorded/retired transaction versions; state correction and supersession | No autonomous temporal relation planner |
-| Memory decay | Optional search-time reranking plus evidence-aware semantic retirement | No raw-evidence deletion or reinforcement from mere retrieval |
+| `MemoryType.SEMANTIC` | Facts and stable application knowledge | Default type. |
+| `MemoryType.EPISODIC` | An event or observation | Usually paired with event time. |
+| `MemoryType.PROCEDURAL` | Instructions or reusable routines | Retrieved as evidence; never executed by MindBridge. |
 
-Before these contracts were added, MindBridge had semantic similarity retrieval and persisted
-`occurred_at`, but every record was otherwise untyped, event time did not affect retrieval, and no
-access history or decay factor existed.
-
-## Python example
+The caller classifies content. MindBridge does not extract facts, segment episodes, or promote one
+type into another unless an explicit `FormationBackend` is configured, and even then formation
+proposes a separate typed record rather than rewriting the caller's role. Type is part of stable identity, so otherwise identical semantic, episodic, and
+procedural records have different IDs. `search` and `ask` accept an optional exact type filter.
 
 ```python
 from datetime import datetime, timezone
 
 from mindbridge import JinaOmniEmbedder, Memory, MemoryType
 
-with Memory(
-    "./data/agent",
-    embedder=JinaOmniEmbedder(),
-    decay_half_life_days=30,
-) as memory:
+with Memory("./data/agent", embedder=JinaOmniEmbedder()) as memory:
     memory.add(
-        "The deployment failed because the token had expired.",
+        "The deployment failed because the token expired.",
         memory_type=MemoryType.EPISODIC,
         occurred_at=datetime(2026, 8, 20, 9, tzinfo=timezone.utc),
-        occurred_end=datetime(2026, 8, 20, 9, 5, tzinfo=timezone.utc),
     )
     memory.add(
         "Refresh the token, retry once, then escalate.",
         memory_type=MemoryType.PROCEDURAL,
     )
 
-    episode = memory.search(
+    episodes = memory.search(
         "What failed last week?",
         memory_type=MemoryType.EPISODIC,
         reference_at=datetime(2026, 8, 27, 12, tzinfo=timezone.utc),
     )
 ```
 
-`add_many(..., occurred_at=(...), occurred_end=(...), metadata=(...), memory_type=...)` preserves
-per-record time and metadata while applying one role to the complete batch. `search` and `ask`
-accept an optional role filter. A different non-semantic role produces a different stable identity
-for otherwise identical content; an omitted end preserves the former instant-event identity.
+Metadata remains application data. A type or metadata value is not an authorization or isolation
+boundary.
 
-Add typed source context without changing the common path:
+## Typed context and formation
+
+Attach source context to an observation without leaving the common path:
 
 ```python
 from mindbridge import EvidenceBasis, ObservationContext
@@ -71,46 +69,31 @@ source = memory.add(
 )
 ```
 
-When `former` is configured, this source commits before typed proposals are formed. A model error
-does not discard the observation. See
-[omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) for formation,
-affect, trait, and spatial examples.
+The source commits before any typed proposal is formed, so a formation model error leaves the
+observation durable and the formation retryable. Two kinds carry extra visibility rules:
 
-## Temporal retrieval
+- `MemoryKind.AFFECT` records a situated cue together with the source modality it came from, so a
+  model cannot claim an audio cue for a source that has no audio.
+- `MemoryKind.TRAIT` stays hidden from active retrieval until two independent sources support the
+  same typed claim, combining their independent confidence with a noisy-OR projection.
 
-`occurred_at` is semantic event start time. `occurred_end` is an optional exclusive end and must be
-later than the start. `created_at` remains storage time and is not substituted for an absent event
-time during temporal matching. A stored interval matches a query interval when they overlap;
-instant events use a one-microsecond internal extent.
+See [omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) for the
+formation, affect, and spatial examples that arrive from capture streams.
 
-`search(..., occurred_from=..., occurred_until=...)` applies that overlap rule as a hard half-open
-filter. Either timezone-aware bound may be omitted. Any bound excludes records without event time,
-and two bounds require `occurred_until > occurred_from`. This explicit filter is separate from
-`reference_at` and from temporal phrases in query text.
+## Event time and strict filters
 
-`reference_at` resolves relative expressions in its timezone. When omitted, MindBridge uses the
-current UTC time. The deterministic parser recognizes:
+`occurred_at` is an event start; `occurred_end` is an optional exclusive end and must be later than
+the start. Both must include a timezone. `created_at` is storage time and is not substituted when a
+record has no event time.
 
-- one or two ISO dates such as `2026-08-20` or `2026-08-20 ... 2026-08-22`;
-- named English or numeric Chinese months such as `December 2023` or `2024年4月`, and bare
-  calendar years from 1900 through 2199;
-- `today`, `yesterday`, `tomorrow`, and their common Chinese equivalents;
-- last, this, next, or past week, including `上周`, `本周`, and `下周`;
-- last, this, or next month and year, including common Chinese equivalents;
-- `N days ago`, `N 天前`, and rolling `past N days`, `过去 N 天`, or `最近 N 天`.
+`search(..., occurred_from=..., occurred_until=...)` applies a hard half-open overlap filter. Either
+bound may be omitted. Any bound excludes records without event time. MindBridge pushes the filter
+into Zvec for candidate selection and rechecks it after SQLite hydration because SQLite is
+authoritative.
 
-For a detected temporal expression, Zvec retrieves both an in-range pool and a global pool.
-When explicit event bounds are present, both pools remain inside those bounds; SQLite rechecks the
-filter after hydration because it is authoritative.
-MindBridge collapses them by record, then multiplies semantic relevance by a smooth temporal factor:
-`1.5` inside the range, decaying toward `0.3` with distance outside it. This keeps nearby evidence
-available when event boundaries are noisy without losing in-range recall. `ask` passes the resolved
-reference time to the generation model so relative-date wording is not interpreted against the
-provider's clock.
-
-This is intentionally a bounded temporal retrieval layer. Complex relation chains such as “the
-meeting two releases after the migration” require application-supplied normalization or a future
-measured temporal planner.
+An instant event is treated internally as a one-microsecond interval. A stored interval matches
+when it overlaps the requested range; an event ending exactly at `occurred_from`, or starting
+exactly at `occurred_until`, does not match.
 
 ## Valid time and transaction time
 
@@ -123,12 +106,12 @@ Raw occurrence and typed assertion time answer different questions:
 | `MemoryContext.recorded_at` / `retired_at` | When MindBridge knew that assertion version |
 
 `RetrievalScope(valid_at=..., known_at=...)` combines the last two axes. `valid_at` selects an
-assertion whose half-open world interval contains the instant. `known_at` selects the transaction
-version active at that instant. Supplying either excludes records without the corresponding typed
-semantic version; raw records created after `known_at` are also excluded. Evidence links carry the
-same recorded/retired transaction bounds, so a historical result never exposes support added later.
-Each evidence change and its semantic projection share one monotonically allocated transaction
-instant even when the device wall clock repeats.
+assertion whose half-open world interval contains that instant; `known_at` selects the transaction
+version active then. Supplying either excludes records without the corresponding typed semantic
+version, and excludes raw records created after `known_at`. Evidence links carry the same
+recorded/retired bounds, so a historical result never exposes support added later. Each evidence
+change and its semantic projection share one monotonically allocated transaction instant even when
+the device wall clock repeats.
 
 ```python
 from mindbridge import RetrievalScope
@@ -139,83 +122,65 @@ what_we_believed_then = memory.search(
 )
 ```
 
-Overlapping state assertions share a deterministic lineage based on kind, normalized subject,
-predicate, and spatial frame/anchor. A later assertion retires the old transaction version and
-splits any unaffected before/after validity segments into carry-forward versions. This preserves
-historical backfill and A→B→A evolution. Assertions remain conflicting only when they belong to the
-same SQLite write batch; equal wall-clock timestamps in separate transactions are still ordered.
+Overlapping state assertions share a deterministic lineage keyed by kind, normalized subject,
+predicate, and spatial frame/anchor. A later assertion retires the previous transaction version and
+splits any unaffected before/after validity segments into carry-forward versions, which is what
+supports bounded backfill and A to B to A evolution. Assertions conflict only within one SQLite
+write batch; equal wall-clock timestamps in separate transactions are still ordered.
 
-`get` and `list` expose the latest typed context even when it is retired or hidden. Default search
-uses only active visible versions. Evidence deletion recalculates derived confidence and visibility;
-the last evidence deletion removes the unsupported derived record. For a reconciled state or
-explicit trait lineage, removing a superseding source or deleting the derived assertion itself
-rebuilds current validity segments from the remaining supported assertions. Source records are
-deleted only by an explicit caller action.
+`get` and `list` expose the latest typed context even when it is retired or hidden, while default
+search uses only active visible versions. Forgetting is evidence-aware: deleting evidence
+recalculates derived confidence and visibility, and removing the last evidence removes the
+unsupported derived record. Removing a superseding source, or deleting a derived assertion, rebuilds
+current validity segments from the remaining supported assertions. Source records are deleted only
+by an explicit caller action.
+
+## Temporal phrases
+
+Temporal phrases in query text add a soft event-time ranking range. They do not replace explicit
+`occurred_from` and `occurred_until` filters.
+
+The bounded parser recognizes:
+
+- ISO dates and ranges;
+- named English month-years, Chinese year-months, and calendar years from 1900 through 2199;
+- today, yesterday, tomorrow, the day before yesterday, and the day after tomorrow in English and
+  Chinese;
+- last, this, next, and rolling weeks; last, this, and next months or years;
+- `N days ago` and rolling past or recent `N` days in English and Chinese.
+
+`reference_at` resolves relative phrases in its timezone. Without it, MindBridge uses the current
+UTC time. A `Today is <date>` declaration can supply the reference date when no explicit reference
+was passed; the declaration is removed before the remaining temporal phrase is parsed. `ask`
+includes the resolved reference time in the generation input when relative time is involved.
+
+For a detected range, retrieval considers in-range and global candidates. In-range events receive a
+boost; nearby events decay smoothly with distance, and records without event time are downranked.
+This is deliberately soft because event boundaries may be noisy. Use explicit bounds when outside
+events must be excluded.
 
 ## Decay and reinforcement
 
-Decay is off by default. Enable it with `Memory(decay_half_life_days=...)`.
+Decay is disabled by default. Enable search-time decay with
+`Memory(..., decay_half_life_days=<positive number>)` or the equivalent `MemoryConfig` setting.
+It changes ranking only: no record, asset, embedding, or outbox row is deleted or rewritten.
 
-MindBridge over-fetches at least 100 candidates, computes a factor at search time, sorts by adjusted
-relevance, clamps public scores to `[0, 1]`, and returns the requested limit. The durable memory is
-never filtered or deleted by decay.
+When enabled, retention uses the most recent eligible explicit reinforcement; otherwise it uses
+event end, event start, or last update time. The configured half-life applies exponential decay
+with a nonzero floor, and repeated confirmations slow that decay. Public scores remain bounded to
+`[0, 1]`. Eligible confirmations also provide a small ranking boost when decay is disabled.
 
-For each candidate:
+Search never reinforces a result. Record positive application feedback explicitly:
 
-```text
-confirmation_factor = 1 + 0.05 * log2(1 + min(access_count, 20))
-anchor = last_accessed_at or occurred_at or updated_at
-strength = 1 + log2(1 + min(access_count, 20))
-retention = 2 ^ (-age / (half_life * strength))
-decay_factor = 0.3 + 1.2 * retention
-adjusted_score = relevance * confirmation_factor * decay_factor
+```python
+used = memory.search("How should I recover the deployment?", limit=1)
+if used and user_confirmed_helpful:
+    memory.reinforce((used[0].id,))
 ```
 
-The confirmation factor applies even when decay is disabled. Feedback recorded after a historical
-`reference_at` is ignored for that query, so evaluation cannot leak future confirmation backward.
+`reinforce` de-duplicates IDs, updates existing records, and caps confirmation count at 20.
+Confirmations after the query's ranking reference are ignored so evaluation cannot leak future
+feedback into the past.
 
-Search never reinforces a hit by itself. After an application observes positive feedback, it may
-call `memory.reinforce((memory_id, ...))`. SQLite de-duplicates the IDs, caps `access_count` at 20,
-and advances `last_accessed_at` using the real feedback time. This prevents accidental retrieval
-from creating a self-reinforcing ranking loop.
-
-## Research basis and architecture decision
-
-The design follows the smallest common mechanism supported by the literature:
-
-- [CoALA](https://arxiv.org/abs/2309.02427) separates episodic experiences, semantic knowledge,
-  and procedural action knowledge, while warning that procedural writes can directly change agent
-  behavior.
-- [Generative Agents](https://arxiv.org/abs/2304.03442) combines relevance, recency, and importance
-  during retrieval rather than deleting old observations.
-- [MemoryBank](https://arxiv.org/abs/2305.10250) adapts an Ebbinghaus-style exponential retention
-  curve and strengthens memories after recall.
-- [LongMemEval](https://arxiv.org/abs/2410.10813) treats temporal reasoning as a distinct long-term
-  memory ability and motivates time-aware query restriction.
-- [MERIT](https://choi-yeeun.github.io/MERIT/) uses multiple retrieval keys, max-over-key scoring,
-  and temporal neighbors for long egocentric video memory; MindBridge applies a bounded form of
-  that inexpensive late-interaction shape to document atoms and focused query text/media.
-- [MemLens](https://arxiv.org/abs/2605.14906) shows that compressing visual evidence into text can
-  destroy information needed at answer time, motivating retrieval over durable raw media instead
-  of caption-only storage.
-- [TReMu](https://aclanthology.org/2025.findings-acl.972/) and
-  [Temporal Semantic Memory](https://aclanthology.org/2026.findings-acl.1496/) show why an event
-  timeline and semantic event time matter more than dialogue or storage order.
-- [Zep's temporal knowledge graph](https://arxiv.org/abs/2501.13956),
-  [A-MEM](https://arxiv.org/abs/2502.12110), and
-  [MIRIX](https://arxiv.org/abs/2507.07957) explore richer graph, linked-note, and multi-store
-  architectures.
-- Mem0 documents comparable conventions for
-  [memory roles](https://mem0.ai/blog/semantic-vs-episodic-vs-procedural-memory-in-ai-agents-a-complete-comparison),
-  [temporal reasoning](https://docs.mem0.ai/platform/features/temporal-reasoning), and
-  [soft memory decay](https://docs.mem0.ai/platform/features/memory-decay).
-
-MindBridge adopts explicit cognitive roles, source-grounded typed formation, valid/transaction time,
-event fields, and access-aware retrieval. It does not adopt a graph database, autonomous
-consolidation agents, or a procedure executor. Those layers would add failure modes and dependencies
-without a measured requirement in the embedded SDK. Add them only when a public-path benchmark
-shows that typed max-over-part retrieval cannot meet a concrete workload. See the
-[competitive review](competitive-memory-systems.md) for the source-level comparison.
-
-Memory type and metadata are not isolation controls. One physical `data_dir` remains one memory
-domain and one live MindBridge owner.
+Use `search_with_trace()` when one query needs its temporal, reinforcement, and retention factors
+explained. Normal telemetry omits per-memory candidate identifiers.

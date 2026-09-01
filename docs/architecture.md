@@ -1,150 +1,172 @@
 # Architecture
 
-MindBridge is an embedded consistency core surrounded by caller-owned model and transport stacks.
+MindBridge is an embedded Python memory runtime. The host application constructs one `Memory`
+instance, supplies model backends, and owns transport and process policy. `Memory` owns memory
+semantics, capability routing, local durability, retrieval, and resource lifecycle.
 
-```text
-Application
-├── provider SDK clients
-├── authentication / gateway / HTTP client
-└── Memory
-    ├── memory semantics and modality routing
-    ├── optional typed formation and bitemporal evidence projection
-    ├── retrieval and grounded-answer orchestration
-    ├── SQLite + media CAS (authoritative)
-    └── Zvec (derived projection)
+This page owns implementation invariants. Use [core concepts](concepts.md) for the user mental
+model and [operations](operations.md) for procedures.
+
+## System boundary
+
+| Component | Responsibility |
+| --- | --- |
+| `Memory` | Validate content, route model work, coordinate writes and retrieval, and expose the public SDK. |
+| Model backends | Embed, generate, transcribe/analyze speech, analyze faces, describe images, or propose typed formations through narrow protocols. |
+| `LocalStore` | Store authoritative records, FP32 embeddings, compatibility metadata, identity state, and the index outbox in SQLite. |
+| `AssetStore` | Store immutable image, video, and audio bytes by SHA-256 under `assets/`. |
+| `ZvecIndex` | Provide disposable dense, lexical, type, and event-time search projections. |
+| REST, MCP, and CLI adapters | Decode and encode their transport, then call the same `Memory` operations. |
+
+One physical `data_dir` is one memory domain. Metadata is application data; it is not an account,
+authorization, or isolation boundary.
+
+## Write path
+
+```mermaid
+flowchart LR
+    input["ContentInput"] --> normalize["Validate order, type, metadata, and event time"]
+    normalize --> cas["Materialize media in CAS<br/>write, fsync, and lease"]
+    cas --> models["Transcribe, analyze, and embed as configured"]
+    models --> sqlite["SQLite transaction<br/>records, asset descriptors, FP32 embeddings, and outbox"]
+    sqlite -->|commit first| apply["Apply current SQLite truth to Zvec"]
+    apply --> flush["Flush Zvec"]
+    flush --> ack["Acknowledge exact outbox rows in SQLite"]
+    apply -. error .-> pending["Leave outbox rows pending"]
+    flush -. error .-> pending
 ```
 
-## Shared execution plane
+Media is copied to the content-addressed store before a model receives it. A failed operation
+removes unreferenced temporary media after its leases are released. Identical bytes reuse one CAS
+object.
 
-`Memory` is the canonical execution plane and the Python SDK exposes it directly. REST, MCP, and the
-product CLI are interfaces over the same application-composed instance, not separate
-implementations of memory behavior.
+Records, asset descriptors, normalized FP32 embeddings, and outbox rows commit in one SQLite
+transaction. SQLite triggers enqueue an upsert or delete for every embedding mutation. Only after
+that commit does MindBridge update and flush Zvec, then delete the exact acknowledged outbox rows.
+An index failure can therefore fail the current call while leaving the record durable and the
+projection work retryable. Startup and later operations drain pending work.
 
-```text
-Developer / Agent
-├── Python SDK ─────────────────────────┐
-├── REST adapter ───────────────────────┤
-├── MCP adapter ────────────────────────┤
-└── product CLI ─────────────────────────┤
-                                        v
-                         application-composed Memory
-                   validation · routing · retrieval · consistency
-                                        |
-                           models · SQLite/CAS · Zvec
+A memory ID is the SHA-256 digest of canonical ordered content, media digests, metadata, event
+time, memory type, and optional typed observation context. Repeating the same add is idempotent. `add_many` uses one model batch and one
+SQLite transaction; `add_stream` deliberately calls the ordinary add path once per completed item,
+so a later stream failure preserves the committed prefix.
+
+An optional `FormationBackend` runs after the source observation commits, and does not make the
+model authoritative: it only proposes. The kernel assigns identity, validates source binding and
+source modality, and resolves validity and conflicts. Derived records, evidence edges, bitemporal
+versions, embeddings, a durable per-source formation marker, and outbox work then commit in one
+SQLite transaction. Formation is idempotent for a given source memory and formation recipe, so a
+model failure leaves the raw observation durable and the formation retryable. Retiring or losing a
+source recomputes derived confidence and visibility from the remaining independent evidence
+instead of destroying the observation.
+
+## Retrieval path
+
+```mermaid
+flowchart LR
+    query["Query content"] --> prepare["Materialize media and derive allowed transcripts"]
+    prepare --> embed["Embed aggregate and bounded focused keys"]
+    embed --> sync["Drain the durable outbox"]
+    sync --> dense["Zvec dense routes"]
+    sync --> lexical["Zvec lexical route"]
+    dense --> hydrate["SQLite hydrates candidate embedding IDs<br/>and discards stale projection IDs"]
+    lexical --> hydrate
+    hydrate --> rank["Collapse by parent memory, filter, and rerank"]
+    rank --> records["SQLite hydrates final records<br/>and leases CAS assets"]
+    records --> hits["SearchHit results"]
 ```
 
-Interface code may decode transport values, call a public operation, and encode its result. It must
-not own a second provider configuration, modality router, retrieval pipeline, persistence path, or
-error taxonomy. SDK behavior is the capability baseline; MCP and CLI schemas project the same
-operations with transport-appropriate types and side-effect annotations.
+Composite records have one aggregate embedding plus de-duplicated text and media embeddings.
+Long text contributes bounded overlapping contextual keys. A query uses its complete aggregate
+and bounded keys focused on the first text atom and query media. Dense routes and the lexical route
+run concurrently, with at most four outer search workers.
 
-One execution plane does not allow several processes to open one `data_dir`. An embedded interface
-calls its process-owned `Memory`. A CLI addressing an already running owner must reach that owner
-through a supported transport rather than opening the directory again. In both cases, the operation
-executes exactly once in the owning `Memory`.
+Zvec groups dense candidates by parent memory where possible. SQLite then hydrates candidate IDs,
+rechecks hard event-time filters, drops stale IDs, and collapses all evidence to authoritative
+records. Ranking combines the strongest dense evidence with bounded lexical, temporal, ambiguity,
+and optional decay signals. `search_with_trace` exposes these score components without copying
+memory content or metadata into the trace.
 
-The current release follows this rule for Python, REST, MCP, and the CLI. The CLI composes one
-`Memory` per invocation with `--app` or `--embedder`, and addresses a directory another process
-already owns with `--url`. See [command-line usage](api/cli.md).
+`RetrievalScope` filters apply as authoritative SQLite checks rather than projection ranking.
+`valid_at` and `known_at` select the assertion valid in the world and known to the system at
+those instants; `near`/`radius_m` compare distance only within a matching spatial frame and
+anchor, and no implicit frame transform is attempted.
 
-## Responsibility boundary
+`ask` uses this same retrieval path, limits the grounded evidence, routes the question and hits
+through the generation backend's declared capabilities, and returns only the hits the backend
+actually used.
 
-MindBridge owns:
+## Storage authority and recovery
 
-- Canonical content and memory types.
-- Stable IDs, event time, typed validity/provenance, spatial context, and local face-and-voice
-  identity.
-- Formation validation, evidence independence, state supersession, and transaction-time history.
-- Capability-aware embedding, transcription fallback, retrieval, and grounding.
-- SQLite/CAS durability and the SQLite-to-Zvec outbox.
-- Validation and sanitization at Python, REST, and MCP boundaries.
+| State | Role | Recovery behavior |
+| --- | --- | --- |
+| `state.sqlite3` | Authoritative records, embeddings, metadata, cached analyses, identity state, typed semantics with evidence, spatial pose, bitemporal versions, durable formation completion, and outbox | Required for recovery. Unsupported schemas or incompatible durable model identities fail at open. |
+| `assets/` | Authoritative original media bytes | Required for media-bearing records; SQLite alone cannot recreate it. |
+| `zvec/` | Derived search collection | May be deleted while stopped; startup rebuilds it from SQLite without re-embedding stored content. |
+| `.mindbridge.lock` | Operating-system lock target | Its presence does not indicate a live owner. |
 
-MindBridge does not own:
+The store records embedding model, space, dimension, transcription space, configured face spaces,
+and the index recipe. An unrecognized mismatch fails instead of mixing incompatible state. A known
+index-only recipe change rebuilds Zvec from stored vectors; a recognized embedding recipe upgrade
+may re-embed records before publishing the new marker.
 
-- Provider credential discovery or rotation.
-- HTTP connection pools, proxies, retries, timeouts, or endpoint normalization.
-- Compatibility registries for model services.
-- REST identity, authorization, TLS, quotas, or audit logging.
-- Remote URL downloading.
-- Sensor capture, stream reconnection, observation segmentation, or turn detection.
-- A second model runtime when Sentence Transformers, FunASR, or a provider SDK already supplies it.
+## Concurrency and lifecycle
 
-## Model composition
+Opening `LocalStore` takes a non-blocking operating-system lock for the lifetime of the instance.
+A second owner of the same directory fails immediately; different directories can run
+concurrently. A `Memory` created before `fork()` is rejected in the child process.
 
-`Memory` depends on narrow operation contracts rather than a combined provider abstraction.
+Model calls and independent SQLite write transactions can overlap. SQLite serializes its own
+writers with `BEGIN IMMEDIATE`. MindBridge's process-local write lock serializes outbox replay,
+destructive operations, final record/asset hydration, and index replacement. Add-time speech
+identity indexing is also serialized because its identity changes must roll back with a failed add.
 
-```text
-Content ──> EmbeddingBackend ──> retrieval vector
-Committed observation ──> FormationBackend ──> typed source-grounded proposals
-Question + hits ──> GenerationBackend ──> grounded answer
-Audio/video ──> TranscriptionBackend ──> fallback text
-Audio/video ──> SpeechBackend ──> timed turns + speakers
-Image/video ──> FaceBackend ──> bounded face observations
-```
+Ordinary Zvec queries may overlap. Collection replacement and close wait for active queries. A
+reindex takes a SQLite snapshot, replaces the collection, then replays the outbox so a record
+committed during the rebuild is not lost.
 
-One adapter may implement several contracts. `OpenAIModels` does so with official SDK clients. Local
-embedding, speech, and face analysis can be composed independently. `Memory.from_config` resolves a
-closed catalog of bundled adapters; direct construction accepts custom adapter objects. Both
-converge on `Memory.from_plugins` and the same execution plane. Provider names never reach the
-kernel, and there is no global runtime plugin registry.
+`close()` rejects new operations, waits for active operations, releases media leases, and closes
+each unique backend and storage resource once. `AsyncMemory` is an `asyncio.to_thread` facade over
+this same synchronous core; it does not introduce a worker service or a second consistency model.
 
-Formation does not make the model authoritative. The source observation commits first. The kernel
-validates proposals and then atomically writes derived records, evidence edges, bitemporal versions,
-embeddings, a durable formation-recipe marker, and index-outbox work. Model failure leaves the raw
-observation durable and retryable.
+## Model and plugin boundary
 
-## Write consistency
+The implemented extension contracts are `EmbeddingBackend`, `GenerationBackend`,
+`TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, and
+`FormationBackend`. A generation backend may additionally
+implement `StreamingGenerationBackend`. Routing uses declared atomic modalities, never provider or
+model names. Unsupported visual evidence fails; unsupported audio can fall back to transcript text
+only when a configured transcription backend declares the required capability.
 
-```text
-normalize -> materialize CAS -> model work -> SQLite transaction
-                                              |
-                                              v
-                                      durable index outbox
-                                              |
-                                              v
-                                      Zvec mutate + flush
-                                              |
-                                              v
-                                      acknowledge outbox
-```
+Applications can pass backend objects directly or bundle them in `MemoryPlugins` for
+`Memory.from_plugins`. `Memory.from_config` validates a closed catalog of bundled providers,
+constructs their adapters, and delegates to the same kernel. There is no global plugin registry,
+package discovery, or hot swap during a `Memory` lifetime.
 
-SQLite commits before Zvec changes. Concurrent record commits may accumulate one outbox batch;
-Zvec mutation, flush, and acknowledgement remain serialized. A failed index operation stays in the
-outbox and is replayed when the owner recovers. Zvec never becomes authoritative.
+Model code is part of the application's trust boundary. In particular, the bundled Jina adapter
+executes upstream code with model and code revisions pinned; [configuration](configuration.md)
+owns the exact recipe and license constraints.
 
-## Read consistency
+SQLite, CAS, and Zvec are internal implementation components, not public storage plugins. A model
+backend may perform inference but cannot bypass validation, stable identity, durability, or final
+SQLite hydration.
 
-MindBridge batches each complete ordered query with bounded focused aggregate and atomic keys from
-its first text atom and media, then asks Zvec for dense and lexical candidates concurrently. Dense
-search matches aggregate and atomic document embeddings and groups them by parent memory inside
-Zvec, with a bounded ordinary-query fallback when best-effort grouping is incomplete. SQLite then
-hydrates those IDs, drops stale IDs, and collapses the remaining derived
-keys before reranking. A missing index is rebuilt from stored FP32 embeddings without re-embedding
-content.
+## Interface and trust boundaries
 
-## Isolation and concurrency
+The `Memory` SDK exposes the complete set of product operations. REST exposes the `/v1` add, batch
+add, search, ask, get, list, and delete subset. MCP exposes six corresponding tools without batch
+add. The local CLI can call the SDK operations; `--url` is limited to operations implemented by
+REST.
 
-One physical directory is one memory domain and one live owner. There are no account, tenant,
-request, or benchmark scope identifiers in the product API. Metadata is application data.
+`create_app(memory=...)` and `build_mcp_server(memory)` use a caller-owned instance and do not
+close it. They also do not add authentication, authorization, TLS, rate limits, quotas, or audit
+policy. See [deployment](deployment.md) for process and network setup.
 
-Provider work, independent SQLite record commits, and Zvec queries may overlap across calls. Outbox
-replay and final hydration/asset leasing are short serialized critical sections; collection
-replacement is exclusive. `close()` waits for active operations before closing adapters and
-storage.
+Python callers may intentionally pass local `Path` values; MindBridge opens only regular files and
+avoids following the final symlink where the platform supports it. REST and MCP accept inline
+bytes or existing asset IDs, and reject local paths and remote URLs. Provider output is validated
+before persistence or return. Every transport omits provider bodies and credentials. REST also
+withholds subjects naming storage, index, or internal state; MCP retains SDK subjects and can expose
+owner-local paths, so a network host must protect or redact its error envelope.
 
-`AsyncMemory` uses threads around this synchronous embedded core. Provider-specific async APIs are
-not normalized by MindBridge; a custom adapter can use the provider's native client where its
-contract permits.
-
-`add_stream` preserves the same write lifecycle by invoking the ordinary add path once per
-completed observation. `AsyncOmniPrefetch` serializes speculative searches for one turn, replaces
-queued snapshots instead of cancelling synchronous work already running in a thread, and confirms
-the exact final snapshot before returning.
-
-## Protocol interfaces
-
-`create_app(memory=...)` and `build_mcp_server(memory)` expose an existing memory. They never
-construct providers or own the memory lifecycle. FastAPI and MCP own sync/async request dispatch;
-deployment infrastructure supplies auth and transport policy. The product CLI follows the same
-boundary: it reuses the shared execution plane and owns only command decoding, output formatting,
-and process lifecycle.
+Backup, restore, index repair, and telemetry procedures are in [operations](operations.md).

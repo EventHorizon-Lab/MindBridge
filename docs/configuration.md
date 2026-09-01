@@ -1,15 +1,39 @@
-# Configuration and composition
+# Configuration
 
-MindBridge offers two composition paths over the same memory kernel:
+MindBridge has two composition paths over the same `Memory` kernel:
 
-- `Memory.from_config` validates pure data and constructs bundled adapters.
-- `Memory(...)` accepts already-constructed protocol implementations for custom models and
-  caller-owned SDK clients.
+- `Memory.from_config()` validates data and constructs bundled adapters.
+- `Memory(...)` accepts constructed protocol implementations and SDK clients.
 
-Provider names exist only in the declarative composition layer. The kernel continues to depend on
-typed capabilities rather than provider branches.
+Use declarative configuration for bundled providers. Use direct injection when the application
+owns clients, credentials, proxies, custom models, or adapter behavior.
 
-## Declarative composition
+## Install only the surfaces you use
+
+The base package provides storage, public values, and adapter protocols. Optional extras add the
+heavy or protocol-specific runtimes:
+
+| Extra | Adds |
+| --- | --- |
+| `local` | Jina and Sentence Transformers embedding, plus FunASR speech |
+| `openai` | Official OpenAI SDK adapter and media handling |
+| `face` | Local OpenCV face analysis |
+| `server` | FastAPI and Uvicorn REST serving |
+| `mcp` | MCP server transport |
+| `observability` | OpenTelemetry SDK export support |
+| `benchmarks` | Benchmark datasets, scorers, and telemetry |
+| `all` | Every optional surface |
+
+For example:
+
+```bash
+uv add "mindbridge[local,openai]"
+```
+
+## Declarative configuration
+
+`embedding` is the only required capability. `data_dir` defaults to `.mindbridge`; all other
+capability slots are optional.
 
 ```python
 from mindbridge import Memory
@@ -17,286 +41,133 @@ from mindbridge import Memory
 config = {
     "data_dir": "./data/assistant",
     "embedding": {
-        "provider": "openai",
-        "model": "text-embedding-3-small",
+        "provider": "jina-omni",
+        "device": "cuda",
+        "batch_size": 16,
     },
     "generation": {
         "provider": "openai",
         "model": "gpt-5-mini",
-        "modalities": ["text", "image"],
         "temperature": 0.1,
     },
-    "speech": {
-        "provider": "funasr",
-        "device": "cuda",
-    },
-    "face": {
-        "provider": "opencv",
-        "detector_model": "./models/yunet.onnx",
-        "recognizer_model": "./models/sface.onnx",
-    },
     "settings": {
-        "index_speech": True,
         "minimum_relevance": 0.55,
+        "ambiguity_margin": 0.01,
     },
 }
 
 with Memory.from_config(config) as memory:
-    memory.add("Remember this")
+    memory.add("Remember this.")
 ```
 
-The same input can be validated ahead of time with `MindBridgeConfig.model_validate(config)`.
-Unknown providers, unknown fields, invalid ranges, and missing required values raise a field-specific
-error before storage opens. `AsyncMemory.from_config` accepts the same configuration.
+`AsyncMemory.from_config()` accepts the same shape. `MindBridgeConfig.model_validate()` can
+validate it before opening storage. Unknown fields, unknown providers, and out-of-range values are
+rejected rather than ignored or coerced.
 
-Hosts that need constructed adapters separately from opening storage can call
-`resolve_memory_config(config)`. It returns a `MemoryComposition`; the caller owns it and must call
-`close()` unless it transfers the plugins to one `Memory`. Ordinary applications should keep using
-`Memory.from_config` so ownership transfers automatically.
+Bundled provider fields are:
 
-Supported declarative slots are intentionally small:
+| Slot and provider | Required fields | Optional fields and defaults |
+| --- | --- | --- |
+| `embedding: jina-omni` | — | `dimension=1024`, `device=None`, `batch_size=32` |
+| `embedding: sentence-transformers` | `model`, `revision` | `dimension=None`, `device=None`, `batch_size=32` |
+| `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, plus connection fields |
+| `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `video_limit=8`, `extra_body=None`, plus connection fields |
+| `speech: funasr` | — | `device=auto` |
+| `speech: openai` | — | `model=whisper-1`, `space=None`, plus connection fields |
+| `face: opencv` | `detector_model`, `recognizer_model` | `score_threshold=0.9`, `nms_threshold=0.3`, `top_k=5000`, `frame_interval_ms=1000`, `max_video_frames=300` |
 
-| Slot | Bundled providers |
-| --- | --- |
-| `embedding` | `openai`, `jina-omni`, `sentence-transformers` |
-| `generation` | `openai` |
-| `speech` | `openai`, `funasr` |
-| `face` | `opencv` |
+Every OpenAI slot accepts `base_url=None`, `timeout=None`, and `max_retries=None`. The official SDK
+then applies its own defaults and reads its standard credentials, including `OPENAI_API_KEY`.
+Declarative configuration intentionally has no credential field; an `api_key` entry is rejected.
+Inject a caller-owned SDK client when credentials must come from another source. Atomic generation
+modalities are `text`, `image`, `video`, and `audio`.
 
-OpenAI slots accept `base_url`, `timeout`, and `max_retries`; the official SDK resolves its standard
-credentials. Generation also accepts atomic `modalities` (`text`, `image`, `video`, and `audio`) so
-request validation matches an OpenAI-compatible model's actual inputs. Use direct injection for
-secret managers, existing clients, custom proxies, or third-party providers. MindBridge owns and
-closes clients created by `from_config`.
+Jina dimensions are `32`, `64`, `128`, `256`, `512`, or `1024`. Batch sizes and model token/video
+limits are positive; OpenAI timeouts are positive, retry counts are non-negative, temperature is
+from 0 through 2, and seed is from 0 through `2**63 - 1`. Face thresholds are from 0 through 1.
+`generation.video_limit` caps retrieved evidence videos in one answer request; question media has
+priority, and `None` disables that evidence-video count.
 
-## Memory settings
+`resolve_memory_config()` is available to hosts that need a `MemoryComposition` before opening
+storage. The caller must close that composition unless its plugins are transferred to one
+`Memory`; ordinary applications should prefer `Memory.from_config()`.
 
-`MemorySettings` is the readable name for the value-only local policy; `MemoryConfig` remains a
-compatible alias. The `settings` section accepts these values:
+## Embedding choices
 
-```python
-Memory(
-    data_dir=".mindbridge",
-    *,
-    embedder=embedder,
-    answerer=None,
-    transcriber=None,
-    face_analyzer=None,
-    former=None,
-    index_speech=False,
-    index_quantization=IndexQuantization.NONE,
-    minimum_relevance=0.55,
-    ambiguity_margin=0.01,
-    decay_half_life_days=None,
-    speaker_similarity=0.78,
-    speaker_margin=0.05,
-    face_similarity=0.363,
-    face_margin=0.05,
-    tracer=None,
-)
-```
+The embedding model defines durable vector identity, so every memory requires one:
 
-- `embedder` is required because its model, dimension, and vector-space recipe are durable data
-  contracts.
-- `answerer` is optional. `ask()` raises `ModelError` when it is absent.
-- `transcriber` is optional. Configure it when audio fallback, add-time transcript indexing, or
-  `speech()` is required. A `TranscriptionBackend` transcribes every stored asset whose modality it
-  declares, so a media memory carries retrievable text even where the embedder accepts the media
-  natively.
-- `vision_describer` is optional and available through direct construction or `MemoryPlugins`.
-  `AsyncVisionStream` calls it at finality only when the embedder lacks native image support and no
-  external `VisionPartial` is available. No bundled declarative provider is selected implicitly.
-- `face_analyzer` is optional. Configure it when `faces()` or visual identity grounding is required.
-- `former` is optional. It proposes typed memories after a raw observation commits. Configure it by
-  direct `Memory` construction or `MemoryPlugins`; the declarative generation slot never enables
-  automatic formation implicitly.
-- `index_speech` opts a configured `SpeechBackend` into add-time transcript and speaker-identity
-  indexing; the default leaves analysis lazy.
-- `index_quantization` defaults to quality-first `NONE`; `FP16`, rotated `INT8`, and x86_64-only
-  `RABITQ` are explicit, lossy capacity choices that rebuild only the derived Zvec projection.
-- `minimum_relevance` drops weak dense evidence. `ambiguity_margin` drops unresolved top-two ties
-  only when `search()` or `ask()` uses `limit=1`, unless the winner has a lexical or temporal anchor.
-  Larger limits preserve qualified candidates for the caller or answerer. Set either to `0` to
-  disable that gate.
-- `decay_half_life_days` controls query-time soft decay; `None` disables it.
-- Face and speaker thresholds are local matching semantics, not provider settings. Each modality
-  applies its own top-two margin before enrolling a new identity.
-- `tracer` optionally injects an OpenTelemetry tracer; `None` uses the global no-op or
-  application-configured provider.
+- `jina-omni` is the pinned multimodal default used in the examples. Its weights are licensed
+  CC BY-NC 4.0 for non-commercial use. Loading it sets `trust_remote_code=True`, with both model
+  and code revisions pinned to the same immutable upstream commit recorded by MindBridge. Review
+  that upstream code as part of the application's dependency trust boundary.
+- `sentence-transformers` loads a model and immutable 40-character commit revision selected by the
+  application. Its supported modalities come from that model.
+- `openai` uses the official SDK and defaults to text embedding. Use direct injection to declare
+  additional capabilities or a non-standard request format.
 
-## Explicit provider clients
+Changing model, revision, dimension, or input recipe changes the embedding space. Do not point the
+new configuration at an existing directory unless it is an explicitly supported bundled upgrade;
+see [metadata mismatch](troubleshooting.md#store-metadata-mismatch).
 
-Use the provider SDK directly:
+## Local memory settings
+
+The `settings` mapping is the value-only `MemorySettings` policy (`MemoryConfig` is a compatible
+alias):
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `index_speech` | `False` | Persist configured speech analysis during `add` |
+| `index_quantization` | `none` | Zvec projection mode: `none`, `fp16`, `int8`, or `rabitq` |
+| `minimum_relevance` | `0.55` | Reject evidence below this confidence |
+| `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1` |
+| `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
+| `speaker_similarity` | `0.78` | Voice identity match threshold |
+| `speaker_margin` | `0.05` | Voice identity ambiguity margin |
+| `face_similarity` | `0.363` | Face identity match threshold |
+| `face_margin` | `0.05` | Face identity ambiguity margin |
+
+Thresholds and margins accept values from `0` through `1`. `minimum_relevance=0` disables the
+weak-evidence floor; a zero ambiguity margin disables the corresponding tie rejection. A zero
+speaker or face similarity is merely the most permissive threshold. `decay_half_life_days` must be
+positive when set. A tracer is passed as the separate `tracer=` argument to
+`Memory.from_config()` or `Memory(...)`, not inside `settings`.
+
+## Direct adapter injection
+
+Construct adapters directly when the application must own an SDK client or use a custom protocol
+implementation:
 
 ```python
 from openai import OpenAI
 
-from mindbridge import OpenAIModels
+from mindbridge import JinaOmniEmbedder, Memory, OpenAIModels
 
-client = OpenAI(
-    api_key="...",
-    base_url="https://api.openai.com/v1",
-    timeout=30.0,
-    max_retries=3,
-)
-models = OpenAIModels(
-    generation_client=client,
-    generation_model="gpt-5-mini",
-)
+with OpenAI(timeout=30.0, max_retries=3) as client:
+    models = OpenAIModels(
+        generation_client=client,
+        generation_model="gpt-5-mini",
+    )
+    with Memory(
+        "./data/assistant",
+        embedder=JinaOmniEmbedder(),
+        answerer=models,
+    ) as memory:
+        print(memory.ask("What should I remember?").answer)
 ```
 
-Provider-specific Chat Completions fields remain explicit. For example, an OpenAI-compatible Qwen
-endpoint can bound output with `generation_max_tokens=512` and disable its thinking template with
-`generation_extra_body={"chat_template_kwargs": {"enable_thinking": False}}`. If an endpoint also
-requires a minimum video duration, set `generation_min_video_seconds` to that documented boundary;
-shorter videos use four ordered stills when image input and the `openai` extra are available.
-`generation_video_limit` defaults to eight distinct retrieved videos per answer; overflow videos
-retain their text or transcript evidence. Set a positive integer to calibrate the limit, or `None`
-only when the provider context and latency budget can safely accept every retrieved video.
+`Memory` closes the adapter objects passed to it. `OpenAIModels.close()` deliberately leaves a
+caller-supplied SDK client open, so the outer client context remains the application's
+responsibility. Credentials, retries, timeouts, proxies, and connection pooling also remain SDK
+configuration.
 
-The SDK may read its own environment variables. MindBridge does not duplicate key lookup, URL
-normalization, proxy support, retry policy, connection pooling, or sync/async conversion.
+Two capability slots are reachable only this way, or through `MemoryPlugins`; no declarative
+provider selects either implicitly:
 
-Separate SDK clients can be supplied for embedding, generation, and transcription when their
-provider settings differ:
+- `former=` takes a `FormationBackend`, which proposes typed memories after a raw observation
+  commits. Configuring the declarative `generation` slot never enables automatic formation.
+- `vision_describer=` takes a `VisionDescriptionBackend`. `AsyncVisionStream` calls it at
+  finality only when the embedder lacks native image support and no external `VisionPartial`
+  is available.
 
-```python
-models = OpenAIModels(
-    embedding_client=embedding_client,
-    generation_client=generation_client,
-    transcription_client=transcription_client,
-)
-```
-
-All clients remain caller-owned and must be closed by the caller.
-
-### OpenAI Transcribe
-
-Use the existing transcription plugin with OpenAI's completed-file Transcriptions API:
-
-```python
-from openai import OpenAI
-
-from mindbridge import OpenAIModels
-
-client = OpenAI()
-transcriber = OpenAIModels(
-    transcription_client=client,
-    transcription_model="gpt-transcribe",
-    transcription_prompt="A household conversation about reminders and medication.",
-    transcription_keywords=("MindBridge", "AC-42"),
-    transcription_languages=("en", "zh-cn"),
-)
-```
-
-MindBridge sends each resolved audio asset to `/audio/transcriptions` as multipart form data and
-returns the response text through `TranscriptionBackend`. `transcription_prompt` supplies
-unstructured context; `transcription_keywords` and `transcription_languages` map to OpenAI's
-`keywords[]` and `languages[]` fields. See the official
-[file transcription guide](https://developers.openai.com/api/docs/guides/speech-to-text).
-
-The `whisper-1` default remains unchanged for compatibility; select `gpt-transcribe` explicitly.
-When no explicit `transcription_space` is supplied, MindBridge hashes prompt, keyword, and language
-settings into the derived space so stored transcripts from different recipes cannot mix. The hash
-does not expose the prompt or keywords in store metadata.
-
-[vLLM multimodal pooling models](https://github.com/vllm-project/vllm/blob/main/examples/pooling/embed/vision_embedding_online.py)
-extend `/embeddings` with top-level chat `messages`. Select that wire format explicitly so text
-queries and media documents use the same model recipe:
-
-```python
-from openai import OpenAI
-
-from mindbridge import Modality, OpenAIModels
-
-client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1")
-embedder = OpenAIModels(
-    embedding_client=client,
-    embedding_model="openai/clip-vit-base-patch32",
-    embedding_dimension=512,
-    embedding_request_format="messages",
-    embedding_capabilities=frozenset({Modality.TEXT, Modality.IMAGE}),
-)
-```
-
-MindBridge still uses the caller-owned official OpenAI SDK client; it does not add a provider
-registry or its own HTTP transport. The `messages` format becomes part of the derived durable
-embedding space, so changing formats against an existing `data_dir` fails rather than mixing
-vectors from different input recipes. `embedding_dimension` declares the model's output size for
-validation; MindBridge does not send it as vLLM's optional Matryoshka truncation control.
-
-## Explicit capabilities
-
-Adapters declare atomic modalities for each operation. `OpenAIModels` defaults to text embedding,
-text generation, and audio transcription. Override only when the selected model and endpoint
-actually accept another modality:
-
-```python
-from mindbridge import Modality, OpenAIModels
-
-models = OpenAIModels(
-    generation_client=client,
-    generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE, Modality.AUDIO}),
-)
-```
-
-MindBridge compares the routed input with these declarations before inference. Unsupported audio
-can be replaced with a transcript when a transcriber exists. Unsupported image or video evidence
-is never silently discarded. Transcription is routed by `transcription_capabilities` rather than by
-the gaps in the embedding or generation adapter, so a transcriber that declares video contributes a
-video's speech on every path that reads a transcript.
-
-## Durable spaces
-
-Every embedding adapter exposes:
-
-- `embedding_model`
-- `embedding_space`
-- `embedding_dimension`
-- `embedding_capabilities`
-
-Every transcription adapter exposes `transcription_model`, `transcription_space`, and
-`transcription_capabilities`. MindBridge persists the embedding model, vector space, dimension,
-transcription space, configured face spaces, and index recipe in SQLite. Opening the directory with
-incompatible values fails immediately.
-
-`reindex()` rebuilds Zvec from stored vectors. It does not re-embed or retranscribe content. Use a
-new directory when changing a semantic recipe.
-
-## Remote content
-
-There is no URL allowlist or built-in downloader. This is deliberate: DNS policy, redirects,
-credentials, retries, streaming, and SSRF controls belong to the application's HTTP stack. Pass
-downloaded bytes as `Blob` or a local file as `Path`.
-
-REST and MCP accept base64 data URLs and stored asset IDs. They reject HTTP(S) URLs and filesystem
-paths at their trust boundaries.
-
-## Local adapters
-
-```python
-from mindbridge import FunASRTranscriber, JinaOmniEmbedder, OpenCVFaceAnalyzer
-
-embedder = JinaOmniEmbedder(device="cuda", batch_size=8)
-speech = FunASRTranscriber(device="cuda")
-faces = OpenCVFaceAnalyzer("./models/yunet.onnx", "./models/sface.onnx")
-```
-
-Jina delegates query/document inference to Sentence Transformers. FunASR delegates execution and
-device selection to `funasr.AutoModel`. Face analysis delegates local decoding, YuNet detection,
-alignment, and SFace encoding to OpenCV; model files are caller-provided and never downloaded by
-MindBridge.
-
-For transcript-only workloads, copy `DEFAULT_FUNASR_RECIPE` with `speaker_model=None` and
-`speaker_revision=None`. This skips CAM++ and returns timed turns without speaker identities; the
-benchmark runner uses that recipe because its tasks do not score speaker identity.
-
-## Benchmark-only environment settings
-
-The benchmark executable has a private `ModelConfig` for reproducible runs. It may read
-`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `MINDBRIDGE_GENERATION_API_KEY`,
-`MINDBRIDGE_GENERATION_BASE_URL`, `MINDBRIDGE_GENERATION_MODEL`,
-`MINDBRIDGE_GENERATION_MODALITIES`, and `MINDBRIDGE_TIMEOUT_SECONDS`. These are benchmark harness
-inputs, not Python SDK configuration. `mindbridge-bench eval --config memory.json` also accepts the
-declarative schema above, replaces its `data_dir` for per-unit isolation, and records the effective
-composition in the benchmark artifacts.
+For every constructor and protocol field, see the [Python API](api/python-sdk.md). For benchmark
+environment variables, see [benchmarking](benchmarking.md).

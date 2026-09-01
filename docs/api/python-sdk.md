@@ -1,48 +1,56 @@
-# Python API
+# Python SDK
 
-Supported public imports come from `mindbridge`.
+## Purpose
 
-`Memory` is MindBridge's canonical execution plane. `AsyncMemory`, REST, MCP, and the required
-product CLI must dispatch to these same domain operations rather than implement parallel routing,
-storage, defaults, or errors.
+The supported root-import SDK is re-exported from `mindbridge`. `Memory` is the synchronous
+execution boundary, and `AsyncMemory` is its async facade. REST, MCP, and the product CLI expose
+subsets of these operations through their own adapters.
 
-## Content values
+One physical `data_dir` belongs to one live `Memory` instance. There are no tenant, user, request,
+or benchmark scope parameters. See [architecture](../architecture.md) for ownership and storage,
+[configuration](../configuration.md) for backend composition, and
+[operations](../operations.md) for lifecycle and observability.
+
+## Invocation
+
+Pass already-constructed backends directly:
 
 ```python
-from mindbridge import AssetRef, Blob, ContentAtom, ContentInput, StreamInput
+from mindbridge import JinaOmniEmbedder, Memory
+
+with Memory("./data/assistant", embedder=JinaOmniEmbedder()) as memory:
+    record = memory.add("The spare key is in the blue toolbox.")
+    hits = memory.search("Where is the spare key?")
 ```
 
+Or let the bundled declarative configuration construct its adapters:
+
 ```python
-ContentAtom = str | pathlib.Path | Blob | AssetRef
-ContentInput = ContentAtom | Sequence[ContentAtom]
+from mindbridge import Memory
+
+with Memory.from_config(
+    {
+        "data_dir": "./data/assistant",
+        "embedding": {"provider": "jina-omni"},
+    }
+) as memory:
+    memory.add("Remember this")
 ```
 
-`Blob(data, media_type, name=None)` requires non-empty bytes and a concrete image, video, or audio
-MIME type. `AssetRef(id, ...)` can be opaque at input boundaries; returned references contain the
-authoritative modality, MIME type, size, digest, name, and local path.
+`Memory` owns and closes every backend object passed to it. A backend may still leave its
+caller-supplied provider client open; that ownership is adapter-specific. Prefer a context manager
+or call `close()` explicitly.
 
-An ordered sequence combines text and media into one memory. A plain `str` always means text, even
-when it resembles a path or URL. Remote URL fetching is outside the SDK.
+The Jina adapter used in these examples executes upstream model code at an immutable pinned
+revision. Review its trust and license constraints in [configuration](../configuration.md#embedding-choices).
 
-### Input limits
+## Contract
 
-These bounds are enforced on the Python surface and raise `ValidationError` before any model call:
+### Construction
 
-| Bound | Value | Message |
-| --- | --- | --- |
-| Parts in one `ContentInput` sequence | 128 | `content must not exceed 128 parts` |
-| Characters in one text value | 65,536 after NFC normalization | `... must not exceed 65536 characters` |
-| `limit` for `search`, `search_with_trace`, `ask`, and `list` | 1–100 inclusive | `limit must be between 1 and 100` |
-
-The transports are stricter than the SDK, not equal to it: REST and MCP cap one request at 16 parts.
-An agent that composes near the Python bound must therefore expect a smaller ceiling over a
-transport; see the [REST](rest.md) and [MCP](mcp.md) references for the per-transport limits.
-
-## Memory
-
-```python
+```text
 Memory(
-    data_dir=".mindbridge",
+    data_dir: str | Path = ".mindbridge",
     *,
     embedder: EmbeddingBackend,
     answerer: GenerationBackend | None = None,
@@ -60,763 +68,540 @@ Memory(
     face_similarity: float = 0.363,
     face_margin: float = 0.05,
     tracer: opentelemetry.trace.Tracer | None = None,
+) -> None
+```
+
+`embedder` is required. `index_speech=True` requires a speech-capable `SpeechBackend` and stores
+transcripts and resolved speaker names with new memories. `index_quantization` changes only the
+rebuildable vector index; supported values are `none`, `fp16`, `int8`, and `rabitq`. The similarity,
+margin, relevance, and decay settings are validated when the instance opens. Their behavior and
+the supported provider configuration fields live in [configuration](../configuration.md).
+
+A plain `TranscriptionBackend` transcribes supported audio/video during `add` regardless of
+`index_speech`; `SpeechBackend` analysis and identity resolution stay behind the explicit flag.
+
+`vision_describer` and `former` have no declarative provider and are reachable only through
+direct construction or `MemoryPlugins`. `former` proposes typed memories after a source
+observation commits; omitting it keeps ordinary add behavior and makes no formation model call.
+
+The two other construction boundaries are:
+
+```text
+Memory.from_plugins(
+    data_dir: str | Path = ".mindbridge",
+    *,
+    plugins: MemoryPlugins,
+    config: MemoryConfig | None = None,
+    tracer: Tracer | None = None,
+) -> Memory
+
+Memory.from_config(
+    config: MindBridgeConfig | Mapping[str, object],
+    *,
+    tracer: Tracer | None = None,
+) -> Memory
+
+resolve_memory_config(
+    value: MindBridgeConfig | Mapping[str, object],
+) -> MemoryComposition
+```
+
+`MemoryPlugins` contains `embedder`, optional `answerer`, optional `transcriber`, optional
+`vision_describer`, optional `face_analyzer`, and optional `former`. `MemoryConfig` contains the value-only settings from the constructor;
+`MemorySettings` is its public alias. `MemoryComposition` contains `data_dir`, `plugins`, and
+`settings`; call `close()` unless its plugins have been transferred to a `Memory`.
+
+### Content contract
+
+```python
+ContentAtom = str | pathlib.Path | Blob | AssetRef
+ContentInput = ContentAtom | Sequence[ContentAtom]
+```
+
+- `str` is always text, even when it resembles a path or URL.
+- `Path` is a local regular media file. Its suffix supplies the media type.
+- `Blob(data: bytes, media_type: str, name: str | None = None)` is non-empty inline image, video,
+  or audio data.
+- `AssetRef(id, ...)` refers to media already stored in the same `data_dir`; `id` is its 64-character
+  lowercase SHA-256 identifier. A returned reference includes `modality`, `media_type`,
+  `size_bytes`, `sha256`, `name`, and its local `path`.
+- An ordered sequence combines text and media into one record. MindBridge does not fetch URLs.
+
+Event timestamps must be timezone-aware. `occurred_end` requires `occurred_at` and must be later
+than it. Metadata is a JSON-compatible mapping with non-empty string keys. `MemoryType` is
+`semantic`, `episodic`, or `procedural`; see
+[memory types, time, and decay](../memory-types-time-and-decay.md).
+
+The stable memory ID covers the ordered canonical content, metadata, event start/end, and memory
+type. Repeating the same canonical input returns the same record without another model call.
+
+`StreamInput` adds per-item values to a stream:
+
+```text
+StreamInput(
+    content: ContentInput,
+    occurred_at: datetime | None = None,
+    occurred_end: datetime | None = None,
+    metadata: Mapping[str, object] | None = None,
+    memory_type: MemoryType = MemoryType.SEMANTIC,
 )
 ```
 
-`embedder` is required. `Memory` validates adapter capabilities and durable space identity before
-opening Zvec. It closes supplied adapters when the memory closes; provider clients owned by an
-adapter may remain caller-owned, as documented by that adapter.
+### Memory operations
 
-`former` and `vision_describer` are optional and available through direct construction or
-`MemoryPlugins`. The declarative catalog does not enable either implicitly. This keeps automatic
-writes and visual model calls observable: applications must deliberately pass the corresponding
-protocol object.
+```text
+add(
+    content: ContentInput,
+    *,
+    occurred_at: datetime | None = None,
+    occurred_end: datetime | None = None,
+    metadata: Mapping[str, object] | None = None,
+    memory_type: MemoryType = MemoryType.SEMANTIC,
+    context: ObservationContext | None = None,
+) -> MemoryRecord
 
-Bundled adapters can be selected without constructing runtime objects:
+add_many(
+    contents: Sequence[ContentInput],
+    *,
+    occurred_at: Sequence[datetime | None] | None = None,
+    occurred_end: Sequence[datetime | None] | None = None,
+    metadata: Sequence[Mapping[str, object] | None] | None = None,
+    memory_type: MemoryType = MemoryType.SEMANTIC,
+    context: Sequence[ObservationContext | None] | None = None,
+) -> tuple[MemoryRecord, ...]
 
-```python
-from mindbridge import Memory
-
-with Memory.from_config(
-    {
-        "data_dir": "./data/example",
-        "embedding": {"provider": "jina-omni"},
-        "speech": {"provider": "funasr"},
-        "settings": {"index_speech": True},
-    }
-) as memory:
-    memory.add("Remember this")
+add_stream(
+    contents: Iterable[ContentInput | StreamInput],
+) -> Iterator[MemoryRecord]
 ```
 
-`Memory.from_config` accepts a `MindBridgeConfig` or mapping. It strictly validates bundled provider
-fields, owns the adapters and SDK clients it constructs, and reports invalid fields before opening
-storage. `AsyncMemory.from_config` accepts the same input. See
-[configuration and composition](../configuration.md) for providers and fields.
+`add` is content-addressed and idempotent. `add_many` uses one model batch and one SQLite
+transaction; each optional per-item sequence must have the same length as `contents`. An empty
+batch returns `()`. `add_stream` requests one item at a time and makes each yielded record durable
+and searchable before requesting the next. If a later item fails, earlier records remain and the
+error `subject` identifies `contents[N]`.
 
-`resolve_memory_config(config)` is the public lower-level boundary for constructing adapters
-separately from storage. It returns an owned `MemoryComposition`; call `close()` unless its plugins
-are transferred to one `Memory`.
+```text
+search(
+    query: ContentInput,
+    *,
+    limit: int = 10,
+    memory_type: MemoryType | None = None,
+    reference_at: datetime | None = None,
+    occurred_from: datetime | None = None,
+    occurred_until: datetime | None = None,
+    scope: RetrievalScope | None = None,
+) -> tuple[SearchHit, ...]
 
-Direct `Memory(...)` construction remains the stable plugin API. The compatibility
-`MemoryPlugins`/`Memory.from_plugins` bundle is also supported for applications that already group
-runtime objects separately from `MemoryConfig` local policy. Every entry point performs the same
-capability validation and uses the same storage, routing, lifecycle, and failure behavior.
+search_with_trace(
+    query: ContentInput,
+    *,
+    limit: int = 10,
+    memory_type: MemoryType | None = None,
+    reference_at: datetime | None = None,
+    occurred_from: datetime | None = None,
+    occurred_until: datetime | None = None,
+    scope: RetrievalScope | None = None,
+) -> TracedSearchResult
 
-`tracer` optionally selects a non-global OpenTelemetry provider. With the default `None`,
-MindBridge uses the standard global tracer. See
-[performance and token observability](../observability.md) for span names, TTFT, usage attributes,
-and privacy behavior.
-
-`index_speech=True` requires a speech-capable backend to analyze supported audio/video during
-`add`. Its transcript, stable speaker IDs, and names already registered at add time become stored,
-retrievable text. The default keeps speech analysis lazy.
-
-A `TranscriptionBackend` needs no flag. `add` transcribes every asset whose modality that backend
-declares and stores the transcript in the record, so a media memory has retrievable text next to
-its native media vector; the media is never replaced. `SpeechBackend` analysis stays behind
-`index_speech` because it also resolves speaker identity.
-
-`index_quantization` controls only Zvec's rebuildable vector index. `NONE` is the default and
-preserves maximum retrieval quality. `FP16` and rotated `INT8` reduce active index memory;
-`RABITQ` uses HNSW-RaBitQ and requires x86_64 with AVX2 plus an embedding dimension from 64 through
-4095. Quantization is lossy, so compare recall and latency before enabling it. Changing this value
-rebuilds Zvec from authoritative FP32 embeddings in SQLite without calling the embedder.
-
-`minimum_relevance` rejects weak dense evidence. `ambiguity_margin` rejects an unresolved top-two
-tie only when `search()` or `ask()` is called with `limit=1`; a lexical or temporal anchor can clear
-the tie. With a larger limit, `search` returns the qualified candidates and `ask` passes them to the
-answerer. Both settings are calibrated `[0, 1]` values and may be set to `0` to disable that gate. A
-candidate that matches the full-text index is scored at `0.6` confidence regardless of its vector
-distance, so it clears the default `minimum_relevance` on the strength of the lexical match alone.
-
-Use `Memory` as a context manager:
-
-```python
-from mindbridge import JinaOmniEmbedder, Memory
-
-with Memory("./data/example", embedder=JinaOmniEmbedder()) as memory:
-    record = memory.add("Remember this")
+ask(
+    question: ContentInput,
+    *,
+    limit: int = 5,
+    memory_type: MemoryType | None = None,
+    reference_at: datetime | None = None,
+    scope: RetrievalScope | None = None,
+) -> AnswerResult
 ```
 
-### Add
+`reference_at` is the timezone-aware clock for relative time and decay. The current UTC time is
+used when it is omitted. `occurred_from` and `occurred_until` are optional timezone-aware,
+half-open event-overlap filters; either may be omitted, and two bounds require
+`occurred_until > occurred_from`. Records without `occurred_at` do not match a bounded search.
 
-```python
-record = memory.add(
-    content,
-    occurred_at=None,
-    occurred_end=None,
-    metadata=None,
-    memory_type=MemoryType.SEMANTIC,
-    context=None,
-)
-records = memory.add_many(
-    contents,
-    occurred_at=(first_time, second_time),
-    occurred_end=(first_end, second_end),
-    metadata=({"source_id": "first"}, {"source_id": "second"}),
-    memory_type=MemoryType.SEMANTIC,
-    context=(first_context, second_context),
-)
+`scope` adds the bitemporal and spatial filters. `valid_at` selects world validity, `known_at`
+selects the transaction version known then, and `near` with a non-negative `radius_m` restricts
+results to one matching coordinate frame and anchor. SQLite reapplies every scope filter after
+candidate retrieval; see
+[valid time and transaction time](../memory-types-time-and-decay.md#valid-time-and-transaction-time).
+
+`search_with_trace(...).hits` equals the corresponding `search(...)` result. Its bounded trace
+contains identifiers, score components, ranks, and rejection reasons, but no query, content,
+metadata, media, vectors, paths, or model output. `ask` requires an answerer and returns only the
+retrieved hits the answerer actually used.
+
+```text
+get(memory_id: str) -> MemoryRecord
+speech(memory_id: str) -> tuple[SpeakerSegment, ...]
+faces(memory_id: str) -> tuple[FaceObservation, ...]
+register_speaker(speaker_id: str, name: str) -> None
+register_identity(identity_id: str, name: str) -> None
+reinforce(memory_ids: Sequence[str]) -> int
+list(*, limit: int = 100, cursor: str | None = None) -> Page
+delete(memory_id: str) -> bool
+reindex() -> int
+optimize() -> None
+close() -> None
 ```
 
-Event times must be timezone-aware. `occurred_end`, when present, requires `occurred_at` and must be
-later than it. Metadata must be a JSON-compatible mapping with non-empty string keys. `context` is
-an optional `ObservationContext` with typed basis, source ID, confidence, validity, and spatial
-pose. For `add_many`, the optional event-time, metadata, and context sequences must contain one
-value per content; this preserves per-record provenance without losing batched model/storage work.
-Duplicate inputs return the same stable record in their original positions. When a
-`FormationBackend` is configured, a context-free add is normalized to an observed source before
-formation.
+`get` raises `MemoryNotFoundError` for an unknown ID. `speech` and `faces` return `()` when the
+record has no relevant media and require their respective configured backend otherwise.
+Registration assigns or replaces a printable name for an existing local identity. `reinforce`
+records explicit positive feedback and returns the number of existing distinct memories updated.
+`list` uses an opaque keyset cursor. `delete` is idempotent and reports whether the record existed.
+`reindex` rebuilds Zvec from authoritative SQLite embeddings without calling the embedder and
+returns the number of memories rebuilt. `optimize` merges and flushes staged index vectors.
+Repeated `close()` calls are harmless.
 
-### Stream input
+### AsyncMemory
 
-`add_stream` consumes an iterable lazily and commits each completed item before requesting the
-next. A plain `ContentInput` uses the same defaults as `add`; wrap an item in `StreamInput` when a
-clip needs its own event time, metadata, memory role, or observation context:
+`AsyncMemory` has the same constructor, class methods, operation names, keyword parameters,
+defaults, and result values as `Memory`. Finite operations are awaited; `close()` is asynchronous.
+Its stream boundary is:
 
-```python
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-
-from mindbridge import MemoryType, StreamInput
-
-started = datetime(2026, 8, 31, 9, tzinfo=timezone.utc)
-
-
-def camera_clips():
-    for sequence, path in enumerate(sorted(Path("./capture").glob("*.mp4"))):
-        occurred_at = started + timedelta(seconds=30 * sequence)
-        yield StreamInput(
-            path,
-            occurred_at=occurred_at,
-            occurred_end=occurred_at + timedelta(seconds=30),
-            metadata={"sequence": sequence},
-            memory_type=MemoryType.EPISODIC,
-        )
-
-
-for record in memory.add_stream(camera_clips()):
-    print(record.id)
+```text
+add_stream(
+    contents: AsyncIterable[ContentInput | StreamInput],
+) -> AsyncIterator[MemoryRecord]
 ```
 
-Each yielded record is already durable and searchable. The stream is not one transaction: if a
-later item fails, earlier records remain committed and the error's `subject` identifies its
-`contents[N]` position. `AsyncMemory.add_stream` accepts an `AsyncIterable` and returns an async
-iterator with the same item semantics. MindBridge consumes completed chunks; the application owns
-camera or microphone capture and chooses chunk boundaries. Composite observations may combine
-text, image, video, and audio atoms. See
-[omni streaming and interaction memory](../omni-streaming-and-interaction-memory.md).
+The facade runs the synchronous embedded consistency core with `asyncio.to_thread`; it does not
+turn synchronous provider clients into native async clients.
 
-### Retrieve and answer
+`AsyncOmniPrefetch` coalesces evolving query snapshots for one turn:
 
-```python
-hits = memory.search(
-    query,
-    limit=10,
-    memory_type=None,
-    reference_at=None,
-    occurred_from=None,
-    occurred_until=None,
-    scope=None,
-)
-result = memory.ask(
-    question,
-    limit=5,
-    memory_type=None,
-    reference_at=None,
-    scope=None,
-)
-```
-
-`search` returns `tuple[SearchHit, ...]`. `ask` retrieves first and passes only those hits to the
-configured answerer. It raises `ModelError` when no answerer is configured.
-
-`reference_at` controls relative-date interpretation and decay reranking. It must be
-timezone-aware. When omitted, the current UTC time is used unless the query declares a valid
-English reference date such as `Today is May 2, 2024`; an explicit `reference_at` always wins.
-Absolute month and year expressions such as `December 2023`, `2024年4月`, or `in 2025` select the
-matching event-time range directly.
-
-`occurred_from` and `occurred_until` are optional timezone-aware hard filters on event time. A
-memory matches when its `[occurred_at, occurred_end)` interval overlaps the half-open query
-interval; an instant event has a one-microsecond extent. Either bound may be omitted. Supplying any
-bound excludes memories without `occurred_at`, and two bounds require
-`occurred_until > occurred_from`. These filters are independent of the soft temporal preference
-inferred from query text.
-
-`scope` is an optional `RetrievalScope`. `valid_at` selects the typed assertion valid in world time;
-`known_at` selects the transaction version known then. `near` plus `radius_m` performs exact
-same-frame, same-anchor metric filtering with positional uncertainty. Scope filtering is
-authoritatively rechecked in SQLite and applies equally to `search`, `search_with_trace`, and `ask`.
-
-Composite records are indexed with an aggregate vector and de-duplicated vectors for each text or
-media atom. Text longer than 2,048 characters also receives overlapping contextual retrieval keys;
-the complete record remains the returned evidence. Queries batch their complete aggregate with
-bounded focused aggregate and atomic keys derived from the first text atom and query media; later
-text atoms do not become independent dense routes. The focused text also supplies the lexical
-query. Dense and lexical candidates hydrate and collapse aggregate or atomic document keys to their
-authoritative parent before reranking. English BM25 uses
-case folding, accent folding, and stemming; queries containing Han characters use Jieba. Weak or
-missing evidence can therefore return `()`. With `limit=1`, an unresolved top-two tie can also
-empty `search` or leave `ask` with no hits; larger limits preserve those qualified candidates.
-
-### Trace one search
-
-```python
-result = memory.search_with_trace(
-    query,
-    limit=10,
-    memory_type=None,
-    reference_at=None,
-    occurred_from=None,
-    occurred_until=None,
-)
-```
-
-`result.hits` is exactly the value the same `search` call returns. `result.trace.candidates`
-explains the bounded candidate set actually considered: parent `memory_id`, contributing
-`index_ids`, dense relevance and confidence, effective lexical relevance, lexical rerank bonus,
-gate confidence, reinforcement, temporal and retention factors, final score, rank, and
-`rejected_by`. For a ranked candidate,
-`base_relevance = min(1, max(dense_relevance, lexical_relevance) + lexical_rerank_bonus)`;
-`gate_confidence` is the value compared with `minimum_relevance`. Rejection values are
-`stale_index`, `occurrence_range`, `missing_memory`, `memory_type`, `minimum_relevance`,
-`ambiguity`, and `limit`. A stale index candidate has `memory_id=None`.
-
-The trace never contains the query, memory content, metadata, media, vectors, paths, or model
-output. It is returned only to the caller and is not persisted or emitted through OpenTelemetry.
-`candidate_limit` is the final bounded retrieval width; `exhaustive` means every route returned
-fewer candidates than that width, not that the complete corpus was scanned. This diagnostic is
-available from Python and the local `search-with-trace` CLI command; REST and MCP do not expose it
-in this release.
-
-### Feedback
-
-```python
-updated = memory.reinforce((hit.id,))
-```
-
-Call `reinforce` only after explicit positive feedback. Retrieval itself never changes access
-strength. Confirmations provide a small bounded ranking boost even without decay and also slow
-decay when it is enabled. The return value is the number of existing, distinct memories updated.
-
-`reinforce` has no REST route and no MCP tool in this release, so the feedback loop is reachable
-only from Python. An application whose retrieval runs over a transport must call back into the
-owning process to record a confirmation.
-
-### Read, list, and delete
-
-```python
-record = memory.get(memory_id)
-page = memory.list(limit=100, cursor=None)
-deleted = memory.delete(memory_id)
-```
-
-`get` raises `MemoryNotFoundError` for an unknown ID. `delete` is idempotent and returns whether a
-record existed. Listing uses an opaque keyset cursor.
-
-### Speech
-
-```python
-turns = memory.speech(memory_id)
-memory.register_speaker(speaker_id, "Ada")
-```
-
-`speech` lazily analyzes stored audio or video through a configured `SpeechBackend`. Returned
-`SpeakerSegment` values contain time bounds, transcript text, opaque local speaker ID, optional
-registered name, and optional identity score. Grounded `ask` calls reuse this cache and pass the
-complete timed identity evidence to the answerer without changing the returned source hits.
-With `index_speech=True`, registering or renaming a speaker also re-embeds every existing memory
-that contains that identity, so name queries work for recordings captured before registration.
-
-### Face and multimodal identity
-
-```python
-observations = memory.faces(memory_id)
-memory.register_identity(observations[0].identity_id, "Ada")
-```
-
-`faces` lazily analyzes stored images or videos through the configured `FaceBackend`. Each
-`FaceObservation` contains a normalized bounding box, optional video timestamp, stable local
-identity ID, optional registered name, and optional match score. Face and voice observations share
-the same identity namespace. For a video with exactly one resolved face identity and one resolved
-speaker identity, MindBridge links them only when their stored modality sets do not conflict; a
-multi-face, multi-speaker, or conflicting-name scene remains unlinked.
-The retired ID remains a durable alias accepted by `register_identity` and `register_speaker`.
-When `index_speech=True`, a merge that changes the speaker's canonical ID atomically refreshes the
-affected record text, FP32 embeddings, and durable index outbox.
-
-Both modalities use bounded exemplar sets and max-over-exemplar cosine matching. Voice retains at
-most 20 exemplars per identity and face retains at most 10; when full, the exemplar nearest the set
-centroid is removed to preserve variation. The first observation enrolls an identity and therefore
-has no match score. Threshold and top-two margin gates are configured independently per modality.
-
-### Index maintenance
-
-```python
-count = memory.reindex()
-memory.optimize()
-```
-
-`reindex` rebuilds the disposable Zvec projection from every stored embedding and returns the
-number of memories rebuilt. It never calls the embedder. `optimize` compacts the current index.
-
-## AsyncMemory
-
-`AsyncMemory` takes the same constructor arguments and exposes the same methods. Finite operations
-use `await`; `add_stream` consumes an `AsyncIterable` with `async for`.
-
-```python
-async with AsyncMemory(
-    "./data/async",
-    embedder=embedder,
-    answerer=answerer,
-    transcriber=transcriber,
-) as memory:
-    await memory.add("Remember this")
-    hits = await memory.search("Remember")
-    async for record in memory.add_stream(observations()):
-        print(record.id)
-```
-
-It runs the embedded synchronous consistency core through `asyncio.to_thread`. It is not a
-provider compatibility layer.
-
-### Async omni prefetch
-
-`AsyncOmniPrefetch` is a per-turn Python orchestration helper over `AsyncMemory.search`. Submit the
-complete current multimodal snapshot whenever useful evidence changes, then confirm the final
-snapshot:
-
-```python
-from mindbridge import AsyncOmniPrefetch
-
-prefetch = AsyncOmniPrefetch(memory, limit=8)
-prefetch.submit((partial_text, frame_blob, audio_blob))
-prefetch.submit((newer_text, frame_blob, audio_blob))
-result = await prefetch.finalize((final_text, frame_blob, audio_blob))
-```
-
-One search runs at a time and only the newest queued revision survives. `latest` returns the newest
-completed `PrefetchResult` without waiting. `finalize` returns a result for the exact final value
-and closes the helper; a failed matching speculation is retried as a new revision. Prefetch
-snapshots accept immutable text, `Blob`, and `AssetRef` values, but reject mutable `Path` inputs.
-`close()` abandons queued work and drains the already-running search without attempting ineffective
-thread cancellation. The helper never persists input or reinforces hits.
-
-### Async capture stream
-
-`AsyncCaptureStream` accepts modality-neutral `StreamEvent` values. `UPDATE` carries a complete
-immutable snapshot for speculative recall; `FINAL` carries the exact durable `ContentInput` or
-`StreamInput`; `CANCEL` and EOF write nothing. `stream_id` defaults to `"default"`; interleaved IDs
-own independent prefetch state, and every `StreamCommit` returns the ID it completed.
-
-```python
-from mindbridge import AsyncCaptureStream, StreamEvent, StreamPhase
-
-
-async def events():
-    yield StreamEvent(StreamPhase.UPDATE, "partial left", stream_id="microphone-left")
-    yield StreamEvent(StreamPhase.UPDATE, "partial right", stream_id="microphone-right")
-    yield StreamEvent(StreamPhase.FINAL, "final left", stream_id="microphone-left")
-    yield StreamEvent(StreamPhase.FINAL, "final right", stream_id="microphone-right")
-
-
-capture = AsyncCaptureStream(memory, limit=8)
-async for commit in capture.consume(events()):
-    print(commit.stream_id, commit.record.id, commit.prefetch, commit.retrieval_error)
-```
-
-`max_streams` defaults to 32 and bounds active associated prefetches. One `StreamCommit` is yielded
-per final observation. A retrieval failure is visible in
-`retrieval_error` while the final record remains durable. Consumer cancellation before the final
-commit starts writes nothing. Once exact-final retrieval has completed and the write starts,
-`FINAL` is an irrevocable commit point: cancellation waits for that write, then propagates. Retrying
-the same final content is idempotent.
-
-### Native audio stream
-
-`AsyncAudioStream` accepts canonical, provider-neutral audio packets directly. PCM is immutable,
-interleaved, and WAV-compatible; its sample rate, channel count, and one-to-four-byte sample width
-must remain constant until a boundary.
-
-```python
-from mindbridge import (
-    ASRPartial,
-    AcousticBoundary,
-    AsyncAudioStream,
-    AudioBoundary,
-    PCMChunk,
-    VADPacket,
+```text
+AsyncOmniPrefetch(
+    memory: AsyncMemory,
+    *,
+    limit: int = 10,
+    memory_type: MemoryType | None = None,
+    reference_at: datetime | None = None,
+    occurred_from: datetime | None = None,
+    occurred_until: datetime | None = None,
 )
 
-
-async def packets():
-    yield AcousticBoundary(AudioBoundary.START, stream_id="headset")
-    yield VADPacket(True, stream_id="headset")
-    yield PCMChunk(pcm_chunk_1, sample_rate_hz=16_000, stream_id="headset")
-    yield ASRPartial("find the red", stream_id="headset")
-    yield PCMChunk(pcm_chunk_2, sample_rate_hz=16_000, stream_id="headset")
-    yield ASRPartial("find the red toolbox", stream_id="headset")
-    yield AcousticBoundary(AudioBoundary.END, stream_id="headset")
-
-
-audio = AsyncAudioStream(memory, limit=8)
-async for commit in audio.consume(packets()):
-    print(commit.stream_id, commit.record.id)
+latest: PrefetchResult | None
+submit(query: ContentInput) -> int
+async finalize(query: ContentInput | None = None) -> PrefetchResult
+async close() -> None
 ```
 
-PCM chunks accumulate per `stream_id` and become one durable WAV asset at `AudioBoundary.END` or
-when `VADPacket(active=False)` arrives. `CANCEL` and unfinished EOF write nothing. With native audio
-embedding, changing WAV snapshots drive prefetch directly. With a text-only embedder, ASR partials
-drive text prefetch; their final hypothesis is recorded as the audio transcript and routes the
-durable PCM through text embedding. Without an external ASR hypothesis, the configured
-`TranscriptionBackend` or `SpeechBackend` supplies the final fallback. Missing both routes raises
-`ModelError` instead of dropping audio.
+Only one search runs at once and only the newest queued snapshot survives. `finalize` returns the
+exact final revision and closes the helper. Snapshots reject mutable `Path` atoms; use `Blob` or
+`AssetRef`.
 
-`StreamInput(..., transcript="...")` exposes the same finalized external-ASR path for exactly one
-audio asset. Provider-specific ASR deltas and microphone byte formats remain adapter concerns;
-adapters emit complete current hypotheses and canonical PCM values.
+### Public values
 
-### Native vision stream
+The principal immutable values are:
 
-`AsyncVisionStream` accepts immutable encoded image frames, complete current visual descriptions,
-and explicit scene boundaries. Every packet carries the `stream_id` used by the shared capture
-reducer.
+| Value | Fields |
+| --- | --- |
+| `Blob` | `data`, `media_type`, `name` |
+| `AssetRef` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name`, `path`; `is_resolved` property |
+| `StreamInput` | `content`, `occurred_at`, `occurred_end`, `metadata`, `memory_type`, `context`, `transcript`, `description` |
+| `MemoryRecord` | `id`, `content`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `assets`, `modality`, `memory_type`, `context` |
+| `SearchHit` | all visible memory fields plus `score` |
+| `AnswerResult` | `answer`, `hits`, `abstained`, `abstention_reason` |
+| `Page` | `items`, `next_cursor` |
+| `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
+| `FaceObservation` | `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
+| `SpatialContext` | `frame_id`, `anchor`, `x`, `y`, `z`, `orientation_xyzw`, `position_uncertainty_m` |
+| `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial` |
+| `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `spatial`, `cue_modality`, `valence`, `arousal` |
+| `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m` |
+| `StreamEvent` | `phase`, `item`, `stream_id` |
+| `StreamCommit` | `record`, `prefetch`, `retrieval_error`, `stream_id` |
+| `PCMChunk` | `data`, `sample_rate_hz`, `channels`, `sample_width_bytes`, `stream_id`, `occurred_at` |
+| `VADPacket` | `active`, `stream_id`, `occurred_at` |
+| `ASRPartial` | `text`, `stream_id`, `occurred_at` |
+| `AcousticBoundary` | `boundary`, `stream_id`, `occurred_at` |
+| `VisionFrame` | `image`, `stream_id`, `occurred_at` |
+| `VisionPartial` | `text`, `stream_id`, `occurred_at` |
+| `SceneBoundary` | `boundary`, `stream_id`, `occurred_at` |
+| `PrefetchResult` | positive `revision`, `hits` |
+| `TracedSearchResult` | `hits`, `trace` |
+| `RetrievalTrace` | `candidates`, `candidate_limit`, `exhaustive`, `ambiguous` |
+| `RetrievalCandidateTrace` | `memory_id`, `index_ids`, `dense_relevance`, `dense_confidence`, `lexical_relevance`, `lexical_rerank_bonus`, `lexical_match`, `gate_confidence`, `base_relevance`, `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`, `rejected_by` |
 
-```python
-from mindbridge import (
-    AsyncVisionStream,
-    Blob,
-    SceneBoundary,
-    VisionBoundary,
-    VisionFrame,
-    VisionPartial,
+Enum values are:
+
+| Enum | Values |
+| --- | --- |
+| `Modality` | `text`, `image`, `video`, `audio`, `omni` |
+| `MemoryType` | `semantic`, `episodic`, `procedural` |
+| `IndexQuantization` | `none`, `fp16`, `int8`, `rabitq` |
+| `AbstentionReason` | `no_evidence`, `insufficient_evidence` |
+| `RetrievalRejection` | `stale_index`, `occurrence_range`, `missing_memory`, `memory_type`, `minimum_relevance`, `ambiguity`, `limit` |
+| `EmbedTask` | `retrieval.query`, `retrieval.document` |
+| `MemoryKind` | `observation`, `entity`, `event`, `state`, `relation`, `affect`, `trait`, `response_policy` |
+| `EvidenceBasis` | `observation`, `user_statement`, `model_inference`, `response_feedback` |
+| `SpatialAnchor` | `observer`, `subject` |
+| `StreamPhase` | `update`, `final`, `cancel` |
+| `AudioBoundary` | `start`, `end`, `cancel` |
+| `VisionBoundary` | `start`, `end`, `cancel` |
+
+### Backend protocols
+
+Backends are runtime-checkable, thread-safe protocols. Their required methods are:
+
+```text
+EmbeddingBackend.embed(
+    inputs: Sequence[ModelInput],
+    task: EmbedTask = EmbedTask.DOCUMENT,
+) -> tuple[tuple[float, ...], ...]
+
+GenerationBackend.answer(
+    question: ModelInput,
+    hits: Sequence[SearchHit],
+) -> AnswerResult
+
+StreamingGenerationBackend.stream_answer(
+    question: ModelInput,
+    hits: Sequence[SearchHit],
+) -> Iterator[str]
+
+TranscriptionBackend.transcribe(
+    assets: Sequence[AssetRef],
+) -> tuple[str, ...]
+
+SpeechBackend.analyze(
+    assets: Sequence[AssetRef],
+) -> tuple[SpeechAnalysis, ...]
+
+FaceBackend.analyze(
+    assets: Sequence[AssetRef],
+) -> tuple[FaceAnalysis, ...]
+
+VisionDescriptionBackend.describe(
+    inputs: Sequence[ModelInput],
+) -> tuple[str, ...]
+
+FormationBackend.form(
+    inputs: Sequence[FormationInput],
+) -> tuple[tuple[FormationProposal, ...], ...]
+```
+
+Required properties are `embedding_capabilities`, `embedding_model`, `embedding_space`, and
+`embedding_dimension` for embedding; `transcription_capabilities`, `transcription_model`, and
+`transcription_space` for transcription and speech; `face_capabilities`, `face_model`,
+`face_space`, and `face_analysis_space` for faces; `vision_capabilities` and `vision_model` for
+visual description; `formation_capabilities`, `formation_model`, and `formation_space` for
+formation; and `generation_capabilities` for generation. Every base protocol except the optional
+streaming extension implements `close()`.
+
+`form` receives one `FormationInput` per committed source and returns one proposal tuple per
+input, in the same order. A former never writes storage: the kernel validates each proposal
+against the source modality and spatial frame, assigns identity, links evidence, and commits.
+
+`ModelInput` contains normalized `text` and resolved `assets`. Speech adapters return
+`SpeechAnalysis(turns, speakers)` using `SpeechTurn` and `SpeakerEmbedding`; face adapters return
+`FaceAnalysis(faces)` using `FaceEmbedding`.
+
+| Backend value | Fields |
+| --- | --- |
+| `ModelInput` | `text`, `assets`; derived `modality` and `modalities` properties |
+| `SpeechTurn` | `start_ms`, `end_ms`, `text`, `speaker_label` |
+| `SpeakerEmbedding` | `speaker_label`, `values` |
+| `SpeechAnalysis` | `turns`, `speakers` |
+| `FaceEmbedding` | `face_label`, `values`, `bounding_box`, `observed_at_ms` |
+| `FaceAnalysis` | `faces` |
+| `FormationInput` | `memory_id`, `content`, `context` |
+| `FormationProposal` | `kind`, `content`, `basis`, `subject`, `predicate`, `value`, `confidence`, `valid_from`, `valid_until`, `spatial`, `cue_modality`, `valence`, `arousal` |
+
+### Bundled adapters
+
+The public construction signatures are:
+
+```text
+SentenceTransformersEmbedder(
+    encoder,
+    *,
+    model_id: str,
+    revision: str,
+    dimension: int | None = None,
+    batch_size: int = 32,
 )
 
+SentenceTransformersEmbedder.load(
+    model_id: str,
+    *,
+    revision: str,
+    dimension: int | None = None,
+    device: str | None = None,
+    batch_size: int = 32,
+) -> SentenceTransformersEmbedder
 
-async def packets():
-    yield VisionFrame(Blob(first_jpeg, "image/jpeg"), stream_id="camera-left")
-    yield VisionPartial("a red toolbox", stream_id="camera-left")
-    yield VisionFrame(Blob(latest_jpeg, "image/jpeg"), stream_id="camera-left")
-    yield SceneBoundary(VisionBoundary.END, stream_id="camera-left")
+JinaOmniEmbedder(
+    *,
+    dimension: int = 1024,
+    device: str | None = None,
+    batch_size: int = 32,
+)
 
+FunASRTranscriber(
+    recipe: FunASRRecipe = DEFAULT_FUNASR_RECIPE,
+    *,
+    device: str = "auto",
+)
 
-vision = AsyncVisionStream(memory, limit=8)
-async for commit in vision.consume(packets()):
-    print(commit.stream_id, commit.record.id)
-```
+FunASRRecipe(
+    model_id: str,
+    vad_model: str,
+    speaker_model: str | None,
+    model_revision: str | None = None,
+    vad_revision: str | None = None,
+    speaker_revision: str | None = None,
+    punctuation_model: str | None = None,
+    punctuation_revision: str | None = None,
+    vad_max_single_segment_ms: int | None = None,
+    hub: str = "ms",
+    trust_remote_code: bool = False,
+)
 
-The latest frame is the scene's durable keyframe; newer frame updates replace queued speculative
-work instead of accumulating an unbounded clip. A native-image embedder receives the frame. A
-text-only embedder receives `VisionPartial.text`, which is bound to the final keyframe through
-`StreamInput.description`. If no partial exists, a configured `VisionDescriptionBackend` runs once
-at finality. Without any of those routes, finalization raises `ModelError` rather than silently
-dropping visual evidence. `START`, `END`, `CANCEL`, EOF, and `max_streams` follow the audio and
-generic capture semantics.
-
-`VisionFrame` deliberately accepts an encoded image `Blob`, not RGB/YUV buffers or camera SDK
-objects. Device adapters own pixel conversion and emit canonical immutable frames.
-
-## Return values
-
-- `MemoryRecord`: stable ID, derived text, modality, memory type, assets, timestamps, metadata, and
-  optional authoritative `MemoryContext`.
-- `SearchHit`: the same visible memory fields plus a normalized score and typed context.
-- `TracedSearchResult`: search hits plus an immutable `RetrievalTrace` of
-  `RetrievalCandidateTrace` values and stable `RetrievalRejection` reasons.
-- `AnswerResult`: grounded answer text, accepted hits, `abstained`, and a machine-readable
-  `abstention_reason` (`no_evidence` or `insufficient_evidence`).
-- `Page`: records and an optional next cursor.
-- `PrefetchResult`: a positive submission revision and immutable search hits.
-- `SpeakerSegment`: one timed speech segment and local identity fields.
-- `ObservationContext`: typed source basis, confidence, validity, and optional `SpatialContext`.
-- `MemoryContext`: stored kind, basis, confidence, valid/transaction time, lineage, evidence,
-  supersession, model recipe, spatial pose, and affect fields.
-- `RetrievalScope`: optional valid time, known time, and same-frame radius constraint.
-- `StreamInput`: one completed `ContentInput` with per-item time, metadata, memory type, context,
-  an optional finalized transcript for one audio asset, and an optional description for one visual
-  asset.
-- `PCMChunk` / `VADPacket` / `ASRPartial` / `AcousticBoundary`: canonical live-audio protocol
-  values consumed by `AsyncAudioStream`.
-- `VisionFrame` / `VisionPartial` / `SceneBoundary`: canonical live-vision protocol values consumed
-  by `AsyncVisionStream`.
-- `StreamEvent` / `StreamCommit`: associated capture lifecycle input and exact-final durable output.
-
-All are frozen, slotted dataclasses. Mappings are detached from caller input.
-
-## Model protocols
-
-The operation-specific contracts are runtime-checkable protocols.
-
-```python
-class EmbeddingBackend(Protocol):
-    embedding_capabilities: frozenset[Modality]
-    embedding_model: str
-    embedding_space: str
-    embedding_dimension: int
-
-    def embed(
-        self,
-        inputs: Sequence[ModelInput],
-        task: EmbedTask = EmbedTask.DOCUMENT,
-    ) -> tuple[tuple[float, ...], ...]: ...
-
-    def close(self) -> None: ...
-```
-
-```python
-class FormationBackend(Protocol):
-    formation_capabilities: frozenset[Modality]
-    formation_model: str
-    formation_space: str
-
-    def form(
-        self,
-        inputs: Sequence[FormationInput],
-    ) -> tuple[tuple[FormationProposal, ...], ...]: ...
-
-    def close(self) -> None: ...
-```
-
-A former receives only committed observations and proposes source-aligned typed memories. It never
-writes storage. MindBridge validates the complete batch, assigns identity, links evidence, maintains
-bitemporal state, and commits derived records atomically. `formation_space` identifies the complete
-durable recipe, including supported modalities, so retries and capability changes cannot be
-confused. Sources outside the current capabilities remain unacknowledged and can be formed after
-reopening with an upgraded adapter.
-
-```python
-class GenerationBackend(Protocol):
-    generation_capabilities: frozenset[Modality]
-
-    def answer(
-        self,
-        question: ModelInput,
-        hits: Sequence[SearchHit],
-    ) -> AnswerResult: ...
-
-    def close(self) -> None: ...
-```
-
-An answerer can additionally implement
-`StreamingGenerationBackend.stream_answer() -> Iterator[str]`. `Memory.ask()` consumes the stream
-into the same `AnswerResult` and records TTFT on the generation span; the stable
-`GenerationBackend.answer()` contract remains available for non-streaming callers.
-
-```python
-class TranscriptionBackend(Protocol):
-    transcription_capabilities: frozenset[Modality]
-    transcription_model: str
-    transcription_space: str
-
-    def transcribe(self, assets: Sequence[AssetRef]) -> tuple[str, ...]: ...
-
-    def close(self) -> None: ...
-```
-
-```python
-class VisionDescriptionBackend(Protocol):
-    vision_capabilities: frozenset[Modality]
-    vision_model: str
-
-    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]: ...
-
-    def close(self) -> None: ...
-```
-
-`describe()` returns one non-empty current description per resolved image input, in order. The
-description may combine caption, OCR, and detector output; MindBridge treats it as explicit text
-fallback and retains the original frame as durable evidence. The backend may run concurrently with
-other model calls and is closed with `Memory`.
-
-`SpeechBackend` has the same transcription identity properties as `TranscriptionBackend` and adds
-`analyze()`:
-
-```python
-class SpeechBackend(Protocol):
-    transcription_capabilities: frozenset[Modality]
-    transcription_model: str
-    transcription_space: str
-
-    def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]: ...
-
-    def close(self) -> None: ...
-```
-
-`analyze()` returns one `SpeechAnalysis` per asset, in the order the assets were supplied — not a
-single value. Each `SpeechAnalysis` carries `turns` and `speakers`. An implementation that returns
-one object per call, rather than a tuple, fails inside `Memory` at runtime.
-
-Backends may implement more than one protocol. Calls can overlap, so adapters must be thread-safe
-until `close()`.
-
-## Built-in adapters
-
-### Sentence Transformers
-
-```python
-embedder = SentenceTransformersEmbedder.load(
-    "sentence-transformers/all-MiniLM-L6-v2",
-    revision="1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+OpenCVFaceAnalyzer(
+    detector_model: str | Path,
+    recognizer_model: str | Path,
+    *,
+    score_threshold: float = 0.9,
+    nms_threshold: float = 0.3,
+    top_k: int = 5000,
+    frame_interval_ms: int = 1000,
+    max_video_frames: int = 300,
 )
 ```
 
-`revision` is keyword-only and required. It must be a 40-character immutable commit hash; a branch
-or tag name raises `ValidationError: revision must be an immutable 40-character commit hash`. The
-immutable revision, dimension, normalization, query/document semantics, and input recipe form the
-durable embedding space, which `Memory` records in `data_dir` and re-checks on open.
+The direct `SentenceTransformersEmbedder` constructor accepts a caller-owned encoder implementing
+`supports`, `get_embedding_dimension`, `encode_query`, and `encode_document`; `load` constructs that
+encoder and requires a 40-character immutable commit revision. `JinaOmniEmbedder.load` has the same
+keyword parameters as its constructor and eagerly loads the pinned model. Jina loading sets
+`trust_remote_code=True` while pinning both model and code revisions. Its weights are CC BY-NC 4.0;
+that license covers the weights, not MindBridge. `DEFAULT_FUNASR_MODEL_ID` and
+`DEFAULT_FUNASR_RECIPE` publish the default speech recipe.
+`FunASRRecipe.auto_model_arguments() -> dict[str, object]` returns its standard FunASR composition.
 
-`dimension`, `device`, and `batch_size` are optional. `device=None` lets Sentence Transformers
-choose; pass `"cuda"` or `"cpu"` to pin it:
+`OpenAIModels` can fill embedding, generation, and transcription slots independently:
 
-```python
-embedder = SentenceTransformersEmbedder.load(
-    "sentence-transformers/all-MiniLM-L6-v2",
-    revision="1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
-    device="cuda",
-    batch_size=8,
+```text
+OpenAIModels(
+    client: OpenAI | None = None,
+    *,
+    embedding_client: OpenAI | None = None,
+    generation_client: OpenAI | None = None,
+    transcription_client: OpenAI | None = None,
+    embedding_model: str = "text-embedding-3-small",
+    embedding_space: str | None = None,
+    embedding_dimension: int = 1536,
+    embedding_request_format: Literal["input", "messages"] = "input",
+    generation_model: str = "gpt-5-mini",
+    transcription_model: str = "whisper-1",
+    transcription_space: str | None = None,
+    transcription_prompt: str | None = None,
+    transcription_keywords: Sequence[str] | None = None,
+    transcription_languages: Sequence[str] | None = None,
+    embedding_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
+    generation_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
+    transcription_capabilities: frozenset[Modality] = frozenset({Modality.AUDIO}),
+    generation_seed: int | None = None,
+    generation_temperature: float | None = None,
+    generation_max_tokens: int | None = None,
+    generation_min_video_seconds: float | None = None,
+    generation_video_limit: int | None = 8,
+    generation_extra_body: Mapping[str, object] | None = None,
 )
 ```
 
-Capabilities come from the loaded model, so a text-only model yields a text-only store. See
-[choosing an embedding backend](../quickstart.md#choose-an-embedding-backend) for how to resolve a
-model's current commit hash.
+The common `client` fills any operation-specific client left unset. A missing client fails only
+when that operation is called. `close()` does not close caller-supplied OpenAI clients. Provider
+selection, extras, model identity, and credential behavior are documented once in
+[configuration](../configuration.md).
 
-`JinaOmniEmbedder` is a lazy pinned specialization:
+`embedding_request_format` selects an `input` or `messages` request for compatible embedding
+endpoints. Transcription prompt, keywords, and languages form the provider hint.
+`generation_min_video_seconds` converts shorter videos to four ordered stills when image generation
+capability is available; `generation_video_limit` caps retrieved evidence videos but not question
+media. `generation_extra_body` is forwarded to the SDK request.
 
-```python
-embedder = JinaOmniEmbedder(dimension=1024, device="cuda", batch_size=8)
+Its operation signatures widen the base protocols only by accepting plain text where useful:
+
+```text
+embed(
+    inputs: Sequence[ModelInput | str],
+    task: EmbedTask = EmbedTask.DOCUMENT,
+) -> tuple[tuple[float, ...], ...]
+answer(question: ModelInput | str, hits: Sequence[SearchHit]) -> AnswerResult
+stream_answer(
+    question: ModelInput | str,
+    hits: Sequence[SearchHit],
+) -> Generator[str, None, tuple[SearchHit, ...]]
+transcribe(assets: Sequence[AssetRef]) -> tuple[str, ...]
+close() -> None
 ```
 
-Its pinned weights are licensed CC BY-NC 4.0 — non-commercial use only. That licence covers the
-model, not MindBridge.
+OpenAI requests inline at most 20 MiB of base64 data per media item and 64 MiB in aggregate. Because
+base64 expands input, that is roughly 15 MiB per source file and 48 MiB per call on disk. Grounded
+answer text is capped at 4 MiB. Answer fitting reserves media capacity for the question, keeps
+highest-ranked evidence that fits, and leaves overflow evidence as text when possible; use a
+provider-specific upload adapter for larger media.
 
-It calls the model's official Sentence Transformers retrieval methods and wraps application text
-so URL- or path-shaped text cannot activate media autodetection.
-Local videos stay as paths through Transformers' PyAV decoder, preserving source fps and duration
-metadata while reproducing the pinned Jina recipe's sampling of at most 32 unique frames.
+Named recipes are also available as a small, closed construction API:
 
-### FunASR
+```text
+from mindbridge import recipes
 
-```python
-speech = FunASRTranscriber(device="auto")
+recipes.names() -> tuple[str, ...]
+recipes.slots(name: str) -> tuple[str, ...]
+recipes.require_slot(name: str, slot: str) -> None
+recipes.probe(name: str) -> str
+recipes.describe(name: str) -> dict[str, object]
+recipes.embedder(name: str, *, load: bool = False) -> EmbeddingBackend
+recipes.answerer(name: str, *, load: bool = False) -> GenerationBackend
+recipes.transcriber(
+    name: str,
+    *,
+    load: bool = False,
+) -> SpeechBackend | TranscriptionBackend
 ```
 
-The adapter delegates model, VAD, and optional speaker execution to `funasr.AutoModel`, then
-validates and maps the result into MindBridge speech values. A `FunASRRecipe` with
-`speaker_model=None` returns timed transcript turns without speaker embeddings.
+Each construction function returns an object the caller owns and closes. `load=True` additionally
+exercises the recipe's published probe (`weights`, `import`, or `client`).
 
-### OpenCV face analysis
-
-Install `mindbridge[face]`, obtain the ONNX weights from OpenCV Zoo's
-[YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) and
-[SFace](https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface) pages, and pass
-their local paths explicitly:
-
-```python
-from mindbridge import OpenCVFaceAnalyzer
-
-faces = OpenCVFaceAnalyzer(
-    detector_model="./models/face_detection_yunet.onnx",
-    recognizer_model="./models/face_recognition_sface.onnx",
-)
-```
-
-The adapter samples videos with a bounded, configurable interval, runs locally through OpenCV, and
-never downloads weights or exports source media. Model-file digests and analysis settings form its
-durable spaces. The default face similarity `0.363` is SFace's published LFW cosine threshold;
-applications should calibrate thresholds on representative, held-out data before relying on names.
-
-### OpenAI SDK
-
-```python
-models = OpenAIModels(
-    client=None,
-    embedding_client=None,
-    generation_client=None,
-    transcription_client=None,
-    embedding_model="text-embedding-3-small",
-    embedding_space=None,
-    embedding_dimension=1536,
-    embedding_request_format="input",
-    generation_model="gpt-5-mini",
-    transcription_model="whisper-1",
-    transcription_space=None,
-    transcription_prompt=None,
-    transcription_keywords=None,
-    transcription_languages=None,
-    embedding_capabilities=frozenset({Modality.TEXT}),
-    generation_capabilities=frozenset({Modality.TEXT}),
-    transcription_capabilities=frozenset({Modality.AUDIO}),
-    generation_seed=None,
-    generation_temperature=None,
-    generation_max_tokens=None,
-    generation_min_video_seconds=None,
-    generation_video_limit=8,
-    generation_extra_body=None,
-)
-```
-
-The common `client` is used for operations without a more specific client. Missing clients fail
-only when their operation is invoked. Media is bounded and sent inline; use a provider-specific
-upload adapter for larger assets. `generation_max_tokens` maps to Chat Completions `max_tokens`;
-`generation_extra_body` passes caller-owned provider extensions through the official SDK. Both are
-built into the shared grounded request, so `answer()` and `stream_answer()` always send identical
-generation controls. `generation_video_limit` bounds distinct retrieved videos while preserving
-overflow hit text; set it to `None` to disable that count limit. The byte limits still apply. SDK
-clients remain caller-owned.
-
-Set `transcription_model="gpt-transcribe"` to use OpenAI Transcribe for completed audio files.
-Optional `transcription_prompt`, `transcription_keywords`, and `transcription_languages` are sent
-through the official SDK. Their normalized values are hashed into the default
-`transcription_space`; supply an explicit space only when the application maintains an equivalent
-stable recipe identity itself. OpenAI Transcribe remains a plain `TranscriptionBackend`; realtime
-audio, timestamps, diarization, and speaker embeddings require their corresponding specialized
-backends.
-
-`embedding_request_format="input"` uses the standard OpenAI Embeddings request field. Set it to
-`"messages"` for OpenAI-compatible servers that implement chat-style embeddings, such as vLLM
-multimodal pooling models. That mode sends ordered text and inline media as top-level chat messages
-through the same `/embeddings` endpoint. The request format is included in the default durable
-`embedding_space`; an explicit space must likewise distinguish recipes that use different formats.
-In `messages` mode, `embedding_dimension` validates returned vectors but is not sent as the
-provider's optional server-side dimension-reduction parameter.
-
-Set `generation_min_video_seconds` only when the selected provider declares a minimum local-video
-duration. With the `openai` extra and declared image input, a shorter video becomes four
-time-ordered JPEG `image_url` parts before the first provider request; videos at or above the limit
-stay native. Derived frames must also fit the existing per-item and whole-request media budgets.
-The stills preserve visual evidence, not native video timing. Missing image capability, local
-decoding, or media budget keeps the existing provider-rejection fallback.
-
-`OpenAIModels.stream_answer()` requests streamed chat completions with final usage enabled.
-`Memory.ask()` selects it automatically to measure first chunk, first token, total generation
-latency, and provider-reported token usage. `answer()` remains the synchronous non-streaming method
-required by `GenerationBackend`.
-
-`OpenAIModels` also implements `FormationBackend`. `form()` sends one batched strict-JSON generation
-request and returns typed proposals. Stable source/CAS IDs and exact spatial values are not sent to
-the provider, and the adapter cannot elevate model output to observation or user-statement basis.
-Generation model and decoding controls form its default durable `formation_space`.
-
-## Exceptions
+## Errors and limits
 
 All stable exceptions derive from `MindBridgeError`:
 
-- `ValidationError`
-- `MemoryNotFoundError`
-- `IdentityNotFoundError`
-- `SpeakerNotFoundError`
-- `ModelError`
-- `ModelOutputTruncatedError`
-- `StorageError`
-- `IndexUnavailableError`
+| Exception | `code` | Default `reason` |
+| --- | --- | --- |
+| `MindBridgeError` | `mindbridge_error` | `None` |
+| `ValidationError` | `validation_error` | `input_invalid` |
+| `MemoryNotFoundError` | `memory_not_found` | `memory_not_found` |
+| `SpeakerNotFoundError` | `speaker_not_found` | `speaker_not_found` |
+| `IdentityNotFoundError` | `identity_not_found` | `identity_not_found` |
+| `ModelError` | `model_error` | `None` |
+| `ModelOutputTruncatedError` | `model_output_truncated` | `output_truncated` |
+| `StorageError` | `storage_error` | `None` |
+| `IndexUnavailableError` | `index_unavailable` | `None` |
 
-`ModelOutputTruncatedError` is the `ModelError` raised when generation stopped at an output token
-limit rather than finishing. It is deterministic: retrying the same request produces the same
-failure. Raise `generation_max_tokens`, or lower the `ask` limit so less evidence competes with the
-answer for the model's output budget. Every other `ModelError` may be transient.
+Every error may carry `reason`, `stage`, and `subject`. `retryable` is true only when `reason` is
+`connection_failed`, `data_dir_in_use`, `flush_failed`, `index_missing`, `rate_limited`, or
+`timeout`; it is never inferred from the message. `ModelOutputTruncatedError` is a deterministic
+`ModelError`, and `IndexUnavailableError` is a `StorageError`.
 
-Provider bodies, credentials, and local paths are not included in public model/storage error
-messages.
+Stable input bounds are:
+
+| Bound | Value |
+| --- | --- |
+| Ordered parts in one `ContentInput` | 128 |
+| Normalized text in one operation, including combined text atoms | 65,536 characters |
+| Serialized metadata for one memory | 262,144 UTF-8 bytes |
+| One local media asset | 512 MiB |
+| `limit` for search, answer, and listing operations | 1 through 100 |
+| Identity or speaker name | 255 printable characters |
+
+The 512 MiB value is the local ingestion ceiling, not a promise that every model backend accepts an
+asset that large. Backend request limits apply before model work.
+
+`add_many` has no separate SDK item-count cap, but each item is subject to the same content and
+metadata bounds. REST and MCP deliberately impose narrower transport limits. A `Memory` is bound
+to the process that opened it and cannot be used after `fork`; open a new instance with a different
+`data_dir` in the child.
