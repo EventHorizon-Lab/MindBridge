@@ -16,7 +16,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
@@ -538,23 +538,20 @@ class _BackendPool:
         self._settings = MemoryConfig(index_speech=self._transcriber is not None)
 
     def memory(self, data_dir: Path) -> AsyncMemory:
-        settings = self._settings
+        # Forwarded from the dataclass rather than field by field. The hand-written list silently
+        # dropped every setting added after it was written, which does not fail anything: the
+        # evaluation simply measures the default policy while reporting the configured one.
+        # `MemoryPlugins` cannot be used here because the shared-backend proxies are structural
+        # and its runtime protocol check reads attributes statically.
+        policy = {entry.name: getattr(self._settings, entry.name) for entry in fields(MemoryConfig)}
         return AsyncMemory(
             data_dir,
             embedder=self._embedder,
             answerer=self._answerer,
             transcriber=self._transcriber,
             face_analyzer=self._face_analyzer,
-            index_speech=settings.index_speech,
-            index_quantization=settings.index_quantization,
-            minimum_relevance=settings.minimum_relevance,
-            ambiguity_margin=settings.ambiguity_margin,
-            decay_half_life_days=settings.decay_half_life_days,
-            speaker_similarity=settings.speaker_similarity,
-            speaker_margin=settings.speaker_margin,
-            face_similarity=settings.face_similarity,
-            face_margin=settings.face_margin,
             tracer=self._tracer,
+            **policy,
         )
 
     def close(self) -> None:
