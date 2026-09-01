@@ -445,7 +445,12 @@ thread cancellation. The helper never persists input or reinforces hits.
 - `TracedSearchResult`: search hits plus an immutable `RetrievalTrace` of
   `RetrievalCandidateTrace` values and stable `RetrievalRejection` reasons.
 - `AnswerResult`: grounded answer text, accepted hits, `abstained`, and a machine-readable
-  `abstention_reason` (`no_evidence` or `insufficient_evidence`).
+  `abstention_reason` (`no_evidence` or `insufficient_evidence`). `abstained` reports that the
+  answerer returned the exact sentence the grounding prompt reserves for having no usable evidence.
+  It is not a measure of how often a model declined to answer: a model that refuses in its own
+  words is not abstaining by this definition, and on one EgoLifeQA slice 12 of 51 answers read as
+  refusals without using the sentence. Treat `abstained` as a protocol signal, and measure refusal
+  rate separately if that is the quantity you need.
 - `Page`: records and an optional next cursor.
 - `PrefetchResult`: a positive submission revision and immutable search hits.
 - `SpeakerSegment`: one timed speech segment and local identity fields.

@@ -277,7 +277,9 @@ Content-Type: application/json
 
 `memory_type` and `reference_at` have the same semantics as search. `hits` are the exact search
 results used to ground the answer. `abstention_reason` is `no_evidence`,
-`insufficient_evidence`, or `null` when `abstained` is false. The outbound generation request
+`insufficient_evidence`, or `null` when `abstained` is false. `abstained` reports that the answerer
+returned the exact sentence reserved for having no usable evidence, not that the model declined to
+answer in its own words. The outbound generation request
 includes their content, `memory_type`, `occurred_at`, `occurred_end`, `created_at`, metadata, and
 media. In the built-in model request, a distinct question/evidence asset is serialized once even
 when multiple hits refer to it.

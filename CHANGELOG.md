@@ -17,31 +17,6 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   all in 76 EgoLife frames, and a recognizer whose similarities do not separate the footage created
   4 026 identities from 4 731 observations, 84.1% of them seen exactly once.
 
-### Changed
-
-- The benchmark harness request timeout now defaults to 300 seconds instead of 3 600. An hour
-  bounds nothing a run cares about: a request the server never answers held its task for the full
-  hour while the remaining workers idled, and the run reported the stall as elapsed time. The
-  slowest mean model call measured across this suite is video grounding at 36.3 seconds.
-- A video the embedding model cannot fit in its context is now embedded as four ordered stills
-  instead of failing the write, recorded on `mindbridge.embedding.video_sampled_inputs`. Only a
-  rejection that declares the length constraint triggers it; any other rejection is unchanged.
-  Against a local vLLM serving `tencent/WeMM-Embedding-2B`, every thirty-second EgoLife clip was a
-  58 344 token prompt against a 35 768 token model and failed; as stills it is 7 756.
-- Media the embedding model cannot accept inline now degrades the retrieval key instead of the
-  whole write. `add` drops the oversized key, stores the memory with its media, keeps it reachable
-  through its remaining keys, and records `mindbridge.embedding.elided_parts` on the span. A memory
-  left with no key at all still fails. On an ATM-Bench slice this recovers 21 of 7 612 memories
-  that previously failed with `payload_too_large`, which is what invalidated the whole task's score.
-- Hybrid ranking no longer compares a reciprocal full-text rank with a cosine through `max`. The
-  rank contributes a small floor, the IDF-weighted query-term coverage lifts the score toward one
-  across the remaining headroom, and a complete term match takes a higher floor. Gold recall at
-  eight rose from 0.8239 to 0.8920 on a Mem-Gallery slice and from 0.8194 to 0.9306 on an
-  ATM-Bench slice. `SearchHit.score` values change, and a strong candidate is no longer clamped
-  to exactly `1.0`.
-
-### Added
-
 - `embedding.modalities` and `embedding.request_format` on the declarative OpenAI embedding slot,
   so a self-hosted multimodal embedding server can be composed from configuration instead of only
   from constructor injection. Defaults stay text-only and `input`-shaped.
@@ -172,6 +147,27 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - A published `mindbridge[all]` extra containing the exact union of every optional dependency.
 
 ### Changed
+
+- The benchmark harness request timeout now defaults to 300 seconds instead of 3 600. An hour
+  bounds nothing a run cares about: a request the server never answers held its task for the full
+  hour while the remaining workers idled, and the run reported the stall as elapsed time. The
+  slowest mean model call measured across this suite is video grounding at 36.3 seconds.
+- A video the embedding model cannot fit in its context is now embedded as four ordered stills
+  instead of failing the write, recorded on `mindbridge.embedding.video_sampled_inputs`. Only a
+  rejection that declares the length constraint triggers it; any other rejection is unchanged.
+  Against a local vLLM serving `tencent/WeMM-Embedding-2B`, every thirty-second EgoLife clip was a
+  58 344 token prompt against a 35 768 token model and failed; as stills it is 7 756.
+- Media the embedding model cannot accept inline now degrades the retrieval key instead of the
+  whole write. `add` drops the oversized key, stores the memory with its media, keeps it reachable
+  through its remaining keys, and records `mindbridge.embedding.elided_parts` on the span. A memory
+  left with no key at all still fails. On an ATM-Bench slice this recovers 21 of 7 612 memories
+  that previously failed with `payload_too_large`, which is what invalidated the whole task's score.
+- Hybrid ranking no longer compares a reciprocal full-text rank with a cosine through `max`. The
+  rank contributes a small floor, the IDF-weighted query-term coverage lifts the score toward one
+  across the remaining headroom, and a complete term match takes a higher floor. Gold recall at
+  eight rose from 0.8239 to 0.8920 on a Mem-Gallery slice and from 0.8194 to 0.9306 on an
+  ATM-Bench slice. `SearchHit.score` values change, and a strong candidate is no longer clamped
+  to exactly `1.0`.
 
 - Composite searches now batch the complete aggregate with bounded focused aggregate and atomic
   keys derived from the first text atom and query media. Later answer-format or instruction atoms
