@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from openai import OpenAI
 
 from mindbridge._telemetry import (
+    EMBEDDING_VIDEO_SAMPLED,
     GEN_AI_FINISH_REASONS,
     GEN_AI_TTFC,
     GROUNDING_HITS_DROPPED,
@@ -355,11 +356,42 @@ class OpenAIModels:
         client = self._client("embedding")
         mark_model_requests(1)
         try:
+            response = self._embedding_response(client, batch, sample_video=False)
+        except ModelError as error:
+            # A video long enough to overrun the model's context is refused outright, and one
+            # refusal would otherwise lose the whole memory. Ordered stills keep the visual
+            # evidence at a fraction of the tokens; they cannot keep the motion, so this is a
+            # degradation and it is recorded as one. A second failure raises on its own, chained
+            # to the refusal that prompted the retry.
+            if not _is_context_length_rejection(error.__cause__) or not _has_video(batch):
+                raise
+            mark_model_requests(1)
+            sampled: list[int] = []
+            response = self._embedding_response(client, batch, sample_video=True, sampled=sampled)
+            _record_video_sampling(len(sampled))
+        _record_openai_usage(
+            response,
+            input_modalities=frozenset(
+                modality for value in batch for modality in value.modalities
+            ),
+            output_modalities=frozenset(),
+        )
+        return _embedding_vectors(response, len(batch), self.embedding_dimension)
+
+    def _embedding_response(
+        self,
+        client: OpenAI,
+        batch: Sequence[ModelInput],
+        *,
+        sample_video: bool,
+        sampled: list[int] | None = None,
+    ) -> object:
+        try:
             if self._embedding_request_format == "messages":
                 from openai.types.create_embedding_response import CreateEmbeddingResponse
 
-                samples = _embedding_samples(batch)
-                response = client.post(
+                samples = _embedding_samples(batch, sample_video=sample_video, sampled=sampled)
+                return client.post(
                     "/embeddings",
                     cast_to=CreateEmbeddingResponse,
                     body={
@@ -370,18 +402,17 @@ class OpenAIModels:
                         "encoding_format": "float",
                     },
                 )
-            else:
-                create_embedding = cast(Any, client.embeddings.create)
-                response = create_embedding(
-                    input=(
-                        [value.text for value in batch]
-                        if all(not value.assets for value in batch)
-                        else _embedding_samples(batch)
-                    ),
-                    model=self.embedding_model,
-                    dimensions=self.embedding_dimension,
-                    encoding_format="float",
-                )
+            create_embedding = cast(Any, client.embeddings.create)
+            return create_embedding(
+                input=(
+                    [value.text for value in batch]
+                    if all(not value.assets for value in batch)
+                    else _embedding_samples(batch, sample_video=sample_video, sampled=sampled)
+                ),
+                model=self.embedding_model,
+                dimensions=self.embedding_dimension,
+                encoding_format="float",
+            )
         except ModelError:
             raise
         except Exception as error:
@@ -390,14 +421,6 @@ class OpenAIModels:
                 reason=_provider_reason(error),
                 stage="embed",
             ) from error
-        _record_openai_usage(
-            response,
-            input_modalities=frozenset(
-                modality for value in batch for modality in value.modalities
-            ),
-            output_modalities=frozenset(),
-        )
-        return _embedding_vectors(response, len(batch), self.embedding_dimension)
 
     def form(
         self,
@@ -1164,6 +1187,27 @@ def _provider_reason(error: Exception) -> str | None:
     return None
 
 
+def _is_context_length_rejection(error: BaseException | None) -> bool:
+    """Recognize a provider declaring the prompt longer than the model, by its own words.
+
+    vLLM says "longer than the maximum model length of N" and OpenAI says "this model's maximum
+    context length is N tokens"; neither exposes a machine-readable code for it. Matching the
+    declared constraint keeps this out of provider-name routing, and an unrecognized rejection is
+    left alone rather than guessed into a retry.
+    """
+    try:
+        import openai
+    except ImportError:  # pragma: no cover - a client call implies the SDK imported already
+        return False
+    message = _member(getattr(error, "body", None), "message")
+    normalized = message.casefold() if isinstance(message, str) else ""
+    return (
+        isinstance(error, openai.BadRequestError)
+        and "maximum" in normalized
+        and ("model length" in normalized or "context length" in normalized)
+    )
+
+
 def _is_short_video_rejection(error: Exception) -> bool:
     """Recognize a provider-declared content constraint without routing by provider name."""
     try:
@@ -1428,9 +1472,29 @@ def _answer_text(response: object) -> str:
 
 def _embedding_samples(
     inputs: Sequence[ModelInput],
+    *,
+    sample_video: bool = False,
+    sampled: list[int] | None = None,
 ) -> list[list[dict[str, object]]]:
     cache: dict[str, str] = {}
-    return [[{"role": "user", "content": _input_parts(value, cache)}] for value in inputs]
+    samples: list[list[dict[str, object]]] = []
+    for index, value in enumerate(inputs):
+        parts, was_sampled = _input_parts(value, cache, sample_video=sample_video)
+        if was_sampled and sampled is not None:
+            sampled.append(index)
+        samples.append([{"role": "user", "content": parts}])
+    return samples
+
+
+def _has_video(inputs: Sequence[ModelInput]) -> bool:
+    return any(asset.modality is Modality.VIDEO for value in inputs for asset in value.assets)
+
+
+def _record_video_sampling(count: int) -> None:
+    """Publish how many inputs reached the model as stills instead of video."""
+    span = trace.get_current_span()
+    if span.is_recording():
+        span.set_attribute(EMBEDDING_VIDEO_SAMPLED, count)
 
 
 def _answer_parts(
@@ -1680,12 +1744,29 @@ def _record_finish_reason(finish_reason: object) -> None:
 def _input_parts(
     value: ModelInput,
     cache: dict[str, str],
-) -> list[dict[str, object]]:
+    *,
+    sample_video: bool = False,
+) -> tuple[list[dict[str, object]], bool]:
+    """Build one input's request parts, reporting whether any video was replaced by stills.
+
+    A video whose duration cannot be read is sent whole even on the sampling retry, so presence
+    of video is not evidence that sampling happened; the flag is what keeps the recorded count
+    from claiming a degradation that did not occur.
+    """
     parts: list[dict[str, object]] = (
         [] if not value.text else [{"type": "text", "text": value.text}]
     )
-    parts.extend(_embedding_asset_part(asset, cache) for asset in value.assets)
-    return parts
+    sampled = False
+    for asset in value.assets:
+        frames = (
+            _video_frame_urls(asset) if sample_video and asset.modality is Modality.VIDEO else None
+        )
+        if frames is None:
+            parts.append(_embedding_asset_part(asset, cache))
+            continue
+        sampled = True
+        parts.extend({"type": "image_url", "image_url": {"url": frame}} for frame in frames)
+    return parts, sampled
 
 
 def _embedding_asset_part(
@@ -1752,6 +1833,15 @@ def _short_video_frame_urls(
     minimum_video_seconds: float,
 ) -> tuple[str, str, str, str] | None:
     """Decode four ordered JPEG stills when an optional local video is below a provider limit."""
+    return _video_frame_urls(asset, below_seconds=minimum_video_seconds)
+
+
+def _video_frame_urls(
+    asset: AssetRef,
+    *,
+    below_seconds: float | None = None,
+) -> tuple[str, str, str, str] | None:
+    """Decode four ordered JPEG stills, optionally only for a video under a provider limit."""
     try:
         import av
 
@@ -1767,7 +1857,9 @@ def _short_video_frame_urls(
                     else None
                 )
             )
-            if duration is None or duration <= 0 or duration >= minimum_video_seconds:
+            if duration is None or duration <= 0:
+                return None
+            if below_seconds is not None and duration >= below_seconds:
                 return None
             start = (
                 float(stream.start_time * stream.time_base)

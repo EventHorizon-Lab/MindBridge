@@ -1,6 +1,6 @@
 """Mechanical parity checks between the Python SDK, REST, and MCP surfaces.
 
-`docs/design-principles.md` requires every surface that shares an operation to preserve the same
+`AGENTS.md` requires every surface that shares an operation to preserve the same
 IDs, field meanings, pagination, idempotency, defaults, and error semantics. Everything here is
 derived from the code so a drifting default, field, or error code fails instead of rotting.
 """

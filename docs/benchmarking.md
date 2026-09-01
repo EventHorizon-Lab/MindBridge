@@ -61,6 +61,13 @@ runner replaces `data_dir` with isolated per-unit directories. See [configuratio
 for the JSON schema. `--device` overrides configured local-model devices, and `--model-args`
 overrides generation model, base URL, timeout, or the provider's minimum video duration.
 
+The harness also reads `MINDBRIDGE_GENERATION_API_KEY`, `MINDBRIDGE_GENERATION_BASE_URL`,
+`MINDBRIDGE_GENERATION_MODEL`, `MINDBRIDGE_GENERATION_MODALITIES`, and
+`MINDBRIDGE_TIMEOUT_SECONDS`. The request timeout defaults to 300 seconds: a request the server
+never answers otherwise holds its task for the whole timeout while the remaining workers idle, and
+the run reports the stall as elapsed time rather than as a failure. Raise it only for a model whose
+legitimate responses exceed it.
+
 Open-ended tasks use a judge. Configure it separately when needed:
 
 ```bash

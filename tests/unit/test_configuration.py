@@ -154,6 +154,66 @@ def test_builtin_openai_generation_config_maps_friendly_names_to_the_sdk_adapter
     }
 
 
+def test_builtin_openai_embedding_config_maps_friendly_names_to_the_sdk_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    marker = object()
+
+    def build(**values: object) -> object:
+        captured.update(values)
+        return marker
+
+    monkeypatch.setattr(recipes_module, "_owned_openai_models", build)
+    spec = configuration.OpenAIEmbeddingConfig(
+        provider="openai",
+        model="tencent/WeMM-Embedding-2B",
+        dimension=2048,
+        modalities=frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO}),
+        request_format="messages",
+        base_url="http://localhost:8000/v1",
+        timeout=600,
+    )
+
+    assert configuration._build_embedding(spec) is marker
+    assert captured == {
+        "base_url": "http://localhost:8000/v1",
+        "timeout": 600.0,
+        "embedding_model": "tencent/WeMM-Embedding-2B",
+        "embedding_dimension": 2048,
+        "embedding_capabilities": frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO}),
+        "embedding_request_format": "messages",
+    }
+
+
+def test_declarative_openai_embedding_defaults_stay_text_and_input_shaped() -> None:
+    spec = configuration.OpenAIEmbeddingConfig(provider="openai")
+
+    assert spec.modalities == frozenset({Modality.TEXT})
+    assert spec.request_format == "input"
+
+    with pytest.raises(PydanticValidationError, match="request_format"):
+        configuration.OpenAIEmbeddingConfig.model_validate(
+            {"provider": "openai", "request_format": "chat"}
+        )
+
+
+def test_declarative_openai_embedding_rejects_a_model_that_declares_no_modality() -> None:
+    # An empty set builds a Memory whose every write fails with "does not support: text". The
+    # value is out of range, so it is refused here rather than at the first add.
+    with pytest.raises(PydanticValidationError, match="too_short"):
+        MindBridgeConfig.model_validate(
+            {
+                "embedding": {
+                    "provider": "openai",
+                    "model": "m",
+                    "dimension": 8,
+                    "modalities": [],
+                }
+            }
+        )
+
+
 def test_composition_closes_the_optional_former(tmp_path: Path) -> None:
     class Former:
         formation_capabilities = frozenset({Modality.TEXT})

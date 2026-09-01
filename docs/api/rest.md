@@ -188,10 +188,12 @@ the injected memory.
 
 `modality` is `text`, `image`, `video`, `audio`, or `omni`. `memory_type` is `semantic`,
 `episodic`, or `procedural`. `abstention_reason` is `no_evidence`, `insufficient_evidence`, or
-`null`. A response `context` is the authoritative `MemoryContext`: typed kind and basis,
-confidence, valid and transaction time, visibility, lineage/source/evidence/supersession IDs,
-model recipe, optional subject/predicate/value, spatial pose, and affect cue fields. It is `null`
-on a raw record formed without typed context. Asset filesystem paths are never serialized.
+`null`. `abstained` reports that the answerer returned the exact sentence reserved for having no
+usable evidence, not that the model declined to answer in its own words. A response `context` is
+the authoritative `MemoryContext`: typed kind and basis, confidence, valid and transaction time,
+visibility, lineage/source/evidence/supersession IDs, model recipe, optional
+subject/predicate/value, spatial pose, and affect cue fields. It is `null` on a raw record formed
+without typed context. Asset filesystem paths are never serialized.
 
 ## Errors and limits
 
