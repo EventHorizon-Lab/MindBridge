@@ -38,6 +38,7 @@ config = {
     "settings": {
         "index_speech": True,
         "minimum_relevance": 0.55,
+        "evidence_budget_chars": 16000,
     },
 }
 
@@ -118,6 +119,7 @@ Memory(
     index_quantization=IndexQuantization.NONE,
     minimum_relevance=0.55,
     ambiguity_margin=0.01,
+    evidence_budget_chars=None,
     decay_half_life_days=None,
     speaker_similarity=0.78,
     speaker_margin=0.05,
@@ -143,6 +145,10 @@ Memory(
   only when `search()` or `ask()` uses `limit=1`, unless the winner has a lexical or temporal anchor.
   Larger limits preserve qualified candidates for the caller or answerer. Set either to `0` to
   disable that gate.
+- `evidence_budget_chars` widens what `ask()` grounds on. The `limit` hits are always kept; the
+  budget then admits further ranked memories while the evidence fits, charging each media asset a
+  flat character equivalent because an image or video part costs a model far more than its record's
+  text. `None` keeps grounding at exactly `limit`.
 - `decay_half_life_days` controls query-time soft decay; `None` disables it.
 - Face and speaker thresholds are local matching semantics, not provider settings. Each modality
   applies its own top-two margin before enrolling a new identity.

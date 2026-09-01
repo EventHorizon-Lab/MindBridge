@@ -20,6 +20,7 @@ from mindbridge.types import IndexQuantization
 _StrictBool = Annotated[bool, Field(strict=True)]
 _UnitInterval = Annotated[float, Field(strict=True, ge=0, le=1)]
 _PositiveFloat = Annotated[float, Field(strict=True, gt=0)]
+_PositiveInt = Annotated[int, Field(strict=True, gt=0)]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -55,6 +56,12 @@ class MemoryConfig:
     index_quantization: IndexQuantization = IndexQuantization.NONE
     minimum_relevance: _UnitInterval = 0.55
     ambiguity_margin: _UnitInterval = 0.01
+    # `ask` grounds on `limit` memories and then keeps admitting lower-ranked ones while the
+    # evidence stays inside this character budget. Retrieval scores separate the right memory
+    # from the rest only weakly, so the answering model does the final selection and needs to
+    # see enough candidates; the budget is what keeps that from becoming an unbounded prompt.
+    # `None` grounds on exactly `limit`.
+    evidence_budget_chars: _PositiveInt | None = None
     decay_half_life_days: _PositiveFloat | None = None
     speaker_similarity: _UnitInterval = 0.78
     speaker_margin: _UnitInterval = 0.05

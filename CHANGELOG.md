@@ -10,6 +10,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- `embedding.modalities` and `embedding.request_format` on the declarative OpenAI embedding slot,
+  so a self-hosted multimodal embedding server can be composed from configuration instead of only
+  from constructor injection. Defaults stay text-only and `input`-shaped.
+- `evidence_budget_chars`, a retrieval policy that lets `ask()` keep grounding past `limit` while
+  the evidence fits one character budget, charging media assets a flat equivalent. `None` keeps the
+  previous behaviour of grounding on exactly `limit` memories.
 - A direct `Memory()` API with `add`, `add_many`, `add_stream`, `search`, `search_with_trace`,
   `ask`, `get`, `speech`, `faces`, `register_speaker`, `register_identity`, `reinforce`, `list`,
   `delete`, `reindex`, and `optimize`.

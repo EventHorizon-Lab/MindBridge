@@ -69,6 +69,7 @@ from mindbridge.types import (
     AssetRef,
     Blob,
     IndexQuantization,
+    MemoryRecord,
     MemoryType,
     Modality,
     SearchHit,
@@ -427,6 +428,7 @@ def _memory(
     embedder: _FakeEmbedder | None = None,
     transcriber: _FakeSpeech | None = None,
     decay_half_life_days: float | None = None,
+    evidence_budget_chars: int | None = None,
 ) -> Memory:
     models = models or _FakeModels()
     return Memory(
@@ -435,6 +437,7 @@ def _memory(
         answerer=models,
         transcriber=models if transcriber is None else transcriber,
         decay_half_life_days=decay_half_life_days,
+        evidence_budget_chars=evidence_budget_chars,
     )
 
 
@@ -1271,6 +1274,69 @@ def test_ask_round_robins_modalities_before_filling_grounding_slots(tmp_path: Pa
         Modality.IMAGE,
         Modality.TEXT,
     ]
+
+
+def _rank_all(records: Sequence[MemoryRecord]) -> None:
+    index = _FakeIndex.instances[-1]
+    index.dense_hits_override = tuple(
+        IndexHit(id=record.id, relevance=0.99 - rank / 100, confidence=0.9)
+        for rank, record in enumerate(records)
+    )
+    index.lexical_hits_override = ()
+
+
+def _hundred_character_records(memory: Memory, count: int) -> tuple[MemoryRecord, ...]:
+    records = tuple(f"evidence {index}".ljust(100, "x") for index in range(count))
+    assert {len(record) for record in records} == {100}
+    return tuple(memory.add(record) for record in records)
+
+
+def test_evidence_budget_widens_grounding_without_ever_narrowing_it(tmp_path: Path) -> None:
+    with _memory(tmp_path / "off", _FakeModels()) as memory:
+        _rank_all(_hundred_character_records(memory, 12))
+        assert len(memory.ask("find evidence", limit=3).hits) == 3
+
+    # A budget below the guaranteed hits' own cost still returns them: the budget widens the
+    # grounding set, never narrows it, so enabling it cannot lose evidence.
+    with _memory(tmp_path / "tight", _FakeModels(), evidence_budget_chars=10) as memory:
+        _rank_all(_hundred_character_records(memory, 12))
+        assert len(memory.ask("find evidence", limit=3).hits) == 3
+
+    with _memory(tmp_path / "wide", _FakeModels(), evidence_budget_chars=700) as memory:
+        records = _hundred_character_records(memory, 12)
+        _rank_all(records)
+        hits = memory.ask("find evidence", limit=3).hits
+
+    # Three guaranteed plus four more, in rank order, exactly filling seven hundred characters.
+    assert [hit.id for hit in hits] == [record.id for record in records[:7]]
+
+
+def test_evidence_budget_charges_media_far_above_its_record_text(tmp_path: Path) -> None:
+    budget = 13_000
+    with _memory(tmp_path / "text", _FakeModels(), evidence_budget_chars=budget) as memory:
+        _rank_all(_hundred_character_records(memory, 40))
+        text_hits = memory.ask("find evidence", limit=2).hits
+
+    with _memory(tmp_path / "media", _FakeModels(), evidence_budget_chars=budget) as memory:
+        _rank_all(
+            tuple(
+                memory.add((f"shot {index}", Blob(str(index).encode(), "image/png")))
+                for index in range(40)
+            )
+        )
+        media_hits = memory.ask("find the shot", limit=2).hits
+
+    # The same budget buys 130 short text records but only one extra image part, because each
+    # asset is charged at four thousand characters rather than its record's few bytes of text.
+    assert len(text_hits) == 40
+    assert len(media_hits) == 3
+
+
+def test_evidence_budget_rejects_values_that_cannot_bound_anything() -> None:
+    for value in (0, -1, True):
+        with pytest.raises(ValidationError, match="evidence_budget_chars"):
+            memory_module._evidence_budget(value)
+    assert memory_module._evidence_budget(None) is None
 
 
 def test_event_span_overlapping_query_day_is_temporally_exact(tmp_path: Path) -> None:

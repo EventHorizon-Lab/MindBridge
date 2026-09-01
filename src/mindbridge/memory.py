@@ -191,6 +191,9 @@ _TEXT_KEY_CHARACTERS = 2_048
 _TEXT_KEY_OVERLAP = 256
 _TEXT_KEY_CONTEXT = 256
 _MAX_RETRIEVAL_KEYS = 128
+# One image or short video part costs these models on the order of a thousand tokens, and four
+# characters per token is the usual rule of thumb, so a media hit is charged as this much text.
+_ASSET_EVIDENCE_CHARS = 4_000
 _MAX_QUERY_RETRIEVAL_KEYS = 7
 _MAX_INDEX_SEARCH_WORKERS = 4
 _TODAY_ISO_DATE = re.compile(r"\btoday\s+is\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
@@ -372,6 +375,7 @@ class Memory:
         index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
         minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
         ambiguity_margin: float = _DEFAULT_CONFIG.ambiguity_margin,
+        evidence_budget_chars: int | None = _DEFAULT_CONFIG.evidence_budget_chars,
         decay_half_life_days: float | None = _DEFAULT_CONFIG.decay_half_life_days,
         speaker_similarity: float = _DEFAULT_CONFIG.speaker_similarity,
         speaker_margin: float = _DEFAULT_CONFIG.speaker_margin,
@@ -399,6 +403,7 @@ class Memory:
         self._index_speech = index_speech
         self._minimum_relevance = _unit_interval(minimum_relevance, "minimum_relevance")
         self._ambiguity_margin = _unit_interval(ambiguity_margin, "ambiguity_margin")
+        self._evidence_budget = _evidence_budget(evidence_budget_chars)
         self._decay_half_life = _decay_half_life(decay_half_life_days)
 
         self._store = _open_store(self.data_dir)
@@ -495,6 +500,7 @@ class Memory:
             index_quantization=config.index_quantization,
             minimum_relevance=config.minimum_relevance,
             ambiguity_margin=config.ambiguity_margin,
+            evidence_budget_chars=config.evidence_budget_chars,
             decay_half_life_days=config.decay_half_life_days,
             speaker_similarity=config.speaker_similarity,
             speaker_margin=config.speaker_margin,
@@ -791,7 +797,12 @@ class Memory:
             search = partial(
                 self._search_prepared,
                 prepared,
-                limit=min(100, limit * 3),
+                # Without a budget the answer grounds on `limit` hits, so ranking three times
+                # that is enough headroom for the modality round robin. With one, the budget is
+                # what decides depth, so the whole rerank pool has to be ranked for it to spend.
+                limit=(
+                    _RERANK_CANDIDATES if self._evidence_budget is not None else min(100, limit * 3)
+                ),
                 operation=assets,
                 memory_type=_optional_memory_type(memory_type),
                 reference_at=reference,
@@ -819,7 +830,7 @@ class Memory:
                 if speech_assets:
                     self._recognize_speech(speech_assets, assets)
                 hits = search().hits
-            hits = _grounding_hits(hits, limit)
+            hits = _grounding_hits(hits, limit, budget_chars=self._evidence_budget)
             routed_question = self._route_generation(
                 (
                     _with_reference_time(prepared, reference)
@@ -3028,6 +3039,7 @@ class AsyncMemory:
         index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
         minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
         ambiguity_margin: float = _DEFAULT_CONFIG.ambiguity_margin,
+        evidence_budget_chars: int | None = _DEFAULT_CONFIG.evidence_budget_chars,
         decay_half_life_days: float | None = _DEFAULT_CONFIG.decay_half_life_days,
         speaker_similarity: float = _DEFAULT_CONFIG.speaker_similarity,
         speaker_margin: float = _DEFAULT_CONFIG.speaker_margin,
@@ -3045,6 +3057,7 @@ class AsyncMemory:
             index_quantization=index_quantization,
             minimum_relevance=minimum_relevance,
             ambiguity_margin=ambiguity_margin,
+            evidence_budget_chars=evidence_budget_chars,
             decay_half_life_days=decay_half_life_days,
             speaker_similarity=speaker_similarity,
             speaker_margin=speaker_margin,
@@ -3079,6 +3092,7 @@ class AsyncMemory:
             index_quantization=config.index_quantization,
             minimum_relevance=config.minimum_relevance,
             ambiguity_margin=config.ambiguity_margin,
+            evidence_budget_chars=config.evidence_budget_chars,
             decay_half_life_days=config.decay_half_life_days,
             speaker_similarity=config.speaker_similarity,
             speaker_margin=config.speaker_margin,
@@ -4012,7 +4026,12 @@ def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _
     return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
 
 
-def _grounding_hits(hits: Sequence[SearchHit], limit: int) -> tuple[SearchHit, ...]:
+def _grounding_hits(
+    hits: Sequence[SearchHit],
+    limit: int,
+    *,
+    budget_chars: int | None = None,
+) -> tuple[SearchHit, ...]:
     queues: dict[Modality, deque[SearchHit]] = {}
     for hit in hits:
         queues.setdefault(hit.modality, deque()).append(hit)
@@ -4024,7 +4043,38 @@ def _grounding_hits(hits: Sequence[SearchHit], limit: int) -> tuple[SearchHit, .
                 del queues[modality]
             if len(selected) == limit:
                 break
-    return tuple(selected)
+    if budget_chars is None:
+        return tuple(selected)
+    return (*selected, *_budgeted_hits(hits, selected, budget_chars))
+
+
+def _budgeted_hits(
+    hits: Sequence[SearchHit],
+    selected: Sequence[SearchHit],
+    budget_chars: int,
+) -> tuple[SearchHit, ...]:
+    """Extend a grounding set down the ranking while the evidence fits one budget.
+
+    The guaranteed hits are never dropped, so this only ever widens what the answer sees. Media
+    is charged a flat per-asset equivalent because an image or video part costs the model far
+    more than its record's text; the provider adapter still enforces its own byte ceiling.
+    """
+    taken = {hit.id for hit in selected}
+    used = sum(_evidence_cost(hit) for hit in selected)
+    extra: list[SearchHit] = []
+    for hit in hits:
+        if hit.id in taken:
+            continue
+        cost = _evidence_cost(hit)
+        if used + cost > budget_chars:
+            break
+        used += cost
+        extra.append(hit)
+    return tuple(extra)
+
+
+def _evidence_cost(hit: SearchHit) -> int:
+    return len(hit.content) + _ASSET_EVIDENCE_CHARS * len(hit.assets)
 
 
 def _merge_index_hits(*groups: Sequence[IndexHit]) -> tuple[IndexHit, ...]:
@@ -4625,6 +4675,14 @@ def _date_range(first: date, last: date, reference_at: datetime) -> tuple[dateti
 def _shift_month(value: datetime, months: int) -> datetime:
     year, month = divmod(value.year * 12 + value.month - 1 + months, 12)
     return value.replace(year=year, month=month + 1)
+
+
+def _evidence_budget(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValidationError("evidence_budget_chars must be a positive integer")
+    return value
 
 
 def _decay_half_life(days: float | None) -> timedelta | None:

@@ -52,6 +52,7 @@ Memory(
     index_quantization: IndexQuantization = IndexQuantization.NONE,
     minimum_relevance: float = 0.55,
     ambiguity_margin: float = 0.01,
+    evidence_budget_chars: int | None = None,
     decay_half_life_days: float | None = None,
     speaker_similarity: float = 0.78,
     speaker_margin: float = 0.05,
@@ -121,6 +122,16 @@ the tie. With a larger limit, `search` returns the qualified candidates and `ask
 answerer. Both settings are calibrated `[0, 1]` values and may be set to `0` to disable that gate. A
 candidate that matches the full-text index is scored at `0.6` confidence regardless of its vector
 distance, so it clears the default `minimum_relevance` on the strength of the lexical match alone.
+
+`evidence_budget_chars` decides how much evidence `ask()` grounds on. Retrieval scores separate the
+right memory from the rest only weakly — one benchmark corpus put the gold memory first for 41% of
+questions but inside the top thirty for 94% — so the answering model performs the final selection
+and needs to see enough candidates. `None` grounds on exactly `limit` memories. An integer keeps
+those `limit` hits and then admits further ranked memories while the grounded evidence fits the
+budget, ranking the full rerank pool instead of `3 * limit` so the budget is what bounds depth.
+Media is charged a flat 4000 characters per asset, since an image or video part costs a model far
+more than the few bytes of text on its record; the provider adapter still applies its own byte
+ceiling on inline media.
 
 Use `Memory` as a context manager:
 
