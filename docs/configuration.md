@@ -23,6 +23,7 @@ config = {
     "generation": {
         "provider": "openai",
         "model": "gpt-5-mini",
+        "modalities": ["text", "image"],
         "temperature": 0.1,
     },
     "speech": {
@@ -48,6 +49,11 @@ The same input can be validated ahead of time with `MindBridgeConfig.model_valid
 Unknown providers, unknown fields, invalid ranges, and missing required values raise a field-specific
 error before storage opens. `AsyncMemory.from_config` accepts the same configuration.
 
+Hosts that need constructed adapters separately from opening storage can call
+`resolve_memory_config(config)`. It returns a `MemoryComposition`; the caller owns it and must call
+`close()` unless it transfers the plugins to one `Memory`. Ordinary applications should keep using
+`Memory.from_config` so ownership transfers automatically.
+
 Supported declarative slots are intentionally small:
 
 | Slot | Bundled providers |
@@ -58,9 +64,10 @@ Supported declarative slots are intentionally small:
 | `face` | `opencv` |
 
 OpenAI slots accept `base_url`, `timeout`, and `max_retries`; the official SDK resolves its standard
-credentials. Use direct injection for secret managers, existing clients, proxies, custom modality
-declarations, or third-party providers. MindBridge owns and closes clients created by
-`from_config`.
+credentials. Generation also accepts atomic `modalities` (`text`, `image`, `video`, and `audio`) so
+request validation matches an OpenAI-compatible model's actual inputs. Use direct injection for
+secret managers, existing clients, custom proxies, or third-party providers. MindBridge owns and
+closes clients created by `from_config`.
 
 ## Memory settings
 
@@ -281,4 +288,6 @@ The benchmark executable has a private `ModelConfig` for reproducible runs. It m
 `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `MINDBRIDGE_GENERATION_API_KEY`,
 `MINDBRIDGE_GENERATION_BASE_URL`, `MINDBRIDGE_GENERATION_MODEL`,
 `MINDBRIDGE_GENERATION_MODALITIES`, and `MINDBRIDGE_TIMEOUT_SECONDS`. These are benchmark harness
-inputs, not Python SDK configuration.
+inputs, not Python SDK configuration. `mindbridge-bench eval --config memory.json` also accepts the
+declarative schema above, replaces its `data_dir` for per-unit isolation, and records the effective
+composition in the benchmark artifacts.

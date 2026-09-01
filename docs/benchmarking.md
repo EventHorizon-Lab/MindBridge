@@ -26,6 +26,37 @@ mindbridge-bench eval \
   --seed 42
 ```
 
+Pass `--config` (also accepted as `--memory-config`) to evaluate a bundled modular composition with
+the same JSON shape accepted by `Memory.from_config`:
+
+```json
+{
+  "embedding": {"provider": "jina-omni", "device": "cuda"},
+  "generation": {
+    "provider": "openai",
+    "model": "gpt-5-mini",
+    "base_url": "http://generation.example/v1"
+  },
+  "speech": {"provider": "funasr", "device": "cuda"},
+  "settings": {"index_speech": true, "minimum_relevance": 0.55}
+}
+```
+
+```bash
+mindbridge-bench eval --config memory.json --tasks locomo-refined
+```
+
+The benchmark replaces `data_dir` with a distinct physical directory for every unit. It honors
+the configured embedding, generation, speech, face, and memory-setting slots; omitted optional
+plugins remain absent. `--model-args` can still override the generation model, base URL, and timeout,
+while `--device` overrides configured Jina, Sentence Transformers, and FunASR devices. The benchmark
+adds each selected task's media modalities to the configured generator, forces its deterministic
+temperature and seed, and gives `--gen-kwargs max_tokens=...` precedence over the configured
+generation limit. To keep those controls deterministic, `generation.extra_body` may not contain
+`temperature`, `seed`, or `max_tokens`. The effective composition is included in the result artifact
+and response-cache namespace. Configured OpenAI slots retain `Memory.from_config` credential
+handling, so the official SDK reads `OPENAI_API_KEY`.
+
 Open-ended tasks are judged inside this command. EgoMemReason is the server-scored exception: the
 same evaluation command automatically writes its official submission file after a complete run.
 `--judge-model-args` follows the same comma-separated style as `--model-args` and accepts `model`,
