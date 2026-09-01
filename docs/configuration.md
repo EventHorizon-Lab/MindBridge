@@ -69,6 +69,38 @@ request validation matches an OpenAI-compatible model's actual inputs. Use direc
 secret managers, existing clients, custom proxies, or third-party providers. MindBridge owns and
 closes clients created by `from_config`.
 
+### Multimodal embedding over an OpenAI-compatible server
+
+`embedding` declares the same two facts about a self-hosted embedding model:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `modalities` | `["text"]` | Atomic modalities the embedding model accepts. |
+| `request_format` | `"input"` | `"input"` posts the standard `input` array; `"messages"` posts chat-style content parts, which is how OpenAI-compatible servers carry media. |
+
+Routing reads the declaration, so it is what decides whether an image or video memory is stored or
+rejected. Leave `modalities` at its default and every non-text write fails with
+`unsupported_modality` — correctly, because nothing would have embedded the pixels. Audio is the one
+modality with a documented fallback: when a `speech` backend is configured, audio is transcribed and
+the text is embedded, so a model without audio support still accepts audio memories.
+
+```python
+config = {
+    "embedding": {
+        "provider": "openai",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "model": "tencent/WeMM-Embedding-2B",
+        "dimension": 2048,
+        "modalities": ["text", "image", "video"],
+        "request_format": "messages",
+    },
+    "speech": {"provider": "funasr", "device": "cuda"},
+}
+```
+
+`embedding_space` records the request format, so switching `request_format` changes the durable
+embedding identity and forces a rebuild instead of silently mixing two spaces.
+
 ## Memory settings
 
 `MemorySettings` is the readable name for the value-only local policy; `MemoryConfig` remains a

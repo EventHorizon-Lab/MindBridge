@@ -71,6 +71,12 @@ class OpenAIEmbeddingConfig(_OpenAIConfig):
     model: _Text = DEFAULT_EMBEDDING_MODEL
     dimension: _PositiveInt = DEFAULT_EMBEDDING_DIMENSION
     space: _Text | None = None
+    # An OpenAI-compatible server may host a multimodal embedding model. Declaring which
+    # modalities it accepts is what lets routing send image, video, and audio memories to it
+    # instead of failing the write; `messages` is the request shape those servers read media
+    # parts from. Both already existed on the backend and were unreachable from configuration.
+    modalities: frozenset[Modality] = frozenset({Modality.TEXT})
+    request_format: Literal["input", "messages"] = "input"
 
 
 class JinaEmbeddingConfig(_ConfigModel):
@@ -235,6 +241,8 @@ def _build_embedding(config: EmbeddingProviderConfig) -> EmbeddingBackend:
         values.update(
             embedding_model=config.model,
             embedding_dimension=config.dimension,
+            embedding_capabilities=config.modalities,
+            embedding_request_format=config.request_format,
         )
         if config.space is not None:
             values["embedding_space"] = config.space

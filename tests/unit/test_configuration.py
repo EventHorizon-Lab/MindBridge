@@ -142,3 +142,47 @@ def test_builtin_openai_generation_config_maps_friendly_names_to_the_sdk_adapter
         "generation_temperature": 0.1,
         "generation_max_tokens": 512,
     }
+
+
+def test_builtin_openai_embedding_config_maps_friendly_names_to_the_sdk_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    marker = object()
+
+    def build(**values: object) -> object:
+        captured.update(values)
+        return marker
+
+    monkeypatch.setattr(recipes_module, "_owned_openai_models", build)
+    spec = configuration.OpenAIEmbeddingConfig(
+        provider="openai",
+        model="tencent/WeMM-Embedding-2B",
+        dimension=2048,
+        modalities=frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO}),
+        request_format="messages",
+        base_url="http://localhost:8000/v1",
+        timeout=600,
+    )
+
+    assert configuration._build_embedding(spec) is marker
+    assert captured == {
+        "base_url": "http://localhost:8000/v1",
+        "timeout": 600.0,
+        "embedding_model": "tencent/WeMM-Embedding-2B",
+        "embedding_dimension": 2048,
+        "embedding_capabilities": frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO}),
+        "embedding_request_format": "messages",
+    }
+
+
+def test_declarative_openai_embedding_defaults_stay_text_and_input_shaped() -> None:
+    spec = configuration.OpenAIEmbeddingConfig(provider="openai")
+
+    assert spec.modalities == frozenset({Modality.TEXT})
+    assert spec.request_format == "input"
+
+    with pytest.raises(PydanticValidationError, match="request_format"):
+        configuration.OpenAIEmbeddingConfig.model_validate(
+            {"provider": "openai", "request_format": "chat"}
+        )
