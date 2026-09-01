@@ -176,17 +176,15 @@ _DEFAULT_CONFIG = MemoryConfig()
 _LEXICAL_MATCH_CONFIDENCE = 0.6
 _DECAY_REINFORCEMENT_LIMIT = 20
 _CONFIRMATION_WEIGHT = 0.05
-# What a full-text match contributes to the *ranking* score. It is deliberately far below the
-# confidence above: `lexical_relevance_by_rank` is a reciprocal rank, not a similarity, so at 0.6
-# the top full-text hit outranked every dense candidate under 0.6 cosine no matter how weak its
-# match actually was. Measured on ranked candidates replayed from two benchmark corpora, gold
-# recall at eight rose from 0.8239 to 0.8920 on Mem-Gallery and from 0.8194 to 0.9306 on
-# ATM-Bench when the rank proxy stopped winning that comparison. The floor is still non-zero so a
-# memory only the full-text route can reach stays orderable.
-_LEXICAL_RANK_RELEVANCE = 0.24
-# Covering every distinctive query term is evidence in a way that ranking first in the full-text
-# index is not, so a complete match ranks as near-certain rather than through the demoted rank
-# proxy, and a memory quoting the whole question cannot be buried by an unrelated dense neighbour.
+# Covering every distinctive query term is evidence in a way that placing well in the full-text
+# index is not, so a complete match ranks as near-certain and a memory quoting the whole question
+# cannot be buried by an unrelated dense neighbour. Nothing short of complete coverage enters the
+# ranking score through this branch. A general floor under every full-text hit used to, at 0.24,
+# but that compared an index-side quantity against a cosine, and how often it decided anything
+# turned entirely on where the configured embedder puts its cosines: replaying 841 dev queries,
+# the share of dense candidates it could outrank was 0.92% on LoCoMo-Refined, 8.48% on
+# Mem-Gallery and 50.26% on MemLens. Deleting it left R@1, R@5, R@10, R@20, R@100 and MRR
+# unchanged to four decimals on all three and the top ten identical on 99.87% of queries.
 # The threshold leaves slack for summation order; the coverage ratio is otherwise exactly one.
 # Across both replayed corpora two candidates in more than twenty thousand reached full coverage,
 # so this rescues the exact-phrase case without moving the measurement at all. The value sits
@@ -2225,12 +2223,12 @@ class Memory:
                     lexical_strength = (
                         lexical_relevance.get(memory_id, 0.0) if lexical_match else 0.0
                     )
-                    lexical_floor = (
+                    lexical_score = (
                         _LEXICAL_FULL_COVERAGE_RELEVANCE
+                        * lexical_relevance_by_rank.get(memory_id, 0.0)
                         if lexical_strength >= _LEXICAL_FULL_COVERAGE
-                        else _LEXICAL_RANK_RELEVANCE
+                        else 0.0
                     )
-                    lexical_score = lexical_floor * lexical_relevance_by_rank.get(memory_id, 0.0)
                     base = max(dense_relevance.get(memory_id, 0.0), lexical_score)
                     relevance = _bounded_scale(
                         base,
@@ -5842,7 +5840,9 @@ def _early_candidate_trace(
         index_ids=index_ids,
         dense_relevance=dense_relevance.get(memory_id, 0.0),
         dense_confidence=dense_confidence.get(memory_id, 0.0),
-        lexical_relevance=(_LEXICAL_RANK_RELEVANCE * lexical_index_relevance.get(memory_id, 0.0)),
+        # Ranking credit needs the term coverage, which is computed from content this candidate
+        # never had hydrated, so the trace reports the index-side strength it does know.
+        lexical_relevance=lexical_index_relevance.get(memory_id, 0.0),
         lexical_match=lexical_match,
         gate_confidence=max(
             dense_confidence.get(memory_id, 0.0),
