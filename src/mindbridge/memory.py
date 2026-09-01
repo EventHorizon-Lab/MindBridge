@@ -4085,10 +4085,15 @@ def _budgeted_hits(
 
 
 def _evidence_cost(hit: SearchHit) -> int:
-    return len(hit.content) + sum(
-        _ASSET_EVIDENCE_CHARS.get(asset.modality, _DEFAULT_ASSET_EVIDENCE_CHARS)
+    # `AssetRef.modality` is optional on the public type; an unresolved asset is charged the
+    # default rather than being treated as free.
+    charges = (
+        _DEFAULT_ASSET_EVIDENCE_CHARS
+        if asset.modality is None
+        else _ASSET_EVIDENCE_CHARS.get(asset.modality, _DEFAULT_ASSET_EVIDENCE_CHARS)
         for asset in hit.assets
     )
+    return len(hit.content) + sum(charges)
 
 
 def _merge_index_hits(*groups: Sequence[IndexHit]) -> tuple[IndexHit, ...]:
