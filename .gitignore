@@ -14,29 +14,8 @@ dist/
 .mindbridge/
 .benchmarks/
 
-# Autoresearch results are local artifacts; reusable harness code remains trackable.
-/autoresearch/**/*.json
-/autoresearch/**/*.jsonl
-/autoresearch/**/*.md
-/autoresearch/**/*.sha256
-/autoresearch/**/*.txt
-
-# Autoresearch runtime stores contain copied media and rebuildable SQLite/Zvec data.
-/autoresearch/**/baseline-data/
-/autoresearch/**/candidate-data/
-/autoresearch/**/final-data/
-/autoresearch/**/cache/
-/autoresearch/**/baseline/
-/autoresearch/**/candidate/
-/autoresearch/**/final/
-/autoresearch/**/candidate-pool-ablation-*/
-/autoresearch/**/candidate-pool-n*-current.json
-/autoresearch/**/ablation-jina-video-*/v5-*/
-/autoresearch/**/dev-current.json
-/autoresearch/**/dev-baseline-current.json
-/autoresearch/**/locked-inputs/
-/autoresearch/**/performance/
-/autoresearch/debug-*/
+# Autoresearch workspaces and generated artifacts are local-only.
+/autoresearch/
 
 # Audit receipts written by the protect-mcp tooling, not by this project. It writes them
 # relative to the working directory it is invoked from, so they appear at the repo root and
