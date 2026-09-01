@@ -3935,6 +3935,9 @@ class AsyncCaptureStream:
                     retrieval = await prefetch.finalize(final_content)
                 except Exception as error:
                     retrieval_error = error
+                    # finalize() drains its own worker only once it has started closing, so an
+                    # early rejection would otherwise abandon a search already in flight.
+                    await prefetch.close()
                 prefetches.pop(stream_id, None)
                 # ponytail: FINAL is the commit point; a cancellable storage transaction would
                 # be needed to revoke it safely once the worker thread has started.

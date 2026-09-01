@@ -17,6 +17,7 @@ from mindbridge import (
     AsyncAudioStream,
     AsyncCaptureStream,
     AsyncMemory,
+    AsyncOmniPrefetch,
     AsyncVisionStream,
     AudioBoundary,
     AudioStreamPacket,
@@ -530,4 +531,51 @@ async def test_cancellation_wins_after_a_started_final_write_fails(
         assert (await memory.list()).items == ()
     finally:
         release.set()
+        await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_final_query_still_drains_its_speculative_search(
+    tmp_path: Path,
+) -> None:
+    memory = AsyncMemory(tmp_path, embedder=TinyEmbedder(), minimum_relevance=0)
+    frame = tmp_path / "frame.png"
+    frame.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+    prefetches: list[AsyncOmniPrefetch] = []
+    build = AsyncCaptureStream._prefetch_for
+
+    def record(
+        self: AsyncCaptureStream,
+        active: dict[str, AsyncOmniPrefetch],
+        stream_id: str,
+    ) -> AsyncOmniPrefetch:
+        prefetch = build(self, active, stream_id)
+        if prefetch not in prefetches:
+            prefetches.append(prefetch)
+        return prefetch
+
+    # A Path is legal in StreamInput but rejected as a speculative snapshot, so finalize()
+    # raises before it closes and drains the worker it started for the earlier UPDATE.
+    cast(Any, AsyncCaptureStream)._prefetch_for = record
+    try:
+        await memory.add("the key is in the blue toolbox")
+        commits = [
+            value
+            async for value in AsyncCaptureStream(memory).consume(
+                _events(
+                    StreamEvent(StreamPhase.UPDATE, "where is the key", stream_id="s1"),
+                    StreamEvent(
+                        StreamPhase.FINAL,
+                        StreamInput(("the key is here", frame)),
+                        stream_id="s1",
+                    ),
+                )
+            )
+        ]
+        assert len(commits) == 1
+        assert commits[0].retrieval_error == ValidationError.code
+        assert [prefetch._closed for prefetch in prefetches] == [True]
+        assert all(prefetch._worker is None or prefetch._worker.done() for prefetch in prefetches)
+    finally:
+        cast(Any, AsyncCaptureStream)._prefetch_for = build
         await memory.close()
