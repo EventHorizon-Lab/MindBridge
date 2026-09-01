@@ -14,6 +14,13 @@ dist/
 .mindbridge/
 .benchmarks/
 
+# Autoresearch results are local artifacts; reusable harness code remains trackable.
+/autoresearch/**/*.json
+/autoresearch/**/*.jsonl
+/autoresearch/**/*.md
+/autoresearch/**/*.sha256
+/autoresearch/**/*.txt
+
 # Autoresearch runtime stores contain copied media and rebuildable SQLite/Zvec data.
 /autoresearch/**/baseline-data/
 /autoresearch/**/candidate-data/
