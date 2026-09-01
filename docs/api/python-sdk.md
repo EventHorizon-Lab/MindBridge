@@ -114,6 +114,16 @@ accuracy from 0.2086 to 0.3583 (paired mean +0.1497, 95% CI [+0.0857, +0.2123], 
 and lowered the abstention rate from 49.2% to 27.3%. Generation token usage was unchanged, because
 the inlined media dominates the prompt either way.
 
+A video the embedding model cannot fit in its context is retried as four ordered stills. The
+provider declares that constraint in its own words — vLLM says the prompt is "longer than the
+maximum model length", OpenAI says "this model's maximum context length is N tokens" — and only a
+rejection saying so triggers the retry; any other rejection is left alone. Measured against a local
+vLLM serving `tencent/WeMM-Embedding-2B`, a thirty-second wearable-camera clip is a 58 344 token
+prompt against a 35 768 token model, and the same clip as four stills is 7 756. The stills keep the
+visual evidence and cannot keep the motion, so `mindbridge.embedding.video_sampled_inputs` records
+how many inputs reached the model that way. The video itself is still stored and still reaches the
+answering model on its own route.
+
 Media the embedding model will not accept inline degrades the retrieval key rather than the
 memory: `add` drops the key holding the oversized asset, stores the memory with its media, and
 keeps it reachable through the keys that did embed, recording

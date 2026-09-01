@@ -157,6 +157,74 @@ def test_messages_embedding_uses_vllm_shape_without_dimensions(tmp_path: Path) -
     assert result[0] == pytest.approx((0.6, 0.8))
 
 
+def test_embedding_retries_a_context_length_rejection_as_ordered_stills(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("PIL.Image")
+    video = _video_asset(tmp_path, "clip", 12)
+    requests: list[list[dict[str, object]]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = cast(
+            list[dict[str, object]], json.loads(request.content)["messages"][0]["content"]
+        )
+        requests.append(content)
+        if len(requests) == 1:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": (
+                            "The decoder prompt (length 58344) is longer than the maximum "
+                            "model length of 35768."
+                        )
+                    }
+                },
+            )
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [3, 4]}]})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(
+            embedding_client=_sdk_client(client),
+            embedding_model="embed-model",
+            embedding_dimension=2,
+            embedding_request_format="messages",
+            embedding_capabilities=frozenset({Modality.TEXT, Modality.VIDEO}),
+        )
+        result = model.embed((ModelInput(text="day one", assets=(video,)),))
+
+    # The clip goes once as video and comes back as four ordered stills, and the text is kept.
+    assert [part["type"] for part in requests[0]] == ["text", "video_url"]
+    assert [part["type"] for part in requests[1]] == ["text", *["image_url"] * 4]
+    assert result[0] == pytest.approx((0.6, 0.8))
+
+
+def test_embedding_does_not_resample_video_for_an_unrelated_bad_request(
+    tmp_path: Path,
+) -> None:
+    video = _asset(tmp_path, "clip", Modality.VIDEO, "video/mp4", b"video")
+    requests = 0
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(400, json={"error": {"message": "bad input"}})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(
+            embedding_client=_sdk_client(client),
+            embedding_model="embed-model",
+            embedding_dimension=2,
+            embedding_request_format="messages",
+            embedding_capabilities=frozenset({Modality.TEXT, Modality.VIDEO}),
+        )
+        with pytest.raises(ModelError) as failure:
+            model.embed((ModelInput(text="day one", assets=(video,)),))
+
+    assert requests == 1
+    assert failure.value.reason == "request_rejected"
+
+
 def test_messages_embedding_batches_chat_conversations() -> None:
     def respond(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)

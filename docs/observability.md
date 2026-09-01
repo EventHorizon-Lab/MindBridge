@@ -72,6 +72,10 @@ token-metered request supplied a usable total; request counters and known modali
 available as an exact lower bound when it is false.
 
 The bundled `OpenAIModels` generation span also reports what its inline media budget removed:
+`mindbridge.embedding.video_sampled_inputs` counts embedding inputs whose video reached the model
+as four ordered stills because the model declared the prompt longer than its context. The memory
+keeps its video; only the vector behind it is built from stills.
+
 `mindbridge.embedding.elided_parts` counts retrieval keys an `add` could not embed because their
 media exceeds what the embedding model accepts inline. The memory is still stored and stays
 reachable through its remaining keys; the attribute is what keeps that degradation visible. It is

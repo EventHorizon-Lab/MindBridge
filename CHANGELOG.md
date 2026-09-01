@@ -10,6 +10,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- A video the embedding model cannot fit in its context is now embedded as four ordered stills
+  instead of failing the write, recorded on `mindbridge.embedding.video_sampled_inputs`. Only a
+  rejection that declares the length constraint triggers it; any other rejection is unchanged.
+  Against a local vLLM serving `tencent/WeMM-Embedding-2B`, every thirty-second EgoLife clip was a
+  58 344 token prompt against a 35 768 token model and failed; as stills it is 7 756.
 - Media the embedding model cannot accept inline now degrades the retrieval key instead of the
   whole write. `add` drops the oversized key, stores the memory with its media, keeps it reachable
   through its remaining keys, and records `mindbridge.embedding.elided_parts` on the span. A memory
