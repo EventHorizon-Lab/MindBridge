@@ -73,6 +73,7 @@ Bundled provider fields are:
 | `embedding: sentence-transformers` | `model`, `revision` | `dimension=None`, `device=None`, `batch_size=32` |
 | `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, `modalities=[text]` (at least one), `request_format=input`, plus connection fields |
 | `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `video_limit=8`, `extra_body=None`, plus connection fields |
+| `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
 | `speech: funasr` | — | `device=auto` |
 | `speech: openai` | — | `model=whisper-1`, `space=None`, plus connection fields |
 | `face: opencv` | `detector_model`, `recognizer_model` | `score_threshold=0.9`, `nms_threshold=0.3`, `top_k=5000`, `frame_interval_ms=1000`, `max_video_frames=300` |
@@ -88,6 +89,45 @@ limits are positive; OpenAI timeouts are positive, retry counts are non-negative
 from 0 through 2, and seed is from 0 through `2**63 - 1`. Face thresholds are from 0 through 1.
 `generation.video_limit` caps retrieved evidence videos in one answer request; question media has
 priority, and `None` disables that evidence-video count.
+
+## Automatic memory formation
+
+The `formation` slot is omitted by default and must stay omitted unless the deployment wants it.
+Configuring it adds one LLM round-trip to every write, after the raw observation has already
+committed. Derived memories are a union with their sources, never a replacement: the raw
+observation stays exactly as it was written and stays retrievable on its own.
+
+```python
+config = {
+    "embedding": {"provider": "jina-omni"},
+    "formation": {
+        "provider": "openai",
+        "model": "gpt-5-mini",
+        "modalities": ["text", "image"],
+        "max_tokens": 4096,
+    },
+}
+```
+
+What that buys is the typed plane: entity, event, state, relation, affect, trait, and
+response-policy memories, each carrying a validity interval, optional metric spatial pose, and
+optional emotional valence and arousal, all linked back to the source memory as evidence.
+
+Two fields decide whether it does anything at all:
+
+- `modalities` is the formation capability set. An observation whose modalities are not covered is
+  skipped silently and by design, so a text-only declaration means image and video sources never
+  form anything. Declare what the endpoint actually accepts.
+- `max_tokens` bounds a JSON response. Formation treats a truncated response as an error rather
+  than parsing it partially, so too small a budget fails the whole batch.
+
+The bundled adapter answers and forms with the same completion controls, so this slot repeats
+them instead of borrowing the `generation` slot; formation usually wants its own model, token
+budget, or endpoint, and configuring `generation` alone never enables formation. `video_limit` is
+absent because it caps answer evidence only. Formation is idempotent per source memory and
+formation recipe, so a model failure leaves the raw observation durable and the formation
+retryable. See [memory types, time, and decay](memory-types-time-and-decay.md) for the typed
+kinds and their visibility rules.
 
 `resolve_memory_config()` is available to hosts that need a `MemoryComposition` before opening
 storage. The caller must close that composition unless its plugins are transferred to one
@@ -173,14 +213,15 @@ caller-supplied SDK client open, so the outer client context remains the applica
 responsibility. Credentials, retries, timeouts, proxies, and connection pooling also remain SDK
 configuration.
 
-Two capability slots are reachable only this way, or through `MemoryPlugins`; no declarative
-provider selects either implicitly:
+One capability slot is reachable only this way, or through `MemoryPlugins`; no declarative
+provider selects it implicitly:
 
-- `former=` takes a `FormationBackend`, which proposes typed memories after a raw observation
-  commits. Configuring the declarative `generation` slot never enables automatic formation.
 - `vision_describer=` takes a `VisionDescriptionBackend`. `AsyncVisionStream` calls it at
   finality only when the embedder lacks native image support and no external `VisionPartial`
   is available.
+
+`former=` takes a `FormationBackend` directly for a custom or non-bundled adapter; the bundled
+OpenAI adapter is reachable through the `formation` slot above.
 
 For every constructor and protocol field, see the [Python API](api/python-sdk.md). For benchmark
 environment variables, see [benchmarking](benchmarking.md).

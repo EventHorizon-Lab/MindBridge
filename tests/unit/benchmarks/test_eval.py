@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from opentelemetry import trace
 
 import mindbridge.benchmarks.eval as eval_module
 from mindbridge import (
@@ -663,15 +664,10 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
     pool = object.__new__(eval_module._BackendPool)
     settings = MemoryConfig(evidence_budget_chars=4_242, minimum_relevance=0.11)
-    for name, value in (
-        ("_settings", settings),
-        ("_embedder", None),
-        ("_answerer", None),
-        ("_transcriber", None),
-        ("_face_analyzer", None),
-        ("_tracer", None),
-    ):
-        setattr(pool, name, value)
+    pool._settings = settings
+    pool._tracer = trace.get_tracer(__name__)
+    for entry in fields(MemoryPlugins):
+        setattr(pool, f"_{entry.name}", None)
 
     pool.memory(Path("unused"))
 
@@ -683,6 +679,30 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
     for constructor in (Memory.__init__, AsyncMemory.__init__):
         unaccepted = declared - set(signature(constructor).parameters)
         assert not unaccepted, f"{constructor.__qualname__} has no keyword for {sorted(unaccepted)}"
+
+
+def test_backend_pool_forwards_every_capability_plugin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`former` was declared on `MemoryPlugins`, built by the SDK adapter, and used by `Memory`,
+    yet the harness never passed it, so no benchmark run has ever exercised derived-memory
+    formation. Deriving the expected keywords from the dataclass makes the next omission red."""
+    captured: dict[str, object] = {}
+
+    class Recorder:
+        def __init__(self, _data_dir: object, **values: object) -> None:
+            captured.update(values)
+
+    monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
+    pool = object.__new__(eval_module._BackendPool)
+    pool._settings = MemoryConfig()
+    pool._tracer = trace.get_tracer(__name__)
+    markers = {entry.name: object() for entry in fields(MemoryPlugins)}
+    for name, marker in markers.items():
+        setattr(pool, f"_{name}", marker)
+
+    pool.memory(Path("unused"))
+
+    for name, marker in markers.items():
+        assert captured[name] is marker, name
 
 
 def test_implementation_identity_tracks_editable_source_changes(

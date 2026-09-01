@@ -23,6 +23,7 @@ from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import (
     EmbeddingBackend,
     FaceBackend,
+    FormationBackend,
     GenerationBackend,
     SpeechBackend,
     TranscriptionBackend,
@@ -108,6 +109,27 @@ class OpenAIGenerationConfig(_OpenAIConfig):
     extra_body: Mapping[str, object] | None = None
 
 
+class OpenAIFormationConfig(_OpenAIConfig):
+    """Chat-completion knobs for the adapter that proposes derived typed memories.
+
+    The bundled adapter derives its formation contract from the same completion controls it uses
+    to answer, so this slot repeats them rather than reusing the generation slot: formation is a
+    separate LLM round-trip on the write path and usually wants its own model, token budget, and
+    endpoint. Leaving the slot out keeps that round-trip off, which is the default.
+    """
+
+    model: _Text = DEFAULT_GENERATION_MODEL
+    # `formation_capabilities` gates which observations reach the former at all: an observation
+    # whose modalities are not covered here is skipped, silently and by design. Declare the media
+    # the endpoint really accepts or image and video sources will never form anything.
+    modalities: frozenset[Modality] = frozenset({Modality.TEXT})
+    temperature: _Temperature | None = None
+    seed: _Seed | None = None
+    # Formation returns JSON; a truncated response is a hard error rather than a partial parse.
+    max_tokens: _PositiveInt | None = None
+    extra_body: Mapping[str, object] | None = None
+
+
 class OpenAITranscriptionConfig(_OpenAIConfig):
     model: _Text = DEFAULT_TRANSCRIPTION_MODEL
     space: _Text | None = None
@@ -145,6 +167,9 @@ class MindBridgeConfig(_ConfigModel):
     data_dir: Path = Path(".mindbridge")
     embedding: EmbeddingProviderConfig
     generation: OpenAIGenerationConfig | None = None
+    # Omitted by default: formation adds an LLM round-trip to every write, and derived memories
+    # are a union with the raw sources rather than a replacement for them.
+    formation: OpenAIFormationConfig | None = None
     speech: SpeechProviderConfig | None = None
     face: OpenCVFaceConfig | None = None
     settings: MemorySettings = Field(default_factory=MemorySettings)
@@ -187,6 +212,9 @@ def resolve_memory_config(
         answerer = None if config.generation is None else _build_generation(config.generation)
         if answerer is not None:
             cleanup.callback(answerer.close)
+        former = None if config.formation is None else _build_formation(config.formation)
+        if former is not None:
+            cleanup.callback(former.close)
         transcriber = None if config.speech is None else _build_speech(config.speech)
         if transcriber is not None:
             cleanup.callback(transcriber.close)
@@ -198,6 +226,7 @@ def resolve_memory_config(
             answerer=answerer,
             transcriber=transcriber,
             face_analyzer=face,
+            former=former,
         )
         cleanup.pop_all()
     return MemoryComposition(config.data_dir, plugins, config.settings)
@@ -267,7 +296,9 @@ def _build_embedding(config: EmbeddingProviderConfig) -> EmbeddingBackend:
     )
 
 
-def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
+def _completion_values(
+    config: OpenAIGenerationConfig | OpenAIFormationConfig,
+) -> dict[str, object]:
     values = _openai_values(config)
     values.update(
         generation_model=config.model,
@@ -280,9 +311,19 @@ def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
         "generation_extra_body": config.extra_body,
     }
     values.update((key, value) for key, value in optional.items() if value is not None)
+    return values
+
+
+def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
+    values = _completion_values(config)
     if config.video_limit != 8:
         values["generation_video_limit"] = config.video_limit
     return cast(GenerationBackend, _openai_factory(values))
+
+
+def _build_formation(config: OpenAIFormationConfig) -> FormationBackend:
+    # The bundled adapter reads the generation controls for `form`; `video_limit` is answer-only.
+    return cast(FormationBackend, _openai_factory(_completion_values(config)))
 
 
 def _build_speech(config: SpeechProviderConfig) -> SpeechBackend | TranscriptionBackend:
@@ -314,6 +355,7 @@ __all__ = [
     "MemoryComposition",
     "MindBridgeConfig",
     "OpenAIEmbeddingConfig",
+    "OpenAIFormationConfig",
     "OpenAIGenerationConfig",
     "OpenAITranscriptionConfig",
     "OpenCVFaceConfig",

@@ -81,9 +81,11 @@ the supported provider configuration fields live in [configuration](../configura
 A plain `TranscriptionBackend` transcribes supported audio/video during `add` regardless of
 `index_speech`; `SpeechBackend` analysis and identity resolution stay behind the explicit flag.
 
-`vision_describer` and `former` have no declarative provider and are reachable only through
-direct construction or `MemoryPlugins`. `former` proposes typed memories after a source
-observation commits; omitting it keeps ordinary add behavior and makes no formation model call.
+`vision_describer` has no declarative provider and is reachable only through direct construction
+or `MemoryPlugins`. `former` proposes typed memories after a source observation commits; omitting
+it keeps ordinary add behavior and makes no formation model call. The bundled OpenAI former is
+selected by the declarative `formation` slot, which stays off unless it is configured; see
+[configuration](../configuration.md#automatic-memory-formation).
 
 Turn `index_speech` on for any corpus whose memories carry speech. Without it a video memory's
 indexed document is whatever text the caller supplied, which for clip-shaped ingestion is often a
