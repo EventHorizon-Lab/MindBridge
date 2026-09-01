@@ -81,6 +81,16 @@ media exceeds what the embedding model accepts inline. The memory is still store
 reachable through its remaining keys; the attribute is what keeps that degradation visible. It is
 absent when nothing was dropped, and a write whose every key is refused fails instead.
 
+`mindbridge.identity.observations` counts the face or speaker observations one write produced, and
+`mindbridge.identity.matched_existing` how many of them joined an identity that already existed.
+Face and speaker analysis reports success whether or not the recognizer can tell people apart, so
+these two numbers are what separate recognition from its two silent failures. Zero observations
+means the detector ran and found nobody — the usual cause is a confidence threshold suited to posed
+photographs applied to wide-angle or egocentric footage. Many observations with almost no matches
+means the recognizer returned embeddings that do not separate the people in the footage, and every
+memory has met a stranger; the identities are real rows, and nothing later in the pipeline will
+report a problem. Both spans are `mindbridge.storage.write`, one per modality.
+
 `mindbridge.grounding.media_elided_hits` counts retrieved hits with any media that did not fit, and
 `mindbridge.grounding.dropped_hits` counts hits left out of the request entirely. Both are zero on
 a request that sent every retrieved hit intact. If a provider explicitly rejects a grounded video

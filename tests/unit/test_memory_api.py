@@ -26,6 +26,8 @@ import mindbridge.configuration as configuration_module
 import mindbridge.memory as memory_module
 from mindbridge import MemoryConfig, MemoryPlugins, RetrievalRejection
 from mindbridge._telemetry import (
+    IDENTITY_MATCHED,
+    IDENTITY_OBSERVATIONS,
     MODEL_REQUEST_COUNT,
     MODEL_TTFT,
     TOKEN_COMPLETE,
@@ -3991,3 +3993,62 @@ async def test_async_memory_from_config_uses_the_same_composition(
         assert (await memory.search("red configured"))[0].id == record.id
 
     assert embedder.close_calls == 1
+
+
+def test_identity_matching_publishes_how_often_an_observation_joined_a_known_identity(
+    tmp_path: Path,
+) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        face_analyzer=_FakeFace(),
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        first = memory.add(Blob(b"a face", "image/png", "a.png"))
+        second = memory.add(Blob(b"the same face", "image/png", "b.png"))
+        memory.faces(first.id)
+        memory.faces(second.id)
+
+    recorded = [
+        span.attributes
+        for span in exporter.get_finished_spans()
+        if span.attributes is not None and IDENTITY_OBSERVATIONS in span.attributes
+    ]
+    # `_FakeFace` returns one embedding for every asset, so the first observation founds an
+    # identity and the second has to join it. A recognizer whose similarities separate nobody
+    # reports the same two observations with zero matches, which is the case this exists to
+    # make visible: analysis succeeds either way and only the match rate tells them apart.
+    assert [
+        (attributes[IDENTITY_OBSERVATIONS], attributes[IDENTITY_MATCHED]) for attributes in recorded
+    ] == [(1, 0), (1, 1)]
+
+
+def test_identity_matching_reports_a_detector_that_found_nothing(tmp_path: Path) -> None:
+    class _BlindFace(_FakeFace):
+        def analyze(self, assets: Sequence[AssetRef]) -> tuple[FaceAnalysis, ...]:
+            self.calls.append(tuple(assets))
+            return tuple(FaceAnalysis(()) for _ in assets)
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        face_analyzer=_BlindFace(),
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        memory.faces(memory.add(Blob(b"a face", "image/png", "a.png")).id)
+
+    # A detector tuned for posed photographs returns nothing on wide-angle footage. Recording
+    # the zero is the whole point: without it, an analyzer that ran and saw nobody is
+    # indistinguishable from an analyzer that was never configured.
+    recorded = [
+        span.attributes
+        for span in exporter.get_finished_spans()
+        if span.attributes is not None and IDENTITY_OBSERVATIONS in span.attributes
+    ]
+    assert [attributes[IDENTITY_OBSERVATIONS] for attributes in recorded] == [0]

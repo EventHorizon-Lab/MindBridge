@@ -32,6 +32,8 @@ from opentelemetry.util.types import AttributeValue
 
 from mindbridge._telemetry import (
     EMBEDDING_PARTS_ELIDED,
+    IDENTITY_MATCHED,
+    IDENTITY_OBSERVATIONS,
     MODEL_MODULE,
     MODEL_TTFT,
     SPAN_KIND,
@@ -2208,6 +2210,15 @@ class Memory:
                         minimum_margin=self._face_margin,
                         preferred_identity=preferred,
                     )
+                written = tuple(
+                    observation
+                    for asset in missing
+                    for observation in operation.face_observations[asset.asset_id]
+                )
+                _record_identity_matching(
+                    len(written),
+                    sum(1 for item in written if item.identity_score is not None),
+                )
         with self._write_lock, _translate_storage_errors("link face and voice identities"):
             for asset in face_assets:
                 self._link_asset_identity(asset.asset_id, operation)
@@ -2419,6 +2430,15 @@ class Memory:
                             minimum_margin=self._speaker_margin,
                         )
                     operation.speech_segments[asset.asset_id] = segments
+                written = tuple(
+                    segment
+                    for asset in missing
+                    for segment in operation.speech_segments[asset.asset_id]
+                )
+                _record_identity_matching(
+                    len(written),
+                    sum(1 for item in written if item.identity_score is not None),
+                )
         for asset in speech_assets:
             segments = operation.speech_segments[asset.asset_id]
             operation.transcripts[asset.asset_id] = "\n".join(segment.text for segment in segments)
@@ -4116,6 +4136,25 @@ def _record_elided_parts(count: int) -> None:
     span = trace.get_current_span()
     if span.is_recording():
         span.set_attribute(EMBEDDING_PARTS_ELIDED, count)
+
+
+def _record_identity_matching(observed: int, matched: int) -> None:
+    """Publish how many identity observations joined an identity that already existed.
+
+    A recognizer whose similarities do not separate the people in front of it still
+    returns an identity for every observation, so face and speaker analysis reports
+    success while each memory quietly meets a stranger. Nothing else in the write path
+    distinguishes that from recognition working, and the difference only shows up much
+    later as an answer that cannot follow one person across two memories.
+
+    Zero observations is recorded rather than skipped: a detector whose confidence threshold
+    suits posed photographs finds no face at all in wide-angle or egocentric footage, and that
+    silence is otherwise indistinguishable from having configured no analyzer.
+    """
+    span = trace.get_current_span()
+    if span.is_recording():
+        span.set_attribute(IDENTITY_OBSERVATIONS, observed)
+        span.set_attribute(IDENTITY_MATCHED, matched)
 
 
 def _grounding_hits(

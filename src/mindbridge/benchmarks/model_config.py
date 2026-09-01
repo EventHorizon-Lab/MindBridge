@@ -11,7 +11,12 @@ from mindbridge.types import Modality
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_GENERATION_MODEL = "gpt-5-mini"
-DEFAULT_TIMEOUT_SECONDS = 3_600.0
+# An hour bounds nothing a benchmark run cares about: a request the server never answers
+# holds its task for the whole hour while the remaining workers idle, and the run reports
+# the stall as elapsed time rather than as a failure. The slowest mean model call measured
+# across this suite is video grounding at ~36s, so five minutes leaves ample headroom for a
+# request that is genuinely slow while still cutting a hung one loose.
+DEFAULT_TIMEOUT_SECONDS = 300.0
 
 
 @dataclass(frozen=True, slots=True)

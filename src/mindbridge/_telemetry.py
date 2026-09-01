@@ -28,6 +28,8 @@ EMBEDDING_PARTS_ELIDED = "mindbridge.embedding.elided_parts"
 EMBEDDING_VIDEO_SAMPLED = "mindbridge.embedding.video_sampled_inputs"
 GROUNDING_MEDIA_ELIDED = "mindbridge.grounding.media_elided_hits"
 GROUNDING_HITS_DROPPED = "mindbridge.grounding.dropped_hits"
+IDENTITY_OBSERVATIONS = "mindbridge.identity.observations"
+IDENTITY_MATCHED = "mindbridge.identity.matched_existing"
 
 TOKEN_MODALITIES = ("text", "image", "video", "audio", "unattributed")
 

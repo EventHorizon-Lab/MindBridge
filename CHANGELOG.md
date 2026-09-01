@@ -8,8 +8,21 @@ may contain breaking changes.
 
 This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` design.
 
+### Added
+
+- Face and speaker writes now record `mindbridge.identity.observations` and
+  `mindbridge.identity.matched_existing` on their storage span, so a recognizer that cannot tell
+  people apart is visible at the write instead of only as a weak answer much later. Both failure
+  modes were silent: a detector whose confidence threshold suits posed photographs found no face at
+  all in 76 EgoLife frames, and a recognizer whose similarities do not separate the footage created
+  4 026 identities from 4 731 observations, 84.1% of them seen exactly once.
+
 ### Changed
 
+- The benchmark harness request timeout now defaults to 300 seconds instead of 3 600. An hour
+  bounds nothing a run cares about: a request the server never answers held its task for the full
+  hour while the remaining workers idled, and the run reported the stall as elapsed time. The
+  slowest mean model call measured across this suite is video grounding at 36.3 seconds.
 - A video the embedding model cannot fit in its context is now embedded as four ordered stills
   instead of failing the write, recorded on `mindbridge.embedding.video_sampled_inputs`. Only a
   rejection that declares the length constraint triggers it; any other rejection is unchanged.

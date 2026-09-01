@@ -329,7 +329,8 @@ benchmark runner uses that recipe because its tasks do not score speaker identit
 The benchmark executable has a private `ModelConfig` for reproducible runs. It may read
 `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `MINDBRIDGE_GENERATION_API_KEY`,
 `MINDBRIDGE_GENERATION_BASE_URL`, `MINDBRIDGE_GENERATION_MODEL`,
-`MINDBRIDGE_GENERATION_MODALITIES`, and `MINDBRIDGE_TIMEOUT_SECONDS`. These are benchmark harness
-inputs, not Python SDK configuration. `mindbridge-bench eval --config memory.json` also accepts the
+`MINDBRIDGE_GENERATION_MODALITIES`, and `MINDBRIDGE_TIMEOUT_SECONDS` (default 300 seconds; a
+request the server never answers otherwise holds its task for the whole timeout while the remaining
+workers idle). These are benchmark harness inputs, not Python SDK configuration. `mindbridge-bench eval --config memory.json` also accepts the
 declarative schema above, replaces its `data_dir` for per-unit isolation, and records the effective
 composition in the benchmark artifacts.

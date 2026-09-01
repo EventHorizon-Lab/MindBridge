@@ -78,7 +78,7 @@ from mindbridge.benchmarks.eval_telemetry import (
     EvaluationTelemetry,
 )
 from mindbridge.benchmarks.isolation import BenchmarkRun
-from mindbridge.benchmarks.model_config import ModelConfig
+from mindbridge.benchmarks.model_config import DEFAULT_TIMEOUT_SECONDS, ModelConfig
 from mindbridge.benchmarks.official_scorers import (
     SCORER_VERSION,
     JudgeMessage,
@@ -189,7 +189,7 @@ class _JudgeConfig:
     model: str
     base_url: str
     api_key: str | None = field(default=None, repr=False)
-    timeout_seconds: float = 3_600.0
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     concurrency: int = 4
 
     def __post_init__(self) -> None:
