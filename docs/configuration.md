@@ -82,6 +82,7 @@ Memory(
     answerer=None,
     transcriber=None,
     face_analyzer=None,
+    former=None,
     index_speech=False,
     index_quantization=IndexQuantization.NONE,
     minimum_relevance=0.55,
@@ -102,7 +103,13 @@ Memory(
   `speech()` is required. A `TranscriptionBackend` transcribes every stored asset whose modality it
   declares, so a media memory carries retrievable text even where the embedder accepts the media
   natively.
+- `vision_describer` is optional and available through direct construction or `MemoryPlugins`.
+  `AsyncVisionStream` calls it at finality only when the embedder lacks native image support and no
+  external `VisionPartial` is available. No bundled declarative provider is selected implicitly.
 - `face_analyzer` is optional. Configure it when `faces()` or visual identity grounding is required.
+- `former` is optional. It proposes typed memories after a raw observation commits. Configure it by
+  direct `Memory` construction or `MemoryPlugins`; the declarative generation slot never enables
+  automatic formation implicitly.
 - `index_speech` opts a configured `SpeechBackend` into add-time transcript and speaker-identity
   indexing; the default leaves analysis lazy.
 - `index_quantization` defaults to quality-first `NONE`; `FP16`, rotated `INT8`, and x86_64-only

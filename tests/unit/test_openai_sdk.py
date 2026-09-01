@@ -34,12 +34,21 @@ from mindbridge.exceptions import ModelError, ModelOutputTruncatedError, Validat
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
+    FormationBackend,
+    FormationInput,
     GenerationBackend,
     ModelInput,
     TranscriptionBackend,
 )
 from mindbridge.models.openai_sdk import UNKNOWN_ANSWER, OpenAIModels
-from mindbridge.types import AbstentionReason, AssetRef, Modality, SearchHit
+from mindbridge.types import (
+    AbstentionReason,
+    AssetRef,
+    MemoryKind,
+    Modality,
+    ObservationContext,
+    SearchHit,
+)
 
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
 ALL_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
@@ -232,6 +241,112 @@ def test_answer_maps_native_hit_media_and_abstains_without_hits(tmp_path: Path) 
     assert result.answer == "The cat is on the sofa."
     assert result.hits == (hit,)
     assert len(requests) == 1
+
+
+def test_formation_batches_grounded_observations_and_validates_typed_output(
+    tmp_path: Path,
+) -> None:
+    audio = _asset(tmp_path, "audio", Modality.AUDIO, "audio/wav", b"wav")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        serialized = request.content.decode()
+        assert "source_text" not in serialized
+        assert "source_audio" not in serialized
+        assert "microphone" not in serialized
+        assert payload["response_format"] == {"type": "json_object"}
+        assert "affect uses subject, value, and cue_modality" in payload["messages"][0]["content"]
+        parts = payload["messages"][1]["content"]
+        assert [part["type"] for part in parts] == ["text", "text", "input_audio"]
+        assert json.loads(parts[0]["text"])["observation"]["observation_id"] == "observation_0"
+        assert json.loads(parts[1]["text"])["observation"]["observation_id"] == "observation_1"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "items": [
+                                        {
+                                            "observation_id": "observation_1",
+                                            "proposals": [
+                                                {
+                                                    "kind": "affect",
+                                                    "content": "Sam sounded pleased.",
+                                                    "subject": "Sam",
+                                                    "value": "pleased",
+                                                    "confidence": 0.7,
+                                                    "cue_modality": "audio",
+                                                    "valence": 0.6,
+                                                    "arousal": 0.4,
+                                                }
+                                            ],
+                                        },
+                                        {
+                                            "observation_id": "observation_0",
+                                            "proposals": [
+                                                {
+                                                    "kind": "state",
+                                                    "content": "The lamp is on.",
+                                                    "subject": "lamp",
+                                                    "predicate": "power",
+                                                    "value": "on",
+                                                    "confidence": 0.9,
+                                                    "valid_from": "2026-08-27T00:00:00Z",
+                                                }
+                                            ],
+                                        },
+                                    ]
+                                }
+                            )
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    inputs = (
+        FormationInput(
+            memory_id="source_text",
+            content=ModelInput(text="The lamp is on."),
+            context=ObservationContext(source_id="user"),
+        ),
+        FormationInput(
+            memory_id="source_audio",
+            content=ModelInput(text="Sam laughed.", assets=(audio,)),
+            context=ObservationContext(source_id="microphone"),
+        ),
+    )
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client))
+        state, affect = model.form(inputs)
+
+    assert isinstance(model, FormationBackend)
+    assert state[0].kind is MemoryKind.STATE
+    assert state[0].valid_from == datetime(2026, 8, 27, tzinfo=timezone.utc)
+    assert affect[0].kind is MemoryKind.AFFECT
+    assert affect[0].cue_modality is Modality.AUDIO
+
+
+def test_formation_space_identifies_every_generation_control() -> None:
+    baseline = OpenAIModels().formation_space
+    variants = {
+        OpenAIModels(generation_seed=7).formation_space,
+        OpenAIModels(generation_temperature=0.2).formation_space,
+        OpenAIModels(generation_max_tokens=128).formation_space,
+        OpenAIModels(generation_extra_body={"reasoning": {"effort": "low"}}).formation_space,
+        OpenAIModels(
+            generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE})
+        ).formation_space,
+    }
+
+    assert baseline not in variants
+    assert len(variants) == 5
+    assert OpenAIModels(generation_seed=7).formation_space in variants
 
 
 def test_answer_marks_the_grounded_unknown_sentinel_as_insufficient_evidence() -> None:

@@ -6,12 +6,14 @@ import asyncio
 import base64
 import builtins
 import hashlib
+import io
 import json
 import math
 import os
 import re
 import shutil
 import unicodedata
+import wave
 from collections import Counter, deque
 from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -76,36 +78,59 @@ from mindbridge.models.base import (
     EmbedTask,
     FaceAnalysis,
     FaceBackend,
+    FormationBackend,
+    FormationInput,
     GenerationBackend,
     ModelInput,
     SpeechAnalysis,
     SpeechBackend,
     StreamingGenerationBackend,
     TranscriptionBackend,
+    VisionDescriptionBackend,
     _modalities,
 )
 from mindbridge.plugins import MemoryConfig, MemoryPlugins
 from mindbridge.types import (
     AbstentionReason,
+    AcousticBoundary,
     AnswerResult,
+    ASRPartial,
     AssetRef,
+    AudioBoundary,
+    AudioStreamPacket,
     Blob,
     ContentAtom,
     ContentInput,
+    EvidenceBasis,
     FaceObservation,
+    FormationProposal,
     IndexQuantization,
+    MemoryContext,
+    MemoryKind,
     MemoryRecord,
     MemoryType,
     Modality,
+    ObservationContext,
     Page,
+    PCMChunk,
     PrefetchResult,
     RetrievalCandidateTrace,
     RetrievalRejection,
+    RetrievalScope,
     RetrievalTrace,
+    SceneBoundary,
     SearchHit,
     SpeakerSegment,
+    StreamCommit,
+    StreamEvent,
     StreamInput,
+    StreamPhase,
     TracedSearchResult,
+    VADPacket,
+    VisionBoundary,
+    VisionFrame,
+    VisionPartial,
+    VisionStreamPacket,
 )
 
 _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
@@ -182,8 +207,10 @@ _MAX_CONTENT_PARTS = 128
 _MODEL_STAGES = {
     "embedding": "embed",
     "face": "recognize",
+    "formation": "form",
     "generation": "generate",
     "transcription": "transcribe",
+    "vision": "describe",
 }
 _MAX_TEXT_CHARACTERS = 65_536
 _MAX_METADATA_BYTES = 262_144
@@ -319,6 +346,26 @@ class _PreparedContent:
     assets: tuple[StoredAsset, ...]
     modality: Modality
     canonical_parts: tuple[tuple[str, str], ...]
+    audio_transcript: bool = False
+    visual_description: bool = False
+
+
+@dataclass(slots=True)
+class _AudioStreamState:
+    pcm: bytearray
+    sample_rate_hz: int | None = None
+    channels: int | None = None
+    sample_width_bytes: int | None = None
+    transcript: str = ""
+    occurred_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class _VisionStreamState:
+    image: Blob | None = None
+    description: str = ""
+    occurred_at: datetime | None = None
+    last_occurred_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +376,7 @@ class _PreparedMemory:
     occurred_at: datetime | None
     occurred_end: datetime | None
     memory_type: MemoryType
+    context: ObservationContext | MemoryContext | None = None
 
 
 @dataclass(slots=True)
@@ -367,7 +415,9 @@ class Memory:
         embedder: EmbeddingBackend,
         answerer: GenerationBackend | None = None,
         transcriber: SpeechBackend | TranscriptionBackend | None = None,
+        vision_describer: VisionDescriptionBackend | None = None,
         face_analyzer: FaceBackend | None = None,
+        former: FormationBackend | None = None,
         index_speech: bool = _DEFAULT_CONFIG.index_speech,
         index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
         minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
@@ -383,6 +433,7 @@ class Memory:
         self._tracer = trace.get_tracer(TRACER_NAME) if tracer is None else tracer
         self._owner_pid = os.getpid()
         self._write_lock = RLock()
+        self._formation_lock = RLock()
         self._lifecycle = Condition()
         self._active_operations = 0
         self._closing = False
@@ -405,7 +456,9 @@ class Memory:
         self._embedder = embedder
         self._answerer = answerer
         self._transcriber = transcriber
+        self._vision_describer = vision_describer
         self._face_analyzer = face_analyzer
+        self._former = former
 
         try:
             (
@@ -427,11 +480,20 @@ class Memory:
                 self._transcription_space,
             ) = _transcription_contract(self._transcriber)
             (
+                self._vision_capabilities,
+                self._vision_model,
+            ) = _vision_contract(self._vision_describer)
+            (
                 self._face_capabilities,
                 self._face_model,
                 self._face_space,
                 self._face_analysis_space,
             ) = _face_contract(self._face_analyzer)
+            (
+                self._formation_capabilities,
+                self._formation_model,
+                self._formation_space,
+            ) = _formation_contract(self._former)
             self._assets = AssetStore(self.data_dir)
             self._collect_orphan_assets(scan_physical=True)
             index_path = self.data_dir / "zvec"
@@ -490,7 +552,9 @@ class Memory:
             embedder=plugins.embedder,
             answerer=plugins.answerer,
             transcriber=plugins.transcriber,
+            vision_describer=plugins.vision_describer,
             face_analyzer=plugins.face_analyzer,
+            former=plugins.former,
             index_speech=config.index_speech,
             index_quantization=config.index_quantization,
             minimum_relevance=config.minimum_relevance,
@@ -579,19 +643,62 @@ class Memory:
         occurred_end: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: ObservationContext | None = None,
     ) -> MemoryRecord:
         """Add one native or mixed-modal memory and return its stable record."""
+        return self._add_one(
+            content,
+            occurred_at=occurred_at,
+            occurred_end=occurred_end,
+            metadata=metadata,
+            memory_type=memory_type,
+            context=context,
+        )
+
+    def _add_one(
+        self,
+        content: ContentInput,
+        *,
+        occurred_at: datetime | None,
+        occurred_end: datetime | None,
+        metadata: Mapping[str, object] | None,
+        memory_type: MemoryType,
+        context: ObservationContext | None,
+        transcript: str | None = None,
+        description: str | None = None,
+    ) -> MemoryRecord:
         with self._trace("mindbridge.add", kind="operation"), self._operation() as assets:
+            if self._former is not None and context is None:
+                context = ObservationContext()
             with self._trace("mindbridge.content.prepare", kind="stage"):
                 prepared_content = self._prepare_content(content, assets)
+                if transcript is not None:
+                    prepared_content = _with_stream_transcript(prepared_content, transcript)
+                if description is not None:
+                    prepared_content = _with_stream_description(prepared_content, description)
             prepared = _prepare_memory(
                 prepared_content,
                 occurred_at=occurred_at,
                 occurred_end=occurred_end,
                 metadata=metadata,
                 memory_type=memory_type,
+                context=context,
             )
-            return self._add_prepared((prepared,), operation=assets)[0]
+            record = self._add_prepared((prepared,), operation=assets)[0]
+            self._form_sources((record,), operation=assets)
+            return record
+
+    def _add_stream_input(self, item: StreamInput) -> MemoryRecord:
+        return self._add_one(
+            item.content,
+            occurred_at=item.occurred_at,
+            occurred_end=item.occurred_end,
+            metadata=item.metadata,
+            memory_type=item.memory_type,
+            context=item.context,
+            transcript=item.transcript,
+            description=item.description,
+        )
 
     def add_many(
         self,
@@ -601,6 +708,7 @@ class Memory:
         occurred_end: Sequence[datetime | None] | None = None,
         metadata: Sequence[Mapping[str, object] | None] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: Sequence[ObservationContext | None] | None = None,
     ) -> tuple[MemoryRecord, ...]:
         """Add memories in one model batch and one SQLite transaction."""
         with self._trace("mindbridge.add_many", kind="operation"), self._operation() as assets:
@@ -614,6 +722,11 @@ class Memory:
             occurrences = _batch_values(occurred_at, len(batch), "occurred_at")
             occurrence_ends = _batch_values(occurred_end, len(batch), "occurred_end")
             metadata_values = _batch_values(metadata, len(batch), "metadata")
+            context_values = _batch_values(context, len(batch), "context")
+            if self._former is not None:
+                context_values = tuple(
+                    value if value is not None else ObservationContext() for value in context_values
+                )
             with self._trace("mindbridge.content.prepare", kind="stage"):
                 prepared = tuple(
                     self._prepare_batch_item(
@@ -624,20 +737,30 @@ class Memory:
                         occurred_end=event_end,
                         metadata=item_metadata,
                         memory_type=normalized_memory_type,
+                        context=item_context,
                     )
-                    for index, (content, event_time, event_end, item_metadata) in enumerate(
+                    for index, (
+                        content,
+                        event_time,
+                        event_end,
+                        item_metadata,
+                        item_context,
+                    ) in enumerate(
                         zip(
                             batch,
                             occurrences,
                             occurrence_ends,
                             metadata_values,
+                            context_values,
                             strict=True,
                         )
                     )
                 )
             if not prepared:
                 return ()
-            return self._add_prepared(prepared, operation=assets)
+            records = self._add_prepared(prepared, operation=assets)
+            self._form_sources(records, operation=assets)
+            return records
 
     def add_stream(
         self,
@@ -662,13 +785,7 @@ class Memory:
                 raise
             try:
                 if isinstance(content, StreamInput):
-                    record = self.add(
-                        content.content,
-                        occurred_at=content.occurred_at,
-                        occurred_end=content.occurred_end,
-                        metadata=content.metadata,
-                        memory_type=content.memory_type,
-                    )
+                    record = self._add_stream_input(content)
                 else:
                     record = self.add(content)
             except MindBridgeError as error:
@@ -687,6 +804,7 @@ class Memory:
         reference_at: datetime | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> tuple[SearchHit, ...]:
         """Return ranked memories for a native or mixed-modal query."""
         return self._search(
@@ -696,6 +814,7 @@ class Memory:
             reference_at=reference_at,
             occurred_from=occurred_from,
             occurred_until=occurred_until,
+            scope=scope,
             capture_trace=False,
         ).hits
 
@@ -708,6 +827,7 @@ class Memory:
         reference_at: datetime | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> TracedSearchResult:
         """Return ranked memories plus an opt-in candidate trace without evidence content."""
         outcome = self._search(
@@ -717,6 +837,7 @@ class Memory:
             reference_at=reference_at,
             occurred_from=occurred_from,
             occurred_until=occurred_until,
+            scope=scope,
             capture_trace=True,
         )
         assert outcome.trace is not None
@@ -731,6 +852,7 @@ class Memory:
         reference_at: datetime | None,
         occurred_from: datetime | None,
         occurred_until: datetime | None,
+        scope: RetrievalScope | None,
         capture_trace: bool,
     ) -> _SearchOutcome:
         with self._trace("mindbridge.search", kind="operation"), self._operation() as assets:
@@ -739,6 +861,7 @@ class Memory:
                 occurred_from,
                 occurred_until,
             )
+            scope = _retrieval_scope(scope)
             with self._trace("mindbridge.content.prepare", kind="stage"):
                 prepared = self._prepare_content(query, assets)
             explicit_reference = _reference_at(reference_at)
@@ -756,6 +879,7 @@ class Memory:
                 temporal_range=_temporal_range(temporal_text, reference),
                 occurred_from=occurred_from,
                 occurred_until=occurred_until,
+                scope=scope,
                 require_unambiguous=limit == 1,
                 capture_trace=capture_trace,
             )
@@ -769,6 +893,7 @@ class Memory:
         limit: int = 5,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> AnswerResult:
         """Answer a native or mixed-modal question only from retrieved memories."""
         with self._trace("mindbridge.ask", kind="operation"), self._operation() as assets:
@@ -788,6 +913,7 @@ class Memory:
                 infer_reference=explicit_reference is None,
             )
             temporal_range = _temporal_range(temporal_text, reference)
+            scope = _retrieval_scope(scope)
             search = partial(
                 self._search_prepared,
                 prepared,
@@ -798,6 +924,7 @@ class Memory:
                 temporal_range=temporal_range,
                 occurred_from=None,
                 occurred_until=None,
+                scope=scope,
                 require_unambiguous=limit == 1,
                 capture_trace=False,
             )
@@ -1133,6 +1260,7 @@ class Memory:
         occurred_end: datetime | None,
         metadata: Mapping[str, object] | None,
         memory_type: MemoryType,
+        context: ObservationContext | None,
     ) -> _PreparedMemory:
         """Prepare one batch item, naming its position when it is the item that fails."""
         try:
@@ -1142,6 +1270,7 @@ class Memory:
                 occurred_end=occurred_end,
                 metadata=metadata,
                 memory_type=memory_type,
+                context=context,
             )
         except MindBridgeError as error:
             if error.subject is None:
@@ -1294,7 +1423,17 @@ class Memory:
                             self._embedding_capabilities,
                             "embedding",
                         )
-                if fallback or self._derives_transcripts(batched):
+                if fallback:
+                    self._cache_audio_transcripts(
+                        tuple(
+                            asset
+                            for memory in missing
+                            if not memory.content.audio_transcript
+                            for asset in memory.content.assets
+                        ),
+                        operation,
+                    )
+                elif self._derives_transcripts(batched):
                     self._cache_audio_transcripts(batched, operation)
                 missing = [self._prepare_for_embedding(memory, operation) for memory in missing]
                 embedding_parts = tuple(
@@ -1321,6 +1460,7 @@ class Memory:
                         occurred_end=memory.occurred_end,
                         created_at=now,
                         updated_at=now,
+                        context=_stored_memory_context(memory, recorded_at=now),
                     )
                     for memory in missing
                 )
@@ -1364,6 +1504,197 @@ class Memory:
         if rows_by_id.keys() != unique.keys():
             raise StorageError("written memories could not be read from SQLite")
         return tuple(self._memory_record(rows_by_id[memory.memory_id]) for memory in prepared)
+
+    def _form_sources(
+        self,
+        sources: Sequence[MemoryRecord],
+        *,
+        operation: _OperationAssets,
+    ) -> None:
+        if self._former is None or not sources:
+            return
+        with self._formation_lock:
+            self._form_sources_locked(sources, operation=operation)
+
+    def _form_sources_locked(
+        self,
+        sources: Sequence[MemoryRecord],
+        *,
+        operation: _OperationAssets,
+    ) -> None:
+        assert self._former is not None
+        pending = tuple({source.id: source for source in sources}.values())
+        pending = tuple(
+            source
+            for source in pending
+            if not self._store.formation_completed(source.id, self._formation_space)
+        )
+        if not pending:
+            return
+        all_inputs = tuple(
+            FormationInput(
+                memory_id=source.id,
+                content=ModelInput(text=source.content, assets=source.assets),
+                context=_observation_from_record(source),
+            )
+            for source in pending
+        )
+        inputs = tuple(
+            value
+            for value in all_inputs
+            if value.content.modalities <= self._formation_capabilities
+        )
+        if not inputs:
+            return
+        try:
+            with self._model_trace(
+                "formation",
+                "form",
+                model=self._formation_model,
+                batch_size=len(inputs),
+                modalities=(modality for value in inputs for modality in value.content.modalities),
+            ):
+                proposals_by_source = self._former.form(inputs)
+        except MindBridgeError:
+            raise
+        except Exception as error:
+            raise ModelError(
+                "automatic memory formation failed",
+                reason="model_failed",
+                stage="form",
+            ) from error
+        if (
+            not isinstance(proposals_by_source, tuple)
+            or len(proposals_by_source) != len(inputs)
+            or any(
+                not isinstance(values, tuple)
+                or any(not isinstance(value, FormationProposal) for value in values)
+                for values in proposals_by_source
+            )
+        ):
+            raise ModelError(
+                "formation backend returned an invalid batch",
+                reason="response_invalid",
+                stage="form",
+            )
+        proposals_by_id: dict[str, tuple[FormationProposal, ...]] = {
+            value.memory_id: proposals
+            for value, proposals in zip(inputs, proposals_by_source, strict=True)
+        }
+
+        now = datetime.now(timezone.utc)
+        pairs: builtins.list[tuple[_PreparedMemory, str, float]] = []
+        inputs_by_id = {value.memory_id: value for value in inputs}
+        formed_sources = tuple(source for source in pending if source.id in inputs_by_id)
+        for source in formed_sources:
+            proposals = proposals_by_id.get(source.id, ())
+            for proposal in proposals:
+                _validate_formation_proposal(proposal, inputs_by_id[source.id])
+                prepared = _prepare_memory(
+                    self._prepare_content(proposal.content, operation),
+                    occurred_at=source.occurred_at,
+                    occurred_end=source.occurred_end,
+                    metadata=None,
+                    memory_type=_formation_memory_type(proposal.kind),
+                )
+                context = _formation_context(
+                    source,
+                    proposal,
+                    model_id=self._formation_model,
+                    recipe=self._formation_space,
+                    recorded_at=now,
+                )
+                pairs.append(
+                    (
+                        replace(
+                            prepared,
+                            memory_id=_formation_memory_id(
+                                source.id,
+                                proposal,
+                                recipe=self._formation_space,
+                                context=context,
+                            ),
+                            context=context,
+                        ),
+                        source.id,
+                        proposal.confidence,
+                    )
+                )
+        _validate_formation_pairs(pairs)
+        self._commit_formation(pairs, formed_sources, completed_at=now)
+
+    def _commit_formation(
+        self,
+        pairs: Sequence[tuple[_PreparedMemory, str, float]],
+        sources: Sequence[MemoryRecord],
+        *,
+        completed_at: datetime,
+    ) -> None:
+        ordered_pairs = tuple(sorted(pairs, key=lambda value: (value[0].memory_id, value[1])))
+        unique = tuple(
+            {
+                prepared.memory_id: prepared
+                for prepared, _source, _score in reversed(ordered_pairs)
+            }.values()
+        )
+        unique = tuple(sorted(unique, key=lambda value: value.memory_id))
+        with _translate_storage_errors("check formed memories"):
+            existing = self._store.read_memories(tuple(value.memory_id for value in unique))
+        existing_ids = {value.memory_id for value in existing}
+        missing = tuple(value for value in unique if value.memory_id not in existing_ids)
+        parts = tuple(
+            (memory, object_part, model_input)
+            for memory in missing
+            for object_part, model_input in enumerate(self._embedding_inputs(memory.content))
+        )
+        vectors = self._embed(
+            tuple(model_input for _memory, _part, model_input in parts),
+            task=EmbedTask.DOCUMENT,
+        )
+        stored = tuple(
+            StoredMemory(
+                memory_id=memory.memory_id,
+                content=memory.content.text,
+                modality=memory.content.modality.value,
+                memory_type=memory.memory_type.value,
+                assets=(),
+                metadata_json=memory.metadata_json,
+                occurred_at=memory.occurred_at,
+                occurred_end=memory.occurred_end,
+                created_at=completed_at,
+                updated_at=completed_at,
+                context=cast(MemoryContext, memory.context),
+            )
+            for memory in missing
+        )
+        embeddings = tuple(
+            StoredEmbedding(
+                embedding_id=_embedding_id(memory.memory_id, object_part),
+                memory_id=memory.memory_id,
+                values=vector,
+                model_id=self._embedding_model,
+                space_id=self._space_id,
+                task=_DOCUMENT_TASK,
+                created_at=completed_at,
+                object_part=object_part,
+                normalized=True,
+            )
+            for (memory, object_part, _model_input), vector in zip(parts, vectors, strict=True)
+        )
+        with self._write_lock:
+            with _translate_storage_errors("commit automatic memory formation"):
+                self._store.apply_formation(
+                    stored,
+                    embeddings,
+                    evidence=tuple(
+                        (prepared.memory_id, source_id, confidence)
+                        for prepared, source_id, confidence in ordered_pairs
+                    ),
+                    source_memory_ids=tuple(source.id for source in sources),
+                    recipe=self._formation_space,
+                    completed_at=completed_at,
+                )
+            self._drain_outbox()
 
     def _prepare_for_embedding(
         self,
@@ -1409,13 +1740,37 @@ class Memory:
     ) -> tuple[ModelInput, ...]:
         prepared = _retrieval_content(prepared)
         aggregate = self._route_embedding(prepared)
-        text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
+        text_parts = tuple(
+            value
+            for kind, value in prepared.canonical_parts
+            if kind in {"text", "audio_transcript", "visual_description"}
+        )
         if prepared.text and prepared.text != "\n\n".join(text_parts):
             text_parts = (*text_parts, prepared.text)
+        if (
+            prepared.audio_transcript or prepared.visual_description
+        ) and Modality.TEXT not in self._embedding_capabilities:
+            text_parts = ()
         text_keys = tuple(key for text in text_parts for key in _contextual_text_keys(text))
         atomic = [
             *(self._route_embedding(_text_content(text)) for text in text_keys),
-            *(self._route_embedding(_asset_content(asset)) for asset in prepared.assets),
+            *(
+                self._route_embedding(_asset_content(asset))
+                for asset in prepared.assets
+                if not (
+                    (
+                        prepared.audio_transcript
+                        and asset.modality == Modality.AUDIO.value
+                        and Modality.AUDIO not in self._embedding_capabilities
+                        and asset.transcript is None
+                    )
+                    or (
+                        prepared.visual_description
+                        and asset.modality in {Modality.IMAGE.value, Modality.VIDEO.value}
+                        and Modality(asset.modality) not in self._embedding_capabilities
+                    )
+                )
+            ),
         ]
         unique = tuple(dict.fromkeys(value for value in atomic if value != aggregate))
         if len(unique) > maximum_keys:
@@ -1475,6 +1830,8 @@ class Memory:
                 assets=memory.assets,
                 modality=Modality(memory.modality),
                 canonical_parts=(("text", base),) if base else (),
+                audio_transcript=_has_stream_transcript(base, memory.assets),
+                visual_description=_has_stream_description(base, memory.assets),
             )
             prepared.append((memory, self._embedding_content(content, operation)))
 
@@ -1511,7 +1868,7 @@ class Memory:
         )
         return updated, embeddings
 
-    def _search_prepared(
+    def _search_prepared(  # noqa: C901 - one shared retrieval plane
         self,
         prepared: _PreparedContent,
         *,
@@ -1522,6 +1879,7 @@ class Memory:
         temporal_range: tuple[datetime, datetime] | None,
         occurred_from: datetime | None,
         occurred_until: datetime | None,
+        scope: RetrievalScope | None,
         require_unambiguous: bool,
         capture_trace: bool,
     ) -> _SearchOutcome:
@@ -1554,6 +1912,7 @@ class Memory:
             lexical_query = ""
         candidate_limit = max(_RERANK_CANDIDATES, limit * 3)
         candidate_ceiling = max(candidate_limit, limit * (_MAX_RETRIEVAL_KEYS + 1))
+        seen_index_ids: set[str] = set()
         with self._write_lock:
             self._drain_outbox()
         while True:
@@ -1640,13 +1999,30 @@ class Memory:
                         occurred_until,
                     )
                 )
-            parent_count = len({document.embedding.memory_id for document in documents})
+            candidate_parent_ids = tuple(
+                dict.fromkeys(document.embedding.memory_id for document in documents)
+            )
+            with _translate_storage_errors("apply search scope"):
+                active_count = len(
+                    self._store.read_memories(
+                        candidate_parent_ids,
+                        valid_at=None if scope is None else scope.valid_at,
+                        known_at=None if scope is None else scope.known_at,
+                        near=None if scope is None else scope.near,
+                        radius_m=None if scope is None else scope.radius_m,
+                        active_only=True,
+                    )
+                )
             if (
-                parent_count >= limit
+                active_count >= limit
                 or candidates.exhausted
                 or candidate_limit >= candidate_ceiling
             ):
                 break
+            current_index_ids = set(index_ids)
+            if current_index_ids <= seen_index_ids:
+                break
+            seen_index_ids.update(current_index_ids)
             candidate_limit = min(candidate_limit * 2, candidate_ceiling)
         index_ids_by_memory = (
             _parent_index_ids(hydrated_documents) if trace_candidates is not None else {}
@@ -1678,7 +2054,14 @@ class Memory:
                 self._trace("mindbridge.storage.hydrate", kind="stage"),
                 _translate_storage_errors("hydrate search results"),
             ):
-                memories = self._store.read_memories(parent_ids)
+                memories = self._store.read_memories(
+                    parent_ids,
+                    valid_at=None if scope is None else scope.valid_at,
+                    known_at=None if scope is None else scope.known_at,
+                    near=None if scope is None else scope.near,
+                    radius_m=None if scope is None else scope.radius_m,
+                    active_only=True,
+                )
             with self._trace("mindbridge.retrieval.rank", kind="stage"):
                 _extend_missing_memory_traces(
                     trace_candidates,
@@ -1740,6 +2123,9 @@ class Memory:
                         temporal_range=temporal_range,
                         decay_half_life=self._decay_half_life,
                     )
+                    if memory.context is not None:
+                        final_score *= memory.context.confidence
+                        gate_confidence *= memory.context.confidence
                     ranked.append(
                         (
                             memory,
@@ -1945,9 +2331,18 @@ class Memory:
         missing = value.modalities - self._embedding_capabilities
         if not missing:
             return value
-        if missing <= {Modality.AUDIO}:
+        if (
+            missing == {Modality.TEXT}
+            and (prepared.audio_transcript or prepared.visual_description)
+            and value.modalities - {Modality.TEXT} <= self._embedding_capabilities
+        ):
+            return ModelInput(assets=value.assets)
+        fallback = {Modality.AUDIO}
+        if prepared.visual_description:
+            fallback.update((Modality.IMAGE, Modality.VIDEO))
+        if missing <= fallback:
             text = _derived_text(value.text, prepared.assets)
-            assets = tuple(asset for asset in value.assets if asset.modality is not Modality.AUDIO)
+            assets = tuple(asset for asset in value.assets if asset.modality not in missing)
             if text or assets:
                 routed = ModelInput(text=text, assets=assets)
                 missing = routed.modalities - self._embedding_capabilities
@@ -1964,14 +2359,26 @@ class Memory:
         prepared: _PreparedContent,
         operation: _OperationAssets,
     ) -> _PreparedContent:
+        media = _prepared_modalities(prepared) - {Modality.TEXT}
+        if (
+            (prepared.audio_transcript or prepared.visual_description)
+            and Modality.TEXT not in self._embedding_capabilities
+            and media
+            and media <= self._embedding_capabilities
+        ):
+            return prepared
         unsupported = _fallback_unsupported(
             prepared,
             self._embedding_capabilities,
             "embedding",
         )
         if Modality.AUDIO in unsupported:
+            if prepared.audio_transcript:
+                return prepared
             _require_audio_transcription(self._transcription_capabilities)
-        elif not self._derives_transcripts(prepared.assets):
+        elif unsupported & {Modality.IMAGE, Modality.VIDEO} or not self._derives_transcripts(
+            prepared.assets
+        ):
             return prepared
         return self._with_audio_transcripts(prepared, operation)
 
@@ -1980,6 +2387,14 @@ class Memory:
         prepared: _PreparedContent,
         operation: _OperationAssets,
     ) -> ModelInput:
+        value = self._resolved_model_input(prepared)
+        missing = value.modalities - self._generation_capabilities
+        if (
+            missing == {Modality.TEXT}
+            and (prepared.audio_transcript or prepared.visual_description)
+            and value.modalities - {Modality.TEXT} <= self._generation_capabilities
+        ):
+            return ModelInput(assets=value.assets)
         unsupported = _fallback_unsupported(
             prepared,
             self._generation_capabilities,
@@ -1987,7 +2402,7 @@ class Memory:
         )
         if self._answer_speech_assets(prepared.assets):
             prepared = self._with_speech_identities(prepared, operation)
-        if Modality.AUDIO in unsupported:
+        if Modality.AUDIO in unsupported and not prepared.audio_transcript:
             _require_audio_transcription(self._transcription_capabilities)
             prepared = self._with_audio_transcripts(prepared, operation)
         value = self._resolved_model_input(prepared)
@@ -1995,8 +2410,11 @@ class Memory:
         if not unsupported:
             return value
         text = _derived_text(value.text, prepared.assets)
-        assets = tuple(asset for asset in value.assets if asset.modality is not Modality.AUDIO)
-        if unsupported <= {Modality.AUDIO} and (text or assets):
+        fallback = {Modality.AUDIO}
+        if prepared.visual_description:
+            fallback.update((Modality.IMAGE, Modality.VIDEO))
+        assets = tuple(asset for asset in value.assets if asset.modality not in unsupported)
+        if unsupported <= fallback and (text or assets):
             routed = ModelInput(
                 text=text,
                 assets=assets,
@@ -2033,6 +2451,8 @@ class Memory:
                     assets=assets,
                     modality=_memory_modality(assets),
                     canonical_parts=(),
+                    audio_transcript=_has_stream_transcript(hit.content, assets),
+                    visual_description=_has_stream_description(hit.content, assets),
                 )
             )
         if Modality.AUDIO not in self._generation_capabilities:
@@ -2049,7 +2469,12 @@ class Memory:
             self._recognize_speech(speech_assets, operation)
         elif Modality.AUDIO not in self._generation_capabilities:
             self._cache_audio_transcripts(
-                tuple(asset for prepared in prepared_hits for asset in prepared.assets),
+                tuple(
+                    asset
+                    for prepared in prepared_hits
+                    if not prepared.audio_transcript
+                    for asset in prepared.assets
+                ),
                 operation,
             )
         face_assets = self._answer_face_assets(
@@ -2508,6 +2933,52 @@ class Memory:
             assets=tuple(self._asset_ref(asset) for asset in prepared.assets),
         )
 
+    def _describe_vision(self, images: Sequence[Blob]) -> tuple[str, ...]:
+        if self._vision_describer is None:
+            raise ModelError(
+                "vision description backend is not configured",
+                reason="backend_not_configured",
+            )
+        if not images:
+            raise ValidationError("vision description requires at least one image")
+        with self._operation() as operation:
+            prepared = tuple(self._prepare_content(image, operation) for image in images)
+            inputs = tuple(self._resolved_model_input(value) for value in prepared)
+            unsupported = frozenset(
+                modality
+                for value in inputs
+                for modality in value.modalities - self._vision_capabilities
+            )
+            if unsupported:
+                names = ", ".join(sorted(modality.value for modality in unsupported))
+                raise ModelError(
+                    f"configured vision model does not support: {names}",
+                    reason="unsupported_modality",
+                )
+            with self._model_trace(
+                "vision",
+                "vision.description",
+                model=self._vision_model,
+                batch_size=len(inputs),
+                modalities=(modality for value in inputs for modality in value.modalities),
+            ):
+                mark_model_requests(1)
+                try:
+                    descriptions = self._vision_describer.describe(inputs)
+                except MindBridgeError:
+                    raise
+                except Exception as error:
+                    raise ModelError("failed to describe vision input") from error
+            if len(descriptions) != len(inputs) or any(
+                not isinstance(description, str) or not description.strip()
+                for description in descriptions
+            ):
+                raise ModelError("vision model returned invalid output")
+            normalized = tuple(description.strip() for description in descriptions)
+            if any(len(description) > _MAX_TEXT_CHARACTERS for description in normalized):
+                raise ModelError("vision description exceeded the supported text length")
+            return normalized
+
     def _embed(
         self,
         inputs: Sequence[ModelInput],
@@ -2627,6 +3098,7 @@ class Memory:
             assets=tuple(self._asset_ref(asset) for asset in memory.assets),
             modality=Modality(memory.modality),
             memory_type=MemoryType(memory.memory_type),
+            context=memory.context,
         )
 
     def _search_hit(self, memory: StoredMemory, relevance: float) -> SearchHit:
@@ -2641,6 +3113,7 @@ class Memory:
             assets=tuple(self._asset_ref(asset) for asset in memory.assets),
             modality=Modality(memory.modality),
             memory_type=MemoryType(memory.memory_type),
+            context=memory.context,
         )
 
     def _asset_ref(self, asset: StoredAsset) -> AssetRef:
@@ -2848,6 +3321,14 @@ class Memory:
                             assets=memory.assets,
                             modality=Modality(memory.modality),
                             canonical_parts=((("text", memory.content),) if memory.content else ()),
+                            audio_transcript=_has_stream_transcript(
+                                memory.content,
+                                memory.assets,
+                            ),
+                            visual_description=_has_stream_description(
+                                memory.content,
+                                memory.assets,
+                            ),
                         )
                     )
                 )
@@ -2933,7 +3414,9 @@ class Memory:
         resources = _present_resources(
             self._embedder,
             self._transcriber,
+            self._vision_describer,
             self._face_analyzer,
+            self._former,
             self._answerer,
             self._store,
         )
@@ -2946,7 +3429,9 @@ class Memory:
         resources = _present_resources(
             self._embedder,
             self._transcriber,
+            self._vision_describer,
             self._face_analyzer,
+            self._former,
             self._answerer,
             self._index,
             self._store,
@@ -3023,7 +3508,9 @@ class AsyncMemory:
         embedder: EmbeddingBackend,
         answerer: GenerationBackend | None = None,
         transcriber: SpeechBackend | TranscriptionBackend | None = None,
+        vision_describer: VisionDescriptionBackend | None = None,
         face_analyzer: FaceBackend | None = None,
+        former: FormationBackend | None = None,
         index_speech: bool = _DEFAULT_CONFIG.index_speech,
         index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
         minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
@@ -3040,7 +3527,9 @@ class AsyncMemory:
             embedder=embedder,
             answerer=answerer,
             transcriber=transcriber,
+            vision_describer=vision_describer,
             face_analyzer=face_analyzer,
+            former=former,
             index_speech=index_speech,
             index_quantization=index_quantization,
             minimum_relevance=minimum_relevance,
@@ -3074,7 +3563,9 @@ class AsyncMemory:
             embedder=plugins.embedder,
             answerer=plugins.answerer,
             transcriber=plugins.transcriber,
+            vision_describer=plugins.vision_describer,
             face_analyzer=plugins.face_analyzer,
+            former=plugins.former,
             index_speech=config.index_speech,
             index_quantization=config.index_quantization,
             minimum_relevance=config.minimum_relevance,
@@ -3121,6 +3612,7 @@ class AsyncMemory:
         occurred_end: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: ObservationContext | None = None,
     ) -> MemoryRecord:
         return await asyncio.to_thread(
             self._memory.add,
@@ -3129,7 +3621,11 @@ class AsyncMemory:
             occurred_end=occurred_end,
             metadata=metadata,
             memory_type=memory_type,
+            context=context,
         )
+
+    async def _add_stream_input(self, item: StreamInput) -> MemoryRecord:
+        return await asyncio.to_thread(self._memory._add_stream_input, item)
 
     async def add_many(
         self,
@@ -3139,6 +3635,7 @@ class AsyncMemory:
         occurred_end: Sequence[datetime | None] | None = None,
         metadata: Sequence[Mapping[str, object] | None] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: Sequence[ObservationContext | None] | None = None,
     ) -> tuple[MemoryRecord, ...]:
         return await asyncio.to_thread(
             self._memory.add_many,
@@ -3147,6 +3644,7 @@ class AsyncMemory:
             occurred_end=occurred_end,
             metadata=metadata,
             memory_type=memory_type,
+            context=context,
         )
 
     async def add_stream(
@@ -3169,13 +3667,7 @@ class AsyncMemory:
                 raise
             try:
                 if isinstance(content, StreamInput):
-                    record = await self.add(
-                        content.content,
-                        occurred_at=content.occurred_at,
-                        occurred_end=content.occurred_end,
-                        metadata=content.metadata,
-                        memory_type=content.memory_type,
-                    )
+                    record = await self._add_stream_input(content)
                 else:
                     record = await self.add(content)
             except MindBridgeError as error:
@@ -3194,6 +3686,7 @@ class AsyncMemory:
         reference_at: datetime | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> tuple[SearchHit, ...]:
         return await asyncio.to_thread(
             self._memory.search,
@@ -3203,6 +3696,7 @@ class AsyncMemory:
             reference_at=reference_at,
             occurred_from=occurred_from,
             occurred_until=occurred_until,
+            scope=scope,
         )
 
     async def search_with_trace(
@@ -3214,6 +3708,7 @@ class AsyncMemory:
         reference_at: datetime | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> TracedSearchResult:
         return await asyncio.to_thread(
             self._memory.search_with_trace,
@@ -3223,6 +3718,7 @@ class AsyncMemory:
             reference_at=reference_at,
             occurred_from=occurred_from,
             occurred_until=occurred_until,
+            scope=scope,
         )
 
     async def ask(
@@ -3232,6 +3728,7 @@ class AsyncMemory:
         limit: int = 5,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> AnswerResult:
         return await asyncio.to_thread(
             self._memory.ask,
@@ -3239,6 +3736,7 @@ class AsyncMemory:
             limit=limit,
             memory_type=memory_type,
             reference_at=reference_at,
+            scope=scope,
         )
 
     async def get(self, memory_id: str) -> MemoryRecord:
@@ -3381,6 +3879,491 @@ class AsyncOmniPrefetch:
             self._worker = None
 
 
+class AsyncCaptureStream:
+    """Reduce associated capture streams into retrieval and durable memories."""
+
+    def __init__(
+        self,
+        memory: AsyncMemory,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        max_streams: int = 32,
+    ) -> None:
+        if not isinstance(memory, AsyncMemory):
+            raise ValidationError("memory must be an AsyncMemory")
+        _limit(limit, maximum=100)
+        self._memory = memory
+        self._limit = limit
+        self._memory_type = _optional_memory_type(memory_type)
+        self._reference_at = _reference_at(reference_at)
+        self._max_streams = _positive_dimension(max_streams, "max_streams")
+
+    async def consume(  # noqa: C901 - the three-state reducer is intentionally inline
+        self,
+        events: AsyncIterable[StreamEvent],
+    ) -> AsyncIterator[StreamCommit]:
+        """Yield only final observations; partials, cancellation, and EOF never write."""
+        if not isinstance(events, AsyncIterable):
+            raise ValidationError("events must be an async iterable of StreamEvent values")
+        prefetches: dict[str, AsyncOmniPrefetch] = {}
+        try:
+            async for event in events:
+                if not isinstance(event, StreamEvent):
+                    raise ValidationError("events must contain StreamEvent values")
+                stream_id = event.stream_id
+                if event.phase is StreamPhase.UPDATE:
+                    prefetch = self._prefetch_for(prefetches, stream_id)
+                    assert event.item is not None and not isinstance(event.item, StreamInput)
+                    prefetch.submit(event.item)
+                    continue
+                if event.phase is StreamPhase.CANCEL:
+                    cancelled_prefetch = (
+                        prefetches.pop(stream_id) if stream_id in prefetches else None
+                    )
+                    if cancelled_prefetch is not None:
+                        await cancelled_prefetch.close()
+                    continue
+                assert event.item is not None
+                prefetch = self._prefetch_for(prefetches, stream_id)
+                item = event.item
+                final_content = self._final_query(item)
+                retrieval_error: Exception | None = None
+                retrieval: PrefetchResult | None = None
+                try:
+                    retrieval = await prefetch.finalize(final_content)
+                except Exception as error:
+                    retrieval_error = error
+                prefetches.pop(stream_id, None)
+                # ponytail: FINAL is the commit point; a cancellable storage transaction would
+                # be needed to revoke it safely once the worker thread has started.
+                commit = asyncio.create_task(self._add_final(item))
+                cancelled = False
+                while not commit.done():
+                    try:
+                        await asyncio.shield(commit)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                    except Exception:
+                        if cancelled:
+                            raise asyncio.CancelledError from None
+                        raise
+                try:
+                    record = commit.result()
+                except Exception:
+                    if cancelled:
+                        raise asyncio.CancelledError from None
+                    raise
+                if cancelled:
+                    raise asyncio.CancelledError
+                if retrieval_error is not None:
+                    yield StreamCommit(
+                        record=record,
+                        prefetch=None,
+                        retrieval_error=(
+                            retrieval_error.code
+                            if isinstance(retrieval_error, MindBridgeError)
+                            else "retrieval_failed"
+                        ),
+                        stream_id=stream_id,
+                    )
+                else:
+                    assert retrieval is not None
+                    yield StreamCommit(
+                        record=record,
+                        prefetch=retrieval,
+                        stream_id=stream_id,
+                    )
+        finally:
+            for prefetch in tuple(prefetches.values()):
+                await prefetch.close()
+
+    def _prefetch_for(
+        self,
+        prefetches: dict[str, AsyncOmniPrefetch],
+        stream_id: str,
+    ) -> AsyncOmniPrefetch:
+        prefetch = prefetches.get(stream_id)
+        if prefetch is not None:
+            return prefetch
+        if len(prefetches) >= self._max_streams:
+            raise ValidationError("capture stream exceeds max_streams")
+        prefetch = self._new_prefetch()
+        prefetches[stream_id] = prefetch
+        return prefetch
+
+    def _final_query(self, item: ContentInput | StreamInput) -> ContentInput:
+        if not isinstance(item, StreamInput) or (
+            item.transcript is None and item.description is None
+        ):
+            return item.content if isinstance(item, StreamInput) else item
+        capabilities = self._memory._memory._embedding_capabilities
+        if Modality.TEXT not in capabilities:
+            return item.content
+        routed: builtins.list[ContentAtom] = [
+            value for value in (item.transcript, item.description) if value is not None
+        ]
+        for atom in _content_atoms(item.content):
+            modality = _declared_atom_modality(atom)
+            if (
+                modality is Modality.AUDIO
+                and item.transcript is not None
+                and modality not in capabilities
+            ):
+                continue
+            if (
+                modality in {Modality.IMAGE, Modality.VIDEO}
+                and item.description is not None
+                and modality not in capabilities
+            ):
+                continue
+            routed.append(atom)
+        return routed[0] if len(routed) == 1 else tuple(routed)
+
+    def _new_prefetch(self) -> AsyncOmniPrefetch:
+        return AsyncOmniPrefetch(
+            self._memory,
+            limit=self._limit,
+            memory_type=self._memory_type,
+            reference_at=self._reference_at,
+        )
+
+    async def _add_final(self, item: ContentInput | StreamInput) -> MemoryRecord:
+        if isinstance(item, StreamInput):
+            return await self._memory._add_stream_input(item)
+        return await self._memory.add(item)
+
+
+class AsyncAudioStream:
+    """Normalize PCM, VAD, ASR, and acoustic boundaries into associated capture events."""
+
+    def __init__(
+        self,
+        memory: AsyncMemory,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        max_streams: int = 32,
+    ) -> None:
+        if not isinstance(memory, AsyncMemory):
+            raise ValidationError("memory must be an AsyncMemory")
+        self._memory = memory
+        self._max_streams = _positive_dimension(max_streams, "max_streams")
+        capabilities = memory._memory._embedding_capabilities
+        self._native_audio = Modality.AUDIO in capabilities
+        self._native_text = Modality.TEXT in capabilities
+        self._max_pcm_bytes = memory._memory._assets.max_bytes - 44
+        self._capture = AsyncCaptureStream(
+            memory,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            max_streams=max_streams,
+        )
+
+    async def consume(
+        self,
+        packets: AsyncIterable[AudioStreamPacket],
+    ) -> AsyncIterator[StreamCommit]:
+        """Yield one associated commit for each VAD or acoustic end boundary."""
+        if not isinstance(packets, AsyncIterable):
+            raise ValidationError("packets must be an async iterable of audio stream values")
+        async for commit in self._capture.consume(self._events(packets)):
+            yield commit
+
+    async def _events(  # noqa: C901 - packet kinds form one explicit stream state machine
+        self,
+        packets: AsyncIterable[AudioStreamPacket],
+    ) -> AsyncIterator[StreamEvent]:
+        states: dict[str, _AudioStreamState] = {}
+        async for packet in packets:
+            if not isinstance(packet, (PCMChunk, VADPacket, ASRPartial, AcousticBoundary)):
+                raise ValidationError("packets contain an invalid audio stream value")
+            stream_id = packet.stream_id
+            if isinstance(packet, AcousticBoundary):
+                if packet.boundary is AudioBoundary.CANCEL:
+                    states.pop(stream_id, None)
+                    yield StreamEvent(StreamPhase.CANCEL, stream_id=stream_id)
+                    continue
+                if packet.boundary is AudioBoundary.END:
+                    final = self._finish(states, stream_id, packet.occurred_at)
+                    if final is not None:
+                        yield final
+                    continue
+                current = states.get(stream_id)
+                if current is not None and (current.pcm or current.transcript):
+                    raise ValidationError("audio stream started before its prior boundary")
+                if current is None:
+                    self._state_for(states, stream_id, packet.occurred_at)
+                else:
+                    current.occurred_at = packet.occurred_at
+                continue
+            if isinstance(packet, VADPacket):
+                if not packet.active:
+                    final = self._finish(states, stream_id, packet.occurred_at)
+                    if final is not None:
+                        yield final
+                else:
+                    self._state_for(states, stream_id, packet.occurred_at)
+                continue
+            state = self._state_for(states, stream_id, packet.occurred_at)
+            if isinstance(packet, ASRPartial):
+                state.transcript = packet.text
+            else:
+                self._append_pcm(state, packet)
+            query = self._query(state)
+            if query is not None:
+                yield StreamEvent(StreamPhase.UPDATE, query, stream_id)
+
+    def _state_for(
+        self,
+        states: dict[str, _AudioStreamState],
+        stream_id: str,
+        occurred_at: datetime | None,
+    ) -> _AudioStreamState:
+        state = states.get(stream_id)
+        if state is not None:
+            if state.occurred_at is None:
+                state.occurred_at = occurred_at
+            return state
+        if len(states) >= self._max_streams:
+            raise ValidationError("audio stream exceeds max_streams")
+        state = _AudioStreamState(bytearray(), occurred_at=occurred_at)
+        states[stream_id] = state
+        return state
+
+    def _append_pcm(self, state: _AudioStreamState, packet: PCMChunk) -> None:
+        sample_format = (
+            packet.sample_rate_hz,
+            packet.channels,
+            packet.sample_width_bytes,
+        )
+        current_format = (
+            state.sample_rate_hz,
+            state.channels,
+            state.sample_width_bytes,
+        )
+        if state.sample_rate_hz is None:
+            state.sample_rate_hz, state.channels, state.sample_width_bytes = sample_format
+        elif current_format != sample_format:
+            raise ValidationError("PCM format changed before an audio boundary")
+        if len(state.pcm) + len(packet.data) > self._max_pcm_bytes:
+            raise ValidationError("PCM stream exceeds the local asset size limit")
+        state.pcm.extend(packet.data)
+
+    def _query(self, state: _AudioStreamState) -> ContentInput | None:
+        if self._native_audio and state.pcm:
+            audio = _pcm_blob(state)
+            if self._native_text and state.transcript:
+                return (state.transcript, audio)
+            return audio
+        return state.transcript or None
+
+    def _finish(
+        self,
+        states: dict[str, _AudioStreamState],
+        stream_id: str,
+        occurred_end: datetime | None,
+    ) -> StreamEvent | None:
+        state = states.pop(stream_id, None)
+        if state is None:
+            return None
+        occurred_at, occurred_end = _audio_interval(state, occurred_end)
+        if state.pcm:
+            item = StreamInput(
+                _pcm_blob(state),
+                occurred_at=occurred_at,
+                occurred_end=occurred_end,
+                transcript=state.transcript or None,
+            )
+        elif state.transcript:
+            item = StreamInput(
+                state.transcript,
+                occurred_at=occurred_at,
+                occurred_end=occurred_end,
+            )
+        else:
+            return StreamEvent(StreamPhase.CANCEL, stream_id=stream_id)
+        return StreamEvent(StreamPhase.FINAL, item, stream_id)
+
+
+class AsyncVisionStream:
+    """Normalize image frames, visual descriptions, and scene boundaries."""
+
+    def __init__(
+        self,
+        memory: AsyncMemory,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        max_streams: int = 32,
+    ) -> None:
+        if not isinstance(memory, AsyncMemory):
+            raise ValidationError("memory must be an AsyncMemory")
+        self._memory = memory
+        self._max_streams = _positive_dimension(max_streams, "max_streams")
+        capabilities = memory._memory._embedding_capabilities
+        self._native_image = Modality.IMAGE in capabilities
+        self._native_text = Modality.TEXT in capabilities
+        self._capture = AsyncCaptureStream(
+            memory,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            max_streams=max_streams,
+        )
+
+    async def consume(
+        self,
+        packets: AsyncIterable[VisionStreamPacket],
+    ) -> AsyncIterator[StreamCommit]:
+        """Yield one associated commit for each completed visual scene."""
+        if not isinstance(packets, AsyncIterable):
+            raise ValidationError("packets must be an async iterable of vision stream values")
+        async for commit in self._capture.consume(self._events(packets)):
+            yield commit
+
+    async def _events(  # noqa: C901 - packet kinds form one explicit stream state machine
+        self,
+        packets: AsyncIterable[VisionStreamPacket],
+    ) -> AsyncIterator[StreamEvent]:
+        states: dict[str, _VisionStreamState] = {}
+        async for packet in packets:
+            if not isinstance(packet, (VisionFrame, VisionPartial, SceneBoundary)):
+                raise ValidationError("packets contain an invalid vision stream value")
+            stream_id = packet.stream_id
+            if isinstance(packet, SceneBoundary):
+                if packet.boundary is VisionBoundary.CANCEL:
+                    states.pop(stream_id, None)
+                    yield StreamEvent(StreamPhase.CANCEL, stream_id=stream_id)
+                    continue
+                if packet.boundary is VisionBoundary.END:
+                    final = await self._finish(states, stream_id, packet.occurred_at)
+                    if final is not None:
+                        yield final
+                    continue
+                current = states.get(stream_id)
+                if current is not None and (current.image is not None or current.description):
+                    raise ValidationError("vision stream started before its prior boundary")
+                if current is None:
+                    self._state_for(states, stream_id, packet.occurred_at)
+                else:
+                    current.occurred_at = packet.occurred_at
+                    current.last_occurred_at = packet.occurred_at
+                continue
+            state = self._state_for(states, stream_id, packet.occurred_at)
+            if isinstance(packet, VisionPartial):
+                state.description = packet.text
+            else:
+                # ponytail: retain one keyframe per scene; add a bounded sampler only when
+                # multi-frame retrieval quality demonstrates that the latest frame is insufficient.
+                state.image = packet.image
+            query = self._query(state)
+            if query is not None:
+                yield StreamEvent(StreamPhase.UPDATE, query, stream_id)
+
+    def _state_for(
+        self,
+        states: dict[str, _VisionStreamState],
+        stream_id: str,
+        occurred_at: datetime | None,
+    ) -> _VisionStreamState:
+        state = states.get(stream_id)
+        if state is None:
+            if len(states) >= self._max_streams:
+                raise ValidationError("vision stream exceeds max_streams")
+            state = _VisionStreamState(occurred_at=occurred_at)
+            states[stream_id] = state
+        elif state.occurred_at is None:
+            state.occurred_at = occurred_at
+        if occurred_at is not None:
+            state.last_occurred_at = occurred_at
+        return state
+
+    def _query(self, state: _VisionStreamState) -> ContentInput | None:
+        if self._native_image and state.image is not None:
+            if self._native_text and state.description:
+                return (state.description, state.image)
+            return state.image
+        return state.description or None
+
+    async def _finish(
+        self,
+        states: dict[str, _VisionStreamState],
+        stream_id: str,
+        occurred_end: datetime | None,
+    ) -> StreamEvent | None:
+        state = states.pop(stream_id, None)
+        if state is None:
+            return None
+        occurred_end = occurred_end or state.last_occurred_at
+        if (
+            state.image is not None
+            and not state.description
+            and not self._native_image
+            and self._native_text
+            and self._memory._memory._vision_describer is not None
+        ):
+            state.description = (
+                await asyncio.to_thread(self._memory._memory._describe_vision, (state.image,))
+            )[0]
+        if state.image is not None:
+            item = StreamInput(
+                state.image,
+                occurred_at=state.occurred_at,
+                occurred_end=occurred_end,
+                description=state.description or None,
+            )
+        elif state.description:
+            item = StreamInput(
+                state.description,
+                occurred_at=state.occurred_at,
+                occurred_end=occurred_end,
+            )
+        else:
+            return StreamEvent(StreamPhase.CANCEL, stream_id=stream_id)
+        return StreamEvent(StreamPhase.FINAL, item, stream_id)
+
+
+def _pcm_blob(state: _AudioStreamState) -> Blob:
+    assert (
+        state.sample_rate_hz is not None
+        and state.channels is not None
+        and state.sample_width_bytes is not None
+    )
+    output = io.BytesIO()
+    with wave.open(output, "wb") as audio:
+        audio.setnchannels(state.channels)
+        audio.setsampwidth(state.sample_width_bytes)
+        audio.setframerate(state.sample_rate_hz)
+        audio.writeframes(state.pcm)
+    return Blob(output.getvalue(), "audio/wav", "capture.wav")
+
+
+def _audio_interval(
+    state: _AudioStreamState,
+    occurred_end: datetime | None,
+) -> tuple[datetime | None, datetime | None]:
+    occurred_at = state.occurred_at
+    if not state.pcm:
+        return occurred_at, occurred_end
+    assert (
+        state.sample_rate_hz is not None
+        and state.channels is not None
+        and state.sample_width_bytes is not None
+    )
+    frames = len(state.pcm) // (state.channels * state.sample_width_bytes)
+    duration = timedelta(seconds=frames / state.sample_rate_hz)
+    if occurred_at is None and occurred_end is not None:
+        occurred_at = occurred_end - duration
+    elif occurred_at is not None and occurred_end is None:
+        occurred_end = occurred_at + duration
+    return occurred_at, occurred_end
+
+
 @contextmanager
 def _staged(span: AbstractContextManager[Span], stage: str) -> Iterator[Span]:
     """Name the failing stage on public errors so an agent never parses prose to find it.
@@ -3411,6 +4394,20 @@ def _content_atoms(content: ContentInput) -> tuple[ContentAtom, ...]:
     return atoms
 
 
+def _declared_atom_modality(atom: ContentAtom) -> Modality | None:
+    if isinstance(atom, str):
+        return Modality.TEXT
+    if isinstance(atom, Blob):
+        return _media_hint(atom.name, atom.media_type)[0]
+    if isinstance(atom, Path):
+        return _media_hint(atom.name, None)[0]
+    if atom.modality is not None:
+        return atom.modality
+    if atom.media_type is not None:
+        return _media_hint(atom.name, atom.media_type)[0]
+    return None
+
+
 def _snapshot_content(content: ContentInput) -> ContentInput:
     atoms = _content_atoms(content)
     if any(isinstance(atom, Path) for atom in atoms):
@@ -3425,6 +4422,7 @@ def _prepare_memory(
     occurred_end: datetime | None,
     metadata: Mapping[str, object] | None,
     memory_type: MemoryType,
+    context: ObservationContext | None = None,
 ) -> _PreparedMemory:
     normalized_occurred_at = _occurred_at(occurred_at)
     normalized_occurred_end = _occurred_end(normalized_occurred_at, occurred_end)
@@ -3441,6 +4439,10 @@ def _prepare_memory(
         identity["occurred_end"] = _datetime_text(normalized_occurred_end)
     if normalized_memory_type is not MemoryType.SEMANTIC:
         identity["memory_type"] = normalized_memory_type.value
+    if context is not None:
+        if not isinstance(context, ObservationContext):
+            raise ValidationError("context must be an ObservationContext")
+        identity["context"] = _observation_context_identity(context)
     payload = json.dumps(
         identity,
         ensure_ascii=False,
@@ -3455,7 +4457,275 @@ def _prepare_memory(
         occurred_at=normalized_occurred_at,
         occurred_end=normalized_occurred_end,
         memory_type=normalized_memory_type,
+        context=context,
     )
+
+
+def _observation_context_identity(context: ObservationContext) -> dict[str, object]:
+    spatial = context.spatial
+    value: dict[str, object] = {
+        "basis": context.basis.value,
+        "source_id": context.source_id,
+        "confidence": context.confidence,
+        "valid_from": (None if context.valid_from is None else _datetime_text(context.valid_from)),
+        "valid_until": (
+            None if context.valid_until is None else _datetime_text(context.valid_until)
+        ),
+    }
+    if spatial is not None:
+        value["spatial"] = {
+            "frame_id": spatial.frame_id,
+            "anchor": spatial.anchor.value,
+            "position_m": (spatial.x, spatial.y, spatial.z),
+            "orientation_xyzw": spatial.orientation_xyzw,
+            "position_uncertainty_m": spatial.position_uncertainty_m,
+        }
+    return value
+
+
+def _stored_memory_context(
+    memory: _PreparedMemory,
+    *,
+    recorded_at: datetime,
+) -> MemoryContext | None:
+    context = memory.context
+    if context is None or isinstance(context, MemoryContext):
+        return context
+    return MemoryContext(
+        kind=MemoryKind.OBSERVATION,
+        basis=context.basis,
+        confidence=context.confidence,
+        valid_from=context.valid_from,
+        valid_until=context.valid_until,
+        recorded_at=recorded_at,
+        lineage_id=memory.memory_id,
+        source_id=context.source_id,
+        spatial=context.spatial,
+    )
+
+
+def _observation_from_record(record: MemoryRecord) -> ObservationContext:
+    context = record.context
+    if context is None:
+        return ObservationContext()
+    return ObservationContext(
+        basis=context.basis,
+        source_id=context.source_id,
+        confidence=context.confidence,
+        valid_from=context.valid_from,
+        valid_until=context.valid_until,
+        spatial=context.spatial,
+    )
+
+
+def _formation_memory_type(kind: MemoryKind) -> MemoryType:
+    if kind in {MemoryKind.EVENT, MemoryKind.AFFECT}:
+        return MemoryType.EPISODIC
+    if kind is MemoryKind.RESPONSE_POLICY:
+        return MemoryType.PROCEDURAL
+    return MemoryType.SEMANTIC
+
+
+def _validate_formation_proposal(
+    proposal: FormationProposal,
+    source: FormationInput,
+) -> None:
+    if proposal.kind is MemoryKind.AFFECT and (
+        proposal.cue_modality is None or proposal.cue_modality not in source.content.modalities
+    ):
+        raise ModelError(
+            "affect formation must name a modality present in its source",
+            reason="response_invalid",
+            stage="form",
+        )
+    if proposal.spatial is not None:
+        observed = source.context.spatial
+        if (
+            observed is None
+            or proposal.spatial.frame_id != observed.frame_id
+            or proposal.spatial.anchor is not observed.anchor
+        ):
+            raise ModelError(
+                "spatial formation must use the source observation frame and anchor",
+                reason="response_invalid",
+                stage="form",
+            )
+
+
+def _validate_formation_pairs(
+    pairs: Sequence[tuple[_PreparedMemory, str, float]],
+) -> None:
+    seen: dict[tuple[str, str], _PreparedMemory] = {}
+    states: dict[tuple[str, str], builtins.list[MemoryContext]] = {}
+    for prepared, source_id, _confidence in pairs:
+        key = (prepared.memory_id, source_id)
+        prior = seen.setdefault(key, prepared)
+        if prior != prepared:
+            raise ModelError(
+                "formation returned conflicting duplicates for one source",
+                reason="response_invalid",
+                stage="form",
+            )
+        context = prepared.context
+        if isinstance(context, MemoryContext) and context.kind is MemoryKind.STATE:
+            states.setdefault((source_id, context.lineage_id or prepared.memory_id), []).append(
+                context
+            )
+    for values in states.values():
+        for index, left in enumerate(values):
+            if any(
+                left.value != right.value
+                and _valid_intervals_overlap(
+                    left.valid_from,
+                    left.valid_until,
+                    right.valid_from,
+                    right.valid_until,
+                )
+                for right in values[index + 1 :]
+            ):
+                raise ModelError(
+                    "formation returned conflicting states for one source",
+                    reason="response_invalid",
+                    stage="form",
+                )
+
+
+def _valid_intervals_overlap(
+    left_from: datetime | None,
+    left_until: datetime | None,
+    right_from: datetime | None,
+    right_until: datetime | None,
+) -> bool:
+    return not (
+        (left_until is not None and right_from is not None and left_until <= right_from)
+        or (right_until is not None and left_from is not None and right_until <= left_from)
+    )
+
+
+def _formation_context(
+    source: MemoryRecord,
+    proposal: FormationProposal,
+    *,
+    model_id: str,
+    recipe: str,
+    recorded_at: datetime,
+) -> MemoryContext:
+    source_context = _observation_from_record(source)
+    valid_from = proposal.valid_from or source_context.valid_from or source.occurred_at
+    if valid_from is None and proposal.kind in {MemoryKind.STATE, MemoryKind.TRAIT}:
+        valid_from = recorded_at
+    valid_until = proposal.valid_until or source_context.valid_until
+    spatial = proposal.spatial or source_context.spatial
+    return MemoryContext(
+        kind=proposal.kind,
+        basis=proposal.basis,
+        confidence=proposal.confidence,
+        valid_from=valid_from,
+        valid_until=valid_until,
+        recorded_at=recorded_at,
+        lineage_id=_formation_lineage_id(proposal, spatial=spatial),
+        source_id=source_context.source_id,
+        subject=proposal.subject,
+        predicate=proposal.predicate,
+        value=proposal.value,
+        evidence_ids=(source.id,),
+        model_id=model_id,
+        recipe=recipe,
+        spatial=spatial,
+        cue_modality=proposal.cue_modality,
+        valence=proposal.valence,
+        arousal=proposal.arousal,
+    )
+
+
+def _formation_lineage_id(
+    proposal: FormationProposal,
+    *,
+    spatial: object = None,
+) -> str:
+    frame_id = getattr(spatial, "frame_id", None)
+    anchor = getattr(getattr(spatial, "anchor", None), "value", None)
+    payload = json.dumps(
+        {
+            "kind": proposal.kind.value,
+            "subject": _semantic_text(proposal.subject),
+            "predicate": _semantic_text(proposal.predicate),
+            "frame_id": frame_id,
+            "anchor": anchor,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(f"mindbridge-lineage-v1:{payload}".encode()).hexdigest()
+
+
+def _formation_memory_id(
+    source_id: str,
+    proposal: FormationProposal,
+    *,
+    recipe: str,
+    context: MemoryContext,
+) -> str:
+    episode_source = (
+        source_id
+        if (
+            proposal.kind in {MemoryKind.EVENT, MemoryKind.AFFECT, MemoryKind.STATE}
+            or (
+                proposal.kind is MemoryKind.TRAIT and proposal.basis is EvidenceBasis.USER_STATEMENT
+            )
+        )
+        else None
+    )
+    spatial = context.spatial
+    payload = json.dumps(
+        {
+            "recipe": recipe,
+            "kind": proposal.kind.value,
+            "subject": _semantic_text(proposal.subject),
+            "predicate": _semantic_text(proposal.predicate),
+            "value": _semantic_text(proposal.value),
+            "assertion_basis": (
+                proposal.basis.value
+                if proposal.basis is not EvidenceBasis.MODEL_INFERENCE
+                else None
+            ),
+            "cue_modality": (
+                None if proposal.cue_modality is None else proposal.cue_modality.value
+            ),
+            "episode_source": episode_source,
+            "content": proposal.content if proposal.kind is MemoryKind.EVENT else None,
+            "valid_from": (
+                _datetime_text(context.valid_from)
+                if episode_source is not None and context.valid_from is not None
+                else None
+            ),
+            "valid_until": (
+                _datetime_text(context.valid_until)
+                if episode_source is not None and context.valid_until is not None
+                else None
+            ),
+            "spatial": (
+                None
+                if spatial is None
+                else {
+                    "frame_id": spatial.frame_id,
+                    "anchor": spatial.anchor.value,
+                    "position_m": (spatial.x, spatial.y, spatial.z),
+                    "orientation_xyzw": spatial.orientation_xyzw,
+                    "position_uncertainty_m": spatial.position_uncertainty_m,
+                }
+            ),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(f"mindbridge-formation-v1:{payload}".encode()).hexdigest()
+
+
+def _semantic_text(value: str | None) -> str | None:
+    return None if value is None else unicodedata.normalize("NFKC", value).casefold().strip()
 
 
 def _media_hint(name: str | None, media_type: str | None) -> tuple[Modality, str]:
@@ -3535,9 +4805,12 @@ def _fallback_unsupported(
     operation: str,
 ) -> frozenset[Modality]:
     unsupported = _prepared_modalities(prepared) - supported
-    fatal = set(unsupported - {Modality.AUDIO})
-    if Modality.AUDIO in unsupported and Modality.TEXT not in supported:
-        fatal.add(Modality.AUDIO)
+    fallback = {Modality.AUDIO}
+    if prepared.visual_description:
+        fallback.update((Modality.IMAGE, Modality.VIDEO))
+    fatal = set(unsupported - fallback)
+    if Modality.TEXT not in supported:
+        fatal.update(unsupported & fallback)
     if fatal:
         names = ", ".join(sorted(modality.value for modality in fatal))
         raise ModelError(
@@ -3553,6 +4826,73 @@ def _require_audio_transcription(capabilities: frozenset[Modality]) -> None:
             "audio fallback requires a transcription model with audio capability",
             reason="unsupported_modality",
         )
+
+
+def _with_stream_transcript(
+    prepared: _PreparedContent,
+    transcript: str,
+) -> _PreparedContent:
+    audio = tuple(asset for asset in prepared.assets if asset.modality == Modality.AUDIO.value)
+    if len(audio) != 1:
+        raise ValidationError("stream transcript requires exactly one audio asset")
+    text = _text(transcript, "stream transcript")
+    section = f"[transcript:{audio[0].asset_id}]\n{text}"
+    content = (
+        prepared.text
+        if section in prepared.text
+        else "\n\n".join(value for value in (prepared.text, section) if value)
+    )
+    if len(content) > _MAX_TEXT_CHARACTERS:
+        raise ValidationError(f"content text must not exceed {_MAX_TEXT_CHARACTERS} characters")
+    return replace(
+        prepared,
+        text=content,
+        canonical_parts=(*prepared.canonical_parts, ("audio_transcript", section)),
+        audio_transcript=True,
+    )
+
+
+def _with_stream_description(
+    prepared: _PreparedContent,
+    description: str,
+) -> _PreparedContent:
+    visual = tuple(
+        asset
+        for asset in prepared.assets
+        if asset.modality in {Modality.IMAGE.value, Modality.VIDEO.value}
+    )
+    if len(visual) != 1:
+        raise ValidationError("stream description requires exactly one visual asset")
+    text = _text(description, "stream description")
+    section = f"[visual description:{visual[0].asset_id}]\n{text}"
+    content = (
+        prepared.text
+        if section in prepared.text
+        else "\n\n".join(value for value in (prepared.text, section) if value)
+    )
+    if len(content) > _MAX_TEXT_CHARACTERS:
+        raise ValidationError(f"content text must not exceed {_MAX_TEXT_CHARACTERS} characters")
+    return replace(
+        prepared,
+        text=content,
+        canonical_parts=(*prepared.canonical_parts, ("visual_description", section)),
+        visual_description=True,
+    )
+
+
+def _has_stream_transcript(text: str, assets: Sequence[StoredAsset]) -> bool:
+    return any(
+        asset.modality == Modality.AUDIO.value and f"[transcript:{asset.asset_id}]\n" in text
+        for asset in assets
+    )
+
+
+def _has_stream_description(text: str, assets: Sequence[StoredAsset]) -> bool:
+    return any(
+        asset.modality in {Modality.IMAGE.value, Modality.VIDEO.value}
+        and f"[visual description:{asset.asset_id}]\n" in text
+        for asset in assets
+    )
 
 
 def _derived_text(text: str, assets: Sequence[StoredAsset]) -> str:
@@ -3763,6 +5103,35 @@ def _generation_contract(answerer: GenerationBackend | None) -> frozenset[Modali
     )
 
 
+def _vision_contract(
+    describer: VisionDescriptionBackend | None,
+) -> tuple[frozenset[Modality], str]:
+    if describer is None:
+        return frozenset(), "none"
+    capabilities = _modalities(describer.vision_capabilities, "vision")
+    if not capabilities or capabilities - {Modality.IMAGE, Modality.VIDEO}:
+        raise ValidationError("vision capabilities must contain image or video")
+    return (
+        capabilities,
+        _model_text(describer.vision_model, "vision model"),
+    )
+
+
+def _formation_contract(
+    former: FormationBackend | None,
+) -> tuple[frozenset[Modality], str, str]:
+    if former is None:
+        return frozenset(), "none", "none"
+    capabilities = _modalities(former.formation_capabilities, "formation")
+    if not capabilities:
+        raise ValidationError("formation capabilities must not be empty")
+    return (
+        capabilities,
+        _model_text(former.formation_model, "formation model"),
+        _model_text(former.formation_space, "formation space"),
+    )
+
+
 def _face_contract(
     analyzer: FaceBackend | None,
 ) -> tuple[frozenset[Modality], str, str, str]:
@@ -3952,6 +5321,12 @@ def _reference_at(value: datetime | None) -> datetime | None:
         return None
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValidationError("reference_at must include a timezone")
+    return value
+
+
+def _retrieval_scope(value: RetrievalScope | None) -> RetrievalScope | None:
+    if value is not None and not isinstance(value, RetrievalScope):
+        raise ValidationError("scope must be a RetrievalScope")
     return value
 
 

@@ -13,8 +13,9 @@ inference, but it cannot own or bypass those rules.
 ## Implemented composition
 
 The supported plugins are the narrow `EmbeddingBackend`, `GenerationBackend`,
-`TranscriptionBackend`, `SpeechBackend`, and `FaceBackend` protocols. The declarative entry point
-constructs bundled implementations without exposing those runtime details:
+`TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, and
+`FormationBackend` protocols. The declarative entry point constructs bundled implementations
+without exposing those runtime details:
 
 ```python
 from mindbridge import Memory
@@ -43,9 +44,28 @@ There is no mid-operation hot swap.
 ## Kernel and plugin boundary
 
 Current computation plugins own model and runtime details such as device, precision, batching,
-thresholds intrinsic to that model, or a caller-supplied remote SDK client. Potential OCR, emotion,
-visual-grounding, reranking, and semantic-extraction capabilities belong on this side only after a
-concrete implementation proves a narrow contract.
+thresholds intrinsic to that model, or a caller-supplied remote SDK client. Formation backends own
+only inference: they receive committed, resolved observations and return typed proposals. The
+kernel validates source modality and spatial binding, assigns deterministic identity, records
+evidence and bitemporal versions, resolves state conflicts, and commits the search outbox. Potential
+Calibrated affect perception, visual grounding, and reranking belong on the plugin side only after
+a concrete implementation proves a narrow contract. Caption, OCR, or detector fallback now uses
+the narrow `VisionDescriptionBackend`; the stream kernel still owns routing and durability.
+
+`OpenAIModels` implements `FormationBackend` with the configured generation model. It sends model
+content but not stable memory/CAS IDs or exact spatial values, and every proposal remains
+`model_inference`. A trusted custom former is injected explicitly:
+
+```python
+with Memory("./data", embedder=embedder, former=former) as memory:
+    source = memory.add(observation, context=observation_context)
+```
+
+The former cannot write storage or acknowledge formation. Derived memories, evidence links,
+embeddings, formation completion, and outbox work commit atomically in SQLite. Omitting `former`
+keeps ordinary add behavior and avoids every formation model call. A custom `formation_space` must
+identify its capability set as part of the recipe; unsupported observations are not marked complete
+and remain eligible after an adapter upgrade.
 
 SQLite, the media CAS, the durable outbox, and Zvec are not public plugins. They have one supported
 implementation, and abstracting them now would add indirection without a second product use case.
@@ -56,8 +76,13 @@ the product CLI remain thin transports over the application-composed `Memory`.
 
 `Memory.add_stream` is also not a plugin boundary. It repeats the existing durable `add` operation
 over caller-segmented observations. `AsyncOmniPrefetch` is a thin lifecycle helper over the same
-`AsyncMemory.search`; it neither performs perception nor owns a second execution plane. Capture,
-ASR partials, frame selection, and finality stay with the application.
+`AsyncMemory.search`. `AsyncCaptureStream` accepts complete `UPDATE` snapshots, exact `FINAL`
+observations, and `CANCEL` boundaries associated by `stream_id`. `AsyncAudioStream` is a thin
+canonical adapter over that reducer for PCM chunks, VAD state, complete ASR hypotheses, and acoustic
+boundaries. `AsyncVisionStream` applies the same pattern to encoded image frames, complete visual
+descriptions, and scene boundaries while retaining one bounded keyframe. Neither owns model
+execution or a second persistence plane; provider-specific packet decoding, device capture, pixel
+conversion, and other sensor protocols remain application adapters.
 
 ## Embodied integration boundary
 
@@ -66,14 +91,16 @@ and failure diagnosis without becoming a robot AgentOS. Planner, skill-runner, v
 edge/cloud routing, robot-control, benchmark harness, and model-training contracts remain outside
 the product boundary. Procedural memory is evidence and is never executed as code.
 
-New entity, relation, or spatial projections must remain additive to authoritative records and earn
-their complexity through MindBridge's own measured retrieval results. A paper's architecture or
-benchmark score is not by itself a reason to replace the flat durable representation.
+Typed entity, relation, temporal, and spatial semantics remain additive to authoritative raw
+records. A graph projection must earn its complexity through MindBridge's own measured retrieval
+results. A paper's architecture or benchmark score is not by itself a reason to add a graph
+database.
 
-Interaction memory uses the existing semantic, episodic, and procedural roles. Any
-emotion, trait, or response-policy inference stays outside the kernel or behind a future concrete
-typed analysis plugin. Derived records retain evidence provenance and use ordinary `Memory` writes;
-plugins may not write around durability or reinterpret metadata as routing, isolation, or trust.
+Interaction memory uses the existing semantic, episodic, and procedural roles. Affect, trait, and
+response-policy are typed `MemoryKind` values within those roles, not new stores or executable
+instructions. A former may propose them, while the kernel retains evidence provenance and enforces
+visibility and correction rules. Plugins may not write around durability or reinterpret metadata as
+routing, isolation, or trust.
 
 ## Trade-offs and revisit triggers
 

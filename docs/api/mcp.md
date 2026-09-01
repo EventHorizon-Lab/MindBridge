@@ -2,6 +2,9 @@
 
 The optional MCP adapter currently exposes six typed tools over one local `Memory` through stdio.
 It is a schema and dispatch surface over the SDK execution plane, not a separate memory service.
+It accepts finalized media through existing content parts. Live audio and vision packet ingestion,
+plus associated `StreamEvent` reduction, remain Python-only because MCP tool calls are finite
+requests.
 
 ## Install and run
 
@@ -59,11 +62,14 @@ Stores one stable text or multimodal record.
 | `occurred_end` | timezone-aware ISO 8601 datetime or null | no | null |
 | `metadata` | JSON object or null | no | null |
 | `memory_type` | `semantic`, `episodic`, or `procedural` | no | `semantic` |
+| `context` | typed observation context or null | no | null |
 
 The structured result contains `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`,
-`occurred_at`, `occurred_end`, and `metadata`. An event end requires a start and must be later than
-it. Asset results contain safe metadata but never a local path. Repeating canonical input returns
-the existing record. The tool is marked as a non-destructive, idempotent write.
+`occurred_at`, `occurred_end`, `metadata`, and optional typed `context`. An event end requires a
+start and must be later than it. Input context carries basis, source ID, confidence, validity, and
+optional spatial pose. Asset results contain safe metadata but never a local path. Repeating
+canonical input returns the existing record. The tool is marked as a non-destructive, idempotent
+write.
 
 Example arguments:
 
@@ -78,7 +84,12 @@ Example arguments:
     }
   ],
   "memory_type": "episodic",
-  "metadata": {"source": "review"}
+  "metadata": {"source": "review"},
+  "context": {
+    "basis": "observation",
+    "source_id": "camera-1:frame-42",
+    "confidence": 0.94
+  }
 }
 ```
 
@@ -94,6 +105,7 @@ Searches local memories.
 | `reference_at` | timezone-aware ISO 8601 datetime or null | no | current UTC |
 | `occurred_from` | timezone-aware ISO 8601 datetime or null | no | null |
 | `occurred_until` | timezone-aware ISO 8601 datetime or null | no | null |
+| `scope` | valid/known time and optional same-frame radius scope, or null | no | null |
 
 The result is `{"hits": [...]}`. Each hit contains memory fields plus `score`. The complete ordered
 query and bounded focused keys from its first text atom and media supply dense candidates; the
@@ -108,6 +120,10 @@ hard-filter overlapping event intervals using a half-open range. Either bound ma
 bound excludes memories without an event time, and two bounds require
 `occurred_until > occurred_from`.
 
+`scope.valid_at` selects world validity and `scope.known_at` selects the transaction version known
+then. `scope.near` and `scope.radius_m` must appear together; frame ID and observer/subject anchor
+must match stored spatial context. SQLite reapplies the filter after candidate retrieval.
+
 ### `ask_memory`
 
 Answers only from retrieved local memories.
@@ -118,6 +134,7 @@ Answers only from retrieved local memories.
 | `limit` | integer from 1 through 100 | no | 5 |
 | `memory_type` | one memory role or null | no | null |
 | `reference_at` | timezone-aware ISO 8601 datetime or null | no | current UTC |
+| `scope` | valid/known time and optional same-frame radius scope, or null | no | null |
 
 The result contains `answer`, the exact grounding `hits`, `abstained`, and
 `abstention_reason` (`no_evidence`, `insufficient_evidence`, or null). Like search, the tool is
@@ -250,7 +267,6 @@ The six current tools do not yet cover the complete SDK capability inventory:
 | --- | --- | --- | --- |
 | `add_many` | absent | `POST /v1/memories/batch` | Implementation gap |
 | `add_stream` | absent | absent | Python iterators are process-local; call `add_memory` per completed chunk |
-| `list` | absent | `GET /v1/memories` | Implementation gap; **MCP therefore cannot paginate the store** |
 | `search_with_trace` | absent | absent | Python/local-CLI retrieval diagnostics |
 | `speech` | absent | absent | Not implemented on any transport yet |
 | `faces` | absent | absent | Python-only visual identity analysis |
@@ -272,8 +288,9 @@ REST caps a whole request at 8 MiB instead. The Python API accepts up to 128 par
 
 ### Absent features
 
-There is no large-file upload tool, local-path input, logical scope, chunking option, per-asset
-vector control, or learned reranker option. The OpenAI adapter inlines at most 20 MiB per encoded
-media item and 64 MiB per embedding or generation call, roughly 15 MiB per file and 48 MiB in
-aggregate on disk; generation admits ranked evidence within those budgets. Answer text evidence is
-limited to 4 MiB. Use a provider-specific upload adapter for larger media.
+There is no large-file upload tool, local-path input, capture-stream tool, coordinate-frame
+transform, chunking option, per-asset vector control, or learned reranker option. The OpenAI adapter
+inlines at most 20 MiB per encoded media item and 64 MiB per embedding or generation call, roughly
+15 MiB per file and 48 MiB in aggregate on disk; generation admits ranked evidence within those
+budgets. Answer text evidence is limited to 4 MiB. Use a provider-specific upload adapter for larger
+media.

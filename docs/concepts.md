@@ -7,7 +7,8 @@ its public behavior.
 
 Python uses one `ContentInput` contract for `add`, `add_stream`, `search`, and `ask`: one `str`,
 `Path`, `Blob`, or `AssetRef`, or an ordered sequence of those atoms. `add_stream` also accepts a
-`StreamInput` wrapper when one item needs its own event time, metadata, or memory role.
+`StreamInput` wrapper when one item needs its own event time, metadata, memory role, or typed
+observation context.
 
 | Atom | Boundary |
 | --- | --- |
@@ -38,6 +39,7 @@ two or more media families are omni.
 | `occurred_at` | Optional timezone-aware event time |
 | `occurred_end` | Optional timezone-aware end of an interval; requires `occurred_at` and must be later than it |
 | `metadata` | Detached JSON application payload |
+| `context` | Optional authoritative kind, provenance, valid/transaction time, evidence, spatial, and affect semantics |
 
 An asset is immutable media stored by SHA-256. Its public descriptor contains ID, modality, MIME
 type, byte size, digest, and optional name. Python also receives the local resolved path so a model
@@ -55,14 +57,16 @@ known. `MemoryType.PROCEDURAL` stores reusable instructions, examples, and routi
 records are grounding evidence and are never executed by MindBridge.
 
 The role is explicit caller input, persisted in SQLite and Zvec, returned on records and hits, and
-available as a search filter. MindBridge does not run another model call to infer or rewrite it.
-See [memory types, temporal reasoning, and decay](memory-types-time-and-decay.md).
+available as a search filter. An explicitly configured `FormationBackend` may propose a finer
+`MemoryKind` after the source observation commits; it does not rewrite the caller's raw role. See
+[memory types, temporal reasoning, and decay](memory-types-time-and-decay.md).
 
 ## Stable identity and idempotency
 
-Before hashing, MindBridge canonicalizes text, ordered asset digests, memory role, event time, and
-JSON metadata. Equivalent logical input has the same memory ID. Repeating an add returns the
-existing record without storing the same bytes or embedding the record again.
+Before hashing, MindBridge canonicalizes text, ordered asset digests, memory role, event time, JSON
+metadata, and optional observation context. Equivalent logical input has the same memory ID.
+Repeating an add returns the existing record without storing the same bytes or embedding the record
+again.
 
 The asset store separately de-duplicates identical media bytes by SHA-256. Multiple memories can
 reference one immutable file. Deleting a memory removes a media file only after its final record
@@ -86,7 +90,9 @@ and provenance. The async facade consumes an `AsyncIterable` with the same behav
 Changing partial input has a different lifetime. `AsyncOmniPrefetch` coalesces complete current
 query snapshots over `AsyncMemory.search`, keeps at most one real search in flight, and never
 persists or reinforces speculative input. The application owns capture, segmentation, partial
-revision policy, and final boundaries. See
+revision policy, and final boundaries. `AsyncCaptureStream` accepts adapter-supplied `UPDATE`,
+`FINAL`, and `CANCEL` events, persists only exact final observations, and applies the same contract
+to audio, visual, and omni streams. See
 [omni streaming and interaction memory](omni-streaming-and-interaction-memory.md).
 
 ## Data directory
@@ -113,8 +119,9 @@ not see one another's memories, give them different directories and apply filesy
 
 SQLite and the content-addressed asset files are authoritative. SQLite stores records, memory
 roles, event/access times, asset descriptors and relationships, FP32 embeddings, the
-embedding/index recipe, and a durable outbox of index work. A successful SQLite commit survives
-even if Zvec cannot be updated immediately.
+embedding/index recipe, typed semantics, bitemporal versions, evidence links, formation recipes,
+and a durable outbox of index work. A successful SQLite commit survives even if Zvec cannot be
+updated immediately.
 
 Zvec is a rebuildable hybrid-search projection. Search gets ranked candidate IDs from Zvec and
 hydrates complete records from SQLite. An index ID that no longer exists in SQLite is discarded.
@@ -125,12 +132,13 @@ model endpoint for historical content.
 
 ## Capability-driven model routing
 
-A typical multimodal memory composition has four independent operations:
+A typical multimodal memory composition has five independent operations:
 
 - Local Jina v5 Omni embedding for stored memories and search queries.
 - Generation for grounded answers.
 - Local Fun-ASR-Nano transcription, FSMN-VAD diarization, and CAM++ speaker encoding.
 - Local YuNet face detection and SFace identity encoding through an optional `FaceBackend`.
+- Optional source-grounded semantic formation through a `FormationBackend`.
 
 Each operation declares the atomic modalities it accepts. MindBridge routes from capabilities,
 not model names:
@@ -138,22 +146,29 @@ not model names:
 1. Natively supported media remains in the model input.
 2. If embedding does not support audio, audio is transcribed and removed; its transcript is added
    to the text while supported image and video parts remain.
-3. A configured `TranscriptionBackend` transcribes every asset whose modality it declares during
+   `AsyncAudioStream` may supply that transcript from its latest external `ASRPartial`; otherwise
+   the configured transcription backend runs at finality.
+3. `AsyncVisionStream` sends frames directly to a native-image embedder. For a text-only embedder,
+   an explicit `VisionPartial` is attached as the final visual description and the image is removed
+   only from model input, not durable evidence. A configured `VisionDescriptionBackend` supplies
+   the description at finality when no partial exists. Missing every route is an error.
+4. A configured `TranscriptionBackend` transcribes every asset whose modality it declares during
    `add`, whatever the embedder accepts. The transcript joins the record text, so the memory gains
    lexical and text-vector keys in addition to the native media vector; the media itself is still
    stored, embedded, and returned as evidence.
-4. Grounded generation with a `SpeechBackend` resolves timed local speaker identities for supported
+5. Grounded generation with a `SpeechBackend` resolves timed local speaker identities for supported
    audio/video and includes them as structured evidence. Unsupported audio is removed after that
    analysis, while supported visual evidence remains.
-5. With `index_speech=True`, the same timed transcript, stable speaker IDs, and registered names
+6. With `index_speech=True`, the same timed transcript, stable speaker IDs, and registered names
    are persisted in the record before embedding so exact-name and dialogue queries can retrieve it.
    Registering or renaming an identity refreshes already indexed recordings atomically.
-6. `Memory.faces` resolves image/video faces. Grounded generation adds compact face identity
+7. `Memory.faces` resolves image/video faces. Grounded generation adds compact face identity
    evidence for retrieved visual memories without rewriting the immutable source record.
-7. If the remaining input is unsupported, the operation fails with `ModelError`.
+8. If the remaining input is unsupported, the operation fails with `ModelError`.
 
-An audio-only input therefore becomes transcript-only when fallback is required. A video or image
-is not silently discarded merely to reach a text model.
+An audio-only input therefore becomes transcript-only at the model boundary when fallback is
+required, while its PCM-derived WAV remains durable evidence. A video or image is not silently
+discarded merely to reach a text model.
 
 Stored embeddings belong to one adapter recipe, model, immutable revision, dimension, vector
 space, and index recipe. Local adapters derive `embedding_space` from those values. MindBridge

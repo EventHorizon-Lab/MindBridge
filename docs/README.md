@@ -13,6 +13,8 @@ MindBridge is an embedded multimodal memory library for text, image, video, audi
   retrieval, decay, research basis, and limits.
 - [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) — completed stream
   ingestion, speculative recall, evidence-backed interaction memory, and the graph evidence gate.
+- [Competitive memory-system review](competitive-memory-systems.md) — paper/source audit of ABot,
+  M3-Agent, VoiceMem, eMEM, MIRIX, Graphiti, Mem0, and TeleMem, plus the resulting gap roadmap.
 - [Configuration](configuration.md) — explicit composition, provider ownership, and durable model spaces.
 
 ## APIs

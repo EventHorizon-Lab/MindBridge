@@ -50,9 +50,15 @@ def test_base_import_does_not_load_optional_protocols() -> None:
 def test_full_modal_contract_is_exported_from_the_package_root() -> None:
     package = importlib.import_module("mindbridge")
     names = {
+        "ASRPartial",
+        "AcousticBoundary",
         "Blob",
         "AssetRef",
+        "AsyncAudioStream",
         "AsyncOmniPrefetch",
+        "AudioBoundary",
+        "AudioStreamPacket",
+        "AsyncVisionStream",
         "ContentAtom",
         "ContentInput",
         "IndexQuantization",
@@ -67,6 +73,7 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "RetrievalCandidateTrace",
         "RetrievalRejection",
         "RetrievalTrace",
+        "SceneBoundary",
         "TracedSearchResult",
         "EmbeddingBackend",
         "FaceBackend",
@@ -76,12 +83,19 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "ModelInput",
         "OpenAIModels",
         "OpenCVFaceAnalyzer",
+        "PCMChunk",
         "EmbedTask",
         "SentenceTransformersEmbedder",
         "SpeakerNotFoundError",
         "StreamInput",
         "StreamingGenerationBackend",
         "TranscriptionBackend",
+        "VADPacket",
+        "VisionBoundary",
+        "VisionDescriptionBackend",
+        "VisionFrame",
+        "VisionPartial",
+        "VisionStreamPacket",
         "resolve_memory_config",
     }
 

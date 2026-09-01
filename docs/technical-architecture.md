@@ -4,7 +4,7 @@
 
 ```text
 src/mindbridge/
-├── memory.py                    # public orchestration, streaming prefetch, and consistency
+├── memory.py                    # public orchestration, formation, streaming, and consistency
 ├── plugins.py                   # explicit capability and policy composition
 ├── types.py                     # stable values
 ├── exceptions.py                # stable failures
@@ -36,8 +36,9 @@ REST and MCP decode base64 data URLs into `Blob` values and map stored IDs to `A
 URLs and server filesystem paths are rejected. This keeps network fetch behavior out of the
 product and prevents protocol callers from selecting local files.
 
-Canonical input order, normalized text, content digests, metadata, event time, and memory type
-produce a stable memory ID. Identical media bytes share a CAS object.
+Canonical input order, normalized text, content digests, metadata, event time, memory type, and
+optional typed observation context produce a stable memory ID. Identical media bytes share a CAS
+object.
 
 ## Model routing
 
@@ -52,6 +53,9 @@ Each operation validates atomic modality sets from its adapter:
   adapter. A `TranscriptionBackend` therefore transcribes declared audio and video during `add`,
   and the derived text is stored beside the native media vector rather than replacing it.
 - `speech()` requires `SpeechBackend` because plain transcription has no timing or speaker data.
+- Formation routes on `formation_capabilities` after a source observation commits. Model proposals
+  are untrusted; the kernel validates source binding, assigns identity, and writes evidence and
+  versions.
 
 Jina application text is wrapped as a non-string text value before its remote model code receives
 it. This prevents path- or URL-shaped application text from being reclassified as media. Real
@@ -68,6 +72,8 @@ SQLite stores:
 - Normalized FP32 aggregate, atomic, and contextual text embeddings with parent memory, object
   part, model, space, task, and dimension.
 - Store metadata for embedding identity, transcription and configured face spaces, and index recipe.
+- Typed semantics, evidence confidence, spatial pose, bitemporal versions, supersession, and durable
+  per-source formation completion.
 - Ordered pending index operations.
 
 Foreign keys and transactions keep records, assets, embeddings, identity merges, aliases, and
@@ -138,7 +144,14 @@ The stream APIs add no queue or worker service. Synchronous and asynchronous ing
 completed observation only after the prior observation is durable. `AsyncOmniPrefetch` owns one
 event-loop task per turn, never runs more than one search concurrently, and coalesces only the
 not-yet-started snapshot. Closing it drains rather than cancels synchronous work already dispatched
-through `asyncio.to_thread`.
+through `asyncio.to_thread`. `AsyncCaptureStream` keeps one bounded helper per `stream_id`, so
+interleaved sources retain independent speculative state; partials never write and exact finals
+write once through `AsyncMemory.add`. `AsyncAudioStream` reduces canonical PCM, VAD, ASR-partial,
+and acoustic-boundary packets into the same lifecycle and uses the embedding capability contract
+to choose native audio or transcript routing. `AsyncVisionStream` keeps one latest encoded frame
+per associated scene and similarly chooses native image, explicit partial, or one final
+`VisionDescriptionBackend` call. Cancellation before final commit writes nothing; cancellation
+after the write starts waits for that commit and then propagates.
 
 ## Trust boundaries
 

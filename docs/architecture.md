@@ -8,6 +8,7 @@ Application
 ├── authentication / gateway / HTTP client
 └── Memory
     ├── memory semantics and modality routing
+    ├── optional typed formation and bitemporal evidence projection
     ├── retrieval and grounded-answer orchestration
     ├── SQLite + media CAS (authoritative)
     └── Zvec (derived projection)
@@ -51,7 +52,9 @@ already owns with `--url`. See [command-line usage](api/cli.md).
 MindBridge owns:
 
 - Canonical content and memory types.
-- Stable IDs, event time, metadata, and local face-and-voice identity.
+- Stable IDs, event time, typed validity/provenance, spatial context, and local face-and-voice
+  identity.
+- Formation validation, evidence independence, state supersession, and transaction-time history.
 - Capability-aware embedding, transcription fallback, retrieval, and grounding.
 - SQLite/CAS durability and the SQLite-to-Zvec outbox.
 - Validation and sanitization at Python, REST, and MCP boundaries.
@@ -72,6 +75,7 @@ MindBridge does not own:
 
 ```text
 Content ──> EmbeddingBackend ──> retrieval vector
+Committed observation ──> FormationBackend ──> typed source-grounded proposals
 Question + hits ──> GenerationBackend ──> grounded answer
 Audio/video ──> TranscriptionBackend ──> fallback text
 Audio/video ──> SpeechBackend ──> timed turns + speakers
@@ -83,6 +87,11 @@ embedding, speech, and face analysis can be composed independently. `Memory.from
 closed catalog of bundled adapters; direct construction accepts custom adapter objects. Both
 converge on `Memory.from_plugins` and the same execution plane. Provider names never reach the
 kernel, and there is no global runtime plugin registry.
+
+Formation does not make the model authoritative. The source observation commits first. The kernel
+validates proposals and then atomically writes derived records, evidence edges, bitemporal versions,
+embeddings, a durable formation-recipe marker, and index-outbox work. Model failure leaves the raw
+observation durable and retryable.
 
 ## Write consistency
 

@@ -26,7 +26,7 @@ from datetime import datetime
 from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
-from typing import TextIO, TypeAlias
+from typing import TextIO, TypeAlias, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -51,11 +51,17 @@ from mindbridge.types import (
     Blob,
     ContentAtom,
     ContentInput,
+    EvidenceBasis,
     FaceObservation,
+    MemoryContext,
     MemoryRecord,
     MemoryType,
     Modality,
+    ObservationContext,
+    RetrievalScope,
     SearchHit,
+    SpatialAnchor,
+    SpatialContext,
     SpeakerSegment,
     StreamInput,
 )
@@ -468,6 +474,7 @@ def _add(memory: Memory, arguments: argparse.Namespace) -> _Document:
             occurred_end=_optional_time(arguments.occurred_end, "occurred_end"),
             metadata=_metadata_value(_json_source(arguments.metadata)),
             memory_type=MemoryType(arguments.memory_type),
+            context=_observation_context(_json_source(arguments.context)),
         )
     )
 
@@ -487,6 +494,7 @@ def _add_many(memory: Memory, arguments: argparse.Namespace) -> _Document:
                 ],
                 metadata=[_metadata_value(item.get("metadata")) for item in items],
                 memory_type=MemoryType(arguments.memory_type),
+                context=[_observation_context(item.get("context")) for item in items],
             )
         ]
     }
@@ -501,6 +509,7 @@ def _add_stream(memory: Memory, arguments: argparse.Namespace) -> _Document:
             occurred_end=_optional_time(item.get("occurred_end"), "occurred_end"),
             metadata=_metadata_value(item.get("metadata")),
             memory_type=memory_type,
+            context=_observation_context(item.get("context")),
         )
         for item in _jsonl_stream(arguments.source)
     )
@@ -517,6 +526,7 @@ def _search(memory: Memory, arguments: argparse.Namespace) -> _Document:
         reference_at=_optional_time(arguments.reference_at, "reference_at"),
         occurred_from=_optional_time(arguments.occurred_from, "occurred_from"),
         occurred_until=_optional_time(arguments.occurred_until, "occurred_until"),
+        scope=_retrieval_scope(_json_source(arguments.scope)),
     )
     return {"hits": [_memory_document(hit) for hit in hits]}
 
@@ -529,6 +539,7 @@ def _search_with_trace(memory: Memory, arguments: argparse.Namespace) -> _Docume
         reference_at=_optional_time(arguments.reference_at, "reference_at"),
         occurred_from=_optional_time(arguments.occurred_from, "occurred_from"),
         occurred_until=_optional_time(arguments.occurred_until, "occurred_until"),
+        scope=_retrieval_scope(_json_source(arguments.scope)),
     )
     return {
         "hits": [_memory_document(hit) for hit in result.hits],
@@ -542,6 +553,7 @@ def _ask(memory: Memory, arguments: argparse.Namespace) -> _Document:
         limit=arguments.limit,
         memory_type=_optional_memory_type(arguments),
         reference_at=_optional_time(arguments.reference_at, "reference_at"),
+        scope=_retrieval_scope(_json_source(getattr(arguments, "scope", None))),
     )
     return {
         "answer": result.answer,
@@ -652,6 +664,11 @@ def _remote_add(arguments: argparse.Namespace) -> tuple[str, str, _Document | No
     _put(body, "occurred_at", _remote_time(arguments.occurred_at, "occurred_at"))
     _put(body, "occurred_end", _remote_time(arguments.occurred_end, "occurred_end"))
     _put(body, "metadata", _metadata_value(_json_source(arguments.metadata)))
+    _put(
+        body,
+        "context",
+        _observation_context_document(_observation_context(_json_source(arguments.context))),
+    )
     return "POST", "/v1/memories", body
 
 
@@ -668,6 +685,9 @@ def _remote_add_many(arguments: argparse.Namespace) -> tuple[str, str, _Document
     metadata = [_metadata_value(item.get("metadata")) for item in items]
     if any(value is not None for value in metadata):
         body["metadata"] = metadata
+    contexts = [_observation_context(item.get("context")) for item in items]
+    if any(value is not None for value in contexts):
+        body["context"] = [_observation_context_document(value) for value in contexts]
     return "POST", "/v1/memories/batch", body
 
 
@@ -686,6 +706,13 @@ def _remote_query(field: str, arguments: argparse.Namespace) -> _Document:
     if field == "query":
         _put(body, "occurred_from", _remote_time(arguments.occurred_from, "occurred_from"))
         _put(body, "occurred_until", _remote_time(arguments.occurred_until, "occurred_until"))
+    _put(
+        body,
+        "scope",
+        _retrieval_scope_document(
+            _retrieval_scope(_json_source(getattr(arguments, "scope", None)))
+        ),
+    )
     return body
 
 
@@ -969,7 +996,7 @@ def _jsonl_stream(source: str) -> Iterator[Mapping[str, object]]:
             raise ValidationError(f"line {number} is not valid JSON") from error
         if not isinstance(item, dict) or "content" not in item:
             raise ValidationError(f"line {number} must be an object with a content field")
-        _fields(item, {"content", "occurred_at", "occurred_end", "metadata"})
+        _fields(item, {"content", "occurred_at", "occurred_end", "metadata", "context"})
         found = True
         yield item
     if not found:
@@ -996,6 +1023,96 @@ def _metadata_value(value: object) -> Mapping[str, object] | None:
     if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
         raise ValidationError("metadata must be a JSON object with string keys")
     return value
+
+
+def _observation_context(value: object) -> ObservationContext | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValidationError("context must be a JSON object")
+    _fields(
+        value,
+        {"basis", "source_id", "confidence", "valid_from", "valid_until", "spatial"},
+    )
+    return ObservationContext(
+        basis=cast(EvidenceBasis, value.get("basis", EvidenceBasis.OBSERVATION)),
+        source_id=cast(str | None, value.get("source_id")),
+        confidence=cast(float, value.get("confidence", 1.0)),
+        valid_from=_optional_time(value.get("valid_from"), "context.valid_from"),
+        valid_until=_optional_time(value.get("valid_until"), "context.valid_until"),
+        spatial=_spatial_context(value.get("spatial")),
+    )
+
+
+def _retrieval_scope(value: object) -> RetrievalScope | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValidationError("scope must be a JSON object")
+    _fields(value, {"valid_at", "known_at", "near", "radius_m"})
+    return RetrievalScope(
+        valid_at=_optional_time(value.get("valid_at"), "scope.valid_at"),
+        known_at=_optional_time(value.get("known_at"), "scope.known_at"),
+        near=_spatial_context(value.get("near")),
+        radius_m=cast(float | None, value.get("radius_m")),
+    )
+
+
+def _spatial_context(value: object) -> SpatialContext | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValidationError("spatial context must be a JSON object")
+    _fields(
+        value,
+        {
+            "frame_id",
+            "anchor",
+            "x",
+            "y",
+            "z",
+            "orientation_xyzw",
+            "position_uncertainty_m",
+        },
+    )
+    orientation = value.get("orientation_xyzw")
+    if orientation is not None and not isinstance(orientation, list | tuple):
+        raise ValidationError("spatial orientation_xyzw must be an array")
+    return SpatialContext(
+        frame_id=cast(str, value.get("frame_id")),
+        anchor=cast(SpatialAnchor, value.get("anchor")),
+        x=cast(float, value.get("x")),
+        y=cast(float, value.get("y")),
+        z=cast(float, value.get("z", 0.0)),
+        orientation_xyzw=(
+            None if orientation is None else cast(tuple[float, float, float, float], orientation)
+        ),
+        position_uncertainty_m=cast(float | None, value.get("position_uncertainty_m")),
+    )
+
+
+def _observation_context_document(context: ObservationContext | None) -> _Document | None:
+    if context is None:
+        return None
+    return {
+        "basis": context.basis.value,
+        "source_id": context.source_id,
+        "confidence": context.confidence,
+        "valid_from": _encode_optional_time(context.valid_from),
+        "valid_until": _encode_optional_time(context.valid_until),
+        "spatial": _spatial_document(context.spatial),
+    }
+
+
+def _retrieval_scope_document(scope: RetrievalScope | None) -> _Document | None:
+    if scope is None:
+        return None
+    return {
+        "valid_at": _encode_optional_time(scope.valid_at),
+        "known_at": _encode_optional_time(scope.known_at),
+        "near": _spatial_document(scope.near),
+        "radius_m": scope.radius_m,
+    }
 
 
 def _json_source(value: str | None) -> object:
@@ -1081,10 +1198,55 @@ def _memory_document(record: MemoryRecord | SearchHit) -> _Document:
         "occurred_at": _encode_optional_time(record.occurred_at),
         "occurred_end": _encode_optional_time(record.occurred_end),
         "metadata": dict(record.metadata),
+        "context": _context_document(record.context),
     }
     if isinstance(record, SearchHit):
         document["score"] = record.score
     return document
+
+
+def _context_document(context: MemoryContext | None) -> _Document | None:
+    if context is None:
+        return None
+    return {
+        "kind": context.kind.value,
+        "basis": context.basis.value,
+        "confidence": context.confidence,
+        "valid_from": _encode_optional_time(context.valid_from),
+        "valid_until": _encode_optional_time(context.valid_until),
+        "recorded_at": _encode_time(context.recorded_at),
+        "visible": context.visible,
+        "retired_at": _encode_optional_time(context.retired_at),
+        "lineage_id": context.lineage_id,
+        "source_id": context.source_id,
+        "subject": context.subject,
+        "predicate": context.predicate,
+        "value": context.value,
+        "evidence_ids": list(context.evidence_ids),
+        "supersedes_id": context.supersedes_id,
+        "model_id": context.model_id,
+        "recipe": context.recipe,
+        "spatial": _spatial_document(context.spatial),
+        "cue_modality": None if context.cue_modality is None else context.cue_modality.value,
+        "valence": context.valence,
+        "arousal": context.arousal,
+    }
+
+
+def _spatial_document(spatial: SpatialContext | None) -> _Document | None:
+    if spatial is None:
+        return None
+    return {
+        "frame_id": spatial.frame_id,
+        "anchor": spatial.anchor.value,
+        "x": spatial.x,
+        "y": spatial.y,
+        "z": spatial.z,
+        "orientation_xyzw": (
+            None if spatial.orientation_xyzw is None else list(spatial.orientation_xyzw)
+        ),
+        "position_uncertainty_m": spatial.position_uncertainty_m,
+    }
 
 
 def _asset_document(asset: AssetRef) -> _Document:
@@ -1260,6 +1422,7 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     add.add_argument("--occurred-at", metavar="TIME", help="ISO 8601 event start")
     add.add_argument("--occurred-end", metavar="TIME", help="ISO 8601 event end")
     add.add_argument("--metadata", metavar="JSON", help="application metadata object, @PATH, or -")
+    add.add_argument("--context", metavar="JSON", help="typed observation context, @PATH, or -")
     _memory_type_option(add, "add")
     batch = commands.add_parser("add-many", help="store a JSONL batch in one transaction")
     batch.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
@@ -1278,6 +1441,7 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         )
         _memory_type_option(command, operation)
         command.add_argument("--reference-at", metavar="TIME", help="retrieval reference clock")
+        command.add_argument("--scope", metavar="JSON", help="temporal/spatial scope, @PATH, or -")
         if operation != "ask":
             command.add_argument("--occurred-from", metavar="TIME", help="event overlap start")
             command.add_argument("--occurred-until", metavar="TIME", help="event overlap end")

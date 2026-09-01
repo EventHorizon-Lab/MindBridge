@@ -11,9 +11,11 @@ from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import (
     EmbeddingBackend,
     FaceBackend,
+    FormationBackend,
     GenerationBackend,
     SpeechBackend,
     TranscriptionBackend,
+    VisionDescriptionBackend,
 )
 from mindbridge.types import IndexQuantization
 
@@ -29,7 +31,9 @@ class MemoryPlugins:
     embedder: EmbeddingBackend
     answerer: GenerationBackend | None = None
     transcriber: SpeechBackend | TranscriptionBackend | None = None
+    vision_describer: VisionDescriptionBackend | None = None
     face_analyzer: FaceBackend | None = None
+    former: FormationBackend | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.embedder, EmbeddingBackend):
@@ -43,8 +47,17 @@ class MemoryPlugins:
             raise ValidationError(
                 "plugins.transcriber must implement SpeechBackend or TranscriptionBackend"
             )
+        if self.vision_describer is not None and not isinstance(
+            self.vision_describer,
+            VisionDescriptionBackend,
+        ):
+            raise ValidationError(
+                "plugins.vision_describer must implement VisionDescriptionBackend"
+            )
         if self.face_analyzer is not None and not isinstance(self.face_analyzer, FaceBackend):
             raise ValidationError("plugins.face_analyzer must implement FaceBackend")
+        if self.former is not None and not isinstance(self.former, FormationBackend):
+            raise ValidationError("plugins.former must implement FormationBackend")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

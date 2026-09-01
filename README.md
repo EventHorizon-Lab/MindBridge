@@ -138,10 +138,11 @@ for record in memory.add_stream(
     handle(record)
 ```
 
-MindBridge does not open cameras or split a live feed; the application supplies bounded text,
-image, video, audio, or combined observations. `AsyncOmniPrefetch` coalesces changing multimodal
-query snapshots without persisting partial input. See the
-[omni streaming and interaction memory](docs/omni-streaming-and-interaction-memory.md).
+MindBridge does not open cameras or microphones. Applications may feed canonical audio packets to
+`AsyncAudioStream`, or immutable encoded `VisionFrame`, `VisionPartial`, and `SceneBoundary`
+values to `AsyncVisionStream`. `AsyncCaptureStream` associates interleaved `StreamEvent` values by
+`stream_id`, coalesces speculative retrieval independently, and returns the same ID on each exact
+final commit. See [omni streaming and interaction memory](docs/omni-streaming-and-interaction-memory.md).
 
 ## Model boundaries
 
@@ -151,7 +152,9 @@ MindBridge exposes narrow, operation-specific protocols:
 - `GenerationBackend` for grounded answers.
 - `TranscriptionBackend` for plain transcripts.
 - `SpeechBackend` for timed transcripts and local voice exemplars.
+- `VisionDescriptionBackend` for caption/OCR/detector text used by visual fallback.
 - `FaceBackend` for local face observations and identity exemplars.
+- `FormationBackend` for typed, source-grounded semantic proposals after observation commit.
 
 A single provider adapter may implement several protocols, but `Memory` does not require one fat
 backend. The declarative catalog constructs only bundled adapters; there is no global plugin
@@ -164,8 +167,8 @@ The built-in adapters are deliberately thin:
   `encode_document` methods.
 - `FunASRTranscriber` delegates model loading and execution to `funasr.AutoModel`.
 - `OpenCVFaceAnalyzer` delegates explicit local YuNet and SFace models to OpenCV.
-- `OpenAIModels` uses caller-owned official OpenAI SDK clients for embeddings, generation, and
-  completed-file transcription.
+- `OpenAIModels` uses caller-owned official OpenAI SDK clients for embeddings, generation, typed
+  formation, and completed-file transcription.
 
 ## Storage and consistency
 

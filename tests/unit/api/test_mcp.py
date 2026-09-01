@@ -31,7 +31,9 @@ from mindbridge.types import (
     MemoryRecord,
     MemoryType,
     Modality,
+    ObservationContext,
     Page,
+    RetrievalScope,
     SearchHit,
 )
 
@@ -73,6 +75,7 @@ class FakeMemory:
         occurred_end: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: ObservationContext | None = None,
     ) -> MemoryRecord:
         self._fail()
         copied_metadata = dict(metadata or {})
@@ -96,6 +99,7 @@ class FakeMemory:
         reference_at: datetime | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> tuple[SearchHit, ...]:
         self._fail()
         self.calls.append(
@@ -118,6 +122,7 @@ class FakeMemory:
         limit: int = 5,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> AnswerResult:
         self._fail()
         self.calls.append(("ask", question, limit, memory_type, reference_at))
@@ -161,7 +166,14 @@ async def test_mcp_publishes_only_the_six_flat_local_tools() -> None:
         "delete_memory",
     }
     assert {name: set(tool.input_schema["properties"]) for name, tool in tools.items()} == {
-        "add_memory": {"content", "occurred_at", "occurred_end", "metadata", "memory_type"},
+        "add_memory": {
+            "content",
+            "occurred_at",
+            "occurred_end",
+            "metadata",
+            "memory_type",
+            "context",
+        },
         "search_memories": {
             "query",
             "limit",
@@ -169,8 +181,9 @@ async def test_mcp_publishes_only_the_six_flat_local_tools() -> None:
             "reference_at",
             "occurred_from",
             "occurred_until",
+            "scope",
         },
-        "ask_memory": {"question", "limit", "memory_type", "reference_at"},
+        "ask_memory": {"question", "limit", "memory_type", "reference_at", "scope"},
         "get_memory": {"memory_id"},
         "list_memories": {"limit", "cursor"},
         "delete_memory": {"memory_id"},
@@ -236,6 +249,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
         "occurred_at": NOW.isoformat().replace("+00:00", "Z"),
         "occurred_end": None,
         "metadata": {"room": "workshop"},
+        "context": None,
     }
     assert searched.structured_content is not None
     assert searched.structured_content["hits"][0]["score"] == 0.9

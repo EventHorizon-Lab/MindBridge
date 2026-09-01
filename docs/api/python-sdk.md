@@ -47,7 +47,9 @@ Memory(
     embedder: EmbeddingBackend,
     answerer: GenerationBackend | None = None,
     transcriber: SpeechBackend | TranscriptionBackend | None = None,
+    vision_describer: VisionDescriptionBackend | None = None,
     face_analyzer: FaceBackend | None = None,
+    former: FormationBackend | None = None,
     index_speech: bool = False,
     index_quantization: IndexQuantization = IndexQuantization.NONE,
     minimum_relevance: float = 0.55,
@@ -64,6 +66,11 @@ Memory(
 `embedder` is required. `Memory` validates adapter capabilities and durable space identity before
 opening Zvec. It closes supplied adapters when the memory closes; provider clients owned by an
 adapter may remain caller-owned, as documented by that adapter.
+
+`former` and `vision_describer` are optional and available through direct construction or
+`MemoryPlugins`. The declarative catalog does not enable either implicitly. This keeps automatic
+writes and visual model calls observable: applications must deliberately pass the corresponding
+protocol object.
 
 Bundled adapters can be selected without constructing runtime objects:
 
@@ -140,6 +147,7 @@ record = memory.add(
     occurred_end=None,
     metadata=None,
     memory_type=MemoryType.SEMANTIC,
+    context=None,
 )
 records = memory.add_many(
     contents,
@@ -147,20 +155,24 @@ records = memory.add_many(
     occurred_end=(first_end, second_end),
     metadata=({"source_id": "first"}, {"source_id": "second"}),
     memory_type=MemoryType.SEMANTIC,
+    context=(first_context, second_context),
 )
 ```
 
 Event times must be timezone-aware. `occurred_end`, when present, requires `occurred_at` and must be
-later than it. Metadata must be a JSON-compatible mapping with non-empty string keys. For
-`add_many`, the optional event-time and metadata sequences must contain one value per content; this
-preserves per-record provenance without losing batched model/storage work. Duplicate inputs return
-the same stable record in their original positions.
+later than it. Metadata must be a JSON-compatible mapping with non-empty string keys. `context` is
+an optional `ObservationContext` with typed basis, source ID, confidence, validity, and spatial
+pose. For `add_many`, the optional event-time, metadata, and context sequences must contain one
+value per content; this preserves per-record provenance without losing batched model/storage work.
+Duplicate inputs return the same stable record in their original positions. When a
+`FormationBackend` is configured, a context-free add is normalized to an observed source before
+formation.
 
 ### Stream input
 
 `add_stream` consumes an iterable lazily and commits each completed item before requesting the
 next. A plain `ContentInput` uses the same defaults as `add`; wrap an item in `StreamInput` when a
-clip needs its own event time, metadata, or memory role:
+clip needs its own event time, metadata, memory role, or observation context:
 
 ```python
 from datetime import datetime, timedelta, timezone
@@ -205,12 +217,14 @@ hits = memory.search(
     reference_at=None,
     occurred_from=None,
     occurred_until=None,
+    scope=None,
 )
 result = memory.ask(
     question,
     limit=5,
     memory_type=None,
     reference_at=None,
+    scope=None,
 )
 ```
 
@@ -229,6 +243,11 @@ interval; an instant event has a one-microsecond extent. Either bound may be omi
 bound excludes memories without `occurred_at`, and two bounds require
 `occurred_until > occurred_from`. These filters are independent of the soft temporal preference
 inferred from query text.
+
+`scope` is an optional `RetrievalScope`. `valid_at` selects the typed assertion valid in world time;
+`known_at` selects the transaction version known then. `near` plus `radius_m` performs exact
+same-frame, same-anchor metric filtering with positional uncertainty. Scope filtering is
+authoritatively rechecked in SQLite and applies equally to `search`, `search_with_trace`, and `ask`.
 
 Composite records are indexed with an aggregate vector and de-duplicated vectors for each text or
 media atom. Text longer than 2,048 characters also receives overlapping contextual retrieval keys;
@@ -385,10 +404,125 @@ snapshots accept immutable text, `Blob`, and `AssetRef` values, but reject mutab
 `close()` abandons queued work and drains the already-running search without attempting ineffective
 thread cancellation. The helper never persists input or reinforces hits.
 
+### Async capture stream
+
+`AsyncCaptureStream` accepts modality-neutral `StreamEvent` values. `UPDATE` carries a complete
+immutable snapshot for speculative recall; `FINAL` carries the exact durable `ContentInput` or
+`StreamInput`; `CANCEL` and EOF write nothing. `stream_id` defaults to `"default"`; interleaved IDs
+own independent prefetch state, and every `StreamCommit` returns the ID it completed.
+
+```python
+from mindbridge import AsyncCaptureStream, StreamEvent, StreamPhase
+
+
+async def events():
+    yield StreamEvent(StreamPhase.UPDATE, "partial left", stream_id="microphone-left")
+    yield StreamEvent(StreamPhase.UPDATE, "partial right", stream_id="microphone-right")
+    yield StreamEvent(StreamPhase.FINAL, "final left", stream_id="microphone-left")
+    yield StreamEvent(StreamPhase.FINAL, "final right", stream_id="microphone-right")
+
+
+capture = AsyncCaptureStream(memory, limit=8)
+async for commit in capture.consume(events()):
+    print(commit.stream_id, commit.record.id, commit.prefetch, commit.retrieval_error)
+```
+
+`max_streams` defaults to 32 and bounds active associated prefetches. One `StreamCommit` is yielded
+per final observation. A retrieval failure is visible in
+`retrieval_error` while the final record remains durable. Consumer cancellation before the final
+commit starts writes nothing. Once exact-final retrieval has completed and the write starts,
+`FINAL` is an irrevocable commit point: cancellation waits for that write, then propagates. Retrying
+the same final content is idempotent.
+
+### Native audio stream
+
+`AsyncAudioStream` accepts canonical, provider-neutral audio packets directly. PCM is immutable,
+interleaved, and WAV-compatible; its sample rate, channel count, and one-to-four-byte sample width
+must remain constant until a boundary.
+
+```python
+from mindbridge import (
+    ASRPartial,
+    AcousticBoundary,
+    AsyncAudioStream,
+    AudioBoundary,
+    PCMChunk,
+    VADPacket,
+)
+
+
+async def packets():
+    yield AcousticBoundary(AudioBoundary.START, stream_id="headset")
+    yield VADPacket(True, stream_id="headset")
+    yield PCMChunk(pcm_chunk_1, sample_rate_hz=16_000, stream_id="headset")
+    yield ASRPartial("find the red", stream_id="headset")
+    yield PCMChunk(pcm_chunk_2, sample_rate_hz=16_000, stream_id="headset")
+    yield ASRPartial("find the red toolbox", stream_id="headset")
+    yield AcousticBoundary(AudioBoundary.END, stream_id="headset")
+
+
+audio = AsyncAudioStream(memory, limit=8)
+async for commit in audio.consume(packets()):
+    print(commit.stream_id, commit.record.id)
+```
+
+PCM chunks accumulate per `stream_id` and become one durable WAV asset at `AudioBoundary.END` or
+when `VADPacket(active=False)` arrives. `CANCEL` and unfinished EOF write nothing. With native audio
+embedding, changing WAV snapshots drive prefetch directly. With a text-only embedder, ASR partials
+drive text prefetch; their final hypothesis is recorded as the audio transcript and routes the
+durable PCM through text embedding. Without an external ASR hypothesis, the configured
+`TranscriptionBackend` or `SpeechBackend` supplies the final fallback. Missing both routes raises
+`ModelError` instead of dropping audio.
+
+`StreamInput(..., transcript="...")` exposes the same finalized external-ASR path for exactly one
+audio asset. Provider-specific ASR deltas and microphone byte formats remain adapter concerns;
+adapters emit complete current hypotheses and canonical PCM values.
+
+### Native vision stream
+
+`AsyncVisionStream` accepts immutable encoded image frames, complete current visual descriptions,
+and explicit scene boundaries. Every packet carries the `stream_id` used by the shared capture
+reducer.
+
+```python
+from mindbridge import (
+    AsyncVisionStream,
+    Blob,
+    SceneBoundary,
+    VisionBoundary,
+    VisionFrame,
+    VisionPartial,
+)
+
+
+async def packets():
+    yield VisionFrame(Blob(first_jpeg, "image/jpeg"), stream_id="camera-left")
+    yield VisionPartial("a red toolbox", stream_id="camera-left")
+    yield VisionFrame(Blob(latest_jpeg, "image/jpeg"), stream_id="camera-left")
+    yield SceneBoundary(VisionBoundary.END, stream_id="camera-left")
+
+
+vision = AsyncVisionStream(memory, limit=8)
+async for commit in vision.consume(packets()):
+    print(commit.stream_id, commit.record.id)
+```
+
+The latest frame is the scene's durable keyframe; newer frame updates replace queued speculative
+work instead of accumulating an unbounded clip. A native-image embedder receives the frame. A
+text-only embedder receives `VisionPartial.text`, which is bound to the final keyframe through
+`StreamInput.description`. If no partial exists, a configured `VisionDescriptionBackend` runs once
+at finality. Without any of those routes, finalization raises `ModelError` rather than silently
+dropping visual evidence. `START`, `END`, `CANCEL`, EOF, and `max_streams` follow the audio and
+generic capture semantics.
+
+`VisionFrame` deliberately accepts an encoded image `Blob`, not RGB/YUV buffers or camera SDK
+objects. Device adapters own pixel conversion and emit canonical immutable frames.
+
 ## Return values
 
-- `MemoryRecord`: stable ID, derived text, modality, memory type, assets, timestamps, metadata.
-- `SearchHit`: the same visible memory fields plus a normalized score.
+- `MemoryRecord`: stable ID, derived text, modality, memory type, assets, timestamps, metadata, and
+  optional authoritative `MemoryContext`.
+- `SearchHit`: the same visible memory fields plus a normalized score and typed context.
 - `TracedSearchResult`: search hits plus an immutable `RetrievalTrace` of
   `RetrievalCandidateTrace` values and stable `RetrievalRejection` reasons.
 - `AnswerResult`: grounded answer text, accepted hits, `abstained`, and a machine-readable
@@ -396,7 +530,18 @@ thread cancellation. The helper never persists input or reinforces hits.
 - `Page`: records and an optional next cursor.
 - `PrefetchResult`: a positive submission revision and immutable search hits.
 - `SpeakerSegment`: one timed speech segment and local identity fields.
-- `StreamInput`: one completed `ContentInput` with per-item time, metadata, and memory type.
+- `ObservationContext`: typed source basis, confidence, validity, and optional `SpatialContext`.
+- `MemoryContext`: stored kind, basis, confidence, valid/transaction time, lineage, evidence,
+  supersession, model recipe, spatial pose, and affect fields.
+- `RetrievalScope`: optional valid time, known time, and same-frame radius constraint.
+- `StreamInput`: one completed `ContentInput` with per-item time, metadata, memory type, context,
+  an optional finalized transcript for one audio asset, and an optional description for one visual
+  asset.
+- `PCMChunk` / `VADPacket` / `ASRPartial` / `AcousticBoundary`: canonical live-audio protocol
+  values consumed by `AsyncAudioStream`.
+- `VisionFrame` / `VisionPartial` / `SceneBoundary`: canonical live-vision protocol values consumed
+  by `AsyncVisionStream`.
+- `StreamEvent` / `StreamCommit`: associated capture lifecycle input and exact-final durable output.
 
 All are frozen, slotted dataclasses. Mappings are detached from caller input.
 
@@ -419,6 +564,27 @@ class EmbeddingBackend(Protocol):
 
     def close(self) -> None: ...
 ```
+
+```python
+class FormationBackend(Protocol):
+    formation_capabilities: frozenset[Modality]
+    formation_model: str
+    formation_space: str
+
+    def form(
+        self,
+        inputs: Sequence[FormationInput],
+    ) -> tuple[tuple[FormationProposal, ...], ...]: ...
+
+    def close(self) -> None: ...
+```
+
+A former receives only committed observations and proposes source-aligned typed memories. It never
+writes storage. MindBridge validates the complete batch, assigns identity, links evidence, maintains
+bitemporal state, and commits derived records atomically. `formation_space` identifies the complete
+durable recipe, including supported modalities, so retries and capability changes cannot be
+confused. Sources outside the current capabilities remain unacknowledged and can be formed after
+reopening with an upgraded adapter.
 
 ```python
 class GenerationBackend(Protocol):
@@ -448,6 +614,21 @@ class TranscriptionBackend(Protocol):
 
     def close(self) -> None: ...
 ```
+
+```python
+class VisionDescriptionBackend(Protocol):
+    vision_capabilities: frozenset[Modality]
+    vision_model: str
+
+    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]: ...
+
+    def close(self) -> None: ...
+```
+
+`describe()` returns one non-empty current description per resolved image input, in order. The
+description may combine caption, OCR, and detector output; MindBridge treats it as explicit text
+fallback and retains the original frame as durable evidence. The backend may run concurrently with
+other model calls and is closed with `Memory`.
 
 `SpeechBackend` has the same transcription identity properties as `TranscriptionBackend` and adds
 `analyze()`:
@@ -613,6 +794,11 @@ decoding, or media budget keeps the existing provider-rejection fallback.
 `Memory.ask()` selects it automatically to measure first chunk, first token, total generation
 latency, and provider-reported token usage. `answer()` remains the synchronous non-streaming method
 required by `GenerationBackend`.
+
+`OpenAIModels` also implements `FormationBackend`. `form()` sends one batched strict-JSON generation
+request and returns typed proposals. Stable source/CAS IDs and exact spatial values are not sent to
+the provider, and the adapter cannot elevate model output to observation or user-statement basis.
+Generation model and decoding controls form its default durable `formation_space`.
 
 ## Exceptions
 

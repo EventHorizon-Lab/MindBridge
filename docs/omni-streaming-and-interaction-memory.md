@@ -1,44 +1,38 @@
 # Omni streaming, speculative recall, and interaction memory
 
-MindBridge separates three lifecycles that a continuous embodied agent must not confuse:
+MindBridge separates four lifecycles that a continuous embodied agent must not confuse:
 
-1. A changing **working snapshot** used only for speculative search.
-2. A completed **observation** that is safe to store durably.
-3. Derived **interaction memory** whose evidence and cognitive role remain explicit.
+1. A changing working snapshot used only for speculative search.
+2. A final observation that is safe to store durably.
+3. A typed interpretation formed from that committed source.
+4. A long-horizon trait or response policy supported by independent evidence.
 
-This separation applies equally to text, image, video, audio, and combined omni input. MindBridge
-does not own cameras, microphones, stream containers, ASR partials, frame selection, or turn
-detection. Applications normalize those sources into the existing `ContentInput` contract.
+The same boundary applies to text, image, video, audio, and combined omni input. MindBridge does not
+own cameras, microphones, stream containers, VAD implementations, provider-specific ASR packets,
+or pixel conversion. It owns canonical audio packets and immutable encoded-frame, visual-partial,
+and scene-boundary values; capture adapters normalize hardware and provider payloads into those
+values or immutable `ContentInput` snapshots.
 
-## Streaming design decisions
+## Completed observations
 
-Speculative recall searches a changing observation before the turn boundary, then consumes the
-prefetched result when the turn ends. The query snapshot uses `ContentInput`, so text, images,
-video, audio, and their ordered combinations follow one path. One search remains in flight while
-queued snapshots coalesce, and the result returned by `finalize` must match the exact final
-snapshot. Cancelling an `asyncio.to_thread` task cannot cancel its synchronous work, and silently
-reusing a result that omits the final input can retrieve the wrong memory.
+`Memory.add_stream` consumes already completed observations lazily. Each item follows ordinary
+`add`, and is durable and searchable before the next item is requested. The stream is not one
+transaction: a later failure leaves the committed prefix intact.
 
-Interaction memory separately records affective episodes, supported traits, and learned response
-experiences. MindBridge maps those roles onto the existing episodic, semantic, and procedural
-memory types instead of adding another store. Emotion and trait inference do not belong in the
-kernel: perception quality, privacy, model cost, and supported modalities belong to an explicitly
-selected application or analysis plugin, while MindBridge keeps the resulting claim, confidence,
-time, and source evidence durable and searchable.
-
-## Completed omni observations
-
-`Memory.add_stream` consumes completed observations lazily. Each item follows the ordinary `add`
-path and is durable and searchable before the next item is requested. The stream is therefore not
-one transaction: a later failure leaves the committed prefix intact.
-
-Use `StreamInput` when an item needs its own event time, metadata, or memory type. Its `content` is
-the same ordered multimodal union accepted by `add`:
+Use `StreamInput` when an item needs its own time, metadata, role, or typed observation context:
 
 ```python
 from datetime import datetime, timedelta, timezone
 
-from mindbridge import Blob, MemoryType, StreamInput
+from mindbridge import (
+    Blob,
+    EvidenceBasis,
+    MemoryType,
+    ObservationContext,
+    SpatialAnchor,
+    SpatialContext,
+    StreamInput,
+)
 
 observed_at = datetime(2026, 8, 31, 9, tzinfo=timezone.utc)
 observation = StreamInput(
@@ -49,192 +43,282 @@ observation = StreamInput(
     ),
     occurred_at=observed_at,
     occurred_end=observed_at + timedelta(seconds=2),
-    metadata={"source": "companion_robot", "sequence": 17},
+    metadata={"sequence": 17},
     memory_type=MemoryType.EPISODIC,
+    context=ObservationContext(
+        basis=EvidenceBasis.OBSERVATION,
+        source_id="companion-camera-1:17",
+        confidence=0.92,
+        spatial=SpatialContext(
+            frame_id="home/map",
+            anchor=SpatialAnchor.OBSERVER,
+            x=1.4,
+            y=2.1,
+            position_uncertainty_m=0.08,
+        ),
+    ),
 )
 
 for record in memory.add_stream((observation,)):
-    print(record.id)
+    print(record.id, record.context)
 ```
 
-An async owner consumes an `AsyncIterable` with `async for`. Both forms preserve backpressure and
+An async owner consumes an `AsyncIterable` with `async for`. Both paths preserve backpressure and
 use the same SQLite, outbox, and Zvec consistency path as `add`. Mutable ASR hypotheses, incomplete
-container fragments, and repeatedly overwritten frame paths are not completed observations and
-must not be passed to `add_stream`.
+container fragments, and overwritten frame paths are not completed observations and must not be
+passed to `add_stream`.
 
-The CLI `add-stream` command provides the same per-line commit behavior for finite JSONL imports.
-It still emits one JSON document per invocation, so it collects result records until EOF. Use the
-Python iterator for an unbounded source.
+The CLI `add-stream` command provides per-line commit behavior for finite JSONL imports. It emits one
+JSON document at EOF, so Python remains the unbounded-source interface.
 
 ## Speculative omni recall
 
 `AsyncOmniPrefetch` hides retrieval latency inside an ongoing turn without persisting partial
-input. Every submission is the complete current snapshot, not a delta. A snapshot may combine any
-modalities the configured embedder supports. Use immutable text, `Blob`, or stored `AssetRef`
-values; raw `Path` values are rejected because their contents can change after submission:
+input. Every submission is the complete current snapshot, not a delta:
 
 ```python
 from mindbridge import AsyncOmniPrefetch
 
 prefetch = AsyncOmniPrefetch(memory, limit=8)
-
 prefetch.submit((partial_text, latest_frame, current_audio_window))
 prefetch.submit((newer_text, latest_frame, current_audio_window))
-
 result = await prefetch.finalize((final_text, final_frame, final_audio_window))
-hits = result.hits
 ```
 
-Only one actual search runs at a time. While it runs, newer submissions replace the queued
-snapshot, so intermediate revisions do not create a thread storm. `latest` exposes the newest
-completed `PrefetchResult` and its revision without waiting. `finalize` reuses the result only when
-the final snapshot is exactly the most recently submitted value and that revision did not fail.
-Otherwise it searches the final snapshot before returning. It then closes that per-turn prefetcher.
+Only one search runs at a time. A newer queued snapshot replaces the older queued snapshot, so
+partials do not create a thread storm. `latest` exposes the newest completed `PrefetchResult`
+without waiting. `finalize` reuses a result only when its revision represents the exact final
+snapshot; otherwise it searches the final value before returning.
 
-If a turn is abandoned, `await prefetch.close()` drops the queued snapshot and drains the search
-already in progress. It deliberately does not cancel `asyncio.to_thread` work, because cancelling
-the task cannot stop its underlying synchronous model or index call.
+Snapshots accept immutable text, `Blob`, and resolved `AssetRef` values. Mutable `Path` values are
+rejected for `UPDATE` because their bytes could change after submission. `close()` abandons queued
+work and drains one already-running synchronous search. Search does not reinforce hits.
 
-Search does not reinforce results. Call `reinforce` only after the application observes that the
-agent actually used a memory and received positive feedback. Applications with a hard response
-deadline may read `latest` and choose their own fallback, but a stale revision must remain visible
-rather than being presented as the final query's result.
+## Capture-event reducer
+
+`AsyncCaptureStream` provides the common lifecycle missing from raw `add_stream`. Every
+`StreamEvent` has a `stream_id` (`"default"` when omitted), so events from microphones, cameras, or
+sessions may be interleaved without sharing speculative state. The same ID is returned on the
+resulting `StreamCommit`.
+
+| Phase | Association | Payload | Retrieval | Durable write |
+| --- | --- | --- | --- | --- |
+| `UPDATE` | One `stream_id` | Complete current `ContentInput` snapshot | Speculative and coalesced | Never |
+| `FINAL` | One `stream_id` | Exact final `ContentInput` or `StreamInput` | Exact-final confirmation | Once |
+| `CANCEL` | One `stream_id` | No payload | Only that stream is discarded/drained | Never |
+| EOF before `FINAL` | All open IDs | — | Pending work is discarded/drained | Never |
+
+```python
+from mindbridge import AsyncCaptureStream, StreamEvent, StreamPhase
+
+
+async def camera_events():
+    yield StreamEvent(StreamPhase.UPDATE, left_frame, stream_id="camera-left")
+    yield StreamEvent(StreamPhase.UPDATE, right_frame, stream_id="camera-right")
+    yield StreamEvent(StreamPhase.FINAL, left_clip, stream_id="camera-left")
+    yield StreamEvent(StreamPhase.FINAL, right_clip, stream_id="camera-right")
+
+
+capture = AsyncCaptureStream(memory, limit=8)
+async for commit in capture.consume(camera_events()):
+    print(commit.stream_id, commit.record.id, commit.prefetch, commit.retrieval_error)
+```
+
+`max_streams` defaults to 32 and bounds the number of active prefetch workers. One worker runs at a
+time per ID; different IDs may search concurrently. A final or cancel boundary frees that ID.
+
+## Native audio protocol
+
+`AsyncAudioStream` is the canonical speech-capture adapter. It accepts four immutable values:
+
+- `PCMChunk`: interleaved WAV-compatible linear PCM plus sample rate, channels, sample width,
+  timestamp, and `stream_id`;
+- `VADPacket`: the complete current voice-active state;
+- `ASRPartial`: the complete current ASR hypothesis, not a provider delta;
+- `AcousticBoundary`: explicit `START`, `END`, or `CANCEL` finality.
+
+```python
+from mindbridge import (
+    ASRPartial,
+    AcousticBoundary,
+    AsyncAudioStream,
+    AudioBoundary,
+    PCMChunk,
+    VADPacket,
+)
+
+
+async def audio_packets():
+    yield VADPacket(True, stream_id="headset")
+    yield PCMChunk(first_pcm, sample_rate_hz=16_000, stream_id="headset")
+    yield ASRPartial("where is the red", stream_id="headset")
+    yield PCMChunk(second_pcm, sample_rate_hz=16_000, stream_id="headset")
+    yield ASRPartial("where is the red toolbox", stream_id="headset")
+    yield AcousticBoundary(AudioBoundary.END, stream_id="headset")
+
+
+audio = AsyncAudioStream(memory, limit=8)
+async for commit in audio.consume(audio_packets()):
+    print(commit.stream_id, commit.record.id)
+```
+
+PCM accumulates independently per ID and is wrapped in a standard WAV container. A native-audio
+embedding backend receives changing audio snapshots directly. A text-only backend receives ASR
+partials for speculative retrieval; the final hypothesis is bound to the WAV through
+`StreamInput.transcript`, remains in the durable record, and drives text embedding. If no external
+ASR hypothesis exists, the configured transcription backend remains the fallback. If neither route
+exists, the operation fails before dropping audio.
+
+`VADPacket(active=False)` and `AudioBoundary.END` finalize; `CANCEL` and incomplete EOF never write.
+PCM format changes inside a segment and buffers beyond the local asset limit fail validation.
+Microphone APIs and provider-specific VAD or ASR payloads remain thin adapter work: normalize them
+to these four values rather than teaching the memory kernel vendor packet schemas.
+
+## Native vision protocol
+
+`AsyncVisionStream` is the canonical live-frame adapter. It accepts three immutable values:
+
+- `VisionFrame`: one encoded image `Blob` plus timestamp and `stream_id`;
+- `VisionPartial`: the complete current caption, OCR, or detector description, not a provider
+  delta;
+- `SceneBoundary`: explicit `START`, `END`, or `CANCEL` finality.
+
+```python
+from mindbridge import (
+    AsyncVisionStream,
+    Blob,
+    SceneBoundary,
+    VisionBoundary,
+    VisionFrame,
+    VisionPartial,
+)
+
+
+async def vision_packets():
+    yield VisionFrame(Blob(first_jpeg, "image/jpeg"), stream_id="camera-left")
+    yield VisionPartial("a red toolbox beside the door", stream_id="camera-left")
+    yield VisionFrame(Blob(latest_jpeg, "image/jpeg"), stream_id="camera-left")
+    yield SceneBoundary(VisionBoundary.END, stream_id="camera-left")
+
+
+vision = AsyncVisionStream(memory, limit=8)
+async for commit in vision.consume(vision_packets()):
+    print(commit.stream_id, commit.record.id)
+```
+
+State and prefetch work remain independent per ID. Each scene retains only its latest frame as the
+durable keyframe; this bounds memory without imposing a hidden video codec or sampler. Applications
+that need a full clip may finalize an encoded video through `AsyncCaptureStream` instead.
+
+With native image embedding, frame changes drive speculative retrieval directly. With a text-only
+embedder, `VisionPartial` drives retrieval and its final value is attached to the keyframe through
+`StreamInput.description`. If no partial exists, a configured `VisionDescriptionBackend` describes
+the final frame once. If none of those routes exists, finalization fails instead of discarding the
+frame. Camera SDK values and RGB/YUV conversion remain adapter work.
+
+If final retrieval fails, the final observation still commits and `StreamCommit.retrieval_error`
+contains a stable public code (or `retrieval_failed` for an unclassified exception). Consumer task
+cancellation before final commit writes nothing. Once the exact-final write starts, `FINAL` is the
+commit point: cancellation waits for the write and then propagates, so no worker can write after a
+cancelled task has already returned.
 
 Useful end-to-end measurements are:
 
-- the fraction of turns with a completed prefetch at the final boundary;
+- fraction of turns with a completed matching prefetch at finality;
 - final-boundary-to-context latency at p50, p95, and p99;
-- the fraction of final snapshots that require another search;
-- searches started per turn and maximum concurrent searches per prefetcher;
-- retrieval quality for the final snapshot, not only for its earlier prefixes.
+- fraction of finals that require another search;
+- searches started per turn and maximum concurrent searches per reducer;
+- retrieval quality for the final snapshot, not just earlier partials;
+- `CANCEL`, EOF, or pre-commit task cancellation that produced a durable record, whose target is
+  zero.
 
-## Interaction memory with existing types
+## Automatic memory formation
 
-Personalized interaction behavior is a storage and retrieval policy over the existing memory
-roles, not a new store or `MemoryType`:
-
-| Evidence | Memory type | Trust and use |
-| --- | --- | --- |
-| Explicit preference or sufficiently supported stable trait | `SEMANTIC` | A user fact or a clearly labelled hypothesis |
-| A situated affective interaction with event time and cause | `EPISODIC` | What happened on one occasion |
-| A response approach that feedback showed was helpful or harmful | `PROCEDURAL` | Internal interaction guidance, never executable code |
-
-The application or an explicitly configured analysis plugin produces these values after the
-observation is final. The memory kernel does not infer emotion or personality. Store the source
-observation first, then preserve its stable ID in application metadata on any derived record:
+Configure an optional `FormationBackend` to turn a committed observation into typed semantic
+proposals. The former cannot write storage and is not trusted to choose IDs, evidence, or conflict
+semantics:
 
 ```python
-from mindbridge import MemoryType, StreamInput
+from mindbridge import Memory, OpenAIModels
 
-interaction_items = (
-    StreamInput(
-        "The user explicitly prefers short, calm explanations.",
-        metadata={
-            "basis": "user_statement",
-            "evidence_ids": [source_record.id],
-            "confidence": 1.0,
-        },
-        memory_type=MemoryType.SEMANTIC,
-    ),
-    StreamInput(
-        "The user sounded tense while discussing the deadline.",
-        occurred_at=source_record.occurred_at,
-        occurred_end=source_record.occurred_end,
-        metadata={
-            "basis": "affect_observation",
-            "evidence_ids": [source_record.id],
-            "confidence": 0.74,
-            "target": "deadline",
-        },
-        memory_type=MemoryType.EPISODIC,
-    ),
-    StreamInput(
-        "When deadline pressure is present, acknowledge it before proposing steps.",
-        metadata={
-            "basis": "response_feedback",
-            "evidence_ids": [source_record.id],
-            "confidence": 0.8,
-        },
-        memory_type=MemoryType.PROCEDURAL,
-    ),
+models = OpenAIModels(
+    embedding_client=embedding_client,
+    generation_client=generation_client,
 )
 
-tuple(memory.add_stream(interaction_items))
+with Memory("./data", embedder=models, former=models) as memory:
+    source = memory.add(observation.content, context=observation.context)
 ```
 
-Metadata is provenance-bearing application data, not an isolation or authorization boundary.
-Keep the original observation even when a derived interpretation later changes. A correction adds
-new temporal evidence or deletes the incorrect derived record; it does not rewrite history.
+The raw source commits first. Formation then validates every proposal against the source modality
+and spatial frame, creates deterministic derived IDs, links evidence, versions state, embeds new
+records, and records the durable formation recipe in one SQLite transaction. If formation fails,
+the source remains durable and retrying the same add can complete the missing projection.
 
-For retrieval, request the roles separately so one category cannot crowd out the others:
+The typed roles are `OBSERVATION`, `ENTITY`, `EVENT`, `STATE`, `RELATION`, `AFFECT`, `TRAIT`, and
+`RESPONSE_POLICY`. They refine the existing semantic, episodic, and procedural `MemoryType` roles;
+they do not create eight stores.
+
+## Affect and personality evidence
+
+Affect is situated evidence. A proposal may carry cue modality, valence, arousal, confidence,
+validity, spatial context, and source evidence. The cue modality must exist in the source
+observation, so a text-only inference cannot claim to have heard vocal tension. Applications should
+preserve text, prosody, face, posture, and environment cues separately and fuse them late.
+
+A trait is a long-horizon claim and has a stricter visibility rule:
+
+- a trusted explicit `USER_STATEMENT` is visible immediately;
+- a `MODEL_INFERENCE` remains hidden from active search until two independent source observations
+  support the same normalized subject/predicate/value claim;
+- repeated extraction from one observation or shared `source_id` counts once;
+- confidence uses the maximum within one source and noisy-OR across independent sources;
+- deleting source evidence recomputes confidence and can hide or remove the trait;
+- explicit corrections use state-like bitemporal replacement instead of overwriting history.
+
+`get` and `list` may expose a hidden trait with `MemoryContext.visible=False` for audit. Ordinary
+search and answer exclude it. This lets developers inspect why a profile did not activate without
+allowing one uncertain emotional episode to personalize future behavior.
+
+Response policies are typed procedural evidence, never executable code. They require explicit
+feedback provenance before an application should use them to adapt companion behavior.
+
+## Retrieval by valid, known, and spatial state
+
+Use `RetrievalScope` to ask what was valid in the world, what MindBridge knew at the time, or what
+was nearby in one coordinate frame:
 
 ```python
-from mindbridge import MemoryType
+from mindbridge import RetrievalScope, SpatialAnchor, SpatialContext
 
-semantic = memory.search(query, memory_type=MemoryType.SEMANTIC, limit=2)
-episodic = memory.search(query, memory_type=MemoryType.EPISODIC, limit=2)
-procedural = memory.search(query, memory_type=MemoryType.PROCEDURAL, limit=1)
+scope = RetrievalScope(
+    valid_at=event_time,
+    known_at=audit_time,
+    near=SpatialContext(
+        frame_id="home/map",
+        anchor=SpatialAnchor.SUBJECT,
+        x=2.0,
+        y=1.0,
+    ),
+    radius_m=0.75,
+)
+hits = memory.search("Where was the red toolbox?", scope=scope)
 ```
 
-Treat the sections differently when constructing an agent prompt:
+Spatial search is same-frame and same-anchor only. Position uncertainty expands the conservative
+intersection test. MindBridge does not guess coordinate transforms. `valid_at` is world time;
+`known_at` is transaction time. The older `occurred_from`/`occurred_until` filters still select raw
+event occurrence and remain separate.
 
-- explicit semantic statements may ground an answer;
-- inferred semantic traits are hypotheses and should influence tone softly;
-- episodes retain target, cause, time, confidence, and source evidence;
-- procedures are private response guidance and must not be quoted as user facts.
+## Graph evidence gate
 
-Do not promote one emotional episode into a stable semantic trait. An inferred trait needs repeated,
-independent evidence or an explicit user statement. User correction outranks model inference.
+No graph database is introduced by formation. Typed lineage and evidence links cover deterministic
+state maintenance without another service. A graph candidate is justified only when public-path
+benchmarks show that gold evidence is commonly retrieved at a larger K but displaced at the product
+K, the failure spans independent memory units, and a prototype improves retrieval/answer metrics
+without violating latency, storage, rebuild, and privacy budgets.
 
-## Emotion and other analysis plugins
-
-This design does not add an emotion plugin without an implementation that proves its contract. A
-future plugin must declare supported atomic modalities, typed output, confidence and provenance,
-model identity, lifecycle and concurrency behavior, privacy/export boundary, and stable failure
-mapping. Audio prosody, text, face, and posture observations should retain their separate evidence
-and be fused late; a single hard label must not erase disagreement between modalities.
-
-Such a plugin may perform inference only. It cannot write around `Memory`, own another store, or
-turn metadata into routing or isolation policy. Omitting it must leave stream ingestion, prefetch,
-and ordinary memory behavior unchanged.
-
-## Evidence gate for a graph projection
-
-No graph is added by this feature. First establish that the current hybrid retrieval loses useful
-top-k positions because a large distractor pool dilutes otherwise retrievable evidence.
-
-Use the public SDK path and fixed dataset/model/runtime revisions. ATM-Bench already reports
-retrieval Recall@1/5/10 and Joint@K, while Mem-Gallery reports retrieval Precision/Recall/Hit@10.
-Run the same task at small and larger recall limits and retain sample diagnostics:
-
-```bash
-mindbridge-bench eval \
-  --tasks atm-bench,mem-gallery \
-  --recall-limit 5 \
-  --log-samples \
-  --output_path .benchmarks/results/left-gate-k5
-
-mindbridge-bench eval \
-  --tasks atm-bench,mem-gallery \
-  --recall-limit 20 \
-  --log-samples \
-  --output_path .benchmarks/results/left-gate-k20
-```
-
-A graph candidate is justified only when all of these are true:
-
-1. Gold evidence is commonly retrieved at a larger K but displaced from the product K; missing
-   evidence caused by unsupported modality, failed transcription, or weak embeddings is not a
-   graph problem.
-2. The failure appears across independent memory units, not a handful of questions sharing one
-   store.
-3. A product-path prototype improves retrieval and joint answer metrics with a paired confidence
-   interval above zero, without a statistically supported regression elsewhere.
-4. Its p95/p99 latency, sustained ingestion cost, index size, and rebuild behavior remain within
-   the target deployment's explicit budget.
-
-If those gates pass, the smallest acceptable implementation is an additive entity/topic projection
-derived from authoritative SQLite records and rebuilt through the existing outbox/index lifecycle.
-It must not introduce a graph database, become a second source of truth, create logical account
-scopes, or learn from abandoned speculative queries. Accepted final queries may inform a later
-measured projection only when that durable, privacy-sensitive behavior is explicit and replayable.
+If that gate passes, start with an additive entity/relation projection derived from authoritative
+SQLite records and rebuilt through the existing outbox lifecycle. It must not become a second source
+of truth, create logical account scopes, or learn from abandoned speculative queries. See the
+[competitive review](competitive-memory-systems.md) for the source audit and roadmap.

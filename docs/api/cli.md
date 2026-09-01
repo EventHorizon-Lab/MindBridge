@@ -177,11 +177,11 @@ Plus exactly one command with no SDK counterpart:
 | --- | --- |
 | `mindbridge doctor` | Resolve the composition, exercise each configured backend's loader, and report — writing nothing |
 
-Per-command options mirror the SDK keywords: `--occurred-at`, `--occurred-end`, `--metadata`, and
-`--memory-type` on `add`; `--memory-type` on `add-many` and `add-stream`; `--limit`,
-`--memory-type`, and `--reference-at` on `search`, `search-with-trace`, and `ask`; the two search
-commands also accept `--occurred-from` and `--occurred-until` for strict event-overlap filtering;
-`--limit` and `--cursor` apply to `list`.
+Per-command options mirror the SDK keywords: `--occurred-at`, `--occurred-end`, `--metadata`,
+`--memory-type`, and `--context` on `add`; `--memory-type` on `add-many` and `add-stream`; `--limit`,
+`--memory-type`, `--reference-at`, and `--scope` on `search`, `search-with-trace`, and `ask`; the two
+search commands also accept `--occurred-from` and `--occurred-until` for strict event-overlap
+filtering; `--limit` and `--cursor` apply to `list`.
 
 `--cursor` is passed through exactly as it was returned and is never parsed.
 
@@ -206,13 +206,23 @@ printf 'The spare key is in the blue toolbox.' | mindbridge --embedder jina-omni
 **`--content-json`.** Reads the same parts array REST and MCP accept — the identical
 `input_text` / `input_image` / `input_file` union, documented in
 [Content input](rest.md#content-input). The value is `-` for stdin, `@PATH` for a file, or the JSON
-itself. `--metadata` accepts the same three forms.
+itself. `--metadata`, `--context`, and `--scope` accept the same three forms.
 
 ```bash
 mindbridge --embedder jina-omni add --content-json - <<'JSON'
 [{"type": "input_text", "text": "Inspection evidence"},
  {"type": "input_file", "path": "/srv/media/panel.png"}]
 JSON
+```
+
+Typed observation and retrieval examples:
+
+```bash
+mindbridge --embedder jina-omni add "The mug is on the table" \
+  --context '{"basis":"observation","source_id":"camera-1:42","confidence":0.94}'
+
+mindbridge --embedder jina-omni search "Where is the mug?" \
+  --scope '{"near":{"frame_id":"home/map","anchor":"subject","x":2,"y":1},"radius_m":0.75}'
 ```
 
 `--content-json` and the positional atoms are two ways to supply the **same** operand, not two
@@ -227,11 +237,11 @@ mode both this part type and `@PATH` are rejected with `unsupported_in_remote_mo
 media in a data URL instead.
 
 `add-many` and `add-stream` read JSONL, one object per line, each with `content` plus optional
-`occurred_at`, `occurred_end`, and `metadata`. `--memory-type` applies to every item. `add-many`
-collects the finite input into one embedding batch and one SQLite transaction. `add-stream` parses
-and commits one line before reading the next; a later failure leaves the committed prefix in the
-store. Each line's `content` is the same union, checked by the same rule, so a local path is refused
-in `--url` mode exactly as a single `add` refuses one.
+`occurred_at`, `occurred_end`, `metadata`, and `context`. `--memory-type` applies to every item.
+`add-many` collects the finite input into one embedding batch and one SQLite transaction.
+`add-stream` parses and commits one line before reading the next; a later failure leaves the
+committed prefix in the store. Each line's `content` is the same union, checked by the same rule, so
+a local path is refused in `--url` mode exactly as a single `add` refuses one.
 
 ```bash
 mindbridge --embedder jina-omni add-many @import.jsonl
@@ -265,6 +275,9 @@ field vocabulary covers three surfaces:
 | `reindex` | `{"memories": int}` |
 | `register-speaker`, `register-identity`, `optimize` | `{}` |
 | `doctor`, `--explain` | the composition document below |
+
+Memory and hit documents include `context` when typed semantics exist. The shape is identical in
+local and `--url` modes; enum values are JSON strings and datetimes are ISO 8601.
 
 `SpeakerSegment` has no REST or MCP precedent, because `speech` has no route and no tool. Its fields
 are the public [`SpeakerSegment`](python-sdk.md) dataclass: `asset_id`, `start_ms`, `end_ms`, `text`,
@@ -413,9 +426,11 @@ limits, including the 8 MiB request body. See
 ### Absent features
 
 No `--format` flag, configuration file, `MINDBRIDGE_*` composition variable, plugin registry,
-backend registration by name, streaming output, interactive prompt, `serve` command, or metadata
-filter. `uvicorn my_application:app` already starts a server. `add-stream` still emits one document
-at EOF and is therefore for finite JSONL; use the Python iterator for an unbounded source.
+backend registration by name, capture-event reducer, streaming output, interactive prompt, `serve`
+command, coordinate-frame transform, or metadata filter. `uvicorn my_application:app` already
+starts a server. `add-stream` still emits one document at EOF and is therefore for finite finalized
+JSONL; use `AsyncAudioStream`, `AsyncVisionStream`, or `AsyncCaptureStream` in Python for live
+sensor packets and associated partial/final/cancel capture events.
 
 ## Benchmarks
 

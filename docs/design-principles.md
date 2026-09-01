@@ -160,11 +160,17 @@ For agents:
   agent-readable index such as `llms.txt` when a documentation site exists.
 
 Agent integrations may add optional lifecycle hooks or skills that retrieve context before a turn
-and store outcomes afterward. Such automation must make writes observable, preserve the distinction
-between user statements and agent-generated conclusions, and remain outside the core memory
-semantics. `AsyncOmniPrefetch` implements the narrow Python-side speculative-recall lifecycle;
-capture, turn detection, derived-memory extraction, and agent prompting remain application work.
-MCP and the `mindbridge` CLI are the implemented transport-facing agent surfaces.
+and store outcomes afterward. Such automation must make writes observable and preserve the
+distinction between observations, user statements, and model conclusions. `AsyncOmniPrefetch`
+implements speculative recall, while `AsyncCaptureStream` reduces adapter-supplied `UPDATE`,
+`FINAL`, and `CANCEL` snapshots into exact-final retrieval and durable observations. Its
+`stream_id` separates interleaved sources. `AsyncAudioStream` normalizes canonical PCM, VAD, ASR
+hypothesis, and acoustic-boundary values. `AsyncVisionStream` normalizes immutable encoded frames,
+complete visual descriptions, and scene boundaries while retaining one final keyframe. Camera and
+microphone I/O, provider-specific packet decoding, frame production, and agent prompting remain
+application work. An optional `FormationBackend` may propose typed derived memories after a source
+observation commits, but the kernel owns validation, evidence, time, identity, conflict, and
+durability. MCP and the `mindbridge` CLI remain the implemented transport-facing agent surfaces.
 
 ### Developer-friendly extensibility
 
@@ -236,22 +242,24 @@ matrix, license and security requirements, performance envelope, and maintenance
 ### Add extensions as narrow, optional capabilities
 
 The current extension surface consists of the explicit `EmbeddingBackend`, `GenerationBackend`,
-`TranscriptionBackend`, `SpeechBackend`, and `FaceBackend` protocols, plus the optional
-`StreamingGenerationBackend` that an answerer may also implement. Applications can pass them
-directly to `Memory`; `Memory.from_config` provides a typed convenience layer for bundled
-implementations and delegates to the same constructor. Explicit objects remain the third-party
-plugin mechanism; there is no global runtime plugin registry.
+`TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, and
+`FormationBackend` protocols, plus the optional `StreamingGenerationBackend` that an answerer may
+also implement. Applications can pass them directly to `Memory`; `Memory.from_config` provides a
+typed convenience layer for bundled implementations and delegates to the same constructor.
+Explicit objects remain the third-party plugin mechanism; there is no global runtime plugin
+registry.
 
 `StreamingGenerationBackend` is the shape a narrow capability should take. It adds one method, stays
 optional, is selected by a structural check rather than a provider name, and leaves the
 `GenerationBackend` contract unchanged for backends that do not implement it.
 
 Face analysis demonstrates the admission rule: its public contract arrived with a concrete local
-OpenCV implementation and end-to-end identity use case. A future public capability such as emotion
-analysis must likewise declare accepted modalities, typed output, provenance, configuration,
-resource lifecycle, concurrency behavior, privacy boundary, and failure mapping. It must not create
-provider branches inside `Memory` or treat metadata as an execution or isolation mechanism. See
-[plugin architecture](plugin-architecture.md).
+OpenCV implementation and end-to-end identity use case. Formation applies the same rule to semantic
+inference: a backend declares atomic modalities, typed output, durable model/recipe identity,
+resource lifecycle, concurrency behavior, privacy boundary, and failure mapping. Affect remains a
+source-grounded proposal, not an untyped emotion label or a new `MemoryType`. A backend must not
+create provider branches inside `Memory` or treat metadata as an execution or isolation mechanism.
+See [plugin architecture](plugin-architecture.md).
 
 ### Preserve evidence, privacy, and durability
 
@@ -277,15 +285,16 @@ revisions must be reproducible before a result guides a default.
 
 | Concern | Current release | Product direction |
 | --- | --- | --- |
-| Input | Ordered text, image, video, and audio through `ContentInput`; lazy completed observations through `StreamInput`/`add_stream`; async speculative omni recall | More capture formats normalize into the same canonical contract |
+| Input | Ordered multimodal `ContentInput`; completed `StreamInput`; associated `StreamEvent`; canonical audio packets through `AsyncAudioStream`; encoded frame/description/scene packets through `AsyncVisionStream` | Additional measured sensor adapters over the same lifecycle contract |
 | Embedding | Caller explicitly supplies a backend; Jina v5 Omni is the bundled omni adapter | Omni-capable recommended composition with route-specific execution |
 | Generation | Optional caller-supplied backend with explicit capabilities | Omni-capable recommended composition where the deployment supports it |
 | Speech runtime | Built-in FunASR adapter uses `AutoModel` | Additional measured runtime adapters, selected explicitly or by observable policy |
-| Extensions | Five explicit model protocols and one optional streaming-generation protocol; no registry | Optional domain capabilities after a real implementation establishes the contract |
+| Extensions | Seven explicit model protocols, including visual fallback and source-grounded formation, plus one optional streaming-generation protocol; no registry | Optional domain capabilities after a real implementation establishes the contract |
 | Hardware | Runs where Python, dependencies, and the selected models are supported | Verified device-class matrix with published quality, latency, and resource evidence |
 | Developer interfaces | Typed Python API, OpenAPI-documented REST adapter, and a JSON-only product CLI over the same composition | Same small vocabulary and time-to-first-success across supported transports |
 | Execution plane | Python SDK, REST, MCP, and the `mindbridge` CLI dispatch to one `Memory` | Every surface reaches the operations the SDK publishes, with no transport gap left undocumented |
 | Agent interfaces | Six typed MCP tools; a `mindbridge` CLI whose commands are the SDK operations kebab-cased, plus `doctor` | SDK-derived MCP and CLI capability parity, machine-readable schemas, and lifecycle integrations |
+| Semantic memory | Typed observation/entity/event/state/relation/affect/trait/response-policy context with evidence and bitemporal versions | Benchmark-calibrated formation, optional measured graph expansion, and companion-policy evaluation |
 
 This distinction is deliberate: goals guide what to build next, while current API and deployment
 documentation remain the source of truth for what users can run now.

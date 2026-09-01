@@ -2,6 +2,11 @@
 
 The optional FastAPI adapter exposes the same local `Memory` core under `/v1`.
 
+REST accepts finalized media files. Live audio packets, vision frames/partials/scene boundaries,
+and associated `StreamEvent` ingestion are Python-only because this adapter has no client-streaming
+route; use `AsyncAudioStream`, `AsyncVisionStream`, or `AsyncCaptureStream` in the application that
+owns the connection.
+
 ## Start the API
 
 ```bash
@@ -127,13 +132,40 @@ A memory response keeps textual content and adds explicit modality and safe asse
   "created_at": "2026-08-27T09:30:00Z",
   "occurred_at": null,
   "occurred_end": null,
-  "metadata": {"source": "design-review"}
+  "metadata": {"source": "design-review"},
+  "context": null
 }
 ```
 
 `modality` is persisted by the core and is one of `text`, `image`, `video`, `audio`, or `omni`.
 `memory_type` is `semantic`, `episodic`, or `procedural`. Asset filesystem paths are never
 serialized.
+
+An input `context` is an optional typed observation:
+
+```json
+{
+  "basis": "observation",
+  "source_id": "camera-1:frame-42",
+  "confidence": 0.94,
+  "valid_from": "2026-08-27T09:00:00Z",
+  "valid_until": null,
+  "spatial": {
+    "frame_id": "home/map",
+    "anchor": "subject",
+    "x": 2.0,
+    "y": 1.0,
+    "z": 0.0,
+    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+    "position_uncertainty_m": 0.08
+  }
+}
+```
+
+When present, response `context` is the authoritative `MemoryContext`. It adds typed kind and basis,
+confidence, valid and transaction time, visibility, lineage/source/evidence/supersession IDs, model
+recipe, optional subject/predicate/value, spatial pose, and affect cue fields. Raw records may have
+no context when formation is disabled. Paths are never serialized.
 
 ## Endpoints
 
@@ -168,12 +200,17 @@ Content-Type: application/json
   "memory_type": "episodic",
   "occurred_at": "2026-08-27T09:00:00Z",
   "occurred_end": "2026-08-27T09:05:00Z",
-  "metadata": {"source": "design-review"}
+  "metadata": {"source": "design-review"},
+  "context": {
+    "basis": "observation",
+    "source_id": "camera-1:frame-42",
+    "confidence": 0.94
+  }
 }
 ```
 
-`occurred_at`, `occurred_end`, `metadata`, and `memory_type` are optional; memory type defaults to
-`semantic`. An event end requires a timezone-aware start and must be later than it.
+`occurred_at`, `occurred_end`, `metadata`, `memory_type`, and `context` are optional; memory type
+defaults to `semantic`. An event end requires a timezone-aware start and must be later than it.
 Response `201` is one memory object. Repeating the same canonical input returns the existing record
 without another model call.
 
@@ -199,6 +236,7 @@ Content-Type: application/json
   "occurred_at": ["2026-08-27T09:00:00Z", null],
   "occurred_end": [null, null],
   "metadata": [{"source": "design-review"}, null],
+  "context": [null, {"basis": "observation", "confidence": 1.0}],
   "memory_type": "procedural"
 }
 ```
@@ -206,10 +244,10 @@ Content-Type: application/json
 `contents` has 1 through 100 items. One optional `memory_type` applies to the complete batch and
 defaults to `semantic`. Response `201` is `{"memories": [...]}` in input order.
 
-`occurred_at`, `occurred_end`, and `metadata` are optional per-item arrays. Supplying one requires
-exactly one entry per item; omitting it applies `null` to every item. These values are part of a
-memory's content-addressed identity, so a batch import that omits them produces different IDs than
-the same records added with them — over any surface.
+`occurred_at`, `occurred_end`, `metadata`, and `context` are optional per-item arrays. Supplying one
+requires exactly one entry per item; omitting it applies `null` to every item. These values are part
+of a memory's content-addressed identity, so a batch import that omits them produces different IDs
+than the same records added with them — over any surface.
 
 ### Search memories
 
@@ -231,7 +269,18 @@ Content-Type: application/json
   "memory_type": "episodic",
   "reference_at": "2026-08-27T12:00:00Z",
   "occurred_from": "2026-08-20T00:00:00Z",
-  "occurred_until": "2026-08-27T00:00:00Z"
+  "occurred_until": "2026-08-27T00:00:00Z",
+  "scope": {
+    "valid_at": "2026-08-26T12:00:00Z",
+    "known_at": "2026-08-27T12:00:00Z",
+    "near": {
+      "frame_id": "home/map",
+      "anchor": "subject",
+      "x": 2.0,
+      "y": 1.0
+    },
+    "radius_m": 0.75
+  }
 }
 ```
 
@@ -248,6 +297,11 @@ hit has the memory fields plus `score`. The complete ordered query and bounded f
 its first text atom and media supply dense candidates; the focused text also supplies lexical
 candidates. All routes collapse aggregate or atomic document keys to parent memories.
 
+`scope` is optional. `valid_at` and `known_at` are timezone-aware world-time and transaction-time
+instants. `near` and non-negative `radius_m` must appear together and restrict results to the same
+coordinate frame and observer/subject anchor. SQLite authoritatively reapplies every scope filter
+after candidate retrieval.
+
 ### Answer from memories
 
 ```http
@@ -260,7 +314,8 @@ Content-Type: application/json
   "question": "What changed last week?",
   "limit": 5,
   "memory_type": "episodic",
-  "reference_at": "2026-08-27T12:00:00Z"
+  "reference_at": "2026-08-27T12:00:00Z",
+  "scope": {"valid_at": "2026-08-26T12:00:00Z"}
 }
 ```
 
@@ -435,7 +490,8 @@ use the Python `Path`/`Blob` contract or a provider-specific adapter.
 ### Absent features
 
 The REST API has no local-path input, large-file upload endpoint, update route, metadata filter,
-logical scope parameter, chunking contract, per-asset vector control, or learned reranker. The OpenAI
-adapter inlines at most 20 MiB per base64-encoded media item and 64 MiB per embedding or generation
-call, roughly 15 MiB per file and 48 MiB in aggregate on disk; generation admits ranked evidence
-within those budgets, and answer text evidence is limited to 4 MiB.
+client-streaming capture route, coordinate-frame transform, chunking contract, per-asset vector
+control, or learned reranker. The OpenAI adapter inlines at most 20 MiB per base64-encoded media item
+and 64 MiB per embedding or generation call, roughly 15 MiB per file and 48 MiB in aggregate on
+disk; generation admits ranked evidence within those budgets, and answer text evidence is limited
+to 4 MiB.
