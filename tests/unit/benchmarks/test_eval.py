@@ -291,6 +291,7 @@ def test_result_table_includes_per_task_time_and_tokens() -> None:
                     "score": {"mean": 1.0, "confidence_interval_95": None},
                     "question_count": 2,
                     "error_count": 0,
+                    "ingest_failure_count": 0,
                     "performance": {
                         "duration_seconds": {"total": 2.5, "average": 1.25},
                         "token_usage": {"total_tokens": 30, "average_tokens": 15.0},
@@ -304,6 +305,33 @@ def test_result_table_includes_per_task_time_and_tokens() -> None:
     assert "avg ms" in output
     assert "30" in output
     assert "15.0" in output
+
+
+def test_result_table_reports_the_writes_that_invalidated_a_score() -> None:
+    # A run that loses every write still answers every question, so `error_count` stays zero and
+    # the score reads INVALID beside it with nothing saying why. One real run lost 7 784 writes to
+    # a transcription dependency that was not installed and printed exactly that.
+    output = eval_module._table(
+        {
+            "tasks": [
+                {
+                    "task": "fixture",
+                    "primary_metric": "accuracy",
+                    "score": {"mean": None, "confidence_interval_95": None},
+                    "question_count": 152,
+                    "error_count": 0,
+                    "ingest_failure_count": 7784,
+                    "performance": {
+                        "duration_seconds": {"total": 1.0, "average": 1.0},
+                        "token_usage": {"total_tokens": 1, "average_tokens": 1.0},
+                    },
+                }
+            ]
+        }
+    )
+
+    assert "unwritten" in output
+    assert "7784" in output
 
 
 def test_cluster_statistics_and_pairing_are_seeded() -> None:

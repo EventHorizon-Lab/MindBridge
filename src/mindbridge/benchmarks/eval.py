@@ -2658,6 +2658,7 @@ def _table(results: Mapping[str, object]) -> str:
                 ),
                 str(task["question_count"]),
                 str(task["error_count"]),
+                str(task["ingest_failure_count"]),
                 (
                     "—"
                     if isinstance(total_duration, bool)
@@ -2690,6 +2691,10 @@ def _table(results: Mapping[str, object]) -> str:
         "95% cluster CI",
         "n",
         "errors",
+        # A score reads INVALID whenever writes failed, and until this column existed the table
+        # said only "errors 0" beside it: answering had in fact succeeded, on an empty store. One
+        # run lost 7 784 writes to a missing transcription dependency and showed nothing.
+        "unwritten",
         "total s",
         "avg ms",
         "tokens",
