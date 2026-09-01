@@ -129,8 +129,9 @@ questions but inside the top thirty for 94% — so the answering model performs 
 and needs to see enough candidates. `None` grounds on exactly `limit` memories. An integer keeps
 those `limit` hits and then admits further ranked memories while the grounded evidence fits the
 budget, ranking the full rerank pool instead of `3 * limit` so the budget is what bounds depth.
-Media is charged a flat 4000 characters per asset, since an image or video part costs a model far
-more than the few bytes of text on its record; the provider adapter still applies its own byte
+Media is charged per modality — 2000 characters for an image, 4000 for audio, 12 000 for video —
+since a media part costs a model far more than the few bytes of text on its record, and the three
+are an order of magnitude apart from each other. The provider adapter still applies its own byte
 ceiling on inline media.
 
 Use `Memory` as a context manager:

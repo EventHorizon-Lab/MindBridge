@@ -23,6 +23,7 @@ from functools import partial
 from pathlib import Path
 from threading import Condition, RLock
 from time import perf_counter
+from types import MappingProxyType
 from typing import Protocol, TypeVar, cast
 
 from opentelemetry import trace
@@ -191,9 +192,19 @@ _TEXT_KEY_CHARACTERS = 2_048
 _TEXT_KEY_OVERLAP = 256
 _TEXT_KEY_CONTEXT = 256
 _MAX_RETRIEVAL_KEYS = 128
-# One image or short video part costs these models on the order of a thousand tokens, and four
-# characters per token is the usual rule of thumb, so a media hit is charged as this much text.
-_ASSET_EVIDENCE_CHARS = 4_000
+# Text-equivalent cost of one grounded media part, at the usual four characters per token. The
+# modalities are an order of magnitude apart in what a model charges for them: an image part
+# measured near five hundred tokens against this stack where a ten-second video part measured
+# near three thousand, so one flat number would either starve text or overrun on video. These
+# are coarse by design; the budget is the caller's knob, not these constants.
+_ASSET_EVIDENCE_CHARS: Mapping[Modality, int] = MappingProxyType(
+    {
+        Modality.IMAGE: 2_000,
+        Modality.AUDIO: 4_000,
+        Modality.VIDEO: 12_000,
+    }
+)
+_DEFAULT_ASSET_EVIDENCE_CHARS = 4_000
 _MAX_QUERY_RETRIEVAL_KEYS = 7
 _MAX_INDEX_SEARCH_WORKERS = 4
 _TODAY_ISO_DATE = re.compile(r"\btoday\s+is\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
@@ -4056,8 +4067,8 @@ def _budgeted_hits(
     """Extend a grounding set down the ranking while the evidence fits one budget.
 
     The guaranteed hits are never dropped, so this only ever widens what the answer sees. Media
-    is charged a flat per-asset equivalent because an image or video part costs the model far
-    more than its record's text; the provider adapter still enforces its own byte ceiling.
+    is charged per modality because an image or video part costs the model far more than its
+    record's text; the provider adapter still enforces its own byte ceiling.
     """
     taken = {hit.id for hit in selected}
     used = sum(_evidence_cost(hit) for hit in selected)
@@ -4074,7 +4085,10 @@ def _budgeted_hits(
 
 
 def _evidence_cost(hit: SearchHit) -> int:
-    return len(hit.content) + _ASSET_EVIDENCE_CHARS * len(hit.assets)
+    return len(hit.content) + sum(
+        _ASSET_EVIDENCE_CHARS.get(asset.modality, _DEFAULT_ASSET_EVIDENCE_CHARS)
+        for asset in hit.assets
+    )
 
 
 def _merge_index_hits(*groups: Sequence[IndexHit]) -> tuple[IndexHit, ...]:

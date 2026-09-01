@@ -1326,10 +1326,10 @@ def test_evidence_budget_charges_media_far_above_its_record_text(tmp_path: Path)
         )
         media_hits = memory.ask("find the shot", limit=2).hits
 
-    # The same budget buys 130 short text records but only one extra image part, because each
-    # asset is charged at four thousand characters rather than its record's few bytes of text.
+    # The same budget buys every short text record but only a handful of image parts, because an
+    # asset is charged at its modality's text equivalent, not its record's few bytes of text.
     assert len(text_hits) == 40
-    assert len(media_hits) == 3
+    assert len(media_hits) == 6
 
 
 def test_evidence_budget_rejects_values_that_cannot_bound_anything() -> None:
