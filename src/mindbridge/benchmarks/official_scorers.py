@@ -146,9 +146,23 @@ _PERSONAMEM_HEADLINES: dict[str, tuple[str, float]] = {
     "hidden_persona_implicit_qa": ("deep_motivation_alignment", 3.0),
 }
 _PERSONAMEM_RUBRIC_HEADLINE = ("pr_combined_personalization_score", 10.0)
-# `compute_ranking_metrics` labels `recall@1` "Headline accuracy = simple
-# top-1: did the agent pick the held-out?".
-_PERSONAMEM_RANKING_HEADLINE = ("recall@1", 1.0)
+# `task_registry.PRIMARY_METRIC` -- the column upstream's aggregator reads --
+# gives all three single-target ranking tasks a graded nDCG@5, chosen over a
+# binary top-1 because the gold is "subtle by design" and nDCG rewards
+# surfacing it high with a smooth position discount. `compute_ranking_metrics`
+# does label its own `recall@1` "Headline accuracy", but that is one of the
+# many metrics it emits, not the one the aggregator reads. Every one of these
+# rows has exactly one target, so the graded gain map reduces to the binary
+# one and `ndcg_graded@5` is that metric.
+_PERSONAMEM_RANKING_HEADLINE = ("ndcg_graded@5", 1.0)
+
+# Ranks a slate like the other three, but its upstream headline is
+# `lifecycle_score` -- the delta between a paired pre-row's and post-row's
+# match rate -- which no single row can carry. It also has 2 to 5 targets per
+# row, so `recall@1`, which divides by the target count, could never exceed
+# 0.5 there. It keeps its ranking diagnostics and takes no headline, like the
+# other paired families.
+_PERSONAMEM_PAIRED_RANKING = frozenset({"short_vs_long_term_lifecycle"})
 _RANKED_INDEXES = re.compile(r"ranked[ _]index(?:es|ices)?\s*[:=]?\s*\[([^\]]*)\]", re.IGNORECASE)
 _RANKED_JSON = re.compile(r'"ranked_indices"\s*:\s*\[([^\]]*)\]')
 
@@ -566,7 +580,7 @@ def _personamem_metric(task_type: str) -> tuple[str, float] | None:
         return _PERSONAMEM_HEADLINES[task_type]
     if task_type in pm3.RUBRIC_HEADLINE_TASK_TYPES:
         return _PERSONAMEM_RUBRIC_HEADLINE
-    if task_type in RANKING_TASK_TYPES:
+    if task_type in RANKING_TASK_TYPES and task_type not in _PERSONAMEM_PAIRED_RANKING:
         return _PERSONAMEM_RANKING_HEADLINE
     return None
 

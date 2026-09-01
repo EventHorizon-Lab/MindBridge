@@ -576,3 +576,72 @@ def test_personamem_v3_reads_the_flattened_row_spelling(tmp_path: Path) -> None:
     assert flattened.rubric_tags == ("avoid_overpersonalization", "telegraph_avoidance")
     assert flattened.judge_evidence["arm"] == "sensitive_event"
     assert queries["26:0044:nulled"].user_query == "what should i cook"
+
+
+def test_personamem_v3_never_records_the_question_as_its_own_reference(tmp_path: Path) -> None:
+    """857 released queries publish no `example_response`."""
+    from mindbridge.benchmarks.eval_adapters import load_task
+    from mindbridge.benchmarks.task_catalog import TASKS
+
+    persona = tmp_path / "personamem-v3" / "backend" / "8"
+    _write(persona / "instagram.json", [_personamem_event("a", 1_000)])
+    _write(
+        persona / "test.json",
+        [
+            _personamem_query(query_id="8:0001:gold"),
+            {
+                **_personamem_query(query_id="8:0002:no-gold"),
+                "example_response": "",
+                "groundtruth_preference": "Enjoys couple-life content.",
+            },
+            {
+                **_personamem_query(query_id="8:0003:nothing"),
+                "example_response": "",
+                "groundtruth_preference": "",
+            },
+        ],
+    )
+
+    unit = load_task(TASKS["personamem-v3"], root=tmp_path, verify_digest=False).units[0]
+    references = {q.question_id: q.references[0] for q in unit.questions}
+
+    assert references["8:0001:gold"] == "pepper stew"
+    # Falls back to label material, never to the prompt itself.
+    assert references["8:0002:no-gold"] == "Enjoys couple-life content."
+    assert "what should i cook" not in references["8:0003:nothing"]
+    assert references["8:0003:nothing"] == "(no reference answer published for this row)"
+
+
+def test_text_memories_split_passages_the_product_would_reject() -> None:
+    """An oversized part is not just dropped -- it voids its whole unit.
+
+    `memory.add` rejects a part over `_MAX_TEXT_CHARACTERS`, the runner counts
+    an ingest failure, and `_apply_judges` then skips every question in that
+    unit. BEAM turns reach 348,864 characters and LongMemEval has one of
+    76,594, so unsplit storage silently left 70% of BEAM's 10M tier unjudged.
+    """
+    from mindbridge.benchmarks.eval_adapters import _text_memories
+    from mindbridge.memory import _MAX_TEXT_CHARACTERS
+
+    short = _text_memories("turn", "one short line")
+    assert len(short) == 1
+    assert short[0].source_id == "turn"
+    assert short[0].content == ("one short line",)
+
+    long_turn = "word " * 120_000
+    assert len(long_turn) > _MAX_TEXT_CHARACTERS
+    parts = _text_memories("turn", long_turn, end_seconds=1_775_000_000.0)
+    assert len(parts) > 1
+    assert all(
+        len(text) <= _MAX_TEXT_CHARACTERS
+        for item in parts
+        for text in item.content
+        if isinstance(text, str)
+    )
+    # Split parts stay individually addressable and keep the causal cutoff.
+    assert [item.source_id for item in parts[:2]] == ["turn_B0000", "turn_B0001"]
+    assert len({item.source_id for item in parts}) == len(parts)
+    assert all(item.end_seconds == 1_775_000_000.0 for item in parts)
+    # Nothing is dropped.
+    rebuilt = "".join(text for item in parts for text in item.content if isinstance(text, str))
+    assert rebuilt.replace("\n\n", " ").split() == long_turn.split()
