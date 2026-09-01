@@ -1,12 +1,17 @@
 # Grounded retrieval research closeout
 
-Snapshot: 2026-08-31. Product revision: `36447989a9634c0aab2106d5adb182c5ed437e57`.
+Snapshot: 2026-08-31; protocol audit: 2026-09-01. Product revision:
+`36447989a9634c0aab2106d5adb182c5ed437e57`.
 
 ## Decision
 
 Keep the product at the current revision. This round found no additional candidate that satisfies
 the project's lexicographic objective of stronger, then faster, then cheaper. Rejected experiments
 remain research artifacts and did not change tracked product code, schemas, or public APIs.
+
+The 2026-09-01 audit withdrew the prior M3 payload and source-bound answer-quality conclusions. The
+conservative no-merge decision remains correct, but the invalidated numbers are not evidence for or
+against those candidates until a corrected no-retry replay is run.
 
 No full EgoLifeQA evaluation was run. Existing EgoLife evidence is limited to previously frozen
 subsets and is not a full-dataset claim.
@@ -16,19 +21,40 @@ subsets and is not a full-dataset claim.
 | Candidate | Stronger | Faster | Cheaper | Decision |
 | --- | --- | --- | --- | --- |
 | Stronger grounded-abstention prompt | Not measurable without gold evidence pointers | Not run | Not run | Rejected before cloud evaluation to avoid reward hacking |
-| Remove private `memory_id` from generation payload | Four-task primary macro about -0.819 pp; M3 bedroom -6.667 pp | Not claimed | Generation tokens -5.90% | Rejected on quality |
-| Replace `memory_id` with request-local `evidence_index` | M3 bedroom 60.0% to 46.7% | Not claimed | Generation tokens -1.70% | Rejected on quality |
+| Remove private `memory_id` from generation payload | Prior four-task macro and M3 score withdrawn: replay omitted product `created_at` fallback | Not established | Prior token result is diagnostic only | No product change; corrected cloud replay required |
+| Replace `memory_id` with request-local `evidence_index` | Prior M3 score withdrawn for the same payload defect | Not established | Prior token result is diagnostic only | No product change; corrected no-retry replay required |
 | Store extracted facts as separate memories | Provenance-folded retrieval improved, but raw Hit@1/5/10/20 became zero through derived-record crowding | Regressed | Added extraction and index cost | Rejected |
-| Bind grounded fact keys to original sources at K20 | LoCoMo dev judge +3.125 pp; two-holdout retrieval macro Hit@20 and Recall@20 both +6.25 pp | Dev ask/TTFT p50 regressed 2.66%/2.09%; both holdout search p50 values regressed slightly | Dev generation tokens +3.27%; larger index | Research-qualified representation only |
-| Source-bound keys at K8 | LoCoMo dev judge -3.125 pp | Ask/TTFT p50 improved 27.13%/25.93% | Generation tokens -56.11% | Rejected on quality |
+| Bind grounded fact keys to original sources at K20 | Two-holdout retrieval macro Hit@20 and Recall@20 both +6.25 pp; prior answer judge withdrawn | Holdout search p50 regressed slightly | Larger index; prior generation-token result withdrawn | Retrieval-qualified representation only |
+| Source-bound keys at K8 | Holdout retrieval macro missed its +5 pp gate by 0.3125 pp; prior answer judge withdrawn | Prior ask/TTFT result withdrawn | Prior generation-token result withdrawn | Not promoted |
 | K12/K16 answer ladder | Not run | Not run | Zero cloud calls | Cancelled because holdout rank data had already exposed both cutoffs |
 | Query-embedding cache or executor rewrite | No representative quality-safe speed candidate | Repeated-query caching would measure an artificial workload | Added lifecycle/memory cost | Skipped |
 
-The source-bound representation is the only direction that generalized across the three frozen
-LoCoMo units. It attaches grounded fact and exact-quote embeddings to the original source ID, so
-search and generation still return only original memories. Productization is deferred until a new,
-independently preregistered experiment covers durable SQLite provenance and rebuilds, cross-modal
-tasks, and the observed latency/token regressions.
+The source-bound representation is the only retrieval direction that generalized across the three
+frozen LoCoMo units. It attaches grounded fact and exact-quote embeddings to the original source ID,
+so search returns only original memories. Productization is deferred until a new, independently
+preregistered experiment covers durable SQLite provenance and rebuilds, corrected answer quality,
+cross-modal tasks, latency, and token cost.
+
+## Protocol audit and repair
+
+- M3 replay payloads now delegate to the current product serializer, preserving its mutually
+  exclusive `occurred_at`/`created_at` behavior. Frozen offline validation passes for both affected
+  runners, but no replacement cloud result was produced.
+- The score replay now explicitly adds `hit.score` to its control arm; its compact arm is the exact
+  current product payload.
+- Every artifact claiming zero provider retries now constructs its OpenAI client with
+  `max_retries=0`.
+- Candidate-pool resume rewrites its journal with only groups containing exactly one row for each
+  frozen candidate; partial and duplicate groups are rerun.
+- Answer caches use schema 2 and bind full query content, logical SQLite plus assets for both
+  stores, limits/seed, endpoint, grounding prompt, and serializer source. The K8 override uses the
+  same identity builder.
+- Fact extraction resumes reject changes to schema, task, source, model, prompt, fact limit,
+  concurrency, blindness, or parse-retry policy before appending.
+
+Superseded generation artifacts are retained byte-for-byte for auditability: the M3 memory-ID,
+M3 Q01 repetition, evidence-index, source-bound K20 answer, and source-bound K8 answer results.
+They must not be used as acceptance evidence.
 
 ## Source-bound evidence
 
@@ -42,7 +68,8 @@ Extraction was query- and answer-blind. Every accepted fact carried an exact sou
 locally recomputed character span. Across the two holdouts, 1,471 grounded keys were added to 1,032
 source records, no derived record reached Top20 or generation, and retrieval returned 20 unique
 original sources per question. The K20 holdout gate passed; the combined low-K experiment was
-rejected because frozen K8 missed its +5 pp macro threshold by 0.3125 pp.
+not promoted because frozen K8 missed its +5 pp macro threshold by 0.3125 pp. Cloud-derived answer,
+latency, and token values from the old answer caches are superseded.
 
 ## Speed finding
 
@@ -68,4 +95,4 @@ universally faster, or universally cheaper claim.
 
 Raw benchmark-derived outputs and local SQLite/Zvec clones stay untracked to avoid committing
 dataset content and roughly 20 GB of runtime state. `round-grounded-retrieval.sha256` records the
-digests of the retained local evidence used by this report.
+digests of retained evidence, including the explicitly superseded artifacts.
