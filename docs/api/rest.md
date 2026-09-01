@@ -1,88 +1,79 @@
 # REST API
 
-The optional FastAPI adapter exposes the same local `Memory` core under `/v1`.
+## Purpose
 
-## Start the API
+The optional FastAPI adapter exposes seven `Memory` operations under `/v1`. It validates transport
+input, calls the injected synchronous memory, and serializes the public SDK values; it is not a
+separate storage or retrieval implementation.
+
+The generated FastAPI schema is the machine-readable contract. A running application serves it at
+`/openapi.json`, with Swagger UI at `/docs` and ReDoc at `/redoc`.
+
+## Invocation
+
+Install the server extra together with the extras required by the chosen backends, construct one
+`Memory`, and inject it:
 
 ```bash
-uv add "mindbridge[local,openai,server]"
+uv add "mindbridge[local,server]"
 ```
 
-Construct `Memory` and provider clients in the host application, then pass the instance to
-`create_app(memory=...)`:
-
 ```python
-from openai import OpenAI
-
-from mindbridge import JinaOmniEmbedder, Memory, OpenAIModels
+from mindbridge import Memory
 from mindbridge.api import create_app
 
-client = OpenAI(timeout=30.0, max_retries=3)
-memory = Memory(
-    ".mindbridge",
-    embedder=JinaOmniEmbedder(),
-    answerer=OpenAIModels(generation_client=client),
+memory = Memory.from_config(
+    {
+        "data_dir": "./data/assistant",
+        "embedding": {"provider": "jina-omni"},
+    }
 )
 app = create_app(memory=memory)
 ```
 
-Host it with the application's ASGI stack, register shutdown hooks for `memory` and `client`, and
-use exactly one worker for a directory. OpenAPI JSON is served at `/openapi.json`, Swagger UI at
-`/docs`, and ReDoc at `/redoc`. See [deployment](../deployment.md) before exposing the service.
+The example uses the pinned Jina recipe; review its upstream code and license boundary in
+[configuration](../configuration.md#embedding-choices).
 
-## Deployment authentication and request limits
+```text
+create_app(*, memory: Memory) -> fastapi.FastAPI
+```
 
-MindBridge does not implement an identity or token system. `create_app()` returns an
-unauthenticated ASGI application so a deployment can use its existing API gateway, service mesh,
-or Starlette/FastAPI authentication middleware. Each `/v1` request body is limited to 8 MiB before
-parsing, including JSON and base64 overhead.
+`create_app` does not own or close `memory`. The host application must close the memory and its
+caller-owned provider clients at shutdown. Run exactly one owner for each physical `data_dir`.
+MindBridge adds no authentication; put the app behind the deployment's gateway, service mesh, or
+FastAPI/Starlette authentication middleware. See [deployment](../deployment.md).
 
-## Content input
+With the host running, the smallest write is:
 
-The `content`, `query`, and `question` fields accept either a non-blank string or an ordered array
-of 1 through 16 OpenAI-compatible content parts. Extra fields are rejected.
+```bash
+curl --fail-with-body \
+  --header 'content-type: application/json' \
+  --data '{"content":"The spare key is in the blue toolbox."}' \
+  http://127.0.0.1:8000/v1/memories
+```
 
-### Text part
+## Contract
+
+### Content input
+
+The `content`, `query`, and `question` fields accept either a trimmed, non-blank string or an
+ordered array of 1 through 16 strict content parts. Unknown fields are rejected.
 
 ```json
 {"type":"input_text","text":"The prototype after the review"}
 ```
 
-### Image part
-
-Supply exactly one of `image_url` or `file_id`:
+An image part supplies exactly one of `image_url` or `file_id`:
 
 ```json
-{
-  "type": "input_image",
-  "image_url": "data:image/png;base64,iVBORw0KGgo="
-}
+{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}
 ```
 
 ```json
-{
-  "type": "input_image",
-  "file_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-}
+{"type":"input_image","file_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
 ```
 
-`image_url` accepts only a base64 `data:image/...` URL and is limited to 8,192 characters. Remote
-URLs are rejected; fetch them with the host application's HTTP client. The OpenAI `detail` field
-is not accepted because MindBridge does not currently carry a sampling-detail contract.
-
-### File part
-
-Use `input_file` for image, video, or audio. Supply exactly one of `file_url`, `file_data`, or
-`file_id`:
-
-```json
-{
-  "type": "input_file",
-  "file_url": "data:video/mp4;base64,AAAA",
-  "media_type": "video/mp4",
-  "filename": "demo.mp4"
-}
-```
+A file part supplies exactly one of `file_url`, `file_data`, or `file_id`:
 
 ```json
 {
@@ -96,228 +87,79 @@ Use `input_file` for image, video, or audio. Supply exactly one of `file_url`, `
 ```json
 {
   "type": "input_file",
-  "file_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  "file_url": "data:video/mp4;base64,AAAA",
+  "media_type": "video/mp4",
+  "filename": "clip.mp4"
 }
 ```
 
-`file_data` is raw base64 without a `data:` prefix and requires a concrete MIME type. `file_url`
-accepts only a base64 data URL. Remote URLs, local paths, and `file:` URLs are never accepted over
-REST.
-
-## Response objects
-
-A memory response keeps textual content and adds explicit modality and safe asset metadata:
-
 ```json
-{
-  "id": "sha256-memory-id",
-  "content": "The prototype after the review",
-  "modality": "image",
-  "memory_type": "episodic",
-  "assets": [
-    {
-      "id": "sha256-asset-id",
-      "modality": "image",
-      "media_type": "image/png",
-      "size_bytes": 42001,
-      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-      "name": "prototype.png"
-    }
-  ],
-  "created_at": "2026-08-27T09:30:00Z",
-  "occurred_at": null,
-  "occurred_end": null,
-  "metadata": {"source": "design-review"}
-}
+{"type":"input_file","file_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","media_type":"video/*"}
 ```
 
-`modality` is persisted by the core and is one of `text`, `image`, `video`, `audio`, or `omni`.
-`memory_type` is `semantic`, `episodic`, or `procedural`. Asset filesystem paths are never
-serialized.
+`image_url` and `file_url` accept only base64 `data:` URLs. `file_data` is raw base64 and requires
+a concrete image, video, or audio MIME type. An optional MIME type must agree with the data URL.
+`filename` is a safe basename of at most 255 characters. Remote URLs, local paths, `file:` URLs,
+and `input_image.detail` are not accepted. Fetch remote media in the host application or use the
+[Python content contract](python-sdk.md#content-contract).
 
-## Endpoints
+`file_id` is an existing asset's 64-character lowercase SHA-256 identifier in the same
+`data_dir`. Its transport field accepts at most 255 characters so malformed IDs reach the shared
+SDK validator and error contract.
 
-### Health
+### Endpoints
 
-```http
-GET /healthz
-```
+| Method and path | Input | Success |
+| --- | --- | --- |
+| `GET /healthz` | none | `200 {"status":"ok"}` |
+| `POST /v1/memories` | `MemoryCreate` | `201 MemoryResponse` |
+| `POST /v1/memories/batch` | `MemoryBatchCreate` | `201 {"memories":[...]}` |
+| `GET /v1/memories` | `limit`, `cursor` query parameters | `200 PageResponse` |
+| `POST /v1/memories/search` | `QueryRequest` | `200 {"hits":[...]}` |
+| `GET /v1/memories/{memory_id}` | non-empty path value | `200 MemoryResponse` |
+| `DELETE /v1/memories/{memory_id}` | non-empty path value | `200 {"deleted":bool}` |
+| `POST /v1/answers` | `AnswerRequest` | `200 AnswerResponse` |
 
-Response `200`:
+Request fields and defaults are:
 
-```json
-{"status":"ok"}
-```
+| Request | Fields |
+| --- | --- |
+| `MemoryCreate` | required `content`; optional `occurred_at`, `occurred_end`, `metadata`; `memory_type="semantic"` |
+| `MemoryBatchCreate` | `contents` with 1–100 items; optional per-item arrays `occurred_at`, `occurred_end`, `metadata`; `memory_type="semantic"` for the complete batch |
+| `QueryRequest` | required `query`; `limit=10`; optional `memory_type`, `reference_at`, `occurred_from`, `occurred_until` |
+| `AnswerRequest` | required `question`; `limit=5`; optional `memory_type`, `reference_at` |
+| List query | `limit=100`; optional opaque `cursor` |
 
-### Create a memory
+All timestamps must include a timezone. An event end requires a start and must be later than it.
+If a batch supplies a per-item array, it must contain exactly one value per content. Search event
+bounds are a half-open overlap filter; two bounds require `occurred_until > occurred_from`, and
+records without `occurred_at` do not match. Pass `next_cursor` back unchanged to continue listing.
+Time and role behavior is defined in
+[memory types, time, and decay](../memory-types-time-and-decay.md).
 
-```http
-POST /v1/memories
-Content-Type: application/json
-```
+Creation is content-addressed and idempotent. Batch results preserve input order. Deletion is also
+idempotent: `deleted` reports whether a record existed. `ask` requires an answerer configured in
+the injected memory.
 
-```json
-{
-  "content": [
-    {"type": "input_text", "text": "The prototype after the review"},
-    {
-      "type": "input_image",
-      "file_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    }
-  ],
-  "memory_type": "episodic",
-  "occurred_at": "2026-08-27T09:00:00Z",
-  "occurred_end": "2026-08-27T09:05:00Z",
-  "metadata": {"source": "design-review"}
-}
-```
+### Response objects
 
-`occurred_at`, `occurred_end`, `metadata`, and `memory_type` are optional; memory type defaults to
-`semantic`. An event end requires a timezone-aware start and must be later than it.
-Response `201` is one memory object. Repeating the same canonical input returns the existing record
-without another model call.
+| Object | Fields |
+| --- | --- |
+| `AssetResponse` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name` |
+| `MemoryResponse` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata` |
+| `SearchHitResponse` | all memory fields plus `score` from 0 through 1 |
+| `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
+| `PageResponse` | `items`, `next_cursor` |
 
-### Create a batch
+`modality` is `text`, `image`, `video`, `audio`, or `omni`. `memory_type` is `semantic`,
+`episodic`, or `procedural`. `abstention_reason` is `no_evidence`, `insufficient_evidence`, or
+`null`. Asset filesystem paths are never serialized.
 
-```http
-POST /v1/memories/batch
-Content-Type: application/json
-```
+## Errors and limits
 
-```json
-{
-  "contents": [
-    "First memory",
-    [
-      {"type": "input_text", "text": "Second memory"},
-      {
-        "type": "input_file",
-        "file_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-      }
-    ]
-  ],
-  "occurred_at": ["2026-08-27T09:00:00Z", null],
-  "occurred_end": [null, null],
-  "metadata": [{"source": "design-review"}, null],
-  "memory_type": "procedural"
-}
-```
+### Error envelope
 
-`contents` has 1 through 100 items. One optional `memory_type` applies to the complete batch and
-defaults to `semantic`. Response `201` is `{"memories": [...]}` in input order.
-
-`occurred_at`, `occurred_end`, and `metadata` are optional per-item arrays. Supplying one requires
-exactly one entry per item; omitting it applies `null` to every item. These values are part of a
-memory's content-addressed identity, so a batch import that omits them produces different IDs than
-the same records added with them — over any surface.
-
-### Search memories
-
-```http
-POST /v1/memories/search
-Content-Type: application/json
-```
-
-```json
-{
-  "query": [
-    {"type": "input_text", "text": "Find a prototype like this"},
-    {
-      "type": "input_image",
-      "file_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    }
-  ],
-  "limit": 10,
-  "memory_type": "episodic",
-  "reference_at": "2026-08-27T12:00:00Z",
-  "occurred_from": "2026-08-20T00:00:00Z",
-  "occurred_until": "2026-08-27T00:00:00Z"
-}
-```
-
-`limit` defaults to 10 and ranges from 1 through 100. `memory_type` optionally filters one role.
-`reference_at` resolves relative date expressions and must include a timezone; current UTC is the
-default unless the query declares a valid English reference date such as
-`Today is May 2, 2024`; an explicit value always wins. Absolute months and years such as
-`December 2023`, `2024年4月`, or `in 2025` select the matching event-time range.
-`occurred_from` and `occurred_until` are optional timezone-aware hard filters. Stored event
-intervals must overlap their half-open range; either bound may be omitted, records without
-`occurred_at` are excluded, and two bounds require `occurred_until > occurred_from`. Response `200`
-is `{"hits": [...]}`; each
-hit has the memory fields plus `score`. The complete ordered query and bounded focused keys from
-its first text atom and media supply dense candidates; the focused text also supplies lexical
-candidates. All routes collapse aggregate or atomic document keys to parent memories.
-
-### Answer from memories
-
-```http
-POST /v1/answers
-Content-Type: application/json
-```
-
-```json
-{
-  "question": "What changed last week?",
-  "limit": 5,
-  "memory_type": "episodic",
-  "reference_at": "2026-08-27T12:00:00Z"
-}
-```
-
-`limit` defaults to 5. Response `200`:
-
-```json
-{
-  "answer": "I don't know based on the available memories.",
-  "hits": [],
-  "abstained": true,
-  "abstention_reason": "no_evidence"
-}
-```
-
-`memory_type` and `reference_at` have the same semantics as search. `hits` are the exact search
-results used to ground the answer. `abstention_reason` is `no_evidence`,
-`insufficient_evidence`, or `null` when `abstained` is false. The outbound generation request
-includes their content, `memory_type`, `occurred_at`, `occurred_end`, `created_at`, metadata, and
-media. In the built-in model request, a distinct question/evidence asset is serialized once even
-when multiple hits refer to it.
-
-### Get a memory
-
-```http
-GET /v1/memories/{memory_id}
-```
-
-Response `200` is one memory object. A missing ID returns `404`.
-
-### List memories
-
-```http
-GET /v1/memories?limit=100&cursor=opaque-value
-```
-
-`limit` defaults to 100 and ranges from 1 through 100, matching `Memory.list`. Omit `cursor` for the
-first page. Response `200`:
-
-```json
-{"items":[],"next_cursor":null}
-```
-
-Pass `next_cursor` back unchanged until it is `null`.
-
-### Delete a memory
-
-```http
-DELETE /v1/memories/{memory_id}
-```
-
-Response `200` is `{"deleted": true}` when the ID existed and `{"deleted": false}` when it did not.
-Deletion is idempotent either way, and the flag matches the Python `bool` and the MCP
-`delete_memory` result so a reconciliation loop can tell the two apart.
-
-## Error envelope
-
-Every error response has one flat shape:
+Every REST failure uses one flat JSON shape:
 
 ```json
 {
@@ -327,7 +169,7 @@ Every error response has one flat shape:
   "stage": null,
   "subject": null,
   "message": "request validation failed",
-  "trace_id": "trace_0123456789abcdef",
+  "trace_id": "trace_0123456789abcdef0123456789abcdef",
   "issues": [
     {
       "location": ["body", "content"],
@@ -338,104 +180,79 @@ Every error response has one flat shape:
 }
 ```
 
-`code` is the stable outer taxonomy. `reason` narrows it to a closed sub-vocabulary, `stage` names
-the pipeline stage that failed, and `subject` names the asset, memory, or batch position the failure
-is about. `issues` is empty for non-validation failures. Any of `reason`, `stage`, and `subject` may
-be `null` when MindBridge cannot classify a failure further; an unclassified failure is never
-reported as retryable.
+`code` is the stable outer category. `reason` narrows it, `stage` identifies the failed pipeline
+stage, and `subject` identifies an input, asset, memory, or batch position. Any may be `null` when
+unclassified. `issues` is populated for request-schema failures. `trace_id` correlates the response
+with owner logs.
 
-**`retryable` is a lookup on `reason`, never a guess.** It is `true` only for `rate_limited`,
-`timeout`, `connection_failed`, `data_dir_in_use`, `flush_failed`, and `index_missing`; the last two
-have no raise site today and are reserved. A retryable
-failure that maps to `503` also carries a `Retry-After` header.
+For unauthenticated REST, `subject` is withheld for `storage_error`, `index_unavailable`, and
+`internal_error` because it may name local server state. Provider exception details and credentials
+are never serialized.
 
 ### Codes and reasons
 
-| `code` | `reason` values |
+| `code` | `reason` values used by the current implementation |
 | --- | --- |
-| `validation_error` | `input_invalid`, `unknown_field`, `payload_too_large` |
+| `validation_error` | `input_invalid` |
+| `request_too_large` | `payload_too_large` |
 | `memory_not_found` | `memory_not_found` |
 | `speaker_not_found` | `speaker_not_found` |
 | `identity_not_found` | `identity_not_found` |
-| `model_error` | `backend_not_configured`, `unsupported_modality`, `auth_failed`, `rate_limited`, `quota_exhausted`, `timeout`, `connection_failed`, `request_rejected`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed` |
+| `model_error` | unset, `backend_not_configured`, `unsupported_modality`, `auth_failed`, `rate_limited`, `quota_exhausted`, `timeout`, `connection_failed`, `request_rejected`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed` |
 | `model_output_truncated` | `output_truncated` |
-| `storage_error` | `data_dir_in_use`, `schema_unsupported`, `io_failed` |
-| `index_unavailable` | *(unset; an index failure is never assumed retryable)* |
+| `storage_error` | unset, `data_dir_in_use`, `schema_unsupported`, `io_failed` |
+| `index_unavailable` | unset |
+| `mindbridge_error` | unset |
 | `internal_error` | `unexpected` |
+| `not_found`, `method_not_allowed`, `http_error` | unset |
 
-`model_error` reasons that name a provider condition are classified from the official OpenAI SDK's
-own exception classes when the bundled adapter is in use; MindBridge does not invent a parallel
-taxonomy. The original provider exception stays as the raised error's `__cause__` in the owner
-process and is never serialized.
+`retryable` is true only for `connection_failed`, `data_dir_in_use`, `flush_failed`,
+`index_missing`, `rate_limited`, and `timeout`. `flush_failed` and `index_missing` are reserved
+retry reasons with no current raise site. A retryable 503 response includes `Retry-After: 1`.
 
-### Status codes
+HTTP status mapping is:
 
-| Status | Code and reason | Meaning |
-| --- | --- | --- |
-| 404 | `not_found` | Route does not exist |
-| 404 | `memory_not_found` | Memory ID does not exist |
-| 404 | `speaker_not_found` | Local speaker identity does not exist |
-| 404 | `identity_not_found` | Face/voice identity does not exist |
-| 405 | `method_not_allowed` | Method is not allowed for this route |
-| 413 | `request_too_large` | Request body exceeds 8 MiB |
-| 422 | `validation_error` | Request, media source, or public input is invalid |
-| 422 | `model_error` + `unsupported_modality` | No configured backend accepts this modality |
-| 500 | `storage_error` + `schema_unsupported` | On-disk schema needs a different MindBridge version |
-| 500 | `internal_error` | Unexpected failure |
-| 501 | `model_error` + `backend_not_configured` | The operation needs a backend this deployment never supplied |
-| 502 | `model_error` | A permanent upstream or response failure; retrying the same call will not help |
-| 502 | `model_output_truncated` | Generation stopped at an output token limit; retrying is pointless |
-| 503 | `model_error` with `retryable: true` | Transient provider failure; honour `Retry-After` |
-| 503 | `index_unavailable` or `storage_error` | Embedded index or durable state failed |
-| — | `http_error` | Any other framework-level HTTP failure |
-
-`501` and `502` mean the same call can never succeed; only `503` invites a retry. Use `trace_id` to
-correlate a response with server logs. Messages are author-written literals: they never carry
-provider responses, credentials, local paths, or native-index details. `subject` is withheld for
-`storage_error`, `index_unavailable`, and `internal_error`, because it names server state rather
-than caller input.
-
-## Current limits
+| Status | Failure |
+| --- | --- |
+| 404 | unknown route, memory, speaker, or identity |
+| 405 | method not allowed |
+| 413 | `/v1` request body exceeds 8 MiB |
+| 422 | request or SDK validation; `model_error/unsupported_modality` |
+| 500 | unexpected failure, generic `MindBridgeError`, or `storage_error/schema_unsupported` |
+| 501 | `model_error/backend_not_configured` |
+| 502 | permanent `model_error` or `model_output_truncated` |
+| 503 | other storage/index failures or retryable model failures |
 
 ### Operations without a route
 
-REST covers `add`, `add_many`, `search`, `ask`, `get`, `list`, and `delete` with the same defaults,
-field meanings, and error semantics as the Python SDK. Nine documented SDK operations have no
-route:
+REST has no route for these Python operations:
 
-| Operation | Why there is no route |
+| Operation | Boundary |
 | --- | --- |
-| `add_stream` | A Python iterator is process-local; clients send completed chunks through `POST /v1/memories` |
-| `search_with_trace` | Owner-process diagnostics with high-cardinality memory and index IDs |
-| `speech` | Not implemented on any transport yet |
-| `faces` | Python-only visual identity analysis |
-| `register_speaker` | Not implemented on any transport yet |
-| `register_identity` | Python-only face/voice identity naming |
-| `reinforce` | Not implemented on any transport yet |
-| `reindex` | Owner-process maintenance: it rebuilds the whole index and must not be reachable by an unauthenticated client |
-| `optimize` | Owner-process maintenance, for the same reason |
+| `add_stream` | Send each completed observation to `POST /v1/memories` |
+| `search_with_trace` | Owner-process retrieval diagnostics |
+| `speech`, `faces` | Owner-process media analysis |
+| `register_speaker`, `register_identity` | Owner-process identity naming |
+| `reinforce` | Owner-process feedback |
+| `reindex`, `optimize` | Owner-process index maintenance |
 
-`add_stream`, `speech`, `faces`, identity registration, and `reinforce` are implementation gaps, not a different
-execution model. Use the Python API in the owner process until they ship. See
-[Python SDK](python-sdk.md) for the full inventory.
+Use the [Python SDK](python-sdk.md) in the owning process for those operations.
 
 ### Input limits
 
-| Limit | REST | MCP | Python |
-| --- | --- | --- | --- |
-| Content parts per operation | 16 | 16 | 128 |
-| Characters per text part | 65,536 | 65,536 | 65,536 |
-| Inline media per part | Bounded by the request body | 8 MiB | Unbounded on disk |
-| Total request size | 8 MiB | Unbounded framing | Unbounded |
+| Bound | REST value |
+| --- | --- |
+| Complete `/v1` request body | 8 MiB before JSON parsing |
+| Content parts | 1 through 16 |
+| One URL source string | 8,192 characters |
+| Normalized text, including combined text parts | 65,536 characters |
+| Batch contents | 1 through 100 |
+| Search, answer, or page `limit` | 1 through 100 |
+| Serialized metadata for one memory | 262,144 UTF-8 bytes |
+| `file_id` or `filename` | 255 characters |
 
-The transports are deliberately narrower than the Python API: an HTTP body is bounded before parsing
-so an oversized request cannot reach the memory core. Fetch large media in the host application and
-use the Python `Path`/`Blob` contract or a provider-specific adapter.
-
-### Absent features
-
-The REST API has no local-path input, large-file upload endpoint, update route, metadata filter,
-logical scope parameter, chunking contract, per-asset vector control, or learned reranker. The OpenAI
-adapter inlines at most 20 MiB per base64-encoded media item and 64 MiB per embedding or generation
-call, roughly 15 MiB per file and 48 MiB in aggregate on disk; generation admits ranked evidence
-within those budgets, and answer text evidence is limited to 4 MiB.
+`file_data` is bounded by the complete HTTP body. A data URL is also bounded by the 8,192-character
+source field. The transport has no local-path input, remote fetch, upload endpoint, logical scope,
+or authentication policy. The owner-side Python input ceiling is 512 MiB per asset, but configured
+backends may be lower; the [OpenAI adapter](python-sdk.md#bundled-adapters) has smaller inline
+request budgets.

@@ -43,8 +43,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - Per-record event-time and metadata sequences on `add_many`, retaining one embedding batch and one
   SQLite transaction.
 - Crash-recoverable index replay and rebuild from SQLite without re-embedding stored content.
-- An optional resource-oriented REST API under `/v1` and six typed MCP stdio tools over a
-  caller-supplied `Memory`.
+- An optional resource-oriented REST API under `/v1` and six typed MCP tools over a caller-supplied
+  `Memory`; the documented MCP invocation uses stdio.
 - One ordered multimodal contract across Python, REST, and MCP; response assets expose stable
   metadata without leaking local paths over wire protocols.
 - Independent embedding, generation, and transcription backends with narrow operation-specific
@@ -290,11 +290,10 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   as having no REST route and no MCP tool, and a full-text match is documented as scoring 0.6
   confidence and so clearing the default `minimum_relevance` regardless of vector distance.
 - `docs/api/cli.md` is now a reference for a shipped command rather than a contract for a pending
-  one, and `docs/design-principles.md`, `docs/architecture.md`, `README.md`, and `CLAUDE.md` no
-  longer describe the product CLI as missing. The design document's "one CLI with two command
-  families" is corrected to two console scripts forming one documented surface, with the reason:
-  the packaging guard scans string constants, so a single dispatcher could not name the benchmark
-  package even to import it lazily.
+  one, and the remaining documentation no longer describes the product CLI as missing. The old
+  "one CLI with two command families" design is corrected to two console scripts forming one
+  documented surface, with the reason: the packaging guard scans string constants, so a single
+  dispatcher could not name the benchmark package even to import it lazily.
 
 ### Removed
 
@@ -337,7 +336,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - No built-in user authentication, rate limiting, quotas, or secure-erasure guarantee.
 - The CLI has no `--format` flag, configuration file, `MINDBRIDGE_*` composition variable, plugin
   registry, backend registration by name, streaming output, interactive prompt, `serve` command, or
-  named `SentenceTransformersEmbedder` recipe. `--url` mode covers only the seven operations REST
-  routes; the other nine CLI commands exit 10 and name the surfaces that do support them.
+  named `SentenceTransformersEmbedder` recipe. `--url` mode covers the seven routed operations plus
+  `doctor`; the other nine CLI commands exit 10 and name the surfaces that do support them.
   `add-stream` reads finite JSONL lazily but collects return records until EOF to preserve the
   one-document stdout contract; unbounded sources use the Python SDK.
