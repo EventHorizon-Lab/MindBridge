@@ -4,21 +4,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import hashlib
 import json
 import math
 import os
 import platform
 import re
+import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, gettempdir
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from opentelemetry import trace
@@ -29,6 +31,7 @@ if TYPE_CHECKING:
 
 from mindbridge import (
     DEFAULT_FUNASR_MODEL_ID,
+    DEFAULT_FUNASR_RECIPE,
     AssetRef,
     AsyncMemory,
     FunASRTranscriber,
@@ -94,6 +97,7 @@ from mindbridge.benchmarks.task_catalog import (
     expand,
     listing,
 )
+from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
@@ -109,7 +113,7 @@ from mindbridge.models.jina import (
 )
 from mindbridge.models.openai_sdk import _model_usage, _record_usage_batch
 
-EVAL_SCHEMA_VERSION = 7
+EVAL_SCHEMA_VERSION = 8
 EVAL_RUNNER_VERSION = "mindbridge_eval_official_v9"
 DEFAULT_BOOTSTRAP_SAMPLES = 2_000
 _RESULTS_FILE = "results.json"
@@ -160,6 +164,7 @@ class _Arguments:
     num_fewshot: int
     use_cache: Path | None
     device: str | None
+    device_lock: bool
     compare: Path | None
     fail_on_regression: bool
     regression_threshold: float
@@ -189,6 +194,26 @@ class _JudgeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class FailureDetail:
+    """Safe, stable benchmark failure diagnostics."""
+
+    source_id: str | None
+    code: str
+    reason: str | None
+    stage: str | None
+    cause_type: str | None
+
+    def json(self) -> dict[str, str | None]:
+        return {
+            "source_id": self.source_id,
+            "code": self.code,
+            "reason": self.reason,
+            "stage": self.stage,
+            "cause_type": self.cause_type,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class SampleResult:
     """One answered question plus diagnostics needed for replay and comparison."""
 
@@ -208,6 +233,12 @@ class SampleResult:
     ingest_failure_count: int
     error_code: str | None
     metadata: Mapping[str, object]
+    abstained: bool = False
+    abstention_reason: str | None = None
+    ingest_failures: tuple[FailureDetail, ...] = ()
+    error_reason: str | None = None
+    error_stage: str | None = None
+    error_cause_type: str | None = None
     cached: bool = False
     prompt: tuple[str, ...] | None = None
     references: tuple[str, ...] | None = None
@@ -251,7 +282,13 @@ class SampleResult:
             "judge_model": self.judge_model,
             "judge_cached": self.judge_cached,
             "ingest_failure_count": self.ingest_failure_count,
+            "ingest_failures": tuple(item.json() for item in self.ingest_failures),
             "error_code": self.error_code,
+            "error_reason": self.error_reason,
+            "error_stage": self.error_stage,
+            "error_cause_type": self.error_cause_type,
+            "abstained": self.abstained,
+            "abstention_reason": self.abstention_reason,
             "cached": self.cached,
             "metadata": dict(self.metadata),
         }
@@ -280,6 +317,8 @@ class _AnswerOutcome:
     confidence: float
     memory_ids: tuple[str, ...]
     evidence: tuple[EvidenceInterval, ...]
+    abstained: bool = False
+    abstention_reason: str | None = None
     cached: bool = False
     error: BaseException | None = None
 
@@ -306,6 +345,18 @@ class _BorrowedBackend:
 
 class _BorrowedSpeechBackend(_BorrowedBackend):
     """Skip visual-only videos before lending the shared speech backend."""
+
+    @property
+    def transcription_capabilities(self) -> frozenset[Modality]:
+        return cast(SpeechBackend, self._backend).transcription_capabilities
+
+    @property
+    def transcription_model(self) -> str:
+        return cast(SpeechBackend, self._backend).transcription_model
+
+    @property
+    def transcription_space(self) -> str:
+        return cast(SpeechBackend, self._backend).transcription_space
 
     def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
         selected = tuple(
@@ -379,7 +430,18 @@ class _BackendPool:
         )
         self.embedder = JinaOmniEmbedder(device=device, batch_size=batch_size)
         self.embedder.embed((ModelInput(text="MindBridge benchmark warmup"),), task=EmbedTask.QUERY)
-        self.transcriber = FunASRTranscriber(device=device or "auto") if needs_speech else None
+        self.transcriber = (
+            FunASRTranscriber(
+                recipe=replace(
+                    DEFAULT_FUNASR_RECIPE,
+                    speaker_model=None,
+                    speaker_revision=None,
+                ),
+                device=device or "auto",
+            )
+            if needs_speech
+            else None
+        )
         self._answerer = cast(GenerationBackend, _BorrowedBackend(self.models))
         self._embedder = cast(EmbeddingBackend, _BorrowedBackend(self.embedder))
         self._transcriber = (
@@ -548,6 +610,114 @@ def _announce_submission(arguments: _Arguments, status: Mapping[str, object] | N
     _announce(f"EgoMemReason submission {status['status']}: {status['reason']}")
 
 
+@contextmanager
+def _benchmark_device_lock(
+    device: str | None,
+    *,
+    enabled: bool,
+    quiet: bool,
+    lock_root: Path | None = None,
+) -> Iterator[None]:
+    normalized = (device or "auto").strip().lower()
+    if not enabled or normalized == "cpu":
+        yield
+        return
+    index = _cuda_logical_index(normalized)
+    identity = _physical_cuda_identity(normalized)
+    if identity is None:
+        yield
+        return
+    if lock_root is None:
+        owner = hashlib.sha256(str(Path.home()).encode()).hexdigest()[:12]
+        lock_root = Path(os.environ.get("XDG_RUNTIME_DIR", gettempdir())) / (
+            f"mindbridge-benchmark-{owner}"
+        )
+    device_key = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    # ponytail: one local model process per CUDA device; use a VRAM budget only when
+    # concurrent model pools demonstrate a safe, repeatable throughput gain.
+    announced = False
+    while True:
+        try:
+            lock = DataDirectoryLock(lock_root / f"cuda-{device_key}")
+            break
+        except DataDirectoryInUseError:
+            if not quiet and not announced:
+                _announce(f"waiting for local CUDA device {index}")
+                announced = True
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        lock.close()
+
+
+def _cuda_logical_index(device: str) -> int:
+    match = re.fullmatch(r"cuda(?::(\d+))?", device)
+    return int(match.group(1)) if match is not None and match.group(1) is not None else 0
+
+
+def _physical_cuda_identity(device: str) -> str | None:
+    logical_index = _cuda_logical_index(device)
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        selected = str(logical_index)
+    else:
+        exposed = tuple(value.strip() for value in visible.split(",") if value.strip())
+        if logical_index >= len(exposed) or exposed[logical_index] == "-1":
+            return None
+        selected = exposed[logical_index]
+    uuids = _nvidia_device_uuids()
+    if selected.isdecimal():
+        physical_index = int(selected)
+        return uuids.get(physical_index, f"index:{physical_index}").casefold()
+    normalized = selected.casefold()
+    return next(
+        (
+            uuid.casefold()
+            for uuid in uuids.values()
+            if uuid.casefold().startswith(normalized) or normalized.startswith(uuid.casefold())
+        ),
+        normalized,
+    )
+
+
+def _nvidia_device_uuids() -> dict[int, str]:
+    try:
+        result = subprocess.run(
+            (
+                "nvidia-smi",
+                "--query-gpu=index,uuid",
+                "--format=csv,noheader,nounits",
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode:
+        return {}
+    devices = {}
+    for line in result.stdout.splitlines():
+        index, separator, uuid = line.partition(",")
+        if separator and index.strip().isdecimal() and uuid.strip():
+            devices[int(index.strip())] = uuid.strip()
+    return devices
+
+
+def _release_device_memory(device: str | None) -> None:
+    if (device or "auto").strip().lower() == "cpu":
+        return
+    gc.collect()
+    with suppress(ImportError):
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def _execute(
     loaded: Sequence[LoadedTask],
     arguments: _Arguments,
@@ -577,35 +747,46 @@ def _execute(
         )
         pool: _BackendPool | None = None
         memory_factory: MemoryFactory
-        try:
-            if response_cache is not None and _all_cached(response_cache, loaded):
-                memory_factory = _cache_only_memory
-            else:
-                pool = _BackendPool(
-                    config,
-                    device=arguments.device,
-                    batch_size=max(batch_sizes.values()),
-                    needs_speech=needs_speech,
-                    seed=arguments.seed,
-                    gen_kwargs=arguments.gen_kwargs,
-                    tracer=telemetry.tracer,
+        all_cached = response_cache is not None and _all_cached(response_cache, loaded)
+        with _benchmark_device_lock(
+            arguments.device,
+            enabled=arguments.device_lock and not all_cached,
+            quiet=arguments.quiet,
+        ):
+            try:
+                if all_cached:
+                    memory_factory = _cache_only_memory
+                else:
+                    pool = _BackendPool(
+                        config,
+                        device=arguments.device,
+                        batch_size=max(batch_sizes.values()),
+                        needs_speech=needs_speech,
+                        seed=arguments.seed,
+                        gen_kwargs=arguments.gen_kwargs,
+                        tracer=telemetry.tracer,
+                    )
+                    memory_factory = pool.memory
+                samples = asyncio.run(
+                    _run_all(
+                        loaded,
+                        arguments,
+                        batch_sizes=batch_sizes,
+                        memory_factory=memory_factory,
+                        response_cache=response_cache,
+                        tracer=telemetry.tracer,
+                    )
                 )
-                memory_factory = pool.memory
-            samples = asyncio.run(
-                _run_all(
-                    loaded,
-                    arguments,
-                    batch_sizes=batch_sizes,
-                    memory_factory=memory_factory,
-                    response_cache=response_cache,
-                    tracer=telemetry.tracer,
-                )
-            )
-        finally:
-            if pool is not None:
-                pool.close()
-            if response_cache is not None:
-                response_cache.close()
+            finally:
+                if pool is not None:
+                    closing = pool
+                    pool = None
+                    memory_factory = _cache_only_memory
+                    closing.close()
+                    del closing
+                    _release_device_memory(arguments.device)
+                if response_cache is not None:
+                    response_cache.close()
         if not arguments.predict_only:
             samples = asyncio.run(
                 _apply_judges(
@@ -759,6 +940,7 @@ async def _run_unit(
     )
     pending = 0
     ingest_failures = 0
+    ingest_failure_details: list[FailureDetail] = []
     try:
         async with memory_factory(data_dir) as memory:
             for cutoff in cutoffs:
@@ -767,7 +949,10 @@ async def _run_unit(
                 while end < len(memories) and _memory_end(memories[end]) <= boundary:
                     end += 1
                 ingest_failures += await _ingest(
-                    memory, memories[pending:end], batch_size=batch_size
+                    memory,
+                    memories[pending:end],
+                    batch_size=batch_size,
+                    on_failure=ingest_failure_details.append,
                 )
                 pending = end
 
@@ -800,6 +985,7 @@ async def _run_unit(
                         question,
                         outcome,
                         ingest_failures=ingest_failures,
+                        ingest_failure_details=tuple(ingest_failure_details),
                         predict_only=predict_only,
                         log_samples=log_samples,
                     )
@@ -817,6 +1003,7 @@ async def _run_unit(
                     question,
                     error,
                     ingest_failures=ingest_failures,
+                    ingest_failure_details=tuple(ingest_failure_details),
                     predict_only=predict_only,
                     log_samples=log_samples,
                 ),
@@ -844,6 +1031,8 @@ def _cached_results(
                 answer.confidence,
                 answer.memory_ids,
                 answer.evidence,
+                abstained=answer.abstained,
+                abstention_reason=answer.abstention_reason,
                 cached=True,
             )
             results[question.question_id] = _sample(
@@ -895,6 +1084,8 @@ def _cache_outcome(
             outcome.confidence,
             outcome.memory_ids,
             outcome.evidence,
+            outcome.abstained,
+            outcome.abstention_reason,
         ),
     )
 
@@ -904,6 +1095,7 @@ async def _ingest(
     items: Sequence[MemoryItem],
     *,
     batch_size: int,
+    on_failure: Callable[[FailureDetail], None] | None = None,
 ) -> int:
     async def add_chunk(chunk: Sequence[MemoryItem]) -> int:
         contents = tuple(_memory_content(item) for item in chunk)
@@ -930,7 +1122,11 @@ async def _ingest(
                 metadata=_memory_metadata(chunk[0]),
                 memory_type=MemoryType.EPISODIC,
             )
-        except Exception:
+        except IndexUnavailableError:
+            raise
+        except Exception as error:
+            if on_failure is not None:
+                on_failure(_failure_detail(error, source_id=chunk[0].source_id))
             return 1
         return 0
 
@@ -984,6 +1180,10 @@ async def _answer_many(
                     max((hit.score for hit in result.hits), default=0.0),
                     tuple(hit.id for hit in result.hits),
                     tuple(_evidence(hit) for hit in result.hits),
+                    abstained=result.abstained,
+                    abstention_reason=(
+                        None if result.abstention_reason is None else result.abstention_reason.value
+                    ),
                 )
         if on_answer is not None:
             on_answer(question, outcome)
@@ -1001,12 +1201,14 @@ def _sample(
     outcome: _AnswerOutcome | BaseException,
     *,
     ingest_failures: int,
+    ingest_failure_details: tuple[FailureDetail, ...] = (),
     predict_only: bool,
     log_samples: bool,
 ) -> SampleResult:
     memory_ids: tuple[str, ...]
     evidence: tuple[EvidenceInterval, ...]
     error_code: str | None
+    error_detail: FailureDetail | None
     if isinstance(outcome, BaseException):
         prediction, latency_ms, confidence, memory_ids, evidence, cached = (
             "",
@@ -1016,7 +1218,10 @@ def _sample(
             (),
             False,
         )
-        error_code = _error_code(outcome)
+        error_detail = _failure_detail(outcome)
+        error_code = error_detail.code
+        abstained = False
+        abstention_reason = None
     else:
         prediction = outcome.prediction
         latency_ms = outcome.latency_ms
@@ -1024,7 +1229,10 @@ def _sample(
         memory_ids = outcome.memory_ids
         evidence = outcome.evidence
         cached = outcome.cached
-        error_code = None if outcome.error is None else _error_code(outcome.error)
+        error_detail = None if outcome.error is None else _failure_detail(outcome.error)
+        error_code = None if error_detail is None else error_detail.code
+        abstained = outcome.abstained
+        abstention_reason = outcome.abstention_reason
     choices = tuple(
         str(value) for value in cast(Sequence[object], question.metadata.get("choices", ()))
     )
@@ -1052,7 +1260,13 @@ def _sample(
         confidence=confidence,
         memory_ids=memory_ids,
         ingest_failure_count=ingest_failures,
+        ingest_failures=ingest_failure_details,
         error_code=error_code,
+        error_reason=None if error_detail is None else error_detail.reason,
+        error_stage=None if error_detail is None else error_detail.stage,
+        error_cause_type=None if error_detail is None else error_detail.cause_type,
+        abstained=abstained,
+        abstention_reason=abstention_reason,
         cached=cached,
         metadata=question.metadata,
         prompt=tuple(str(part) for part in question.content) if log_samples else None,
@@ -1107,7 +1321,7 @@ async def _apply_judges(
     }
     planned: dict[str, JudgePlan] = {}
     for sample in samples:
-        if sample.error_code is not None:
+        if sample.error_code is not None or sample.ingest_failure_count:
             continue
         question = questions[(sample.task, sample.unit_id, sample.question_id)]
         plan = judge_plan(
@@ -1538,6 +1752,7 @@ def _results(
         "response_cache": None if arguments.use_cache is None else str(arguments.use_cache),
         "cached_response_count": sum(sample.cached for sample in samples),
         "cached_judge_count": sum(sample.judge_cached for sample in samples),
+        "abstentions": _abstentions(samples),
         "allow_unverified_data": arguments.allow_unverified_data,
         "limit": arguments.limit,
         "offset": arguments.offset,
@@ -1658,6 +1873,7 @@ def _metrics(
         "question_count": len(samples),
         "error_count": error_count,
         "ingest_failure_count": ingest_failure_count,
+        "abstentions": _abstentions(samples),
         "latency_ms": {
             "p50": _percentile(latencies, 0.50),
             "p95": _percentile(latencies, 0.95),
@@ -1713,6 +1929,21 @@ def _metrics(
         result["ref_at_300"] = ref_summary
         metric_rows["ref_at_300"] = ref_summary
     return result
+
+
+def _abstentions(samples: Sequence[SampleResult]) -> dict[str, object]:
+    count = sum(sample.abstained for sample in samples)
+    reasons = {
+        reason: sum(sample.abstention_reason == reason for sample in samples)
+        for reason in sorted(
+            {sample.abstention_reason for sample in samples if sample.abstention_reason is not None}
+        )
+    }
+    return {
+        "count": count,
+        "rate": 0.0 if not samples else count / len(samples),
+        "reasons": reasons,
+    }
 
 
 def _metric_breakdowns(
@@ -2366,6 +2597,12 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", help="Jina/FunASR device: cpu, cuda, or cuda:N")
     parser.add_argument(
+        "--device-lock",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="serialize local model pools that share one CUDA device",
+    )
+    parser.add_argument(
         "--use-cache",
         "--use_cache",
         "-c",
@@ -2446,6 +2683,7 @@ def _arguments(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> _
         num_fewshot=parsed.num_fewshot,
         use_cache=(None if parsed.use_cache is None else parsed.use_cache.expanduser().resolve()),
         device=parsed.device,
+        device_lock=parsed.device_lock,
         compare=parsed.compare,
         fail_on_regression=parsed.fail_on_regression,
         regression_threshold=parsed.regression_threshold,
@@ -2638,6 +2876,24 @@ def _memory_end(item: MemoryItem) -> float:
 
 def _error_code(error: BaseException) -> str:
     return error.code if isinstance(error, MindBridgeError) else type(error).__name__
+
+
+def _failure_detail(error: BaseException, *, source_id: str | None = None) -> FailureDetail:
+    cause = error.__cause__ or error.__context__
+    seen = {id(error)}
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        next_cause = cause.__cause__ or cause.__context__
+        if next_cause is None:
+            break
+        cause = next_cause
+    return FailureDetail(
+        source_id=source_id,
+        code=_error_code(error),
+        reason=error.reason if isinstance(error, MindBridgeError) else None,
+        stage=error.stage if isinstance(error, MindBridgeError) else None,
+        cause_type=None if cause is None else type(cause).__name__,
+    )
 
 
 def _task_seed(seed: int, task: str) -> int:

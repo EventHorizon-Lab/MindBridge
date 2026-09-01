@@ -1,62 +1,87 @@
-# Extension status
+# Plugin architecture
 
-MindBridge v0.2 does not expose a runtime plugin registry. The supported implementation is one
-direct path from `Memory` to SQLite, Zvec, and explicit operation backends.
+## Decision
 
-This is deliberate:
+MindBridge uses a stable memory kernel with explicit, typed computation plugins. It does not use a
+global registry, arbitrary pipeline hooks, automatic package installation, or a second execution
+plane.
 
-- There is one authoritative storage implementation.
-- There is one derived search implementation.
-- `SentenceTransformersEmbedder` covers standard local models; `JinaOmniEmbedder` isolates Jina's
-  provider-specific input contract.
-- The official OpenAI SDK adapter covers compatible cloud endpoints without a provider registry;
-  other services use their provider SDK behind the narrow operation protocols.
-- Constructor injection already supplies the lifecycle boundary for another implementation.
+The kernel owns memory identity and semantics, capability routing, validation, SQLite and media-CAS
+durability, the index outbox, SQLite hydration, and final context construction. A plugin may perform
+inference, but it cannot own or bypass those rules.
 
-Application code can extend behavior by composition:
+## Implemented composition
+
+The supported plugins are the narrow `EmbeddingBackend`, `GenerationBackend`,
+`TranscriptionBackend`, `SpeechBackend`, and `FaceBackend` protocols. The declarative entry point
+constructs bundled implementations without exposing those runtime details:
 
 ```python
-from mindbridge import EmbeddingBackend, Memory
+from mindbridge import Memory
 
-
-class ProjectMemory:
-    def __init__(self, path: str, embedder: EmbeddingBackend) -> None:
-        self.memory = Memory(path, embedder=embedder)
-
-    def remember_decision(self, text: str) -> str:
-        return self.memory.add(text, metadata={"kind": "decision"}).id
-
-    def close(self) -> None:
-        self.memory.close()
+with Memory.from_config(
+    {
+        "data_dir": "./data",
+        "embedding": {"provider": "jina-omni"},
+        "speech": {"provider": "funasr"},
+        "settings": {"index_speech": True},
+    }
+) as memory:
+    memory.add("Remember this")
 ```
 
-Composition must not rely on metadata as a security boundary. Independent applications or memory
-domains still require independent directories.
+`Memory.from_config` validates a closed catalog of bundled providers, constructs owned adapters, and
+then delegates through `Memory.from_plugins` to the normal constructor. Custom and third-party
+implementations remain explicit object injection. All paths share capability validation, durable
+identity checks, storage, and execution. Omitting an optional plugin adds no model call or optional
+dependency. Reusing one object for several protocols is supported by the object API.
 
-The optional `server` and `mcp` dependencies are packaging boundaries, not runtime plugins. The
-REST and MCP adapters are thin transports over `Memory`; they do not provide alternative storage
-or retrieval implementations.
+Composition is fixed for one `Memory` lifetime. Changing an adapter requires closing and reopening
+the instance; changing the embedder also requires a compatible durable space or a new directory.
+There is no mid-operation hot swap.
 
-## Design direction
+## Kernel and plugin boundary
 
-MindBridge is intended to be pluggable through narrow, explicitly configured capabilities, not
-through a global registry of arbitrary hooks. The narrow backend protocols are the supported
-extension surface. A host can replace an implementation without changing memory semantics or
-adding provider branches to `Memory`.
+Current computation plugins own model and runtime details such as device, precision, batching,
+thresholds intrinsic to that model, or a caller-supplied remote SDK client. Potential OCR, emotion,
+visual-grounding, reranking, and semantic-extraction capabilities belong on this side only after a
+concrete implementation proves a narrow contract.
 
-Face recognition now follows that rule: `FaceBackend` has typed observations and stable spaces;
-`OpenCVFaceAnalyzer` supplies a concrete local YuNet/SFace path; and `Memory.faces` persists bounded
-exemplars and links conservative face/voice identities end to end. Omitting it leaves ordinary
-memory and speech behavior unchanged. Future capabilities such as emotion recognition require the
-same concrete adapter, provenance, lifecycle, privacy, failure, and product-path evidence before a
-new public contract is added.
+SQLite, the media CAS, the durable outbox, and Zvec are not public plugins. They have one supported
+implementation, and abstracting them now would add indirection without a second product use case.
+Metadata remains application data, never an execution, isolation, or authorization boundary.
 
-Automatic runtime selection may eventually choose among explicitly available adapters, but it must
-remain observable and overrideable. Package discovery, configuration files, or entry points should
-be added only when a real independently distributed plugin requires them; constructor injection is
-the smaller complete mechanism today. See [product goals and design principles](design-principles.md)
-for the decision criteria.
+The optional `server` and `mcp` dependencies are packaging boundaries, not plugins. REST, MCP, and
+the product CLI remain thin transports over the application-composed `Memory`.
 
-A future extension point should be introduced only with a concrete implementation and contract
-tests for lifecycle, failure mapping, durability, and performance. Until then, private constructor
-arguments and infrastructure adapters are internal and may change without compatibility promises.
+`Memory.add_stream` is also not a plugin boundary. It repeats the existing durable `add` operation
+over caller-segmented observations. `AsyncOmniPrefetch` is a thin lifecycle helper over the same
+`AsyncMemory.search`; it neither performs perception nor owns a second execution plane. Capture,
+ASR partials, frame selection, and finality stay with the application.
+
+## Embodied integration boundary
+
+MindBridge may improve embodied memory representation, retrieval, provenance, temporal validity,
+and failure diagnosis without becoming a robot AgentOS. Planner, skill-runner, verifier,
+edge/cloud routing, robot-control, benchmark harness, and model-training contracts remain outside
+the product boundary. Procedural memory is evidence and is never executed as code.
+
+New entity, relation, or spatial projections must remain additive to authoritative records and earn
+their complexity through MindBridge's own measured retrieval results. A paper's architecture or
+benchmark score is not by itself a reason to replace the flat durable representation.
+
+Interaction memory uses the existing semantic, episodic, and procedural roles. Any
+emotion, trait, or response-policy inference stays outside the kernel or behind a future concrete
+typed analysis plugin. Derived records retain evidence provenance and use ordinary `Memory` writes;
+plugins may not write around durability or reinterpret metadata as routing, isolation, or trust.
+
+## Trade-offs and revisit triggers
+
+Typed declarative construction makes bundled adapters concise; explicit construction keeps custom
+dependencies, lifecycle, privacy, and hardware selection visible. Both require reopening `Memory`
+to change composition.
+
+Add package entry-point discovery only when an independently distributed plugin requires it. Add a
+new public capability only with a concrete adapter plus lifecycle, failure, privacy, provenance, and
+product-path tests. Add richer evidence or relationship storage only when the executable embodied
+loop demonstrates that existing records cannot represent the required state without loss.

@@ -5,8 +5,9 @@ its public behavior.
 
 ## Content and modality
 
-Python uses one `ContentInput` contract for `add`, `search`, and `ask`: one `str`, `Path`, `Blob`,
-or `AssetRef`, or an ordered sequence of those atoms.
+Python uses one `ContentInput` contract for `add`, `add_stream`, `search`, and `ask`: one `str`,
+`Path`, `Blob`, or `AssetRef`, or an ordered sequence of those atoms. `add_stream` also accepts a
+`StreamInput` wrapper when one item needs its own event time, metadata, or memory role.
 
 | Atom | Boundary |
 | --- | --- |
@@ -68,6 +69,26 @@ reference one immutable file. Deleting a memory removes a media file only after 
 reference is gone. The optional name is digest-level CAS metadata, not per-reference metadata: the
 first authoritative non-empty name is reused when identical bytes later arrive with another name.
 
+## Omni stream lifecycle
+
+`Memory.add_stream` pulls one completed observation at a time from a lazy iterable. It runs that
+item through the ordinary `add` path and yields only after SQLite, the durable outbox, and Zvec are
+updated, so the caller can search the record before the next item is requested. Items are separate
+memories and separate transactions; an unbounded source is never collected into RAM, and a later
+failure does not roll back the committed prefix.
+
+This follows the clip-by-clip boundary in
+[M3-Agent's memorization loop](https://github.com/ByteDance-Seed/m3-agent/blob/0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c/m3_agent/memorization_memory_graphs.py#L63-L92)
+without moving sensor ownership into MindBridge. Capture, reconnection, and segmentation remain
+application concerns. A raw `ContentInput` is the short form; `StreamInput` preserves per-clip time
+and provenance. The async facade consumes an `AsyncIterable` with the same behavior.
+
+Changing partial input has a different lifetime. `AsyncOmniPrefetch` coalesces complete current
+query snapshots over `AsyncMemory.search`, keeps at most one real search in flight, and never
+persists or reinforces speculative input. The application owns capture, segmentation, partial
+revision policy, and final boundaries. See
+[omni streaming and interaction memory](omni-streaming-and-interaction-memory.md).
+
 ## Data directory
 
 A `data_dir` is the complete durability and isolation boundary for one `Memory`:
@@ -104,7 +125,7 @@ model endpoint for historical content.
 
 ## Capability-driven model routing
 
-A typical embodied composition has four independent operations:
+A typical multimodal memory composition has four independent operations:
 
 - Local Jina v5 Omni embedding for stored memories and search queries.
 - Generation for grounded answers.
@@ -177,15 +198,26 @@ qualified lexical or temporal evidence anchors the winner; larger limits preserv
 candidates. Each hydrated hit has a score from 0 through 1; scores rank results within a request and
 are not stable global probabilities.
 
-`ask` retrieves evidence first and routes those hits, including retained media, to generation. A
+`search_with_trace` runs the same bounded pipeline and returns the same hits plus candidate IDs.
+Ranked candidates include reconstructable dense/lexical score components, gate confidence, rank,
+and terminal rejection reason; candidates rejected before ranking contain the signals available at
+their rejection stage. The trace deliberately omits query and evidence payloads and is neither
+persisted nor exported as telemetry, so failure diagnosis does not turn the memory store or tracing
+backend into a second evidence plane.
+
+`ask` retrieves a bounded ranked candidate pool, fills the requested evidence slots round-robin by
+modality while preserving rank within each modality, and routes those hits, including retained
+media, to generation. `search` itself remains globally score ordered. A
 configured `SpeechBackend` caches complete identity analysis and adds each segment's timing, text,
 stable ID, optional registered name, and match score to the model-only grounding context; returned
 source hits remain unchanged. Generation-time analysis does not rewrite an existing record's
 `content`. `AnswerResult` contains the canonical source hits that the generation backend reports it
-used, filtering any unknown IDs, for display or grounding audits. The built-in backend sends one
+used, filtering any unknown IDs, for display or grounding audits, plus structured abstention status.
+The built-in backend sends one
 binary content part per distinct asset in an answer request, even when the question or several hits
 refer to it. Each encoded item is limited to 20 MiB. The adapter reserves the 64 MiB aggregate
-budget for question assets, then admits ranked hit assets until full. Oversized or overflow assets
+budget for question assets, then admits ranked hit assets until full, with a configurable default
+ceiling of eight distinct retrieved videos. Oversized or overflow assets
 are removed individually, so fitting siblings from the same hit remain; a hit with no admitted
 media remains as text evidence when it has text.
 
@@ -195,7 +227,7 @@ remains exclusive while ordinary Zvec queries can overlap.
 
 Long text receives bounded overlapping retrieval keys while remaining one immutable returned
 record. MindBridge does not segment long media, generate model-authored semantic keys, or use a
-learned reranker. Applications should still ingest natural turns or bounded media clips. The
+learned reranker. Applications should still ingest natural turns or bounded omni observations. The
 OpenAI adapter inlines at most 20 MiB per base64-encoded media item and 64 MiB per model call,
 roughly 15 MiB per file and 48 MiB in aggregate on disk; a provider-specific upload adapter is the
 large-video path.

@@ -38,6 +38,11 @@ be selected with `--gen-kwargs max_tokens=512,enable_thinking=false`; both contr
 the cache namespace and result artifact. `--model-args generation_min_video_seconds=2` explicitly
 records a provider's minimum video duration and enables the shared four-still preflight.
 
+CUDA runs acquire a per-device process lock before loading Jina or FunASR. This prevents separate
+benchmark commands from overcommitting one GPU while preserving request concurrency to the remote
+generation service. Use `--no-device-lock` only when an external scheduler already owns GPU
+admission control.
+
 Missing annotations and media are downloaded by default. Public releases use immutable Git or
 Hugging Face revisions; annotations are also checked against a published SHA-256 when available.
 ZIP volumes are extracted with traversal/link checks and resume at the first missing or truncated
@@ -85,8 +90,10 @@ The catalog covers these benchmark families:
 
 `all` expands to every concrete task in fixed catalog order. Multiple names and wildcard patterns
 are de-duplicated and run in catalog order. As in `lmms-eval`, `--limit` accepts `-1`, an absolute
-count, or a fraction and `--offset` starts from a later document. Video-MME-v2 keeps whole
-four-question groups because its official rating is defined at that boundary.
+count, or a fraction and `--offset` starts from a later released document or memory unit. It is not
+a universal question cap: one M3-Bench unit contains several questions. Use the resulting per-task
+`question_count` when reporting case counts. Video-MME-v2 keeps whole four-question groups because
+its official rating is defined at that boundary.
 
 LoCoMo-Refined and MemLens use their released caption/text tracks. Mem-Gallery is multimodal and
 requires its dialogue and question images; ATM-Bench exposes raw-media and schema-guided-memory
@@ -133,7 +140,10 @@ larger text batch, capped by `--max-batch-size`; a failed batch is bisected unti
 individual item is reported as failed. `--unit-concurrency` runs physically isolated
 units in parallel, while one shared `--request-concurrency` limit bounds answer calls across all
 units in the task. One shared Jina/FunASR model pool is reused across those stores, so weights are
-not loaded once per case.
+not loaded once per case. The per-device process lock also prevents a second benchmark process from
+loading another pool onto the same CUDA device. The benchmark FunASR recipe omits CAM++ because
+these tasks score transcript evidence rather than persistent speaker identity; this also avoids
+loading an unused model and FunASR's incompatible punctuation requirement for that path.
 
 The runner stores source memories as episodic, preserves released wall-clock event spans as typed
 bounds, and retains source-relative clip intervals as provenance metadata. LoCoMo-Refined,
@@ -148,7 +158,8 @@ instructions as later atoms, exercising the same public mixed-content API as app
 
 The benchmark's OpenAI adapter reserves at most 20 MiB per base64-encoded media item and 64 MiB per
 answer request for question media and top-ranked evidence — roughly 15 MiB per file and 48 MiB in
-aggregate on disk — making prepared clips important. A benchmark against larger question media
+aggregate on disk — and sends at most eight distinct retrieved videos by default. Evidence whose
+video is elided remains available as text or transcript. A benchmark against larger question media
 needs a provider-specific harness adapter with that provider's native upload mechanism.
 
 ## Reproducibility and result trust
@@ -167,9 +178,10 @@ latency without hiding it in ingestion or generation metrics.
 
 Every run writes atomically to its output directory:
 
-- `samples.jsonl` contains predictions, parsed options, all per-sample native metrics, scorer
-  protocol, judge identity/cache state, exact retrieved source intervals, retrieval diagnostics,
-  and failures. `--log-samples` additionally retains prompts, references, and raw judge responses.
+- `samples.jsonl` contains predictions, parsed options, structured abstention status, all
+  per-sample native metrics, scorer protocol, judge identity/cache state, exact retrieved source
+  intervals, retrieval diagnostics, and safe failure fields (`source_id`, stable reason/stage, and
+  cause type). `--log-samples` additionally retains prompts, references, and raw judge responses.
 - `results.json` contains pins, aggregate metrics, a SHA-256 of the samples, cluster-robust
   standard errors, deterministic cluster-bootstrap 95% confidence intervals, and per-task
   performance/token aggregates.
@@ -203,9 +215,10 @@ independent units; the runner does not manufacture precision from questions shar
 
 Each task's `performance` object reports total wall time, mean time per selected question, every
 MindBridge operation/stage/model span, generation TTFT, total and mean provider tokens, modality
-breakdowns, and per-module usage. It also includes judge time/tokens because those are part of the
-actual evaluation cost. Missing provider usage makes `total_tokens` and `average_tokens` null while
-retaining an exact `reported_total_tokens` lower bound. Full field semantics are documented in
+breakdowns, per-module usage, and aggregate media/hit elision. Task and run rows also count
+abstentions by reason. It includes judge time/tokens because those are part of the actual evaluation
+cost. Missing provider usage makes `total_tokens` and `average_tokens` null while retaining an exact
+`reported_total_tokens` lower bound. Full field semantics are documented in
 [performance and token observability](observability.md#benchmark-output).
 
 The scorer uses each release's native protocol:
@@ -242,6 +255,7 @@ mindbridge-bench eval \
 The comparison validates the dataset digest, scorer protocol, and judge identity; joins by stable
 sample ID; and reports paired cluster-bootstrap confidence intervals plus win/tie/loss counts. Any
 answer error or incomplete ingest also makes the command fail instead of quietly lowering a score.
+Samples with an ingest failure are never sent to an LLM judge.
 
 ## Isolation contract
 

@@ -1,6 +1,6 @@
 # Product goals and design principles
 
-MindBridge's product position is an **Agentic Native Embodied Memory System**: the memory layer
+MindBridge's product direction is an **Agentic Native Embodied Memory System**: the memory layer
 for agents that perceive and act in the physical world. Its primary product context is a household
 robot for emotional companionship. The same memory contract should also serve desktop robots and
 personal work assistants without requiring a separate architecture.
@@ -11,10 +11,10 @@ search, question, and trace back to evidence.
 
 > This page defines product direction and the criteria for future design decisions. It is not a
 > claim that every target is implemented in the current release. See [architecture](architecture.md)
-> for the implemented system and [extension status](plugin-architecture.md) for today's extension
+> for the implemented system and [plugin architecture](plugin-architecture.md) for today's extension
 > boundary.
 
-## What the position means
+## What the direction means
 
 | Term | Commitment |
 | --- | --- |
@@ -121,9 +121,11 @@ routing, retrieval, persistence, provider selection, defaults, or error policy. 
 
 For developers:
 
-- The common path is one explicit `Memory`, followed by `add`, `search`, and optionally `ask`. The
-  [command line](api/cli.md) is the same path without an editor: one composition flag, one command.
-- Public operations use a small vocabulary: `add`, `search`, `ask`, `get`, `list`, and `delete`.
+- The common path is one explicit `Memory`, followed by `add`, `search`, and optionally `ask`;
+  continuous sources use `add_stream`. The [command line](api/cli.md) is the same path without an
+  editor: one composition flag, one command.
+- Public operations use a small vocabulary: `add`, `add_stream`, `search`, `ask`, `get`, `list`,
+  and `delete`.
 - The SDK is the canonical capability inventory. MCP and the product CLI expose the same product
   operations unless a transport limitation is documented explicitly; a gap is implementation work,
   not permission to create different behavior.
@@ -160,8 +162,9 @@ For agents:
 Agent integrations may add optional lifecycle hooks or skills that retrieve context before a turn
 and store outcomes afterward. Such automation must make writes observable, preserve the distinction
 between user statements and agent-generated conclusions, and remain outside the core memory
-semantics. MCP and the `mindbridge` CLI are the implemented agent-native surfaces; lifecycle
-integration packages remain a design target.
+semantics. `AsyncOmniPrefetch` implements the narrow Python-side speculative-recall lifecycle;
+capture, turn detection, derived-memory extraction, and agent prompting remain application work.
+MCP and the `mindbridge` CLI are the implemented transport-facing agent surfaces.
 
 ### Developer-friendly extensibility
 
@@ -234,8 +237,10 @@ matrix, license and security requirements, performance envelope, and maintenance
 
 The current extension surface consists of the explicit `EmbeddingBackend`, `GenerationBackend`,
 `TranscriptionBackend`, `SpeechBackend`, and `FaceBackend` protocols, plus the optional
-`StreamingGenerationBackend` that an answerer may also implement. Constructor injection is the
-plugin mechanism implemented today; there is no runtime plugin registry.
+`StreamingGenerationBackend` that an answerer may also implement. Applications can pass them
+directly to `Memory`; `Memory.from_config` provides a typed convenience layer for bundled
+implementations and delegates to the same constructor. Explicit objects remain the third-party
+plugin mechanism; there is no global runtime plugin registry.
 
 `StreamingGenerationBackend` is the shape a narrow capability should take. It adds one method, stays
 optional, is selected by a structural check rather than a provider name, and leaves the
@@ -246,7 +251,7 @@ OpenCV implementation and end-to-end identity use case. A future public capabili
 analysis must likewise declare accepted modalities, typed output, provenance, configuration,
 resource lifecycle, concurrency behavior, privacy boundary, and failure mapping. It must not create
 provider branches inside `Memory` or treat metadata as an execution or isolation mechanism. See
-[extension status](plugin-architecture.md).
+[plugin architecture](plugin-architecture.md).
 
 ### Preserve evidence, privacy, and durability
 
@@ -272,11 +277,11 @@ revisions must be reproducible before a result guides a default.
 
 | Concern | Current release | Product direction |
 | --- | --- | --- |
-| Input | Ordered text, image, video, and audio through `ContentInput` | More capture formats normalize into the same canonical contract |
+| Input | Ordered text, image, video, and audio through `ContentInput`; lazy completed observations through `StreamInput`/`add_stream`; async speculative omni recall | More capture formats normalize into the same canonical contract |
 | Embedding | Caller explicitly supplies a backend; Jina v5 Omni is the bundled omni adapter | Omni-capable recommended composition with route-specific execution |
 | Generation | Optional caller-supplied backend with explicit capabilities | Omni-capable recommended composition where the deployment supports it |
 | Speech runtime | Built-in FunASR adapter uses `AutoModel` | Additional measured runtime adapters, selected explicitly or by observable policy |
-| Extensions | Five explicit model protocols and one optional streaming protocol; no registry | Optional domain capabilities after a real implementation establishes the contract |
+| Extensions | Five explicit model protocols and one optional streaming-generation protocol; no registry | Optional domain capabilities after a real implementation establishes the contract |
 | Hardware | Runs where Python, dependencies, and the selected models are supported | Verified device-class matrix with published quality, latency, and resource evidence |
 | Developer interfaces | Typed Python API, OpenAPI-documented REST adapter, and a JSON-only product CLI over the same composition | Same small vocabulary and time-to-first-success across supported transports |
 | Execution plane | Python SDK, REST, MCP, and the `mindbridge` CLI dispatch to one `Memory` | Every surface reaches the operations the SDK publishes, with no transport gap left undocumented |

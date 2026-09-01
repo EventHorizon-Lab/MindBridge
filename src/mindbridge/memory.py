@@ -12,8 +12,8 @@ import os
 import re
 import shutil
 import unicodedata
-from collections import Counter
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections import Counter, deque
+from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, suppress
 from contextvars import copy_context
@@ -40,6 +40,7 @@ from mindbridge._telemetry import (
     operation_span,
     traced_span,
 )
+from mindbridge.configuration import MindBridgeConfig, _resolve_config
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -83,7 +84,9 @@ from mindbridge.models.base import (
     TranscriptionBackend,
     _modalities,
 )
+from mindbridge.plugins import MemoryConfig, MemoryPlugins
 from mindbridge.types import (
+    AbstentionReason,
     AnswerResult,
     AssetRef,
     Blob,
@@ -95,8 +98,14 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     Page,
+    PrefetchResult,
+    RetrievalCandidateTrace,
+    RetrievalRejection,
+    RetrievalTrace,
     SearchHit,
     SpeakerSegment,
+    StreamInput,
+    TracedSearchResult,
 )
 
 _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
@@ -124,8 +133,7 @@ _REEMBED_PAGE_SIZE = 32
 _RERANK_CANDIDATES = 100
 _RANK_FLOOR = 0.3
 _RANK_CEILING = 1.5
-_DEFAULT_MINIMUM_RELEVANCE = 0.55
-_DEFAULT_AMBIGUITY_MARGIN = 0.01
+_DEFAULT_CONFIG = MemoryConfig()
 _LEXICAL_MATCH_CONFIDENCE = 0.6
 _DECAY_REINFORCEMENT_LIMIT = 20
 _CONFIRMATION_WEIGHT = 0.05
@@ -343,6 +351,12 @@ class _IndexCandidates:
     exhausted: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _SearchOutcome:
+    hits: tuple[SearchHit, ...]
+    trace: RetrievalTrace | None = None
+
+
 class Memory:
     """Persist and retrieve native text, image, video, audio, and omni memories."""
 
@@ -354,15 +368,15 @@ class Memory:
         answerer: GenerationBackend | None = None,
         transcriber: SpeechBackend | TranscriptionBackend | None = None,
         face_analyzer: FaceBackend | None = None,
-        index_speech: bool = False,
-        index_quantization: IndexQuantization = IndexQuantization.NONE,
-        minimum_relevance: float = _DEFAULT_MINIMUM_RELEVANCE,
-        ambiguity_margin: float = _DEFAULT_AMBIGUITY_MARGIN,
-        decay_half_life_days: float | None = None,
-        speaker_similarity: float = 0.78,
-        speaker_margin: float = 0.05,
-        face_similarity: float = 0.363,
-        face_margin: float = 0.05,
+        index_speech: bool = _DEFAULT_CONFIG.index_speech,
+        index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
+        minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
+        ambiguity_margin: float = _DEFAULT_CONFIG.ambiguity_margin,
+        decay_half_life_days: float | None = _DEFAULT_CONFIG.decay_half_life_days,
+        speaker_similarity: float = _DEFAULT_CONFIG.speaker_similarity,
+        speaker_margin: float = _DEFAULT_CONFIG.speaker_margin,
+        face_similarity: float = _DEFAULT_CONFIG.face_similarity,
+        face_margin: float = _DEFAULT_CONFIG.face_margin,
         tracer: Tracer | None = None,
     ) -> None:
         self.data_dir = Path(data_dir).expanduser().resolve()
@@ -453,6 +467,60 @@ class Memory:
         except BaseException:
             self._closed = True
             self._close_resources()
+            raise
+
+    @classmethod
+    def from_plugins(
+        cls,
+        data_dir: str | Path = ".mindbridge",
+        *,
+        plugins: MemoryPlugins,
+        config: MemoryConfig | None = None,
+        tracer: Tracer | None = None,
+    ) -> Memory:
+        """Open memory from an explicit capability bundle and local policy."""
+        if not isinstance(plugins, MemoryPlugins):
+            raise ValidationError("plugins must be a MemoryPlugins value")
+        if config is None:
+            config = MemoryConfig()
+        elif not isinstance(config, MemoryConfig):
+            raise ValidationError("config must be a MemoryConfig value")
+        return cls(
+            data_dir,
+            embedder=plugins.embedder,
+            answerer=plugins.answerer,
+            transcriber=plugins.transcriber,
+            face_analyzer=plugins.face_analyzer,
+            index_speech=config.index_speech,
+            index_quantization=config.index_quantization,
+            minimum_relevance=config.minimum_relevance,
+            ambiguity_margin=config.ambiguity_margin,
+            decay_half_life_days=config.decay_half_life_days,
+            speaker_similarity=config.speaker_similarity,
+            speaker_margin=config.speaker_margin,
+            face_similarity=config.face_similarity,
+            face_margin=config.face_margin,
+            tracer=tracer,
+        )
+
+    @classmethod
+    def from_config(
+        cls,
+        config: MindBridgeConfig | Mapping[str, object],
+        *,
+        tracer: Tracer | None = None,
+    ) -> Memory:
+        """Open memory from validated declarative configuration."""
+        resolved = _resolve_config(config)
+        try:
+            return cls.from_plugins(
+                resolved.data_dir,
+                plugins=resolved.plugins,
+                config=resolved.settings,
+                tracer=tracer,
+            )
+        except BaseException:
+            resolved.close()
             raise
 
     def __enter__(self) -> Memory:
@@ -571,6 +639,45 @@ class Memory:
                 return ()
             return self._add_prepared(prepared, operation=assets)
 
+    def add_stream(
+        self,
+        contents: Iterable[ContentInput | StreamInput],
+    ) -> Iterator[MemoryRecord]:
+        """Add a lazy omni stream one durable, searchable observation at a time."""
+        if isinstance(contents, (str, bytes, Path, Blob, AssetRef, Mapping)):
+            raise ValidationError("contents must be an iterable of memory inputs")
+        try:
+            iterator = iter(contents)
+        except TypeError:
+            raise ValidationError("contents must be an iterable of memory inputs") from None
+        index = 0
+        while True:
+            try:
+                content = next(iterator)
+            except StopIteration:
+                return
+            except MindBridgeError as error:
+                if error.subject is None:
+                    error.subject = f"contents[{index}]"
+                raise
+            try:
+                if isinstance(content, StreamInput):
+                    record = self.add(
+                        content.content,
+                        occurred_at=content.occurred_at,
+                        occurred_end=content.occurred_end,
+                        metadata=content.metadata,
+                        memory_type=content.memory_type,
+                    )
+                else:
+                    record = self.add(content)
+            except MindBridgeError as error:
+                if error.subject is None:
+                    error.subject = f"contents[{index}]"
+                raise
+            yield record
+            index += 1
+
     def search(
         self,
         query: ContentInput,
@@ -578,10 +685,60 @@ class Memory:
         limit: int = 10,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
     ) -> tuple[SearchHit, ...]:
         """Return ranked memories for a native or mixed-modal query."""
+        return self._search(
+            query,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
+            capture_trace=False,
+        ).hits
+
+    def search_with_trace(
+        self,
+        query: ContentInput,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
+    ) -> TracedSearchResult:
+        """Return ranked memories plus an opt-in candidate trace without evidence content."""
+        outcome = self._search(
+            query,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
+            capture_trace=True,
+        )
+        assert outcome.trace is not None
+        return TracedSearchResult(hits=outcome.hits, trace=outcome.trace)
+
+    def _search(
+        self,
+        query: ContentInput,
+        *,
+        limit: int,
+        memory_type: MemoryType | None,
+        reference_at: datetime | None,
+        occurred_from: datetime | None,
+        occurred_until: datetime | None,
+        capture_trace: bool,
+    ) -> _SearchOutcome:
         with self._trace("mindbridge.search", kind="operation"), self._operation() as assets:
             _limit(limit, maximum=100)
+            occurred_from, occurred_until = _search_occurrence_range(
+                occurred_from,
+                occurred_until,
+            )
             with self._trace("mindbridge.content.prepare", kind="stage"):
                 prepared = self._prepare_content(query, assets)
             explicit_reference = _reference_at(reference_at)
@@ -590,17 +747,20 @@ class Memory:
                 explicit_reference or datetime.now(timezone.utc),
                 infer_reference=explicit_reference is None,
             )
-            hits = self._search_prepared(
+            outcome = self._search_prepared(
                 prepared,
                 limit=limit,
                 operation=assets,
                 memory_type=_optional_memory_type(memory_type),
                 reference_at=reference,
                 temporal_range=_temporal_range(temporal_text, reference),
+                occurred_from=occurred_from,
+                occurred_until=occurred_until,
                 require_unambiguous=limit == 1,
+                capture_trace=capture_trace,
             )
             self._persist_transcripts(assets)
-            return hits
+            return outcome
 
     def ask(
         self,
@@ -631,12 +791,15 @@ class Memory:
             search = partial(
                 self._search_prepared,
                 prepared,
-                limit=limit,
+                limit=min(100, limit * 3),
                 operation=assets,
                 memory_type=_optional_memory_type(memory_type),
                 reference_at=reference,
                 temporal_range=temporal_range,
+                occurred_from=None,
+                occurred_until=None,
                 require_unambiguous=limit == 1,
+                capture_trace=False,
             )
             speech_assets = self._answer_speech_assets(prepared.assets)
             if speech_assets and all(
@@ -650,12 +813,13 @@ class Memory:
                         speech_assets,
                         assets,
                     )
-                    hits = search()
+                    hits = search().hits
                     identities.result()
             else:
                 if speech_assets:
                     self._recognize_speech(speech_assets, assets)
-                hits = search()
+                hits = search().hits
+            hits = _grounding_hits(hits, limit)
             routed_question = self._route_generation(
                 (
                     _with_reference_time(prepared, reference)
@@ -673,6 +837,8 @@ class Memory:
             return AnswerResult(
                 answer=result.answer,
                 hits=tuple(hit for hit in hits if hit.id in used_ids),
+                abstained=result.abstained,
+                abstention_reason=result.abstention_reason,
             )
 
     def get(self, memory_id: str) -> MemoryRecord:
@@ -1354,8 +1520,14 @@ class Memory:
         memory_type: MemoryType | None,
         reference_at: datetime,
         temporal_range: tuple[datetime, datetime] | None,
+        occurred_from: datetime | None,
+        occurred_until: datetime | None,
         require_unambiguous: bool,
-    ) -> tuple[SearchHit, ...]:
+        capture_trace: bool,
+    ) -> _SearchOutcome:
+        trace_candidates: builtins.list[RetrievalCandidateTrace] | None = (
+            [] if capture_trace else None
+        )
         prepared = self._embedding_content(prepared, operation)
         aggregate = self._route_embedding(prepared)
         text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
@@ -1392,23 +1564,36 @@ class Memory:
                         lexical_query=lexical_query,
                         limit=candidate_limit,
                         memory_type=memory_type,
+                        occurred_from=occurred_from,
+                        occurred_until=occurred_until,
                     )
                 else:
                     # Zvec range-filtered FTS is unstable after dense queries; the global
                     # fallback below still contributes the same lexical route.
-                    preferred = self._index_candidates(
-                        vectors,
-                        lexical_query="",
-                        limit=candidate_limit,
-                        memory_type=memory_type,
-                        occurred_from=temporal_range[0],
-                        occurred_until=temporal_range[1],
+                    preferred_range = _intersect_occurrence_range(
+                        temporal_range,
+                        occurred_from,
+                        occurred_until,
+                    )
+                    preferred = (
+                        _IndexCandidates(dense=(), lexical=(), exhausted=True)
+                        if preferred_range is None
+                        else self._index_candidates(
+                            vectors,
+                            lexical_query="",
+                            limit=candidate_limit,
+                            memory_type=memory_type,
+                            occurred_from=preferred_range[0],
+                            occurred_until=preferred_range[1],
+                        )
                     )
                     fallback = self._index_candidates(
                         vectors,
                         lexical_query=lexical_query,
                         limit=candidate_limit,
                         memory_type=memory_type,
+                        occurred_from=occurred_from,
+                        occurred_until=occurred_until,
                     )
                     candidates = _IndexCandidates(
                         dense=_merge_index_hits(preferred.dense, fallback.dense),
@@ -1419,21 +1604,41 @@ class Memory:
                 dict.fromkeys(hit.id for hit in (*candidates.dense, *candidates.lexical))
             )
             if not index_ids:
-                return ()
+                return _search_outcome(
+                    (),
+                    trace_candidates,
+                    candidate_limit=candidate_limit,
+                    exhaustive=candidates.exhausted,
+                )
             with (
                 self._trace("mindbridge.storage.hydrate", kind="stage"),
                 _translate_storage_errors("hydrate search candidates"),
             ):
-                documents = self._store.read_index_documents(index_ids)
+                hydrated_documents = self._store.read_index_documents(index_ids)
             with _translate_index_errors("search memories"):
-                candidates, documents = self._deepen_temporal_lexical_candidates(
+                candidates, hydrated_documents = self._deepen_temporal_lexical_candidates(
                     candidates,
-                    documents,
+                    hydrated_documents,
                     lexical_query=lexical_query,
                     temporal_range=temporal_range,
                     memory_type=memory_type,
                     route_limit=candidate_limit,
                     result_limit=limit,
+                )
+            index_ids = tuple(
+                dict.fromkeys(hit.id for hit in (*candidates.dense, *candidates.lexical))
+            )
+            documents = hydrated_documents
+            if occurred_from is not None or occurred_until is not None:
+                documents = tuple(
+                    document
+                    for document in documents
+                    if _occurrence_overlaps(
+                        document.occurred_at,
+                        document.occurred_end,
+                        occurred_from,
+                        occurred_until,
+                    )
                 )
             parent_count = len({document.embedding.memory_id for document in documents})
             if (
@@ -1443,6 +1648,17 @@ class Memory:
             ):
                 break
             candidate_limit = min(candidate_limit * 2, candidate_ceiling)
+        index_ids_by_memory = (
+            _parent_index_ids(hydrated_documents) if trace_candidates is not None else {}
+        )
+        _extend_hydration_traces(
+            trace_candidates,
+            candidates,
+            index_ids,
+            hydrated_documents,
+            documents,
+            index_ids_by_memory,
+        )
         (
             dense_relevance,
             dense_confidence,
@@ -1451,7 +1667,12 @@ class Memory:
         ) = _parent_index_signals(candidates, documents)
         parent_ids = tuple(dict.fromkeys((*dense_relevance, *lexical_matches)))
         if not parent_ids:
-            return ()
+            return _search_outcome(
+                (),
+                trace_candidates,
+                candidate_limit=candidate_limit,
+                exhaustive=candidates.exhausted,
+            )
         with self._write_lock:
             with (
                 self._trace("mindbridge.storage.hydrate", kind="stage"),
@@ -1459,12 +1680,35 @@ class Memory:
             ):
                 memories = self._store.read_memories(parent_ids)
             with self._trace("mindbridge.retrieval.rank", kind="stage"):
+                _extend_missing_memory_traces(
+                    trace_candidates,
+                    parent_ids,
+                    memories,
+                    index_ids_by_memory,
+                    dense_relevance,
+                    dense_confidence,
+                    lexical_relevance_by_rank,
+                    lexical_matches,
+                )
                 if memory_type is not None:
+                    _extend_memory_type_traces(
+                        trace_candidates,
+                        memories,
+                        memory_type,
+                        index_ids_by_memory,
+                        dense_relevance,
+                        dense_confidence,
+                        lexical_relevance_by_rank,
+                        lexical_matches,
+                    )
                     memories = tuple(
                         memory for memory in memories if memory.memory_type == memory_type.value
                     )
                 lexical_relevance = _lexical_relevance(lexical_query, memories)
                 ranked = []
+                ranked_traces: dict[str, RetrievalCandidateTrace] | None = (
+                    {} if trace_candidates is not None else None
+                )
                 for memory in memories:
                     memory_id = memory.memory_id
                     lexical_match = memory_id in lexical_matches
@@ -1474,34 +1718,72 @@ class Memory:
                     lexical_score = _LEXICAL_MATCH_CONFIDENCE * lexical_relevance_by_rank.get(
                         memory_id, 0.0
                     )
+                    lexical_rerank_bonus = lexical_strength * _MAX_LEXICAL_RERANK_BONUS
                     relevance = min(
                         1.0,
                         max(dense_relevance.get(memory_id, 0.0), lexical_score)
-                        + lexical_strength * _MAX_LEXICAL_RERANK_BONUS,
+                        + lexical_rerank_bonus,
+                    )
+                    gate_confidence = max(
+                        dense_confidence.get(memory_id, 0.0),
+                        _LEXICAL_MATCH_CONFIDENCE if lexical_match else 0.0,
+                    )
+                    (
+                        final_score,
+                        reinforcement_factor,
+                        temporal_factor,
+                        retention_factor,
+                    ) = _ranking_signals(
+                        memory,
+                        relevance,
+                        reference_at=reference_at,
+                        temporal_range=temporal_range,
+                        decay_half_life=self._decay_half_life,
                     )
                     ranked.append(
                         (
                             memory,
-                            _ranked_relevance(
-                                memory,
-                                relevance,
-                                reference_at=reference_at,
-                                temporal_range=temporal_range,
-                                decay_half_life=self._decay_half_life,
-                            ),
-                            max(dense_confidence.get(memory_id, 0.0), lexical_score),
-                            lexical_score > 0.0,
+                            final_score,
+                            gate_confidence,
+                            lexical_match,
                         )
                     )
-                ranked = [item for item in ranked if item[2] >= self._minimum_relevance]
+                    _record_ranked_trace(
+                        ranked_traces,
+                        memory_id,
+                        index_ids_by_memory,
+                        dense_relevance,
+                        dense_confidence,
+                        lexical_relevance=lexical_score,
+                        lexical_rerank_bonus=lexical_rerank_bonus,
+                        lexical_match=lexical_match,
+                        gate_confidence=gate_confidence,
+                        base_relevance=relevance,
+                        reinforcement_factor=reinforcement_factor,
+                        temporal_factor=temporal_factor,
+                        retention_factor=retention_factor,
+                        final_score=final_score,
+                    )
+                ranked = _qualified_candidates(
+                    ranked,
+                    minimum_relevance=self._minimum_relevance,
+                    trace_candidates=trace_candidates,
+                    ranked_traces=ranked_traces,
+                )
                 ranked.sort(key=lambda item: (-item[1], item[0].memory_id))
-                if require_unambiguous and _retrieval_is_ambiguous(
+                ambiguous = require_unambiguous and _retrieval_is_ambiguous(
                     ranked,
                     margin=self._ambiguity_margin,
                     temporal_range=temporal_range,
-                ):
-                    return ()
-                visible = ranked[:limit]
+                )
+                _extend_ranked_traces(
+                    trace_candidates,
+                    ranked_traces,
+                    ranked,
+                    limit=limit,
+                    ambiguous=ambiguous,
+                )
+                visible = () if ambiguous else ranked[:limit]
                 self._lease_assets(
                     tuple(
                         asset
@@ -1515,8 +1797,15 @@ class Memory:
                     for memory, _score, _confidence, _lexical in visible
                     for asset in memory.assets
                 )
-        return tuple(
+        hits = tuple(
             self._search_hit(memory, score) for memory, score, _confidence, _lexical in visible
+        )
+        return _search_outcome(
+            hits,
+            trace_candidates,
+            candidate_limit=candidate_limit,
+            exhaustive=candidates.exhausted,
+            ambiguous=ambiguous,
         )
 
     def _deepen_temporal_lexical_candidates(
@@ -2292,15 +2581,31 @@ class Memory:
                     answer = "".join(parts)
                     if not answer.strip():
                         raise ModelError("generation model returned an invalid answer")
-                    if used_hits is None:
+                    if isinstance(used_hits, AnswerResult):
+                        if used_hits.answer != answer:
+                            raise ModelError("generation model returned an invalid answer")
+                        result = used_hits
+                    elif used_hits is None:
                         grounded = tuple(hits)
                     elif isinstance(used_hits, tuple) and all(
                         isinstance(hit, SearchHit) for hit in used_hits
                     ):
                         grounded = used_hits
+                        abstention_reason = getattr(used_hits, "abstention_reason", None)
+                        if abstention_reason is not None and not isinstance(
+                            abstention_reason, AbstentionReason
+                        ):
+                            raise ModelError("generation model returned invalid abstention status")
                     else:
                         raise ModelError("generation model returned invalid grounding hits")
-                    result = AnswerResult(answer=answer, hits=grounded)
+                    if not isinstance(used_hits, AnswerResult):
+                        reason = abstention_reason if isinstance(used_hits, tuple) else None
+                        result = AnswerResult(
+                            answer=answer,
+                            hits=grounded,
+                            abstained=reason is not None,
+                            abstention_reason=reason,
+                        )
                 else:
                     result = self._answerer.answer(question, hits)
             except MindBridgeError:
@@ -2719,15 +3024,15 @@ class AsyncMemory:
         answerer: GenerationBackend | None = None,
         transcriber: SpeechBackend | TranscriptionBackend | None = None,
         face_analyzer: FaceBackend | None = None,
-        index_speech: bool = False,
-        index_quantization: IndexQuantization = IndexQuantization.NONE,
-        minimum_relevance: float = _DEFAULT_MINIMUM_RELEVANCE,
-        ambiguity_margin: float = _DEFAULT_AMBIGUITY_MARGIN,
-        decay_half_life_days: float | None = None,
-        speaker_similarity: float = 0.78,
-        speaker_margin: float = 0.05,
-        face_similarity: float = 0.363,
-        face_margin: float = 0.05,
+        index_speech: bool = _DEFAULT_CONFIG.index_speech,
+        index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
+        minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
+        ambiguity_margin: float = _DEFAULT_CONFIG.ambiguity_margin,
+        decay_half_life_days: float | None = _DEFAULT_CONFIG.decay_half_life_days,
+        speaker_similarity: float = _DEFAULT_CONFIG.speaker_similarity,
+        speaker_margin: float = _DEFAULT_CONFIG.speaker_margin,
+        face_similarity: float = _DEFAULT_CONFIG.face_similarity,
+        face_margin: float = _DEFAULT_CONFIG.face_margin,
         tracer: Tracer | None = None,
     ) -> None:
         self._memory = Memory(
@@ -2747,6 +3052,60 @@ class AsyncMemory:
             face_margin=face_margin,
             tracer=tracer,
         )
+
+    @classmethod
+    def from_plugins(
+        cls,
+        data_dir: str | Path = ".mindbridge",
+        *,
+        plugins: MemoryPlugins,
+        config: MemoryConfig | None = None,
+        tracer: Tracer | None = None,
+    ) -> AsyncMemory:
+        """Open async memory from an explicit capability bundle and local policy."""
+        if not isinstance(plugins, MemoryPlugins):
+            raise ValidationError("plugins must be a MemoryPlugins value")
+        if config is None:
+            config = MemoryConfig()
+        elif not isinstance(config, MemoryConfig):
+            raise ValidationError("config must be a MemoryConfig value")
+        return cls(
+            data_dir,
+            embedder=plugins.embedder,
+            answerer=plugins.answerer,
+            transcriber=plugins.transcriber,
+            face_analyzer=plugins.face_analyzer,
+            index_speech=config.index_speech,
+            index_quantization=config.index_quantization,
+            minimum_relevance=config.minimum_relevance,
+            ambiguity_margin=config.ambiguity_margin,
+            decay_half_life_days=config.decay_half_life_days,
+            speaker_similarity=config.speaker_similarity,
+            speaker_margin=config.speaker_margin,
+            face_similarity=config.face_similarity,
+            face_margin=config.face_margin,
+            tracer=tracer,
+        )
+
+    @classmethod
+    def from_config(
+        cls,
+        config: MindBridgeConfig | Mapping[str, object],
+        *,
+        tracer: Tracer | None = None,
+    ) -> AsyncMemory:
+        """Open async memory from validated declarative configuration."""
+        resolved = _resolve_config(config)
+        try:
+            return cls.from_plugins(
+                resolved.data_dir,
+                plugins=resolved.plugins,
+                config=resolved.settings,
+                tracer=tracer,
+            )
+        except BaseException:
+            resolved.close()
+            raise
 
     async def __aenter__(self) -> AsyncMemory:
         return self
@@ -2790,6 +3149,42 @@ class AsyncMemory:
             memory_type=memory_type,
         )
 
+    async def add_stream(
+        self,
+        contents: AsyncIterable[ContentInput | StreamInput],
+    ) -> AsyncIterator[MemoryRecord]:
+        """Add an async omni stream one durable, searchable observation at a time."""
+        if not isinstance(contents, AsyncIterable):
+            raise ValidationError("contents must be an async iterable of memory inputs")
+        iterator = aiter(contents)
+        index = 0
+        while True:
+            try:
+                content = await anext(iterator)
+            except StopAsyncIteration:
+                return
+            except MindBridgeError as error:
+                if error.subject is None:
+                    error.subject = f"contents[{index}]"
+                raise
+            try:
+                if isinstance(content, StreamInput):
+                    record = await self.add(
+                        content.content,
+                        occurred_at=content.occurred_at,
+                        occurred_end=content.occurred_end,
+                        metadata=content.metadata,
+                        memory_type=content.memory_type,
+                    )
+                else:
+                    record = await self.add(content)
+            except MindBridgeError as error:
+                if error.subject is None:
+                    error.subject = f"contents[{index}]"
+                raise
+            yield record
+            index += 1
+
     async def search(
         self,
         query: ContentInput,
@@ -2797,6 +3192,8 @@ class AsyncMemory:
         limit: int = 10,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
     ) -> tuple[SearchHit, ...]:
         return await asyncio.to_thread(
             self._memory.search,
@@ -2804,6 +3201,28 @@ class AsyncMemory:
             limit=limit,
             memory_type=memory_type,
             reference_at=reference_at,
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
+        )
+
+    async def search_with_trace(
+        self,
+        query: ContentInput,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
+    ) -> TracedSearchResult:
+        return await asyncio.to_thread(
+            self._memory.search_with_trace,
+            query,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
         )
 
     async def ask(
@@ -2856,6 +3275,112 @@ class AsyncMemory:
         await asyncio.to_thread(self._memory.close)
 
 
+class AsyncOmniPrefetch:
+    """Coalesce evolving omni query snapshots into one in-flight search per turn."""
+
+    def __init__(
+        self,
+        memory: AsyncMemory,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
+    ) -> None:
+        _limit(limit, maximum=100)
+        occurred_from, occurred_until = _search_occurrence_range(
+            occurred_from,
+            occurred_until,
+        )
+        self._memory = memory
+        self._limit = limit
+        self._memory_type = _optional_memory_type(memory_type)
+        self._reference_at = _reference_at(reference_at)
+        self._occurred_from = occurred_from
+        self._occurred_until = occurred_until
+        self._revision = 0
+        self._submitted: tuple[int, ContentInput] | None = None
+        self._pending: tuple[int, ContentInput] | None = None
+        self._latest: PrefetchResult | None = None
+        self._failure: tuple[int, Exception] | None = None
+        self._worker: asyncio.Task[None] | None = None
+        self._closed = False
+
+    @property
+    def latest(self) -> PrefetchResult | None:
+        """Return the newest completed result without waiting."""
+        return self._latest
+
+    def submit(self, query: ContentInput) -> int:
+        """Queue a complete current snapshot, replacing any not-yet-started snapshot."""
+        if self._closed:
+            raise ValidationError("prefetch is closed")
+        loop = asyncio.get_running_loop()
+        snapshot = _snapshot_content(query)
+        if self._submitted is not None and self._submitted[1] == snapshot:
+            failed = self._failure is not None and self._failure[0] == self._submitted[0]
+            if not failed:
+                return self._submitted[0]
+        self._revision += 1
+        revision = self._revision
+        self._submitted = (revision, snapshot)
+        self._pending = self._submitted
+        self._failure = None
+        if self._worker is None:
+            self._worker = loop.create_task(self._run())
+        return revision
+
+    async def finalize(self, query: ContentInput | None = None) -> PrefetchResult:
+        """Finish the turn and return a result for the exact final snapshot."""
+        if self._closed:
+            raise ValidationError("prefetch is closed")
+        if query is None:
+            if self._submitted is None:
+                raise ValidationError("prefetch has no submitted query")
+            target = self._submitted[0]
+        else:
+            target = self.submit(query)
+        self._closed = True
+        worker = self._worker
+        if worker is not None:
+            await asyncio.shield(worker)
+        if self._latest is not None and self._latest.revision == target:
+            return self._latest
+        if self._failure is not None and self._failure[0] == target:
+            raise self._failure[1]
+        raise RuntimeError("prefetch completed without its final revision")
+
+    async def close(self) -> None:
+        """Discard queued snapshots and drain the one search that may already be running."""
+        self._closed = True
+        self._pending = None
+        worker = self._worker
+        if worker is not None:
+            await asyncio.shield(worker)
+
+    async def _run(self) -> None:
+        try:
+            while self._pending is not None:
+                revision, query = self._pending
+                self._pending = None
+                try:
+                    hits = await self._memory.search(
+                        query,
+                        limit=self._limit,
+                        memory_type=self._memory_type,
+                        reference_at=self._reference_at,
+                        occurred_from=self._occurred_from,
+                        occurred_until=self._occurred_until,
+                    )
+                except Exception as error:
+                    self._failure = (revision, error)
+                    continue
+                self._latest = PrefetchResult(revision=revision, hits=hits)
+        finally:
+            self._worker = None
+
+
 @contextmanager
 def _staged(span: AbstractContextManager[Span], stage: str) -> Iterator[Span]:
     """Name the failing stage on public errors so an agent never parses prose to find it.
@@ -2884,6 +3409,13 @@ def _content_atoms(content: ContentInput) -> tuple[ContentAtom, ...]:
     if any(not isinstance(atom, (str, Path, Blob, AssetRef)) for atom in atoms):
         raise ValidationError("content contains an unsupported input value")
     return atoms
+
+
+def _snapshot_content(content: ContentInput) -> ContentInput:
+    atoms = _content_atoms(content)
+    if any(isinstance(atom, Path) for atom in atoms):
+        raise ValidationError("prefetch paths are mutable; use Blob or AssetRef")
+    return atoms[0] if len(atoms) == 1 else atoms
 
 
 def _prepare_memory(
@@ -3354,6 +3886,60 @@ def _occurred_at(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
+def _search_occurrence_range(
+    occurred_from: datetime | None,
+    occurred_until: datetime | None,
+) -> tuple[datetime | None, datetime | None]:
+    bounds = []
+    for value, name in (
+        (occurred_from, "occurred_from"),
+        (occurred_until, "occurred_until"),
+    ):
+        if value is not None and (
+            not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None
+        ):
+            raise ValidationError(f"{name} must include a timezone")
+        bounds.append(None if value is None else value.astimezone(timezone.utc))
+    start, end = bounds
+    if start is not None and end is not None and end <= start:
+        raise ValidationError("occurred_until must be later than occurred_from")
+    return start, end
+
+
+def _intersect_occurrence_range(
+    temporal_range: tuple[datetime, datetime],
+    occurred_from: datetime | None,
+    occurred_until: datetime | None,
+) -> tuple[datetime, datetime] | None:
+    start = (
+        max(temporal_range[0], occurred_from) if occurred_from is not None else temporal_range[0]
+    )
+    end = (
+        min(temporal_range[1], occurred_until) if occurred_until is not None else temporal_range[1]
+    )
+    return None if end <= start else (start, end)
+
+
+def _occurrence_overlaps(
+    occurred_at: datetime | None,
+    occurred_end: datetime | None,
+    occurred_from: datetime | None,
+    occurred_until: datetime | None,
+) -> bool:
+    if occurred_from is None and occurred_until is None:
+        return True
+    if occurred_at is None:
+        return False
+    return (
+        occurred_from is None
+        or (
+            occurred_end > occurred_from
+            if occurred_end is not None
+            else occurred_at >= occurred_from
+        )
+    ) and (occurred_until is None or occurred_at < occurred_until)
+
+
 def _occurred_end(start: datetime | None, value: datetime | None) -> datetime | None:
     end = _occurred_at(value)
     if end is not None and (start is None or end <= start):
@@ -3426,6 +4012,21 @@ def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _
     return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
 
 
+def _grounding_hits(hits: Sequence[SearchHit], limit: int) -> tuple[SearchHit, ...]:
+    queues: dict[Modality, deque[SearchHit]] = {}
+    for hit in hits:
+        queues.setdefault(hit.modality, deque()).append(hit)
+    selected: list[SearchHit] = []
+    while queues and len(selected) < limit:
+        for modality in tuple(queues):
+            selected.append(queues[modality].popleft())
+            if not queues[modality]:
+                del queues[modality]
+            if len(selected) == limit:
+                break
+    return tuple(selected)
+
+
 def _merge_index_hits(*groups: Sequence[IndexHit]) -> tuple[IndexHit, ...]:
     merged: dict[str, IndexHit] = {}
     for group in groups:
@@ -3441,6 +4042,257 @@ def _merge_index_hits(*groups: Sequence[IndexHit]) -> tuple[IndexHit, ...]:
                     lexical_match=current.lexical_match or hit.lexical_match,
                 )
     return tuple(merged.values())
+
+
+def _search_outcome(
+    hits: Sequence[SearchHit],
+    candidates: Sequence[RetrievalCandidateTrace] | None,
+    *,
+    candidate_limit: int,
+    exhaustive: bool,
+    ambiguous: bool = False,
+) -> _SearchOutcome:
+    trace = (
+        None
+        if candidates is None
+        else RetrievalTrace(
+            candidates=tuple(candidates),
+            candidate_limit=candidate_limit,
+            exhaustive=exhaustive,
+            ambiguous=ambiguous,
+        )
+    )
+    return _SearchOutcome(hits=tuple(hits), trace=trace)
+
+
+def _parent_index_ids(documents: Sequence[IndexDocument]) -> dict[str, tuple[str, ...]]:
+    grouped: dict[str, builtins.list[str]] = {}
+    for document in documents:
+        grouped.setdefault(document.embedding.memory_id, []).append(document.embedding.embedding_id)
+    return {memory_id: tuple(index_ids) for memory_id, index_ids in grouped.items()}
+
+
+def _early_candidate_trace(
+    memory_id: str,
+    index_ids: tuple[str, ...],
+    dense_relevance: Mapping[str, float],
+    dense_confidence: Mapping[str, float],
+    lexical_index_relevance: Mapping[str, float],
+    lexical_matches: set[str],
+    rejected_by: RetrievalRejection,
+) -> RetrievalCandidateTrace:
+    lexical_match = memory_id in lexical_matches
+    return RetrievalCandidateTrace(
+        memory_id=memory_id,
+        index_ids=index_ids,
+        dense_relevance=dense_relevance.get(memory_id, 0.0),
+        dense_confidence=dense_confidence.get(memory_id, 0.0),
+        lexical_relevance=(_LEXICAL_MATCH_CONFIDENCE * lexical_index_relevance.get(memory_id, 0.0)),
+        lexical_match=lexical_match,
+        gate_confidence=max(
+            dense_confidence.get(memory_id, 0.0),
+            _LEXICAL_MATCH_CONFIDENCE if lexical_match else 0.0,
+        ),
+        rejected_by=rejected_by,
+    )
+
+
+def _extend_hydration_traces(
+    target: builtins.list[RetrievalCandidateTrace] | None,
+    candidates: _IndexCandidates,
+    index_ids: Sequence[str],
+    hydrated_documents: Sequence[IndexDocument],
+    accepted_documents: Sequence[IndexDocument],
+    index_ids_by_memory: Mapping[str, tuple[str, ...]],
+) -> None:
+    if target is None:
+        return
+    (
+        dense_relevance,
+        dense_confidence,
+        lexical_index_relevance,
+        lexical_matches,
+    ) = _parent_index_signals(candidates, hydrated_documents)
+    dense_by_id = {hit.id: hit for hit in candidates.dense}
+    lexical_by_id = {hit.id: hit for hit in candidates.lexical}
+    hydrated_ids = {document.embedding.embedding_id for document in hydrated_documents}
+    for index_id in index_ids:
+        if index_id in hydrated_ids:
+            continue
+        dense_hit = dense_by_id.get(index_id)
+        lexical_hit = lexical_by_id.get(index_id)
+        dense_hit_confidence = None if dense_hit is None else cast(float, dense_hit.confidence)
+        target.append(
+            RetrievalCandidateTrace(
+                memory_id=None,
+                index_ids=(index_id,),
+                dense_relevance=None if dense_hit is None else dense_hit.relevance,
+                dense_confidence=dense_hit_confidence,
+                lexical_relevance=(
+                    None
+                    if lexical_hit is None
+                    else _LEXICAL_MATCH_CONFIDENCE * lexical_hit.relevance
+                ),
+                lexical_match=lexical_hit is not None,
+                gate_confidence=max(
+                    dense_hit_confidence or 0.0,
+                    _LEXICAL_MATCH_CONFIDENCE if lexical_hit is not None else 0.0,
+                ),
+                rejected_by=RetrievalRejection.STALE_INDEX,
+            )
+        )
+    accepted_parent_ids = {document.embedding.memory_id for document in accepted_documents}
+    for memory_id, parent_index_ids in index_ids_by_memory.items():
+        if memory_id in accepted_parent_ids:
+            continue
+        target.append(
+            _early_candidate_trace(
+                memory_id,
+                parent_index_ids,
+                dense_relevance,
+                dense_confidence,
+                lexical_index_relevance,
+                lexical_matches,
+                RetrievalRejection.OCCURRENCE_RANGE,
+            )
+        )
+
+
+def _extend_missing_memory_traces(
+    target: builtins.list[RetrievalCandidateTrace] | None,
+    parent_ids: Sequence[str],
+    memories: Sequence[StoredMemory],
+    index_ids_by_memory: Mapping[str, tuple[str, ...]],
+    dense_relevance: Mapping[str, float],
+    dense_confidence: Mapping[str, float],
+    lexical_index_relevance: Mapping[str, float],
+    lexical_matches: set[str],
+) -> None:
+    if target is None:
+        return
+    hydrated_ids = {memory.memory_id for memory in memories}
+    for memory_id in parent_ids:
+        if memory_id not in hydrated_ids:
+            target.append(
+                _early_candidate_trace(
+                    memory_id,
+                    index_ids_by_memory[memory_id],
+                    dense_relevance,
+                    dense_confidence,
+                    lexical_index_relevance,
+                    lexical_matches,
+                    RetrievalRejection.MISSING_MEMORY,
+                )
+            )
+
+
+def _extend_memory_type_traces(
+    target: builtins.list[RetrievalCandidateTrace] | None,
+    memories: Sequence[StoredMemory],
+    memory_type: MemoryType,
+    index_ids_by_memory: Mapping[str, tuple[str, ...]],
+    dense_relevance: Mapping[str, float],
+    dense_confidence: Mapping[str, float],
+    lexical_index_relevance: Mapping[str, float],
+    lexical_matches: set[str],
+) -> None:
+    if target is None:
+        return
+    for memory in memories:
+        if memory.memory_type != memory_type.value:
+            target.append(
+                _early_candidate_trace(
+                    memory.memory_id,
+                    index_ids_by_memory[memory.memory_id],
+                    dense_relevance,
+                    dense_confidence,
+                    lexical_index_relevance,
+                    lexical_matches,
+                    RetrievalRejection.MEMORY_TYPE,
+                )
+            )
+
+
+def _record_ranked_trace(
+    target: dict[str, RetrievalCandidateTrace] | None,
+    memory_id: str,
+    index_ids_by_memory: Mapping[str, tuple[str, ...]],
+    dense_relevance: Mapping[str, float],
+    dense_confidence: Mapping[str, float],
+    *,
+    lexical_relevance: float,
+    lexical_rerank_bonus: float,
+    lexical_match: bool,
+    gate_confidence: float,
+    base_relevance: float,
+    reinforcement_factor: float,
+    temporal_factor: float | None,
+    retention_factor: float | None,
+    final_score: float,
+) -> None:
+    if target is None:
+        return
+    target[memory_id] = RetrievalCandidateTrace(
+        memory_id=memory_id,
+        index_ids=index_ids_by_memory[memory_id],
+        dense_relevance=dense_relevance.get(memory_id, 0.0),
+        dense_confidence=dense_confidence.get(memory_id, 0.0),
+        lexical_relevance=lexical_relevance,
+        lexical_rerank_bonus=lexical_rerank_bonus,
+        lexical_match=lexical_match,
+        gate_confidence=gate_confidence,
+        base_relevance=base_relevance,
+        reinforcement_factor=reinforcement_factor,
+        temporal_factor=temporal_factor,
+        retention_factor=retention_factor,
+        final_score=final_score,
+    )
+
+
+def _qualified_candidates(
+    ranked: Sequence[tuple[StoredMemory, float, float, bool]],
+    *,
+    minimum_relevance: float,
+    trace_candidates: builtins.list[RetrievalCandidateTrace] | None,
+    ranked_traces: Mapping[str, RetrievalCandidateTrace] | None,
+) -> builtins.list[tuple[StoredMemory, float, float, bool]]:
+    qualified = []
+    for item in ranked:
+        if item[2] >= minimum_relevance:
+            qualified.append(item)
+        elif trace_candidates is not None and ranked_traces is not None:
+            trace_candidates.append(
+                replace(
+                    ranked_traces[item[0].memory_id],
+                    rejected_by=RetrievalRejection.MINIMUM_RELEVANCE,
+                )
+            )
+    return qualified
+
+
+def _extend_ranked_traces(
+    target: builtins.list[RetrievalCandidateTrace] | None,
+    ranked_traces: Mapping[str, RetrievalCandidateTrace] | None,
+    ranked: Sequence[tuple[StoredMemory, float, float, bool]],
+    *,
+    limit: int,
+    ambiguous: bool,
+) -> None:
+    if target is None or ranked_traces is None:
+        return
+    for rank, item in enumerate(ranked, start=1):
+        rejected_by = None
+        if ambiguous:
+            rejected_by = RetrievalRejection.AMBIGUITY if rank <= 2 else RetrievalRejection.LIMIT
+        elif rank > limit:
+            rejected_by = RetrievalRejection.LIMIT
+        target.append(
+            replace(
+                ranked_traces[item[0].memory_id],
+                rank=rank,
+                rejected_by=rejected_by,
+            )
+        )
 
 
 def _parent_index_signals(
@@ -3496,6 +4348,23 @@ def _ranked_relevance(
     temporal_range: tuple[datetime, datetime] | None,
     decay_half_life: timedelta | None,
 ) -> float:
+    return _ranking_signals(
+        memory,
+        relevance,
+        reference_at=reference_at,
+        temporal_range=temporal_range,
+        decay_half_life=decay_half_life,
+    )[0]
+
+
+def _ranking_signals(
+    memory: StoredMemory,
+    relevance: float,
+    *,
+    reference_at: datetime,
+    temporal_range: tuple[datetime, datetime] | None,
+    decay_half_life: timedelta | None,
+) -> tuple[float, float, float | None, float | None]:
     ranking_reference = temporal_range[1] if temporal_range is not None else reference_at
     confirmed_at = memory.last_accessed_at
     confirmations = (
@@ -3503,15 +4372,23 @@ def _ranked_relevance(
         if confirmed_at is not None and confirmed_at <= ranking_reference
         else 0
     )
+    reinforcement_factor = 1.0 + _CONFIRMATION_WEIGHT * math.log2(1.0 + confirmations)
     score = _bounded_scale(
         relevance,
-        1.0 + _CONFIRMATION_WEIGHT * math.log2(1.0 + confirmations),
+        reinforcement_factor,
     )
+    temporal_factor = None
     if temporal_range is not None:
+        temporal_factor = _temporal_factor(
+            memory.occurred_at,
+            memory.occurred_end,
+            temporal_range,
+        )
         score = _bounded_scale(
             score,
-            _temporal_factor(memory.occurred_at, memory.occurred_end, temporal_range),
+            temporal_factor,
         )
+    retention_factor = None
     if decay_half_life is not None:
         decay_reference = ranking_reference
         accessed_at = memory.last_accessed_at
@@ -3523,11 +4400,12 @@ def _ranked_relevance(
         age = max(0.0, (decay_reference - anchor).total_seconds())
         strength = 1.0 + math.log2(1.0 + min(access_count, _DECAY_REINFORCEMENT_LIMIT))
         retention = 2.0 ** (-age / (decay_half_life.total_seconds() * strength))
+        retention_factor = _RANK_FLOOR + (_RANK_CEILING - _RANK_FLOOR) * retention
         score = _bounded_scale(
             score,
-            _RANK_FLOOR + (_RANK_CEILING - _RANK_FLOOR) * retention,
+            retention_factor,
         )
-    return score
+    return score, reinforcement_factor, temporal_factor, retention_factor
 
 
 def _bounded_scale(score: float, factor: float) -> float:

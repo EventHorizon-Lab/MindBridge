@@ -14,6 +14,8 @@ from opentelemetry.util.types import AttributeValue
 
 from mindbridge._telemetry import (
     GEN_AI_TTFC,
+    GROUNDING_HITS_DROPPED,
+    GROUNDING_MEDIA_ELIDED,
     MODEL_MODULE,
     MODEL_REQUEST_COUNT,
     MODEL_TTFT,
@@ -176,6 +178,8 @@ class _TaskTelemetry:
     nodes: dict[str, _Durations] = field(default_factory=dict)
     tokens: _Tokens = field(default_factory=_Tokens)
     tokens_by_module: dict[str, _Tokens] = field(default_factory=dict)
+    media_elided_hits: int = 0
+    dropped_hits: int = 0
 
     def add(self, span: ReadableSpan) -> None:
         attributes = span.attributes or {}
@@ -196,6 +200,8 @@ class _TaskTelemetry:
         self.nodes.setdefault(span.name, _Durations()).add(span)
         if kind == "model":
             self.tokens.add(attributes)
+            self.media_elided_hits += _int_attribute(attributes, GROUNDING_MEDIA_ELIDED) or 0
+            self.dropped_hits += _int_attribute(attributes, GROUNDING_HITS_DROPPED) or 0
             module = _string_attribute(attributes, MODEL_MODULE) or "unknown"
             self.tokens_by_module.setdefault(module, _Tokens()).add(attributes)
 
@@ -220,6 +226,10 @@ class _TaskTelemetry:
                     name: value.json(question_count)
                     for name, value in sorted(self.tokens_by_module.items())
                 },
+            },
+            "grounding": {
+                "media_elided_hits": self.media_elided_hits,
+                "dropped_hits": self.dropped_hits,
             },
         }
 

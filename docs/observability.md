@@ -32,6 +32,10 @@ non-global provider. `AsyncMemory` accepts the same argument and preserves conte
 worker thread. No span records memory text, media bytes, asset IDs, paths, metadata, or model
 responses.
 
+Per-candidate retrieval diagnostics are intentionally not span attributes: memory and index IDs
+are high-cardinality identifiers. Use the opt-in Python `search_with_trace()` return value or the
+local `search-with-trace` CLI command when one search needs explanation.
+
 ## Span structure
 
 The operation span is the elapsed time visible to the caller. Child spans identify the work that
@@ -46,6 +50,9 @@ can be optimized independently:
 
 End-to-end operation spans contain their stage and model spans, so those levels are intentionally
 not additive. Material stage spans are siblings; compare them directly when locating a bottleneck.
+Each `add_stream` item produces an ordinary `mindbridge.add` span; an unbounded source does not hold
+one artificial lifetime span open. Each speculative prefetch is an ordinary `mindbridge.search`
+span, so existing latency and model-call accounting remains comparable.
 
 Model spans use OpenTelemetry GenAI attributes where the ecosystem defines them:
 
@@ -98,7 +105,8 @@ remainder is recorded as `.unattributed`. This preserves the exact total without
 or audio split. OpenAI transcription token details are mapped to text/audio; duration-billed
 responses additionally expose `mindbridge.token_usage.audio_seconds`. The bundled local Jina,
 Sentence Transformers, and FunASR adapters are not token-billed and do not synthesize tokenizer
-usage.
+usage. FunASR does report `audio_seconds` through the final timed speech turn for each analyzed
+asset, so local ASR work is visible without inventing tokens.
 
 `mindbridge.model.request_count`, `mindbridge.token_usage.expected_request_count`, and
 `mindbridge.token_usage.reported_request_count` make missing usage visible. A failed request or a
@@ -136,6 +144,10 @@ task row in `results.json` includes:
       "input_by_modality": {"text": 1000, "image": 200},
       "output_by_modality": {"text": 300},
       "by_module": {}
+    },
+    "grounding": {
+      "media_elided_hits": 2,
+      "dropped_hits": 0
     }
   }
 }
@@ -146,3 +158,4 @@ selected question count. Node totals are diagnostic accumulated span time and ca
 concurrency. Token totals include MindBridge model calls and benchmark judge calls. Cached answers
 do not consume new model tokens. `total_tokens` and `average_tokens` are `null` when any
 token-metered response omitted usage; `reported_total_tokens` remains the exact lower bound.
+`grounding` sums the request-level media elision and whole-hit drop counters for the task.

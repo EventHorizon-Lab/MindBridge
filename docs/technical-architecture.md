@@ -4,7 +4,8 @@
 
 ```text
 src/mindbridge/
-├── memory.py                    # public orchestration and consistency
+├── memory.py                    # public orchestration, streaming prefetch, and consistency
+├── plugins.py                   # explicit capability and policy composition
 ├── types.py                     # stable values
 ├── exceptions.py                # stable failures
 ├── models/
@@ -132,6 +133,12 @@ Final SQLite hydration and CAS leases share the write boundary so returned media
 Closing starts a lifecycle barrier, rejects new calls, waits for active calls, and closes each
 unique adapter or storage resource once. Forked processes must create a new instance and distinct
 directory.
+
+The stream APIs add no queue or worker service. Synchronous and asynchronous ingestion pull one
+completed observation only after the prior observation is durable. `AsyncOmniPrefetch` owns one
+event-loop task per turn, never runs more than one search concurrently, and coalesces only the
+not-yet-started snapshot. Closing it drains rather than cancels synchronous work already dispatched
+through `asyncio.to_thread`.
 
 ## Trust boundaries
 

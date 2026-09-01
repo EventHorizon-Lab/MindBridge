@@ -1,11 +1,71 @@
 # Configuration and composition
 
-MindBridge has no product-wide provider configuration object. Construct model clients and adapters
-where the application already manages dependencies and secrets.
+MindBridge offers two composition paths over the same memory kernel:
+
+- `Memory.from_config` validates pure data and constructs bundled adapters.
+- `Memory(...)` accepts already-constructed protocol implementations for custom models and
+  caller-owned SDK clients.
+
+Provider names exist only in the declarative composition layer. The kernel continues to depend on
+typed capabilities rather than provider branches.
+
+## Declarative composition
+
+```python
+from mindbridge import Memory
+
+config = {
+    "data_dir": "./data/assistant",
+    "embedding": {
+        "provider": "openai",
+        "model": "text-embedding-3-small",
+    },
+    "generation": {
+        "provider": "openai",
+        "model": "gpt-5-mini",
+        "temperature": 0.1,
+    },
+    "speech": {
+        "provider": "funasr",
+        "device": "cuda",
+    },
+    "face": {
+        "provider": "opencv",
+        "detector_model": "./models/yunet.onnx",
+        "recognizer_model": "./models/sface.onnx",
+    },
+    "settings": {
+        "index_speech": True,
+        "minimum_relevance": 0.55,
+    },
+}
+
+with Memory.from_config(config) as memory:
+    memory.add("Remember this")
+```
+
+The same input can be validated ahead of time with `MindBridgeConfig.model_validate(config)`.
+Unknown providers, unknown fields, invalid ranges, and missing required values raise a field-specific
+error before storage opens. `AsyncMemory.from_config` accepts the same configuration.
+
+Supported declarative slots are intentionally small:
+
+| Slot | Bundled providers |
+| --- | --- |
+| `embedding` | `openai`, `jina-omni`, `sentence-transformers` |
+| `generation` | `openai` |
+| `speech` | `openai`, `funasr` |
+| `face` | `opencv` |
+
+OpenAI slots accept `base_url`, `timeout`, and `max_retries`; the official SDK resolves its standard
+credentials. Use direct injection for secret managers, existing clients, proxies, custom modality
+declarations, or third-party providers. MindBridge owns and closes clients created by
+`from_config`.
 
 ## Memory settings
 
-`Memory` accepts only local semantic and consistency settings:
+`MemorySettings` is the readable name for the value-only local policy; `MemoryConfig` remains a
+compatible alias. The `settings` section accepts these values:
 
 ```python
 Memory(
@@ -50,7 +110,7 @@ Memory(
 - `tracer` optionally injects an OpenTelemetry tracer; `None` uses the global no-op or
   application-configured provider.
 
-## Provider clients
+## Explicit provider clients
 
 Use the provider SDK directly:
 
@@ -76,6 +136,9 @@ endpoint can bound output with `generation_max_tokens=512` and disable its think
 `generation_extra_body={"chat_template_kwargs": {"enable_thinking": False}}`. If an endpoint also
 requires a minimum video duration, set `generation_min_video_seconds` to that documented boundary;
 shorter videos use four ordered stills when image input and the `openai` extra are available.
+`generation_video_limit` defaults to eight distinct retrieved videos per answer; overflow videos
+retain their text or transcript evidence. Set a positive integer to calibrate the limit, or `None`
+only when the provider context and latency budget can safely accept every retrieved video.
 
 The SDK may read its own environment variables. MindBridge does not duplicate key lookup, URL
 normalization, proxy support, retry policy, connection pooling, or sync/async conversion.
@@ -92,6 +155,61 @@ models = OpenAIModels(
 ```
 
 All clients remain caller-owned and must be closed by the caller.
+
+### OpenAI Transcribe
+
+Use the existing transcription plugin with OpenAI's completed-file Transcriptions API:
+
+```python
+from openai import OpenAI
+
+from mindbridge import OpenAIModels
+
+client = OpenAI()
+transcriber = OpenAIModels(
+    transcription_client=client,
+    transcription_model="gpt-transcribe",
+    transcription_prompt="A household conversation about reminders and medication.",
+    transcription_keywords=("MindBridge", "AC-42"),
+    transcription_languages=("en", "zh-cn"),
+)
+```
+
+MindBridge sends each resolved audio asset to `/audio/transcriptions` as multipart form data and
+returns the response text through `TranscriptionBackend`. `transcription_prompt` supplies
+unstructured context; `transcription_keywords` and `transcription_languages` map to OpenAI's
+`keywords[]` and `languages[]` fields. See the official
+[file transcription guide](https://developers.openai.com/api/docs/guides/speech-to-text).
+
+The `whisper-1` default remains unchanged for compatibility; select `gpt-transcribe` explicitly.
+When no explicit `transcription_space` is supplied, MindBridge hashes prompt, keyword, and language
+settings into the derived space so stored transcripts from different recipes cannot mix. The hash
+does not expose the prompt or keywords in store metadata.
+
+[vLLM multimodal pooling models](https://github.com/vllm-project/vllm/blob/main/examples/pooling/embed/vision_embedding_online.py)
+extend `/embeddings` with top-level chat `messages`. Select that wire format explicitly so text
+queries and media documents use the same model recipe:
+
+```python
+from openai import OpenAI
+
+from mindbridge import Modality, OpenAIModels
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1")
+embedder = OpenAIModels(
+    embedding_client=client,
+    embedding_model="openai/clip-vit-base-patch32",
+    embedding_dimension=512,
+    embedding_request_format="messages",
+    embedding_capabilities=frozenset({Modality.TEXT, Modality.IMAGE}),
+)
+```
+
+MindBridge still uses the caller-owned official OpenAI SDK client; it does not add a provider
+registry or its own HTTP transport. The `messages` format becomes part of the derived durable
+embedding space, so changing formats against an existing `data_dir` fails rather than mixing
+vectors from different input recipes. `embedding_dimension` declares the model's output size for
+validation; MindBridge does not send it as vLLM's optional Matryoshka truncation control.
 
 ## Explicit capabilities
 
@@ -154,6 +272,10 @@ Jina delegates query/document inference to Sentence Transformers. FunASR delegat
 device selection to `funasr.AutoModel`. Face analysis delegates local decoding, YuNet detection,
 alignment, and SFace encoding to OpenCV; model files are caller-provided and never downloaded by
 MindBridge.
+
+For transcript-only workloads, copy `DEFAULT_FUNASR_RECIPE` with `speaker_model=None` and
+`speaker_revision=None`. This skips CAM++ and returns timed turns without speaker identities; the
+benchmark runner uses that recipe because its tasks do not score speaker identity.
 
 ## Benchmark-only environment settings
 

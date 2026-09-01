@@ -9,7 +9,7 @@ storage, defaults, or errors.
 ## Content values
 
 ```python
-from mindbridge import AssetRef, Blob, ContentAtom, ContentInput
+from mindbridge import AssetRef, Blob, ContentAtom, ContentInput, StreamInput
 ```
 
 ```python
@@ -32,7 +32,7 @@ These bounds are enforced on the Python surface and raise `ValidationError` befo
 | --- | --- | --- |
 | Parts in one `ContentInput` sequence | 128 | `content must not exceed 128 parts` |
 | Characters in one text value | 65,536 after NFC normalization | `... must not exceed 65536 characters` |
-| `limit` for `search`, `ask`, and `list` | 1–100 inclusive | `limit must be between 1 and 100` |
+| `limit` for `search`, `search_with_trace`, `ask`, and `list` | 1–100 inclusive | `limit must be between 1 and 100` |
 
 The transports are stricter than the SDK, not equal to it: REST and MCP cap one request at 16 parts.
 An agent that composes near the Python bound must therefore expect a smaller ceiling over a
@@ -64,6 +64,32 @@ Memory(
 `embedder` is required. `Memory` validates adapter capabilities and durable space identity before
 opening Zvec. It closes supplied adapters when the memory closes; provider clients owned by an
 adapter may remain caller-owned, as documented by that adapter.
+
+Bundled adapters can be selected without constructing runtime objects:
+
+```python
+from mindbridge import Memory
+
+with Memory.from_config(
+    {
+        "data_dir": "./data/example",
+        "embedding": {"provider": "jina-omni"},
+        "speech": {"provider": "funasr"},
+        "settings": {"index_speech": True},
+    }
+) as memory:
+    memory.add("Remember this")
+```
+
+`Memory.from_config` accepts a `MindBridgeConfig` or mapping. It strictly validates bundled provider
+fields, owns the adapters and SDK clients it constructs, and reports invalid fields before opening
+storage. `AsyncMemory.from_config` accepts the same input. See
+[configuration and composition](../configuration.md) for providers and fields.
+
+Direct `Memory(...)` construction remains the stable plugin API. The compatibility
+`MemoryPlugins`/`Memory.from_plugins` bundle is also supported for applications that already group
+runtime objects separately from `MemoryConfig` local policy. Every entry point performs the same
+capability validation and uses the same storage, routing, lifecycle, and failure behavior.
 
 `tracer` optionally selects a non-global OpenTelemetry provider. With the default `None`,
 MindBridge uses the standard global tracer. See
@@ -126,6 +152,45 @@ later than it. Metadata must be a JSON-compatible mapping with non-empty string 
 preserves per-record provenance without losing batched model/storage work. Duplicate inputs return
 the same stable record in their original positions.
 
+### Stream input
+
+`add_stream` consumes an iterable lazily and commits each completed item before requesting the
+next. A plain `ContentInput` uses the same defaults as `add`; wrap an item in `StreamInput` when a
+clip needs its own event time, metadata, or memory role:
+
+```python
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from mindbridge import MemoryType, StreamInput
+
+started = datetime(2026, 8, 31, 9, tzinfo=timezone.utc)
+
+
+def camera_clips():
+    for sequence, path in enumerate(sorted(Path("./capture").glob("*.mp4"))):
+        occurred_at = started + timedelta(seconds=30 * sequence)
+        yield StreamInput(
+            path,
+            occurred_at=occurred_at,
+            occurred_end=occurred_at + timedelta(seconds=30),
+            metadata={"sequence": sequence},
+            memory_type=MemoryType.EPISODIC,
+        )
+
+
+for record in memory.add_stream(camera_clips()):
+    print(record.id)
+```
+
+Each yielded record is already durable and searchable. The stream is not one transaction: if a
+later item fails, earlier records remain committed and the error's `subject` identifies its
+`contents[N]` position. `AsyncMemory.add_stream` accepts an `AsyncIterable` and returns an async
+iterator with the same item semantics. MindBridge consumes completed chunks; the application owns
+camera or microphone capture and chooses chunk boundaries. Composite observations may combine
+text, image, video, and audio atoms. See
+[omni streaming and interaction memory](../omni-streaming-and-interaction-memory.md).
+
 ### Retrieve and answer
 
 ```python
@@ -134,6 +199,8 @@ hits = memory.search(
     limit=10,
     memory_type=None,
     reference_at=None,
+    occurred_from=None,
+    occurred_until=None,
 )
 result = memory.ask(
     question,
@@ -152,6 +219,13 @@ English reference date such as `Today is May 2, 2024`; an explicit `reference_at
 Absolute month and year expressions such as `December 2023`, `2024年4月`, or `in 2025` select the
 matching event-time range directly.
 
+`occurred_from` and `occurred_until` are optional timezone-aware hard filters on event time. A
+memory matches when its `[occurred_at, occurred_end)` interval overlaps the half-open query
+interval; an instant event has a one-microsecond extent. Either bound may be omitted. Supplying any
+bound excludes memories without `occurred_at`, and two bounds require
+`occurred_until > occurred_from`. These filters are independent of the soft temporal preference
+inferred from query text.
+
 Composite records are indexed with an aggregate vector and de-duplicated vectors for each text or
 media atom. Text longer than 2,048 characters also receives overlapping contextual retrieval keys;
 the complete record remains the returned evidence. Queries batch their complete aggregate with
@@ -162,6 +236,36 @@ authoritative parent before reranking. English BM25 uses
 case folding, accent folding, and stemming; queries containing Han characters use Jieba. Weak or
 missing evidence can therefore return `()`. With `limit=1`, an unresolved top-two tie can also
 empty `search` or leave `ask` with no hits; larger limits preserve those qualified candidates.
+
+### Trace one search
+
+```python
+result = memory.search_with_trace(
+    query,
+    limit=10,
+    memory_type=None,
+    reference_at=None,
+    occurred_from=None,
+    occurred_until=None,
+)
+```
+
+`result.hits` is exactly the value the same `search` call returns. `result.trace.candidates`
+explains the bounded candidate set actually considered: parent `memory_id`, contributing
+`index_ids`, dense relevance and confidence, effective lexical relevance, lexical rerank bonus,
+gate confidence, reinforcement, temporal and retention factors, final score, rank, and
+`rejected_by`. For a ranked candidate,
+`base_relevance = min(1, max(dense_relevance, lexical_relevance) + lexical_rerank_bonus)`;
+`gate_confidence` is the value compared with `minimum_relevance`. Rejection values are
+`stale_index`, `occurrence_range`, `missing_memory`, `memory_type`, `minimum_relevance`,
+`ambiguity`, and `limit`. A stale index candidate has `memory_id=None`.
+
+The trace never contains the query, memory content, metadata, media, vectors, paths, or model
+output. It is returned only to the caller and is not persisted or emitted through OpenTelemetry.
+`candidate_limit` is the final bounded retrieval width; `exhaustive` means every route returned
+fewer candidates than that width, not that the complete corpus was scanned. This diagnostic is
+available from Python and the local `search-with-trace` CLI command; REST and MCP do not expose it
+in this release.
 
 ### Feedback
 
@@ -236,7 +340,8 @@ number of memories rebuilt. It never calls the embedder. `optimize` compacts the
 
 ## AsyncMemory
 
-`AsyncMemory` takes the same constructor arguments and exposes the same methods with `await`.
+`AsyncMemory` takes the same constructor arguments and exposes the same methods. Finite operations
+use `await`; `add_stream` consumes an `AsyncIterable` with `async for`.
 
 ```python
 async with AsyncMemory(
@@ -247,18 +352,47 @@ async with AsyncMemory(
 ) as memory:
     await memory.add("Remember this")
     hits = await memory.search("Remember")
+    async for record in memory.add_stream(observations()):
+        print(record.id)
 ```
 
 It runs the embedded synchronous consistency core through `asyncio.to_thread`. It is not a
 provider compatibility layer.
 
+### Async omni prefetch
+
+`AsyncOmniPrefetch` is a per-turn Python orchestration helper over `AsyncMemory.search`. Submit the
+complete current multimodal snapshot whenever useful evidence changes, then confirm the final
+snapshot:
+
+```python
+from mindbridge import AsyncOmniPrefetch
+
+prefetch = AsyncOmniPrefetch(memory, limit=8)
+prefetch.submit((partial_text, frame_blob, audio_blob))
+prefetch.submit((newer_text, frame_blob, audio_blob))
+result = await prefetch.finalize((final_text, frame_blob, audio_blob))
+```
+
+One search runs at a time and only the newest queued revision survives. `latest` returns the newest
+completed `PrefetchResult` without waiting. `finalize` returns a result for the exact final value
+and closes the helper; a failed matching speculation is retried as a new revision. Prefetch
+snapshots accept immutable text, `Blob`, and `AssetRef` values, but reject mutable `Path` inputs.
+`close()` abandons queued work and drains the already-running search without attempting ineffective
+thread cancellation. The helper never persists input or reinforces hits.
+
 ## Return values
 
 - `MemoryRecord`: stable ID, derived text, modality, memory type, assets, timestamps, metadata.
 - `SearchHit`: the same visible memory fields plus a normalized score.
-- `AnswerResult`: grounded answer text and the accepted hits.
+- `TracedSearchResult`: search hits plus an immutable `RetrievalTrace` of
+  `RetrievalCandidateTrace` values and stable `RetrievalRejection` reasons.
+- `AnswerResult`: grounded answer text, accepted hits, `abstained`, and a machine-readable
+  `abstention_reason` (`no_evidence` or `insufficient_evidence`).
 - `Page`: records and an optional next cursor.
+- `PrefetchResult`: a positive submission revision and immutable search hits.
 - `SpeakerSegment`: one timed speech segment and local identity fields.
+- `StreamInput`: one completed `ContentInput` with per-item time, metadata, and memory type.
 
 All are frozen, slotted dataclasses. Mappings are detached from caller input.
 
@@ -384,8 +518,9 @@ metadata while reproducing the pinned Jina recipe's sampling of at most 32 uniqu
 speech = FunASRTranscriber(device="auto")
 ```
 
-The adapter delegates model, VAD, and speaker execution to `funasr.AutoModel`, then validates and
-maps the result into MindBridge speech values.
+The adapter delegates model, VAD, and optional speaker execution to `funasr.AutoModel`, then
+validates and maps the result into MindBridge speech values. A `FunASRRecipe` with
+`speaker_model=None` returns timed transcript turns without speaker embeddings.
 
 ### OpenCV face analysis
 
@@ -419,9 +554,13 @@ models = OpenAIModels(
     embedding_model="text-embedding-3-small",
     embedding_space=None,
     embedding_dimension=1536,
+    embedding_request_format="input",
     generation_model="gpt-5-mini",
     transcription_model="whisper-1",
     transcription_space=None,
+    transcription_prompt=None,
+    transcription_keywords=None,
+    transcription_languages=None,
     embedding_capabilities=frozenset({Modality.TEXT}),
     generation_capabilities=frozenset({Modality.TEXT}),
     transcription_capabilities=frozenset({Modality.AUDIO}),
@@ -429,6 +568,7 @@ models = OpenAIModels(
     generation_temperature=None,
     generation_max_tokens=None,
     generation_min_video_seconds=None,
+    generation_video_limit=8,
     generation_extra_body=None,
 )
 ```
@@ -438,7 +578,25 @@ only when their operation is invoked. Media is bounded and sent inline; use a pr
 upload adapter for larger assets. `generation_max_tokens` maps to Chat Completions `max_tokens`;
 `generation_extra_body` passes caller-owned provider extensions through the official SDK. Both are
 built into the shared grounded request, so `answer()` and `stream_answer()` always send identical
-generation controls. SDK clients remain caller-owned.
+generation controls. `generation_video_limit` bounds distinct retrieved videos while preserving
+overflow hit text; set it to `None` to disable that count limit. The byte limits still apply. SDK
+clients remain caller-owned.
+
+Set `transcription_model="gpt-transcribe"` to use OpenAI Transcribe for completed audio files.
+Optional `transcription_prompt`, `transcription_keywords`, and `transcription_languages` are sent
+through the official SDK. Their normalized values are hashed into the default
+`transcription_space`; supply an explicit space only when the application maintains an equivalent
+stable recipe identity itself. OpenAI Transcribe remains a plain `TranscriptionBackend`; realtime
+audio, timestamps, diarization, and speaker embeddings require their corresponding specialized
+backends.
+
+`embedding_request_format="input"` uses the standard OpenAI Embeddings request field. Set it to
+`"messages"` for OpenAI-compatible servers that implement chat-style embeddings, such as vLLM
+multimodal pooling models. That mode sends ordered text and inline media as top-level chat messages
+through the same `/embeddings` endpoint. The request format is included in the default durable
+`embedding_space`; an explicit space must likewise distinguish recipes that use different formats.
+In `messages` mode, `embedding_dimension` validates returned vectors but is not sent as the
+provider's optional server-side dimension-reduction parameter.
 
 Set `generation_min_video_seconds` only when the selected provider declares a minimum local-video
 duration. With the `openai` extra and declared image input, a shorter video becomes four

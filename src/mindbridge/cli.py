@@ -19,13 +19,14 @@ import inspect
 import json
 import math
 import sys
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import datetime
 from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
-from typing import TypeAlias
+from typing import TextIO, TypeAlias
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -56,6 +57,7 @@ from mindbridge.types import (
     Modality,
     SearchHit,
     SpeakerSegment,
+    StreamInput,
 )
 
 PROGRAM = "mindbridge"
@@ -82,7 +84,9 @@ DATA_DIR_IN_USE_EXIT_CODE = 9
 OPERATIONS: tuple[str, ...] = (
     "add",
     "add_many",
+    "add_stream",
     "search",
+    "search_with_trace",
     "ask",
     "get",
     "speech",
@@ -97,10 +101,15 @@ OPERATIONS: tuple[str, ...] = (
 )
 DOCTOR = "doctor"
 COMMANDS: tuple[str, ...] = (*(name.replace("_", "-") for name in OPERATIONS), DOCTOR)
-# Operations a running owner serves over `/v1`. The other five have no route today; that is a
+# Operations a running owner serves over `/v1`. Other operations have no route today; that is a
 # documented transport gap, reported honestly, not a CLI design choice.
 REMOTE_COMMANDS = frozenset({"add", "add-many", "search", "ask", "get", "list", "delete"})
-_QUERY_METAVAR: Mapping[str, str] = {"add": "TEXT", "search": "QUERY", "ask": "QUESTION"}
+_QUERY_METAVAR: Mapping[str, str] = {
+    "add": "TEXT",
+    "search": "QUERY",
+    "search-with-trace": "QUERY",
+    "ask": "QUESTION",
+}
 _DEFAULT_REMOTE_TIMEOUT_SECONDS = 30.0
 _TUNING: tuple[str, ...] = (
     "index_speech",
@@ -483,14 +492,48 @@ def _add_many(memory: Memory, arguments: argparse.Namespace) -> _Document:
     }
 
 
+def _add_stream(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    memory_type = MemoryType(arguments.memory_type)
+    inputs = (
+        StreamInput(
+            _parts_input(item["content"]),
+            occurred_at=_optional_time(item.get("occurred_at"), "occurred_at"),
+            occurred_end=_optional_time(item.get("occurred_end"), "occurred_end"),
+            metadata=_metadata_value(item.get("metadata")),
+            memory_type=memory_type,
+        )
+        for item in _jsonl_stream(arguments.source)
+    )
+    # ponytail: preserve the CLI's one-JSON-document contract by collecting result records; add
+    # streaming output only if finite CLI imports outgrow memory. The SDK input path stays lazy.
+    return {"memories": [_memory_document(record) for record in memory.add_stream(inputs)]}
+
+
 def _search(memory: Memory, arguments: argparse.Namespace) -> _Document:
     hits = memory.search(
         _content_input(arguments),
         limit=arguments.limit,
         memory_type=_optional_memory_type(arguments),
         reference_at=_optional_time(arguments.reference_at, "reference_at"),
+        occurred_from=_optional_time(arguments.occurred_from, "occurred_from"),
+        occurred_until=_optional_time(arguments.occurred_until, "occurred_until"),
     )
     return {"hits": [_memory_document(hit) for hit in hits]}
+
+
+def _search_with_trace(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    result = memory.search_with_trace(
+        _content_input(arguments),
+        limit=arguments.limit,
+        memory_type=_optional_memory_type(arguments),
+        reference_at=_optional_time(arguments.reference_at, "reference_at"),
+        occurred_from=_optional_time(arguments.occurred_from, "occurred_from"),
+        occurred_until=_optional_time(arguments.occurred_until, "occurred_until"),
+    )
+    return {
+        "hits": [_memory_document(hit) for hit in result.hits],
+        "trace": asdict(result.trace),
+    }
 
 
 def _ask(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -500,7 +543,14 @@ def _ask(memory: Memory, arguments: argparse.Namespace) -> _Document:
         memory_type=_optional_memory_type(arguments),
         reference_at=_optional_time(arguments.reference_at, "reference_at"),
     )
-    return {"answer": result.answer, "hits": [_memory_document(hit) for hit in result.hits]}
+    return {
+        "answer": result.answer,
+        "hits": [_memory_document(hit) for hit in result.hits],
+        "abstained": result.abstained,
+        "abstention_reason": (
+            None if result.abstention_reason is None else result.abstention_reason.value
+        ),
+    }
 
 
 def _get(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -553,7 +603,9 @@ def _optimize(memory: Memory, _arguments: argparse.Namespace) -> _Document:
 _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "add": _add,
     "add-many": _add_many,
+    "add-stream": _add_stream,
     "search": _search,
+    "search-with-trace": _search_with_trace,
     "ask": _ask,
     "get": _get,
     "speech": _speech,
@@ -631,6 +683,9 @@ def _remote_query(field: str, arguments: argparse.Namespace) -> _Document:
     body: _Document = {field: _content_value(arguments), "limit": arguments.limit}
     _put(body, "memory_type", arguments.memory_type)
     _put(body, "reference_at", _remote_time(arguments.reference_at, "reference_at"))
+    if field == "query":
+        _put(body, "occurred_from", _remote_time(arguments.occurred_from, "occurred_from"))
+        _put(body, "occurred_until", _remote_time(arguments.occurred_until, "occurred_until"))
     return body
 
 
@@ -900,8 +955,12 @@ def _decode_base64(value: str) -> bytes:
 
 
 def _jsonl(source: str) -> tuple[Mapping[str, object], ...]:
-    items: list[Mapping[str, object]] = []
-    for number, line in enumerate(_read_source(source).splitlines(), start=1):
+    return tuple(_jsonl_stream(source))
+
+
+def _jsonl_stream(source: str) -> Iterator[Mapping[str, object]]:
+    found = False
+    for number, line in enumerate(_source_lines(source), start=1):
         if not line.strip():
             continue
         try:
@@ -911,10 +970,24 @@ def _jsonl(source: str) -> tuple[Mapping[str, object], ...]:
         if not isinstance(item, dict) or "content" not in item:
             raise ValidationError(f"line {number} must be an object with a content field")
         _fields(item, {"content", "occurred_at", "occurred_end", "metadata"})
-        items.append(item)
-    if not items:
+        found = True
+        yield item
+    if not found:
         raise ValidationError("no memories were supplied")
-    return tuple(items)
+
+
+def _source_lines(source: str) -> Iterable[str]:
+    if source == _STDIN:
+        yield from _claim_stdin()
+        return
+    if source.startswith("@"):
+        try:
+            with Path(source[1:]).open(encoding="utf-8") as stream:
+                yield from stream
+        except OSError as error:
+            raise ValidationError(f"cannot read {source[1:]}: {error.strerror}") from None
+        return
+    yield from source.splitlines()
 
 
 def _metadata_value(value: object) -> Mapping[str, object] | None:
@@ -946,13 +1019,17 @@ def _read_source(value: str) -> str:
 
 
 def _read_stdin() -> str:
+    return _claim_stdin().read()
+
+
+def _claim_stdin() -> TextIO:
     global _stdin_consumed
     if _stdin_consumed:
         raise ValidationError("standard input can only be read once per invocation")
     if sys.stdin.isatty():
         raise ValidationError("no content was supplied and standard input is a terminal")
     _stdin_consumed = True
-    return sys.stdin.read()
+    return sys.stdin
 
 
 def _optional_time(value: object, name: str) -> datetime | None:
@@ -1187,16 +1264,23 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     batch = commands.add_parser("add-many", help="store a JSONL batch in one transaction")
     batch.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
     _memory_type_option(batch, "add_many")
-    for name in ("search", "ask"):
+    stream = commands.add_parser("add-stream", help="store completed JSONL items incrementally")
+    stream.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
+    _memory_type_option(stream, "add")
+    for operation in ("search", "search_with_trace", "ask"):
+        name = operation.replace("_", "-")
         command = _content_command(commands, name, f"{name} memories")
         command.add_argument(
             "--limit",
             type=int,
-            default=_default(name, "limit"),
+            default=_default(operation, "limit"),
             help="maximum hits (default: %(default)s)",
         )
-        _memory_type_option(command, name)
+        _memory_type_option(command, operation)
         command.add_argument("--reference-at", metavar="TIME", help="retrieval reference clock")
+        if operation != "ask":
+            command.add_argument("--occurred-from", metavar="TIME", help="event overlap start")
+            command.add_argument("--occurred-until", metavar="TIME", help="event overlap end")
     for name, help_text in (
         ("get", "read one memory"),
         ("speech", "transcribe and identify speakers"),

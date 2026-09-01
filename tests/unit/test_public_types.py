@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge import IndexQuantization
+from mindbridge import IndexQuantization, PrefetchResult, StreamInput
 from mindbridge.exceptions import (
     RETRYABLE_REASONS,
     IndexUnavailableError,
@@ -20,6 +20,7 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.types import (
+    AbstentionReason,
     AnswerResult,
     AssetRef,
     Blob,
@@ -27,7 +28,11 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     Page,
+    RetrievalCandidateTrace,
+    RetrievalRejection,
+    RetrievalTrace,
     SearchHit,
+    TracedSearchResult,
 )
 
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
@@ -59,6 +64,29 @@ def test_memory_record_metadata_is_detached_and_serializable() -> None:
         memory.content = "changed"  # type: ignore[misc]
 
 
+def test_stream_input_snapshots_omni_parts_and_metadata() -> None:
+    parts: list[str | Blob] = ["observation", Blob(b"image", "image/png")]
+    metadata = {"source": "camera"}
+    item = StreamInput(
+        parts,
+        occurred_at=NOW,
+        occurred_end=NOW + timedelta(seconds=30),
+        metadata=metadata,
+        memory_type=MemoryType.EPISODIC,
+    )
+
+    parts[0] = "changed"
+    metadata["source"] = "changed"
+
+    assert item.content == ("observation", Blob(b"image", "image/png"))
+    assert item.metadata == {"source": "camera"}
+    assert pickle.loads(pickle.dumps(item)) == item
+    with pytest.raises(ValidationError, match="timezone"):
+        StreamInput("clip", occurred_at=NOW.replace(tzinfo=None))
+    with pytest.raises(ValidationError, match="timezone"):
+        StreamInput("clip", occurred_at="2026-08-31T09:00:00Z")  # type: ignore[arg-type]
+
+
 def test_search_hit_is_flat_and_rejects_invalid_scores() -> None:
     hit = SearchHit(
         id="memory_1",
@@ -82,6 +110,51 @@ def test_search_hit_is_flat_and_rejects_invalid_scores() -> None:
             content="A red screwdriver.",
             created_at=NOW,
             memory_type="episodic",  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(ValidationError, match="positive integer"):
+        PrefetchResult(revision=0, hits=(hit,))
+
+
+def test_retrieval_trace_values_are_immutable_and_bounded() -> None:
+    hit = SearchHit(id="memory_1", content="memory", score=0.9, created_at=NOW)
+    candidate = RetrievalCandidateTrace(
+        memory_id=hit.id,
+        index_ids=("embedding_1",),
+        dense_relevance=0.9,
+        dense_confidence=0.8,
+        lexical_relevance=0.6,
+        lexical_rerank_bonus=0.2,
+        gate_confidence=0.8,
+        base_relevance=0.9,
+        reinforcement_factor=1.0,
+        final_score=hit.score,
+        rank=1,
+    )
+    result = TracedSearchResult(
+        hits=(hit,),
+        trace=RetrievalTrace(
+            candidates=(candidate,),
+            candidate_limit=50,
+            exhaustive=True,
+        ),
+    )
+
+    assert pickle.loads(pickle.dumps(result)) == result
+    assert tuple(reason.value for reason in RetrievalRejection) == (
+        "stale_index",
+        "occurrence_range",
+        "missing_memory",
+        "memory_type",
+        "minimum_relevance",
+        "ambiguity",
+        "limit",
+    )
+    with pytest.raises(ValidationError, match="must not exceed one"):
+        RetrievalCandidateTrace(
+            memory_id=hit.id,
+            index_ids=("embedding_1",),
+            final_score=1.1,
         )
 
 
@@ -162,6 +235,14 @@ def test_answer_and_page_reuse_the_public_values() -> None:
     hit = SearchHit(id=memory.id, content=memory.content, score=0.9, created_at=memory.created_at)
 
     assert AnswerResult(answer="It is in the toolbox.", hits=(hit,)).hits == (hit,)
+    abstention = AnswerResult(
+        answer="unknown",
+        abstained=True,
+        abstention_reason=AbstentionReason.INSUFFICIENT_EVIDENCE,
+    )
+    assert abstention.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
+    with pytest.raises(ValidationError, match="must agree"):
+        AnswerResult(answer="unknown", abstained=True)
     assert Page(items=(memory,), next_cursor="cursor_1").items == (memory,)
 
 

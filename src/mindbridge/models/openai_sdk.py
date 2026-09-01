@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import time
@@ -28,7 +29,7 @@ from mindbridge._telemetry import (
 )
 from mindbridge.exceptions import ModelError, ModelOutputTruncatedError, ValidationError
 from mindbridge.models.base import EmbedTask, ModelInput, _modalities
-from mindbridge.types import AnswerResult, AssetRef, Modality, SearchHit
+from mindbridge.types import AbstentionReason, AnswerResult, AssetRef, Modality, SearchHit
 
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_GENERATION_MODEL = "gpt-5-mini"
@@ -72,6 +73,7 @@ class OpenAIModels:
         "_embedding_capabilities",
         "_embedding_dimension",
         "_embedding_model",
+        "_embedding_request_format",
         "_embedding_space",
         "_generation_capabilities",
         "_generation_extra_body",
@@ -80,12 +82,16 @@ class OpenAIModels:
         "_generation_model",
         "_generation_seed",
         "_generation_temperature",
+        "_generation_video_limit",
         "_transcription_capabilities",
+        "_transcription_keywords",
+        "_transcription_languages",
         "_transcription_model",
+        "_transcription_prompt",
         "_transcription_space",
     )
 
-    def __init__(
+    def __init__(  # noqa: C901 - validates independent adapter controls
         self,
         client: OpenAI | None = None,
         *,
@@ -95,9 +101,13 @@ class OpenAIModels:
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         embedding_space: str | None = None,
         embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION,
+        embedding_request_format: Literal["input", "messages"] = "input",
         generation_model: str = DEFAULT_GENERATION_MODEL,
         transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL,
         transcription_space: str | None = None,
+        transcription_prompt: str | None = None,
+        transcription_keywords: Sequence[str] | None = None,
+        transcription_languages: Sequence[str] | None = None,
         embedding_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
         generation_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
         transcription_capabilities: frozenset[Modality] = frozenset({Modality.AUDIO}),
@@ -105,17 +115,26 @@ class OpenAIModels:
         generation_temperature: float | None = None,
         generation_max_tokens: int | None = None,
         generation_min_video_seconds: float | None = None,
+        generation_video_limit: int | None = 8,
         generation_extra_body: Mapping[str, object] | None = None,
     ) -> None:
         embedding_model = _text(embedding_model, "embedding_model")
         generation_model = _text(generation_model, "generation_model")
         transcription_model = _text(transcription_model, "transcription_model")
+        transcription_prompt, transcription_keywords, transcription_languages = (
+            _transcription_context(
+                transcription_prompt,
+                transcription_keywords,
+                transcription_languages,
+            )
+        )
         if (
             isinstance(embedding_dimension, bool)
             or not isinstance(embedding_dimension, int)
             or embedding_dimension <= 0
         ):
             raise ValidationError("embedding_dimension must be a positive integer")
+        embedding_request_format = _embedding_format(embedding_request_format)
         if generation_seed is not None and (
             isinstance(generation_seed, bool)
             or not isinstance(generation_seed, int)
@@ -142,6 +161,12 @@ class OpenAIModels:
             or generation_min_video_seconds <= 0
         ):
             raise ValidationError("generation_min_video_seconds must be a positive finite number")
+        if generation_video_limit is not None and (
+            isinstance(generation_video_limit, bool)
+            or not isinstance(generation_video_limit, int)
+            or generation_video_limit <= 0
+        ):
+            raise ValidationError("generation_video_limit must be a positive integer")
         if generation_extra_body is not None and (
             not isinstance(generation_extra_body, Mapping)
             or any(not isinstance(key, str) or not key.strip() for key in generation_extra_body)
@@ -159,15 +184,28 @@ class OpenAIModels:
             self._clients["transcription"] = transcription_client
         self._embedding_model = embedding_model
         self._embedding_dimension = embedding_dimension
+        self._embedding_request_format = embedding_request_format
         self._embedding_space = (
-            f"{embedding_model}:{embedding_dimension}:l2-v1"
+            (
+                f"{embedding_model}:{embedding_dimension}:messages-v1:l2-v1"
+                if embedding_request_format == "messages"
+                else f"{embedding_model}:{embedding_dimension}:l2-v1"
+            )
             if embedding_space is None
             else _text(embedding_space, "embedding_space")
         )
         self._generation_model = generation_model
         self._transcription_model = transcription_model
+        self._transcription_prompt = transcription_prompt
+        self._transcription_keywords = transcription_keywords
+        self._transcription_languages = transcription_languages
         self._transcription_space = (
-            f"{transcription_model}:asr-v1"
+            _default_transcription_space(
+                transcription_model,
+                prompt=transcription_prompt,
+                keywords=transcription_keywords,
+                languages=transcription_languages,
+            )
             if transcription_space is None
             else _text(transcription_space, "transcription_space")
         )
@@ -180,6 +218,7 @@ class OpenAIModels:
         self._generation_min_video_seconds = (
             None if generation_min_video_seconds is None else float(generation_min_video_seconds)
         )
+        self._generation_video_limit = generation_video_limit
         self._generation_extra_body = (
             None if generation_extra_body is None else dict(generation_extra_body)
         )
@@ -225,7 +264,7 @@ class OpenAIModels:
         inputs: Sequence[ModelInput | str],
         task: EmbedTask = EmbedTask.DOCUMENT,
     ) -> tuple[tuple[float, ...], ...]:
-        """Encode one batch with the standard API shape.
+        """Encode one batch with the configured OpenAI-compatible API shape.
 
         ``task`` is validated but intentionally not serialized: the generic OpenAI embeddings
         contract has no task field. Task-aware providers should implement ``EmbeddingBackend``.
@@ -251,19 +290,36 @@ class OpenAIModels:
         _require_consistent_assets(embedding_assets)
         _require_inline_size(embedding_assets)
 
-        create_embedding = cast(Any, self._client("embedding").embeddings.create)
+        client = self._client("embedding")
         mark_model_requests(1)
         try:
-            response = create_embedding(
-                input=(
-                    [value.text for value in batch]
-                    if all(not value.assets for value in batch)
-                    else _embedding_samples(batch)
-                ),
-                model=self.embedding_model,
-                dimensions=self.embedding_dimension,
-                encoding_format="float",
-            )
+            if self._embedding_request_format == "messages":
+                from openai.types.create_embedding_response import CreateEmbeddingResponse
+
+                samples = _embedding_samples(batch)
+                response = client.post(
+                    "/embeddings",
+                    cast_to=CreateEmbeddingResponse,
+                    body={
+                        "messages": samples[0] if len(samples) == 1 else samples,
+                        "model": self.embedding_model,
+                        # The declared dimension validates output; chat servers may reject it as
+                        # an unsupported Matryoshka truncation request.
+                        "encoding_format": "float",
+                    },
+                )
+            else:
+                create_embedding = cast(Any, client.embeddings.create)
+                response = create_embedding(
+                    input=(
+                        [value.text for value in batch]
+                        if all(not value.assets for value in batch)
+                        else _embedding_samples(batch)
+                    ),
+                    model=self.embedding_model,
+                    dimensions=self.embedding_dimension,
+                    encoding_format="float",
+                )
         except ModelError:
             raise
         except Exception as error:
@@ -289,9 +345,13 @@ class OpenAIModels:
         """Answer only from supplied hits, preserving native media content parts."""
         mark_model_requests(0, token_usage_expected=0)
         prepared = self._answer_request(question, hits)
-        if prepared is None:
+        if isinstance(prepared, AbstentionReason):
             mark_model_requests(0, token_usage_expected=0)
-            return AnswerResult(answer=UNKNOWN_ANSWER)
+            return AnswerResult(
+                answer=UNKNOWN_ANSWER,
+                abstained=True,
+                abstention_reason=prepared,
+            )
         response, grounded, modalities, request_count = self._create_answer(
             question,
             hits,
@@ -304,7 +364,7 @@ class OpenAIModels:
             request_count=request_count,
         )
         answer = _answer_text(response)
-        return AnswerResult(answer=answer, hits=grounded)
+        return _answer_result(answer, grounded)
 
     def stream_answer(  # noqa: C901 - stream validation and usage share one response lifecycle
         self,
@@ -314,10 +374,10 @@ class OpenAIModels:
         """Yield grounded text deltas while recording first-token and final usage data."""
         mark_model_requests(0, token_usage_expected=0)
         prepared = self._answer_request(question, hits)
-        if prepared is None:
+        if isinstance(prepared, AbstentionReason):
             mark_model_requests(0, token_usage_expected=0)
             yield UNKNOWN_ANSWER
-            return ()
+            return _GroundedHits((), prepared)
         started = time.perf_counter()
         usage_response: object | None = None
         responses, grounded, modalities, request_count = self._create_answer(
@@ -329,6 +389,7 @@ class OpenAIModels:
         try:
             finish_reason: object = None
             emitted = False
+            answer_parts = []
             first_chunk = False
             for response in cast(Any, responses):
                 elapsed = time.perf_counter() - started
@@ -367,6 +428,7 @@ class OpenAIModels:
                     if not emitted:
                         span.set_attribute(MODEL_TTFT, elapsed)
                     emitted = True
+                    answer_parts.append(content)
                     yield content
         except ModelError:
             raise
@@ -391,7 +453,7 @@ class OpenAIModels:
             raise ModelError(
                 "generation response was invalid", reason="response_invalid", stage="generate"
             )
-        return grounded
+        return _GroundedHits(grounded, _abstention_reason("".join(answer_parts)))
 
     def _create_answer(
         self,
@@ -467,15 +529,16 @@ class OpenAIModels:
         if reduced == tuple(grounded):
             return None
         fallback = self._answer_request(question, reduced)
-        if fallback is not None:
-            _record_grounding_fit(tuple(retrieved), fallback[1])
+        if isinstance(fallback, AbstentionReason):
+            return None
+        _record_grounding_fit(tuple(retrieved), fallback[1])
         return fallback
 
     def _answer_request(
         self,
         question: ModelInput | str,
         hits: Sequence[SearchHit],
-    ) -> tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]] | None:
+    ) -> tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]] | AbstentionReason:
         question_input = ModelInput(text=question) if isinstance(question, str) else question
         if not isinstance(question_input, ModelInput):
             raise ValidationError("question must be a ModelInput value")
@@ -484,10 +547,18 @@ class OpenAIModels:
         retrieved = tuple(hits)
         if any(not isinstance(hit, SearchHit) for hit in retrieved):
             raise ValidationError("hits must contain SearchHit values")
-        grounded = _fit_grounding_media(question_input, retrieved)
+        grounded = _fit_grounding_media(
+            question_input,
+            retrieved,
+            video_limit=self._generation_video_limit,
+        )
         _record_grounding_fit(retrieved, grounded)
         if not grounded:
-            return None
+            return (
+                AbstentionReason.NO_EVIDENCE
+                if not retrieved
+                else AbstentionReason.INSUFFICIENT_EVIDENCE
+            )
 
         assets = question_input.assets + tuple(asset for hit in grounded for asset in hit.assets)
         text_parts = (
@@ -577,8 +648,13 @@ class OpenAIModels:
                         attempted += 1
                         mark_model_requests(attempted)
                         response = create_transcription(
-                            model=self.transcription_model,
-                            file=(asset.name or path.name, stream, media_type),
+                            **_transcription_request(
+                                self.transcription_model,
+                                (asset.name or path.name, stream, media_type),
+                                prompt=self._transcription_prompt,
+                                keywords=self._transcription_keywords,
+                                languages=self._transcription_languages,
+                            )
                         )
                 except ModelError:
                     raise
@@ -631,6 +707,21 @@ class _ModelUsage:
     cached_input_tokens: int | None = None
     reasoning_output_tokens: int | None = None
     audio_seconds: float | None = None
+
+
+class _GroundedHits(tuple[SearchHit, ...]):
+    """Keep the stream completion tuple-compatible while carrying abstention status."""
+
+    abstention_reason: AbstentionReason | None
+
+    def __new__(
+        cls,
+        hits: Sequence[SearchHit],
+        abstention_reason: AbstentionReason | None,
+    ) -> _GroundedHits:
+        value = super().__new__(cls, hits)
+        value.abstention_reason = abstention_reason
+        return value
 
 
 def _record_openai_usage(
@@ -829,6 +920,80 @@ def _text(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{name} must be non-empty text")
     return value.strip()
+
+
+def _text_sequence(value: object, name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValidationError(f"{name} must be a sequence of non-empty strings")
+    values = tuple(value)
+    if any(not isinstance(item, str) or not item.strip() for item in values):
+        raise ValidationError(f"{name} must be a sequence of non-empty strings")
+    return tuple(cast(str, item).strip() for item in values)
+
+
+def _transcription_context(
+    prompt: object,
+    keywords: object,
+    languages: object,
+) -> tuple[str | None, tuple[str, ...], tuple[str, ...]]:
+    normalized_prompt = None if prompt is None else _text(prompt, "transcription_prompt")
+    normalized_keywords = _text_sequence(keywords, "transcription_keywords")
+    normalized_languages = _text_sequence(languages, "transcription_languages")
+    if any(any(character in keyword for character in "<>\r\n") for keyword in normalized_keywords):
+        raise ValidationError(
+            "transcription_keywords must contain one-line text without '<' or '>'"
+        )
+    return normalized_prompt, normalized_keywords, normalized_languages
+
+
+def _transcription_request(
+    model: str,
+    file: object,
+    *,
+    prompt: str | None,
+    keywords: Sequence[str],
+    languages: Sequence[str],
+) -> dict[str, object]:
+    request: dict[str, object] = {"model": model, "file": file}
+    if prompt is not None:
+        request["prompt"] = prompt
+    context = {}
+    if keywords:
+        context["keywords"] = list(keywords)
+    if languages:
+        context["languages"] = list(languages)
+    if context:
+        request["extra_body"] = context
+    return request
+
+
+def _default_transcription_space(
+    model: str,
+    *,
+    prompt: str | None,
+    keywords: Sequence[str],
+    languages: Sequence[str],
+) -> str:
+    context: dict[str, object] = {}
+    if prompt is not None:
+        context["prompt"] = prompt
+    if keywords:
+        context["keywords"] = list(keywords)
+    if languages:
+        context["languages"] = list(languages)
+    if not context:
+        return f"{model}:asr-v1"
+    payload = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(f"openai-transcription-v1:{payload}".encode()).hexdigest()[:16]
+    return f"{model}:asr-v1:{digest}"
+
+
+def _embedding_format(value: object) -> Literal["input", "messages"]:
+    if not isinstance(value, str) or value not in ("input", "messages"):
+        raise ValidationError("embedding_request_format must be 'input' or 'messages'")
+    return cast(Literal["input", "messages"], value)
 
 
 def _provider_reason(error: Exception) -> str | None:
@@ -1106,15 +1271,24 @@ def _require_consistent_assets(assets: Sequence[AssetRef]) -> tuple[AssetRef, ..
 def _fit_grounding_media(
     question: ModelInput,
     hits: Sequence[SearchHit],
+    *,
+    video_limit: int | None,
 ) -> tuple[SearchHit, ...]:
     seen = {asset.id for asset in question.assets}
     used = sum(_encoded_size(cast(int, asset.size_bytes)) for asset in question.assets)
+    videos = 0
     selected = []
     for hit in hits:
         assets = []
         for asset in hit.assets:
             if asset.id in seen:
                 assets.append(asset)
+                continue
+            if (
+                asset.modality is Modality.VIDEO
+                and video_limit is not None
+                and videos >= video_limit
+            ):
                 continue
             size = cast(int, asset.size_bytes)
             encoded_size = _encoded_size(size)
@@ -1126,6 +1300,8 @@ def _fit_grounding_media(
             assets.append(asset)
             seen.add(asset.id)
             used += encoded_size
+            if asset.modality is Modality.VIDEO:
+                videos += 1
         if assets:
             admitted = tuple(assets)
             selected.append(
@@ -1140,6 +1316,20 @@ def _fit_grounding_media(
         elif hit.content.strip():
             selected.append(replace(hit, assets=(), modality=Modality.TEXT))
     return tuple(selected)
+
+
+def _answer_result(answer: str, hits: tuple[SearchHit, ...]) -> AnswerResult:
+    reason = _abstention_reason(answer)
+    return AnswerResult(
+        answer=answer,
+        hits=hits,
+        abstained=reason is not None,
+        abstention_reason=reason,
+    )
+
+
+def _abstention_reason(answer: str) -> AbstentionReason | None:
+    return AbstentionReason.INSUFFICIENT_EVIDENCE if answer.strip() == UNKNOWN_ANSWER else None
 
 
 def _record_grounding_fit(

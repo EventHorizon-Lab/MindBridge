@@ -229,7 +229,9 @@ Content-Type: application/json
   ],
   "limit": 10,
   "memory_type": "episodic",
-  "reference_at": "2026-08-27T12:00:00Z"
+  "reference_at": "2026-08-27T12:00:00Z",
+  "occurred_from": "2026-08-20T00:00:00Z",
+  "occurred_until": "2026-08-27T00:00:00Z"
 }
 ```
 
@@ -237,11 +239,14 @@ Content-Type: application/json
 `reference_at` resolves relative date expressions and must include a timezone; current UTC is the
 default unless the query declares a valid English reference date such as
 `Today is May 2, 2024`; an explicit value always wins. Absolute months and years such as
-`December 2023`, `2024年4月`, or `in 2025` select the matching event-time range. Response `200` is
-`{"hits": [...]}`; each hit has the memory fields plus `score`. The complete ordered query and
-bounded focused keys from its first text atom and media supply dense candidates; the focused text
-also supplies lexical candidates. All routes collapse aggregate or atomic document keys to parent
-memories.
+`December 2023`, `2024年4月`, or `in 2025` select the matching event-time range.
+`occurred_from` and `occurred_until` are optional timezone-aware hard filters. Stored event
+intervals must overlap their half-open range; either bound may be omitted, records without
+`occurred_at` are excluded, and two bounds require `occurred_until > occurred_from`. Response `200`
+is `{"hits": [...]}`; each
+hit has the memory fields plus `score`. The complete ordered query and bounded focused keys from
+its first text atom and media supply dense candidates; the focused text also supplies lexical
+candidates. All routes collapse aggregate or atomic document keys to parent memories.
 
 ### Answer from memories
 
@@ -264,14 +269,18 @@ Content-Type: application/json
 ```json
 {
   "answer": "I don't know based on the available memories.",
-  "hits": []
+  "hits": [],
+  "abstained": true,
+  "abstention_reason": "no_evidence"
 }
 ```
 
 `memory_type` and `reference_at` have the same semantics as search. `hits` are the exact search
-results used to ground the answer. The outbound generation request includes their content,
-`memory_type`, `occurred_at`, `occurred_end`, `created_at`, metadata, and media. In the built-in model request, a
-distinct question/evidence asset is serialized once even when multiple hits refer to it.
+results used to ground the answer. `abstention_reason` is `no_evidence`,
+`insufficient_evidence`, or `null` when `abstained` is false. The outbound generation request
+includes their content, `memory_type`, `occurred_at`, `occurred_end`, `created_at`, metadata, and
+media. In the built-in model request, a distinct question/evidence asset is serialized once even
+when multiple hits refer to it.
 
 ### Get a memory
 
@@ -391,11 +400,13 @@ than caller input.
 ### Operations without a route
 
 REST covers `add`, `add_many`, `search`, `ask`, `get`, `list`, and `delete` with the same defaults,
-field meanings, and error semantics as the Python SDK. Seven documented SDK operations have no
+field meanings, and error semantics as the Python SDK. Nine documented SDK operations have no
 route:
 
 | Operation | Why there is no route |
 | --- | --- |
+| `add_stream` | A Python iterator is process-local; clients send completed chunks through `POST /v1/memories` |
+| `search_with_trace` | Owner-process diagnostics with high-cardinality memory and index IDs |
 | `speech` | Not implemented on any transport yet |
 | `faces` | Python-only visual identity analysis |
 | `register_speaker` | Not implemented on any transport yet |
@@ -404,7 +415,7 @@ route:
 | `reindex` | Owner-process maintenance: it rebuilds the whole index and must not be reachable by an unauthenticated client |
 | `optimize` | Owner-process maintenance, for the same reason |
 
-`speech`, `faces`, identity registration, and `reinforce` are implementation gaps, not a different
+`add_stream`, `speech`, `faces`, identity registration, and `reinforce` are implementation gaps, not a different
 execution model. Use the Python API in the owner process until they ship. See
 [Python SDK](python-sdk.md) for the full inventory.
 

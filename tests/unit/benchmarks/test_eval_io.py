@@ -224,6 +224,8 @@ def test_response_cache_merges_run_shards_into_the_shared_cache(tmp_path: Path) 
         0.75,
         ("memory-1",),
         (EvidenceInterval("memory-1", "clip-1", 300.0, 420.0),),
+        True,
+        "insufficient_evidence",
     )
     first = ResponseCache(tmp_path / "responses", "run-a", "namespace")
     first.put("task", "unit", "question", answer)

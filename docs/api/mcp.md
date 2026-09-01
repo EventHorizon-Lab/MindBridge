@@ -92,6 +92,8 @@ Searches local memories.
 | `limit` | integer from 1 through 100 | no | 10 |
 | `memory_type` | one memory role or null | no | null |
 | `reference_at` | timezone-aware ISO 8601 datetime or null | no | current UTC |
+| `occurred_from` | timezone-aware ISO 8601 datetime or null | no | null |
+| `occurred_until` | timezone-aware ISO 8601 datetime or null | no | null |
 
 The result is `{"hits": [...]}`. Each hit contains memory fields plus `score`. The complete ordered
 query and bounded focused keys from its first text atom and media supply dense candidates; the
@@ -101,7 +103,10 @@ keys to parent memories. Relative temporal expressions resolve against
 current UTC, while an explicit value always wins. Absolute months and years such as
 `December 2023`, `2024年4月`, or `in 2025` select the matching event-time range. Search is
 conservatively marked non-read-only because it may drain durable index work or populate transcript
-caches; it never reinforces a hit merely for being returned.
+caches; it never reinforces a hit merely for being returned. `occurred_from` and `occurred_until`
+hard-filter overlapping event intervals using a half-open range. Either bound may be omitted; any
+bound excludes memories without an event time, and two bounds require
+`occurred_until > occurred_from`.
 
 ### `ask_memory`
 
@@ -114,10 +119,11 @@ Answers only from retrieved local memories.
 | `memory_type` | one memory role or null | no | null |
 | `reference_at` | timezone-aware ISO 8601 datetime or null | no | current UTC |
 
-The result contains `answer` and the exact grounding `hits`. Like search, the tool is marked
-non-read-only because retrieval may maintain local caches/index state. The built-in outbound answer
-request serializes each distinct question/evidence asset once even if several hits refer to it. It
-reserves the raw-media budget for question assets, keeps ranked evidence media that fits, and
+The result contains `answer`, the exact grounding `hits`, `abstained`, and
+`abstention_reason` (`no_evidence`, `insufficient_evidence`, or null). Like search, the tool is
+marked non-read-only because retrieval may maintain local caches/index state. The built-in outbound
+answer request serializes each distinct question/evidence asset once even if several hits refer to
+it. It reserves the raw-media budget for question assets, keeps ranked evidence media that fits, and
 retains overflow hits as text when possible. It also sends each hit's content, `memory_type`,
 metadata, and one primary timestamp to the configured generation endpoint: `occurred_at` when the
 event time is known, otherwise `created_at`. An `occurred_end` is included when present.
@@ -243,6 +249,9 @@ The six current tools do not yet cover the complete SDK capability inventory:
 | Operation | MCP | REST | Note |
 | --- | --- | --- | --- |
 | `add_many` | absent | `POST /v1/memories/batch` | Implementation gap |
+| `add_stream` | absent | absent | Python iterators are process-local; call `add_memory` per completed chunk |
+| `list` | absent | `GET /v1/memories` | Implementation gap; **MCP therefore cannot paginate the store** |
+| `search_with_trace` | absent | absent | Python/local-CLI retrieval diagnostics |
 | `speech` | absent | absent | Not implemented on any transport yet |
 | `faces` | absent | absent | Python-only visual identity analysis |
 | `register_speaker` | absent | absent | Not implemented on any transport yet |

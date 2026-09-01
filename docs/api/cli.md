@@ -155,7 +155,9 @@ kebab-cased. Nothing is renamed, grouped, or invented.
 | --- | --- | --- |
 | `add` | `mindbridge add [TEXT ...]` | idempotent write |
 | `add_many` | `mindbridge add-many [JSONL]` | idempotent write |
+| `add_stream` | `mindbridge add-stream [JSONL]` | incremental idempotent writes |
 | `search` | `mindbridge search [QUERY ...]` | read, plus a lazy transcript cache |
+| `search_with_trace` | `mindbridge search-with-trace [QUERY ...]` | read, plus a lazy transcript cache |
 | `ask` | `mindbridge ask [QUESTION ...]` | read, plus a lazy transcript cache |
 | `get` | `mindbridge get MEMORY_ID` | read |
 | `speech` | `mindbridge speech MEMORY_ID` | read, plus a transcript cache |
@@ -176,8 +178,10 @@ Plus exactly one command with no SDK counterpart:
 | `mindbridge doctor` | Resolve the composition, exercise each configured backend's loader, and report — writing nothing |
 
 Per-command options mirror the SDK keywords: `--occurred-at`, `--occurred-end`, `--metadata`, and
-`--memory-type` on `add`; `--limit`, `--memory-type`, and `--reference-at` on `search` and `ask`;
-`--limit` and `--cursor` on `list`.
+`--memory-type` on `add`; `--memory-type` on `add-many` and `add-stream`; `--limit`,
+`--memory-type`, and `--reference-at` on `search`, `search-with-trace`, and `ask`; the two search
+commands also accept `--occurred-from` and `--occurred-until` for strict event-overlap filtering;
+`--limit` and `--cursor` apply to `list`.
 
 `--cursor` is passed through exactly as it was returned and is never parsed.
 
@@ -222,15 +226,21 @@ already accepts a `pathlib.Path` atom. REST and MCP refuse local paths on purpos
 mode both this part type and `@PATH` are rejected with `unsupported_in_remote_mode`; send base64
 media in a data URL instead.
 
-`add-many` reads JSONL, one object per line, each with `content` plus optional `occurred_at`,
-`occurred_end`, and `metadata`. `--memory-type` applies to the batch, matching `add_many`. The whole
-batch is one embedding batch and one SQLite transaction. Each line's `content` is the same union,
-checked by the same rule, so a batched local path is refused in `--url` mode exactly as a single
-`add` refuses one.
+`add-many` and `add-stream` read JSONL, one object per line, each with `content` plus optional
+`occurred_at`, `occurred_end`, and `metadata`. `--memory-type` applies to every item. `add-many`
+collects the finite input into one embedding batch and one SQLite transaction. `add-stream` parses
+and commits one line before reading the next; a later failure leaves the committed prefix in the
+store. Each line's `content` is the same union, checked by the same rule, so a local path is refused
+in `--url` mode exactly as a single `add` refuses one.
 
 ```bash
 mindbridge --embedder jina-omni add-many @import.jsonl
+mindbridge --embedder jina-omni add-stream @completed-observations.jsonl
 ```
+
+`add-stream` keeps input lazy but collects returned records for the CLI's one-document stdout
+contract, so it is for finite JSONL. Use Python `Memory.add_stream` or `AsyncMemory.add_stream` for
+an unbounded source.
 
 ## Output
 
@@ -243,9 +253,10 @@ field vocabulary covers three surfaces:
 | Command | stdout |
 | --- | --- |
 | `add`, `get` | `MemoryResponse` |
-| `add-many` | `{"memories": [MemoryResponse, ...]}` |
+| `add-many`, `add-stream` | `{"memories": [MemoryResponse, ...]}` |
 | `search` | `{"hits": [SearchHitResponse, ...]}` |
-| `ask` | `{"answer": str, "hits": [SearchHitResponse, ...]}` |
+| `search-with-trace` | `{"hits": [SearchHitResponse, ...], "trace": RetrievalTrace}` |
+| `ask` | `{"answer": str, "hits": [SearchHitResponse, ...], "abstained": bool, "abstention_reason": str \| null}` |
 | `list` | `{"items": [MemoryResponse, ...], "next_cursor": str \| null}` |
 | `delete` | `{"deleted": bool}` |
 | `speech` | `{"segments": [SpeakerSegment, ...]}` |
@@ -375,11 +386,13 @@ The existing store-metadata guard already fails the first real operation with a 
 
 ### Operations without a remote route
 
-`--url` covers `add`, `add-many`, `search`, `ask`, `get`, `list`, and `delete`. The other seven exit
-`10` with `unsupported_in_remote_mode` and name the surfaces that do support them. That mirrors the
-[REST gap](rest.md#operations-without-a-route) honestly rather than hiding it: `speech`, `faces`,
-identity registration, and `reinforce` are implementation gaps, and `reindex` and `optimize` are
-owner-process maintenance that must not be reachable by an unauthenticated client.
+`--url` covers `add`, `add-many`, `search`, `ask`, `get`, `list`, and `delete`. The other nine CLI
+commands exit `10` with `unsupported_in_remote_mode` and name the surfaces that do support them.
+That mirrors the [REST gap](rest.md#operations-without-a-route) honestly rather than hiding it:
+`speech`, `faces`, identity registration, and `reinforce` are implementation gaps, and `reindex`
+and `optimize` are owner-process maintenance that must not be reachable by an unauthenticated
+client. `add-stream` remains local because REST has no client-streaming route.
+Remote callers submit completed observations with ordinary `add` requests.
 
 ### Backends without a recipe
 
@@ -401,8 +414,8 @@ limits, including the 8 MiB request body. See
 
 No `--format` flag, configuration file, `MINDBRIDGE_*` composition variable, plugin registry,
 backend registration by name, streaming output, interactive prompt, `serve` command, or metadata
-filter. `uvicorn my_application:app` already starts a server, and streaming has no meaning for a
-command that emits a single document.
+filter. `uvicorn my_application:app` already starts a server. `add-stream` still emits one document
+at EOF and is therefore for finite JSONL; use the Python iterator for an unbounded source.
 
 ## Benchmarks
 

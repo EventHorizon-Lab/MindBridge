@@ -10,11 +10,17 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
-- A direct `Memory()` API with `add`, `add_many`, `search`, `ask`, `get`, `list`, `delete`,
-  `reinforce`, `reindex`, and `optimize`.
+- A direct `Memory()` API with `add`, `add_many`, `add_stream`, `search`, `search_with_trace`,
+  `ask`, `get`, `speech`, `faces`, `register_speaker`, `register_identity`, `reinforce`, `list`,
+  `delete`, `reindex`, and `optimize`.
 - An `AsyncMemory` facade with the same operations and return values.
+- `AsyncOmniPrefetch`, a per-turn speculative-recall helper that accepts complete text, image,
+  video, audio, or combined snapshots, permits only one real search at a time, coalesces queued
+  revisions, and confirms the exact final snapshot without persisting partial input.
+- An evidence-backed interaction-memory recipe over the existing semantic, episodic, and
+  procedural roles, plus a public-SDK benchmark gate that must justify any future graph projection.
 - Frozen, slotted public content/result types for text, image, video, audio, and omni memories,
-  plus a stable `MindBridgeError` exception hierarchy.
+  including per-item `StreamInput` provenance, plus a stable `MindBridgeError` exception hierarchy.
 - SQLite as the authoritative local store for records, canonical FP32 embeddings, compatibility
   metadata, and a durable Zvec outbox.
 - Content-addressed local media storage with safe `Path`/`Blob` ingestion, MIME validation, and
@@ -23,8 +29,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - First-class semantic, episodic, and procedural memory roles across Python, REST, MCP, SQLite,
   Zvec filtering, grounded evidence, and stable return values.
 - Event-time interval retrieval with `occurred_at`/`occurred_end`, overlap filters, explicit
-  reference clocks, deterministic English/Chinese calendar expressions, bounded fallback
-  retrieval, and query-time reranking.
+  `occurred_from`/`occurred_until` search bounds, reference clocks, deterministic English/Chinese
+  calendar expressions, bounded fallback retrieval, and query-time reranking.
+- Opt-in `search_with_trace()` diagnostics with candidate/index IDs, reconstructable dense/lexical
+  score components, gate confidence, ranks, and terminal rejection reasons, without query/evidence
+  payloads, persistence, or OTel cardinality.
 - Opt-in non-destructive memory decay with explicit, bounded SQLite reinforcement and no
   background worker or new dependency.
 - Aggregate-plus-atomic embeddings for composite memories, bounded overlapping keys for long text,
@@ -41,6 +50,10 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - Independent embedding, generation, and transcription backends with narrow operation-specific
   protocols, explicit capabilities, durable transcription-space identity, and capability-driven
   ASR plus visual-language fallback.
+- `MemoryPlugins`, `MemoryConfig`, and `Memory.from_plugins()` / `AsyncMemory.from_plugins()` as an
+  explicit grouped composition path over the same typed backends and local policy as the direct
+  constructors, with protocol validation before storage opens and without a registry, provider
+  factory, or alternate execution plane.
 - A narrow `EmbeddingBackend` seam, pinned Jina v5 Omni adapter, and generic Sentence
   Transformers adapter using standard multimodal dict/message inputs for models such as Qwen3-VL.
 - A narrow `SpeechBackend` seam and lazy FunASR composition through `funasr.AutoModel`: pinned
@@ -93,11 +106,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - An explicit OpenAI-compatible minimum-video setting that converts shorter local videos to four
   ordered stills before the first request while preserving the existing media budgets and fallback.
 - A `mindbridge` product console script over the shared `Memory` execution plane. Its commands are
-  the SDK operations kebab-cased — `add`, `add-many`, `search`, `ask`, `get`, `speech`,
-  `register-speaker`, `reinforce`, `list`, `delete`, `reindex`, `optimize` — plus one command with
-  no SDK counterpart, `doctor`. Output is one JSON document per invocation on stdout in the REST
-  field vocabulary, diagnostics and the shared error envelope go to stderr, and exit statuses are
-  stable, one per error code, so an agent branches on `$?` without parsing anything.
+  the SDK operations kebab-cased — `add`, `add-many`, `add-stream`, `search`, `search-with-trace`,
+  `ask`, `get`, `speech`, `faces`, `register-speaker`, `register-identity`, `reinforce`, `list`,
+  `delete`, `reindex`, `optimize` — plus one command with no SDK counterpart, `doctor`. Output is
+  one JSON document per invocation on stdout in the REST field vocabulary, diagnostics and the
+  shared error envelope go to stderr, and exit statuses are stable, one per error code, so an agent
+  branches on `$?` without parsing anything.
 - Three explicit CLI composition paths, of which exactly one is required per invocation and none is
   a default: `--app MODULE:ATTR` for any application-composed `Memory`, `--embedder NAME` for the
   bundled backends, and `--url URL` to address a running owner over `/v1`. There is no environment
@@ -113,7 +127,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   (`weights`, `client`, or `import`) so the result never overstates the check.
 - CLI input forms that carry generated content without shell quoting: ordered positional atoms with
   `@PATH` for a local file and `@@TEXT` for a literal `@`, `-` for standard input, `--content-json`
-  for the same discriminated parts array REST and MCP accept, and JSONL on `add-many`. The CLI adds
+  for the same discriminated parts array REST and MCP accept, and JSONL on `add-many` or
+  `add-stream`. The CLI adds
   exactly one part type to that union, `{"type": "input_file", "path": "..."}`, valid in local mode
   only and refused in `--url` mode.
 - A published `mindbridge[all]` extra containing the exact union of every optional dependency.
@@ -270,7 +285,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   third-party backends that fail inside `Memory`.
 - `Memory.list` is documented as defaulting to `limit=100`, not 50.
 - The three enforced Python input limits are recorded: 128 content parts, 65,536 characters per text
-  value, and `limit` between 1 and 100 for `search`, `ask`, and `list`.
+  value, and `limit` between 1 and 100 for `search`, `search_with_trace`, `ask`, and `list`.
 - `occurred_end` is in the `MemoryRecord` field table in the concepts guide, `reinforce` is recorded
   as having no REST route and no MCP tool, and a full-text match is documented as scoring 0.6
   confidence and so clearing the default `minimum_relevance` regardless of vector distance.
@@ -323,5 +338,6 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - The CLI has no `--format` flag, configuration file, `MINDBRIDGE_*` composition variable, plugin
   registry, backend registration by name, streaming output, interactive prompt, `serve` command, or
   named `SentenceTransformersEmbedder` recipe. `--url` mode covers only the seven operations REST
-  routes; the other five exit 10 and name the surfaces that do support them. Each invocation opens
-  and closes one `Memory`, which makes it the wrong tool for a loop.
+  routes; the other nine CLI commands exit 10 and name the surfaces that do support them.
+  `add-stream` reads finite JSONL lazily but collects return records until EOF to preserve the
+  one-document stdout contract; unbounded sources use the Python SDK.

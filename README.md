@@ -1,11 +1,11 @@
 # MindBridge
 
-MindBridge is an Agentic Native Embodied Memory System: fast, embedded multimodal memory for
-machines that see, hear, and act.
+MindBridge is a local-first, agent-native multimodal memory substrate for embodied systems.
 
 MindBridge owns three things: memory semantics, retrieval orchestration, and durable local
-consistency. Applications construct model adapters explicitly. Provider SDKs and deployment
-infrastructure own credentials, network transport, retries, timeouts, and authentication.
+consistency. Applications may select bundled adapters with validated configuration or inject
+custom adapters directly. Provider SDKs and deployment infrastructure still own credentials,
+network transport, retries, timeouts, and authentication.
 
 SQLite is authoritative for records, embeddings, metadata, and the search-index outbox. Media is
 stored in a local content-addressed store, and Zvec is a rebuildable search projection. One
@@ -13,7 +13,7 @@ physical `data_dir` has exactly one live `Memory` owner.
 
 ## Install
 
-Install the local Jina and FunASR adapters, plus the official OpenAI SDK when grounded answers use
+Install the local Jina and FunASR adapters, plus the official OpenAI SDK when generation or ASR uses
 OpenAI:
 
 ```bash
@@ -42,16 +42,22 @@ Apache-2.0 alternative.
 ## Search local memory
 
 ```python
-from mindbridge import JinaOmniEmbedder, Memory
+from mindbridge import Memory
 
-with Memory("./data/assistant", embedder=JinaOmniEmbedder()) as memory:
+with Memory.from_config(
+    {
+        "data_dir": "./data/assistant",
+        "embedding": {"provider": "jina-omni"},
+    }
+) as memory:
     memory.add("Ada prefers concise status updates.")
     hits = memory.search("How should I write Ada's update?")
     for hit in hits:
         print(hit.score, hit.content)
 ```
 
-`Memory` never selects a provider or reads provider credentials.
+`Memory.from_config` resolves a small, typed catalog of bundled adapters. The `Memory` kernel still
+routes only by capability and never reads provider credentials.
 
 `search` returns a possibly empty tuple. MindBridge always withholds weak evidence and withholds an
 unresolved top-two tie when `limit=1`; multi-result search returns the qualified candidates for the
@@ -60,34 +66,34 @@ caller to handle. `ask` applies the same rule to evidence retrieval. See
 
 ## Add grounded answers
 
-Construct and own the provider client in application code:
+The declarative path constructs and closes the official SDK client; the SDK reads its standard
+credential environment variables:
 
 ```python
-from openai import OpenAI
+from mindbridge import Memory
 
-from mindbridge import JinaOmniEmbedder, Memory, OpenAIModels
-
-with OpenAI() as client:
-    answerer = OpenAIModels(
-        generation_client=client,
-        generation_model="gpt-5-mini",
-    )
-    with Memory(
-        "./data/assistant",
-        embedder=JinaOmniEmbedder(),
-        answerer=answerer,
-    ) as memory:
-        memory.add("The release review is Thursday at 10:00 UTC.")
-        print(memory.ask("When is the release review?").answer)
+with Memory.from_config(
+    {
+        "data_dir": "./data/assistant",
+        "embedding": {"provider": "jina-omni"},
+        "generation": {
+            "provider": "openai",
+            "model": "gpt-5-mini",
+            "temperature": 0.1,
+        },
+    }
+) as memory:
+    memory.add("The release review is Thursday at 10:00 UTC.")
+    print(memory.ask("When is the release review?").answer)
 ```
 
-`OpenAIModels` maps MindBridge model inputs to the official SDK. It does not create or close SDK
-clients. Configure API keys, base URLs, proxies, retries, and timeouts with `OpenAI(...)` or the
-provider's own SDK.
+Inject `OpenAIModels` directly when the application must supply an existing client, proxy, custom
+credential source, or capabilities beyond the declarative schema. Caller-supplied clients remain
+caller-owned.
 
 ## Content contract
 
-`add`, `search`, and `ask` accept one atom or an ordered sequence of atoms:
+`add`, `add_stream`, `search`, and `ask` use the same atom or ordered sequence contract:
 
 | Value | Meaning |
 | --- | --- |
@@ -119,6 +125,24 @@ with Memory("./data/media", embedder=JinaOmniEmbedder()) as memory:
 Use `FunASRTranscriber()` explicitly when audio fallback, timed speech, or speaker matching is
 needed. Unsupported modalities fail before inference; model support is declared by each adapter.
 
+For continuous input, pass completed application-owned chunks lazily. Each yielded record is
+already durable and searchable:
+
+```python
+from mindbridge import MemoryType, StreamInput
+
+for record in memory.add_stream(
+    StreamInput(path, metadata={"sequence": index}, memory_type=MemoryType.EPISODIC)
+    for index, path in enumerate(completed_clip_paths)
+):
+    handle(record)
+```
+
+MindBridge does not open cameras or split a live feed; the application supplies bounded text,
+image, video, audio, or combined observations. `AsyncOmniPrefetch` coalesces changing multimodal
+query snapshots without persisting partial input. See the
+[omni streaming and interaction memory](docs/omni-streaming-and-interaction-memory.md).
+
 ## Model boundaries
 
 MindBridge exposes narrow, operation-specific protocols:
@@ -130,8 +154,8 @@ MindBridge exposes narrow, operation-specific protocols:
 - `FaceBackend` for local face observations and identity exemplars.
 
 A single provider adapter may implement several protocols, but `Memory` does not require one fat
-backend. There is no provider registry, endpoint normalizer, credential store, retry layer, or
-sync/async provider compatibility layer.
+backend. The declarative catalog constructs only bundled adapters; there is no global plugin
+registry, credential store, retry layer, or sync/async provider compatibility layer.
 
 The built-in adapters are deliberately thin:
 
@@ -140,7 +164,8 @@ The built-in adapters are deliberately thin:
   `encode_document` methods.
 - `FunASRTranscriber` delegates model loading and execution to `funasr.AutoModel`.
 - `OpenCVFaceAnalyzer` delegates explicit local YuNet and SFace models to OpenCV.
-- `OpenAIModels` uses caller-owned official OpenAI SDK clients.
+- `OpenAIModels` uses caller-owned official OpenAI SDK clients for embeddings, generation, and
+  completed-file transcription.
 
 ## Storage and consistency
 

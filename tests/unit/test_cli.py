@@ -34,7 +34,16 @@ from mindbridge.exceptions import MindBridgeError, ValidationError
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.models.funasr import DEFAULT_FUNASR_MODEL_ID
 from mindbridge.models.jina import DEFAULT_JINA_MODEL_ID, DEFAULT_JINA_REVISION
-from mindbridge.types import AssetRef, MemoryRecord, MemoryType, Modality, Page, SearchHit
+from mindbridge.types import (
+    AbstentionReason,
+    AnswerResult,
+    AssetRef,
+    MemoryRecord,
+    MemoryType,
+    Modality,
+    Page,
+    SearchHit,
+)
 
 # The REST content union itself, so the two decoders are compared over one schema.
 _REST_CONTENT: TypeAdapter[rest._Content] = TypeAdapter(rest._Content)
@@ -182,7 +191,7 @@ def _record(**overrides: object) -> MemoryRecord:
 
 
 def test_memory_documents_equal_the_rest_response_models() -> None:
-    from mindbridge.cli import _memory_document
+    from mindbridge.cli import _ask, _memory_document
 
     record = _record()
     assert _memory_document(record) == rest.MemoryResponse.model_validate(record).model_dump(
@@ -209,6 +218,29 @@ def test_memory_documents_equal_the_rest_response_models() -> None:
         "next_cursor": page.next_cursor,
     } == rest.PageResponse.model_validate(page).model_dump(mode="json")
     assert rest.DeleteResponse(deleted=True).model_dump(mode="json") == {"deleted": True}
+
+    answer = AnswerResult(
+        "unknown",
+        hits=(hit,),
+        abstained=True,
+        abstention_reason=AbstentionReason.INSUFFICIENT_EVIDENCE,
+    )
+
+    class AnsweringMemory:
+        def ask(self, *_args: object, **_kwargs: object) -> AnswerResult:
+            return answer
+
+    document = _ask(
+        cast(Memory, AnsweringMemory()),
+        argparse.Namespace(
+            content=["question"],
+            content_json=None,
+            limit=5,
+            memory_type=None,
+            reference_at=None,
+        ),
+    )
+    assert document == rest.AnswerResponse.model_validate(answer).model_dump(mode="json")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -299,6 +331,22 @@ def test_add_search_get_list_and_delete_round_trip(
     hits = cast(dict[str, list[dict[str, object]]], found)["hits"]
     assert [hit["id"] for hit in hits] == [record["id"]]
 
+    status, traced, _ = _run(
+        capsys,
+        "--app",
+        app,
+        "-q",
+        "search-with-trace",
+        "red wrench",
+    )
+    assert status == 0
+    traced_document = cast(dict[str, object], traced)
+    assert cast(list[dict[str, object]], traced_document["hits"])[0]["id"] == record["id"]
+    trace = cast(dict[str, object], traced_document["trace"])
+    candidate = cast(list[dict[str, object]], trace["candidates"])[0]
+    assert candidate["memory_id"] == record["id"]
+    assert {"lexical_relevance", "lexical_rerank_bonus", "gate_confidence"} <= candidate.keys()
+
     status, page, _ = _run(capsys, "--app", app, "-q", "list", "--limit", "1")
     assert status == 0
     assert cast(dict[str, object], page)["next_cursor"] is None
@@ -358,6 +406,37 @@ def test_add_many_reads_jsonl_with_per_item_time_and_metadata(
     memories = cast(dict[str, list[dict[str, object]]], document)["memories"]
     assert [item["metadata"] for item in memories] == [{"n": 1}, {}]
     assert memories[1]["occurred_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_add_stream_commits_before_reading_a_later_invalid_line(
+    app: str, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    source = tmp_path / "stream.jsonl"
+    source.write_text(
+        f"{json.dumps({'content': 'a red wrench', 'metadata': {'sequence': 0}})}\nnot-json\n",
+        encoding="utf-8",
+    )
+
+    status, document, stderr = _run(
+        capsys,
+        "--app",
+        app,
+        "-q",
+        "add-stream",
+        f"@{source}",
+        "--memory-type",
+        "episodic",
+    )
+
+    assert status == EXIT_CODES[ValidationError.code]
+    assert document is None
+    assert "line 2" in cast(dict[str, str], stderr[0])["message"]
+    assert cast(dict[str, object], stderr[0])["subject"] == "contents[1]"
+    with Memory(tmp_path / "store", embedder=_Embedder()) as memory:
+        records = memory.list().items
+    assert [(record.content, record.metadata, record.memory_type) for record in records] == [
+        ("a red wrench", {"sequence": 0}, MemoryType.EPISODIC)
+    ]
 
 
 def test_a_second_owner_of_the_directory_exits_nine(
@@ -447,9 +526,11 @@ class _SdkClient:
 
     def __init__(self) -> None:
         self.closed = False
+        self.close_calls = 0
 
     def close(self) -> None:
         self.closed = True
+        self.close_calls += 1
 
 
 @pytest.mark.parametrize("slot", ("embedder", "answerer", "transcriber"))
@@ -467,10 +548,12 @@ def test_a_recipe_closes_the_sdk_client_it_constructed(
     assert [client.closed for client in clients] == [False]
 
     backend.close()
+    backend.close()
 
     # `OpenAIModels.close()` leaves a caller-supplied client open; a recipe-built one is the
     # recipe's, so the connection pool goes when the returned backend does.
     assert [client.closed for client in clients] == [True]
+    assert [client.close_calls for client in clients] == [1]
 
 
 @pytest.mark.parametrize(
@@ -589,7 +672,18 @@ def test_remote_mode_posts_to_v1_and_echoes_the_body(
     calls: list[tuple[str, str, object]], capsys: pytest.CaptureFixture[str]
 ) -> None:
     status, document, _ = _run(
-        capsys, "--url", "http://owner:8000/", "-q", "search", "red wrench", "--limit", "3"
+        capsys,
+        "--url",
+        "http://owner:8000/",
+        "-q",
+        "search",
+        "red wrench",
+        "--limit",
+        "3",
+        "--occurred-from",
+        "2026-08-27T00:00:00Z",
+        "--occurred-until",
+        "2026-08-28T00:00:00Z",
     )
     assert status == 0
     assert document == {"hits": []}
@@ -597,7 +691,12 @@ def test_remote_mode_posts_to_v1_and_echoes_the_body(
         (
             "POST",
             "http://owner:8000/v1/memories/search",
-            {"query": "red wrench", "limit": 3},
+            {
+                "query": "red wrench",
+                "limit": 3,
+                "occurred_from": "2026-08-27T00:00:00Z",
+                "occurred_until": "2026-08-28T00:00:00Z",
+            },
         )
     ]
 
@@ -612,6 +711,7 @@ def test_remote_mode_passes_the_cursor_through_unparsed(
 @pytest.mark.parametrize(
     ("command", "operands"),
     (
+        ("add-stream", ("[]",)),
         ("speech", ("memory-1",)),
         ("faces", ("memory-1",)),
         ("register-speaker", ("speaker-1", "Ana")),

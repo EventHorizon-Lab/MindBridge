@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import os
 import re
 import shutil
 import sqlite3
-from collections.abc import Generator, Iterable, Iterator, Sequence
+from collections.abc import AsyncIterator, Generator, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import MISSING, asdict, dataclass, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier, Event, Thread
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
@@ -20,7 +22,9 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 
+import mindbridge.configuration as configuration_module
 import mindbridge.memory as memory_module
+from mindbridge import MemoryConfig, MemoryPlugins, RetrievalRejection
 from mindbridge._telemetry import (
     MODEL_REQUEST_COUNT,
     MODEL_TTFT,
@@ -48,7 +52,7 @@ from mindbridge.infrastructure.local.store import (
     StoredMemory,
 )
 from mindbridge.infrastructure.local.zvec_index import IndexHit
-from mindbridge.memory import AsyncMemory, Memory
+from mindbridge.memory import AsyncMemory, AsyncOmniPrefetch, Memory
 from mindbridge.models.base import (
     EmbedTask,
     FaceAnalysis,
@@ -58,7 +62,9 @@ from mindbridge.models.base import (
     SpeechAnalysis,
     SpeechTurn,
 )
+from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.types import (
+    AbstentionReason,
     AnswerResult,
     AssetRef,
     Blob,
@@ -66,6 +72,7 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     SearchHit,
+    StreamInput,
 )
 
 ALL_INPUT_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
@@ -622,6 +629,44 @@ def test_streaming_answer_reports_only_the_hits_the_stream_used(tmp_path: Path) 
     assert len(result.hits) == 1
 
 
+def test_streaming_answer_preserves_structured_abstention(tmp_path: Path) -> None:
+    class AbstainingStreamModels(_FakeModels):
+        def stream_answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+        ) -> Generator[str, None, AnswerResult]:
+            del question
+            yield "unknown"
+            return AnswerResult(
+                answer="unknown",
+                hits=(hits[0],),
+                abstained=True,
+                abstention_reason=AbstentionReason.INSUFFICIENT_EVIDENCE,
+            )
+
+    with _memory(tmp_path, AbstainingStreamModels()) as memory:
+        memory.add("red evidence")
+        result = memory.ask("red")
+
+    assert result.abstained is True
+    assert result.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
+    assert len(result.hits) == 1
+
+
+def test_openai_stream_marks_an_empty_retrieval_as_no_evidence(tmp_path: Path) -> None:
+    with Memory(
+        tmp_path,
+        embedder=_FakeModels(),
+        answerer=OpenAIModels(),
+    ) as memory:
+        result = memory.ask("unknown")
+
+    assert result.abstained is True
+    assert result.abstention_reason is AbstentionReason.NO_EVIDENCE
+    assert result.hits == ()
+
+
 def test_memory_types_are_stable_and_filterable(tmp_path: Path) -> None:
     with _memory(tmp_path, _FakeModels()) as memory:
         semantic = memory.add("shared instruction")
@@ -638,6 +683,271 @@ def test_memory_types_are_stable_and_filterable(tmp_path: Path) -> None:
         assert memory.search("shared", memory_type=MemoryType.PROCEDURAL)[0].id == procedural.id
         with pytest.raises(ValidationError, match="MemoryType"):
             memory.add("invalid type", memory_type="episodic")  # type: ignore[arg-type]
+
+
+def test_explicit_event_range_is_a_strict_overlap_filter(tmp_path: Path) -> None:
+    start = datetime(2026, 8, 17, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 24, tzinfo=timezone.utc)
+    with _memory(tmp_path, _FakeModels()) as memory:
+        memory.add("project review without a time")
+        before = memory.add(
+            "project review before",
+            occurred_at=datetime(2026, 8, 16, tzinfo=timezone.utc),
+        )
+        overlap = memory.add(
+            "project review overlap",
+            occurred_at=datetime(2026, 8, 16, tzinfo=timezone.utc),
+            occurred_end=datetime(2026, 8, 18, tzinfo=timezone.utc),
+        )
+        inside = memory.add(
+            "project review inside",
+            occurred_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
+        )
+        boundary = memory.add(
+            "project review boundary",
+            occurred_at=until,
+        )
+
+        bounded = memory.search(
+            "project review",
+            occurred_from=start,
+            occurred_until=until,
+        )
+        from_only = memory.search("project review", occurred_from=until)
+        until_only = memory.search("project review", occurred_until=start)
+
+    assert {hit.id for hit in bounded} == {overlap.id, inside.id}
+    assert [hit.id for hit in from_only] == [boundary.id]
+    assert {hit.id for hit in until_only} == {before.id, overlap.id}
+
+
+def test_explicit_event_range_stays_strict_after_temporal_fallback(tmp_path: Path) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        outside = memory.add(
+            "project review happened",
+            occurred_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
+        )
+        allowed = memory.add(
+            "project review happened",
+            occurred_at=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        )
+        _FakeIndex.instances[-1].hits_override = (
+            IndexHit(id=outside.id, relevance=0.9, confidence=0.9),
+            IndexHit(id=allowed.id, relevance=0.9, confidence=0.9),
+        )
+
+        result = memory.search_with_trace(
+            "What happened on 2026-08-20?",
+            limit=1,
+            occurred_from=datetime(2026, 8, 22, tzinfo=timezone.utc),
+            occurred_until=datetime(2026, 8, 23, tzinfo=timezone.utc),
+        )
+
+    assert [hit.id for hit in result.hits] == [allowed.id]
+    rejected = {candidate.memory_id: candidate.rejected_by for candidate in result.trace.candidates}
+    assert rejected[outside.id] is RetrievalRejection.OCCURRENCE_RANGE
+    assert rejected[allowed.id] is None
+
+
+@pytest.mark.parametrize(
+    ("occurred_from", "occurred_until", "message"),
+    [
+        (datetime(2026, 8, 20, tzinfo=timezone.utc).replace(tzinfo=None), None, "occurred_from"),
+        (None, datetime(2026, 8, 20, tzinfo=timezone.utc).replace(tzinfo=None), "occurred_until"),
+        (
+            datetime(2026, 8, 21, tzinfo=timezone.utc),
+            datetime(2026, 8, 20, tzinfo=timezone.utc),
+            "later than",
+        ),
+    ],
+)
+def test_explicit_event_range_is_validated_before_embedding(
+    tmp_path: Path,
+    occurred_from: datetime | None,
+    occurred_until: datetime | None,
+    message: str,
+) -> None:
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory, pytest.raises(ValidationError, match=message):
+        memory.search(
+            "project review",
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
+        )
+
+    assert models.embed_batches == []
+
+
+def test_search_with_trace_explains_bounded_candidates_without_evidence_content(
+    tmp_path: Path,
+) -> None:
+    models = _FakeModels()
+    with Memory(
+        tmp_path,
+        embedder=models,
+        minimum_relevance=0.55,
+        ambiguity_margin=0,
+    ) as memory:
+        first = memory.add(
+            ("private-alpha", "atomic child"),
+            metadata={"private": "metadata-secret"},
+        )
+        second = memory.add("private-beta")
+        weak = memory.add("private-weak")
+        first_documents = memory._store.read_memory_index_documents((first.id,))
+        second_documents = memory._store.read_memory_index_documents((second.id,))
+        weak_documents = memory._store.read_memory_index_documents((weak.id,))
+        first_child = first_documents[-1].embedding.embedding_id
+        second_index = second_documents[0].embedding.embedding_id
+        weak_index = weak_documents[0].embedding.embedding_id
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = (
+            IndexHit(id=first_child, relevance=0.95, confidence=0.95),
+            IndexHit(id=second_index, relevance=0.8, confidence=0.8),
+            IndexHit(id=weak_index, relevance=0.9, confidence=0.1),
+            IndexHit(id="stale_candidate", relevance=0.99, confidence=0.99),
+        )
+        index.lexical_hits_override = ()
+
+        result = memory.search_with_trace("private-query", limit=1)
+        ordinary = memory.search("private-query", limit=1)
+
+    assert result.hits == ordinary
+    assert [hit.id for hit in result.hits] == [first.id]
+    by_memory = {
+        candidate.memory_id: candidate
+        for candidate in result.trace.candidates
+        if candidate.memory_id is not None
+    }
+    assert by_memory[first.id].rank == 1
+    assert by_memory[first.id].rejected_by is None
+    assert by_memory[first.id].final_score == result.hits[0].score
+    assert by_memory[first.id].index_ids == (first_child,)
+    assert by_memory[second.id].rejected_by is RetrievalRejection.LIMIT
+    assert by_memory[weak.id].rejected_by is RetrievalRejection.MINIMUM_RELEVANCE
+    stale = next(candidate for candidate in result.trace.candidates if candidate.memory_id is None)
+    assert stale.index_ids == ("stale_candidate",)
+    assert stale.rejected_by is RetrievalRejection.STALE_INDEX
+    considered_ids = [
+        index_id for candidate in result.trace.candidates for index_id in candidate.index_ids
+    ]
+    assert len(considered_ids) == len(set(considered_ids)) == 4
+    serialized = json.dumps(asdict(result.trace))
+    assert all(
+        secret not in serialized
+        for secret in ("private-alpha", "private-beta", "metadata-secret", "private-query")
+    )
+
+
+def test_search_with_trace_exposes_every_lexical_ranking_input(tmp_path: Path) -> None:
+    with Memory(
+        tmp_path,
+        embedder=_FakeModels(),
+        minimum_relevance=0,
+        ambiguity_margin=0,
+    ) as memory:
+        first = memory.add("rare alpha")
+        second = memory.add("rare beta")
+        first_index = memory._store.read_memory_index_documents((first.id,))[
+            0
+        ].embedding.embedding_id
+        second_index = memory._store.read_memory_index_documents((second.id,))[
+            0
+        ].embedding.embedding_id
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = ()
+        index.lexical_hits_override = (
+            IndexHit(
+                id=first_index,
+                relevance=1.0,
+                confidence=0.0,
+                lexical_match=True,
+            ),
+            IndexHit(
+                id=second_index,
+                relevance=0.76,
+                confidence=0.0,
+                lexical_match=True,
+            ),
+        )
+
+        result = memory.search_with_trace("rare")
+
+    by_memory = {
+        candidate.memory_id: candidate
+        for candidate in result.trace.candidates
+        if candidate.memory_id is not None
+    }
+    first_trace = by_memory[first.id]
+    second_trace = by_memory[second.id]
+    assert first_trace.lexical_relevance == pytest.approx(0.6)
+    assert second_trace.lexical_relevance == pytest.approx(0.456)
+    for candidate in (first_trace, second_trace):
+        assert candidate.dense_relevance is not None
+        assert candidate.lexical_relevance is not None
+        assert candidate.lexical_rerank_bonus is not None
+        assert candidate.dense_relevance == 0
+        assert candidate.lexical_rerank_bonus == pytest.approx(0.2)
+        assert candidate.gate_confidence == pytest.approx(0.6)
+        assert candidate.base_relevance == pytest.approx(
+            min(
+                1.0,
+                max(candidate.dense_relevance, candidate.lexical_relevance)
+                + candidate.lexical_rerank_bonus,
+            )
+        )
+    assert first_trace.base_relevance != second_trace.base_relevance
+
+
+def test_search_with_trace_reports_temporal_and_retention_factors(tmp_path: Path) -> None:
+    models = _FakeModels()
+    reference = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
+    with Memory(
+        tmp_path,
+        embedder=models,
+        minimum_relevance=0,
+        ambiguity_margin=0,
+        decay_half_life_days=7,
+    ) as memory:
+        record = memory.add(
+            "project review happened",
+            occurred_at=datetime(2026, 8, 20, 12, tzinfo=timezone.utc),
+        )
+        result = memory.search_with_trace(
+            "What happened on 2026-08-20?",
+            limit=1,
+            reference_at=reference,
+        )
+
+    candidate = next(
+        candidate for candidate in result.trace.candidates if candidate.memory_id == record.id
+    )
+    assert candidate.temporal_factor is not None
+    assert candidate.retention_factor is not None
+    assert candidate.final_score == result.hits[0].score
+
+
+def test_search_with_trace_marks_the_candidates_rejected_by_ambiguity(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with Memory(tmp_path, embedder=models) as memory:
+        first = memory.add("first private scene")
+        second = memory.add("second private scene")
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = (
+            IndexHit(id=first.id, relevance=0.9, confidence=0.9),
+            IndexHit(id=second.id, relevance=0.9, confidence=0.9),
+        )
+        index.lexical_hits_override = ()
+
+        result = memory.search_with_trace("unrelated", limit=1)
+
+    assert result.hits == ()
+    assert result.trace.ambiguous is True
+    assert {
+        candidate.rejected_by
+        for candidate in result.trace.candidates
+        if candidate.memory_id is not None
+    } == {RetrievalRejection.AMBIGUITY}
 
 
 def test_relative_time_prefers_event_time_and_routes_the_reference(tmp_path: Path) -> None:
@@ -922,6 +1232,47 @@ def test_exact_lexical_evidence_beats_a_weak_dense_neighbor(tmp_path: Path) -> N
     assert [hit.id for hit in hits] == [exact.id, neighbor.id]
 
 
+def test_lexical_candidate_confidence_does_not_decay_with_its_result_rank(
+    tmp_path: Path,
+) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        exact = memory.add("BMVC hotel reservation total cost")
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = ()
+        index.lexical_hits_override = (
+            IndexHit(id=exact.id, relevance=0.2, confidence=0.0, lexical_match=True),
+        )
+
+        hits = memory.search("BMVC accommodation total", limit=1)
+
+    assert [hit.id for hit in hits] == [exact.id]
+
+
+def test_ask_round_robins_modalities_before_filling_grounding_slots(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory:
+        images = tuple(
+            memory.add((f"image evidence {index}", Blob(str(index).encode(), "image/png")))
+            for index in range(4)
+        )
+        texts = tuple(memory.add(f"text evidence {index}") for index in range(2))
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = tuple(
+            IndexHit(id=record.id, relevance=0.99 - rank / 100, confidence=0.9)
+            for rank, record in enumerate((*images, *texts))
+        )
+        index.lexical_hits_override = ()
+
+        result = memory.ask("find evidence", limit=4)
+
+    assert [hit.modality for hit in result.hits] == [
+        Modality.IMAGE,
+        Modality.TEXT,
+        Modality.IMAGE,
+        Modality.TEXT,
+    ]
+
+
 def test_event_span_overlapping_query_day_is_temporally_exact(tmp_path: Path) -> None:
     with _memory(tmp_path, _FakeModels()) as memory:
         spanning = memory.add(
@@ -1099,6 +1450,219 @@ def test_explicit_embedder_owns_embedding_and_models_own_generation(tmp_path: Pa
 def test_memory_requires_an_explicit_embedder(tmp_path: Path) -> None:
     with pytest.raises(TypeError, match="embedder"):
         Memory(tmp_path)  # type: ignore[call-arg]
+
+
+def test_memory_composes_explicit_plugins_and_local_policy(tmp_path: Path) -> None:
+    models = _FakeModels()
+    faces = _FakeFace()
+    plugins = MemoryPlugins(
+        embedder=models,
+        answerer=models,
+        transcriber=models,
+        face_analyzer=faces,
+    )
+    config = MemoryConfig(
+        index_speech=True,
+        index_quantization=IndexQuantization.FP16,
+        minimum_relevance=0,
+        ambiguity_margin=0,
+        decay_half_life_days=7,
+        speaker_similarity=0.7,
+        speaker_margin=0.04,
+        face_similarity=0.3,
+        face_margin=0.03,
+    )
+
+    with Memory.from_plugins(tmp_path, plugins=plugins, config=config) as memory:
+        assert memory.add("red plugin-composed memory")
+        assert memory._embedder is models
+        assert memory._answerer is models
+        assert memory._transcriber is models
+        assert memory._face_analyzer is faces
+        assert _FakeIndex.instances[-1].quantization is IndexQuantization.FP16
+        assert memory._index_speech is True
+        assert memory._minimum_relevance == 0
+        assert memory._ambiguity_margin == 0
+        assert memory._decay_half_life == timedelta(days=7)
+        assert memory._speaker_similarity == 0.7
+        assert memory._speaker_margin == 0.04
+        assert memory._face_similarity == 0.3
+        assert memory._face_margin == 0.03
+
+    assert models.close_calls == 1
+    assert faces.closed is True
+
+
+def test_memory_from_config_uses_the_same_kernel_and_closes_resolved_backends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedder = _FakeEmbedder()
+    answerer = _FakeModels()
+    speech = _FakeSpeech()
+    faces = _FakeFace()
+    monkeypatch.setattr(configuration_module, "_build_embedding", lambda _spec: embedder)
+    monkeypatch.setattr(configuration_module, "_build_generation", lambda _spec: answerer)
+    monkeypatch.setattr(configuration_module, "_build_speech", lambda _spec: speech)
+    monkeypatch.setattr(configuration_module, "_build_face", lambda _spec: faces)
+
+    config = {
+        "data_dir": tmp_path,
+        "embedding": {"provider": "jina-omni"},
+        "generation": {"provider": "openai", "model": "gpt-5-mini"},
+        "speech": {"provider": "funasr"},
+        "face": {
+            "provider": "opencv",
+            "detector_model": tmp_path / "yunet.onnx",
+            "recognizer_model": tmp_path / "sface.onnx",
+        },
+        "settings": {
+            "index_speech": True,
+            "index_quantization": "fp16",
+            "minimum_relevance": 0,
+        },
+    }
+
+    with Memory.from_config(config) as memory:
+        record = memory.add("red declarative memory")
+        assert memory.search("red declarative")[0].id == record.id
+        assert memory._embedder is embedder
+        assert memory._answerer is answerer
+        assert memory._transcriber is speech
+        assert memory._face_analyzer is faces
+        assert memory._index_speech is True
+        assert memory._minimum_relevance == 0
+        assert _FakeIndex.instances[-1].quantization is IndexQuantization.FP16
+
+    assert embedder.close_calls == 1
+    assert answerer.close_calls == 1
+    assert speech.closed is True
+    assert faces.closed is True
+
+
+def test_memory_from_config_reports_the_invalid_field_before_opening_storage(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "store"
+    with pytest.raises(ValidationError, match=r"config\.embedding\.provider"):
+        Memory.from_config(
+            {
+                "data_dir": data_dir,
+                "embedding": {"provider": "unknown"},
+            }
+        )
+
+    assert not data_dir.exists()
+
+
+def test_memory_from_config_validates_settings_before_building_backends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_build(_spec: object) -> object:
+        pytest.fail("backend construction must follow settings validation")
+
+    monkeypatch.setattr(configuration_module, "_build_embedding", unexpected_build)
+
+    with pytest.raises(ValidationError, match=r"config\.settings\.minimum_relevance"):
+        Memory.from_config(
+            {
+                "embedding": {"provider": "jina-omni"},
+                "settings": {"minimum_relevance": 2},
+            }
+        )
+
+
+def test_config_resolution_closes_an_earlier_backend_when_a_later_one_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedder = _FakeEmbedder()
+    monkeypatch.setattr(configuration_module, "_build_embedding", lambda _spec: embedder)
+
+    def fail(_spec: object) -> object:
+        raise ValidationError("generation config failed")
+
+    monkeypatch.setattr(configuration_module, "_build_generation", fail)
+
+    with pytest.raises(ValidationError, match="generation config failed"):
+        Memory.from_config(
+            {
+                "embedding": {"provider": "jina-omni"},
+                "generation": {"provider": "openai"},
+            }
+        )
+
+    assert embedder.close_calls == 1
+
+
+def test_memory_rejects_invalid_composition_values(tmp_path: Path) -> None:
+    plugins = MemoryPlugins(embedder=_FakeModels())
+    with pytest.raises(ValidationError, match="plugins"):
+        Memory.from_plugins(tmp_path, plugins=object())  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="config"):
+        Memory.from_plugins(tmp_path, plugins=plugins, config=object())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "protocol"),
+    [
+        ("embedder", "EmbeddingBackend"),
+        ("answerer", "GenerationBackend"),
+        ("transcriber", "SpeechBackend or TranscriptionBackend"),
+        ("face_analyzer", "FaceBackend"),
+    ],
+)
+def test_memory_plugins_reject_malformed_adapters_before_opening_storage(
+    tmp_path: Path,
+    field: str,
+    protocol: str,
+) -> None:
+    values: dict[str, object] = {"embedder": _FakeModels(), field: object()}
+    data_dir = tmp_path / field
+
+    with pytest.raises(ValidationError, match=rf"plugins\.{field}.*{protocol}"):
+        Memory.from_plugins(
+            data_dir,
+            plugins=MemoryPlugins(**values),  # type: ignore[arg-type]
+        )
+
+    assert not data_dir.exists()
+
+
+def test_composition_values_require_keywords() -> None:
+    with pytest.raises(TypeError):
+        MemoryPlugins(_FakeModels())  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        MemoryConfig(True)  # type: ignore[call-arg]
+
+
+def test_plugin_composition_stays_in_constructor_parity() -> None:
+    parameters = inspect.signature(Memory).parameters
+    assert parameters == inspect.signature(AsyncMemory).parameters
+    assert (
+        inspect.signature(Memory.search).parameters
+        == inspect.signature(AsyncMemory.search).parameters
+    )
+    assert (
+        inspect.signature(Memory.search_with_trace).parameters
+        == inspect.signature(AsyncMemory.search_with_trace).parameters
+    )
+    assert (
+        inspect.signature(Memory.from_plugins).parameters
+        == inspect.signature(AsyncMemory.from_plugins).parameters
+    )
+    assert (
+        inspect.signature(Memory.from_config).parameters
+        == inspect.signature(AsyncMemory.from_config).parameters
+    )
+
+    composition_fields = (*fields(MemoryPlugins), *fields(MemoryConfig))
+    assert {field.name for field in composition_fields} == set(parameters) - {
+        "data_dir",
+        "tracer",
+    }
+    for field in composition_fields:
+        default = inspect.Parameter.empty if field.default is MISSING else field.default
+        assert parameters[field.name].default == default
 
 
 def test_explicit_speech_is_lazy_and_recognizes_a_speaker_across_recordings(
@@ -1851,6 +2415,117 @@ def test_add_many_preserves_per_record_event_time_and_metadata(tmp_path: Path) -
             memory.add_many(("third",), occurred_at=(occurred, None))
 
 
+def test_add_stream_commits_each_input_before_pulling_the_next(tmp_path: Path) -> None:
+    occurred = datetime(2026, 8, 20, 9, tzinfo=timezone.utc)
+    pulled: list[str] = []
+
+    def contents() -> Iterator[str]:
+        for content in ("red first clip", "blue second clip", "   "):
+            pulled.append(content)
+            yield content
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        source = iter(contents())
+        stream = memory.add_stream(
+            StreamInput(
+                content,
+                occurred_at=occurred,
+                metadata={"source": "camera"},
+                memory_type=MemoryType.EPISODIC,
+            )
+            if content.strip()
+            else content
+            for content in source
+        )
+
+        first = next(stream)
+        assert pulled == ["red first clip"]
+        assert memory.get(first.id) == first
+        assert first.occurred_at == occurred
+        assert first.metadata == {"source": "camera"}
+        assert first.memory_type is MemoryType.EPISODIC
+
+        second = next(stream)
+        with pytest.raises(ValidationError) as failure:
+            next(stream)
+
+        assert failure.value.subject == "contents[2]"
+        assert {item.id for item in memory.list().items} == {first.id, second.id}
+
+
+def test_add_stream_commits_each_omni_observation_before_pulling_the_next(
+    tmp_path: Path,
+) -> None:
+    occurred = datetime(2026, 8, 20, 9, tzinfo=timezone.utc)
+    pulled: list[str] = []
+
+    def contents() -> Iterator[StreamInput | str]:
+        pulled.append("omni")
+        yield StreamInput(
+            (
+                "red workshop observation",
+                Blob(b"image", "image/png", "frame.png"),
+                Blob(b"audio", "audio/wav", "sound.wav"),
+            ),
+            occurred_at=occurred,
+            metadata={"source": "robot"},
+            memory_type=MemoryType.EPISODIC,
+        )
+        pulled.append("invalid")
+        yield "   "
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        stream = memory.add_stream(contents())
+        first = next(stream)
+
+        assert pulled == ["omni"]
+        assert memory.get(first.id) == first
+        assert first.modality is Modality.OMNI
+        assert first.occurred_at == occurred
+        assert first.metadata == {"source": "robot"}
+        assert first.memory_type is MemoryType.EPISODIC
+        with pytest.raises(ValidationError) as failure:
+            next(stream)
+
+        assert failure.value.subject == "contents[1]"
+        assert memory.list().items == (first,)
+
+
+def test_existing_memory_types_form_evidence_separated_interaction_memory(tmp_path: Path) -> None:
+    occurred = datetime(2026, 8, 20, 9, tzinfo=timezone.utc)
+    items = (
+        StreamInput(
+            "The user explicitly says they prefer calm red explanations.",
+            metadata={"basis": "user_statement", "evidence_ids": ["turn-1"]},
+            memory_type=MemoryType.SEMANTIC,
+        ),
+        StreamInput(
+            "The user became tense while discussing the red deadline.",
+            occurred_at=occurred,
+            metadata={"basis": "observed_episode", "evidence_ids": ["turn-2"]},
+            memory_type=MemoryType.EPISODIC,
+        ),
+        StreamInput(
+            "When a red deadline is discussed, acknowledge pressure before proposing steps.",
+            metadata={"basis": "response_feedback", "evidence_ids": ["turn-2"]},
+            memory_type=MemoryType.PROCEDURAL,
+        ),
+    )
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        records = tuple(memory.add_stream(items))
+        recalled = {
+            memory_type: memory.search("red deadline", memory_type=memory_type, limit=1)[0]
+            for memory_type in MemoryType
+        }
+
+    assert {record.memory_type for record in records} == set(MemoryType)
+    assert {memory_type: hit.memory_type for memory_type, hit in recalled.items()} == {
+        memory_type: memory_type for memory_type in MemoryType
+    }
+    assert all(hit.metadata["evidence_ids"] for hit in recalled.values())
+
+
 def test_add_many_hydrates_the_index_outbox_in_batches(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2582,7 +3257,7 @@ def test_the_transcript_marker_names_no_modality(tmp_path: Path) -> None:
     # weak-evidence floor, so every word of the marker is a term that makes this memory visible to
     # any query containing it. A marker naming a modality both mislabels a video transcript as
     # audio and hands each media memory a free match on an ordinary English word.
-    assert memory_module._LEXICAL_MATCH_CONFIDENCE > memory_module._DEFAULT_MINIMUM_RELEVANCE
+    assert MemoryConfig().minimum_relevance < memory_module._LEXICAL_MATCH_CONFIDENCE
     assert "spoken red wrench" in indexed
     assert not {"audio", "video"} & set(re.findall(r"\w+", indexed.casefold()))
 
@@ -3046,3 +3721,157 @@ async def test_async_memory_matches_sync_surface(tmp_path: Path) -> None:
     assert models.embed_batches == []
     assert embedder.close_calls == 1
     assert models.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_async_add_stream_consumes_an_async_iterable(tmp_path: Path) -> None:
+    pulled: list[str] = []
+
+    async def contents() -> AsyncIterator[str]:
+        for content in ("red async clip", "blue async clip"):
+            pulled.append(content)
+            yield content
+
+    async with AsyncMemory(tmp_path, embedder=_FakeEmbedder()) as memory:
+        stream = memory.add_stream(contents())
+        first = await anext(stream)
+        assert pulled == ["red async clip"]
+        records = [first, *[record async for record in stream]]
+
+        assert pulled == ["red async clip", "blue async clip"]
+        assert len(records) == 2
+        assert await memory.get(records[1].id) == records[1]
+
+
+@pytest.mark.asyncio
+async def test_async_add_stream_names_a_source_failure(tmp_path: Path) -> None:
+    async def contents() -> AsyncIterator[str]:
+        yield "red async clip"
+        raise ValidationError("source failed")
+
+    async with AsyncMemory(tmp_path, embedder=_FakeEmbedder()) as memory:
+        stream = memory.add_stream(contents())
+        first = await anext(stream)
+        with pytest.raises(ValidationError) as failure:
+            await anext(stream)
+
+        assert failure.value.subject == "contents[1]"
+        assert await memory.get(first.id) == first
+
+
+@pytest.mark.asyncio
+async def test_omni_prefetch_coalesces_snapshots_and_confirms_the_final_query() -> None:
+    class SearchMemory:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+            self.active = 0
+            self.maximum_active = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def search(self, query: object, **_options: object) -> tuple[SearchHit, ...]:
+            self.calls.append(query)
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+            try:
+                if len(self.calls) == 1:
+                    self.started.set()
+                    await self.release.wait()
+                return ()
+            finally:
+                self.active -= 1
+
+    search_memory = SearchMemory()
+    prefetch = AsyncOmniPrefetch(cast(AsyncMemory, search_memory))
+    image = Blob(b"image", "image/png", "frame.png")
+    audio = Blob(b"audio", "audio/wav", "sound.wav")
+    partial: list[str | Blob] = ["red partial", image, audio]
+
+    first_revision = prefetch.submit(partial)
+    partial[0] = "mutated after submit"
+    await search_memory.started.wait()
+    prefetch.submit(("red newer", image, audio))
+    search_memory.release.set()
+    result = await prefetch.finalize(("red final", image, audio))
+
+    assert first_revision == 1
+    assert result.revision == 3
+    assert search_memory.calls == [
+        ("red partial", image, audio),
+        ("red final", image, audio),
+    ]
+    assert search_memory.maximum_active == 1
+    assert prefetch.latest == result
+
+
+@pytest.mark.asyncio
+async def test_omni_prefetch_retries_a_failed_final_snapshot() -> None:
+    class SearchMemory:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.failed = asyncio.Event()
+
+        async def search(self, _query: object, **_options: object) -> tuple[SearchHit, ...]:
+            self.calls += 1
+            if self.calls == 1:
+                self.failed.set()
+                raise ModelError("temporary search failure", reason="timeout")
+            return ()
+
+    search_memory = SearchMemory()
+    prefetch = AsyncOmniPrefetch(cast(AsyncMemory, search_memory))
+
+    prefetch.submit("red final")
+    await search_memory.failed.wait()
+    result = await prefetch.finalize("red final")
+
+    assert result.revision == 2
+    assert search_memory.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_omni_prefetch_rejects_mutable_path_snapshots(tmp_path: Path) -> None:
+    class SearchMemory:
+        async def search(self, _query: object, **_options: object) -> tuple[SearchHit, ...]:
+            raise AssertionError("search must not start")
+
+    prefetch = AsyncOmniPrefetch(cast(AsyncMemory, SearchMemory()))
+
+    with pytest.raises(ValidationError, match="use Blob or AssetRef"):
+        prefetch.submit(tmp_path / "frame.jpg")
+
+
+@pytest.mark.asyncio
+async def test_async_memory_composes_explicit_plugins(tmp_path: Path) -> None:
+    models = _FakeModels()
+    plugins = MemoryPlugins(embedder=models, answerer=models, transcriber=models)
+
+    async with AsyncMemory.from_plugins(tmp_path, plugins=plugins) as memory:
+        record = await memory.add("red async plugin-composed memory")
+        assert (await memory.search("red async plugin"))[0].id == record.id
+        traced = await memory.search_with_trace("red async plugin")
+        assert traced.hits[0].id == record.id
+        assert traced.trace.candidates[0].memory_id == record.id
+
+    assert models.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_async_memory_from_config_uses_the_same_composition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedder = _FakeEmbedder()
+    monkeypatch.setattr(configuration_module, "_build_embedding", lambda _spec: embedder)
+
+    async with AsyncMemory.from_config(
+        {
+            "data_dir": tmp_path,
+            "embedding": {"provider": "jina-omni"},
+            "settings": {"minimum_relevance": 0},
+        }
+    ) as memory:
+        record = await memory.add("red async configured memory")
+        assert (await memory.search("red configured"))[0].id == record.id
+
+    assert embedder.close_calls == 1

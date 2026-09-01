@@ -1,5 +1,6 @@
 """Fast local multimodal memory for Python agents."""
 
+from mindbridge.configuration import MindBridgeConfig
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -11,7 +12,7 @@ from mindbridge.exceptions import (
     StorageError,
     ValidationError,
 )
-from mindbridge.memory import AsyncMemory, Memory
+from mindbridge.memory import AsyncMemory, AsyncOmniPrefetch, Memory
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
@@ -37,7 +38,9 @@ from mindbridge.models.jina import JinaOmniEmbedder
 from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
+from mindbridge.plugins import MemoryConfig, MemoryPlugins, MemorySettings
 from mindbridge.types import (
+    AbstentionReason,
     AnswerResult,
     AssetRef,
     Blob,
@@ -49,16 +52,24 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     Page,
+    PrefetchResult,
+    RetrievalCandidateTrace,
+    RetrievalRejection,
+    RetrievalTrace,
     SearchHit,
     SpeakerSegment,
+    StreamInput,
+    TracedSearchResult,
 )
 
 __all__ = [
     "DEFAULT_FUNASR_MODEL_ID",
     "DEFAULT_FUNASR_RECIPE",
+    "AbstentionReason",
     "AnswerResult",
     "AssetRef",
     "AsyncMemory",
+    "AsyncOmniPrefetch",
     "Blob",
     "ContentAtom",
     "ContentInput",
@@ -76,9 +87,13 @@ __all__ = [
     "IndexUnavailableError",
     "JinaOmniEmbedder",
     "Memory",
+    "MemoryConfig",
     "MemoryNotFoundError",
+    "MemoryPlugins",
     "MemoryRecord",
+    "MemorySettings",
     "MemoryType",
+    "MindBridgeConfig",
     "MindBridgeError",
     "Modality",
     "ModelError",
@@ -87,6 +102,10 @@ __all__ = [
     "OpenAIModels",
     "OpenCVFaceAnalyzer",
     "Page",
+    "PrefetchResult",
+    "RetrievalCandidateTrace",
+    "RetrievalRejection",
+    "RetrievalTrace",
     "SearchHit",
     "SentenceTransformersEmbedder",
     "SpeakerEmbedding",
@@ -96,7 +115,9 @@ __all__ = [
     "SpeechBackend",
     "SpeechTurn",
     "StorageError",
+    "StreamInput",
     "StreamingGenerationBackend",
+    "TracedSearchResult",
     "TranscriptionBackend",
     "ValidationError",
 ]
