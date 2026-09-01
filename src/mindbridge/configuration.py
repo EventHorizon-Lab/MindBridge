@@ -75,7 +75,10 @@ class OpenAIEmbeddingConfig(_OpenAIConfig):
     # modalities it accepts is what lets routing send image, video, and audio memories to it
     # instead of failing the write; `messages` is the request shape those servers read media
     # parts from. Both already existed on the backend and were unreachable from configuration.
-    modalities: frozenset[Modality] = frozenset({Modality.TEXT})
+    # At least one: an empty set declares a model that can embed nothing, which builds a `Memory`
+    # whose every write fails with "does not support: text". Configuration rejects out-of-range
+    # values rather than deferring them to the first `add`.
+    modalities: Annotated[frozenset[Modality], Field(min_length=1)] = frozenset({Modality.TEXT})
     request_format: Literal["input", "messages"] = "input"
 
 

@@ -186,3 +186,19 @@ def test_declarative_openai_embedding_defaults_stay_text_and_input_shaped() -> N
         configuration.OpenAIEmbeddingConfig.model_validate(
             {"provider": "openai", "request_format": "chat"}
         )
+
+
+def test_declarative_openai_embedding_rejects_a_model_that_declares_no_modality() -> None:
+    # An empty set builds a Memory whose every write fails with "does not support: text". The
+    # value is out of range, so it is refused here rather than at the first add.
+    with pytest.raises(PydanticValidationError, match="too_short"):
+        MindBridgeConfig.model_validate(
+            {
+                "embedding": {
+                    "provider": "openai",
+                    "model": "m",
+                    "dimension": 8,
+                    "modalities": [],
+                }
+            }
+        )

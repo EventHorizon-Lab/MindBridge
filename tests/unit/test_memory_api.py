@@ -1326,6 +1326,34 @@ def test_media_the_embedder_cannot_carry_degrades_the_key_not_the_memory(tmp_pat
         assert oversized not in embedded
 
 
+def test_a_degraded_memory_keeps_its_full_text_document(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory:
+        record = memory.add(("the kitchen at dusk", Blob(b"oversized-clip", "video/mp4")))
+        oversized = record.assets[0].id
+        memory.delete(record.id)
+        models.oversized_assets = frozenset({oversized})
+
+        stored = memory.add(("the kitchen at dusk", Blob(b"oversized-clip", "video/mp4")))
+
+        # The search index carries a memory's full-text document on its `object_part == 0` row
+        # alone. Part 0 is the aggregate key, which is also the key holding every asset, so it is
+        # exactly the key an oversized asset elides -- and a memory left without part 0 has an
+        # empty lexical document and is reachable by the dense route only. That is a silent
+        # retrieval hole, not the degradation this promises, and no fake index models the rule,
+        # so the invariant is asserted against the stored rows.
+        with memory._store._connection() as connection:
+            parts = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT object_part FROM embeddings WHERE memory_id = ? ORDER BY object_part",
+                    (stored.id,),
+                )
+            ]
+        assert parts and parts[0] == 0
+        assert parts == list(range(len(parts)))
+
+
 def test_a_memory_with_no_carriable_key_still_fails(tmp_path: Path) -> None:
     models = _FakeModels()
     with _memory(tmp_path, models) as memory:

@@ -304,8 +304,9 @@ class OpenAIModels:
             if not _is_context_length_rejection(error.__cause__) or not _has_video(batch):
                 raise
             mark_model_requests(1)
-            response = self._embedding_response(client, batch, sample_video=True)
-            _record_video_sampling(batch)
+            sampled: list[int] = []
+            response = self._embedding_response(client, batch, sample_video=True, sampled=sampled)
+            _record_video_sampling(len(sampled))
         _record_openai_usage(
             response,
             input_modalities=frozenset(
@@ -321,12 +322,13 @@ class OpenAIModels:
         batch: Sequence[ModelInput],
         *,
         sample_video: bool,
+        sampled: list[int] | None = None,
     ) -> object:
         try:
             if self._embedding_request_format == "messages":
                 from openai.types.create_embedding_response import CreateEmbeddingResponse
 
-                samples = _embedding_samples(batch, sample_video=sample_video)
+                samples = _embedding_samples(batch, sample_video=sample_video, sampled=sampled)
                 return client.post(
                     "/embeddings",
                     cast_to=CreateEmbeddingResponse,
@@ -343,7 +345,7 @@ class OpenAIModels:
                 input=(
                     [value.text for value in batch]
                     if all(not value.assets for value in batch)
-                    else _embedding_samples(batch, sample_video=sample_video)
+                    else _embedding_samples(batch, sample_video=sample_video, sampled=sampled)
                 ),
                 model=self.embedding_model,
                 dimensions=self.embedding_dimension,
@@ -1153,26 +1155,27 @@ def _embedding_samples(
     inputs: Sequence[ModelInput],
     *,
     sample_video: bool = False,
+    sampled: list[int] | None = None,
 ) -> list[list[dict[str, object]]]:
     cache: dict[str, str] = {}
-    return [
-        [{"role": "user", "content": _input_parts(value, cache, sample_video=sample_video)}]
-        for value in inputs
-    ]
+    samples: list[list[dict[str, object]]] = []
+    for index, value in enumerate(inputs):
+        parts, was_sampled = _input_parts(value, cache, sample_video=sample_video)
+        if was_sampled and sampled is not None:
+            sampled.append(index)
+        samples.append([{"role": "user", "content": parts}])
+    return samples
 
 
 def _has_video(inputs: Sequence[ModelInput]) -> bool:
     return any(asset.modality is Modality.VIDEO for value in inputs for asset in value.assets)
 
 
-def _record_video_sampling(inputs: Sequence[ModelInput]) -> None:
+def _record_video_sampling(count: int) -> None:
     """Publish how many inputs reached the model as stills instead of video."""
     span = trace.get_current_span()
     if span.is_recording():
-        span.set_attribute(
-            EMBEDDING_VIDEO_SAMPLED,
-            sum(1 for value in inputs if any(a.modality is Modality.VIDEO for a in value.assets)),
-        )
+        span.set_attribute(EMBEDDING_VIDEO_SAMPLED, count)
 
 
 def _answer_parts(
@@ -1424,10 +1427,17 @@ def _input_parts(
     cache: dict[str, str],
     *,
     sample_video: bool = False,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], bool]:
+    """Build one input's request parts, reporting whether any video was replaced by stills.
+
+    A video whose duration cannot be read is sent whole even on the sampling retry, so presence
+    of video is not evidence that sampling happened; the flag is what keeps the recorded count
+    from claiming a degradation that did not occur.
+    """
     parts: list[dict[str, object]] = (
         [] if not value.text else [{"type": "text", "text": value.text}]
     )
+    sampled = False
     for asset in value.assets:
         frames = (
             _video_frame_urls(asset) if sample_video and asset.modality is Modality.VIDEO else None
@@ -1435,8 +1445,9 @@ def _input_parts(
         if frames is None:
             parts.append(_embedding_asset_part(asset, cache))
             continue
+        sampled = True
         parts.extend({"type": "image_url", "image_url": {"url": frame}} for frame in frames)
-    return parts
+    return parts, sampled
 
 
 def _embedding_asset_part(

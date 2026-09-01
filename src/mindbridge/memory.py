@@ -219,13 +219,13 @@ _TEXT_KEY_CHARACTERS = 2_048
 _TEXT_KEY_OVERLAP = 256
 _TEXT_KEY_CONTEXT = 256
 _MAX_RETRIEVAL_KEYS = 128
+# The reason an embedding backend reports when media does not fit one inline request.
+_PAYLOAD_TOO_LARGE = "payload_too_large"
 # Text-equivalent cost of one grounded media part, at the usual four characters per token. The
 # modalities are an order of magnitude apart in what a model charges for them: an image part
 # measured near five hundred tokens against this stack where a ten-second video part measured
 # near three thousand, so one flat number would either starve text or overrun on video. These
 # are coarse by design; the budget is the caller's knob, not these constants.
-# The reason an embedding backend reports when media does not fit one inline request.
-_PAYLOAD_TOO_LARGE = "payload_too_large"
 _ASSET_EVIDENCE_CHARS: Mapping[Modality, int] = MappingProxyType(
     {
         Modality.IMAGE: 2_000,
@@ -2608,6 +2608,18 @@ class Memory:
                     raise
                 continue
             kept.append(entry)
+        # The index carries a memory's full-text document on its `object_part == 0` row alone,
+        # and part 0 is the aggregate key -- the one holding every asset, so the one an oversized
+        # asset elides. Leaving the gap stores a memory with no lexical document at all, which is
+        # a silent retrieval hole rather than the degradation this promises. Renumbering restores
+        # the invariant; the part index orders a memory's keys and is not a handle on any input.
+        renumbered: builtins.list[tuple[_PreparedMemory, int, ModelInput]] = []
+        next_part: dict[str, int] = {}
+        for memory, _dropped_part, model_input in kept:
+            position = next_part.get(memory.memory_id, 0)
+            next_part[memory.memory_id] = position + 1
+            renumbered.append((memory, position, model_input))
+        kept = renumbered
         embedded = {entry[0].memory_id for entry in kept}
         unreachable = tuple(
             entry[0].memory_id for entry in parts if entry[0].memory_id not in embedded
