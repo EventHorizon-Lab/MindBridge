@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from mindbridge import EvidenceBasis, MemoryContext, MemoryKind
 from mindbridge.infrastructure.local import (
     DataDirectoryInUseError,
     LocalStore,
@@ -123,6 +124,33 @@ def _asset(
     )
 
 
+def _state_memory(
+    memory_id: str,
+    source_memory_id: str,
+    value: str,
+    *,
+    valid_from: datetime,
+    recorded_at: datetime,
+    valid_until: datetime | None = None,
+) -> StoredMemory:
+    return replace(
+        _memory(memory_id, f"preferred drink is {value}", created_at=recorded_at),
+        context=MemoryContext(
+            kind=MemoryKind.STATE,
+            basis=EvidenceBasis.MODEL_INFERENCE,
+            confidence=0.9,
+            valid_from=valid_from,
+            valid_until=valid_until,
+            recorded_at=recorded_at,
+            lineage_id="user:preferred_drink",
+            subject="user",
+            predicate="preferred_drink",
+            value=value,
+            evidence_ids=(source_memory_id,),
+        ),
+    )
+
+
 def _install_legacy_identity_schema(
     connection: sqlite3.Connection,
     *,
@@ -212,7 +240,7 @@ def test_schema_is_local_and_enforces_foreign_keys(tmp_path: Path) -> None:
                     "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
                 )
             )
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
             assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert "tenant" not in schema.casefold()
@@ -279,7 +307,7 @@ def test_schema_v1_is_migrated_atomically_with_text_modality(tmp_path: Path) -> 
         assert legacy.access_count == 0
         assert legacy.assets == ()
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -303,7 +331,7 @@ def test_schema_v2_is_migrated_without_losing_memories(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         assert store.read_memory("preserved") is not None
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -322,7 +350,7 @@ def test_schema_v3_adds_optional_speaker_names(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         with closing(sqlite3.connect(store.database_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(identities)")}
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
         assert "name" in columns
 
 
@@ -342,7 +370,7 @@ def test_schema_v5_adds_optional_event_end(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         with closing(sqlite3.connect(store.database_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(memory_records)")}
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
         assert "occurred_end" in columns
 
 
@@ -409,6 +437,31 @@ def test_schema_v6_migrates_the_centroid_into_a_voice_exemplar(tmp_path: Path) -
     assert exemplar[:3] == ("speaker_legacy", "voice", 0)
     assert struct.unpack("<2f", exemplar[3]) == pytest.approx((0.6, 0.8))
     assert "speaker_identities" not in tables
+
+
+def test_schema_v7_adds_transactional_evidence_without_losing_records(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        store.write_memory(_memory("preserved"))
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.executescript(
+            """
+            DROP TABLE formation_runs;
+            DROP TABLE memory_evidence;
+            DROP TABLE memory_versions;
+            DROP TABLE memory_semantics;
+            PRAGMA user_version = 7;
+            """
+        )
+
+    with LocalStore(tmp_path) as store:
+        preserved = store.read_memory("preserved")
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(memory_evidence)")}
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert preserved is not None and preserved.content == "A red tool is in drawer two"
+    assert {"source_group_id", "recorded_at", "retired_at"} <= columns
+    assert version == 8
 
 
 def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
@@ -1066,3 +1119,164 @@ def test_conflicting_asset_metadata_rolls_back_the_memory_write(tmp_path: Path) 
             store.write_memory(conflicting)
         assert store.read_memory(conflicting.memory_id) is None
         assert store.read_memory(first.memory_id) == first
+
+
+def test_state_order_uses_storage_batch_not_wall_clock_equality(tmp_path: Path) -> None:
+    recorded_at = datetime(2026, 8, 27, 1, 2, 3, tzinfo=timezone.utc)
+    january = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    february = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    march = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    known_at = recorded_at + timedelta(microseconds=2)
+    tea_source = _memory("tea-source", "tea evidence", created_at=recorded_at)
+    coffee_source = _memory("coffee-source", "coffee evidence", created_at=recorded_at)
+    tea = _state_memory(
+        "tea-state",
+        tea_source.memory_id,
+        "tea",
+        valid_from=january,
+        recorded_at=recorded_at,
+    )
+    coffee = _state_memory(
+        "coffee-state",
+        coffee_source.memory_id,
+        "coffee",
+        valid_from=february,
+        recorded_at=recorded_at,
+    )
+
+    with LocalStore(tmp_path / "sequential") as store:
+        store.write_memories((tea_source, tea))
+        store.write_memories((coffee_source, coffee))
+        current = store.read_memories(
+            (tea.memory_id, coffee.memory_id),
+            valid_at=march,
+            known_at=known_at,
+            active_only=True,
+        )
+
+    with LocalStore(tmp_path / "same-batch") as store:
+        store.write_memories((tea_source, coffee_source, tea, coffee))
+        conflicting = store.read_memories(
+            (tea.memory_id, coffee.memory_id),
+            valid_at=march,
+            known_at=known_at,
+            active_only=True,
+        )
+
+    assert [memory.context.value for memory in current if memory.context] == ["coffee"]
+    assert {memory.context.value for memory in conflicting if memory.context} == {
+        "coffee",
+        "tea",
+    }
+
+
+def test_separate_lineage_writes_advance_a_frozen_transaction_clock(tmp_path: Path) -> None:
+    recorded_at = datetime(2026, 8, 27, 1, 2, 3, tzinfo=timezone.utc)
+    january = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    february = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    march = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    april = datetime(2026, 4, 1, tzinfo=timezone.utc)
+    first_source = _memory("first-source", "first evidence", created_at=recorded_at)
+    second_source = _memory("second-source", "second evidence", created_at=recorded_at)
+    first = _state_memory(
+        "first-state",
+        first_source.memory_id,
+        "tea",
+        valid_from=january,
+        valid_until=february,
+        recorded_at=recorded_at,
+    )
+    second = _state_memory(
+        "second-state",
+        second_source.memory_id,
+        "coffee",
+        valid_from=march,
+        valid_until=april,
+        recorded_at=recorded_at,
+    )
+    next_transaction = recorded_at + timedelta(microseconds=1)
+
+    with LocalStore(tmp_path) as store:
+        store.write_memories((first_source, first))
+        store.write_memories((second_source, second))
+        before = store.read_memories(
+            (second.memory_id,),
+            valid_at=march,
+            known_at=recorded_at,
+            active_only=True,
+        )
+        after = store.read_memories(
+            (second.memory_id,),
+            valid_at=march,
+            known_at=next_transaction,
+            active_only=True,
+        )
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            evidence_time = connection.execute(
+                "SELECT recorded_at FROM memory_evidence WHERE memory_id = ?",
+                (second.memory_id,),
+            ).fetchone()
+
+    assert before == ()
+    assert len(after) == 1
+    assert after[0].context is not None
+    assert after[0].context.recorded_at == next_transaction
+    assert evidence_time == (
+        next_transaction.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+
+
+def test_evidence_and_projection_share_one_transaction_time(tmp_path: Path) -> None:
+    recorded_at = datetime(2026, 8, 27, 1, 2, 3, tzinfo=timezone.utc)
+    first = _memory("source-1", "first witness", created_at=recorded_at)
+    second = _memory("source-2", "second witness", created_at=recorded_at)
+    entity = replace(
+        _memory("entity", "the user", created_at=recorded_at),
+        context=MemoryContext(
+            kind=MemoryKind.ENTITY,
+            basis=EvidenceBasis.MODEL_INFERENCE,
+            confidence=0.8,
+            valid_from=None,
+            valid_until=None,
+            recorded_at=recorded_at,
+            lineage_id="user",
+            subject="user",
+            evidence_ids=(first.memory_id,),
+        ),
+    )
+
+    with LocalStore(tmp_path) as store:
+        store.write_memories((first, second, entity))
+        assert store.add_memory_evidence(
+            entity.memory_id,
+            second.memory_id,
+            confidence=0.8,
+            recorded_at=recorded_at,
+        )
+        prior = store.read_memories(
+            (entity.memory_id,),
+            known_at=recorded_at,
+            active_only=True,
+        )[0].context
+        current = store.read_memory(entity.memory_id)
+        assert current is not None and current.context is not None
+
+        store.delete_memory(second.memory_id)
+        retracted = store.read_memory(entity.memory_id)
+        assert retracted is not None and retracted.context is not None
+        before_retraction = store.read_memories(
+            (entity.memory_id,),
+            known_at=retracted.context.recorded_at - timedelta(microseconds=1),
+            active_only=True,
+        )[0].context
+
+    assert prior is not None
+    assert prior.evidence_ids == (first.memory_id,)
+    assert prior.confidence == pytest.approx(0.8)
+    assert current.context.evidence_ids == (first.memory_id, second.memory_id)
+    assert current.context.confidence == pytest.approx(0.96)
+    assert before_retraction is not None
+    assert before_retraction.evidence_ids == (first.memory_id, second.memory_id)
+    assert before_retraction.confidence == pytest.approx(0.96)
+    assert retracted.context.evidence_ids == (first.memory_id,)
+    assert retracted.context.confidence == pytest.approx(0.8)

@@ -35,6 +35,35 @@ class MemoryType(str, Enum):
     PROCEDURAL = "procedural"
 
 
+class EvidenceBasis(str, Enum):
+    """How a source or derived memory became known."""
+
+    OBSERVATION = "observation"
+    USER_STATEMENT = "user_statement"
+    MODEL_INFERENCE = "model_inference"
+    RESPONSE_FEEDBACK = "response_feedback"
+
+
+class MemoryKind(str, Enum):
+    """The typed semantic role maintained for a memory record."""
+
+    OBSERVATION = "observation"
+    ENTITY = "entity"
+    EVENT = "event"
+    STATE = "state"
+    RELATION = "relation"
+    AFFECT = "affect"
+    TRAIT = "trait"
+    RESPONSE_POLICY = "response_policy"
+
+
+class SpatialAnchor(str, Enum):
+    """Whether a pose locates the observer or the observed subject."""
+
+    OBSERVER = "observer"
+    SUBJECT = "subject"
+
+
 class AbstentionReason(str, Enum):
     """Why an answer backend declined to answer from retrieved evidence."""
 
@@ -128,6 +157,310 @@ ContentAtom: TypeAlias = str | Path | Blob | AssetRef
 ContentInput: TypeAlias = ContentAtom | Sequence[ContentAtom]
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SpatialContext:
+    """One metric pose in an application-selected Cartesian coordinate frame."""
+
+    frame_id: str
+    anchor: SpatialAnchor
+    x: float
+    y: float
+    z: float = 0.0
+    orientation_xyzw: tuple[float, float, float, float] | None = None
+    position_uncertainty_m: float | None = None
+
+    def __post_init__(self) -> None:  # noqa: C901 - validates one physical value
+        object.__setattr__(self, "frame_id", _text(self.frame_id, "spatial frame_id"))
+        if not isinstance(self.anchor, SpatialAnchor):
+            try:
+                object.__setattr__(self, "anchor", SpatialAnchor(self.anchor))
+            except (TypeError, ValueError):
+                raise ValidationError("spatial anchor is invalid") from None
+        for name in ("x", "y", "z"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(float(value))
+            ):
+                raise ValidationError(f"spatial {name} must be a finite number")
+            object.__setattr__(self, name, float(value))
+        uncertainty = self.position_uncertainty_m
+        if uncertainty is not None:
+            if (
+                isinstance(uncertainty, bool)
+                or not isinstance(uncertainty, int | float)
+                or not math.isfinite(float(uncertainty))
+                or uncertainty < 0
+            ):
+                raise ValidationError(
+                    "spatial position_uncertainty_m must be a non-negative finite number"
+                )
+            object.__setattr__(self, "position_uncertainty_m", float(uncertainty))
+        supplied_orientation = self.orientation_xyzw
+        if supplied_orientation is None:
+            return
+        try:
+            values = tuple(float(value) for value in supplied_orientation)
+        except (TypeError, ValueError):
+            raise ValidationError("spatial orientation_xyzw must contain four numbers") from None
+        if len(values) != 4 or any(not math.isfinite(value) for value in values):
+            raise ValidationError("spatial orientation_xyzw must contain four finite numbers")
+        x, y, z, w = values
+        norm = math.hypot(*values)
+        if norm == 0:
+            raise ValidationError("spatial orientation_xyzw must not be zero")
+        normalized: tuple[float, float, float, float] = (
+            x / norm,
+            y / norm,
+            z / norm,
+            w / norm,
+        )
+        sign_value = normalized[3]
+        if sign_value == 0:
+            sign_value = next((value for value in normalized[:3] if value != 0), 0)
+        if sign_value < 0:
+            normalized = (
+                -normalized[0],
+                -normalized[1],
+                -normalized[2],
+                -normalized[3],
+            )
+        object.__setattr__(
+            self,
+            "orientation_xyzw",
+            tuple(0.0 if value == 0 else value for value in normalized),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ObservationContext:
+    """Typed provenance, validity, and optional pose supplied with an observation."""
+
+    basis: EvidenceBasis = EvidenceBasis.OBSERVATION
+    source_id: str | None = None
+    confidence: float = 1.0
+    valid_from: datetime | None = None
+    valid_until: datetime | None = None
+    spatial: SpatialContext | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.basis, EvidenceBasis):
+            try:
+                object.__setattr__(self, "basis", EvidenceBasis(self.basis))
+            except (TypeError, ValueError):
+                raise ValidationError("observation basis is invalid") from None
+        object.__setattr__(
+            self,
+            "source_id",
+            _optional_text(self.source_id, "observation source_id"),
+        )
+        object.__setattr__(
+            self,
+            "confidence",
+            _unit_interval(self.confidence, "observation confidence"),
+        )
+        _require_named_interval(
+            self.valid_from,
+            self.valid_until,
+            "valid_from",
+            "valid_until",
+        )
+        if self.spatial is not None and not isinstance(self.spatial, SpatialContext):
+            raise ValidationError("observation spatial context is invalid")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RetrievalScope:
+    """Optional world-time, knowledge-time, and same-frame spatial retrieval scope."""
+
+    valid_at: datetime | None = None
+    known_at: datetime | None = None
+    near: SpatialContext | None = None
+    radius_m: float | None = None
+
+    def __post_init__(self) -> None:
+        _require_aware(self.valid_at, "scope valid_at")
+        _require_aware(self.known_at, "scope known_at")
+        if (self.near is None) != (self.radius_m is None):
+            raise ValidationError("scope near and radius_m must be supplied together")
+        if self.near is not None and not isinstance(self.near, SpatialContext):
+            raise ValidationError("scope near must be a SpatialContext")
+        if self.radius_m is not None:
+            radius = self.radius_m
+            if (
+                isinstance(radius, bool)
+                or not isinstance(radius, int | float)
+                or not math.isfinite(float(radius))
+                or radius < 0
+            ):
+                raise ValidationError("scope radius_m must be a non-negative finite number")
+            object.__setattr__(self, "radius_m", float(radius))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FormationProposal:
+    """One typed, source-grounded semantic memory proposed by a model adapter."""
+
+    kind: MemoryKind
+    content: str
+    basis: EvidenceBasis = EvidenceBasis.MODEL_INFERENCE
+    subject: str | None = None
+    predicate: str | None = None
+    value: str | None = None
+    confidence: float = 1.0
+    valid_from: datetime | None = None
+    valid_until: datetime | None = None
+    spatial: SpatialContext | None = None
+    cue_modality: Modality | None = None
+    valence: float | None = None
+    arousal: float | None = None
+
+    def __post_init__(self) -> None:  # noqa: C901 - kind-specific boundary validation
+        if not isinstance(self.kind, MemoryKind):
+            try:
+                object.__setattr__(self, "kind", MemoryKind(self.kind))
+            except (TypeError, ValueError):
+                raise ValidationError("formation kind is invalid") from None
+        if self.kind is MemoryKind.OBSERVATION:
+            raise ValidationError("formation cannot propose an observation")
+        if not isinstance(self.basis, EvidenceBasis):
+            try:
+                object.__setattr__(self, "basis", EvidenceBasis(self.basis))
+            except (TypeError, ValueError):
+                raise ValidationError("formation basis is invalid") from None
+        if self.basis is EvidenceBasis.OBSERVATION:
+            raise ValidationError("formation basis cannot be observation")
+        object.__setattr__(self, "content", _text(self.content, "formation content"))
+        for name in ("subject", "predicate", "value"):
+            object.__setattr__(
+                self,
+                name,
+                _optional_text(getattr(self, name), f"formation {name}"),
+            )
+        needs_subject = {
+            MemoryKind.ENTITY,
+            MemoryKind.STATE,
+            MemoryKind.RELATION,
+            MemoryKind.AFFECT,
+            MemoryKind.TRAIT,
+            MemoryKind.RESPONSE_POLICY,
+        }
+        needs_predicate = {
+            MemoryKind.STATE,
+            MemoryKind.RELATION,
+            MemoryKind.TRAIT,
+            MemoryKind.RESPONSE_POLICY,
+        }
+        needs_value = needs_predicate | {MemoryKind.AFFECT}
+        if self.kind in needs_subject and self.subject is None:
+            raise ValidationError(f"{self.kind.value} formation requires a subject")
+        if self.kind in needs_predicate and self.predicate is None:
+            raise ValidationError(f"{self.kind.value} formation requires a predicate")
+        if self.kind in needs_value and self.value is None:
+            raise ValidationError(f"{self.kind.value} formation requires a value")
+        object.__setattr__(
+            self,
+            "confidence",
+            _unit_interval(self.confidence, "formation confidence"),
+        )
+        _require_named_interval(
+            self.valid_from,
+            self.valid_until,
+            "formation valid_from",
+            "formation valid_until",
+        )
+        if self.spatial is not None and not isinstance(self.spatial, SpatialContext):
+            raise ValidationError("formation spatial context is invalid")
+        if self.cue_modality is not None:
+            try:
+                cue_modality = Modality(self.cue_modality)
+            except (TypeError, ValueError):
+                raise ValidationError("formation cue_modality is invalid") from None
+            if cue_modality is Modality.OMNI:
+                raise ValidationError("formation cue_modality must be atomic")
+            object.__setattr__(self, "cue_modality", cue_modality)
+        object.__setattr__(self, "valence", _bounded_optional(self.valence, "valence", -1, 1))
+        object.__setattr__(self, "arousal", _bounded_optional(self.arousal, "arousal", 0, 1))
+        if self.kind is not MemoryKind.AFFECT and any(
+            value is not None for value in (self.cue_modality, self.valence, self.arousal)
+        ):
+            raise ValidationError("affect fields require kind='affect'")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MemoryContext:
+    """Authoritative typed semantics attached to a stored memory."""
+
+    kind: MemoryKind
+    basis: EvidenceBasis
+    confidence: float
+    valid_from: datetime | None
+    valid_until: datetime | None
+    recorded_at: datetime
+    visible: bool = True
+    retired_at: datetime | None = None
+    lineage_id: str | None = None
+    source_id: str | None = None
+    subject: str | None = None
+    predicate: str | None = None
+    value: str | None = None
+    evidence_ids: tuple[str, ...] = ()
+    supersedes_id: str | None = None
+    model_id: str | None = None
+    recipe: str | None = None
+    spatial: SpatialContext | None = None
+    cue_modality: Modality | None = None
+    valence: float | None = None
+    arousal: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, MemoryKind) or not isinstance(self.basis, EvidenceBasis):
+            raise ValidationError("memory context kind or basis is invalid")
+        object.__setattr__(
+            self,
+            "confidence",
+            _unit_interval(self.confidence, "memory context confidence"),
+        )
+        _require_named_interval(
+            self.valid_from,
+            self.valid_until,
+            "memory context valid_from",
+            "memory context valid_until",
+        )
+        _require_aware(self.recorded_at, "memory context recorded_at")
+        if not isinstance(self.visible, bool):
+            raise ValidationError("memory context visible must be a boolean")
+        _require_aware(self.retired_at, "memory context retired_at")
+        if self.retired_at is not None and self.retired_at <= self.recorded_at:
+            raise ValidationError("memory context retired_at must follow recorded_at")
+        for name in (
+            "source_id",
+            "lineage_id",
+            "subject",
+            "predicate",
+            "value",
+            "supersedes_id",
+            "model_id",
+            "recipe",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _optional_text(getattr(self, name), f"memory context {name}"),
+            )
+        evidence_ids = tuple(dict.fromkeys(self.evidence_ids))
+        if any(not isinstance(value, str) or not value.strip() for value in evidence_ids):
+            raise ValidationError("memory context evidence_ids are invalid")
+        object.__setattr__(self, "evidence_ids", evidence_ids)
+        if self.spatial is not None and not isinstance(self.spatial, SpatialContext):
+            raise ValidationError("memory context spatial value is invalid")
+        if self.cue_modality is not None and not isinstance(self.cue_modality, Modality):
+            raise ValidationError("memory context cue_modality is invalid")
+        object.__setattr__(self, "valence", _bounded_optional(self.valence, "valence", -1, 1))
+        object.__setattr__(self, "arousal", _bounded_optional(self.arousal, "arousal", 0, 1))
+
+
 @dataclass(frozen=True, slots=True)
 class StreamInput:
     """One independently durable observation from an omni input stream."""
@@ -137,15 +470,12 @@ class StreamInput:
     occurred_end: datetime | None = None
     metadata: Mapping[str, object] | None = field(default=None, hash=False)
     memory_type: MemoryType = MemoryType.SEMANTIC
+    context: ObservationContext | None = None
+    transcript: str | None = None
+    description: str | None = None
 
     def __post_init__(self) -> None:
-        content = self.content
-        if not isinstance(content, (str, Path, Blob, AssetRef)):
-            if isinstance(content, bytes) or not isinstance(content, Sequence):
-                raise ValidationError(
-                    "stream content must be text, media, or an ordered sequence of them"
-                )
-            content = tuple(content)
+        content = _stream_content(self.content)
         _require_interval(self.occurred_at, self.occurred_end)
         if not isinstance(self.memory_type, MemoryType):
             raise ValidationError("memory_type is invalid")
@@ -156,6 +486,208 @@ class StreamInput:
             metadata = dict(metadata)
         object.__setattr__(self, "content", content)
         object.__setattr__(self, "metadata", metadata)
+        if self.context is not None and not isinstance(self.context, ObservationContext):
+            raise ValidationError("stream context must be an ObservationContext")
+        object.__setattr__(
+            self,
+            "transcript",
+            _optional_text(self.transcript, "stream transcript"),
+        )
+        object.__setattr__(
+            self,
+            "description",
+            _optional_text(self.description, "stream description"),
+        )
+
+
+class AudioBoundary(str, Enum):
+    """A canonical acoustic segment boundary."""
+
+    START = "start"
+    END = "end"
+    CANCEL = "cancel"
+
+
+@dataclass(frozen=True, slots=True)
+class PCMChunk:
+    """One immutable chunk of interleaved WAV-compatible linear PCM."""
+
+    data: bytes = field(repr=False)
+    sample_rate_hz: int = 16_000
+    channels: int = 1
+    sample_width_bytes: int = 2
+    stream_id: str = "default"
+    occurred_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data, bytes) or not self.data:
+            raise ValidationError("PCM chunk data must be non-empty bytes")
+        for name in ("sample_rate_hz", "channels", "sample_width_bytes"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValidationError(f"PCM {name} must be a positive integer")
+        if self.sample_width_bytes > 4:
+            raise ValidationError("PCM sample_width_bytes must be between one and four")
+        frame_bytes = self.channels * self.sample_width_bytes
+        if frame_bytes > 0xFFFF or self.sample_rate_hz * frame_bytes > 0xFFFFFFFF:
+            raise ValidationError("PCM format exceeds WAV limits")
+        if len(self.data) % frame_bytes:
+            raise ValidationError("PCM chunk data must contain complete sample frames")
+        object.__setattr__(self, "stream_id", _text(self.stream_id, "stream_id"))
+        _require_aware(self.occurred_at, "PCM occurred_at")
+
+
+@dataclass(frozen=True, slots=True)
+class VADPacket:
+    """One canonical voice-activity state transition."""
+
+    active: bool
+    stream_id: str = "default"
+    occurred_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.active, bool):
+            raise ValidationError("VAD active must be a boolean")
+        object.__setattr__(self, "stream_id", _text(self.stream_id, "stream_id"))
+        _require_aware(self.occurred_at, "VAD occurred_at")
+
+
+@dataclass(frozen=True, slots=True)
+class ASRPartial:
+    """The complete current ASR hypothesis for one audio stream."""
+
+    text: str
+    stream_id: str = "default"
+    occurred_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise ValidationError("ASR partial text must be text")
+        object.__setattr__(self, "text", self.text.strip())
+        object.__setattr__(self, "stream_id", _text(self.stream_id, "stream_id"))
+        _require_aware(self.occurred_at, "ASR occurred_at")
+
+
+@dataclass(frozen=True, slots=True)
+class AcousticBoundary:
+    """Start, finish, or cancel one canonical acoustic segment."""
+
+    boundary: AudioBoundary
+    stream_id: str = "default"
+    occurred_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.boundary, AudioBoundary):
+            try:
+                object.__setattr__(self, "boundary", AudioBoundary(self.boundary))
+            except (TypeError, ValueError):
+                raise ValidationError("audio boundary is invalid") from None
+        object.__setattr__(self, "stream_id", _text(self.stream_id, "stream_id"))
+        _require_aware(self.occurred_at, "audio boundary occurred_at")
+
+
+AudioStreamPacket: TypeAlias = PCMChunk | VADPacket | ASRPartial | AcousticBoundary
+
+
+class VisionBoundary(str, Enum):
+    """A canonical visual scene boundary."""
+
+    START = "start"
+    END = "end"
+    CANCEL = "cancel"
+
+
+@dataclass(frozen=True, slots=True)
+class VisionFrame:
+    """One immutable encoded image frame from a visual stream."""
+
+    image: Blob
+    stream_id: str = "default"
+    occurred_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.image, Blob) or not self.image.media_type.startswith("image/"):
+            raise ValidationError("vision frame must contain an image Blob")
+        object.__setattr__(self, "stream_id", _text(self.stream_id, "stream_id"))
+        _require_aware(self.occurred_at, "vision frame occurred_at")
+
+
+@dataclass(frozen=True, slots=True)
+class VisionPartial:
+    """The complete current caption, OCR, or detector description for one scene."""
+
+    text: str
+    stream_id: str = "default"
+    occurred_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise ValidationError("vision partial text must be text")
+        object.__setattr__(self, "text", self.text.strip())
+        object.__setattr__(self, "stream_id", _text(self.stream_id, "stream_id"))
+        _require_aware(self.occurred_at, "vision partial occurred_at")
+
+
+@dataclass(frozen=True, slots=True)
+class SceneBoundary:
+    """Start, finish, or cancel one canonical visual scene."""
+
+    boundary: VisionBoundary
+    stream_id: str = "default"
+    occurred_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.boundary, VisionBoundary):
+            try:
+                object.__setattr__(self, "boundary", VisionBoundary(self.boundary))
+            except (TypeError, ValueError):
+                raise ValidationError("vision boundary is invalid") from None
+        object.__setattr__(self, "stream_id", _text(self.stream_id, "stream_id"))
+        _require_aware(self.occurred_at, "vision boundary occurred_at")
+
+
+VisionStreamPacket: TypeAlias = VisionFrame | VisionPartial | SceneBoundary
+
+
+class StreamPhase(str, Enum):
+    """Lifecycle boundary emitted by a modality-specific capture adapter."""
+
+    UPDATE = "update"
+    FINAL = "final"
+    CANCEL = "cancel"
+
+
+@dataclass(frozen=True, slots=True)
+class StreamEvent:
+    """A complete current snapshot, final durable observation, or cancellation."""
+
+    phase: StreamPhase
+    item: ContentInput | StreamInput | None = None
+    stream_id: str = "default"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.phase, StreamPhase):
+            try:
+                object.__setattr__(self, "phase", StreamPhase(self.phase))
+            except (TypeError, ValueError):
+                raise ValidationError("stream phase is invalid") from None
+        object.__setattr__(self, "stream_id", _text(self.stream_id, "stream_id"))
+        if self.phase is StreamPhase.CANCEL:
+            if self.item is not None:
+                raise ValidationError("cancel stream events must not contain an item")
+            return
+        if self.item is None:
+            raise ValidationError("update and final stream events require an item")
+        if self.phase is StreamPhase.UPDATE and isinstance(self.item, StreamInput):
+            raise ValidationError("update stream events require a content snapshot")
+        content = (
+            self.item.content if isinstance(self.item, StreamInput) else _stream_content(self.item)
+        )
+        if not isinstance(self.item, StreamInput):
+            object.__setattr__(self, "item", content)
+        atoms = (content,) if isinstance(content, (str, Path, Blob, AssetRef)) else tuple(content)
+        if self.phase is StreamPhase.UPDATE and any(isinstance(atom, Path) for atom in atoms):
+            raise ValidationError("update stream paths are mutable; use Blob or AssetRef")
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +794,27 @@ def _text(value: object, name: str) -> str:
     return value.strip()
 
 
+def _stream_content(value: object) -> ContentInput:
+    if isinstance(value, str):
+        return _text(value, "stream content")
+    if isinstance(value, (Path, Blob, AssetRef)):
+        return value
+    if isinstance(value, bytes) or not isinstance(value, Sequence):
+        raise ValidationError("stream content must be text, media, or an ordered sequence of them")
+    atoms = tuple(value)
+    if not atoms:
+        raise ValidationError("stream content must not be empty")
+    normalized: list[ContentAtom] = []
+    for atom in atoms:
+        if isinstance(atom, str):
+            normalized.append(_text(atom, "stream text"))
+        elif isinstance(atom, (Path, Blob, AssetRef)):
+            normalized.append(atom)
+        else:
+            raise ValidationError("stream content contains an unsupported value")
+    return tuple(normalized)
+
+
 def _optional_text(value: object | None, name: str) -> str | None:
     return None if value is None else _text(value, name)
 
@@ -300,6 +853,47 @@ def _require_interval(start: datetime | None, end: datetime | None) -> None:
     _require_aware(end, "occurred_end")
     if end is not None and (start is None or end <= start):
         raise ValidationError("occurred_end must be later than occurred_at")
+
+
+def _require_named_interval(
+    start: datetime | None,
+    end: datetime | None,
+    start_name: str,
+    end_name: str,
+) -> None:
+    _require_aware(start, start_name)
+    _require_aware(end, end_name)
+    if end is not None and (start is None or end <= start):
+        raise ValidationError(f"{end_name} must be later than {start_name}")
+
+
+def _unit_interval(value: object, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(float(value))
+        or not 0 <= value <= 1
+    ):
+        raise ValidationError(f"{name} must be between zero and one")
+    return float(value)
+
+
+def _bounded_optional(
+    value: object | None,
+    name: str,
+    minimum: float,
+    maximum: float,
+) -> float | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(float(value))
+        or not minimum <= value <= maximum
+    ):
+        raise ValidationError(f"{name} must be between {minimum:g} and {maximum:g}")
+    return float(value)
 
 
 def _trace_number(value: object, name: str, *, maximum: float | None = None) -> None:
@@ -345,6 +939,7 @@ class MemoryRecord:
     assets: tuple[AssetRef, ...] = ()
     modality: Modality = Modality.TEXT
     memory_type: MemoryType = MemoryType.SEMANTIC
+    context: MemoryContext | None = None
 
     def __post_init__(self) -> None:
         _text(self.id, "id")
@@ -359,6 +954,8 @@ class MemoryRecord:
             raise ValidationError("memory must contain content or media assets")
         object.__setattr__(self, "metadata", _metadata(self.metadata))
         object.__setattr__(self, "assets", assets)
+        if self.context is not None and not isinstance(self.context, MemoryContext):
+            raise ValidationError("memory context is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +972,7 @@ class SearchHit:
     assets: tuple[AssetRef, ...] = ()
     modality: Modality = Modality.TEXT
     memory_type: MemoryType = MemoryType.SEMANTIC
+    context: MemoryContext | None = None
 
     def __post_init__(self) -> None:
         _text(self.id, "id")
@@ -391,6 +989,8 @@ class SearchHit:
             raise ValidationError("memory must contain content or media assets")
         object.__setattr__(self, "metadata", _metadata(self.metadata))
         object.__setattr__(self, "assets", assets)
+        if self.context is not None and not isinstance(self.context, MemoryContext):
+            raise ValidationError("memory context is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,6 +1011,27 @@ class PrefetchResult:
         if any(not isinstance(hit, SearchHit) for hit in hits):
             raise ValidationError("prefetch hits are invalid")
         object.__setattr__(self, "hits", hits)
+
+
+@dataclass(frozen=True, slots=True)
+class StreamCommit:
+    """One durable final observation plus retrieval success or a visible retrieval failure."""
+
+    record: MemoryRecord
+    prefetch: PrefetchResult | None
+    retrieval_error: str | None = None
+    stream_id: str = "default"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, MemoryRecord):
+            raise ValidationError("stream commit values are invalid")
+        if self.prefetch is not None and not isinstance(self.prefetch, PrefetchResult):
+            raise ValidationError("stream prefetch result is invalid")
+        error = _optional_text(self.retrieval_error, "stream retrieval_error")
+        if (self.prefetch is None) == (error is None):
+            raise ValidationError("stream commit requires either prefetch or retrieval_error")
+        object.__setattr__(self, "retrieval_error", error)
+        object.__setattr__(self, "stream_id", _text(self.stream_id, "stream_id"))
 
 
 class RetrievalRejection(str, Enum):

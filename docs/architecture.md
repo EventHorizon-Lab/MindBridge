@@ -12,7 +12,7 @@ model and [operations](operations.md) for procedures.
 | Component | Responsibility |
 | --- | --- |
 | `Memory` | Validate content, route model work, coordinate writes and retrieval, and expose the public SDK. |
-| Model backends | Embed, generate, transcribe/analyze speech, or analyze faces through narrow protocols. |
+| Model backends | Embed, generate, transcribe/analyze speech, analyze faces, describe images, or propose typed formations through narrow protocols. |
 | `LocalStore` | Store authoritative records, FP32 embeddings, compatibility metadata, identity state, and the index outbox in SQLite. |
 | `AssetStore` | Store immutable image, video, and audio bytes by SHA-256 under `assets/`. |
 | `ZvecIndex` | Provide disposable dense, lexical, type, and event-time search projections. |
@@ -47,9 +47,18 @@ An index failure can therefore fail the current call while leaving the record du
 projection work retryable. Startup and later operations drain pending work.
 
 A memory ID is the SHA-256 digest of canonical ordered content, media digests, metadata, event
-time, and memory type. Repeating the same add is idempotent. `add_many` uses one model batch and one
+time, memory type, and optional typed observation context. Repeating the same add is idempotent. `add_many` uses one model batch and one
 SQLite transaction; `add_stream` deliberately calls the ordinary add path once per completed item,
 so a later stream failure preserves the committed prefix.
+
+An optional `FormationBackend` runs after the source observation commits, and does not make the
+model authoritative: it only proposes. The kernel assigns identity, validates source binding and
+source modality, and resolves validity and conflicts. Derived records, evidence edges, bitemporal
+versions, embeddings, a durable per-source formation marker, and outbox work then commit in one
+SQLite transaction. Formation is idempotent for a given source memory and formation recipe, so a
+model failure leaves the raw observation durable and the formation retryable. Retiring or losing a
+source recomputes derived confidence and visibility from the remaining independent evidence
+instead of destroying the observation.
 
 ## Retrieval path
 
@@ -78,6 +87,11 @@ records. Ranking combines the strongest dense evidence with bounded lexical, tem
 and optional decay signals. `search_with_trace` exposes these score components without copying
 memory content or metadata into the trace.
 
+`RetrievalScope` filters apply as authoritative SQLite checks rather than projection ranking.
+`valid_at` and `known_at` select the assertion valid in the world and known to the system at
+those instants; `near`/`radius_m` compare distance only within a matching spatial frame and
+anchor, and no implicit frame transform is attempted.
+
 `ask` uses this same retrieval path, limits the grounded evidence, routes the question and hits
 through the generation backend's declared capabilities, and returns only the hits the backend
 actually used.
@@ -86,7 +100,7 @@ actually used.
 
 | State | Role | Recovery behavior |
 | --- | --- | --- |
-| `state.sqlite3` | Authoritative records, embeddings, metadata, cached analyses, identity state, and outbox | Required for recovery. Unsupported schemas or incompatible durable model identities fail at open. |
+| `state.sqlite3` | Authoritative records, embeddings, metadata, cached analyses, identity state, typed semantics with evidence, spatial pose, bitemporal versions, durable formation completion, and outbox | Required for recovery. Unsupported schemas or incompatible durable model identities fail at open. |
 | `assets/` | Authoritative original media bytes | Required for media-bearing records; SQLite alone cannot recreate it. |
 | `zvec/` | Derived search collection | May be deleted while stopped; startup rebuilds it from SQLite without re-embedding stored content. |
 | `.mindbridge.lock` | Operating-system lock target | Its presence does not indicate a live owner. |
@@ -118,7 +132,8 @@ this same synchronous core; it does not introduce a worker service or a second c
 ## Model and plugin boundary
 
 The implemented extension contracts are `EmbeddingBackend`, `GenerationBackend`,
-`TranscriptionBackend`, `SpeechBackend`, and `FaceBackend`. A generation backend may additionally
+`TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, and
+`FormationBackend`. A generation backend may additionally
 implement `StreamingGenerationBackend`. Routing uses declared atomic modalities, never provider or
 model names. Unsupported visual evidence fails; unsupported audio can fall back to transcript text
 only when a configured transcription backend declares the required capability.

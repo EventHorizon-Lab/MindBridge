@@ -153,7 +153,9 @@ class MemoryComposition:
         seen: set[int] = set()
         resources = (
             self.plugins.face_analyzer,
+            self.plugins.vision_describer,
             self.plugins.transcriber,
+            self.plugins.former,
             self.plugins.answerer,
             self.plugins.embedder,
         )

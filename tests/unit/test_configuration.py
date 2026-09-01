@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
 
 import pytest
+from _feature_support import TinyEmbedder
 from pydantic import ValidationError as PydanticValidationError
 
 import mindbridge.configuration as configuration
 import mindbridge.recipes as recipes_module
-from mindbridge import MemoryConfig, MemorySettings, MindBridgeConfig, Modality
+from mindbridge import (
+    FormationInput,
+    FormationProposal,
+    MemoryConfig,
+    MemoryPlugins,
+    MemorySettings,
+    MindBridgeConfig,
+    Modality,
+)
 from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import GenerationBackend
 from mindbridge.types import IndexQuantization
@@ -142,3 +152,33 @@ def test_builtin_openai_generation_config_maps_friendly_names_to_the_sdk_adapter
         "generation_temperature": 0.1,
         "generation_max_tokens": 512,
     }
+
+
+def test_composition_closes_the_optional_former(tmp_path: Path) -> None:
+    class Former:
+        formation_capabilities = frozenset({Modality.TEXT})
+        formation_model = "test"
+        formation_space = "test:v1"
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def form(
+            self,
+            inputs: Sequence[FormationInput],
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            return tuple(() for _value in inputs)
+
+        def close(self) -> None:
+            self.closed = True
+
+    former = Former()
+    composition = configuration.MemoryComposition(
+        tmp_path,
+        MemoryPlugins(embedder=TinyEmbedder(), former=former),
+        MemoryConfig(),
+    )
+
+    composition.close()
+
+    assert former.closed is True

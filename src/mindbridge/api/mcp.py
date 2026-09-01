@@ -41,9 +41,12 @@ from mindbridge.types import (
     AssetRef,
     Blob,
     ContentInput,
+    MemoryContext,
     MemoryRecord,
     MemoryType,
     Modality,
+    ObservationContext,
+    RetrievalScope,
     SearchHit,
 )
 
@@ -95,7 +98,9 @@ _DELETE = ToolAnnotations(
     open_world_hint=False,
 )
 _TOOL_ARGUMENTS = {
-    "add_memory": frozenset({"content", "occurred_at", "occurred_end", "metadata", "memory_type"}),
+    "add_memory": frozenset(
+        {"content", "occurred_at", "occurred_end", "metadata", "memory_type", "context"}
+    ),
     "search_memories": frozenset(
         {
             "query",
@@ -104,9 +109,10 @@ _TOOL_ARGUMENTS = {
             "reference_at",
             "occurred_from",
             "occurred_until",
+            "scope",
         }
     ),
-    "ask_memory": frozenset({"question", "limit", "memory_type", "reference_at"}),
+    "ask_memory": frozenset({"question", "limit", "memory_type", "reference_at", "scope"}),
     "get_memory": frozenset({"memory_id"}),
     "list_memories": frozenset({"limit", "cursor"}),
     "delete_memory": frozenset({"memory_id"}),
@@ -217,6 +223,7 @@ class MemoryResult(BaseModel):
     occurred_at: AwareDatetime | None
     occurred_end: AwareDatetime | None
     metadata: dict[str, JsonValue]
+    context: MemoryContext | None = None
 
 
 class SearchHitResult(MemoryResult):
@@ -261,6 +268,7 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
         occurred_end: AwareDatetime | None = None,
         metadata: dict[str, JsonValue] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: ObservationContext | None = None,
     ) -> MemoryResult:
         """Store one memory and return its stable record."""
         record = memory.add(
@@ -269,6 +277,7 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
             occurred_end=occurred_end,
             metadata=metadata,
             memory_type=memory_type,
+            context=context,
         )
         return _memory_result(record)
 
@@ -281,6 +290,7 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
         reference_at: AwareDatetime | None = None,
         occurred_from: AwareDatetime | None = None,
         occurred_until: AwareDatetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> SearchResult:
         """Find the most relevant local memories."""
         hits = memory.search(
@@ -290,6 +300,7 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
             reference_at=reference_at,
             occurred_from=occurred_from,
             occurred_until=occurred_until,
+            scope=scope,
         )
         return SearchResult(hits=tuple(_search_hit_result(hit) for hit in hits))
 
@@ -300,6 +311,7 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
         limit: _Limit = 5,
         memory_type: MemoryType | None = None,
         reference_at: AwareDatetime | None = None,
+        scope: RetrievalScope | None = None,
     ) -> AnswerResponse:
         """Answer only from retrieved local memories."""
         result = memory.ask(
@@ -307,6 +319,7 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
             limit=limit,
             memory_type=memory_type,
             reference_at=reference_at,
+            scope=scope,
         )
         return AnswerResponse(
             answer=result.answer,
@@ -403,6 +416,7 @@ def _memory_result(record: MemoryRecord) -> MemoryResult:
         occurred_at=record.occurred_at,
         occurred_end=record.occurred_end,
         metadata=cast(dict[str, JsonValue], dict(record.metadata)),
+        context=record.context,
     )
 
 
@@ -418,6 +432,7 @@ def _search_hit_result(hit: SearchHit) -> SearchHitResult:
         occurred_at=hit.occurred_at,
         occurred_end=hit.occurred_end,
         metadata=cast(dict[str, JsonValue], dict(hit.metadata)),
+        context=hit.context,
     )
 
 

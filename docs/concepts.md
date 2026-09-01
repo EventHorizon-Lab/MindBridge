@@ -19,8 +19,9 @@ Python accepts one content atom or an ordered sequence of atoms:
 | `AssetRef` | Media already stored in the same data directory |
 
 The same `ContentInput` shape is used by `add`, `search`, and `ask`. `add_stream` also accepts
-`StreamInput` so each completed observation can carry its own event time, metadata, and memory
-type.
+`StreamInput` so each completed observation can carry its own event time, metadata, memory type,
+and typed observation context. That optional `MemoryContext` records provenance, world-time
+validity, spatial pose, and affect semantics alongside the observation.
 
 MindBridge never downloads remote URLs. In Python, a URL-shaped `str` is still text; fetch remote
 media in the application and pass a `Blob` or local `Path`. REST and MCP reject network URLs and
@@ -35,8 +36,8 @@ media family keeps that media modality; combining multiple media families produc
 metadata, and resolved assets. Search returns the same application fields in ranked `SearchHit`
 values.
 
-Memory IDs are derived from canonical content, ordered asset digests, memory type, event time, and
-metadata. Adding the same logical input again returns the existing record instead of embedding and
+Memory IDs are derived from canonical content, ordered asset digests, memory type, event time,
+metadata, and any typed observation context. Adding the same logical input again returns the existing record instead of embedding and
 storing a duplicate. Media bytes are independently de-duplicated by SHA-256, so several records may
 reference one immutable asset.
 
@@ -70,9 +71,14 @@ See [architecture](architecture.md) for transaction order, index recovery, and c
 
 ## Models are capabilities
 
-Every memory needs an `EmbeddingBackend`. Grounded answers, transcription, speech identity, and
-face identity are optional capabilities supplied by `GenerationBackend`, `TranscriptionBackend` or
-`SpeechBackend`, and `FaceBackend`.
+Every memory needs an `EmbeddingBackend`. Grounded answers, transcription, speech identity, face
+identity, visual description, and typed formation are optional capabilities supplied by
+`GenerationBackend`, `TranscriptionBackend` or `SpeechBackend`, `FaceBackend`,
+`VisionDescriptionBackend`, and `FormationBackend`.
+
+Formation is the one capability that runs after a write. An explicitly configured
+`FormationBackend` may propose a finer `MemoryKind` once the source observation has committed; it
+never rewrites the memory type the caller supplied, and omitting it keeps ordinary add behavior.
 
 `Memory.from_config()` constructs the small set of bundled adapters. `Memory(...)` accepts
 already-constructed protocol implementations for application-specific models and SDK clients.

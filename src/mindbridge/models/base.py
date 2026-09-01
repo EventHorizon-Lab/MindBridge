@@ -9,7 +9,14 @@ from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from mindbridge.exceptions import ValidationError
-from mindbridge.types import AnswerResult, AssetRef, Modality, SearchHit
+from mindbridge.types import (
+    AnswerResult,
+    AssetRef,
+    FormationProposal,
+    Modality,
+    ObservationContext,
+    SearchHit,
+)
 
 
 class EmbedTask(str, Enum):
@@ -58,6 +65,23 @@ class ModelInput:
         return frozenset(value for value in values if value is not None)
 
 
+@dataclass(frozen=True, slots=True)
+class FormationInput:
+    """One committed observation presented to an automatic formation backend."""
+
+    memory_id: str
+    content: ModelInput
+    context: ObservationContext
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.memory_id, str) or not self.memory_id.strip():
+            raise ValidationError("formation input memory_id must not be blank")
+        if not isinstance(self.content, ModelInput):
+            raise ValidationError("formation input content must be a ModelInput")
+        if not isinstance(self.context, ObservationContext):
+            raise ValidationError("formation input context must be an ObservationContext")
+
+
 def _modalities(
     values: Iterable[Modality],
     name: str,
@@ -94,6 +118,27 @@ class EmbeddingBackend(Protocol):
         inputs: Sequence[ModelInput],
         task: EmbedTask = EmbedTask.DOCUMENT,
     ) -> tuple[tuple[float, ...], ...]: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class FormationBackend(Protocol):
+    """One thread-safe model that proposes typed semantics without writing storage."""
+
+    @property
+    def formation_capabilities(self) -> frozenset[Modality]: ...
+
+    @property
+    def formation_model(self) -> str: ...
+
+    @property
+    def formation_space(self) -> str: ...
+
+    def form(
+        self,
+        inputs: Sequence[FormationInput],
+    ) -> tuple[tuple[FormationProposal, ...], ...]: ...
 
     def close(self) -> None: ...
 
@@ -291,5 +336,20 @@ class TranscriptionBackend(Protocol):
     def transcription_space(self) -> str: ...
 
     def transcribe(self, assets: Sequence[AssetRef]) -> tuple[str, ...]: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class VisionDescriptionBackend(Protocol):
+    """One thread-safe visual-description adapter for text embedding fallback."""
+
+    @property
+    def vision_capabilities(self) -> frozenset[Modality]: ...
+
+    @property
+    def vision_model(self) -> str: ...
+
+    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]: ...
 
     def close(self) -> None: ...
