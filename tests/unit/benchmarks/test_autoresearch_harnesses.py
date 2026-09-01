@@ -5,7 +5,8 @@ import importlib
 import json
 import sqlite3
 import sys
-from datetime import UTC, datetime
+from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,7 +38,7 @@ def test_replay_payloads_match_product_and_keep_score_control(harnesses: SimpleN
         id="memory-1",
         content="source",
         score=0.875,
-        created_at=datetime(2026, 8, 31, tzinfo=UTC),
+        created_at=datetime(2026, 8, 31, tzinfo=timezone.utc),
     )
     product = openai_sdk._hit_payload(hit)
     assert harnesses.gallery._hit_payload(hit, include_memory_id=True) == product
@@ -89,9 +90,10 @@ def test_answer_cache_binds_queries_stores_and_generation_protocol(
     for label in ("baseline", "candidate"):
         path = tmp_path / label
         path.mkdir()
-        with sqlite3.connect(path / "state.sqlite3") as connection:
+        with closing(sqlite3.connect(path / "state.sqlite3")) as connection:
             connection.execute("CREATE TABLE evidence (value TEXT NOT NULL)")
             connection.execute("INSERT INTO evidence VALUES (?)", (label,))
+            connection.commit()
         stores[label] = path
     cache_path = tmp_path / "cache.json"
     monkeypatch.setattr(harnesses.answer_gate, "BASELINE_PATH", stores["baseline"])
@@ -108,13 +110,15 @@ def test_answer_cache_binds_queries_stores_and_generation_protocol(
             "unit", harnesses.answer_gate._query_digest((changed_query,))
         )
 
-    with sqlite3.connect(stores["candidate"] / "state.sqlite3") as connection:
+    with closing(sqlite3.connect(stores["candidate"] / "state.sqlite3")) as connection:
         connection.execute("UPDATE evidence SET value = 'changed'")
+        connection.commit()
     with pytest.raises(RuntimeError, match="store_sha256"):
         harnesses.answer_gate._load_cache("unit", query_digest)
 
-    with sqlite3.connect(stores["candidate"] / "state.sqlite3") as connection:
+    with closing(sqlite3.connect(stores["candidate"] / "state.sqlite3")) as connection:
         connection.execute("UPDATE evidence SET value = 'candidate'")
+        connection.commit()
     monkeypatch.setattr(
         harnesses.answer_gate.openai_sdk,
         "_GROUNDED_SYSTEM_PROMPT",

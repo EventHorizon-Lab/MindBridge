@@ -15,6 +15,7 @@ import sqlite3
 import statistics
 import time
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import closing
 from pathlib import Path
 from typing import Any, cast
 
@@ -140,7 +141,7 @@ def _validate_store_pair() -> dict[str, dict[str, object]]:
 def _store_digest(path: Path) -> str:
     digest = hashlib.sha256()
     database = path / "state.sqlite3"
-    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+    with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
         for statement in connection.iterdump():
             digest.update(statement.encode())
             digest.update(b"\n")
