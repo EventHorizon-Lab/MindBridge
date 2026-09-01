@@ -1,43 +1,35 @@
 # MindBridge documentation
 
-MindBridge is an embedded multimodal memory library for text, image, video, audio, and combined
-`omni` inputs. Start with the short path, then use the reference pages for exact contracts.
+Each page has one job. Start with the learning path, then use the reference or operating page that
+owns the fact you need.
 
-## Start here
+## Learn the product
 
-- [Product goals and design principles](design-principles.md) — positioning, modality and
-  performance goals, portability, ecosystem reuse, and extension criteria.
-- [Quick start](quickstart.md) — install, add text and media, retrieve, and upgrade.
-- [Core concepts](concepts.md) — content, assets, identity, isolation, models, and indexing.
-- [Memory types, time, and decay](memory-types-time-and-decay.md) — cognitive roles, temporal
-  retrieval, decay, research basis, and limits.
-- [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) — completed stream
-  ingestion, speculative recall, evidence-backed interaction memory, and the graph evidence gate.
-- [Configuration](configuration.md) — explicit composition, provider ownership, and durable model spaces.
+1. [Quick start](quickstart.md) — install MindBridge and run the first local memory.
+2. [Core concepts](concepts.md) — understand content, records, retrieval, and isolation.
+3. [Configuration](configuration.md) — choose bundled adapters or inject your own.
 
-## APIs
+## API reference
 
-- [Python API](api/python-sdk.md) — `Memory`, content values, return values, and exceptions.
-- [REST API](api/rest.md) — ordered content parts, endpoints, deployment boundary, and errors.
-- [MCP API](api/mcp.md) — six typed tools, shared SDK execution plane, and capability gaps.
-- [Command-line usage](api/cli.md) — the `mindbridge` product commands and the benchmark dispatcher.
+- [Python SDK](api/python-sdk.md) — complete `mindbridge` root-import contract.
+- [REST API](api/rest.md) — `/v1` schemas, routes, errors, and limits.
+- [MCP tools](api/mcp.md) — six tool schemas and transport boundary.
+- [Command line](api/cli.md) — commands, input forms, JSON output, and exit codes.
 
-## Build and run
+## Operate MindBridge
 
-- [Architecture](architecture.md) — components, model routing, and consistency.
-- [Technical architecture](technical-architecture.md) — SQLite, CAS, Zvec, trust boundaries, and concurrency.
-- [Plugin architecture](plugin-architecture.md) — current composition boundary and criteria for
-  future capability plugins.
-- [Deployment](deployment.md) — one-process embedded and REST deployment.
-- [Operations](operations.md) — backup, restore, rebuild, and observability.
-- [Performance and token observability](observability.md) — end-to-end traces, node latency, TTFT,
-  multimodal token accounting, and benchmark aggregates.
-- [Troubleshooting](troubleshooting.md) — startup, asset, model, and index failures.
-- [Benchmarking](benchmarking.md) — evaluation tasks, uncertainty, isolation, and local-index metrics.
+- [Architecture](architecture.md) — storage, consistency, concurrency, and model boundaries.
+- [Deployment](deployment.md) — embedded, REST, and edge deployment shapes.
+- [Operations](operations.md) — backup, recovery, index maintenance, and telemetry.
+- [Security](../SECURITY.md) — trust boundaries, data exposure, and deployment hardening.
+- [Troubleshooting](troubleshooting.md) — diagnose common startup, retrieval, and model failures.
 
-## Scope notes
+## Go deeper
 
-- [Edge status](edge.md) — local media memory on constrained devices.
+- [Memory types, time, and decay](memory-types-time-and-decay.md) — role and ranking semantics.
+- [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) — completed
+  observations, speculative recall, and derived records.
+- [Benchmarking](benchmarking.md) — reproducible evaluation and local-index measurement.
 
-Historical service and account-scoping documents were removed because they describe contracts
-that no longer exist. A `data_dir`, not a tenant or user field, is the isolation boundary.
+For repository setup and quality gates, see [CONTRIBUTING.md](../CONTRIBUTING.md).
+When a fact changes, update its owning page and link to it instead of copying it into another guide.

@@ -27,7 +27,7 @@ assignees: ''
 - MindBridge version or commit:
 - Python version:
 - Operating system and architecture:
-- Install surface (`base`, `server`, or `mcp`):
+- Installed extras (for example `local`, `openai`, `server`, or `mcp`):
 - Component (`Memory`, `AsyncMemory`, REST, MCP, CLI, or benchmark):
 - Data directory state (new, existing, restored, or rebuilt):
 - Filesystem type:
