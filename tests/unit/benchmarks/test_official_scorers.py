@@ -600,6 +600,11 @@ def test_personamem_ranking_is_deterministic_and_reads_both_answer_shapes() -> N
     assert miss["recall@1"] == 0.0
     assert miss["mrr"] == pytest.approx(1 / 3)
     assert miss["negative_in_top1"] == 0.0
+    # The headline is upstream's graded nDCG@5, not top-1: burying the gold at
+    # rank 3 costs a position discount rather than the whole score, which is
+    # exactly what separates `ndcg_graded@5` from `recall@1` here.
+    assert miss["ndcg_graded@5"] == pytest.approx(0.5)
+    assert miss["personamem_score"] == pytest.approx(0.5)
 
     # A reply that is not a permutation of the slate is unusable, and so is an
     # answer with no ranking in it. Both fall back to the identity order, which
@@ -628,6 +633,9 @@ def test_personamem_ranking_is_deterministic_and_reads_both_answer_shapes() -> N
         "local_recommendation_geo_shift",
         "over_personalization_repetition_chatbot",
         "over_personalization_repetition_recsys",
+        # Ranks a slate like the other three, but upstream scores it with a
+        # delta across two paired rows that a single row cannot carry.
+        "short_vs_long_term_lifecycle",
     ],
 )
 def test_personamem_leaves_families_it_cannot_reproduce_unscored(task_type: str) -> None:
@@ -640,7 +648,12 @@ def test_personamem_leaves_families_it_cannot_reproduce_unscored(task_type: str)
         "negative_indexes": (0,),
         "judge_evidence": {},
     }
-    assert _scores("personamem-v3", "Ranked indexes: [1, 0, 2, 3]", "gold", dict(metadata)) == {}
+    scored = _scores("personamem-v3", "Ranked indexes: [1, 0, 2, 3]", "gold", dict(metadata))
+    # A slate-ranking task with no reproducible headline still reports its
+    # deterministic diagnostics; it just must not enter the aggregate.
+    assert "personamem_score" not in scored
+    if task_type != "short_vs_long_term_lifecycle":
+        assert scored == {}
     assert (
         judge_plan(
             "personamem-v3",

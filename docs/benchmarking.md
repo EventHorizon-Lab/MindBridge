@@ -61,6 +61,13 @@ runner replaces `data_dir` with isolated per-unit directories. See [configuratio
 for the JSON schema. `--device` overrides configured local-model devices, and `--model-args`
 overrides generation model, base URL, timeout, or the provider's minimum video duration.
 
+The harness also reads `MINDBRIDGE_GENERATION_API_KEY`, `MINDBRIDGE_GENERATION_BASE_URL`,
+`MINDBRIDGE_GENERATION_MODEL`, `MINDBRIDGE_GENERATION_MODALITIES`, and
+`MINDBRIDGE_TIMEOUT_SECONDS`. The request timeout defaults to 300 seconds: a request the server
+never answers otherwise holds its task for the whole timeout while the remaining workers idle, and
+the run reports the stall as elapsed time rather than as a failure. Raise it only for a model whose
+legitimate responses exceed it.
+
 Open-ended tasks use a judge. Configure it separately when needed:
 
 ```bash
@@ -129,11 +136,13 @@ Three of them need a note before a number is quoted:
   repository has drifted from the released data -- the repository's slate scorer reads a `slate`
   and `origin_by_idx` the release does not publish -- so the reproduced protocols read only
   released fields: the unified personalization rubric (13 task types), the four task-specific
-  judges, and the deterministic ranking family. The proactive decision judge, the two
-  repetition-fatigue cluster tasks, `new_suggestions_chatbot`, `local_recommendation_geo_shift`
-  and `active_mistake_prevention` are answered and reported but carry no official headline; the
-  cluster rows are dropped at load because their runner threads each response into the next
-  prompt. The rubric judge's evidence block is also narrower than upstream's `build_source_a`,
+  judges, and the deterministic ranking family, whose headline is the graded nDCG@5 that
+  `task_registry.PRIMARY_METRIC` names. The proactive decision judge, the two repetition-fatigue
+  cluster tasks, `new_suggestions_chatbot`, `local_recommendation_geo_shift`,
+  `active_mistake_prevention` and `short_vs_long_term_lifecycle` are answered and reported but
+  carry no official headline -- the last one ranks a slate like the other three, but upstream
+  scores it with a delta across two paired rows that a single row cannot carry. The cluster rows
+  are dropped at load because their runner threads each response into the next prompt. The rubric judge's evidence block is also narrower than upstream's `build_source_a`,
   which queries the persona backend for the same-day avoid slice and the privacy flags, so
   hard-rule checks that depend on those under-fire relative to a full-harness run.
 

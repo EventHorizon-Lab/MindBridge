@@ -62,6 +62,7 @@ Memory(
     index_quantization: IndexQuantization = IndexQuantization.NONE,
     minimum_relevance: float = 0.55,
     ambiguity_margin: float = 0.01,
+    evidence_budget_chars: int | None = None,
     decay_half_life_days: float | None = None,
     speaker_similarity: float = 0.78,
     speaker_margin: float = 0.05,
@@ -83,6 +84,21 @@ A plain `TranscriptionBackend` transcribes supported audio/video during `add` re
 `vision_describer` and `former` have no declarative provider and are reachable only through
 direct construction or `MemoryPlugins`. `former` proposes typed memories after a source
 observation commits; omitting it keeps ordinary add behavior and makes no formation model call.
+
+Turn `index_speech` on for any corpus whose memories carry speech. Without it a video memory's
+indexed document is whatever text the caller supplied, which for clip-shaped ingestion is often a
+source identifier and nothing else, leaving the full-text route unable to match anything. On a
+15-unit, 187-question M3-Bench robot slice it moved the mean indexed document from 29 to 536
+characters and accuracy from 0.2086 to 0.3583 (paired mean +0.1497, 95% CI [+0.0857, +0.2123]),
+at unchanged generation token usage because the inlined media dominates the prompt either way.
+
+`evidence_budget_chars` decides how much evidence `ask()` grounds on. Retrieval scores separate the
+right memory from the rest only weakly, so the answering model performs the final selection and
+needs to see enough candidates. `None` grounds on exactly `limit`. An integer keeps those `limit`
+hits and then admits further ranked memories while the grounded evidence fits the budget, ranking
+the full rerank pool rather than `3 * limit`. Media is charged its modality's text equivalent —
+2000 characters for an image, 4000 for audio, 12 000 for video — because a media part costs a model
+far more than the few bytes of text on its record.
 
 The two other construction boundaries are:
 
@@ -348,6 +364,12 @@ The principal immutable values are:
 | `TracedSearchResult` | `hits`, `trace` |
 | `RetrievalTrace` | `candidates`, `candidate_limit`, `exhaustive`, `ambiguous` |
 | `RetrievalCandidateTrace` | `memory_id`, `index_ids`, `dense_relevance`, `dense_confidence`, `lexical_relevance`, `lexical_rerank_bonus`, `lexical_match`, `gate_confidence`, `base_relevance`, `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`, `rejected_by` |
+
+`abstained` reports that the answerer returned the exact sentence the grounding prompt reserves for
+having no usable evidence. It is not a measure of how often a model declined to answer: a model that
+refuses in its own words is not abstaining by this definition, and on one EgoLifeQA slice 12 of 51
+answers read as refusals without using the sentence. Treat it as a protocol signal and measure
+refusal rate separately if that is the quantity needed.
 
 Enum values are:
 
@@ -625,6 +647,15 @@ Stable input bounds are:
 
 The 512 MiB value is the local ingestion ceiling, not a promise that every model backend accepts an
 asset that large. Backend request limits apply before model work.
+
+Two degradations keep a write alive rather than failing it, and both are recorded on the operation
+span. Media the embedding model will not accept inline drops the retrieval key holding it: the
+memory is still stored with its media and stays reachable through the keys that did embed, counted
+by `mindbridge.embedding.elided_parts`. A memory whose every key is refused still fails, because
+nothing would find it. Separately, a video the embedding model cannot fit in its context is embedded
+as four ordered stills, counted by `mindbridge.embedding.video_sampled_inputs`; only a rejection
+that declares the length constraint triggers it, and the video itself is still stored and still
+reaches the answering model on its own route.
 
 `add_many` has no separate SDK item-count cap, but each item is subject to the same content and
 metadata bounds. REST and MCP deliberately impose narrower transport limits. A `Memory` is bound

@@ -182,12 +182,19 @@ non-empty text delta. Providers may report `gen_ai.response.time_to_first_chunk`
 `mindbridge.grounding.media_elided_hits` and `mindbridge.grounding.dropped_hits` when request limits
 shrink retrieved evidence.
 
+Two write-path counters make silent degradation visible. `mindbridge.embedding.elided_parts` counts
+retrieval keys an `add` could not embed because their media exceeds what the embedding model accepts
+inline; the memory is still stored and reachable through its remaining keys, and a write whose every
+key is refused fails instead. `mindbridge.embedding.video_sampled_inputs` counts embedding inputs
+whose video reached the model as four ordered stills because the model declared the prompt longer
+than its context — the memory keeps its video, only the vector behind it is built from stills.
+
 ### Identity recognition yield
 
-Face and speaker recognition report what each asset actually produced, so a recognizer that runs
-and finds nothing is distinguishable from one that was never configured. A detection threshold
-tuned for another domain is the common cause: it costs full analysis time and yields zero faces
-silently.
+Face and speaker recognition each emit one `mindbridge.identity.faces` or
+`mindbridge.identity.speakers` span per asset, so a recognizer that runs and finds nothing is
+distinguishable from one that was never configured, and a cached re-read is distinguishable from
+both.
 
 | Attribute | Meaning |
 | --- | --- |
@@ -200,10 +207,16 @@ silently.
 | `mindbridge.identity.evidence_required` | Co-occurrences required before the pair merges. |
 | `mindbridge.identity.linked` | Whether this asset's co-occurrence completed a merge. |
 
-A steady `created` with a near-zero `matched_existing` means the recognizer is not re-identifying
-anyone across assets, so every sighting becomes a new person. Compare the two before adjusting any
-similarity threshold: when a recognizer cannot separate people on the material at hand, no
-threshold value helps, and lowering one converts fragmentation into wrong merges.
+Analysis reports success whether or not the recognizer can tell people apart, so these numbers are
+what separate recognition from its two silent failures. Zero observations means the detector ran and
+found nobody, usually a confidence threshold suited to posed photographs applied to wide-angle or
+egocentric footage. Many observations with almost no matches means the embeddings do not separate
+the people in the footage and every memory has met a stranger; the identities are real rows, and
+nothing later in the pipeline reports a problem.
+
+Compare `created` against `matched_existing` before adjusting any similarity threshold. When a
+recognizer cannot separate people on the material at hand, no threshold value helps: lowering one
+converts fragmentation into wrong merges, and raising it turns every sighting into a new person.
 
 Spans do not record memory text, media bytes, paths, asset or memory IDs, metadata, model responses,
 or exception details. Failed spans receive only error status. For one retrieval investigation, use

@@ -53,6 +53,7 @@ config = {
     "settings": {
         "minimum_relevance": 0.55,
         "ambiguity_margin": 0.01,
+        "evidence_budget_chars": 12000,
     },
 }
 
@@ -70,7 +71,7 @@ Bundled provider fields are:
 | --- | --- | --- |
 | `embedding: jina-omni` | — | `dimension=1024`, `device=None`, `batch_size=32` |
 | `embedding: sentence-transformers` | `model`, `revision` | `dimension=None`, `device=None`, `batch_size=32` |
-| `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, plus connection fields |
+| `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, `modalities=[text]` (at least one), `request_format=input`, plus connection fields |
 | `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `video_limit=8`, `extra_body=None`, plus connection fields |
 | `speech: funasr` | — | `device=auto` |
 | `speech: openai` | — | `model=whisper-1`, `space=None`, plus connection fields |
@@ -102,8 +103,15 @@ The embedding model defines durable vector identity, so every memory requires on
   that upstream code as part of the application's dependency trust boundary.
 - `sentence-transformers` loads a model and immutable 40-character commit revision selected by the
   application. Its supported modalities come from that model.
-- `openai` uses the official SDK and defaults to text embedding. Use direct injection to declare
-  additional capabilities or a non-standard request format.
+- `openai` uses the official SDK and defaults to text embedding. An OpenAI-compatible server may
+  host a multimodal embedding model, so `modalities` declares which atomic modalities it accepts and
+  `request_format` selects how media is carried: `input` posts the standard array, `messages` posts
+  chat-style content parts. Routing reads that declaration, so it decides whether an image or video
+  memory is stored or rejected — left at the default, every non-text write fails with
+  `unsupported_modality`, correctly, because nothing would have embedded the pixels. Audio is the
+  one modality with a fallback: with a `speech` backend configured it is transcribed and the text is
+  embedded. `embedding_space` records the request format, so changing it forces a rebuild rather
+  than silently mixing two spaces.
 
 Changing model, revision, dimension, or input recipe changes the embedding space. Do not point the
 new configuration at an existing directory unless it is an explicitly supported bundled upgrade;
@@ -120,6 +128,7 @@ alias):
 | `index_quantization` | `none` | Zvec projection mode: `none`, `fp16`, `int8`, or `rabitq` |
 | `minimum_relevance` | `0.55` | Reject evidence below this confidence |
 | `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1` |
+| `evidence_budget_chars` | `None` | Widen `ask` grounding while the evidence fits this budget; `None` grounds on exactly `limit` |
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
 | `speaker_similarity` | `0.78` | Voice identity match threshold |
 | `speaker_margin` | `0.05` | Voice identity ambiguity margin |
@@ -130,7 +139,10 @@ alias):
 Thresholds and margins accept values from `0` through `1`. `minimum_relevance=0` disables the
 weak-evidence floor; a zero ambiguity margin disables the corresponding tie rejection. A zero
 speaker or face similarity is merely the most permissive threshold. `decay_half_life_days` must be
-positive when set. A tracer is passed as the separate `tracer=` argument to
+positive when set. `evidence_budget_chars` keeps the `limit` hits unconditionally and then admits
+further ranked memories while the evidence fits, charging each media asset its modality's text
+equivalent because a media part costs a model far more than its record's text. A tracer is passed
+as the separate `tracer=` argument to
 `Memory.from_config()` or `Memory(...)`, not inside `settings`.
 
 ## Direct adapter injection

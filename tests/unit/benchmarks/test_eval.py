@@ -648,6 +648,40 @@ def test_backend_pool_warms_query_embedding_before_evaluation(
     assert calls == [((ModelInput(text="MindBridge benchmark warmup"),), EmbedTask.QUERY)]
 
 
+def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hand-written forwarding list drops new policy silently, which is worse than crashing:
+    the run measures the default while the artifact reports the configured value."""
+    captured: dict[str, object] = {}
+
+    class Recorder:
+        def __init__(self, _data_dir: object, **values: object) -> None:
+            captured.update(values)
+
+    monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
+    pool = object.__new__(eval_module._BackendPool)
+    settings = MemoryConfig(evidence_budget_chars=4_242, minimum_relevance=0.11)
+    for name, value in (
+        ("_settings", settings),
+        ("_embedder", None),
+        ("_answerer", None),
+        ("_transcriber", None),
+        ("_face_analyzer", None),
+        ("_tracer", None),
+    ):
+        setattr(pool, name, value)
+
+    pool.memory(Path("unused"))
+
+    for entry in fields(MemoryConfig):
+        assert captured[entry.name] == getattr(settings, entry.name), entry.name
+    # Deriving the forwarding from the dataclass is only safe while every declared field names
+    # a real constructor keyword; a field added without one would raise at call time instead.
+    declared = {entry.name for entry in fields(MemoryConfig)}
+    for constructor in (Memory.__init__, AsyncMemory.__init__):
+        unaccepted = declared - set(signature(constructor).parameters)
+        assert not unaccepted, f"{constructor.__qualname__} has no keyword for {sorted(unaccepted)}"
+
+
 def test_implementation_identity_tracks_editable_source_changes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1627,52 +1661,3 @@ async def test_answer_many_preserves_structured_abstention() -> None:
     assert isinstance(outcome, eval_module._AnswerOutcome)
     assert outcome.abstained is True
     assert outcome.abstention_reason == "insufficient_evidence"
-
-
-def test_backend_pool_forwards_every_memory_config_field(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Every declared local policy field must reach the constructed store.
-
-    A field missing from the forwarding list runs the benchmark on the default while
-    results.json reports the configured value, so the omission is invisible in the output.
-    """
-    settings = MemoryConfig(
-        index_speech=True,
-        minimum_relevance=0.61,
-        ambiguity_margin=0.02,
-        decay_half_life_days=7.0,
-        speaker_similarity=0.81,
-        speaker_margin=0.06,
-        face_similarity=0.4,
-        face_margin=0.07,
-    )
-    declared = {entry.name for entry in fields(MemoryConfig)}
-    for constructor in (Memory.__init__, AsyncMemory.__init__):
-        accepted = set(signature(constructor).parameters)
-        unaccepted = declared - accepted
-        assert not unaccepted, f"{constructor.__qualname__} has no keyword for {sorted(unaccepted)}"
-
-    recorded: dict[str, object] = {}
-
-    def recorder(_data_dir: Path, **kwargs: object) -> AsyncMemory:
-        recorded.update(kwargs)
-        return cast(AsyncMemory, SimpleNamespace())
-
-    monkeypatch.setattr(eval_module, "AsyncMemory", recorder)
-    pool = cast(
-        eval_module._BackendPool,
-        SimpleNamespace(
-            _embedder=None,
-            _answerer=None,
-            _transcriber=None,
-            _face_analyzer=None,
-            _tracer=None,
-            _settings=settings,
-        ),
-    )
-    eval_module._BackendPool.memory(pool, Path("unused"))
-
-    dropped = declared - set(recorded)
-    assert not dropped, f"_BackendPool.memory does not forward {sorted(dropped)}"
-    assert all(recorded[name] == getattr(settings, name) for name in declared)

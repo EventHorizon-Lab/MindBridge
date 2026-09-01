@@ -16,7 +16,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
@@ -78,7 +78,7 @@ from mindbridge.benchmarks.eval_telemetry import (
     EvaluationTelemetry,
 )
 from mindbridge.benchmarks.isolation import BenchmarkRun
-from mindbridge.benchmarks.model_config import ModelConfig
+from mindbridge.benchmarks.model_config import DEFAULT_TIMEOUT_SECONDS, ModelConfig
 from mindbridge.benchmarks.official_scorers import (
     SCORER_VERSION,
     JudgeMessage,
@@ -189,7 +189,7 @@ class _JudgeConfig:
     model: str
     base_url: str
     api_key: str | None = field(default=None, repr=False)
-    timeout_seconds: float = 3_600.0
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     concurrency: int = 4
 
     def __post_init__(self) -> None:
@@ -538,27 +538,20 @@ class _BackendPool:
         self._settings = MemoryConfig(index_speech=self._transcriber is not None)
 
     def memory(self, data_dir: Path) -> AsyncMemory:
-        # Every MemoryConfig field must appear here. A missing one silently runs the default
-        # while the recorded configuration reports the configured value, which is invisible in
-        # results.json; test_backend_pool_forwards_every_memory_config_field guards the set.
-        settings = self._settings
+        # Forwarded from the dataclass rather than field by field. The hand-written list silently
+        # dropped every setting added after it was written, which does not fail anything: the
+        # evaluation simply measures the default policy while reporting the configured one.
+        # `MemoryPlugins` cannot be used here because the shared-backend proxies are structural
+        # and its runtime protocol check reads attributes statically.
+        policy = {entry.name: getattr(self._settings, entry.name) for entry in fields(MemoryConfig)}
         return AsyncMemory(
             data_dir,
             embedder=self._embedder,
             answerer=self._answerer,
             transcriber=self._transcriber,
             face_analyzer=self._face_analyzer,
-            index_speech=settings.index_speech,
-            index_quantization=settings.index_quantization,
-            minimum_relevance=settings.minimum_relevance,
-            ambiguity_margin=settings.ambiguity_margin,
-            decay_half_life_days=settings.decay_half_life_days,
-            speaker_similarity=settings.speaker_similarity,
-            speaker_margin=settings.speaker_margin,
-            face_similarity=settings.face_similarity,
-            face_margin=settings.face_margin,
-            identity_link_min_assets=settings.identity_link_min_assets,
             tracer=self._tracer,
+            **policy,
         )
 
     def close(self) -> None:
