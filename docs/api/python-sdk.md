@@ -105,6 +105,15 @@ and privacy behavior.
 `add`. Its transcript, stable speaker IDs, and names already registered at add time become stored,
 retrievable text. The default keeps speech analysis lazy.
 
+**Turn it on for any corpus whose memories carry speech.** Without it a video memory's indexed
+document is whatever text the caller supplied — for clip-shaped ingestion that is often a source
+identifier and nothing else, which leaves the full-text route unable to match anything and the
+dense route holding a single cross-modal vector per clip. On a 15-unit, 187-question M3-Bench robot
+slice, enabling it moved the mean memory's indexed content from 29 characters to 536, raised
+accuracy from 0.2086 to 0.3583 (paired mean +0.1497, 95% CI [+0.0857, +0.2123], 12 regressions),
+and lowered the abstention rate from 49.2% to 27.3%. Generation token usage was unchanged, because
+the inlined media dominates the prompt either way.
+
 A `TranscriptionBackend` needs no flag. `add` transcribes every asset whose modality that backend
 declares and stores the transcript in the record, so a media memory has retrievable text next to
 its native media vector; the media is never replaced. `SpeechBackend` analysis stays behind

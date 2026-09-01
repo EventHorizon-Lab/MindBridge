@@ -138,7 +138,9 @@ Memory(
   natively.
 - `face_analyzer` is optional. Configure it when `faces()` or visual identity grounding is required.
 - `index_speech` opts a configured `SpeechBackend` into add-time transcript and speaker-identity
-  indexing; the default leaves analysis lazy.
+  indexing; the default leaves analysis lazy. Enable it whenever memories carry speech: without it
+  a clip-shaped video memory's indexed document can be a source identifier and nothing more. See
+  [the Python SDK reference](api/python-sdk.md) for the measured effect.
 - `index_quantization` defaults to quality-first `NONE`; `FP16`, rotated `INT8`, and x86_64-only
   `RABITQ` are explicit, lossy capacity choices that rebuild only the derived Zvec projection.
 - `minimum_relevance` drops weak dense evidence. `ambiguity_margin` drops unresolved top-two ties
