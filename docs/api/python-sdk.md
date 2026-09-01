@@ -292,6 +292,13 @@ egocentric capture: the wearer talks while somebody else fills the frame. Bindin
 therefore attaches the wearer's voice to whoever happened to be visible. Set
 `identity_link_min_assets=1` to bind on first co-occurrence.
 
+Counting assets raises the price of that mistake without preventing it: a wearer talks to the same
+person across many clips, so the wrong pair accumulates as fast as a genuine speaker's. Binding is
+therefore also contained. Only a voice-only and a face-only identity may fuse, so an identity that
+already holds both modalities absorbs nothing further and one wrong bind cannot cascade into the
+next person. A fragment whose modality the identity already holds stays orphaned; merge it
+deliberately through the store if the claim is established some other way.
+
 Binding is recorded, not guessed at read time, so it is durable and reversible through
 `unlink_identity`. Recognizer yield per asset is reported under the `mindbridge.identity.*` span
 attributes, including when nothing was detected.

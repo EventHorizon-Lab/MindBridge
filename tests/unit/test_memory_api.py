@@ -4627,3 +4627,124 @@ def test_ranking_does_not_hydrate_stored_embedding_vectors(tmp_path: Path) -> No
 
     assert calls == []
     assert [hit.content for hit in hits][:1] == ["a stored fact about winter"]
+
+
+def _scripted(script: dict[str, tuple[str, str]], ref: AssetRef) -> tuple[str, str]:
+    """Look up a clip's (speaker, visible face) by the blob name the test gave it."""
+    assert ref.name is not None
+    return script[ref.name]
+
+
+class _ScriptedSpeech:
+    """A speech backend whose speaker vector is chosen per asset by a clip script."""
+
+    transcription_capabilities = frozenset({Modality.AUDIO, Modality.VIDEO})
+    transcription_model = "scripted-cam"
+    transcription_space = "scripted-cam:speech:test"
+
+    def __init__(self, script: dict[str, tuple[str, str]], voices: Sequence[str]) -> None:
+        self.script = script
+        self.voices = tuple(voices)
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+        return tuple(
+            SpeechAnalysis(
+                turns=(SpeechTurn(0, 900, "talking", "0"),),
+                speakers=(
+                    SpeakerEmbedding("0", _one_hot(self.voices, _scripted(self.script, ref)[0])),
+                ),
+            )
+            for ref in assets
+        )
+
+    def close(self) -> None:
+        return None
+
+
+class _ScriptedFace:
+    """A face backend whose face vector is chosen per asset by the same clip script."""
+
+    face_capabilities = frozenset({Modality.IMAGE, Modality.VIDEO})
+    face_model = "scripted-sface"
+    face_space = "scripted-sface:test"
+    face_analysis_space = "scripted-yunet:test"
+
+    def __init__(self, script: dict[str, tuple[str, str]], faces: Sequence[str]) -> None:
+        self.script = script
+        self.faces = tuple(faces)
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[FaceAnalysis, ...]:
+        return tuple(
+            FaceAnalysis(
+                (
+                    FaceEmbedding(
+                        "face-0",
+                        _one_hot(self.faces, _scripted(self.script, ref)[1]),
+                        (0.1, 0.1, 0.4, 0.5),
+                        100,
+                    ),
+                )
+            )
+            for ref in assets
+        )
+
+    def close(self) -> None:
+        return None
+
+
+def _one_hot(members: Sequence[str], member: str) -> tuple[float, ...]:
+    return tuple(1.0 if other == member else 0.0 for other in members)
+
+
+def test_a_wearer_voice_binding_one_face_does_not_cascade_to_everybody(tmp_path: Path) -> None:
+    """One unavoidable cross-modal mistake must not consume every other person.
+
+    Egocentric footage puts an off-camera wearer's voice in the same clip as whoever is in
+    frame, and `identity_link_min_assets` cannot separate the two, because the wearer talks
+    to the same person across many clips and that wrong pair accumulates exactly as fast as
+    a genuine speaker's. What is avoidable is the cascade that follows: the moment the
+    wearer's voice owns an interlocutor's face, that identity holds both modalities, and
+    permitting fragments to rejoin it hands it the interlocutor's own voice and then the
+    next interlocutor's face, until one identity is everybody.
+
+    The script below runs the wearer talking to A and then to B, with each of them also
+    speaking on camera. The wearer will bind to A's face; B must survive it intact.
+    """
+    script = {
+        "wearer-a-0.mp4": ("wearer", "a"),
+        "a-speaks-0.mp4": ("a", "a"),
+        "wearer-a-1.mp4": ("wearer", "a"),
+        "a-speaks-1.mp4": ("a", "a"),
+        "wearer-b-0.mp4": ("wearer", "b"),
+        "b-speaks-0.mp4": ("b", "b"),
+        "wearer-b-1.mp4": ("wearer", "b"),
+        "b-speaks-1.mp4": ("b", "b"),
+    }
+    voice_ids: dict[str, str] = {}
+    face_ids: dict[str, str] = {}
+
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_ScriptedSpeech(script, ("wearer", "a", "b")),
+        face_analyzer=_ScriptedFace(script, ("a", "b")),
+    ) as memory:
+        for name, (speaker, seen) in script.items():
+            record = memory.add(Blob(name.encode() * 4, "video/mp4", name))
+            observed = memory.faces(record.id)[0].identity_id
+            heard = memory.speech(record.id)[0].speaker_id
+            assert heard is not None
+            voice_ids.setdefault(speaker, heard)
+            face_ids.setdefault(seen, observed)
+        resolve = memory._store.resolve_identity_id
+        voices = {person: resolve(value) for person, value in voice_ids.items()}
+        faces = {person: resolve(value) for person, value in face_ids.items()}
+
+    # B speaks on camera twice, so B's own voice and face still merge.
+    assert faces["b"] == voices["b"]
+    # The wearer took A's face, and that is where it stops: B is not swallowed, and A's own
+    # voice is left orphaned rather than folded into the identity that already owns A's face.
+    assert faces["a"] == voices["wearer"]
+    assert faces["b"] != faces["a"]
+    assert voices["a"] != faces["a"]
+    assert len(set(voices.values()) | set(faces.values())) == 3

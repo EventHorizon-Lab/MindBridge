@@ -2738,9 +2738,15 @@ class Memory:
         One asset's co-occurrence is not evidence that one person produced both. Egocentric
         capture is the adversarial case: the wearer speaks while a different person's face
         fills the frame, so a single clip would bind the listener's face to the wearer's voice
-        and nothing downstream could tell. Requiring the same pair across distinct assets
-        separates the two, because a wearer's voice pairs with many different faces and no
-        single pair accumulates, while a genuine speaker's pair recurs.
+        and nothing downstream could tell.
+
+        Counting assets raises the price of that mistake but does not prevent it. A wearer
+        talks to the same person across many clips, so the wrong pair accumulates as fast as a
+        genuine speaker's, and measurement on synthetic egocentric traffic confirms it: at the
+        default of two assets the wearer still binds to an interlocutor's face under every
+        ingestion order tried. What the count does buy is that a face seen once is never
+        bound, and `_link_asset_identity` keeps the damage to that one bind by refusing to let
+        an identity holding both modalities absorb anything further.
         """
         observed = self._store.record_identity_link_evidence(speaker_id, face_id, asset_id)
         corroborated = observed >= self._identity_link_min_assets
@@ -2800,9 +2806,17 @@ class Memory:
             return
         if not self._identity_link_is_corroborated(speaker_id, face_id, asset_id):
             return
-        # A fragment may legitimately rejoin an identity that already holds this modality; the
-        # store still refuses to fuse two identities that each hold both.
-        plan = self._store.identity_link_plan(speaker_id, face_id, allow_shared_modality=True)
+        # Only a voice-only and a face-only identity may fuse here. Letting a fragment rejoin
+        # an identity that already holds its modality is what turns one wrong cross-modal bind
+        # into a cascade: once a wearer's voice owns one interlocutor's face, that identity
+        # holds both modalities, and every later fragment (the interlocutor's own voice, then
+        # the next interlocutor's face) is a fragment rejoining it. Measured on synthetic
+        # egocentric traffic (one off-camera wearer, three interlocutors, random ingestion
+        # order), permitting it collapsed all four people into one identity every time;
+        # refusing it capped the damage at the single unavoidable first bind and raised
+        # correct merges from 0/3 to 2/3. `LocalStore` still offers the wider merge to a
+        # caller that has established the claim some other way.
+        plan = self._store.identity_link_plan(speaker_id, face_id)
         if plan is None:
             return
         memories, embeddings = self._relabelled_speaker_index(plan, speaker_id, operation)
@@ -2811,7 +2825,6 @@ class Memory:
                 speaker_id,
                 face_id,
                 expected=plan,
-                allow_shared_modality=True,
                 memories=memories,
                 embeddings=embeddings,
             )

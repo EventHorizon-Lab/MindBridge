@@ -208,6 +208,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   behaviour bound the wearer's voice to whoever was visible. The undocumented shortcut that let an
   asset's lone face adopt its lone voice inside the store write has been removed, leaving exactly
   one cross-modal entrance. Set `identity_link_min_assets=1` for the previous behaviour.
+  Counting assets bounds that mistake rather than removing it, because a wearer talks to the same
+  person across many clips and the wrong pair accumulates as fast as a genuine speaker's, so the
+  merge is also contained: only a voice-only and a face-only identity fuse on this path, and an
+  identity already holding both modalities absorbs nothing further. On synthetic egocentric
+  traffic with one off-camera wearer and three interlocutors, allowing the wider merge collapsed
+  all four people into a single identity under every ingestion order tried, while containing it
+  held the damage to the first bind and raised correct merges from 0 of 3 to 2 of 3.
 - The local schema is version 9. Version 8 directories upgrade in place, adding identity link
   evidence, an identity `relationship`, and the merge record that makes `unlink_identity` possible.
   Merges recorded before the upgrade have no such record and are therefore not reversible.
