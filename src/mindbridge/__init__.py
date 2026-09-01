@@ -1,6 +1,6 @@
 """Fast local multimodal memory for Python agents."""
 
-from mindbridge.configuration import MindBridgeConfig
+from mindbridge.configuration import MemoryComposition, MindBridgeConfig, resolve_memory_config
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -87,6 +87,7 @@ __all__ = [
     "IndexUnavailableError",
     "JinaOmniEmbedder",
     "Memory",
+    "MemoryComposition",
     "MemoryConfig",
     "MemoryNotFoundError",
     "MemoryPlugins",
@@ -120,4 +121,5 @@ __all__ = [
     "TracedSearchResult",
     "TranscriptionBackend",
     "ValidationError",
+    "resolve_memory_config",
 ]

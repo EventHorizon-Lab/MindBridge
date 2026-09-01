@@ -8,7 +8,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 import mindbridge.configuration as configuration
 import mindbridge.recipes as recipes_module
-from mindbridge import MemoryConfig, MemorySettings, MindBridgeConfig
+from mindbridge import MemoryConfig, MemorySettings, MindBridgeConfig, Modality
 from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import GenerationBackend
 from mindbridge.types import IndexQuantization
@@ -124,6 +124,7 @@ def test_builtin_openai_generation_config_maps_friendly_names_to_the_sdk_adapter
     spec = configuration.OpenAIGenerationConfig(
         provider="openai",
         model="gpt-5-mini",
+        modalities=frozenset({Modality.TEXT, Modality.IMAGE}),
         temperature=0.1,
         max_tokens=512,
         base_url="http://localhost:11434/v1",
@@ -137,6 +138,7 @@ def test_builtin_openai_generation_config_maps_friendly_names_to_the_sdk_adapter
         "timeout": 20.0,
         "max_retries": 1,
         "generation_model": "gpt-5-mini",
+        "generation_capabilities": frozenset({Modality.TEXT, Modality.IMAGE}),
         "generation_temperature": 0.1,
         "generation_max_tokens": 512,
     }
