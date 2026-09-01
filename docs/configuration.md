@@ -168,7 +168,7 @@ alias):
 | `index_quantization` | `none` | Zvec projection mode: `none`, `fp16`, `int8`, or `rabitq` |
 | `minimum_relevance` | `0.55` | Reject evidence below this confidence |
 | `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1` |
-| `evidence_budget_chars` | `None` | Widen `ask` grounding while the evidence fits this budget; `None` grounds on exactly `limit` |
+| `evidence_budget_chars` | `None` | Widen `ask` grounding while the evidence fits this budget; raises a floor, never a ceiling; `None` grounds on exactly `limit` |
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
 | `speaker_similarity` | `0.78` | Voice identity match threshold |
 | `speaker_margin` | `0.05` | Voice identity ambiguity margin |
@@ -181,7 +181,10 @@ weak-evidence floor; a zero ambiguity margin disables the corresponding tie reje
 speaker or face similarity is merely the most permissive threshold. `decay_half_life_days` must be
 positive when set. `evidence_budget_chars` keeps the `limit` hits unconditionally and then admits
 further ranked memories while the evidence fits, charging each media asset its modality's text
-equivalent because a media part costs a model far more than its record's text. A tracer is passed
+equivalent because a media part costs a model far more than its record's text. Because the `limit`
+hits are never dropped, this setting can only enlarge a prompt: to bound one, lower `limit` and
+leave the budget at `None`. Setting it also removes `limit`'s effect on prompt size, since the
+budget refills the window to the same width whatever `limit` was. A tracer is passed
 as the separate `tracer=` argument to
 `Memory.from_config()` or `Memory(...)`, not inside `settings`.
 
