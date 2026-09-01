@@ -58,6 +58,7 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "IndexQuantization",
         "MemoryType",
         "MemoryConfig",
+        "MemoryComposition",
         "MemorySettings",
         "MindBridgeConfig",
         "MemoryPlugins",
@@ -81,6 +82,7 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "StreamInput",
         "StreamingGenerationBackend",
         "TranscriptionBackend",
+        "resolve_memory_config",
     }
 
     assert names <= set(package.__all__)

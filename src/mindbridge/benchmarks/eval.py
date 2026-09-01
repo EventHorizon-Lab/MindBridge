@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib import metadata
@@ -32,16 +32,21 @@ if TYPE_CHECKING:
 from mindbridge import (
     DEFAULT_FUNASR_MODEL_ID,
     DEFAULT_FUNASR_RECIPE,
+    AnswerResult,
     AssetRef,
     AsyncMemory,
+    FaceAnalysis,
     FunASRTranscriber,
     IndexUnavailableError,
     JinaOmniEmbedder,
+    MemoryConfig,
     MemoryType,
+    MindBridgeConfig,
     MindBridgeError,
     Modality,
     OpenAIModels,
     SearchHit,
+    resolve_memory_config,
 )
 from mindbridge._telemetry import (
     MODEL_MODULE,
@@ -101,10 +106,12 @@ from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataD
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
+    FaceBackend,
     GenerationBackend,
     ModelInput,
     SpeechAnalysis,
     SpeechBackend,
+    TranscriptionBackend,
 )
 from mindbridge.models.jina import (
     DEFAULT_JINA_DIMENSION,
@@ -158,6 +165,7 @@ class _Arguments:
     bootstrap_samples: int
     model: str
     model_args: str
+    memory_config: Path | None
     judge_model_args: str
     judge_concurrency: int
     gen_kwargs: str
@@ -343,6 +351,40 @@ class _BorrowedBackend:
         return None
 
 
+class _BorrowedGenerationBackend(_BorrowedBackend):
+    """Lend one answerer without transferring ownership to a per-unit memory."""
+
+    @property
+    def generation_capabilities(self) -> frozenset[Modality]:
+        return cast(GenerationBackend, self._backend).generation_capabilities
+
+    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        return cast(GenerationBackend, self._backend).answer(question, hits)
+
+
+class _BorrowedFaceBackend(_BorrowedBackend):
+    """Lend one face analyzer while preserving the runtime-checkable protocol."""
+
+    @property
+    def face_capabilities(self) -> frozenset[Modality]:
+        return cast(FaceBackend, self._backend).face_capabilities
+
+    @property
+    def face_model(self) -> str:
+        return cast(FaceBackend, self._backend).face_model
+
+    @property
+    def face_space(self) -> str:
+        return cast(FaceBackend, self._backend).face_space
+
+    @property
+    def face_analysis_space(self) -> str:
+        return cast(FaceBackend, self._backend).face_analysis_space
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[FaceAnalysis, ...]:
+        return cast(FaceBackend, self._backend).analyze(assets)
+
+
 class _BorrowedSpeechBackend(_BorrowedBackend):
     """Skip visual-only videos before lending the shared speech backend."""
 
@@ -390,9 +432,49 @@ class _BackendPool:
         needs_speech: bool,
         seed: int,
         gen_kwargs: str = "",
+        memory_config: MindBridgeConfig | None = None,
         tracer: Tracer | None = None,
     ) -> None:
         self.config = config
+        self._resolved_config = None
+        self._tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
+        if memory_config is not None:
+            if memory_config.generation is not None:
+                memory_config = memory_config.model_copy(
+                    update={
+                        "generation": memory_config.generation.model_copy(
+                            update={"modalities": config.generation_capabilities}
+                        )
+                    }
+                )
+            resolved = resolve_memory_config(memory_config)
+            self._resolved_config = resolved
+            plugins = resolved.plugins
+            self._embedder = cast(EmbeddingBackend, _BorrowedBackend(plugins.embedder))
+            self._answerer = (
+                None
+                if plugins.answerer is None
+                else cast(GenerationBackend, _BorrowedGenerationBackend(plugins.answerer))
+            )
+            self._transcriber = (
+                None
+                if plugins.transcriber is None
+                else cast(
+                    SpeechBackend | TranscriptionBackend,
+                    (
+                        _BorrowedSpeechBackend(plugins.transcriber)
+                        if isinstance(plugins.transcriber, SpeechBackend)
+                        else _BorrowedBackend(plugins.transcriber)
+                    ),
+                )
+            )
+            self._face_analyzer = (
+                None
+                if plugins.face_analyzer is None
+                else cast(FaceBackend, _BorrowedFaceBackend(plugins.face_analyzer))
+            )
+            self._settings = resolved.settings
+            return
         try:
             from openai import OpenAI
         except ImportError:
@@ -442,26 +524,43 @@ class _BackendPool:
             if needs_speech
             else None
         )
-        self._answerer = cast(GenerationBackend, _BorrowedBackend(self.models))
+        self._answerer = cast(
+            GenerationBackend,
+            _BorrowedGenerationBackend(self.models),
+        )
         self._embedder = cast(EmbeddingBackend, _BorrowedBackend(self.embedder))
         self._transcriber = (
             cast(SpeechBackend, _BorrowedSpeechBackend(self.transcriber))
             if self.transcriber is not None
             else None
         )
-        self._tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
+        self._face_analyzer = None
+        self._settings = MemoryConfig(index_speech=self._transcriber is not None)
 
     def memory(self, data_dir: Path) -> AsyncMemory:
+        settings = self._settings
         return AsyncMemory(
-            data_dir=data_dir,
+            data_dir,
             embedder=self._embedder,
             answerer=self._answerer,
             transcriber=self._transcriber,
-            index_speech=self._transcriber is not None,
+            face_analyzer=self._face_analyzer,
+            index_speech=settings.index_speech,
+            index_quantization=settings.index_quantization,
+            minimum_relevance=settings.minimum_relevance,
+            ambiguity_margin=settings.ambiguity_margin,
+            decay_half_life_days=settings.decay_half_life_days,
+            speaker_similarity=settings.speaker_similarity,
+            speaker_margin=settings.speaker_margin,
+            face_similarity=settings.face_similarity,
+            face_margin=settings.face_margin,
             tracer=self._tracer,
         )
 
     def close(self) -> None:
+        if self._resolved_config is not None:
+            self._resolved_config.close()
+            return
         resources = (self.transcriber, self.embedder, self.client)
         for resource in resources:
             if resource is not None:
@@ -504,7 +603,12 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         )
         return 0
     try:
-        base_config = _model_config(arguments.model, arguments.model_args)
+        memory_config = _load_memory_config(arguments.memory_config)
+        base_config = _model_config(
+            arguments.model,
+            arguments.model_args,
+            memory_config=memory_config,
+        )
         judge_config = _judge_config(base_config, arguments)
     except ValueError as error:
         parser.error(str(error))
@@ -543,8 +647,16 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         manifest_directory = effective_manifest.parent
     loaded = _load_tasks(arguments, manifest, manifest_directory)
     config = _evaluation_config(base_config, loaded)
+    memory_config = _evaluation_memory_config(memory_config, config, arguments)
     batch_sizes = {task.spec.name: _batch_size(arguments, task) for task in loaded}
-    samples, duration, performance = _execute(loaded, arguments, config, judge_config, batch_sizes)
+    samples, duration, performance = _execute(
+        loaded,
+        arguments,
+        config,
+        judge_config,
+        batch_sizes,
+        memory_config=memory_config,
+    )
     submission_bytes, submission_status = _egomem_submission(
         samples,
         requested="egomemreason" in arguments.tasks,
@@ -560,6 +672,7 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         batch_sizes,
         submission_status,
         performance,
+        memory_config=memory_config,
     )
     comparisons = _comparisons(arguments, loaded, samples)
     if comparisons:
@@ -724,6 +837,8 @@ def _execute(
     config: ModelConfig,
     judge_config: _JudgeConfig,
     batch_sizes: Mapping[str, int],
+    *,
+    memory_config: MindBridgeConfig | None,
 ) -> tuple[tuple[SampleResult, ...], float, Mapping[str, Mapping[str, object]]]:
     needs_speech = any(
         isinstance(atom, Path)
@@ -742,17 +857,27 @@ def _execute(
             else ResponseCache(
                 arguments.use_cache,
                 arguments.run_id,
-                _cache_namespace(arguments, config, batch_sizes),
+                _cache_namespace(
+                    arguments,
+                    config,
+                    batch_sizes,
+                    memory_config=memory_config,
+                ),
             )
         )
         pool: _BackendPool | None = None
         memory_factory: MemoryFactory
         all_cached = response_cache is not None and _all_cached(response_cache, loaded)
-        with _benchmark_device_lock(
-            arguments.device,
-            enabled=arguments.device_lock and not all_cached,
-            quiet=arguments.quiet,
-        ):
+        devices = _evaluation_devices(arguments.device, memory_config)
+        with ExitStack() as device_locks:
+            for device in devices:
+                device_locks.enter_context(
+                    _benchmark_device_lock(
+                        device,
+                        enabled=arguments.device_lock and not all_cached,
+                        quiet=arguments.quiet,
+                    )
+                )
             try:
                 if all_cached:
                     memory_factory = _cache_only_memory
@@ -764,6 +889,7 @@ def _execute(
                         needs_speech=needs_speech,
                         seed=arguments.seed,
                         gen_kwargs=arguments.gen_kwargs,
+                        memory_config=memory_config,
                         tracer=telemetry.tracer,
                     )
                     memory_factory = pool.memory
@@ -784,7 +910,8 @@ def _execute(
                     memory_factory = _cache_only_memory
                     closing.close()
                     del closing
-                    _release_device_memory(arguments.device)
+                    for device in devices:
+                        _release_device_memory(device)
                 if response_cache is not None:
                     response_cache.close()
         if not arguments.predict_only:
@@ -1687,6 +1814,8 @@ def _results(
     batch_sizes: Mapping[str, int],
     submission_status: Mapping[str, object] | None,
     performance: Mapping[str, Mapping[str, object]],
+    *,
+    memory_config: MindBridgeConfig | None = None,
 ) -> dict[str, object]:
     task_rows = []
     for task in tasks:
@@ -1764,25 +1893,7 @@ def _results(
         "unit_concurrency": arguments.unit_concurrency,
         "request_concurrency": arguments.request_concurrency,
         "recall_limit": arguments.recall_limit,
-        "model": {
-            "adapter": arguments.model,
-            "embedding_model": DEFAULT_JINA_MODEL_ID,
-            "embedding_revision": DEFAULT_JINA_REVISION,
-            "embedding_dimension": DEFAULT_JINA_DIMENSION,
-            "embedding_warmup": {"count": 1, "task": EmbedTask.QUERY.value},
-            "device": arguments.device or "auto",
-            "generation_model": config.generation_model,
-            "generation_base_url": config.generation_base_url,
-            "generation_modalities": sorted(
-                modality.value for modality in config.generation_capabilities
-            ),
-            "generation_seed": arguments.seed,
-            "generation_temperature": 0.0,
-            "generation_kwargs": arguments.gen_kwargs,
-            "generation_min_video_seconds": config.generation_min_video_seconds,
-            "transcription_model": DEFAULT_FUNASR_MODEL_ID,
-            "timeout_seconds": config.timeout_seconds,
-        },
+        "model": _model_result(arguments, config, memory_config),
         "judge": {
             "model": judge_config.model,
             "base_url": judge_config.base_url,
@@ -1798,6 +1909,72 @@ def _results(
         },
         "tasks": task_rows,
     }
+
+
+def _model_result(
+    arguments: _Arguments,
+    config: ModelConfig,
+    memory_config: MindBridgeConfig | None,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "adapter": arguments.model,
+        "embedding_model": DEFAULT_JINA_MODEL_ID,
+        "embedding_revision": DEFAULT_JINA_REVISION,
+        "embedding_dimension": DEFAULT_JINA_DIMENSION,
+        "embedding_warmup": {"count": 1, "task": EmbedTask.QUERY.value},
+        "device": arguments.device or "auto",
+        "generation_model": config.generation_model,
+        "generation_base_url": config.generation_base_url,
+        "generation_modalities": sorted(
+            modality.value for modality in config.generation_capabilities
+        ),
+        "generation_seed": arguments.seed,
+        "generation_temperature": 0.0,
+        "generation_kwargs": arguments.gen_kwargs,
+        "generation_min_video_seconds": config.generation_min_video_seconds,
+        "transcription_model": DEFAULT_FUNASR_MODEL_ID,
+        "timeout_seconds": config.timeout_seconds,
+    }
+    if memory_config is None:
+        return result
+    embedding = memory_config.embedding.model_dump(mode="json")
+    speech = None if memory_config.speech is None else memory_config.speech.model_dump(mode="json")
+    provider = str(embedding["provider"])
+    result.update(
+        embedding_model=(DEFAULT_JINA_MODEL_ID if provider == "jina-omni" else embedding["model"]),
+        embedding_revision=(
+            DEFAULT_JINA_REVISION if provider == "jina-omni" else embedding.get("revision")
+        ),
+        embedding_dimension=embedding.get("dimension"),
+        device=_configured_device_label(arguments.device, memory_config),
+        transcription_model=(
+            None
+            if speech is None
+            else DEFAULT_FUNASR_MODEL_ID
+            if speech["provider"] == "funasr"
+            else speech["model"]
+        ),
+        memory_config=_memory_config_payload(memory_config),
+    )
+    return result
+
+
+def _configured_device_label(explicit: str | None, config: MindBridgeConfig) -> str:
+    if explicit is not None:
+        return explicit
+    devices = []
+    if config.embedding.provider in {"jina-omni", "sentence-transformers"}:
+        devices.append(config.embedding.device or "auto")
+    if config.speech is not None and config.speech.provider == "funasr":
+        devices.append(config.speech.device)
+    return ",".join(dict.fromkeys(devices)) or "remote"
+
+
+def _memory_config_payload(config: MindBridgeConfig) -> dict[str, object]:
+    return cast(
+        dict[str, object],
+        config.model_dump(mode="json", exclude={"data_dir"}),
+    )
 
 
 def _metrics(
@@ -2546,6 +2723,13 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--config",
+        "--memory-config",
+        dest="memory_config",
+        type=Path,
+        help="JSON MindBridgeConfig; data_dir is replaced by isolated benchmark directories",
+    )
+    parser.add_argument(
         "--judge-model-args",
         "--judge_model_args",
         default="",
@@ -2595,7 +2779,7 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--bootstrap-samples", type=_positive_int, default=DEFAULT_BOOTSTRAP_SAMPLES
     )
-    parser.add_argument("--device", help="Jina/FunASR device: cpu, cuda, or cuda:N")
+    parser.add_argument("--device", help="local embedding/FunASR device: cpu, cuda, or cuda:N")
     parser.add_argument(
         "--device-lock",
         action=argparse.BooleanOptionalAction,
@@ -2677,6 +2861,9 @@ def _arguments(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> _
         bootstrap_samples=parsed.bootstrap_samples,
         model=parsed.model,
         model_args=parsed.model_args,
+        memory_config=(
+            None if parsed.memory_config is None else parsed.memory_config.expanduser().resolve()
+        ),
         judge_model_args=parsed.judge_model_args,
         judge_concurrency=parsed.judge_concurrency,
         gen_kwargs=gen_kwargs,
@@ -2696,10 +2883,49 @@ def _arguments(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> _
     )
 
 
-def _model_config(model: str, arguments: str) -> ModelConfig:
+def _load_memory_config(path: Path | None) -> MindBridgeConfig | None:
+    if path is None:
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise ValueError(f"cannot read benchmark config {path}: {error}") from None
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"benchmark config {path} is invalid JSON at line {error.lineno}, column {error.colno}"
+        ) from None
+    config = MindBridgeConfig.model_validate(value)
+    if config.generation is None:
+        raise ValueError("benchmark --config requires config.generation")
+    conflicts = sorted(
+        {"max_tokens", "seed", "temperature"}.intersection(config.generation.extra_body or {})
+    )
+    if conflicts:
+        raise ValueError(
+            "benchmark config generation.extra_body cannot set benchmark controls: "
+            + ", ".join(conflicts)
+        )
+    return config
+
+
+def _model_config(
+    model: str,
+    arguments: str,
+    *,
+    memory_config: MindBridgeConfig | None = None,
+) -> ModelConfig:
     if model != "mindbridge":
         raise ValueError("model must be mindbridge")
     config = ModelConfig.from_environment()
+    if memory_config is not None and memory_config.generation is not None:
+        generation = memory_config.generation
+        config = replace(
+            config,
+            generation_base_url=generation.base_url or config.generation_base_url,
+            generation_model=generation.model,
+            generation_capabilities=generation.modalities,
+            timeout_seconds=generation.timeout or config.timeout_seconds,
+        )
     allowed = {
         "base_url",
         "generation_model",
@@ -2770,6 +2996,73 @@ def _evaluation_config(config: ModelConfig, tasks: Sequence[LoadedTask]) -> Mode
         config,
         generation_capabilities=frozenset((*config.generation_capabilities, *required)),
     )
+
+
+def _evaluation_memory_config(
+    config: MindBridgeConfig | None,
+    model: ModelConfig,
+    arguments: _Arguments,
+) -> MindBridgeConfig | None:
+    if config is None:
+        return None
+    generation = config.generation
+    if generation is None:
+        return config
+    options = dict(item.split("=", 1) for item in arguments.gen_kwargs.split(","))
+    extra_body = None if generation.extra_body is None else dict(generation.extra_body)
+    if "enable_thinking" in options:
+        extra_body = {} if extra_body is None else extra_body
+        current = extra_body.get("chat_template_kwargs")
+        template = dict(current) if isinstance(current, Mapping) else {}
+        template["enable_thinking"] = options["enable_thinking"] == "true"
+        extra_body["chat_template_kwargs"] = template
+    generation = generation.model_copy(
+        update={
+            "base_url": model.generation_base_url,
+            "model": model.generation_model,
+            "timeout": model.timeout_seconds,
+            "temperature": 0.0,
+            "seed": arguments.seed,
+            "modalities": model.generation_capabilities,
+            "max_tokens": (
+                generation.max_tokens if "max_tokens" not in options else int(options["max_tokens"])
+            ),
+            "extra_body": extra_body,
+        }
+    )
+    embedding = config.embedding
+    speech = config.speech
+    if arguments.device is not None:
+        if embedding.provider in {"jina-omni", "sentence-transformers"}:
+            embedding = embedding.model_copy(update={"device": arguments.device})
+        if speech is not None and speech.provider == "funasr":
+            speech = speech.model_copy(update={"device": arguments.device})
+    return config.model_copy(
+        update={
+            "embedding": embedding,
+            "generation": generation,
+            "speech": speech,
+        }
+    )
+
+
+def _evaluation_devices(
+    explicit: str | None,
+    config: MindBridgeConfig | None,
+) -> tuple[str | None, ...]:
+    if config is None:
+        return (explicit,)
+    configured = []
+    if config.embedding.provider in {"jina-omni", "sentence-transformers"}:
+        configured.append(explicit or config.embedding.device or "auto")
+    if config.speech is not None and config.speech.provider == "funasr":
+        configured.append(explicit or config.speech.device)
+    devices: dict[str, str | None] = {}
+    for device in sorted(set(configured)):
+        normalized = device.strip().lower()
+        identity = None if normalized == "cpu" else _physical_cuda_identity(normalized)
+        devices.setdefault(identity or normalized, None if normalized == "auto" else device)
+    return tuple(devices[identity] for identity in sorted(devices))
 
 
 def _replace_config(config: ModelConfig, key: str, value: str) -> ModelConfig:
@@ -2902,7 +3195,11 @@ def _task_seed(seed: int, task: str) -> int:
 
 
 def _cache_namespace(
-    arguments: _Arguments, config: ModelConfig, batch_sizes: Mapping[str, int]
+    arguments: _Arguments,
+    config: ModelConfig,
+    batch_sizes: Mapping[str, int],
+    *,
+    memory_config: MindBridgeConfig | None = None,
 ) -> str:
     payload = {
         "runner": EVAL_RUNNER_VERSION,
@@ -2920,6 +3217,8 @@ def _cache_namespace(
         "recall_limit": arguments.recall_limit,
         "batch_sizes": dict(sorted(batch_sizes.items())),
     }
+    if memory_config is not None:
+        payload["memory_config"] = _memory_config_payload(memory_config)
     return hashlib.sha256(_json_bytes(payload)).hexdigest()
 
 

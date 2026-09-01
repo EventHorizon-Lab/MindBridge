@@ -86,6 +86,10 @@ fields, owns the adapters and SDK clients it constructs, and reports invalid fie
 storage. `AsyncMemory.from_config` accepts the same input. See
 [configuration and composition](../configuration.md) for providers and fields.
 
+`resolve_memory_config(config)` is the public lower-level boundary for constructing adapters
+separately from storage. It returns an owned `MemoryComposition`; call `close()` unless its plugins
+are transferred to one `Memory`.
+
 Direct `Memory(...)` construction remains the stable plugin API. The compatibility
 `MemoryPlugins`/`Memory.from_plugins` bundle is also supported for applications that already group
 runtime objects separately from `MemoryConfig` local policy. Every entry point performs the same

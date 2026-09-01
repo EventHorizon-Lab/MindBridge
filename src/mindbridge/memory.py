@@ -40,7 +40,7 @@ from mindbridge._telemetry import (
     operation_span,
     traced_span,
 )
-from mindbridge.configuration import MindBridgeConfig, _resolve_config
+from mindbridge.configuration import MindBridgeConfig, resolve_memory_config
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -511,7 +511,7 @@ class Memory:
         tracer: Tracer | None = None,
     ) -> Memory:
         """Open memory from validated declarative configuration."""
-        resolved = _resolve_config(config)
+        resolved = resolve_memory_config(config)
         try:
             return cls.from_plugins(
                 resolved.data_dir,
@@ -3095,7 +3095,7 @@ class AsyncMemory:
         tracer: Tracer | None = None,
     ) -> AsyncMemory:
         """Open async memory from validated declarative configuration."""
-        resolved = _resolve_config(config)
+        resolved = resolve_memory_config(config)
         try:
             return cls.from_plugins(
                 resolved.data_dir,

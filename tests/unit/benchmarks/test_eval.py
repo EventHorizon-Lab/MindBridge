@@ -10,6 +10,7 @@ from argparse import ArgumentTypeError
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
+from inspect import getattr_static
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -22,8 +23,13 @@ from mindbridge import (
     AnswerResult,
     AssetRef,
     AsyncMemory,
+    FaceAnalysis,
+    FaceBackend,
     IndexUnavailableError,
+    MemoryConfig,
+    MemoryPlugins,
     MemoryType,
+    MindBridgeConfig,
     Modality,
     ModelError,
     SearchHit,
@@ -32,6 +38,7 @@ from mindbridge.benchmarks.eval import (
     MemoryFactory,
     SampleResult,
     _answer_many,
+    _BorrowedFaceBackend,
     _BorrowedSpeechBackend,
     _cache_namespace,
     _generation_kwargs,
@@ -713,6 +720,25 @@ def test_benchmark_device_lock_can_be_disabled_for_manual_scheduling(tmp_path: P
         pass
 
 
+def test_configured_devices_are_locked_in_physical_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = MindBridgeConfig.model_validate(
+        {
+            "embedding": {"provider": "jina-omni", "device": "cuda:0"},
+            "speech": {"provider": "funasr", "device": "cuda:1"},
+        }
+    )
+    identities = {"cuda:0": "gpu-z", "cuda:1": "gpu-a"}
+    monkeypatch.setattr(
+        eval_module,
+        "_physical_cuda_identity",
+        lambda device: identities[device],
+    )
+
+    assert eval_module._evaluation_devices(None, config) == ("cuda:1", "cuda:0")
+
+
 def test_model_base_url_override_replaces_environment_operation_urls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -729,6 +755,188 @@ def test_model_short_video_limit_is_explicit_and_validated() -> None:
     assert config.generation_min_video_seconds == 2.0
     with pytest.raises(ValueError, match="generation_min_video_seconds"):
         _model_config("mindbridge", "generation_min_video_seconds=0")
+
+
+def test_eval_config_reuses_the_declarative_memory_schema(tmp_path: Path) -> None:
+    path = tmp_path / "memory.json"
+    path.write_text(
+        json.dumps(
+            {
+                "data_dir": "ignored-by-benchmark",
+                "embedding": {
+                    "provider": "jina-omni",
+                    "device": "cpu",
+                    "batch_size": 4,
+                },
+                "generation": {
+                    "provider": "openai",
+                    "model": "configured-model",
+                    "base_url": "https://configured.example/v1",
+                    "timeout": 45.0,
+                    "temperature": 0.7,
+                },
+                "speech": {"provider": "funasr", "device": "cpu"},
+                "settings": {"index_speech": True, "minimum_relevance": 0.2},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = eval_module._load_memory_config(path)
+    assert loaded is not None
+    model = _model_config(
+        "mindbridge",
+        "generation_model=override-model",
+        memory_config=loaded,
+    )
+    model = replace(
+        model,
+        generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE}),
+    )
+    arguments = cast(
+        eval_module._Arguments,
+        SimpleNamespace(
+            gen_kwargs="temperature=0,do_sample=false,seed=7,max_tokens=512",
+            seed=7,
+            device="cuda:1",
+            recall_limit=20,
+            model="mindbridge",
+        ),
+    )
+    effective = eval_module._evaluation_memory_config(loaded, model, arguments)
+
+    assert effective is not None and effective.generation is not None
+    assert effective.data_dir == Path("ignored-by-benchmark")
+    assert getattr(effective.embedding, "device", None) == "cuda:1"
+    assert effective.speech is not None
+    assert getattr(effective.speech, "device", None) == "cuda:1"
+    assert effective.generation.model == "override-model"
+    assert effective.generation.base_url == "https://configured.example/v1"
+    assert effective.generation.temperature == 0.0
+    assert effective.generation.seed == 7
+    assert effective.generation.max_tokens == 512
+    assert effective.generation.modalities == frozenset({Modality.TEXT, Modality.IMAGE})
+    assert effective.settings.minimum_relevance == 0.2
+    assert "data_dir" not in eval_module._memory_config_payload(effective)
+    assert _cache_namespace(arguments, model, {"task": 4}) != _cache_namespace(
+        arguments,
+        model,
+        {"task": 4},
+        memory_config=effective,
+    )
+    recorded = eval_module._model_result(arguments, model, effective)
+    assert recorded["generation_model"] == "override-model"
+    assert recorded["memory_config"] == eval_module._memory_config_payload(effective)
+
+
+def test_configured_backend_pool_lends_plugins_and_closes_the_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    closed: list[bool] = []
+
+    class Embedder:
+        embedding_capabilities = frozenset({Modality.TEXT})
+        embedding_model = "embedder"
+        embedding_space = "embedder-space"
+        embedding_dimension = 2
+
+        def embed(self, *_args: object, **_kwargs: object) -> tuple[tuple[float, ...], ...]:
+            return ((0.0, 1.0),)
+
+        def close(self) -> None:
+            raise AssertionError("a borrowed plugin must not close its owner")
+
+    class Answerer:
+        generation_capabilities = frozenset({Modality.TEXT, Modality.IMAGE})
+
+        def answer(self, *_args: object, **_kwargs: object) -> AnswerResult:
+            raise AssertionError("not called")
+
+        def close(self) -> None:
+            raise AssertionError("a borrowed plugin must not close its owner")
+
+    plugins = MemoryPlugins(embedder=Embedder(), answerer=Answerer())
+    settings = MemoryConfig(minimum_relevance=0.2)
+    resolved = SimpleNamespace(
+        plugins=plugins,
+        settings=settings,
+        close=lambda: closed.append(True),
+    )
+    configured: list[MindBridgeConfig] = []
+
+    def resolve(config: MindBridgeConfig) -> object:
+        configured.append(config)
+        return resolved
+
+    monkeypatch.setattr(eval_module, "resolve_memory_config", resolve)
+    memory_config = MindBridgeConfig.model_validate(
+        {
+            "embedding": {"provider": "openai"},
+            "generation": {"provider": "openai"},
+        }
+    )
+
+    pool = eval_module._BackendPool(
+        ModelConfig(generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE})),
+        device=None,
+        batch_size=1,
+        needs_speech=False,
+        seed=0,
+        memory_config=memory_config,
+    )
+
+    assert pool._settings is settings
+    assert configured[0].generation is not None
+    assert configured[0].generation.modalities == frozenset({Modality.TEXT, Modality.IMAGE})
+    assert pool._answerer is not None
+    assert pool._answerer.generation_capabilities == frozenset({Modality.TEXT, Modality.IMAGE})
+    asyncio.run(pool.memory(tmp_path).close())
+    pool._embedder.close()
+    assert closed == []
+    pool.close()
+    assert closed == [True]
+
+
+def test_borrowed_face_backend_preserves_the_runtime_protocol() -> None:
+    class Analyzer:
+        face_capabilities = frozenset({Modality.IMAGE})
+        face_model = "face"
+        face_space = "face-space"
+        face_analysis_space = "analysis-space"
+
+        def analyze(self, _assets: Sequence[AssetRef]) -> tuple[FaceAnalysis, ...]:
+            return (FaceAnalysis(()),)
+
+        def close(self) -> None:
+            raise AssertionError("a borrowed plugin must not close its owner")
+
+    borrowed = _BorrowedFaceBackend(Analyzer())
+
+    assert getattr_static(borrowed, "analyze") is not None
+    assert isinstance(borrowed, FaceBackend)
+    assert borrowed.analyze(()) == (FaceAnalysis(()),)
+    borrowed.close()
+
+
+@pytest.mark.parametrize("key", ("temperature", "seed", "max_tokens"))
+def test_eval_config_rejects_benchmark_controls_in_extra_body(
+    key: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "memory.json"
+    path.write_text(
+        json.dumps(
+            {
+                "embedding": {"provider": "openai"},
+                "generation": {"provider": "openai", "extra_body": {key: 1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=rf"benchmark controls: {key}"):
+        eval_module._load_memory_config(path)
 
 
 def test_generation_kwargs_normalize_bounded_non_thinking_inference() -> None:

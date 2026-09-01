@@ -42,6 +42,7 @@ from mindbridge.models.openai_sdk import (
     DEFAULT_TRANSCRIPTION_MODEL,
     OpenAIModels,
 )
+from mindbridge.types import Modality
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -171,6 +172,7 @@ class _OwnedClientModels(OpenAIModels):
         embedding_space: str | None = None,
         embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION,
         generation_model: str = DEFAULT_GENERATION_MODEL,
+        generation_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
         transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL,
         transcription_space: str | None = None,
         generation_seed: int | None = None,
@@ -185,6 +187,7 @@ class _OwnedClientModels(OpenAIModels):
             embedding_space=embedding_space,
             embedding_dimension=embedding_dimension,
             generation_model=generation_model,
+            generation_capabilities=generation_capabilities,
             transcription_model=transcription_model,
             transcription_space=transcription_space,
             generation_seed=generation_seed,
@@ -214,6 +217,7 @@ def _owned_openai_models(
     embedding_space: str | None = None,
     embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION,
     generation_model: str = DEFAULT_GENERATION_MODEL,
+    generation_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
     transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL,
     transcription_space: str | None = None,
     generation_seed: int | None = None,
@@ -240,6 +244,7 @@ def _owned_openai_models(
             embedding_space=embedding_space,
             embedding_dimension=embedding_dimension,
             generation_model=generation_model,
+            generation_capabilities=generation_capabilities,
             transcription_model=transcription_model,
             transcription_space=transcription_space,
             generation_seed=generation_seed,

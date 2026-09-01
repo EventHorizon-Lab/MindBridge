@@ -39,6 +39,7 @@ from mindbridge.models.openai_sdk import (
 from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
 from mindbridge.plugins import MemoryConfig, MemoryPlugins, MemorySettings
+from mindbridge.types import Modality
 
 _Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 _PositiveFloat = Annotated[float, Field(strict=True, gt=0)]
@@ -90,6 +91,7 @@ class SentenceTransformersEmbeddingConfig(_ConfigModel):
 
 class OpenAIGenerationConfig(_OpenAIConfig):
     model: _Text = DEFAULT_GENERATION_MODEL
+    modalities: frozenset[Modality] = frozenset({Modality.TEXT})
     temperature: _Temperature | None = None
     seed: _Seed | None = None
     max_tokens: _PositiveInt | None = None
@@ -140,7 +142,9 @@ class MindBridgeConfig(_ConfigModel):
 
 
 @dataclass(frozen=True, slots=True)
-class _ResolvedConfig:
+class MemoryComposition:
+    """Constructed plugins and settings owned by one declarative composition."""
+
     data_dir: Path
     plugins: MemoryPlugins
     settings: MemoryConfig
@@ -161,7 +165,10 @@ class _ResolvedConfig:
                 resource.close()
 
 
-def _resolve_config(value: MindBridgeConfig | Mapping[str, object]) -> _ResolvedConfig:
+def resolve_memory_config(
+    value: MindBridgeConfig | Mapping[str, object],
+) -> MemoryComposition:
+    """Construct and return the bundled plugins described by declarative configuration."""
     config = _validated_config(value)
     with ExitStack() as cleanup:
         embedder = _build_embedding(config.embedding)
@@ -182,7 +189,7 @@ def _resolve_config(value: MindBridgeConfig | Mapping[str, object]) -> _Resolved
             face_analyzer=face,
         )
         cleanup.pop_all()
-    return _ResolvedConfig(config.data_dir, plugins, config.settings)
+    return MemoryComposition(config.data_dir, plugins, config.settings)
 
 
 def _validated_config(value: MindBridgeConfig | Mapping[str, object]) -> MindBridgeConfig:
@@ -249,7 +256,10 @@ def _build_embedding(config: EmbeddingProviderConfig) -> EmbeddingBackend:
 
 def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
     values = _openai_values(config)
-    values["generation_model"] = config.model
+    values.update(
+        generation_model=config.model,
+        generation_capabilities=config.modalities,
+    )
     optional = {
         "generation_temperature": config.temperature,
         "generation_seed": config.seed,
@@ -288,6 +298,7 @@ __all__ = [
     "EmbeddingProviderConfig",
     "FunASRSpeechConfig",
     "JinaEmbeddingConfig",
+    "MemoryComposition",
     "MindBridgeConfig",
     "OpenAIEmbeddingConfig",
     "OpenAIGenerationConfig",
@@ -295,4 +306,5 @@ __all__ = [
     "OpenCVFaceConfig",
     "SentenceTransformersEmbeddingConfig",
     "SpeechProviderConfig",
+    "resolve_memory_config",
 ]
