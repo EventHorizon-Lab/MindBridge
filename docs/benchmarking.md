@@ -66,7 +66,8 @@ endpoint, key, and timeout. The equivalent environment variables are
 `MINDBRIDGE_JUDGE_TIMEOUT_SECONDS`. Use `--judge-concurrency` to bound parallel judge requests.
 For OpenAI-compatible models that expose a thinking template, bounded deterministic generation can
 be selected with `--gen-kwargs max_tokens=512,enable_thinking=false`; both controls are recorded in
-the cache namespace and result artifact.
+the cache namespace and result artifact. `--model-args generation_min_video_seconds=2` explicitly
+records a provider's minimum video duration and enables the shared four-still preflight.
 
 CUDA runs acquire a per-device process lock before loading Jina or FunASR. This prevents separate
 benchmark commands from overcommitting one GPU while preserving request concurrency to the remote
@@ -201,6 +202,10 @@ limit, and seed. Generation requests use the run seed and temperature `0`; judge
 each benchmark's published transport and sampling settings. Model providers can still change
 weights behind an unversioned model name, so use an immutable model identifier for publishable
 runs.
+
+Before task spans begin, the runner performs one local `retrieval.query` embedding warmup and
+records it under `model.embedding_warmup`. This removes lazy weight loading from per-question ask
+latency without hiding it in ingestion or generation metrics.
 
 Every run writes atomically to its output directory:
 

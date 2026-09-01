@@ -18,6 +18,68 @@ from mindbridge.models.jina import (
 from mindbridge.models.sentence_transformers import _recipe_space
 from mindbridge.types import AssetRef, Modality
 
+_DEFAULT_PROCESSOR = object()
+
+
+def _eval_video_frames(path: object) -> tuple[str, object]:
+    return ("decoded", path)
+
+
+def load_video(
+    video: object,
+    *,
+    backend: str,
+    sample_indices_fn: object,
+) -> tuple[object, object]:
+    return video, SimpleNamespace(backend=backend, sample_indices_fn=sample_indices_fn)
+
+
+class _VideoProcessor:
+    def __init__(self) -> None:
+        self.cap_pixels_per_frame = False
+        self.do_sample_frames = False
+        self.fps = 2
+        self.max_frames = 768
+        self.num_frames = None
+
+    def sample_frames(
+        self,
+        metadata: object,
+        *,
+        num_frames: int | None = None,
+        fps: float | None = None,
+        **_kwargs: object,
+    ) -> tuple[int, ...]:
+        del fps
+        total = metadata.total_num_frames  # type: ignore[attr-defined]
+        count = total if num_frames is None else num_frames
+        if count == 1:
+            return (0,)
+        return tuple(round(index * (total - 1) / (count - 1)) for index in range(count))
+
+    def fetch_videos(
+        self,
+        video: object,
+        sample_indices_fn: object = None,
+    ) -> tuple[object, object]:
+        return load_video(video, backend="original", sample_indices_fn=sample_indices_fn)
+
+
+class _ProviderModule:
+    def __init__(self, processor: object) -> None:
+        self.processor = processor
+
+    def _encode_composite_parts(
+        self,
+        expanded: list[tuple[str, object]],
+        device: object,
+    ) -> tuple[object, ...]:
+        del device
+        values = []
+        for kind, value in expanded:
+            values.append(_eval_video_frames(value) if kind == "video" else value)
+        return tuple(values)
+
 
 class _Matrix:
     def __init__(self, values: list[list[float]]) -> None:
@@ -28,9 +90,19 @@ class _Matrix:
 
 
 class _Encoder:
-    def __init__(self, *, dimension: int = 2, processor: object | None = object()) -> None:
+    def __init__(
+        self,
+        *,
+        dimension: int = 2,
+        processor: object | None = _DEFAULT_PROCESSOR,
+    ) -> None:
         self.dimension = dimension
-        self.module = SimpleNamespace(processor=processor)
+        selected = (
+            SimpleNamespace(video_processor=_VideoProcessor())
+            if processor is _DEFAULT_PROCESSOR
+            else processor
+        )
+        self.module = _ProviderModule(selected)
         self.config = SimpleNamespace(is_matryoshka=True, matryoshka_dimensions=(2, 32))
         self.calls: list[tuple[str, list[object], int | None, int]] = []
 
@@ -133,13 +205,107 @@ def test_application_text_cannot_trigger_jina_url_or_path_autodetection(tmp_path
     assert tuple(map(str, prepared)) == texts
 
 
-def test_loaded_jina_uses_reference_video_pixel_cap() -> None:
-    video_processor = SimpleNamespace(cap_pixels_per_frame=None)
+def test_loaded_jina_keeps_video_paths_and_configures_only_its_processor() -> None:
+    video_processor = _VideoProcessor()
     encoder = _Encoder(processor=SimpleNamespace(video_processor=video_processor))
+    sibling = _Encoder()
+    first = encoder[0]
+    other = sibling[0]
 
     jina._LoadedJinaOmniEmbedder(encoder, dimension=2)
 
+    assert first._encode_composite_parts([("video", "clip.mp4")], "cpu") == ("clip.mp4",)  # type: ignore[attr-defined]
+    assert other._encode_composite_parts([("video", "clip.mp4")], "cpu") == (  # type: ignore[attr-defined]
+        ("decoded", "clip.mp4"),
+    )
     assert video_processor.cap_pixels_per_frame is True
+    assert video_processor.do_sample_frames is True
+    assert video_processor.fps is None
+    assert video_processor.max_frames == 32
+    assert video_processor.num_frames == 32
+    sibling_video = sibling.module.processor.video_processor
+    assert sibling_video.do_sample_frames is False
+    assert sibling_video.fps == 2
+    assert sibling_video.max_frames == 768
+
+
+def test_loaded_jina_uses_pyav_metadata_and_unique_bounded_frames(tmp_path: Path) -> None:
+    av = pytest.importorskip("av")
+    image_module = pytest.importorskip("PIL.Image")
+    qwen = pytest.importorskip("transformers.models.qwen3_vl.video_processing_qwen3_vl")
+    metadata_module = pytest.importorskip("transformers.video_utils")
+    path = tmp_path / "clip.mp4"
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("mpeg4", rate=20)
+        stream.width = 16
+        stream.height = 16
+        stream.pix_fmt = "yuv420p"
+        for index in range(40):
+            frame = av.VideoFrame.from_image(image_module.new("RGB", (16, 16), (index * 5, 0, 0)))
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+    video_processor = qwen.Qwen3VLVideoProcessor()
+    encoder = _Encoder(processor=SimpleNamespace(video_processor=video_processor))
+    jina._LoadedJinaOmniEmbedder(encoder, dimension=2)
+
+    batched_frames, batched_metadata = video_processor.fetch_videos(
+        [str(path)], sample_indices_fn=video_processor.sample_frames
+    )
+    frames, metadata = batched_frames[0], batched_metadata[0]
+
+    assert frames.shape[0] == 32
+    assert metadata.total_num_frames == 40
+    assert metadata.fps == pytest.approx(20.0)
+    assert metadata.duration == pytest.approx(2.0)
+    assert metadata.video_backend == "pyav"
+    assert metadata.frames_indices[0] == 0
+    assert metadata.frames_indices[-1] == 39
+    assert len(metadata.frames_indices) == len(set(metadata.frames_indices)) == 32
+
+    short = metadata_module.VideoMetadata(total_num_frames=3, fps=20.0, duration=0.15)
+    short_indices = video_processor.sample_frames(short)
+    assert tuple(short_indices) == (0, 1, 2)
+    assert len(short_indices) == len(set(short_indices))
+    long = metadata_module.VideoMetadata(total_num_frames=600, fps=20.0, duration=30.0)
+    assert tuple(video_processor.sample_frames(long)) == (
+        0,
+        19,
+        38,
+        57,
+        77,
+        96,
+        115,
+        135,
+        154,
+        173,
+        193,
+        212,
+        231,
+        251,
+        270,
+        289,
+        309,
+        328,
+        347,
+        367,
+        386,
+        405,
+        425,
+        444,
+        463,
+        483,
+        502,
+        521,
+        541,
+        560,
+        579,
+        599,
+    )
+    with pytest.raises(ModelError, match="invalid frame metadata"):
+        video_processor.sample_frames(metadata_module.VideoMetadata(total_num_frames=0))
 
 
 def test_public_adapter_has_fixed_identity_and_does_not_load_until_needed(
@@ -158,12 +324,18 @@ def test_public_adapter_has_fixed_identity_and_does_not_load_until_needed(
     assert isinstance(backend, EmbeddingBackend)
     assert backend.embedding_model == DEFAULT_JINA_MODEL_ID
     assert backend.embedding_dimension == 32
+    assert backend.embedding_space == _recipe_space(
+        "jina-v5-omni-official-sentence-transformers-v6",
+        DEFAULT_JINA_MODEL_ID,
+        DEFAULT_JINA_REVISION,
+        32,
+    )
     assert backend._legacy_embedding_spaces == {
-        _recipe_space(
+        _recipe_space(recipe, DEFAULT_JINA_MODEL_ID, DEFAULT_JINA_REVISION, 32)
+        for recipe in (
             "jina-v5-omni-official-sentence-transformers-v3",
-            DEFAULT_JINA_MODEL_ID,
-            DEFAULT_JINA_REVISION,
-            32,
+            "jina-v5-omni-official-sentence-transformers-v4",
+            "jina-v5-omni-official-sentence-transformers-v5",
         )
     }
     assert backend.embed(()) == ()
@@ -288,6 +460,15 @@ def test_jina_readiness_validation_stays_at_the_adapter_boundary(
         JinaOmniEmbedder()
     with pytest.raises(ValidationError, match="one of"):
         JinaOmniEmbedder(dimension=2)
+
+
+def test_jina_video_provider_shape_mismatch_fails_closed() -> None:
+    module = SimpleNamespace(
+        processor=SimpleNamespace(video_processor=_VideoProcessor()),
+    )
+
+    with pytest.raises(ModelError, match="video integration is incompatible"):
+        jina._configure_jina_video(module)
 
 
 def _asset(

@@ -3,6 +3,7 @@
 import base64
 import json
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,6 +21,7 @@ from mindbridge._telemetry import (
     GEN_AI_TTFC,
     GROUNDING_HITS_DROPPED,
     GROUNDING_MEDIA_ELIDED,
+    MODEL_REQUEST_COUNT,
     MODEL_TTFT,
     TOKEN_COMPLETE,
     TOKEN_REPORTED_REQUEST_COUNT,
@@ -195,6 +197,9 @@ def test_answer_maps_native_hit_media_and_abstains_without_hits(tmp_path: Path) 
         payload = json.loads(request.content)
         content = payload["messages"][1]["content"]
         assert [part["type"] for part in content] == ["text", "text", "image_url"]
+        memory = json.loads(content[1]["text"])["memory"]
+        assert memory["created_at"] == NOW.isoformat()
+        assert not {"score", "occurred_at", "occurred_end"} & memory.keys()
         return httpx.Response(
             200,
             json={
@@ -263,11 +268,9 @@ def test_answer_serializes_temporal_and_metadata_evidence() -> None:
         assert hit == {
             "memory_id": "memory_1",
             "content": "The red parcel arrived.",
-            "score": 0.9,
             "memory_type": "semantic",
             "occurred_at": occurred_at.isoformat(),
             "occurred_end": occurred_end.isoformat(),
-            "created_at": NOW.isoformat(),
             "metadata": {"dialog": "delivery", "turn": 7},
         }
         return httpx.Response(
@@ -602,6 +605,198 @@ def test_answer_uses_standard_inline_audio_part(tmp_path: Path) -> None:
         answer = _model(_sdk_client(client)).answer(ModelInput(text="What?"), (hit,))
 
     assert answer.answer == "A greeting is audible."
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "converted", "tight_budget"),
+    [(6, True, False), (8, False, False), (6, False, True)],
+)
+def test_answer_converts_only_videos_below_the_configured_provider_minimum(
+    frame_count: int,
+    converted: bool,
+    tight_budget: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image_module = pytest.importorskip("PIL.Image")
+    video = _video_asset(tmp_path, "clip", frame_count)
+    hit = SearchHit(
+        id="memory_1",
+        content="The colored frames are ordered.",
+        score=0.9,
+        created_at=NOW,
+        assets=(video,),
+        modality=Modality.VIDEO,
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        media = content[2:]
+        if converted:
+            assert [part["type"] for part in media] == ["image_url"] * 4
+            reds = []
+            for part in media:
+                encoded = part["image_url"]["url"].partition(",")[2]
+                with image_module.open(BytesIO(base64.b64decode(encoded))) as image:
+                    reds.append(image.convert("RGB").getpixel((0, 0))[0])
+            assert reds == sorted(reds)
+            assert len(set(reds)) == 4
+        else:
+            assert [part["type"] for part in media] == ["video_url"]
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "Ordered."},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    original = video.path.read_bytes() if video.path is not None else b""
+    if tight_budget:
+        monkeypatch.setattr(
+            openai_backend, "_MAX_INLINE_MODEL_BYTES", openai_backend._encoded_size(len(original))
+        )
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client), generation_min_video_seconds=2.0)
+        prepared = model._answer_request("What happened?", (hit,))
+        assert prepared is not None
+        assert prepared[2] == frozenset(
+            {Modality.TEXT, Modality.IMAGE if converted else Modality.VIDEO}
+        )
+        result = model.answer("What happened?", (hit,))
+
+    assert result.hits == (hit,)
+    assert video.path is not None and video.path.read_bytes() == original
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("image_capable", [False, True])
+def test_answer_retries_provider_rejected_short_hit_video_as_text(
+    streaming: bool,
+    image_capable: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video = _asset(tmp_path, "short", Modality.VIDEO, "video/mp4", b"video")
+    hit = SearchHit(
+        id="memory_1",
+        content="The blue toolbox is beside the door.",
+        score=0.9,
+        created_at=NOW,
+        assets=(video,),
+        modality=Modality.VIDEO,
+    )
+    requests: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = cast(dict[str, object], json.loads(request.content))
+        requests.append(payload)
+        content = cast(list[dict[str, object]], payload["messages"])[1]["content"]
+        if len(requests) == 1:
+            assert isinstance(content, list)
+            assert any(part["type"] == "video_url" for part in content)
+            return httpx.Response(
+                400,
+                json={"error": {"message": "The video file is too short."}},
+            )
+        assert isinstance(content, str)
+        assert "The blue toolbox is beside the door." in content
+        if payload.get("stream"):
+            chunk = {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "answer-model",
+                "choices": [
+                    {"index": 0, "delta": {"content": "Beside the door."}, "finish_reason": "stop"}
+                ],
+            }
+            return httpx.Response(
+                200,
+                content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "Beside the door."},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        provider.get_tracer("test").start_as_current_span("model"),
+    ):
+        if not image_capable:
+            monkeypatch.setattr(
+                openai_backend,
+                "_short_video_frame_urls",
+                lambda *_args: pytest.fail("preflight ran without image capability"),
+            )
+        model = _model(
+            _sdk_client(client),
+            generation_capabilities=(
+                ALL_MODALITIES if image_capable else frozenset({Modality.TEXT, Modality.VIDEO})
+            ),
+            generation_min_video_seconds=2.0,
+        )
+        if streaming:
+            answer = "".join(model.stream_answer("Where is the toolbox?", (hit,)))
+        else:
+            result = model.answer("Where is the toolbox?", (hit,))
+            answer = result.answer
+            assert result.hits[0].assets == ()
+            assert result.hits[0].modality is Modality.TEXT
+    provider.shutdown()
+
+    assert answer == "Beside the door."
+    assert len(requests) == 2
+    attributes = exporter.get_finished_spans()[0].attributes
+    assert attributes is not None
+    assert attributes[MODEL_REQUEST_COUNT] == 2
+    assert attributes[GROUNDING_MEDIA_ELIDED] == 1
+    assert attributes[TOKEN_COMPLETE] is False
+
+
+def test_answer_does_not_elide_video_for_an_unrelated_bad_request(tmp_path: Path) -> None:
+    video = _asset(tmp_path, "video", Modality.VIDEO, "video/mp4", b"video")
+    hit = SearchHit(
+        id="memory_1",
+        content="evidence",
+        score=0.9,
+        created_at=NOW,
+        assets=(video,),
+        modality=Modality.VIDEO,
+    )
+    requests = 0
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(400, json={"error": {"message": "bad input"}})
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        pytest.raises(ModelError) as failure,
+    ):
+        _model(_sdk_client(client)).answer("What happened?", (hit,))
+
+    assert requests == 1
+    assert failure.value.reason == "request_rejected"
 
 
 def test_answer_sends_shared_media_once_and_bounds_inline_bytes(
@@ -1294,6 +1489,8 @@ def test_adapter_controls_reject_invalid_values() -> None:
         OpenAIModels(generation_max_tokens=0)
     with pytest.raises(ValidationError, match="generation_extra_body"):
         OpenAIModels(generation_extra_body={"": False})
+    with pytest.raises(ValidationError, match="generation_min_video_seconds"):
+        OpenAIModels(generation_min_video_seconds=float("nan"))
     with pytest.raises(ValidationError, match="generation_video_limit"):
         OpenAIModels(generation_video_limit=0)
     with pytest.raises(ValidationError, match="transcription_prompt"):
@@ -1317,8 +1514,10 @@ def _model(
     generation_seed: int | None = None,
     generation_temperature: float | None = None,
     generation_max_tokens: int | None = None,
+    generation_min_video_seconds: float | None = None,
     generation_video_limit: int | None = 8,
     generation_extra_body: dict[str, object] | None = None,
+    generation_capabilities: frozenset[Modality] = ALL_MODALITIES,
 ) -> OpenAIModels:
     return OpenAIModels(
         client,
@@ -1328,11 +1527,12 @@ def _model(
         transcription_model="speech-model",
         embedding_dimension=2,
         embedding_capabilities=ALL_MODALITIES,
-        generation_capabilities=ALL_MODALITIES,
+        generation_capabilities=generation_capabilities,
         transcription_capabilities=frozenset({Modality.AUDIO, Modality.VIDEO}),
         generation_seed=generation_seed,
         generation_temperature=generation_temperature,
         generation_max_tokens=generation_max_tokens,
+        generation_min_video_seconds=generation_min_video_seconds,
         generation_video_limit=generation_video_limit,
         generation_extra_body=generation_extra_body,
     )
@@ -1363,5 +1563,31 @@ def _asset(
         size_bytes=len(data),
         sha256="a" * 64,
         name=f"{asset_id}.wav" if modality is Modality.AUDIO else f"{asset_id}.bin",
+        path=path,
+    )
+
+
+def _video_asset(directory: Path, asset_id: str, frame_count: int) -> AssetRef:
+    av = pytest.importorskip("av")
+    image_module = pytest.importorskip("PIL.Image")
+    path = directory / f"{asset_id}.mp4"
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("mpeg4", rate=4)
+        stream.width = 16
+        stream.height = 16
+        stream.pix_fmt = "yuv420p"
+        for index in range(frame_count):
+            frame = av.VideoFrame.from_image(image_module.new("RGB", (16, 16), (index * 30, 0, 0)))
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return AssetRef(
+        id=asset_id,
+        modality=Modality.VIDEO,
+        media_type="video/mp4",
+        size_bytes=path.stat().st_size,
+        sha256="a" * 64,
+        name=path.name,
         path=path,
     )

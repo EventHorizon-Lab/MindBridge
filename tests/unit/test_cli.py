@@ -463,14 +463,18 @@ def test_an_application_target_that_is_not_a_memory_exits_ten(
     assert cast(dict[str, object], stderr[0])["reason"] == "app_invalid"
 
 
-def test_recipe_options_are_refused_where_something_else_composes(
-    app: str, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(("option", "value"), (("--answerer", "openai"), ("--timeout", "1")))
+def test_composition_specific_options_are_refused_by_other_compositions(
+    option: str,
+    value: str,
+    app: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    status, _stdout, stderr = _run(capsys, "--app", app, "-q", "--answerer", "openai", "list")
+    status, _stdout, stderr = _run(capsys, "--app", app, "-q", option, value, "list")
     assert status == 10
     envelope = cast(dict[str, object], stderr[0])
     assert envelope["reason"] == "option_not_applicable"
-    assert "--answerer" in cast(str, envelope["message"])
+    assert envelope["subject"] == option
 
 
 def test_explain_reports_the_composition_and_executes_nothing(
@@ -615,6 +619,7 @@ def test_doctor_sees_a_directory_another_process_owns(
 
     assert _data_dir_state(store) == "free"
     assert cast(dict[str, object], report)["url"] == "http://127.0.0.1:0"
+    assert cast(dict[str, object], report)["timeout_seconds"] == 30.0
 
 
 # ---------------------------------------------------------------------------------------------
@@ -652,7 +657,8 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[tuple[str, str, obje
 
     seen: list[tuple[str, str, object]] = []
 
-    def fake(request: Request) -> _Response:
+    def fake(request: Request, *, timeout: float) -> _Response:
+        assert timeout == 30.0
         data = request.data
         body = None if data is None else json.loads(cast(bytes, data))
         seen.append((request.get_method(), request.full_url, body))
@@ -824,7 +830,7 @@ def test_a_remote_failure_envelope_is_forwarded_and_mapped(
         def read(self, _size: int = -1) -> bytes:
             return json.dumps(envelope).encode("utf-8")
 
-    def fake(request: object) -> _Response:
+    def fake(request: object, *, timeout: float) -> _Response:
         raise _Failure
 
     monkeypatch.setattr(cli, "urlopen", fake)
@@ -839,7 +845,7 @@ def test_an_unreachable_owner_is_a_retryable_storage_error(
 ) -> None:
     from mindbridge import cli
 
-    def fake(request: object) -> _Response:
+    def fake(request: object, *, timeout: float) -> _Response:
         raise URLError("connection refused")
 
     monkeypatch.setattr(cli, "urlopen", fake)
@@ -848,3 +854,41 @@ def test_an_unreachable_owner_is_a_retryable_storage_error(
     envelope = cast(dict[str, object], stderr[0])
     assert envelope["reason"] == "connection_failed"
     assert envelope["retryable"] is True
+
+
+@pytest.mark.parametrize(
+    "failure", (TimeoutError("socket detail"), URLError(TimeoutError("socket detail")))
+)
+def test_a_remote_timeout_is_a_retryable_storage_error(
+    failure: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from mindbridge import cli
+
+    def fake(request: object, *, timeout: float) -> _Response:
+        assert timeout == 0.25
+        raise failure
+
+    monkeypatch.setattr(cli, "urlopen", fake)
+    status, stdout, stderr = _run(
+        capsys, "--url", "http://owner:8000", "--timeout", "0.25", "-q", "list"
+    )
+    assert status == EXIT_CODES["storage_error"] == 7
+    assert stdout is None
+    envelope = cast(dict[str, object], stderr[0])
+    assert envelope["reason"] == "timeout"
+    assert envelope["retryable"] is True
+    assert envelope["stage"] == "request"
+    assert envelope["subject"] is None
+    assert "socket detail" not in cast(str, envelope["message"])
+
+
+@pytest.mark.parametrize("value", ("0", "-1", "nan", "inf", "-inf"))
+def test_remote_timeout_must_be_positive_and_finite(
+    value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        main(("--url", "http://owner:8000", "--timeout", value, "list"))
+    assert raised.value.code == 2
+    assert "--timeout" in capsys.readouterr().err

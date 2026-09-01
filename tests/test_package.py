@@ -288,7 +288,7 @@ def test_dependency_surface_is_exact() -> None:
     assert extras == {
         "benchmarks": {"httpx", "huggingface-hub", "nltk", "opentelemetry-sdk", "pyarrow"},
         "observability": {"opentelemetry-sdk"},
-        "openai": {"openai"},
+        "openai": {"av", "openai", "pillow"},
         "face": {"opencv-python-headless"},
         "local": {
             "cairosvg",

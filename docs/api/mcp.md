@@ -1,6 +1,6 @@
 # MCP API
 
-The optional MCP adapter currently exposes five typed tools over one local `Memory` through stdio.
+The optional MCP adapter currently exposes six typed tools over one local `Memory` through stdio.
 It is a schema and dispatch surface over the SDK execution plane, not a separate memory service.
 
 ## Install and run
@@ -100,11 +100,13 @@ query and bounded focused keys from its first text atom and media supply dense c
 focused text also supplies lexical candidates. All routes collapse aggregate or atomic document
 keys to parent memories. Relative temporal expressions resolve against
 `reference_at`; when omitted, a valid English declaration such as `Today is May 2, 2024` replaces
-current UTC, while an explicit value always wins. Search is conservatively marked non-read-only
-because it may drain durable index work or populate transcript caches; it never reinforces a hit
-merely for being returned. `occurred_from` and `occurred_until` hard-filter overlapping event
-intervals using a half-open range. Either bound may be omitted; any bound excludes memories without
-an event time, and two bounds require `occurred_until > occurred_from`.
+current UTC, while an explicit value always wins. Absolute months and years such as
+`December 2023`, `2024年4月`, or `in 2025` select the matching event-time range. Search is
+conservatively marked non-read-only because it may drain durable index work or populate transcript
+caches; it never reinforces a hit merely for being returned. `occurred_from` and `occurred_until`
+hard-filter overlapping event intervals using a half-open range. Either bound may be omitted; any
+bound excludes memories without an event time, and two bounds require
+`occurred_until > occurred_from`.
 
 ### `ask_memory`
 
@@ -123,7 +125,8 @@ marked non-read-only because retrieval may maintain local caches/index state. Th
 answer request serializes each distinct question/evidence asset once even if several hits refer to
 it. It reserves the raw-media budget for question assets, keeps ranked evidence media that fits, and
 retains overflow hits as text when possible. It also sends each hit's content, `memory_type`,
-`occurred_at`, `occurred_end`, `created_at`, and metadata to the configured generation endpoint.
+metadata, and one primary timestamp to the configured generation endpoint: `occurred_at` when the
+event time is known, otherwise `created_at`. An `occurred_end` is included when present.
 
 ### `get_memory`
 
@@ -134,6 +137,19 @@ Reads one record by stable ID.
 | `memory_id` | non-blank, trimmed string | yes |
 
 The structured result is one memory record. The tool is read-only.
+
+### `list_memories`
+
+Lists newest memories with the SDK's opaque stable keyset cursor.
+
+| Argument | Type | Required | Default |
+| --- | --- | --- | --- |
+| `limit` | integer from 1 through 100 | no | 100 |
+| `cursor` | non-empty opaque string or null | no | null |
+
+The result is `{"items":[...],"next_cursor":"..."}`. Each item has the same fields as
+`get_memory`. Omit `cursor` for the first page, then pass `next_cursor` back unchanged until it is
+`null`. The tool is read-only.
 
 ### `delete_memory`
 
@@ -148,7 +164,7 @@ idempotent.
 
 ## Validation and errors
 
-Only the five documented tool names and their exact top-level arguments are accepted. Unknown,
+Only the six documented tool names and their exact top-level arguments are accepted. Unknown,
 tenant, user, and run fields are rejected rather than silently ignored.
 
 Tool failures expose the same JSON envelope the REST adapter returns, in the MCP error result:
@@ -228,7 +244,7 @@ maintain a second sync/async dispatch layer.
 
 ### Operations without a tool
 
-The five current tools do not yet cover the complete SDK capability inventory:
+The six current tools do not yet cover the complete SDK capability inventory:
 
 | Operation | MCP | REST | Note |
 | --- | --- | --- | --- |
@@ -243,11 +259,6 @@ The five current tools do not yet cover the complete SDK capability inventory:
 | `reinforce` | absent | absent | Not implemented on any transport yet |
 | `reindex` | absent | absent | Owner-process maintenance |
 | `optimize` | absent | absent | Owner-process maintenance |
-
-The missing `list` tool is the one an agent feels first: an MCP client can search and answer, but it
-cannot enumerate the store or resume from a cursor, which `docs/design-principles.md` requires of an
-agent-native surface. Until a `list_memories` tool ships, enumerate through the REST adapter or the
-Python API in the owner process.
 
 These are implementation gaps, not a separate MCP execution model. Additive tools must map to the
 existing SDK operations and carry appropriate read, idempotency, and destructive annotations.

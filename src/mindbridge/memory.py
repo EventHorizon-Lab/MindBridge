@@ -110,7 +110,7 @@ from mindbridge.types import (
 
 _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
 _INDEX_RECIPE_PREFIX = (
-    "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:context-keys-v8"
+    "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:context-keys-v9"
 )
 _LEGACY_INDEX_RECIPES = frozenset(
     {
@@ -118,18 +118,19 @@ _LEGACY_INDEX_RECIPES = frozenset(
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:single-vector-v3",
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:multi-vector-v4",
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:multi-vector-v5",
-    }
-)
-_LEGACY_INDEX_ONLY_RECIPES = frozenset(
-    {
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:context-keys-v6",
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:grouped-range:context-keys-v7",
+        *(
+            "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
+            f"context-keys-v8:quantization-{mode.value}"
+            for mode in IndexQuantization
+        ),
     }
 )
 _OUTBOX_BATCH_SIZE = 256
 _REINDEX_PAGE_SIZE = 256
 _REEMBED_PAGE_SIZE = 32
-_RERANK_CANDIDATES = 50
+_RERANK_CANDIDATES = 100
 _RANK_FLOOR = 0.3
 _RANK_CEILING = 1.5
 _DEFAULT_CONFIG = MemoryConfig()
@@ -193,13 +194,22 @@ _MAX_RETRIEVAL_KEYS = 128
 _MAX_QUERY_RETRIEVAL_KEYS = 7
 _MAX_INDEX_SEARCH_WORKERS = 4
 _TODAY_ISO_DATE = re.compile(r"\btoday\s+is\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
+_MONTH_NAME = (
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+)
 _TODAY_NAMED_DATE = re.compile(
-    r"\btoday\s+is\s+"
-    r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
-    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    rf"\btoday\s+is\s+({_MONTH_NAME})"
     r"\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{4}))?",
     re.IGNORECASE,
 )
+_NAMED_MONTH_YEAR = re.compile(rf"\b({_MONTH_NAME})\s+((?:19|20|21)\d{{2}})\b", re.IGNORECASE)
+_CJK_YEAR_MONTH = re.compile(
+    r"(?<![A-Za-z0-9_$-])((?:19|20|21)\d{2})年\s*(1[0-2]|0?[1-9])月"
+    r"(?![A-Za-z0-9_$-])"
+)
+_CJK_CALENDAR_YEAR = re.compile(r"(?<![A-Za-z0-9_$-])((?:19|20|21)\d{2})年(?![A-Za-z0-9_$-])")
+_CALENDAR_YEAR = re.compile(r"(?<![\w$-])((?:19|20|21)\d{2})(?![\w-])")
 _MONTHS = {
     name: index
     for index, name in enumerate(
@@ -1397,6 +1407,7 @@ class Memory:
         *,
         maximum_keys: int = _MAX_RETRIEVAL_KEYS,
     ) -> tuple[ModelInput, ...]:
+        prepared = _retrieval_content(prepared)
         aggregate = self._route_embedding(prepared)
         text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
         if prepared.text and prepared.text != "\n\n".join(text_parts):
@@ -1557,6 +1568,8 @@ class Memory:
                         occurred_until=occurred_until,
                     )
                 else:
+                    # Zvec range-filtered FTS is unstable after dense queries; the global
+                    # fallback below still contributes the same lexical route.
                     preferred_range = _intersect_occurrence_range(
                         temporal_range,
                         occurred_from,
@@ -1567,7 +1580,7 @@ class Memory:
                         if preferred_range is None
                         else self._index_candidates(
                             vectors,
-                            lexical_query=lexical_query,
+                            lexical_query="",
                             limit=candidate_limit,
                             memory_type=memory_type,
                             occurred_from=preferred_range[0],
@@ -1602,6 +1615,19 @@ class Memory:
                 _translate_storage_errors("hydrate search candidates"),
             ):
                 hydrated_documents = self._store.read_index_documents(index_ids)
+            with _translate_index_errors("search memories"):
+                candidates, hydrated_documents = self._deepen_temporal_lexical_candidates(
+                    candidates,
+                    hydrated_documents,
+                    lexical_query=lexical_query,
+                    temporal_range=temporal_range,
+                    memory_type=memory_type,
+                    route_limit=candidate_limit,
+                    result_limit=limit,
+                )
+            index_ids = tuple(
+                dict.fromkeys(hit.id for hit in (*candidates.dense, *candidates.lexical))
+            )
             documents = hydrated_documents
             if occurred_from is not None or occurred_until is not None:
                 documents = tuple(
@@ -1781,6 +1807,84 @@ class Memory:
             exhaustive=candidates.exhausted,
             ambiguous=ambiguous,
         )
+
+    def _deepen_temporal_lexical_candidates(
+        self,
+        candidates: _IndexCandidates,
+        documents: tuple[IndexDocument, ...],
+        *,
+        lexical_query: str,
+        temporal_range: tuple[datetime, datetime] | None,
+        memory_type: MemoryType | None,
+        route_limit: int,
+        result_limit: int,
+    ) -> tuple[_IndexCandidates, tuple[IndexDocument, ...]]:
+        if temporal_range is None or not lexical_query or len(candidates.lexical) < route_limit:
+            return candidates, documents
+        lexical_by_id = {hit.id: hit for hit in candidates.lexical}
+        qualified_parents = {
+            document.embedding.memory_id
+            for document in documents
+            if (hit := lexical_by_id.get(document.embedding.embedding_id)) is not None
+            and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
+            and _overlaps_temporal_range(
+                document.occurred_at,
+                document.occurred_end,
+                temporal_range,
+            )
+        }
+        if len(qualified_parents) >= result_limit:
+            return candidates, documents
+        with (
+            self._trace("mindbridge.storage.temporal_candidates", kind="stage"),
+            _translate_storage_errors("read temporal search candidates"),
+        ):
+            in_range, total = self._store.embedding_ids_in_range(
+                *temporal_range,
+                space_id=self._space_id,
+                task=_DOCUMENT_TASK,
+                memory_type=None if memory_type is None else memory_type.value,
+            )
+        if not in_range:
+            return candidates, documents
+        required = min(result_limit, len(in_range))
+        search_limit = route_limit
+        lexical = candidates.lexical
+        qualified = tuple(
+            hit
+            for hit in lexical
+            if hit.id in in_range
+            and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
+        )
+        while len(qualified) < required and len(lexical) >= search_limit and search_limit < total:
+            search_limit = min(search_limit * 2, total)
+            lexical = self._index_candidates(
+                (),
+                lexical_query=lexical_query,
+                limit=search_limit,
+                memory_type=memory_type,
+            ).lexical
+            qualified = tuple(
+                hit
+                for hit in lexical
+                if hit.id in in_range
+                and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
+            )
+        updated = _IndexCandidates(
+            dense=candidates.dense,
+            lexical=_merge_index_hits(candidates.lexical, qualified[:route_limit]),
+            exhausted=candidates.exhausted,
+        )
+        added_ids = tuple(hit.id for hit in updated.lexical if hit.id not in lexical_by_id)
+        if not added_ids:
+            return updated, documents
+        with (
+            self._trace("mindbridge.storage.hydrate", kind="stage"),
+            _translate_storage_errors("hydrate temporal lexical candidates"),
+        ):
+            added = self._store.read_index_documents(added_ids)
+        by_id = {document.embedding.embedding_id: document for document in (*documents, *added)}
+        return updated, tuple(by_id.values())
 
     def _index_candidates(
         self,
@@ -2195,7 +2299,11 @@ class Memory:
     ) -> _PreparedContent:
         speech_assets = self._answer_speech_assets(prepared.assets)
         self._recognize_speech(speech_assets, operation, reversible=True)
-        text = _speech_identity_text(prepared.text, speech_assets, operation.speech_segments)
+        base = _without_speech_identities(
+            prepared.text,
+            tuple(asset.asset_id for asset in speech_assets),
+        )
+        text = _speech_identity_text(base, speech_assets, operation.speech_segments)
         if len(text) > _MAX_TEXT_CHARACTERS:
             raise ModelError("speaker identity evidence exceeded the supported text length")
         return replace(prepared, text=text)
@@ -2658,9 +2766,27 @@ class Memory:
                 hydrated = self._store.read_index_documents(
                     tuple(operation.embedding_id for operation in current)
                 )
+                identity_memory_ids = tuple(
+                    dict.fromkeys(
+                        document.embedding.memory_id
+                        for document in hydrated
+                        if "[speech identities:" in document.content
+                    )
+                )
+                memories = self._store.read_memories(identity_memory_ids)
             by_id = {document.embedding.embedding_id: document for document in hydrated}
+            asset_ids = {
+                memory.memory_id: frozenset(asset.asset_id for asset in memory.assets)
+                for memory in memories
+            }
             documents = [
-                by_id[operation.embedding_id]
+                _retrieval_document(
+                    by_id[operation.embedding_id],
+                    asset_ids.get(
+                        by_id[operation.embedding_id].embedding.memory_id,
+                        frozenset(),
+                    ),
+                )
                 for operation in current
                 if operation.embedding_id in by_id
             ]
@@ -2688,9 +2814,19 @@ class Memory:
                 memories = self._store.list_memories(limit=_REINDEX_PAGE_SIZE, after=after)
             if not memories:
                 return
+            asset_ids = {
+                memory.memory_id: frozenset(asset.asset_id for asset in memory.assets)
+                for memory in memories
+            }
             with _translate_storage_errors("hydrate memories for reindexing"):
-                yield from self._store.read_memory_index_documents(
-                    tuple(memory.memory_id for memory in memories)
+                yield from (
+                    _retrieval_document(
+                        document,
+                        asset_ids[document.embedding.memory_id],
+                    )
+                    for document in self._store.read_memory_index_documents(
+                        tuple(memory.memory_id for memory in memories)
+                    )
                 )
             last = memories[-1]
             after = (last.created_at, last.memory_id)
@@ -3436,7 +3572,8 @@ def _derived_text(text: str, assets: Sequence[StoredAsset]) -> str:
         # `asset.modality` would only move the free match to the commoner word. The modality is
         # already published on the record's assets, so nothing is lost by leaving it out.
         marker = f"[transcript:{asset.asset_id}]"
-        if marker not in text:
+        identity_marker = f"[speech identities:{asset.asset_id}]\n"
+        if marker not in text and identity_marker not in text:
             sections.append(f"{marker}\n{transcript}")
     return "\n\n".join(sections)
 
@@ -3518,6 +3655,73 @@ def _face_identity_text(
 def _without_speech_identities(text: str, asset_ids: Sequence[str]) -> str:
     markers = tuple(f"[speech identities:{asset_id}]\n" for asset_id in asset_ids)
     return "\n\n".join(section for section in text.split("\n\n") if not section.startswith(markers))
+
+
+def _retrieval_content(prepared: _PreparedContent) -> _PreparedContent:
+    if "[speech identities:" not in prepared.text:
+        return prepared
+    asset_ids = frozenset(asset.asset_id for asset in prepared.assets)
+    return replace(
+        prepared,
+        text=_retrieval_text(prepared.text, asset_ids),
+        canonical_parts=tuple(
+            (kind, _retrieval_text(value, asset_ids))
+            if kind == "text" and "[speech identities:" in value
+            else (kind, value)
+            for kind, value in prepared.canonical_parts
+        ),
+    )
+
+
+def _retrieval_document(
+    document: IndexDocument,
+    asset_ids: frozenset[str],
+) -> IndexDocument:
+    if "[speech identities:" not in document.content:
+        return document
+    return replace(document, content=_retrieval_text(document.content, asset_ids))
+
+
+def _retrieval_text(text: str, asset_ids: frozenset[str]) -> str:
+    sections = []
+    for section in text.split("\n\n"):
+        marker, separator, payload = section.partition("\n")
+        if separator and marker.startswith("[speech identities:") and marker.endswith("]"):
+            asset_id = marker.removeprefix("[speech identities:").removesuffix("]")
+            if asset_id in asset_ids:
+                projected = _speech_retrieval_text(payload, asset_id)
+                if projected is not None:
+                    sections.append(f"{marker}\n{projected}")
+                    continue
+        sections.append(section)
+    return "\n\n".join(sections)
+
+
+def _speech_retrieval_text(payload: str, asset_id: str) -> str | None:
+    try:
+        evidence = json.loads(payload)
+        if not isinstance(evidence, dict) or evidence.get("asset_id") != asset_id:
+            return None
+        segments = evidence["segments"]
+        if not isinstance(segments, list):
+            return None
+        aliases: dict[str, str] = {}
+        normalized = []
+        changed = False
+        for segment in segments:
+            if not isinstance(segment, dict) or "speaker_id" not in segment:
+                return None
+            speaker_id = segment.get("speaker_id")
+            if isinstance(speaker_id, str) and speaker_id.startswith("identity_"):
+                speaker_id = aliases.setdefault(speaker_id, f"speaker_{len(aliases) + 1}")
+                changed = True
+            normalized.append({**segment, "speaker_id": speaker_id})
+        if not changed:
+            return payload
+        evidence = {**evidence, "segments": normalized}
+        return json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _open_store(data_dir: Path) -> LocalStore:
@@ -3779,9 +3983,7 @@ def _known_metadata_upgrade(
     if key == _STORE_METADATA_KEYS["space"] and stored in legacy_embedding_spaces:
         return True
     if key == _STORE_METADATA_KEYS["index"] and stored in (
-        _LEGACY_INDEX_RECIPES
-        | _LEGACY_INDEX_ONLY_RECIPES
-        | {_index_recipe(mode) for mode in IndexQuantization}
+        _LEGACY_INDEX_RECIPES | {_index_recipe(mode) for mode in IndexQuantization}
     ):
         return stored in _LEGACY_INDEX_RECIPES
     return None
@@ -4251,12 +4453,24 @@ def _temporal_factor(
         return _RANK_FLOOR
     start, until = temporal_range
     event_until = occurred_end or occurred_at + timedelta(microseconds=1)
-    if occurred_at < until and event_until > start:
+    if _overlaps_temporal_range(occurred_at, occurred_end, temporal_range):
         return _RANK_CEILING
     distance = start - event_until if event_until <= start else occurred_at - until
     window = max((until - start).total_seconds(), timedelta(days=1).total_seconds())
     proximity = math.pow(2.0, -distance.total_seconds() / window)
     return _RANK_FLOOR + (_RANK_CEILING - _RANK_FLOOR) * proximity
+
+
+def _overlaps_temporal_range(
+    occurred_at: datetime | None,
+    occurred_end: datetime | None,
+    temporal_range: tuple[datetime, datetime],
+) -> bool:
+    if occurred_at is None:
+        return False
+    start, until = temporal_range
+    event_until = occurred_end or occurred_at + timedelta(microseconds=1)
+    return occurred_at < until and event_until > start
 
 
 def _temporal_range(text: str, reference_at: datetime) -> tuple[datetime, datetime] | None:
@@ -4310,6 +4524,19 @@ def _parse_temporal_range(  # noqa: C901 - ordered phrases are clearer as one pa
         return _date_range(min(dates), max(dates), reference_at)
 
     normalized = text.casefold()
+    months = [
+        (int(match.group(2)), _MONTHS[match.group(1)[:3]])
+        for match in _NAMED_MONTH_YEAR.finditer(normalized)
+    ]
+    months.extend(
+        (int(match.group(1)), int(match.group(2))) for match in _CJK_YEAR_MONTH.finditer(normalized)
+    )
+    if months:
+        first = min(date(year, month, 1) for year, month in months)
+        last = max(date(year, month, 1) for year, month in months)
+        start = _day_start(first, reference_at)
+        return start, _shift_month(_day_start(last, reference_at), 1)
+
     relative_day = re.search(r"(?<!\d)(\d{1,5})\s*天前", normalized) or re.search(
         r"\b(\d{1,5})\s+days?\s+ago\b", normalized
     )
@@ -4371,6 +4598,14 @@ def _parse_temporal_range(  # noqa: C901 - ordered phrases are clearer as one pa
         return (
             year_start.replace(year=year_start.year + 1),
             year_start.replace(year=year_start.year + 2),
+        )
+
+    years = [int(value) for value in _CALENDAR_YEAR.findall(normalized)]
+    years.extend(int(value) for value in _CJK_CALENDAR_YEAR.findall(normalized))
+    if years:
+        return (
+            _day_start(date(min(years), 1, 1), reference_at),
+            _day_start(date(max(years) + 1, 1, 1), reference_at),
         )
     return None
 

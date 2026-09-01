@@ -105,6 +105,7 @@ from mindbridge.benchmarks.task_catalog import (
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
 from mindbridge.models.base import (
     EmbeddingBackend,
+    EmbedTask,
     FaceBackend,
     GenerationBackend,
     ModelInput,
@@ -498,6 +499,7 @@ class _BackendPool:
                 if "max_tokens" not in generation_options
                 else int(generation_options["max_tokens"])
             ),
+            generation_min_video_seconds=config.generation_min_video_seconds,
             generation_extra_body=(
                 None
                 if enable_thinking is None
@@ -509,6 +511,7 @@ class _BackendPool:
             ),
         )
         self.embedder = JinaOmniEmbedder(device=device, batch_size=batch_size)
+        self.embedder.embed((ModelInput(text="MindBridge benchmark warmup"),), task=EmbedTask.QUERY)
         self.transcriber = (
             FunASRTranscriber(
                 recipe=replace(
@@ -565,7 +568,9 @@ class _BackendPool:
                     resource.close()
 
 
-def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
+def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
+    argv: Sequence[str] | None = None, *, prog: str | None = None
+) -> int:
     """Parse one reproducible evaluation sweep and write its artifacts."""
     parser = _build_parser(prog)
     parsed = parser.parse_args(argv)
@@ -574,6 +579,29 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
         print(listing(parsed.benchmarks_root.expanduser().resolve(), list_mode))
         return 0
     arguments = _arguments(parser, parsed)
+    if parsed.check_integrity:
+        manifest, manifest_directory = load_media_manifest(arguments.media_manifest)
+        loaded = _load_tasks(arguments, manifest, manifest_directory)
+        print(
+            _json_bytes(
+                {
+                    "status": "ok",
+                    "tasks": [
+                        {
+                            "task": task.spec.name,
+                            "dataset_sha256": task.dataset_sha256,
+                            "evaluation_sha256": task.evaluation_sha256,
+                            "unit_count": len(task.units),
+                            "question_count": sum(len(unit.questions) for unit in task.units),
+                        }
+                        for task in loaded
+                    ],
+                },
+                pretty=True,
+            ).decode(),
+            end="",
+        )
+        return 0
     try:
         memory_config = _load_memory_config(arguments.memory_config)
         base_config = _model_config(
@@ -617,22 +645,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
         _atomic_replace(((effective_manifest, _json_bytes(manifest, pretty=True)),))
         arguments = replace(arguments, media_manifest=effective_manifest)
         manifest_directory = effective_manifest.parent
-    loaded = tuple(
-        load_task(
-            TASKS[name],
-            root=arguments.benchmarks_root,
-            dataset_path=arguments.dataset_overrides.get(name),
-            media_root=arguments.media_overrides.get(name),
-            media_manifest=manifest,
-            manifest_directory=manifest_directory,
-            limit=arguments.limit,
-            offset=arguments.offset,
-            verify_digest=not (
-                arguments.allow_unverified_data and name in arguments.dataset_overrides
-            ),
-        )
-        for name in arguments.tasks
-    )
+    loaded = _load_tasks(arguments, manifest, manifest_directory)
     config = _evaluation_config(base_config, loaded)
     memory_config = _evaluation_memory_config(memory_config, config, arguments)
     batch_sizes = {task.spec.name: _batch_size(arguments, task) for task in loaded}
@@ -676,6 +689,29 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     )
     submission_invalid = submission_status is not None and submission_status["status"] == "invalid"
     return int(has_errors or regressed or submission_invalid)
+
+
+def _load_tasks(
+    arguments: _Arguments,
+    manifest: Mapping[str, object] | None,
+    manifest_directory: Path | None,
+) -> tuple[LoadedTask, ...]:
+    return tuple(
+        load_task(
+            TASKS[name],
+            root=arguments.benchmarks_root,
+            dataset_path=arguments.dataset_overrides.get(name),
+            media_root=arguments.media_overrides.get(name),
+            media_manifest=manifest,
+            manifest_directory=manifest_directory,
+            limit=arguments.limit,
+            offset=arguments.offset,
+            verify_digest=not (
+                arguments.allow_unverified_data and name in arguments.dataset_overrides
+            ),
+        )
+        for name in arguments.tasks
+    )
 
 
 def _announce_submission(arguments: _Arguments, status: Mapping[str, object] | None) -> None:
@@ -1241,8 +1277,8 @@ async def _answer_many(
     semaphore = request_semaphore or asyncio.Semaphore(request_concurrency)
 
     async def answer(question: EvalQuestion) -> _AnswerOutcome:
-        started = time.perf_counter()
         async with semaphore:
+            started = time.perf_counter()
             content = _content(question.content)
             try:
                 result = await memory.ask(
@@ -1885,6 +1921,7 @@ def _model_result(
         "embedding_model": DEFAULT_JINA_MODEL_ID,
         "embedding_revision": DEFAULT_JINA_REVISION,
         "embedding_dimension": DEFAULT_JINA_DIMENSION,
+        "embedding_warmup": {"count": 1, "task": EmbedTask.QUERY.value},
         "device": arguments.device or "auto",
         "generation_model": config.generation_model,
         "generation_base_url": config.generation_base_url,
@@ -1894,6 +1931,7 @@ def _model_result(
         "generation_seed": arguments.seed,
         "generation_temperature": 0.0,
         "generation_kwargs": arguments.gen_kwargs,
+        "generation_min_video_seconds": config.generation_min_video_seconds,
         "transcription_model": DEFAULT_FUNASR_MODEL_ID,
         "timeout_seconds": config.timeout_seconds,
     }
@@ -2679,7 +2717,10 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         "--model-args",
         "--model_args",
         default="",
-        help="comma-separated generation_model/base_url/timeout_seconds overrides",
+        help=(
+            "comma-separated generation_model/base_url/timeout_seconds/"
+            "generation_min_video_seconds overrides"
+        ),
     )
     parser.add_argument(
         "--config",
@@ -2888,6 +2929,7 @@ def _model_config(
     allowed = {
         "base_url",
         "generation_model",
+        "generation_min_video_seconds",
         "timeout_seconds",
     }
     aliases = {"pretrained": "generation_model", "model": "generation_model"}
@@ -3033,6 +3075,8 @@ def _replace_config(config: ModelConfig, key: str, value: str) -> ModelConfig:
         return replace(config, generation_model=value)
     if key == "timeout_seconds":
         return replace(config, timeout_seconds=float(value))
+    if key == "generation_min_video_seconds":
+        return replace(config, generation_min_video_seconds=float(value))
     raise AssertionError(f"unhandled model setting: {key}")
 
 
@@ -3160,6 +3204,7 @@ def _cache_namespace(
     payload = {
         "runner": EVAL_RUNNER_VERSION,
         "schema": EVAL_SCHEMA_VERSION,
+        "implementation": _implementation_identity(),
         "model": config.generation_model,
         "base_url": config.generation_base_url,
         "embedding_model": DEFAULT_JINA_MODEL_ID,
@@ -3168,12 +3213,22 @@ def _cache_namespace(
         "device": arguments.device or "auto",
         "seed": arguments.seed,
         "gen_kwargs": arguments.gen_kwargs,
+        "generation_min_video_seconds": config.generation_min_video_seconds,
         "recall_limit": arguments.recall_limit,
         "batch_sizes": dict(sorted(batch_sizes.items())),
     }
     if memory_config is not None:
         payload["memory_config"] = _memory_config_payload(memory_config)
     return hashlib.sha256(_json_bytes(payload)).hexdigest()
+
+
+def _implementation_identity() -> str:
+    root = Path(__file__).resolve().parents[1]
+    sources = [
+        (path.relative_to(root).as_posix(), hashlib.sha256(path.read_bytes()).hexdigest())
+        for path in sorted(root.rglob("*.py"))
+    ]
+    return hashlib.sha256(_json_bytes(sources)).hexdigest()
 
 
 def _cache_task(task: LoadedTask) -> str:

@@ -220,6 +220,8 @@ configured answerer. It raises `ModelError` when no answerer is configured.
 `reference_at` controls relative-date interpretation and decay reranking. It must be
 timezone-aware. When omitted, the current UTC time is used unless the query declares a valid
 English reference date such as `Today is May 2, 2024`; an explicit `reference_at` always wins.
+Absolute month and year expressions such as `December 2023`, `2024年4月`, or `in 2025` select the
+matching event-time range directly.
 
 `occurred_from` and `occurred_until` are optional timezone-aware hard filters on event time. A
 memory matches when its `[occurred_at, occurred_end)` interval overlaps the half-open query
@@ -511,6 +513,8 @@ model, not MindBridge.
 
 It calls the model's official Sentence Transformers retrieval methods and wraps application text
 so URL- or path-shaped text cannot activate media autodetection.
+Local videos stay as paths through Transformers' PyAV decoder, preserving source fps and duration
+metadata while reproducing the pinned Jina recipe's sampling of at most 32 unique frames.
 
 ### FunASR
 
@@ -567,6 +571,7 @@ models = OpenAIModels(
     generation_seed=None,
     generation_temperature=None,
     generation_max_tokens=None,
+    generation_min_video_seconds=None,
     generation_video_limit=8,
     generation_extra_body=None,
 )
@@ -596,6 +601,13 @@ through the same `/embeddings` endpoint. The request format is included in the d
 `embedding_space`; an explicit space must likewise distinguish recipes that use different formats.
 In `messages` mode, `embedding_dimension` validates returned vectors but is not sent as the
 provider's optional server-side dimension-reduction parameter.
+
+Set `generation_min_video_seconds` only when the selected provider declares a minimum local-video
+duration. With the `openai` extra and declared image input, a shorter video becomes four
+time-ordered JPEG `image_url` parts before the first provider request; videos at or above the limit
+stay native. Derived frames must also fit the existing per-item and whole-request media budgets.
+The stills preserve visual evidence, not native video timing. Missing image capability, local
+decoding, or media budget keeps the existing provider-rejection fallback.
 
 `OpenAIModels.stream_answer()` requests streamed chat completions with final usage enabled.
 `Memory.ask()` selects it automatically to measure first chunk, first token, total generation

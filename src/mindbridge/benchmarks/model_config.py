@@ -23,6 +23,7 @@ class ModelConfig:
     generation_model: str = DEFAULT_GENERATION_MODEL
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     generation_capabilities: frozenset[Modality] = frozenset({Modality.TEXT})
+    generation_min_video_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if not self.generation_base_url.strip():
@@ -31,6 +32,11 @@ class ModelConfig:
             raise ValueError("generation_model must not be blank")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if self.generation_min_video_seconds is not None and (
+            not math.isfinite(self.generation_min_video_seconds)
+            or self.generation_min_video_seconds <= 0
+        ):
+            raise ValueError("generation_min_video_seconds must be positive")
 
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> ModelConfig:

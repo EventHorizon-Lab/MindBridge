@@ -9,6 +9,7 @@ import math
 import time
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -53,6 +54,11 @@ _INSUFFICIENT_QUOTA = "insufficient_quota"
 _MAX_INLINE_MODEL_BYTES = 64 * 1024 * 1024
 _MAX_INLINE_MODEL_ITEM_BYTES = 20 * 1024 * 1024
 _MAX_GROUNDED_TEXT_BYTES = 4 * 1024 * 1024
+_GENERATION_MODALITY_BY_PART_TYPE = {
+    "image_url": Modality.IMAGE,
+    "video_url": Modality.VIDEO,
+    "input_audio": Modality.AUDIO,
+}
 
 
 class OpenAIModels:
@@ -72,6 +78,7 @@ class OpenAIModels:
         "_generation_capabilities",
         "_generation_extra_body",
         "_generation_max_tokens",
+        "_generation_min_video_seconds",
         "_generation_model",
         "_generation_seed",
         "_generation_temperature",
@@ -84,7 +91,7 @@ class OpenAIModels:
         "_transcription_space",
     )
 
-    def __init__(
+    def __init__(  # noqa: C901 - validates independent adapter controls
         self,
         client: OpenAI | None = None,
         *,
@@ -107,6 +114,7 @@ class OpenAIModels:
         generation_seed: int | None = None,
         generation_temperature: float | None = None,
         generation_max_tokens: int | None = None,
+        generation_min_video_seconds: float | None = None,
         generation_video_limit: int | None = 8,
         generation_extra_body: Mapping[str, object] | None = None,
     ) -> None:
@@ -146,6 +154,13 @@ class OpenAIModels:
             or generation_max_tokens <= 0
         ):
             raise ValidationError("generation_max_tokens must be a positive integer")
+        if generation_min_video_seconds is not None and (
+            isinstance(generation_min_video_seconds, bool)
+            or not isinstance(generation_min_video_seconds, int | float)
+            or not math.isfinite(generation_min_video_seconds)
+            or generation_min_video_seconds <= 0
+        ):
+            raise ValidationError("generation_min_video_seconds must be a positive finite number")
         if generation_video_limit is not None and (
             isinstance(generation_video_limit, bool)
             or not isinstance(generation_video_limit, int)
@@ -200,6 +215,9 @@ class OpenAIModels:
         self._generation_seed = generation_seed
         self._generation_temperature = generation_temperature
         self._generation_max_tokens = generation_max_tokens
+        self._generation_min_video_seconds = (
+            None if generation_min_video_seconds is None else float(generation_min_video_seconds)
+        )
         self._generation_video_limit = generation_video_limit
         self._generation_extra_body = (
             None if generation_extra_body is None else dict(generation_extra_body)
@@ -334,23 +352,16 @@ class OpenAIModels:
                 abstained=True,
                 abstention_reason=prepared,
             )
-        request, grounded, modalities = prepared
-        create_completion = cast(Any, self._client("generation").chat.completions.create)
-        mark_model_requests(1)
-        try:
-            response = create_completion(**request)
-        except ModelError:
-            raise
-        except Exception as error:
-            raise ModelError(
-                "generation request failed",
-                reason=_provider_reason(error),
-                stage="generate",
-            ) from error
+        response, grounded, modalities, request_count = self._create_answer(
+            question,
+            hits,
+            prepared,
+        )
         _record_openai_usage(
             response,
             input_modalities=modalities,
             output_modalities=frozenset({Modality.TEXT}),
+            request_count=request_count,
         )
         answer = _answer_text(response)
         return _answer_result(answer, grounded)
@@ -367,22 +378,20 @@ class OpenAIModels:
             mark_model_requests(0, token_usage_expected=0)
             yield UNKNOWN_ANSWER
             return _GroundedHits((), prepared)
-        request, grounded, modalities = prepared
-        create_completion = cast(Any, self._client("generation").chat.completions.create)
-        mark_model_requests(1)
         started = time.perf_counter()
         usage_response: object | None = None
+        responses, grounded, modalities, request_count = self._create_answer(
+            question,
+            hits,
+            prepared,
+            stream=True,
+        )
         try:
-            responses = create_completion(
-                **request,
-                stream=True,
-                stream_options={"include_usage": True},
-            )
             finish_reason: object = None
             emitted = False
             answer_parts = []
             first_chunk = False
-            for response in responses:
+            for response in cast(Any, responses):
                 elapsed = time.perf_counter() - started
                 span = trace.get_current_span()
                 if not first_chunk:
@@ -435,6 +444,7 @@ class OpenAIModels:
                     usage_response,
                     input_modalities=modalities,
                     output_modalities=frozenset({Modality.TEXT}),
+                    request_count=request_count,
                 )
         _record_finish_reason(finish_reason)
         if finish_reason == "length":
@@ -444,6 +454,85 @@ class OpenAIModels:
                 "generation response was invalid", reason="response_invalid", stage="generate"
             )
         return _GroundedHits(grounded, _abstention_reason("".join(answer_parts)))
+
+    def _create_answer(
+        self,
+        question: ModelInput | str,
+        hits: Sequence[SearchHit],
+        prepared: tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]],
+        *,
+        stream: bool = False,
+    ) -> tuple[object, tuple[SearchHit, ...], frozenset[Modality], int]:
+        request, grounded, modalities = prepared
+        create_completion = cast(Any, self._client("generation").chat.completions.create)
+
+        def create() -> object:
+            if stream:
+                return create_completion(
+                    **request,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                )
+            return create_completion(**request)
+
+        mark_model_requests(1)
+        try:
+            return create(), grounded, modalities, 1
+        except ModelError:
+            raise
+        except Exception as error:
+            fallback = self._short_video_fallback(question, hits, grounded, error)
+            if fallback is None:
+                raise ModelError(
+                    "generation request failed",
+                    reason=_provider_reason(error),
+                    stage="generate",
+                ) from error
+            request, grounded, modalities = fallback
+            mark_model_requests(2)
+            try:
+                return create(), grounded, modalities, 2
+            except ModelError:
+                raise
+            except Exception as retry_error:
+                raise ModelError(
+                    "generation request failed",
+                    reason=_provider_reason(retry_error),
+                    stage="generate",
+                ) from retry_error
+
+    def _short_video_fallback(
+        self,
+        question: ModelInput | str,
+        retrieved: Sequence[SearchHit],
+        grounded: Sequence[SearchHit],
+        error: Exception,
+    ) -> tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]] | None:
+        if not _is_short_video_rejection(error):
+            return None
+        # ponytail: the provider does not identify the rejected clip; keep every hit's text and
+        # non-video media, then replace this with asset-specific fallback if APIs expose an ID.
+        reduced = tuple(
+            replace(
+                hit,
+                assets=assets,
+                modality=ModelInput(text=hit.content, assets=assets).modality,
+            )
+            for hit in grounded
+            if (
+                assets := tuple(
+                    asset for asset in hit.assets if asset.modality is not Modality.VIDEO
+                )
+            )
+            or hit.content.strip()
+        )
+        if reduced == tuple(grounded):
+            return None
+        fallback = self._answer_request(question, reduced)
+        if isinstance(fallback, AbstentionReason):
+            return None
+        _record_grounding_fit(tuple(retrieved), fallback[1])
+        return fallback
 
     def _answer_request(
         self,
@@ -491,8 +580,7 @@ class OpenAIModels:
             )
         required = {Modality.TEXT}
         required.update(cast(Modality, asset.modality) for asset in assets)
-        modalities = frozenset(required)
-        _require_capabilities("generation", modalities, self.generation_capabilities)
+        _require_capabilities("generation", frozenset(required), self.generation_capabilities)
         unique_assets = _require_consistent_assets(assets)
         _require_inline_size(unique_assets)
         content: str | list[dict[str, object]] = (
@@ -500,10 +588,18 @@ class OpenAIModels:
                 question_input,
                 grounded,
                 text_parts,
+                media_slack_bytes=_MAX_INLINE_MODEL_BYTES
+                - sum(_encoded_size(cast(int, asset.size_bytes)) for asset in unique_assets),
+                minimum_video_seconds=(
+                    self._generation_min_video_seconds
+                    if Modality.IMAGE in self.generation_capabilities
+                    else None
+                ),
             )
             if assets
             else text_parts[0]
         )
+        modalities = _generation_modalities(content)
         request: dict[str, object] = {
             "model": self._generation_model,
             "messages": [
@@ -926,6 +1022,21 @@ def _provider_reason(error: Exception) -> str | None:
     return None
 
 
+def _is_short_video_rejection(error: Exception) -> bool:
+    """Recognize a provider-declared content constraint without routing by provider name."""
+    try:
+        import openai
+    except ImportError:  # pragma: no cover - a client call implies the SDK imported already
+        return False
+    message = _member(getattr(error, "body", None), "message")
+    normalized = message.casefold() if isinstance(message, str) else ""
+    return (
+        isinstance(error, openai.BadRequestError)
+        and "video" in normalized
+        and "too short" in normalized
+    )
+
+
 def _require_capabilities(
     operation: str,
     required: frozenset[Modality],
@@ -1007,21 +1118,50 @@ def _answer_parts(
     question: ModelInput,
     hits: Sequence[SearchHit],
     texts: Sequence[str],
+    *,
+    media_slack_bytes: int,
+    minimum_video_seconds: float | None,
 ) -> list[dict[str, object]]:
     cache: dict[str, str] = {}
     parts: list[dict[str, object]] = [{"type": "text", "text": texts[0]}]
     seen_assets: set[str] = set()
     for asset in question.assets:
         if asset.id not in seen_assets:
-            parts.append(_generation_asset_part(asset, cache))
+            original_size = _encoded_size(cast(int, asset.size_bytes))
+            asset_parts = _generation_asset_parts(
+                asset, cache, minimum_video_seconds, original_size + media_slack_bytes
+            )
+            parts.extend(asset_parts)
+            if asset.modality is Modality.VIDEO and asset_parts[0]["type"] == "image_url":
+                media_slack_bytes += original_size - _image_parts_size(asset_parts)
             seen_assets.add(asset.id)
     for hit, text in zip(hits, texts[1:], strict=True):
         parts.append({"type": "text", "text": text})
         for asset in hit.assets:
             if asset.id not in seen_assets:
-                parts.append(_generation_asset_part(asset, cache))
+                original_size = _encoded_size(cast(int, asset.size_bytes))
+                asset_parts = _generation_asset_parts(
+                    asset, cache, minimum_video_seconds, original_size + media_slack_bytes
+                )
+                parts.extend(asset_parts)
+                if asset.modality is Modality.VIDEO and asset_parts[0]["type"] == "image_url":
+                    media_slack_bytes += original_size - _image_parts_size(asset_parts)
                 seen_assets.add(asset.id)
     return parts
+
+
+def _generation_modalities(
+    content: str | Sequence[Mapping[str, object]],
+) -> frozenset[Modality]:
+    modalities = {Modality.TEXT}
+    if not isinstance(content, str):
+        modalities.update(
+            _GENERATION_MODALITY_BY_PART_TYPE[kind]
+            for part in content
+            if isinstance((kind := part.get("type")), str)
+            and kind in _GENERATION_MODALITY_BY_PART_TYPE
+        )
+    return frozenset(modalities)
 
 
 def _answer_text_parts(
@@ -1053,11 +1193,13 @@ def _hit_payload(hit: SearchHit) -> dict[str, object]:
     return {
         "memory_id": hit.id,
         "content": hit.content,
-        "score": hit.score,
         "memory_type": hit.memory_type.value,
-        "occurred_at": None if hit.occurred_at is None else hit.occurred_at.isoformat(),
-        "occurred_end": None if hit.occurred_end is None else hit.occurred_end.isoformat(),
-        "created_at": hit.created_at.isoformat(),
+        **(
+            {"occurred_at": hit.occurred_at.isoformat()}
+            if hit.occurred_at is not None
+            else {"created_at": hit.created_at.isoformat()}
+        ),
+        **({"occurred_end": hit.occurred_end.isoformat()} if hit.occurred_end is not None else {}),
         "metadata": dict(hit.metadata),
     }
 
@@ -1258,6 +1400,90 @@ def _generation_asset_part(
             "format": _audio_format(asset.name or path.name, media_type),
         },
     }
+
+
+def _generation_asset_parts(
+    asset: AssetRef,
+    cache: dict[str, str],
+    minimum_video_seconds: float | None,
+    maximum_encoded_bytes: int,
+) -> tuple[dict[str, object], ...]:
+    if asset.modality is Modality.VIDEO and minimum_video_seconds is not None:
+        frames = _short_video_frame_urls(asset, minimum_video_seconds)
+        if (
+            frames is not None
+            and all(len(frame.encode()) <= _MAX_INLINE_MODEL_ITEM_BYTES for frame in frames)
+            and sum(len(frame.partition(",")[2].encode()) for frame in frames)
+            <= maximum_encoded_bytes
+        ):
+            # Ordered stills retain visual evidence, but cannot retain native video timing.
+            return tuple({"type": "image_url", "image_url": {"url": frame}} for frame in frames)
+    return (_generation_asset_part(asset, cache),)
+
+
+def _image_parts_size(parts: Sequence[Mapping[str, object]]) -> int:
+    return sum(
+        len(cast(Mapping[str, str], part["image_url"])["url"].partition(",")[2].encode())
+        for part in parts
+    )
+
+
+def _short_video_frame_urls(
+    asset: AssetRef,
+    minimum_video_seconds: float,
+) -> tuple[str, str, str, str] | None:
+    """Decode four ordered JPEG stills when an optional local video is below a provider limit."""
+    try:
+        import av
+
+        _modality, _media_type, path = _resolved_asset(asset)
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            duration = (
+                float(stream.duration * stream.time_base)
+                if stream.duration is not None and stream.time_base is not None
+                else (
+                    float(container.duration / av.time_base)
+                    if container.duration is not None
+                    else None
+                )
+            )
+            if duration is None or duration <= 0 or duration >= minimum_video_seconds:
+                return None
+            start = (
+                float(stream.start_time * stream.time_base)
+                if stream.start_time is not None and stream.time_base is not None
+                else 0.0
+            )
+            targets = tuple(start + duration * index / 3 for index in range(3))
+            sampled: list[Any] = []
+            last: Any = None
+            for index, frame in enumerate(container.decode(stream)):
+                last = frame
+                timestamp = frame.time
+                if timestamp is None and stream.average_rate:
+                    timestamp = start + index / float(stream.average_rate)
+                while (
+                    timestamp is not None
+                    and len(sampled) < len(targets)
+                    and timestamp >= targets[len(sampled)]
+                ):
+                    sampled.append(frame)
+            if last is None:
+                return None
+            sampled.extend(last for _ in range(3 - len(sampled)))
+            sampled.append(last)
+            urls = tuple(_jpeg_frame_url(frame) for frame in sampled)
+            return cast(tuple[str, str, str, str], urls)
+    except Exception:
+        # PyAV/Pillow are optional; decode failures preserve the existing provider fallback path.
+        return None
+
+
+def _jpeg_frame_url(frame: object) -> str:
+    encoded = BytesIO()
+    cast(Any, frame).to_image().convert("RGB").save(encoded, format="JPEG", quality=85)
+    return f"data:image/jpeg;base64,{base64.b64encode(encoded.getvalue()).decode('ascii')}"
 
 
 def _asset_url(asset: AssetRef) -> str:

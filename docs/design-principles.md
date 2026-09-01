@@ -285,7 +285,7 @@ revisions must be reproducible before a result guides a default.
 | Hardware | Runs where Python, dependencies, and the selected models are supported | Verified device-class matrix with published quality, latency, and resource evidence |
 | Developer interfaces | Typed Python API, OpenAPI-documented REST adapter, and a JSON-only product CLI over the same composition | Same small vocabulary and time-to-first-success across supported transports |
 | Execution plane | Python SDK, REST, MCP, and the `mindbridge` CLI dispatch to one `Memory` | Every surface reaches the operations the SDK publishes, with no transport gap left undocumented |
-| Agent interfaces | Five typed MCP tools; a `mindbridge` CLI whose commands are the SDK operations kebab-cased, plus `doctor` | SDK-derived MCP and CLI capability parity, machine-readable schemas, and lifecycle integrations |
+| Agent interfaces | Six typed MCP tools; a `mindbridge` CLI whose commands are the SDK operations kebab-cased, plus `doctor` | SDK-derived MCP and CLI capability parity, machine-readable schemas, and lifecycle integrations |
 
 This distinction is deliberate: goals guide what to build next, while current API and deployment
 documentation remain the source of truth for what users can run now.

@@ -10,7 +10,7 @@ import sqlite3
 from collections.abc import AsyncIterator, Generator, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
-from dataclasses import MISSING, asdict, dataclass, fields
+from dataclasses import MISSING, asdict, dataclass, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier, Event, Thread
@@ -978,6 +978,40 @@ def test_relative_time_prefers_event_time_and_routes_the_reference(tmp_path: Pat
     )
 
 
+def test_named_month_and_calendar_year_prefer_event_time(tmp_path: Path) -> None:
+    reference = datetime(2026, 8, 30, 12, tzinfo=timezone.utc)
+    relative = memory_module._parse_temporal_range("2024 days ago", reference)
+    assert relative is not None
+    assert relative[0].date() == reference.date() - timedelta(days=2024)
+    assert memory_module._parse_temporal_range("X2024", reference) is None
+    assert memory_module._parse_temporal_range("resolution 2024p", reference) is None
+    assert memory_module._parse_temporal_range("release_2024", reference) is None
+    assert memory_module._parse_temporal_range("型号X2024年", reference) is None
+    assert memory_module._parse_temporal_range("2024年p", reference) is None
+    assert memory_module._parse_temporal_range("型号X2024年4月", reference) is None
+    assert memory_module._parse_temporal_range("X2024年04月p", reference) is None
+    cjk_year = memory_module._parse_temporal_range("2024年发生了什么?", reference)
+    assert cjk_year is not None and cjk_year[0].year == 2024
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        december = memory.add(
+            "shared conference memory",
+            occurred_at=datetime(2023, 12, 15, tzinfo=timezone.utc),
+        )
+        april = memory.add(
+            "shared conference memory",
+            occurred_at=datetime(2024, 4, 15, tzinfo=timezone.utc),
+        )
+        memory.add(
+            "shared conference memory",
+            occurred_at=datetime(2026, 1, 15, tzinfo=timezone.utc),
+        )
+
+        assert memory.search("What happened in December 2023?", limit=1)[0].id == december.id
+        assert memory.search("2024年4月发生了什么?", limit=1)[0].id == april.id
+        assert memory.search("What happened at BMVC 2024?", limit=3)[0].id == april.id
+
+
 def test_natural_today_anchor_sets_relative_time_unless_reference_is_explicit(
     tmp_path: Path,
 ) -> None:
@@ -1088,9 +1122,44 @@ def test_temporal_proximity_is_a_soft_score_not_a_hard_sort_key(tmp_path: Path) 
             reference_at=reference,
         )
         assert _FakeIndex.instances[-1].dense_search_calls == 2
-        assert _FakeIndex.instances[-1].lexical_search_calls == 2
+        assert _FakeIndex.instances[-1].lexical_search_calls == 1
 
     assert [hit.id for hit in hits] == [adjacent.id, exact.id]
+
+
+def test_temporal_search_reads_lexical_evidence_from_authoritative_time_range(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        outside = memory.add_many(
+            tuple(f"shared witness outside {index}" for index in range(130)),
+            occurred_at=(datetime(2026, 1, 1, tzinfo=timezone.utc),) * 130,
+        )
+        weak = memory.add(
+            "shared witness weak",
+            occurred_at=datetime(2024, 5, 1, tzinfo=timezone.utc),
+        )
+        target = memory.add(
+            "shared witness target",
+            occurred_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
+        )
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = ()
+        index.lexical_hits_override = tuple(
+            IndexHit(
+                id=record.id,
+                relevance=0.5 if record.id == weak.id else 1.0,
+                lexical_match=True,
+            )
+            for record in (*outside[:99], weak, *outside[99:], target)
+        )
+        hits = memory.search("shared witness in 2024", limit=1)
+        assert hits and hits[0].id == target.id
+        assert index.lexical_search_calls == 2
+
+        monkeypatch.setattr(memory._store, "read_memories", lambda _memory_ids: ())
+        assert memory.search("shared witness in 2024", limit=1) == ()
 
 
 def test_text_reranking_preserves_negation_and_bounded_scores(tmp_path: Path) -> None:
@@ -1799,6 +1868,109 @@ def test_opt_in_speech_indexing_makes_registered_names_retrievable(
             1,
             2,
         }
+        assert all(
+            "Alicia" in document.content and speaker_id not in document.content
+            for document in index.documents.values()
+        )
+
+
+def test_retrieval_projection_is_stable_across_opaque_speaker_ids(tmp_path: Path) -> None:
+    embedded = []
+    indexed = []
+    stored = []
+    for name in ("first", "second"):
+        models = _FakeModels()
+        with Memory(
+            tmp_path / name,
+            embedder=models,
+            transcriber=_FakeSpeech(),
+            index_speech=True,
+        ) as memory:
+            record = memory.add(Blob(b"same speech", "audio/wav", "speech.wav"))
+            stored.append(record.content)
+            embedded.append(tuple(value.text for value in models.embed_inputs[0]))
+            indexed.append(
+                tuple(document.content for document in _FakeIndex.instances[-1].documents.values())
+            )
+
+    assert stored[0] != stored[1]
+    assert embedded[0] == embedded[1]
+    assert indexed[0] == indexed[1]
+    assert "spoken red wrench" in indexed[0][0]
+    assert '"speaker_id":"speaker_1"' in indexed[0][0]
+    assert '"speaker_id":"identity_' not in indexed[0][0]
+
+
+def test_retrieval_projection_covers_atomic_embeddings_during_migration(tmp_path: Path) -> None:
+    original = _FakeModels()
+    with Memory(
+        tmp_path,
+        embedder=original,
+        transcriber=_FakeSpeech(),
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"same speech", "audio/wav", "speech.wav"))
+        speaker_id = memory.speech(record.id)[0].speaker_id
+    assert speaker_id is not None
+    with LocalStore(tmp_path) as store:
+        store.set_metadata(
+            "index.recipe",
+            "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
+            "context-keys-v8:quantization-none",
+        )
+
+    migrated = _FakeModels()
+    with Memory(
+        tmp_path,
+        embedder=migrated,
+        transcriber=_FakeSpeech(),
+        index_speech=True,
+    ):
+        pass
+
+    migrated_text = tuple(value.text for batch in migrated.embed_inputs for value in batch)
+    assert any('"speaker_id":"speaker_1"' in text for text in migrated_text)
+    assert all(speaker_id not in text for text in migrated_text)
+
+
+def test_retrieval_projection_preserves_user_marker_text(tmp_path: Path) -> None:
+    asset_id = "a" * 64
+    text = f'[speech identities:{asset_id}]\n{{"asset_id":"{asset_id}","segments":[]}}'
+    models = _FakeModels()
+
+    with _memory(tmp_path, models) as memory:
+        record = memory.add(text)
+        document = _FakeIndex.instances[-1].documents[record.id]
+
+    assert record.content == text
+    assert models.embed_inputs[0][0].text == text
+    assert document.content == text
+
+
+def test_generation_deduplicates_indexed_speech_evidence(tmp_path: Path) -> None:
+    models = _FakeModels(
+        capabilities=_Capabilities(
+            embedding=ALL_INPUT_MODALITIES,
+            generation=frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO}),
+            transcription=frozenset({Modality.AUDIO, Modality.VIDEO}),
+        )
+    )
+    with Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        transcriber=_FakeSpeech(),
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"red speech", "audio/wav", "speech.wav"))
+
+        result = memory.ask("what was said?")
+
+    routed = models.answer_calls[-1][1][0].content
+    assert routed.count("[speech identities:") == 1
+    assert routed.count("spoken red wrench") == 1
+    assert "[transcript:" not in routed
+    assert result.hits[0].content == record.content
 
 
 def test_speech_indexing_batches_add_many_recognition(tmp_path: Path) -> None:
@@ -2150,7 +2322,7 @@ def test_search_expands_candidates_until_it_has_distinct_parent_memories(
         transcriber=models,
         ambiguity_margin=0,
     ) as memory:
-        crowded = memory.add(tuple(f"crowded part {index}" for index in range(60)))
+        crowded = memory.add(tuple(f"crowded part {index}" for index in range(110)))
         other = memory.add("other parent")
         index = _FakeIndex.instances[-1]
         crowded_hits = tuple(
@@ -2158,7 +2330,7 @@ def test_search_expands_candidates_until_it_has_distinct_parent_memories(
             for document_id, document in index.documents.items()
             if document.embedding.memory_id == crowded.id
         )
-        assert len(crowded_hits) > 50
+        assert len(crowded_hits) > 100
         other_id = next(
             document_id
             for document_id, document in index.documents.items()
@@ -2523,6 +2695,9 @@ def test_missing_index_checkpoint_precedes_collection_creation(
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:single-vector-v3",
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:multi-vector-v4",
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:multi-vector-v5",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:context-keys-v6",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:grouped-range:context-keys-v7",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:context-keys-v8:quantization-none",
     ),
 )
 def test_legacy_index_recipe_is_rebuilt_from_sqlite(tmp_path: Path, recipe: str) -> None:
@@ -2576,29 +2751,6 @@ def test_failed_embedding_space_upgrade_keeps_legacy_marker(tmp_path: Path) -> N
 
     with LocalStore(tmp_path) as store:
         assert store.get_metadata("embedding.space_id") == legacy_space
-
-
-@pytest.mark.parametrize(
-    "legacy",
-    (
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:context-keys-v6",
-        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:grouped-range:context-keys-v7",
-    ),
-)
-def test_schema_recipe_rebuilds_only_the_disposable_index(
-    tmp_path: Path,
-    legacy: str,
-) -> None:
-    with _memory(tmp_path, _FakeModels()) as memory:
-        record = memory.add("preserved memory")
-    with LocalStore(tmp_path) as store:
-        store.set_metadata("index.recipe", legacy)
-
-    reopened_models = _FakeModels()
-    with _memory(tmp_path, reopened_models):
-        assert record.id in _FakeIndex.instances[-1].documents
-
-    assert reopened_models.embed_inputs == []
 
 
 def test_index_quantization_change_rebuilds_without_reembedding(tmp_path: Path) -> None:
@@ -3108,6 +3260,22 @@ def test_the_transcript_marker_names_no_modality(tmp_path: Path) -> None:
     assert MemoryConfig().minimum_relevance < memory_module._LEXICAL_MATCH_CONFIDENCE
     assert "spoken red wrench" in indexed
     assert not {"audio", "video"} & set(re.findall(r"\w+", indexed.casefold()))
+
+
+def test_transcript_fallback_remains_when_speech_has_no_identity_block(tmp_path: Path) -> None:
+    asset = replace(
+        AssetStore(tmp_path).materialize_bytes(
+            b"speech",
+            modality="audio",
+            mime_type="audio/wav",
+            name="speech.wav",
+        ),
+        transcript="spoken red wrench",
+    )
+
+    derived = memory_module._derived_text("", (asset,))
+
+    assert derived == f"[transcript:{asset.asset_id}]\nspoken red wrench"
 
 
 def test_audio_fallback_also_transcribes_declared_video_speech(tmp_path: Path) -> None:

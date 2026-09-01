@@ -1,0 +1,33 @@
+{
+  "capture_method": "analyzer_live_sqlite",
+  "data_root": "/home/yons/.codex/worktrees/6763/MindBridge/autoresearch/orchestrator-260830-2214/candidate-data/jina-v6-egolife-n10",
+  "data_root_stat": {
+    "device": 66306,
+    "inode": 114847831
+  },
+  "exclusive_lock_available": true,
+  "results_sha256": "057c255a1816475c6a535e462ef63e1c6ab5482f6c26cf75d3bc92eba88b1bfe",
+  "run_id": "jina-v6-af62f5da5554-egolife-n10",
+  "samples_sha256": "39591e4b2649ac25302994bb07790268a9cbb97f1dcd43b51ef12dc945afc934",
+  "schema_version": 1,
+  "stores": [
+    {
+      "relative_database_path": "benchmark-mvtw63djmzsxcyi/run-njuw4yjnoy3c2ylggyzgmnleme2tknjufvswo33mnftgkllogeya/unit-ieyv6ssbjncq/state.sqlite3",
+      "row_counts": {
+        "media_assets": 135,
+        "memory_records": 135,
+        "search_index_queue": 0,
+        "speech_analyses": 135
+      },
+      "sqlite_integrity_check": "ok",
+      "store_metadata": {
+        "embedding.dimension": "1024",
+        "embedding.model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+        "embedding.space_id": "sentence-transformers:459b06a9f4ad55f70bc5f4401482844d4ba0bf07d341daf1f93c8d50dfa937d2",
+        "index.recipe": "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:context-keys-v8:quantization-none",
+        "transcription.space_id": "FunAudioLLM/Fun-ASR-Nano-2512:speech:b47a175e755dea61"
+      },
+      "unit": "unit-ieyv6ssbjncq"
+    }
+  ]
+}

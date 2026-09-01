@@ -17,6 +17,7 @@ import base64
 import binascii
 import inspect
 import json
+import math
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -109,6 +110,7 @@ _QUERY_METAVAR: Mapping[str, str] = {
     "search-with-trace": "QUERY",
     "ask": "QUESTION",
 }
+_DEFAULT_REMOTE_TIMEOUT_SECONDS = 30.0
 _TUNING: tuple[str, ...] = (
     "index_speech",
     "minimum_relevance",
@@ -195,6 +197,12 @@ def _dispatch(arguments: argparse.Namespace) -> _Document:
 
 def _resolve(arguments: argparse.Namespace) -> _Document:
     """Report the resolved composition without running the operation it selects."""
+    if arguments.url is None and arguments.timeout is not None:
+        raise _CompositionError(
+            "--timeout applies only to --url compositions",
+            reason="option_not_applicable",
+            subject="--timeout",
+        )
     if arguments.embedder is None:
         _reject_embedder_only_options(arguments)
     if arguments.app is None and arguments.embedder is None and arguments.url is None:
@@ -206,7 +214,11 @@ def _resolve(arguments: argparse.Namespace) -> _Document:
             reason="composition_missing",
         )
     if arguments.url is not None:
-        return {"source": f"--url {arguments.url}", "url": arguments.url}
+        return {
+            "source": f"--url {arguments.url}",
+            "url": arguments.url,
+            "timeout_seconds": _remote_timeout(arguments),
+        }
     if arguments.app is not None:
         module_name, attribute = _application_target(arguments.app)
         return {
@@ -629,7 +641,7 @@ def _run_remote(arguments: argparse.Namespace) -> _Document:
             subject=command,
         )
     method, path, body = _REMOTE[command](arguments)
-    return _request(arguments.url, method, path, body)
+    return _request(arguments.url, method, path, body, _remote_timeout(arguments))
 
 
 def _remote_add(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
@@ -709,19 +721,25 @@ def _remote_doctor(arguments: argparse.Namespace) -> _Document:
         "version": _installed_version(),
         "python": ".".join(str(part) for part in sys.version_info[:3]),
         "url": arguments.url,
-        "health": _request(arguments.url, "GET", "/healthz", None),
+        "health": _request(arguments.url, "GET", "/healthz", None, _remote_timeout(arguments)),
         "composition": {"source": f"--url {arguments.url}", "owner": "remote"},
     }
 
 
-def _request(url: str, method: str, path: str, body: _Document | None) -> _Document:
+def _remote_timeout(arguments: argparse.Namespace) -> float:
+    return (
+        _DEFAULT_REMOTE_TIMEOUT_SECONDS if arguments.timeout is None else float(arguments.timeout)
+    )
+
+
+def _request(url: str, method: str, path: str, body: _Document | None, timeout: float) -> _Document:
     payload = None if body is None else json.dumps(body).encode("utf-8")
     headers = {"Accept": "application/json"}
     if payload is not None:
         headers["Content-Type"] = "application/json"
     request = Request(f"{url.rstrip('/')}{path}", data=payload, headers=headers, method=method)
     try:
-        with urlopen(request) as response:
+        with urlopen(request, timeout=timeout) as response:
             return _response(response.read())
     except HTTPError as error:
         # An error response is still an open response: `HTTPError` wraps the body file, so leaving
@@ -731,12 +749,19 @@ def _request(url: str, method: str, path: str, body: _Document | None) -> _Docum
         finally:
             error.close()
         raise _RemoteFailure(envelope) from error
-    except URLError as error:
+    except (TimeoutError, URLError) as error:
+        cause = error.reason if isinstance(error, URLError) else error
+        if isinstance(cause, TimeoutError):
+            raise StorageError(
+                f"request to the MindBridge owner at {url} timed out after {timeout:g} seconds",
+                reason="timeout",
+                stage="request",
+            ) from error
         raise StorageError(
             f"cannot reach the MindBridge owner at {url}",
             reason="connection_failed",
             stage="request",
-            subject=str(error.reason),
+            subject=str(cause),
         ) from error
 
 
@@ -1184,6 +1209,12 @@ def _parser() -> argparse.ArgumentParser:
     composition.add_argument("--app", metavar="MODULE:ATTR", help="an application-composed Memory")
     composition.add_argument("--embedder", metavar="NAME", help=f"one of: {_recipes()}")
     composition.add_argument("--url", metavar="URL", help="address a running owner over /v1")
+    parser.add_argument(
+        "--timeout",
+        type=_positive_seconds,
+        metavar="SECONDS",
+        help=f"remote request timeout (default: {_DEFAULT_REMOTE_TIMEOUT_SECONDS:g})",
+    )
     parser.add_argument("--answerer", metavar="NAME", help="generation recipe, with --embedder")
     parser.add_argument("--transcriber", metavar="NAME", help="speech recipe, with --embedder")
     parser.add_argument("--index-speech", action="store_true", help="index transcripts on add")
@@ -1212,6 +1243,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("-q", "--quiet", action="store_true", help="suppress the stderr banner")
     _commands(parser.add_subparsers(dest="command", required=True, metavar="COMMAND"))
     return parser
+
+
+def _positive_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive finite number") from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return seconds
 
 
 def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:

@@ -75,7 +75,7 @@ from mindbridge.benchmarks.model_config import ModelConfig
 from mindbridge.benchmarks.official_scorers import scorer_protocol
 from mindbridge.benchmarks.task_catalog import TASKS, TaskSpec, expand
 from mindbridge.benchmarks.video_mme_v2 import score_group_answers
-from mindbridge.models.base import SpeechAnalysis, SpeechBackend
+from mindbridge.models.base import EmbedTask, ModelInput, SpeechAnalysis, SpeechBackend
 
 
 def _egomem_sample(example_id: int, answer: str | None = None) -> SampleResult:
@@ -190,6 +190,86 @@ def test_lmms_style_task_listing(capsys: pytest.CaptureFixture[str], tmp_path: P
     output = capsys.readouterr().out
     assert "groups:" in output
     assert "video-mme-v2" in output
+
+
+def test_integrity_check_is_an_offline_json_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    spec = TASKS["locomo-refined"]
+    task = LoadedTask(
+        spec,
+        tmp_path / "dataset.json",
+        "1" * 64,
+        (EvalUnit("unit", (), (EvalQuestion("question", ("Prompt",), ("Answer",)),)),),
+        {"dataset": "1" * 64, "memory": "2" * 64},
+    )
+    loaded_with: list[dict[str, object]] = []
+
+    def load(_spec: TaskSpec, **kwargs: object) -> LoadedTask:
+        assert _spec is spec
+        loaded_with.append(kwargs)
+        return task
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("integrity checks must remain offline and side-effect free")
+
+    monkeypatch.setattr(eval_module, "load_task", load)
+    for name in (
+        "_model_config",
+        "_require_output",
+        "acquire_inputs",
+        "prepare_task_media",
+        "_execute",
+    ):
+        monkeypatch.setattr(eval_module, name, forbidden)
+    output = tmp_path / "output"
+    data = tmp_path / "data"
+
+    assert (
+        main(
+            (
+                "--tasks",
+                spec.name,
+                "--benchmarks-root",
+                str(tmp_path),
+                "--data-root",
+                str(data),
+                "--output-path",
+                str(output),
+                "--check-integrity",
+            )
+        )
+        == 0
+    )
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "ok",
+        "tasks": [
+            {
+                "task": spec.name,
+                "dataset_sha256": task.dataset_sha256,
+                "evaluation_sha256": task.evaluation_sha256,
+                "unit_count": 1,
+                "question_count": 1,
+            }
+        ],
+    }
+    assert loaded_with == [
+        {
+            "root": tmp_path.resolve(),
+            "dataset_path": None,
+            "media_root": None,
+            "media_manifest": None,
+            "manifest_directory": None,
+            "limit": None,
+            "offset": 0,
+            "verify_digest": True,
+        }
+    ]
+    assert not output.exists()
+    assert not data.exists()
 
 
 def test_result_table_includes_per_task_time_and_tokens() -> None:
@@ -519,6 +599,66 @@ def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch.setattr(eval_module, "EVAL_RUNNER_VERSION", "next-runner-recipe")
 
     assert _cache_namespace(arguments, ModelConfig(), {"text": 1}) != before
+    assert (
+        _cache_namespace(arguments, ModelConfig(generation_min_video_seconds=2.0), {"text": 1})
+        != before
+    )
+
+
+def test_backend_pool_warms_query_embedding_before_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    calls: list[tuple[tuple[ModelInput, ...], EmbedTask]] = []
+
+    class Client:
+        def __init__(self, **_kwargs: object) -> None: ...
+
+        def close(self) -> None: ...
+
+    class Models(Client):
+        pass
+
+    class Embedder:
+        def __init__(self, **_kwargs: object) -> None: ...
+
+        def embed(
+            self, inputs: Sequence[ModelInput], task: EmbedTask
+        ) -> tuple[tuple[float, ...], ...]:
+            calls.append((tuple(inputs), task))
+            return ((1.0,),)
+
+        def close(self) -> None: ...
+
+    monkeypatch.setattr(openai, "OpenAI", Client)
+    monkeypatch.setattr(eval_module, "OpenAIModels", Models)
+    monkeypatch.setattr(eval_module, "JinaOmniEmbedder", Embedder)
+
+    pool = eval_module._BackendPool(
+        ModelConfig(), device="cuda", batch_size=8, needs_speech=False, seed=7
+    )
+    pool.close()
+
+    assert calls == [((ModelInput(text="MindBridge benchmark warmup"),), EmbedTask.QUERY)]
+
+
+def test_implementation_identity_tracks_editable_source_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    package = tmp_path / "mindbridge"
+    benchmark = package / "benchmarks" / "eval.py"
+    benchmark.parent.mkdir(parents=True)
+    benchmark.write_text("RUNNER = 1\n", encoding="utf-8")
+    implementation = package / "memory.py"
+    implementation.write_text("RECIPE = 1\n", encoding="utf-8")
+    monkeypatch.setattr(eval_module, "__file__", str(benchmark))
+
+    identity = eval_module._implementation_identity()
+
+    assert eval_module._implementation_identity() == identity
+    implementation.write_text("RECIPE = 2\n", encoding="utf-8")
+    assert eval_module._implementation_identity() != identity
 
 
 def test_benchmark_device_lock_serializes_separate_processes(tmp_path: Path) -> None:
@@ -607,6 +747,14 @@ def test_model_base_url_override_replaces_environment_operation_urls(
     config = _model_config("mindbridge", "base_url=https://new.example/v1")
 
     assert config.generation_base_url == "https://new.example/v1"
+
+
+def test_model_short_video_limit_is_explicit_and_validated() -> None:
+    config = _model_config("mindbridge", "generation_min_video_seconds=2")
+
+    assert config.generation_min_video_seconds == 2.0
+    with pytest.raises(ValueError, match="generation_min_video_seconds"):
+        _model_config("mindbridge", "generation_min_video_seconds=0")
 
 
 def test_eval_config_reuses_the_declarative_memory_schema(tmp_path: Path) -> None:
@@ -1359,6 +1507,46 @@ async def test_runner_applies_request_concurrency_across_units(tmp_path: Path) -
     )
 
     assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_answer_many_latency_excludes_request_semaphore_wait() -> None:
+    slow_started = asyncio.Event()
+    release_slow = asyncio.Event()
+
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            del limit, reference_at
+            if question == "slow":
+                slow_started.set()
+                await release_slow.wait()
+            return AnswerResult("A")
+
+    pending = asyncio.create_task(
+        _answer_many(
+            cast(AsyncMemory, Memory([])),
+            (
+                EvalQuestion("slow", ("slow",), references=("A",)),
+                EvalQuestion("fast", ("fast",), references=("A",)),
+            ),
+            request_concurrency=1,
+            recall_limit=1,
+        )
+    )
+    await asyncio.wait_for(slow_started.wait(), timeout=1)
+    await asyncio.sleep(0.05)
+    release_slow.set()
+    slow, fast = await pending
+
+    assert not isinstance(slow, BaseException)
+    assert not isinstance(fast, BaseException)
+    assert fast.latency_ms < slow.latency_ms / 4
 
 
 @pytest.mark.asyncio

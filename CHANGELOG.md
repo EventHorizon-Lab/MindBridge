@@ -43,7 +43,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - Per-record event-time and metadata sequences on `add_many`, retaining one embedding batch and one
   SQLite transaction.
 - Crash-recoverable index replay and rebuild from SQLite without re-embedding stored content.
-- An optional resource-oriented REST API under `/v1` and five typed MCP stdio tools over a
+- An optional resource-oriented REST API under `/v1` and six typed MCP stdio tools over a
   caller-supplied `Memory`.
 - One ordered multimodal contract across Python, REST, and MCP; response assets expose stable
   metadata without leaking local paths over wire protocols.
@@ -103,6 +103,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - `gen_ai.response.finish_reasons` on the generation span, plus
   `mindbridge.grounding.media_elided_hits` and `mindbridge.grounding.dropped_hits` recording the
   retrieved evidence the OpenAI adapter's inline budget removed.
+- An explicit OpenAI-compatible minimum-video setting that converts shorter local videos to four
+  ordered stills before the first request while preserving the existing media budgets and fallback.
 - A `mindbridge` product console script over the shared `Memory` execution plane. Its commands are
   the SDK operations kebab-cased — `add`, `add-many`, `add-stream`, `search`, `search-with-trace`,
   `ask`, `get`, `speech`, `faces`, `register-speaker`, `register-identity`, `reinforce`, `list`,
@@ -138,8 +140,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   remain in the complete aggregate but cannot become independent dense queries.
 - Dense ranking now uses nonnegative cosine separately from rescaled confidence, and exact lexical
   evidence receives a bounded reranking bonus without overriding strong semantic evidence.
-- Jina video preprocessing now adopts Qwen's reference per-frame pixel cap, reducing short-video
-  token cost; its embedding recipe advances so existing stores re-embed instead of mixing recipes.
+- Jina video preprocessing keeps local paths through Transformers' PyAV decoder so source
+  fps/duration metadata drives the pinned Jina recipe's floor-spaced sampling of at most 32 unique
+  frames, while retaining Qwen's reference per-frame pixel cap. Its recipe advances so existing
+  stores re-embed.
+- The benchmark runner performs and records one local query-embedding warmup before timed task
+  spans, so a cloned store cannot charge lazy Jina loading to several concurrent questions.
 - The OpenAI adapter now limits each base64-encoded media item to 20 MiB as well as keeping the
   64 MiB aggregate ceiling. It removes oversized retrieved assets individually, keeps fitting
   siblings from the same hit, and falls back to text when no media from that hit fits.
@@ -209,6 +215,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- Remote product CLI requests now default to a finite 30-second timeout, configurable with the
+  positive `--timeout SECONDS` option. Timeouts use the existing retryable `storage_error` envelope
+  with `reason="timeout"` and `stage="request"` instead of leaving an agent blocked indefinitely.
 - Multi-result `search` and `ask` preserve qualified candidates when the top two scores tie;
   ambiguity abstention now applies only to an unresolved `limit=1` choice.
 - Local Zvec maintenance periodically optimizes and copy-on-write compacts durable segments, so

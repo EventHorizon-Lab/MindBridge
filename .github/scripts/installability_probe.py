@@ -109,12 +109,15 @@ def _observability() -> None:
 
 def _openai() -> None:
     """Build the adapter over a real SDK client without issuing a request."""
+    import av
     from openai import OpenAI
+    from PIL import Image
 
     from mindbridge import OpenAIModels
 
     client = OpenAI(api_key="installability-probe", base_url="http://127.0.0.1:1/v1")
     models = OpenAIModels(client)
+    assert callable(av.open) and Image.Image is not None
     assert models.embedding_dimension > 0
     models.close()
 
@@ -172,7 +175,7 @@ def _server() -> None:
 
 
 def _mcp() -> None:
-    """Build the real MCP server and resolve the five supported tool schemas."""
+    """Build the real MCP server and resolve the six supported tool schemas."""
     import asyncio
 
     from mindbridge import Memory
@@ -189,6 +192,7 @@ def _mcp() -> None:
         "ask_memory",
         "delete_memory",
         "get_memory",
+        "list_memories",
         "search_memories",
     }
 

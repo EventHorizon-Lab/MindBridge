@@ -6,7 +6,7 @@ import threading
 from collections.abc import Callable, Sequence
 from importlib import import_module
 from importlib.util import find_spec
-from types import MethodType
+from types import FunctionType, MethodType
 from typing import cast
 
 from mindbridge.exceptions import ModelError, ValidationError
@@ -26,10 +26,17 @@ from mindbridge.types import Modality
 DEFAULT_JINA_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
 DEFAULT_JINA_REVISION = "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4"
 DEFAULT_JINA_DIMENSION = 1024
-_JINA_RECIPE = "jina-v5-omni-official-sentence-transformers-v4"
-_JINA_LEGACY_RECIPES = frozenset({"jina-v5-omni-official-sentence-transformers-v3"})
+_JINA_RECIPE = "jina-v5-omni-official-sentence-transformers-v6"
+_JINA_LEGACY_RECIPES = frozenset(
+    {
+        "jina-v5-omni-official-sentence-transformers-v3",
+        "jina-v5-omni-official-sentence-transformers-v4",
+        "jina-v5-omni-official-sentence-transformers-v5",
+    }
+)
 _JINA_CAPABILITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
 _JINA_DIMENSIONS = frozenset({32, 64, 128, 256, 512, 1024})
+_JINA_VIDEO_FRAMES = 32
 _ENCODE_METHODS = ("encode", "encode_query", "encode_document")
 _jina_methods: dict[str, Callable[..., object]] | None = None
 
@@ -172,9 +179,7 @@ class _LoadedJinaOmniEmbedder(SentenceTransformersEmbedder):
                 "Jina Omni's media processor is unavailable; install MindBridge with the "
                 "local extra"
             )
-        video_processor = getattr(encoder[0].processor, "video_processor", None)  # type: ignore[index]
-        if video_processor is not None and hasattr(video_processor, "cap_pixels_per_frame"):
-            video_processor.cap_pixels_per_frame = True
+        _configure_jina_video(encoder[0])  # type: ignore[index]
         super().__init__(
             encoder,
             model_id=DEFAULT_JINA_MODEL_ID,
@@ -248,6 +253,101 @@ def _media_processor_missing(encoder: object) -> bool:
     except (IndexError, KeyError, TypeError):
         return True
     return getattr(first, "processor", None) is None
+
+
+def _configure_jina_video(module: object) -> None:
+    processor = getattr(module, "processor", None)
+    video_processor = getattr(processor, "video_processor", None)
+    composite = getattr(module, "_encode_composite_parts", None)
+    required = ("cap_pixels_per_frame", "do_sample_frames", "fps", "max_frames", "num_frames")
+    if (
+        video_processor is None
+        or any(not hasattr(video_processor, name) for name in required)
+        or not isinstance(composite, MethodType)
+        or composite.__self__ is not module
+        or "_eval_video_frames" not in composite.__func__.__code__.co_names
+        or not callable(composite.__func__.__globals__.get("_eval_video_frames"))
+    ):
+        raise ModelError("the pinned Jina video integration is incompatible")
+
+    provider_sample_frames = getattr(video_processor, "sample_frames", None)
+    fetch_videos = getattr(video_processor, "fetch_videos", None)
+    if (
+        not isinstance(provider_sample_frames, MethodType)
+        or provider_sample_frames.__self__ is not video_processor
+        or not isinstance(fetch_videos, MethodType)
+        or fetch_videos.__self__ is not video_processor
+    ):
+        raise ModelError("the pinned Jina video integration is incompatible")
+    load_video = fetch_videos.__func__.__globals__.get("load_video")
+    if not callable(load_video):
+        raise ModelError("the pinned Jina video integration is incompatible")
+
+    source = composite.__func__
+    isolated_globals = dict(source.__globals__)
+    isolated_globals["_eval_video_frames"] = _video_path
+    isolated = FunctionType(
+        source.__code__,
+        isolated_globals,
+        source.__name__,
+        source.__defaults__,
+        source.__closure__,
+    )
+    isolated.__kwdefaults__ = source.__kwdefaults__
+
+    def bounded_sample_frames(
+        _processor: object,
+        metadata: object,
+        **kwargs: object,
+    ) -> object:
+        del kwargs
+        total = getattr(metadata, "total_num_frames", None)
+        if isinstance(total, bool) or not isinstance(total, int) or total <= 0:
+            raise ModelError("video decoder returned invalid frame metadata")
+        import numpy as np
+
+        return np.linspace(0, total - 1, min(total, _JINA_VIDEO_FRAMES), dtype=int)
+
+    def pyav_fetch_videos(
+        _processor: object,
+        videos: object,
+        sample_indices_fn: Callable[..., object] | None = None,
+    ) -> object:
+        return _fetch_jina_videos(load_video, videos, sample_indices_fn)
+
+    try:
+        setattr(module, "_encode_composite_parts", MethodType(isolated, module))  # noqa: B010
+        settings = {
+            "cap_pixels_per_frame": True,
+            "do_sample_frames": True,
+            "fps": None,
+            "max_frames": _JINA_VIDEO_FRAMES,
+            "num_frames": _JINA_VIDEO_FRAMES,
+            "sample_frames": MethodType(bounded_sample_frames, video_processor),
+            "fetch_videos": MethodType(pyav_fetch_videos, video_processor),
+        }
+        for name, value in settings.items():
+            setattr(video_processor, name, value)
+    except (AttributeError, TypeError, ValueError):
+        raise ModelError("the pinned Jina video integration is incompatible") from None
+
+
+def _video_path(value: object) -> object:
+    return value
+
+
+def _fetch_jina_videos(
+    load_video: Callable[..., object],
+    videos: object,
+    sample_indices_fn: Callable[..., object] | None,
+) -> object:
+    if isinstance(videos, list):
+        decoded = (
+            cast(tuple[object, object], _fetch_jina_videos(load_video, video, sample_indices_fn))
+            for video in videos
+        )
+        return list(zip(*decoded, strict=False))
+    return load_video(videos, backend="pyav", sample_indices_fn=sample_indices_fn)
 
 
 def _request(

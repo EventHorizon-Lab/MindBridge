@@ -140,7 +140,9 @@ models = OpenAIModels(
 
 Provider-specific Chat Completions fields remain explicit. For example, an OpenAI-compatible Qwen
 endpoint can bound output with `generation_max_tokens=512` and disable its thinking template with
-`generation_extra_body={"chat_template_kwargs": {"enable_thinking": False}}`.
+`generation_extra_body={"chat_template_kwargs": {"enable_thinking": False}}`. If an endpoint also
+requires a minimum video duration, set `generation_min_video_seconds` to that documented boundary;
+shorter videos use four ordered stills when image input and the `openai` extra are available.
 `generation_video_limit` defaults to eight distinct retrieved videos per answer; overflow videos
 retain their text or transcript evidence. Set a positive integer to calibrate the limit, or `None`
 only when the provider context and latency budget can safely accept every retrieved video.

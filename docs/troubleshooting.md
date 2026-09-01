@@ -101,9 +101,12 @@ HTTP 500, and needs a different MindBridge version or a new directory.
 
 The directory was opened with a different embedding model, embedding space, dimension,
 transcription space, or unknown index recipe. Known older retrieval-key recipes migrate by
-re-embedding automatically, as does the bundled Jina v3-to-v4 input-recipe upgrade. Other
-mismatches require the original adapter or a new directory. `reindex()` itself cannot change stored
-vectors or transcripts.
+re-embedding automatically, as do the bundled Jina v3, v4, and v5 input-recipe upgrades to v6.
+The context-key v6, grouped-range v7, and context-key v8 upgrades to v9 also re-embed records to
+remove opaque identity IDs from retrieval text. Those upgrades load the model and re-embed every
+record, so back up the directory and budget model memory, elapsed time, and free disk before
+startup. Other mismatches require the original adapter or a new directory. `reindex()` itself
+cannot change stored vectors or transcripts.
 
 ## Missing or damaged Zvec index
 
@@ -139,6 +142,20 @@ oversized question asset or embedding input still fails.
 removed, so a shrunken payload is never silent.
 Use a provider-specific adapter that uploads or streams large assets through that provider's SDK.
 MindBridge does not expose local `file://` paths as a compatibility transport.
+
+## A provider rejects a short video
+
+When the provider documents a minimum duration and accepts images, configure that boundary as
+`generation_min_video_seconds` on `OpenAIModels`. A shorter local video is then represented by four
+ordered JPEG stills before the first request, subject to the same inline media budget. This retains
+visual order but not native motion or audio, so leave it disabled unless the provider requires it.
+
+If an OpenAI-compatible provider explicitly reports that a grounded video is too short, the
+adapter retries once using each hit's text and non-video media. It never removes a video supplied
+as part of the question. Inspect `mindbridge.grounding.media_elided_hits` and
+`mindbridge.model.request_count`; the retry is observable and its token total is deliberately
+marked incomplete because the rejected request reports no usage. Other bad requests still fail
+without discarding evidence.
 
 ## Answers fail with `model_output_truncated`
 

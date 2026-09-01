@@ -70,6 +70,8 @@ and two bounds require `occurred_until > occurred_from`. This explicit filter is
 current UTC time. The deterministic parser recognizes:
 
 - one or two ISO dates such as `2026-08-20` or `2026-08-20 ... 2026-08-22`;
+- named English or numeric Chinese months such as `December 2023` or `2024年4月`, and bare
+  calendar years from 1900 through 2199;
 - `today`, `yesterday`, `tomorrow`, and their common Chinese equivalents;
 - last, this, next, or past week, including `上周`, `本周`, and `下周`;
 - last, this, or next month and year, including common Chinese equivalents;
@@ -92,7 +94,7 @@ measured temporal planner.
 
 Decay is off by default. Enable it with `Memory(decay_half_life_days=...)`.
 
-MindBridge over-fetches at least 50 candidates, computes a factor at search time, sorts by adjusted
+MindBridge over-fetches at least 100 candidates, computes a factor at search time, sorts by adjusted
 relevance, clamps public scores to `[0, 1]`, and returns the requested limit. The durable memory is
 never filtered or deleted by decay.
 
