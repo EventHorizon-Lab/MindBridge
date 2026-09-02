@@ -1,4 +1,11 @@
-"""Standalone SQLite + Zvec ingestion and recall benchmark."""
+"""Standalone SQLite + Zvec storage microbenchmark.
+
+This is the narrow storage microbenchmark AGENTS.md allows to touch the local adapters: its
+purpose is to measure SQLite and Zvec directly on synthetic vectors. Its numbers are not
+product ingest or search numbers and must not be reported as such - it never embeds, never
+routes a modality, never prepares media, and never grounds an answer. The end-to-end figures
+the design doc asks for come from ``mindbridge-bench eval``, which drives the public SDK.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
 
+from mindbridge.benchmarks.eval_statistics import percentile
 from mindbridge.infrastructure.local import (
     IndexDocument,
     LocalStore,
@@ -80,6 +88,14 @@ def run_benchmark(
     )
     zvec_bytes = _tree_bytes(root / "index")
     return {
+        "scope": "storage_microbenchmark",
+        "excludes": (
+            "embedding",
+            "modality routing",
+            "media preparation",
+            "generation",
+            "the public Memory API",
+        ),
         "rows": rows,
         "dimension": dimension,
         "queries": queries,
@@ -90,9 +106,9 @@ def run_benchmark(
         "optimize_seconds": optimize_seconds,
         "recall_at_k": recall,
         "query_latency_ms": {
-            "p50": _percentile(latencies, 0.50) * 1_000.0,
-            "p95": _percentile(latencies, 0.95) * 1_000.0,
-            "p99": _percentile(latencies, 0.99) * 1_000.0,
+            "p50": _milliseconds(latencies, 0.50),
+            "p95": _milliseconds(latencies, 0.95),
+            "p99": _milliseconds(latencies, 0.99),
         },
         "query_qps": queries / query_seconds,
         "disk_bytes": {
@@ -236,14 +252,11 @@ def _normalized_fp32(rng: random.Random, fp32: struct.Struct) -> tuple[float, ..
             return fp32.unpack(fp32.pack(*(value / norm for value in values)))
 
 
-def _percentile(values: Sequence[float], quantile: float) -> float:
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * quantile
-    lower = math.floor(position)
-    upper = math.ceil(position)
-    if lower == upper:
-        return ordered[lower]
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+def _milliseconds(values: Sequence[float], quantile: float) -> float:
+    seconds = percentile(values, quantile)
+    if seconds is None:
+        raise ValueError("query latency percentiles need at least one measurement")
+    return seconds * 1_000.0
 
 
 def _tree_bytes(path: Path) -> int:

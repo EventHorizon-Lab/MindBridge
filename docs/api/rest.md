@@ -115,7 +115,7 @@ SDK validator and error contract.
 
 | Method and path | Input | Success |
 | --- | --- | --- |
-| `GET /healthz` | none | `200 {"status":"ok"}` |
+| `GET /healthz` | none | `200 HealthResponse` |
 | `POST /v1/memories` | `MemoryCreate` | `201 MemoryResponse` |
 | `POST /v1/memories/batch` | `MemoryBatchCreate` | `201 {"memories":[...]}` |
 | `GET /v1/memories` | `limit`, `cursor` query parameters | `200 PageResponse` |
@@ -211,6 +211,8 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 | `ReinforceResponse` | `reinforced` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResponse` | `items`, `next_cursor` |
+| `CapabilitiesResponse` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `speaker_recognition`, `streaming_generation` |
+| `HealthResponse` | `status`, `capabilities` |
 
 `modality` is `text`, `image`, `video`, `audio`, or `omni`. `memory_type` is `semantic`,
 `episodic`, or `procedural`. `abstention_reason` is `no_evidence`, `insufficient_evidence`, or
@@ -220,6 +222,41 @@ the authoritative `MemoryContext`: typed kind and basis, confidence, valid and t
 visibility, lineage/source/evidence/supersession IDs, model recipe, optional
 subject/predicate/value, spatial pose, and affect cue fields. It is `null` on a raw record formed
 without typed context. Asset filesystem paths are never serialized.
+
+`/healthz` reports liveness and the composition behind the process, so an operator does not have
+to send a probe write to learn what the deployment can do:
+
+```json
+{
+  "status": "ok",
+  "capabilities": {
+    "embedding": ["audio", "image", "text", "video"],
+    "embedding_model": "jina-v5-omni",
+    "embedding_space": "jina-v5-omni:1024",
+    "embedding_dimension": 1024,
+    "generation": ["text"],
+    "transcription": ["audio"],
+    "vision": [],
+    "face": [],
+    "formation": [],
+    "generation_model": "qwen3-omni",
+    "transcription_space": "funasr-nano:cam++",
+    "vision_model": null,
+    "face_model": null,
+    "formation_model": null,
+    "speaker_recognition": true,
+    "streaming_generation": false
+  }
+}
+```
+
+The six modality lists are the declarations routing reads, sorted for a stable document; an empty
+list means the backend is absent, not that it supports nothing. A `null` model ID means the same.
+`embedding_space` is the value that decides whether stored vectors and a new backend belong to the
+same space. `speaker_recognition` is not derivable from `transcription`: a transcription backend
+and a speech backend occupy one slot and declare the same modalities, but only the second resolves
+speakers, so this is the field that says whether `speech` will work. Values are captured when
+`Memory` is constructed, so the route performs no I/O and no model call.
 
 ## Errors and limits
 
@@ -264,30 +301,39 @@ are never serialized.
 | `memory_not_found` | `memory_not_found` |
 | `speaker_not_found` | `speaker_not_found` |
 | `identity_not_found` | `identity_not_found` |
-| `model_error` | unset, `backend_not_configured`, `unsupported_modality`, `auth_failed`, `rate_limited`, `quota_exhausted`, `timeout`, `connection_failed`, `request_rejected`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed` |
+| `model_error` | unset, `backend_not_configured`, `unsupported_modality`, `auth_failed`, `rate_limited`, `quota_exhausted`, `timeout`, `connection_failed`, `request_rejected`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed`, `model_failed` |
 | `model_output_truncated` | `output_truncated` |
-| `storage_error` | unset, `data_dir_in_use`, `schema_unsupported`, `io_failed` |
-| `index_unavailable` | unset |
+| `storage_error` | unset, `data_dir_in_use`, `schema_unsupported`, `io_failed`, `flush_failed`, `instance_unusable` |
+| `index_unavailable` | unset, `index_missing` |
 | `mindbridge_error` | unset |
 | `internal_error` | `unexpected` |
 | `not_found`, `method_not_allowed`, `http_error` | unset |
 
 `retryable` is true only for `connection_failed`, `data_dir_in_use`, `flush_failed`,
-`index_missing`, `rate_limited`, and `timeout`. `flush_failed` and `index_missing` are reserved
-retry reasons with no current raise site. A retryable 503 response includes `Retry-After: 1`.
+`index_missing`, `rate_limited`, and `timeout`. A retryable 503 response includes `Retry-After: 1`.
 
-HTTP status mapping is:
+The status is a function of `reason` alone, read from one table in `mindbridge.api.errors`. Which
+exception class carried the failure, and which raise site produced it, do not change the answer:
+one condition has one status everywhere, and a reason with no row falls back to a coarse status
+for its `code`. Every 503 is a reason in `RETRYABLE_REASONS` and every retryable reason is a 503,
+in both directions, so a client can act on the status without also reading the reason.
 
-| Status | Failure |
+| Status | `reason` |
 | --- | --- |
-| 404 | unknown route, memory, speaker, or identity |
+| 404 | unknown route; `memory_not_found`, `speaker_not_found`, `identity_not_found` |
 | 405 | method not allowed |
-| 413 | `/v1` request body exceeds 8 MiB |
-| 422 | request or SDK validation; `model_error/unsupported_modality` |
-| 500 | unexpected failure, generic `MindBridgeError`, or `storage_error/schema_unsupported` |
-| 501 | `model_error/backend_not_configured` |
-| 502 | permanent `model_error` or `model_output_truncated` |
-| 503 | other storage/index failures or retryable model failures |
+| 413 | `payload_too_large`, whether the `/v1` request body exceeded 8 MiB or a configured backend rejected one asset as too large |
+| 422 | `input_invalid`, `unsupported_modality` |
+| 500 | `unexpected`, `schema_unsupported`, `io_failed`, `instance_unusable`, or a generic `MindBridgeError` with no reason |
+| 501 | `backend_not_configured` |
+| 502 | `auth_failed`, `quota_exhausted`, `request_rejected`, `response_invalid`, `output_truncated`, `asset_unavailable`, `asset_changed`, `model_failed`, or a `model_error` with no reason |
+| 503 | `connection_failed`, `timeout`, `rate_limited`, `data_dir_in_use`, `flush_failed`, `index_missing`, or a `storage_error` with no reason |
+
+Two rows are worth stating explicitly, because both used to answer twice. `payload_too_large` is
+one condition seen from two sides and both are fixed by sending less, so the provider path no
+longer reports 502. `io_failed` is the coarse label the storage wrapper puts on a failure it
+cannot classify, programming errors included, and it is deliberately not retryable, so it reports
+500 rather than telling a client the condition is transient.
 
 ### Operations without a route
 
@@ -297,11 +343,14 @@ REST has no route for these Python operations:
 | --- | --- |
 | `add_stream` | Send each completed observation to `POST /v1/memories` |
 | `search_with_trace` | Send `POST /v1/memories/search` with `"explain": true` |
-| `speech`, `faces` | Owner-process media analysis |
-| `register_speaker`, `register_identity` | Owner-process identity naming |
-| `reindex`, `optimize` | Owner-process index maintenance |
+| `speech`, `faces` | No route; both have an [MCP tool](mcp.md#tools) |
+| `register_speaker`, `register_identity` | No route; both have an MCP tool |
+| `identity`, `unlink_identity`, `forget_identity` | No route; all three have an MCP tool |
+| `reindex`, `optimize` | Index maintenance an operator schedules |
 
-Use the [Python SDK](python-sdk.md) in the owning process for those operations.
+Use the [Python SDK](python-sdk.md) in the owning process, or the MCP adapter where the table
+names a tool. None of these is a REST limitation: the adapter runs in the process that owns
+`Memory`, so a route is unwritten work rather than an impossibility.
 
 ### Input limits
 

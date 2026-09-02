@@ -283,9 +283,11 @@ map would be worse than returning no result.
 VAD state, complete ASR hypotheses, and acoustic boundaries into those states while keeping one WAV
 buffer per `stream_id`. Native-audio embedders receive audio directly; text-only embedders receive
 external ASR hypotheses or the configured final transcription fallback. Camera and omni adapters
-may instead use `AsyncVisionStream`, which retains the latest encoded frame per scene and routes an
-explicit or plugin-produced visual description to text-only embedders. Provider-specific deltas and
-device SDK values do not enter the kernel.
+may instead use `AsyncVisionStream`, which retains the latest encoded frame per scene and, for a
+text-only embedder, resolves an explicit or plugin-produced visual description early so speculative
+retrieval has a query. Indexing that description is not conditional on the embedder: the durable
+`add` path unions a configured describer's text into the stored document for every embedder.
+Provider-specific deltas and device SDK values do not enter the kernel.
 
 Retrieval failure does not erase a final observation: the commit contains the durable record and a
 stable retrieval error. Consumer cancellation before commit writes nothing. Once the final write
@@ -317,7 +319,8 @@ optional.
 | MCP | optional `context` on `add_memory` | optional `scope` on search/ask | adapters call existing tools after finality |
 | CLI | `--context JSON/@PATH/-`; per-item JSONL context | `--scope JSON/@PATH/-` | finite finalized JSONL remains `add-stream` |
 
-No new MCP tool was added: the six-tool vocabulary remains stable. Typed context is application
+No new MCP tool was added for typed context; the tool vocabulary grew only with the embodied and
+identity operations. Typed context is application
 data about evidence, not an account, tenant, request, or benchmark scope.
 
 ## Remaining priorities

@@ -13,7 +13,7 @@ owns the fact you need.
 
 - [Python SDK](api/python-sdk.md) — complete `mindbridge` root-import contract.
 - [REST API](api/rest.md) — `/v1` schemas, routes, errors, and limits.
-- [MCP tools](api/mcp.md) — six tool schemas and transport boundary.
+- [MCP tools](api/mcp.md) — fourteen tool schemas and transport boundary.
 - [Command line](api/cli.md) — commands, input forms, JSON output, and exit codes.
 
 ## Operate MindBridge
@@ -23,6 +23,13 @@ owns the fact you need.
 - [Operations](operations.md) — backup, recovery, index maintenance, and telemetry.
 - [Security](../SECURITY.md) — trust boundaries, data exposure, and deployment hardening.
 - [Troubleshooting](troubleshooting.md) — diagnose common startup, retrieval, and model failures.
+
+## Understand the direction
+
+- [Product goals and design principles](design-principles.md) — the product target, the design
+  goals, and the criteria a change must answer. States direction, not implemented status.
+- [Plugin architecture](plugin-architecture.md) — the kernel/plugin boundary and the admission rule
+  a new public capability must satisfy.
 
 ## Go deeper
 

@@ -32,6 +32,7 @@ from mindbridge.infrastructure.local import (
     StoredEmbedding,
     StoredMemory,
 )
+from mindbridge.infrastructure.local.store import _SCHEMA_VERSION
 from mindbridge.models.base import (
     FaceAnalysis,
     FaceEmbedding,
@@ -294,7 +295,7 @@ def test_schema_is_local_and_enforces_foreign_keys(tmp_path: Path) -> None:
                     "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
                 )
             )
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
             assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert "tenant" not in schema.casefold()
@@ -361,7 +362,7 @@ def test_schema_v1_is_migrated_atomically_with_text_modality(tmp_path: Path) -> 
         assert legacy.access_count == 0
         assert legacy.assets == ()
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -385,7 +386,7 @@ def test_schema_v2_is_migrated_without_losing_memories(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         assert store.read_memory("preserved") is not None
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -404,7 +405,7 @@ def test_schema_v3_adds_optional_speaker_names(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         with closing(sqlite3.connect(store.database_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(identities)")}
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
         assert "name" in columns
 
 
@@ -424,7 +425,7 @@ def test_schema_v5_adds_optional_event_end(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         with closing(sqlite3.connect(store.database_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(memory_records)")}
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
         assert "occurred_end" in columns
 
 
@@ -515,7 +516,7 @@ def test_schema_v7_adds_transactional_evidence_without_losing_records(tmp_path: 
 
     assert preserved is not None and preserved.content == "A red tool is in drawer two"
     assert {"source_group_id", "recorded_at", "retired_at"} <= columns
-    assert version == 9
+    assert version == _SCHEMA_VERSION
 
 
 @pytest.mark.skipif(sqlite3.sqlite_version_info < (3, 35), reason="DROP COLUMN needs SQLite 3.35")
@@ -551,7 +552,7 @@ def test_schema_v8_adds_identity_profiles_and_link_evidence(tmp_path: Path) -> N
     assert recorded == 1
     assert named == IdentityProfile(identity_id=face_id, name="Alice", relationship="neighbour")
     assert "contributed_modality" in alias_columns
-    assert version == 9
+    assert version == _SCHEMA_VERSION
 
 
 def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:

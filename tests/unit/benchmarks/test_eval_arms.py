@@ -388,7 +388,13 @@ def _sample_with(
 )
 def test_invented_metrics_are_never_stamped_official(metric: str, expected: bool) -> None:
     task, _, _ = _task()
-    arguments = cast(eval_module._Arguments, SimpleNamespace(seed=7, bootstrap_samples=20))
+    # `_metrics` reads `recall_limit` for the retrieval cutoffs and `blind` for the
+    # controls block; both arrived with the arms merge. `_Arguments` bounds
+    # `recall_limit` to 1..100, so 10 is a value the real parser would accept.
+    arguments = cast(
+        eval_module._Arguments,
+        SimpleNamespace(seed=7, bootstrap_samples=20, recall_limit=10, blind=False),
+    )
     sample = _sample_with({metric: 1.0})
 
     result = _metrics(task, (sample,), arguments)
@@ -400,7 +406,13 @@ def test_invented_metrics_are_never_stamped_official(metric: str, expected: bool
 
 def test_a_baseline_arm_never_reports_an_official_metric() -> None:
     task, _, _ = _task()
-    arguments = cast(eval_module._Arguments, SimpleNamespace(seed=7, bootstrap_samples=20))
+    # `_metrics` reads `recall_limit` for the retrieval cutoffs and `blind` for the
+    # controls block; both arrived with the arms merge. `_Arguments` bounds
+    # `recall_limit` to 1..100, so 10 is a value the real parser would accept.
+    arguments = cast(
+        eval_module._Arguments,
+        SimpleNamespace(seed=7, bootstrap_samples=20, recall_limit=10, blind=False),
+    )
     sample = _sample_with({"accuracy": 1.0}, arm="full-context")
 
     result = _metrics(task, (sample,), arguments, arm="full-context")
@@ -470,6 +482,12 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
             seed=7,
             seeds=(7, 7, 7, 7),
             bootstrap_samples=20,
+            # `_results` records the baseline document it was compared against; None is the
+            # in-run case, where the blind arm itself satisfies the control. `blind` reaches
+            # `_controls` as `is_blind_run`: this fake selects arms explicitly rather than via
+            # `--blind`, so it is False.
+            blind_baseline=None,
+            blind=False,
             tasks=(task.spec.name,),
             benchmarks_root=Path("root"),
             data_root=Path("data"),

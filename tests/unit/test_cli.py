@@ -28,6 +28,7 @@ from pydantic import TypeAdapter
 
 from mindbridge import Memory, recipes
 from mindbridge.api import app as rest
+from mindbridge.api import content as rest_content
 from mindbridge.api.errors import ErrorEnvelope
 from mindbridge.cli import COMMANDS, EXIT_CODES, OPERATIONS, main
 from mindbridge.exceptions import MindBridgeError, ValidationError
@@ -46,7 +47,7 @@ from mindbridge.types import (
 )
 
 # The REST content union itself, so the two decoders are compared over one schema.
-_REST_CONTENT: TypeAdapter[rest._Content] = TypeAdapter(rest._Content)
+_REST_CONTENT: TypeAdapter[rest_content.Content] = TypeAdapter(rest_content.Content)
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode("ascii")
 WAV = base64.b64encode(b"RIFF____WAVE").decode("ascii")
 APP_SOURCE = '''
@@ -268,7 +269,7 @@ PART_CASES: tuple[list[dict[str, object]], ...] = (
 def test_parts_decode_exactly_as_rest_decodes_them(parts: list[dict[str, object]]) -> None:
     from mindbridge.cli import _parts_input
 
-    assert _parts_input(parts) == rest._content_input(_REST_CONTENT.validate_python(parts))
+    assert _parts_input(parts) == rest_content.content_input(_REST_CONTENT.validate_python(parts))
 
 
 @pytest.mark.parametrize(
@@ -297,7 +298,7 @@ def test_invalid_parts_are_rejected_by_both_surfaces(parts: list[dict[str, objec
     with pytest.raises(ValidationError):
         _parts_input(parts)
     with pytest.raises(ValueError):
-        rest._content_input(_REST_CONTENT.validate_python(parts))
+        rest_content.content_input(_REST_CONTENT.validate_python(parts))
 
 
 def test_the_cli_only_path_part_reaches_memory_as_a_path(tmp_path: Path) -> None:
@@ -345,7 +346,7 @@ def test_add_search_get_list_and_delete_round_trip(
     trace = cast(dict[str, object], traced_document["trace"])
     candidate = cast(list[dict[str, object]], trace["candidates"])[0]
     assert candidate["memory_id"] == record["id"]
-    assert {"lexical_relevance", "lexical_rerank_bonus", "gate_confidence"} <= candidate.keys()
+    assert {"lexical_relevance", "lexical_rerank_bonus", "gate_relevance"} <= candidate.keys()
 
     status, page, _ = _run(capsys, "--app", app, "-q", "list", "--limit", "1")
     assert status == 0

@@ -154,7 +154,8 @@ SQLite hydration.
 ## Interface and trust boundaries
 
 The `Memory` SDK exposes the complete set of product operations. REST exposes the `/v1` add, batch
-add, search, ask, get, list, and delete subset. MCP exposes six corresponding tools without batch
+add, search, ask, get, list, and delete subset. MCP exposes fourteen tools -- that subset plus
+the embodied and identity operations -- without batch
 add. The local CLI can call the SDK operations; `--url` is limited to operations implemented by
 REST.
 

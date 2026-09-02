@@ -297,6 +297,16 @@ def test_result_table_includes_per_task_time_and_tokens() -> None:
                         "duration_seconds": {"total": 2.5, "average": 1.25},
                         "token_usage": {"total_tokens": 30, "average_tokens": 15.0},
                     },
+                    "controls": {
+                        "random_ranker": None,
+                        "recall_at_1": None,
+                        "recall_at_20": None,
+                        "blind": None,
+                        "is_blind_run": False,
+                        "missing": ["random_ranker", "blind", "recall_at_20"],
+                        "interpretable": False,
+                        "reason": "fixture reports a score without its controls",
+                    },
                 }
             ]
         }
@@ -322,6 +332,20 @@ def test_result_table_reports_the_writes_that_invalidated_a_score() -> None:
                     "question_count": 152,
                     "error_count": 0,
                     "ingest_failure_count": 7784,
+                    # `_table` refuses to render a task row with no controls block, so a
+                    # score can never be printed without the baselines that make it
+                    # interpretable. This row is about the writes column, so the controls
+                    # are all absent and correctly report themselves as missing.
+                    "controls": {
+                        "random_ranker": None,
+                        "recall_at_1": None,
+                        "recall_at_20": None,
+                        "blind": None,
+                        "is_blind_run": False,
+                        "missing": ["random_ranker", "blind", "recall_at_20"],
+                        "interpretable": False,
+                        "reason": "fixture reports a score without random_ranker, blind, recall_at_20",
+                    },
                     "performance": {
                         "duration_seconds": {"total": 1.0, "average": 1.0},
                         "token_usage": {"total_tokens": 1, "average_tokens": 1.0},
@@ -630,7 +654,7 @@ def test_response_cache_namespace_changes_with_runner_recipe(
     assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v10"
     arguments = cast(
         eval_module._Arguments,
-        SimpleNamespace(device=None, seed=7, gen_kwargs="{}", recall_limit=8),
+        SimpleNamespace(device=None, seed=7, gen_kwargs="{}", recall_limit=8, blind=False),
     )
     before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
 
@@ -902,6 +926,7 @@ def test_eval_config_reuses_the_declarative_memory_schema(tmp_path: Path) -> Non
             device="cuda:1",
             recall_limit=20,
             model="mindbridge",
+            blind=False,
         ),
     )
     effective = eval_module._evaluation_memory_config(loaded, model, arguments)
@@ -2049,7 +2074,7 @@ def test_an_unlabelled_beam_difficulty_is_left_out_of_the_breakdown(tmp_path: Pa
 
 
 def _breakdown_arguments() -> SimpleNamespace:
-    return SimpleNamespace(seed=1234, bootstrap_samples=8)
+    return SimpleNamespace(seed=1234, bootstrap_samples=8, recall_limit=20, blind=False)
 
 
 def test_a_task_worded_refusal_counts_as_an_abstention() -> None:

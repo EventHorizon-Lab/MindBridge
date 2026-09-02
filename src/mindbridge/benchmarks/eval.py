@@ -12,6 +12,7 @@ import os
 import platform
 import random
 import re
+import statistics
 import subprocess
 import sys
 import time
@@ -71,15 +72,19 @@ from mindbridge.benchmarks.eval_statistics import (
     ScoredValue,
     paired_comparison,
     parse_choice,
+    percentile,
     summarize,
 )
 from mindbridge.benchmarks.eval_telemetry import (
     BENCHMARK_ANSWER_SPAN,
+    BENCHMARK_INGEST_ITEMS,
+    BENCHMARK_INGEST_SPAN,
     BENCHMARK_JUDGE_SPAN,
     BENCHMARK_SAMPLE,
     BENCHMARK_TASK,
     BENCHMARK_TASK_SPAN,
     EvaluationTelemetry,
+    ResourceSampler,
 )
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.model_config import DEFAULT_TIMEOUT_SECONDS, ModelConfig
@@ -128,6 +133,14 @@ from mindbridge.models.jina import (
 )
 from mindbridge.models.openai_sdk import _model_usage, _record_usage_batch
 
+# Measured on this harness: a per-benchmark difference under three points is inside the run to
+# run noise band, whose per-question standard deviation is about seventeen points.
+NOISE_FLOOR = 0.03
+# Gold retrieval evidence is only carried by the adapters that received source-level labels.
+_GOLD_EVIDENCE_KEYS = ("evidence_ids", "clue_ids")
+_UNRESOLVED_EVIDENCE_KEY = "unresolved_evidence_ids"
+_RECALL_CUTOFFS = (1, 5, 10, 20)
+_MANDATORY_CONTROLS = ("random_ranker", "blind", "recall_at_20")
 EVAL_SCHEMA_VERSION = 9
 EVAL_RUNNER_VERSION = "mindbridge_eval_official_v10"
 DEFAULT_ARM = "mindbridge"
@@ -233,6 +246,8 @@ class _Arguments:
     device: str | None
     device_lock: bool
     compare: Path | None
+    blind: bool
+    blind_baseline: Path | None
     fail_on_regression: bool
     regression_threshold: float
     predict_only: bool
@@ -301,6 +316,10 @@ class SampleResult:
     error_code: str | None
     metadata: Mapping[str, object]
     arm: str = DEFAULT_ARM
+    # Two different denominators, both needed. `candidate_count` is the pool a ranker could have
+    # drawn from, which is what makes the random-ranker expectation meaningful;
+    # `retrieval_candidates` is how deep the retriever's own ranked list actually went.
+    candidate_count: int = 0
     retrieval_candidates: int = 0
     dropped_hits: int | None = None
     abstained: bool = False
@@ -347,6 +366,7 @@ class SampleResult:
             "latency_ms": self.latency_ms,
             "confidence": self.confidence,
             "memory_ids": self.memory_ids,
+            "candidate_count": self.candidate_count,
             "evidence": tuple(item.json() for item in self.evidence),
             "ref_at_300": self.ref_at_300,
             "metrics": dict(self.metrics),
@@ -852,7 +872,7 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
     config = _evaluation_config(base_config, loaded)
     memory_config = _evaluation_memory_config(memory_config, config, arguments)
     batch_sizes = {task.spec.name: _batch_size(arguments, task) for task in loaded}
-    samples, duration, performance = _execute(
+    samples, duration, performance, resources = _execute(
         loaded,
         arguments,
         config,
@@ -876,12 +896,15 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         submission_status,
         performance,
         memory_config=memory_config,
+        resources=resources,
     )
     comparisons = _comparisons(arguments, loaded, samples)
     if comparisons:
         results["comparisons"] = comparisons
     _write_artifacts(arguments, samples, results, submission_bytes)
     _announce_submission(arguments, submission_status)
+    for reason in _uninterpretable_tasks(results):
+        _announce(f"UNINTERPRETABLE: {reason}")
     if not arguments.quiet:
         print(_table(results))
     has_errors = any(
@@ -1042,7 +1065,9 @@ def _execute(
     batch_sizes: Mapping[str, int],
     *,
     memory_config: MindBridgeConfig | None,
-) -> tuple[tuple[SampleResult, ...], float, Mapping[str, Mapping[str, object]]]:
+) -> tuple[
+    tuple[SampleResult, ...], float, Mapping[str, Mapping[str, object]], Mapping[str, object]
+]:
     needs_speech = any(
         isinstance(atom, Path)
         and _MODALITY_BY_SUFFIX.get(atom.suffix.casefold()) in {Modality.AUDIO, Modality.VIDEO}
@@ -1053,6 +1078,7 @@ def _execute(
     )
     started = time.perf_counter()
     telemetry = EvaluationTelemetry()
+    sampler = ResourceSampler(storage_root=arguments.data_root)
     try:
         response_cache = (
             None
@@ -1097,18 +1123,19 @@ def _execute(
                         tracer=telemetry.tracer,
                     )
                     memory_factory = pool.memory
-                samples = asyncio.run(
-                    _run_all(
-                        loaded,
-                        arguments,
-                        batch_sizes=batch_sizes,
-                        memory_factory=memory_factory,
-                        response_cache=response_cache,
-                        tracer=telemetry.tracer,
-                        config=config,
-                        memory_config=memory_config,
+                with sampler:
+                    samples = asyncio.run(
+                        _run_all(
+                            loaded,
+                            arguments,
+                            batch_sizes=batch_sizes,
+                            memory_factory=memory_factory,
+                            response_cache=response_cache,
+                            tracer=telemetry.tracer,
+                            config=config,
+                            memory_config=memory_config,
+                        )
                     )
-                )
             finally:
                 if pool is not None:
                     closing = pool
@@ -1138,7 +1165,8 @@ def _execute(
             )
             for task in loaded
         }
-        return samples, time.perf_counter() - started, performance
+        duration = time.perf_counter() - started
+        return samples, duration, performance, sampler.json(wall_seconds=duration)
     finally:
         telemetry.close()
 
@@ -1373,6 +1401,7 @@ async def _run_unit(
                         memories[pending:end],
                         batch_size=batch_size,
                         on_failure=ingest_failure_details.append,
+                        tracer=tracer,
                     )
                 pending = end
                 context = (
@@ -1576,6 +1605,25 @@ def _cache_outcome(
     )
 
 
+@contextmanager
+def _durable_write(tracer: Tracer | None, count: int) -> Iterator[None]:
+    """Time one accepted batch through to durable, searchable memory.
+
+    ``add``/``add_many`` return only after SQLite commits, Zvec flushes, and the search-index
+    outbox is acknowledged, so this span measures accepted input to durable and searchable
+    memory rather than the time until the call was accepted.
+    """
+    if tracer is None:
+        yield
+        return
+    with traced_span(
+        tracer,
+        BENCHMARK_INGEST_SPAN,
+        attributes={SPAN_KIND: "stage", BENCHMARK_INGEST_ITEMS: count},
+    ):
+        yield
+
+
 def _declined(answer: str, question: EvalQuestion) -> bool:
     """Report a refusal a task worded itself, which the product cannot recognise."""
     return question.refusal is not None and answer.strip().rstrip(".") == (
@@ -1589,17 +1637,22 @@ async def _ingest(
     *,
     batch_size: int,
     on_failure: Callable[[FailureDetail], None] | None = None,
+    tracer: Tracer | None = None,
 ) -> int:
+    # An arm that reads no memory never reaches here: `_run_unit` skips ingestion for it, so the
+    # blind control cannot accidentally score a store it was supposed to run without.
+
     async def add_chunk(chunk: Sequence[MemoryItem]) -> int:
         contents = tuple(_memory_content(item) for item in chunk)
         try:
-            await memory.add_many(
-                contents,
-                occurred_at=tuple(item.occurred_at for item in chunk),
-                occurred_end=tuple(item.occurred_end for item in chunk),
-                metadata=tuple(_memory_metadata(item) for item in chunk),
-                memory_type=MemoryType.EPISODIC,
-            )
+            with _durable_write(tracer, len(chunk)):
+                await memory.add_many(
+                    contents,
+                    occurred_at=tuple(item.occurred_at for item in chunk),
+                    occurred_end=tuple(item.occurred_end for item in chunk),
+                    metadata=tuple(_memory_metadata(item) for item in chunk),
+                    memory_type=MemoryType.EPISODIC,
+                )
             return 0
         except IndexUnavailableError:
             raise
@@ -1608,13 +1661,14 @@ async def _ingest(
                 middle = len(chunk) // 2
                 return await add_chunk(chunk[:middle]) + await add_chunk(chunk[middle:])
         try:
-            await memory.add(
-                contents[0],
-                occurred_at=chunk[0].occurred_at,
-                occurred_end=chunk[0].occurred_end,
-                metadata=_memory_metadata(chunk[0]),
-                memory_type=MemoryType.EPISODIC,
-            )
+            with _durable_write(tracer, 1):
+                await memory.add(
+                    contents[0],
+                    occurred_at=chunk[0].occurred_at,
+                    occurred_end=chunk[0].occurred_end,
+                    metadata=_memory_metadata(chunk[0]),
+                    memory_type=MemoryType.EPISODIC,
+                )
         except IndexUnavailableError:
             raise
         except Exception as error:
@@ -1629,6 +1683,12 @@ async def _ingest(
             for offset in range(0, len(items), batch_size)
         ]
     )
+
+
+def _candidate_count(unit: EvalUnit, question: EvalQuestion) -> int:
+    """Count distinct sources a ranker could return for one question at its cutoff."""
+    boundary = math.inf if question.cutoff_seconds is None else question.cutoff_seconds
+    return len({item.source_id for item in unit.memories if _memory_end(item) <= boundary})
 
 
 async def _answer_many(
@@ -1886,6 +1946,7 @@ def _sample(
         latency_ms=latency_ms,
         confidence=confidence,
         memory_ids=memory_ids,
+        candidate_count=_candidate_count(unit, question),
         ingest_failure_count=ingest_failures,
         ingest_failures=ingest_failure_details,
         error_code=error_code,
@@ -2342,13 +2403,21 @@ def _results(
     performance: Mapping[str, Mapping[str, object]],
     *,
     memory_config: MindBridgeConfig | None = None,
+    resources: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
+    # A blind arm run here is the same control as an external `--blind` document, measured on the
+    # same inputs, so it satisfies the blind control too. An explicitly supplied document still
+    # wins: the caller named it.
+    blind_rows = {
+        **_in_run_blind_rows(arguments, tasks, samples),
+        **_blind_baseline_rows(arguments.blind_baseline, tasks),
+    }
     task_rows = []
     for task, arm in ((task, arm) for task in tasks for arm in arguments.arms):
         selected = tuple(
             sample for sample in samples if sample.task == task.spec.name and sample.arm == arm
         )
-        metrics = _metrics(task, selected, arguments, arm=arm)
+        metrics = _metrics(task, selected, arguments, blind_rows.get(task.spec.name), arm=arm)
         if (
             task.spec.name == "egomemreason"
             and submission_status is not None
@@ -2382,6 +2451,7 @@ def _results(
                 "input_sha256": dict(task.input_sha256),
                 "evaluation_sha256": task.evaluation_sha256,
                 "batch_size": batch_sizes[task.spec.name],
+                "input_modalities": _task_modalities(task),
                 "performance": dict(performance.get(task.spec.name, {})),
                 **metrics,
             }
@@ -2415,6 +2485,13 @@ def _results(
         "cached_response_count": sum(sample.cached for sample in samples),
         "cached_judge_count": sum(sample.judge_cached for sample in samples),
         "abstentions": _abstentions(samples),
+        "blind": arguments.blind,
+        "blind_baseline": (
+            None if arguments.blind_baseline is None else str(arguments.blind_baseline)
+        ),
+        "controls_complete": all(
+            cast(Mapping[str, object], row["controls"])["interpretable"] for row in task_rows
+        ),
         "allow_unverified_data": arguments.allow_unverified_data,
         "limit": arguments.limit,
         "offset": arguments.offset,
@@ -2438,9 +2515,15 @@ def _results(
         "environment": {
             "mindbridge_version": _version("mindbridge"),
             "zvec_version": _version("zvec"),
+            "runtime_versions": {
+                name: _version(name)
+                for name in ("torch", "transformers", "opentelemetry-sdk", "openai", "funasr")
+            },
             "python_version": platform.python_version(),
             "platform": platform.platform(),
+            "hardware": _hardware(),
         },
+        "resources": None if resources is None else dict(resources),
         "tasks": task_rows,
     }
 
@@ -2530,6 +2613,38 @@ def _model_result(
     return result
 
 
+def _task_modalities(task: LoadedTask) -> list[str]:
+    """List the atomic input modalities this task actually routes through the SDK."""
+    modalities = (
+        {Modality.TEXT.value}
+        if any(
+            isinstance(atom, str)
+            for unit in task.units
+            for item in unit.memories
+            for atom in item.content
+        )
+        else set()
+    )
+    for unit in task.units:
+        for item in unit.memories:
+            for atom in item.content:
+                if isinstance(atom, Path):
+                    modality = _MODALITY_BY_SUFFIX.get(atom.suffix.casefold())
+                    if modality is not None:
+                        modalities.add(modality.value)
+    return sorted(modalities)
+
+
+def _hardware() -> dict[str, object]:
+    """Record the hardware facts a quality claim has to identify."""
+    return {
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "logical_cores": os.cpu_count(),
+        "cuda_device_uuids": {str(index): uuid for index, uuid in _nvidia_device_uuids().items()},
+    }
+
+
 def _configured_device_label(explicit: str | None, config: MindBridgeConfig) -> str:
     if explicit is not None:
         return explicit
@@ -2552,6 +2667,7 @@ def _metrics(
     task: LoadedTask,
     samples: Sequence[SampleResult],
     arguments: _Arguments,
+    blind: Mapping[str, object] | None = None,
     *,
     arm: str = DEFAULT_ARM,
 ) -> dict[str, object]:
@@ -2601,6 +2717,12 @@ def _metrics(
             ),
         }
     latencies = sorted(sample.latency_ms for sample in samples if sample.latency_ms > 0)
+    retrieval = _retrieval_quality(
+        samples,
+        seed=seed,
+        bootstrap_samples=arguments.bootstrap_samples,
+        recall_limit=arguments.recall_limit,
+    )
     error_count = sum(sample.error_code is not None for sample in samples)
     ingest_failure_count = sum(
         max(sample.ingest_failure_count for sample in samples if sample.unit_id == unit_id)
@@ -2628,10 +2750,25 @@ def _metrics(
         "error_count": error_count,
         "ingest_failure_count": ingest_failure_count,
         "abstentions": _abstentions(samples),
-        "latency_ms": {
-            "p50": _percentile(latencies, 0.50),
-            "p95": _percentile(latencies, 0.95),
+        "answer_latency_ms": {
+            "measures": (
+                "memory.ask wall clock per question, timed after concurrency admission so it "
+                "is response latency and not queue depth"
+            ),
+            "count": len(latencies),
+            "p50": percentile(latencies, 0.50),
+            "p95": percentile(latencies, 0.95),
+            "p99": percentile(latencies, 0.99),
         },
+        "retrieval": retrieval,
+        "controls": _controls(task.spec.name, retrieval, blind, is_blind_run=arguments.blind),
+        "noise_floor": _noise_floor(scored, primary),
+        "cross_harness_comparable": False,
+        "comparability_note": (
+            "scores are comparable only against runs of this harness at the same runner "
+            "version, dataset revision, and scorer protocol. LoCoMo has ranged from 28.0 to "
+            "92.5 across harnesses on identical data"
+        ),
         "breakdowns": _metric_breakdowns(task, samples, arguments),
     }
     if task.spec.name == "video-mme" and scored:
@@ -2686,6 +2823,238 @@ def _metrics(
         result["ref_at_300"] = ref_summary
         metric_rows["ref_at_300"] = ref_summary
     return result
+
+
+def _metadata_ids(metadata: Mapping[str, object], key: str) -> tuple[str, ...]:
+    value = metadata.get(key)
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    return tuple(str(item) for item in value if str(item).strip())
+
+
+def _retrieved_sources(sample: SampleResult) -> tuple[str, ...]:
+    """Return the retrieved source IDs in rank order, deduplicated."""
+    return tuple(dict.fromkeys(item.source_id for item in sample.evidence if item.source_id).keys())
+
+
+def _retrieval_quality(
+    samples: Sequence[SampleResult],
+    *,
+    seed: int,
+    bootstrap_samples: int,
+    recall_limit: int,
+) -> dict[str, object]:
+    """Report recall at every cutoff next to the random-ranker expectation.
+
+    R@20 is the measured retrieval ceiling on this harness and a perfect reranker buys only a
+    few points, so R@1 is never reported without it. The random-ranker row is the exact
+    expectation for a uniform ranker over the same candidate pool, which is what makes a high
+    recall interpretable: a pool of ten candidates already gives R@10 = 1.0 by chance.
+    """
+    key = next(
+        (
+            name
+            for name in _GOLD_EVIDENCE_KEYS
+            if any(_metadata_ids(sample.metadata, name) for sample in samples)
+        ),
+        None,
+    )
+    # A published evidence ID that named no stored memory. An adapter that joins a
+    # separate label list onto its own source IDs reports what did not match, so a
+    # release whose label vocabulary is not the source-ID vocabulary shows up here
+    # instead of as a plausible recall number over the handful that happened to join.
+    unresolved = sum(
+        len(_metadata_ids(sample.metadata, _UNRESOLVED_EVIDENCE_KEY)) for sample in samples
+    )
+    if key is None:
+        return {
+            "gold_evidence_key": None,
+            "recall_limit": recall_limit,
+            "labelled_question_count": 0,
+            "recall_at_k": {},
+            "random_ranker_recall_at_k": {},
+            "unresolved_gold_evidence_ids": unresolved,
+            "unavailable_reason": (
+                "this task adapter carries no gold evidence source IDs, so retrieval quality "
+                "cannot be measured at these retrieval settings"
+            ),
+        }
+    labelled = tuple(sample for sample in samples if _metadata_ids(sample.metadata, key))
+    measured: dict[int, list[ScoredValue]] = {cutoff: [] for cutoff in _RECALL_CUTOFFS}
+    random_ranker: dict[int, list[ScoredValue]] = {cutoff: [] for cutoff in _RECALL_CUTOFFS}
+    pool_sizes = []
+    for sample in labelled:
+        gold = set(_metadata_ids(sample.metadata, key))
+        retrieved = _retrieved_sources(sample)
+        pool = sample.candidate_count
+        pool_sizes.append(pool)
+        for cutoff in _RECALL_CUTOFFS:
+            measured[cutoff].append(
+                ScoredValue(
+                    sample.sample_id,
+                    sample.unit_id,
+                    len(set(retrieved[:cutoff]) & gold) / len(gold),
+                )
+            )
+            if pool > 0:
+                random_ranker[cutoff].append(
+                    ScoredValue(sample.sample_id, sample.unit_id, min(1.0, cutoff / pool))
+                )
+
+    def rows(values: Mapping[int, Sequence[ScoredValue]]) -> dict[str, object]:
+        return {
+            str(cutoff): summarize(
+                tuple(values[cutoff]),
+                seed=_task_seed(seed, f"recall@{cutoff}"),
+                bootstrap_samples=bootstrap_samples,
+                clamp=(0.0, 1.0),
+            )
+            for cutoff in _RECALL_CUTOFFS
+            if values[cutoff]
+        }
+
+    return {
+        "gold_evidence_key": key,
+        "recall_limit": recall_limit,
+        "labelled_question_count": len(labelled),
+        "unresolved_gold_evidence_ids": unresolved,
+        "recall_at_k": rows(measured),
+        "random_ranker_recall_at_k": rows(random_ranker),
+        "random_ranker_method": (
+            "exact expectation min(1, k / candidate_pool_size) for a uniformly random ranker"
+        ),
+        "candidate_pool_size": {
+            "min": min(pool_sizes, default=None),
+            "max": max(pool_sizes, default=None),
+            "mean": statistics.fmean(pool_sizes) if pool_sizes else None,
+        },
+        "truncated_cutoffs": [cutoff for cutoff in _RECALL_CUTOFFS if cutoff > recall_limit],
+    }
+
+
+def _noise_floor(scored: Sequence[ScoredValue], primary: Mapping[str, object]) -> dict[str, object]:
+    """Report the smallest difference this run size can resolve."""
+    values = tuple(value.value for value in scored)
+    error = primary.get("cluster_standard_error")
+    standard_error = error if isinstance(error, float) else None
+    resolvable = NOISE_FLOOR
+    if standard_error is not None:
+        resolvable = max(NOISE_FLOOR, 1.959963984540054 * standard_error * math.sqrt(2))
+    return {
+        "floor": NOISE_FLOOR,
+        "per_question_standard_deviation": (statistics.stdev(values) if len(values) > 1 else None),
+        "cluster_standard_error": standard_error,
+        "minimum_meaningful_difference": resolvable,
+        "note": (
+            "a difference smaller than minimum_meaningful_difference is inside this run's "
+            "noise band and is not a result"
+        ),
+    }
+
+
+def _controls(
+    task_name: str,
+    retrieval: Mapping[str, object],
+    blind: Mapping[str, object] | None,
+    *,
+    is_blind_run: bool,
+) -> dict[str, object]:
+    """Report the three controls that make a score interpretable, and which are absent.
+
+    Each of these has independently invalidated a conclusion on this project: a random ranker
+    reached R@10 = 0.9941 on one benchmark, blind answering already scores 0.383 on another,
+    and R@1 moving without R@20 moving is noise.
+    """
+    recall = retrieval.get("recall_at_k")
+    random_ranker = retrieval.get("random_ranker_recall_at_k")
+    recall_rows = recall if isinstance(recall, Mapping) else {}
+    random_rows = random_ranker if isinstance(random_ranker, Mapping) else {}
+    present = {
+        "random_ranker": bool(random_rows),
+        "recall_at_20": "20" in recall_rows and "1" in recall_rows,
+        "blind": is_blind_run or blind is not None,
+    }
+    missing = tuple(name for name in _MANDATORY_CONTROLS if not present[name])
+    return {
+        "random_ranker": {str(k): v for k, v in random_rows.items()} or None,
+        "recall_at_1": recall_rows.get("1"),
+        "recall_at_20": recall_rows.get("20"),
+        "blind": None if blind is None else dict(blind),
+        "is_blind_run": is_blind_run,
+        "missing": list(missing),
+        "interpretable": not missing,
+        "reason": (
+            None
+            if not missing
+            else (
+                f"{task_name} reports a score without "
+                + ", ".join(missing)
+                + "; the score is not interpretable as a memory-quality result"
+            )
+        ),
+    }
+
+
+def _in_run_blind_rows(
+    arguments: _Arguments,
+    tasks: Sequence[LoadedTask],
+    samples: Sequence[SampleResult],
+) -> dict[str, dict[str, object]]:
+    """Report this run's own blind arm as the blind control, when it was one of the arms."""
+    if "blind" not in arguments.arms:
+        return {}
+    rows: dict[str, dict[str, object]] = {}
+    for task in tasks:
+        scores = [
+            sample.score
+            for sample in samples
+            if sample.task == task.spec.name and sample.arm == "blind" and sample.score is not None
+        ]
+        if not scores:
+            continue
+        rows[task.spec.name] = {
+            "run_id": arguments.run_id,
+            "primary_metric": task_primary_metric(task.spec.name),
+            "mean": statistics.fmean(scores),
+            "question_count": len(scores),
+            "source": f"blind arm of this run, prompt {BLIND_PROMPT_VERSION}",
+        }
+    return rows
+
+
+def _blind_baseline_rows(
+    path: Path | None, tasks: Sequence[LoadedTask]
+) -> dict[str, dict[str, object]]:
+    """Load per-task scores from a prior --blind run of the same evaluation inputs."""
+    if path is None:
+        return {}
+    resolved = path.expanduser().resolve()
+    document_path = resolved / _RESULTS_FILE if resolved.is_dir() else resolved
+    if not document_path.is_file():
+        raise FileNotFoundError(f"blind baseline does not exist: {document_path}")
+    document = json.loads(document_path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ValueError("blind baseline must be a results.json document")
+    if document.get("blind") is not True:
+        raise ValueError("blind baseline must come from a run started with --blind")
+    if document.get("schema_version") != EVAL_SCHEMA_VERSION:
+        raise ValueError("blind baseline schema version is unsupported")
+    digests = {task.spec.name: task.evaluation_sha256 for task in tasks}
+    rows: dict[str, dict[str, object]] = {}
+    for row in document.get("tasks", ()):
+        name = row.get("task") if isinstance(row, Mapping) else None
+        if not isinstance(name, str) or name not in digests:
+            continue
+        if row.get("evaluation_sha256") != digests[name]:
+            raise ValueError(f"blind baseline evaluation inputs differ for {name}")
+        score = row.get("score")
+        rows[name] = {
+            "run_id": document.get("run_id"),
+            "primary_metric": row.get("primary_metric"),
+            "mean": score.get("mean") if isinstance(score, Mapping) else None,
+            "question_count": row.get("question_count"),
+        }
+    return rows
 
 
 def _abstentions(samples: Sequence[SampleResult]) -> dict[str, object]:
@@ -2942,16 +3311,22 @@ def _comparisons(
             continue
         if not previous:
             raise ValueError(f"baseline has no scored samples for {task.spec.name}")
+        comparison = paired_comparison(
+            current,
+            previous,
+            seed=_task_seed(arguments.seed, task.spec.name),
+            bootstrap_samples=arguments.bootstrap_samples,
+        )
+        delta = comparison.get("mean")
         rows.append(
             {
                 "task": task.spec.name,
                 "metric": _comparison_metric(task),
-                **paired_comparison(
-                    current,
-                    previous,
-                    seed=_task_seed(arguments.seed, task.spec.name),
-                    bootstrap_samples=arguments.bootstrap_samples,
+                "noise_floor": NOISE_FLOOR,
+                "below_noise_floor": (
+                    None if not isinstance(delta, float) else abs(delta) < NOISE_FLOOR
                 ),
+                **comparison,
             }
         )
     return rows
@@ -3195,6 +3570,7 @@ def _table(results: Mapping[str, object]) -> str:
         performance = cast(Mapping[str, object], task["performance"])
         duration = cast(Mapping[str, object], performance["duration_seconds"])
         usage = cast(Mapping[str, object], performance["token_usage"])
+        controls = cast(Mapping[str, object], task["controls"])
         mean = score.get("mean")
         interval = score.get("confidence_interval_95")
         total_duration = duration.get("total")
@@ -3248,6 +3624,19 @@ def _table(results: Mapping[str, object]) -> str:
                     or not isinstance(average_tokens, int | float)
                     else f"{float(average_tokens):.1f}"
                 ),
+                _control_cell(controls.get("recall_at_1")),
+                _control_cell(controls.get("recall_at_20")),
+                _control_cell(
+                    cast(Mapping[str, object], controls["random_ranker"]).get("20")
+                    if isinstance(controls.get("random_ranker"), Mapping)
+                    else None
+                ),
+                ("SELF" if controls.get("is_blind_run") else _control_cell(controls.get("blind"))),
+                (
+                    "ok"
+                    if controls.get("interpretable")
+                    else "MISSING " + ",".join(cast(Sequence[str], controls.get("missing", ())))
+                ),
             )
         )
     headers = (
@@ -3265,6 +3654,11 @@ def _table(results: Mapping[str, object]) -> str:
         "avg ms",
         "tokens",
         "tokens/q",
+        "R@1",
+        "R@20",
+        "rand@20",
+        "blind",
+        "controls",
     )
     widths = tuple(
         max(len(row[index]) for row in (headers, *rows)) for index in range(len(headers))
@@ -3272,6 +3666,26 @@ def _table(results: Mapping[str, object]) -> str:
     return "\n".join(
         "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)).rstrip()
         for row in (headers, *rows)
+    )
+
+
+def _control_cell(value: object) -> str:
+    """Render one control value, and never let an absent control render as a number."""
+    if not isinstance(value, Mapping):
+        return "MISSING"
+    mean = value.get("mean")
+    if isinstance(mean, bool) or not isinstance(mean, int | float):
+        return "MISSING"
+    return f"{float(mean):.4f}"
+
+
+def _uninterpretable_tasks(results: Mapping[str, object]) -> tuple[str, ...]:
+    """Return the tasks whose mandatory controls are absent."""
+    tasks = cast(Sequence[Mapping[str, object]], results["tasks"])
+    return tuple(
+        str(cast(Mapping[str, object], task["controls"])["reason"])
+        for task in tasks
+        if not cast(Mapping[str, object], task["controls"])["interpretable"]
     )
 
 
@@ -3378,6 +3792,20 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         help="SQLite response-cache directory or .db file",
     )
     parser.add_argument("--compare", type=Path, help="prior result directory or samples.jsonl")
+    parser.add_argument(
+        "--blind",
+        action="store_true",
+        help=(
+            "run the no-memory control: answer every question through the public path with "
+            "nothing ingested, so the score measures the generator instead of the memory"
+        ),
+    )
+    parser.add_argument(
+        "--blind-baseline",
+        "--blind_baseline",
+        type=Path,
+        help="results.json from a --blind run of the same evaluation inputs",
+    )
     parser.add_argument("--fail-on-regression", action="store_true")
     parser.add_argument("--regression-threshold", type=_nonnegative_float, default=0.0)
     parser.add_argument("--predict-only", "--predict_only", "-x", action="store_true")
@@ -3400,15 +3828,29 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     return parser
 
 
-def _arguments(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> _Arguments:
-    if parsed.model != "mindbridge":
-        parser.error("--model must be mindbridge")
+def _selected_arms(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> tuple[str, ...]:
+    """Resolve which arms this run answers, coupling `--blind` to the arm that has no evidence."""
     arms = tuple(dict.fromkeys(part.strip() for part in parsed.arms.split(",") if part.strip()))
     if not arms:
         parser.error("--arms must name at least one arm")
     unknown = tuple(name for name in arms if name not in ARMS)
     if unknown:
         parser.error(f"unknown arm(s): {', '.join(unknown)}; choose from {', '.join(ARMS)}")
+    if not parsed.blind:
+        return arms
+    # `--blind` labels the whole run as the control, in the results document and in the
+    # response-cache namespace, so it has to select the arm that actually answers without
+    # evidence. Leaving the product arm running under that label is how a memory-backed run gets
+    # published as its own baseline.
+    if parsed.arms != DEFAULT_ARM and arms != ("blind",):
+        parser.error("--blind runs the blind arm alone; drop --arms or pass --arms blind")
+    return ("blind",)
+
+
+def _arguments(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> _Arguments:
+    if parsed.model != "mindbridge":
+        parser.error("--model must be mindbridge")
+    arms = _selected_arms(parser, parsed)
     if not parsed.tasks:
         parser.error("--tasks is required unless --list-tasks is used")
     if parsed.fail_on_regression and parsed.compare is None:
@@ -3464,6 +3906,10 @@ def _arguments(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> _
         device=parsed.device,
         device_lock=parsed.device_lock,
         compare=parsed.compare,
+        blind=parsed.blind,
+        blind_baseline=(
+            None if parsed.blind_baseline is None else parsed.blind_baseline.expanduser().resolve()
+        ),
         fail_on_regression=parsed.fail_on_regression,
         regression_threshold=parsed.regression_threshold,
         predict_only=parsed.predict_only,
@@ -3807,6 +4253,7 @@ def _cache_namespace(
         "gen_kwargs": arguments.gen_kwargs,
         "generation_min_video_seconds": config.generation_min_video_seconds,
         "recall_limit": arguments.recall_limit,
+        "blind": arguments.blind,
         "batch_sizes": dict(sorted(batch_sizes.items())),
     }
     if memory_config is not None:
@@ -3844,16 +4291,6 @@ def _all_cached(
 
 def _cache_only_memory(_path: Path) -> _MemoryContext:
     raise RuntimeError("response cache was incomplete after the cache-only preflight")
-
-
-def _percentile(values: Sequence[float], probability: float) -> float | None:
-    if not values:
-        return None
-    position = probability * (len(values) - 1)
-    lower = int(position)
-    upper = min(lower + 1, len(values) - 1)
-    weight = position - lower
-    return values[lower] * (1 - weight) + values[upper] * weight
 
 
 def _version(distribution: str) -> str:
