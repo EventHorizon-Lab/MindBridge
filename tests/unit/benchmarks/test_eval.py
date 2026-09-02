@@ -1255,6 +1255,48 @@ async def test_answer_failure_preserves_independent_retrieval_diagnostics(tmp_pa
     assert sample.evidence[0].source_id == "source-1"
 
 
+def test_a_provider_error_leaves_the_answer_unscored_but_keeps_retrieval(tmp_path: Path) -> None:
+    """A 500 is a missing answer, not a wrong one.
+
+    Scoring the empty prediction gave every provider failure an f1 of 0.0 and deflated the
+    arms unevenly (one run: blind errored 3.4x more than the product arm). The retriever
+    did rank before the generator failed, so its diagnostics stay.
+    """
+    question = EvalQuestion(
+        "q1",
+        ("question",),
+        references=("answer",),
+        metadata={"clue_ids": ("gold",)},
+    )
+    unit = EvalUnit("unit", (MemoryItem("gold", ("the answer",)),), (question,))
+    # Mem-Gallery scores answers deterministically (f1 of "" is 0.0), so this family shows
+    # the difference between "unscored" and "scored zero"; ATM's answer score is judge-only.
+    task = LoadedTask(
+        TaskSpec("mem-gallery", "Mem-Gallery", "fixture.json", "v1", "owner/repo", "0" * 40),
+        tmp_path / "fixture.json",
+        "1" * 64,
+        (unit,),
+    )
+    outcome = eval_module._AnswerOutcome(
+        "",
+        12.0,
+        0.0,
+        (),
+        (),
+        error=ModelError("upstream 500", reason="model_failed", stage="generate"),
+        ranked_source_ids=("gold", "other"),
+    )
+
+    sample = eval_module._sample(
+        task, unit, question, outcome, ingest_failures=0, predict_only=False, log_samples=False
+    )
+
+    assert sample.error_code == "model_error"
+    assert sample.score is None
+    assert sample.metrics and all(name.startswith("retrieval_") for name in sample.metrics)
+    assert "f1" not in sample.metrics
+
+
 def test_run_identifier_cannot_escape_the_default_output_root() -> None:
     with pytest.raises(ArgumentTypeError):
         _run_identifier("../escape")

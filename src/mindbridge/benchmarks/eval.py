@@ -1965,6 +1965,11 @@ def _sample(
         # The response cache stores answers, not candidate lists, so a replayed answer cannot
         # carry a retrieval score. Reporting the empty list as recall zero would invent one.
         retrieval_available=arm.retrieves and not cached,
+        # A provider failure produced no answer. Scoring the empty prediction turned every 500
+        # into a confident zero, and because the arms fail at different rates the deflation was
+        # asymmetric: on one run the blind arm errored 3.4x more often than the product arm,
+        # so the naive "memory is worth +X" gap was inflated by the error-rate difference.
+        answer_failed=error_code is not None,
     )
     return SampleResult(
         task=task.spec.name,
@@ -2015,6 +2020,7 @@ def _score(
     predict_only: bool,
     arm: _Arm = PRODUCT_ARM,
     retrieval_available: bool = True,
+    answer_failed: bool = False,
 ) -> tuple[Mapping[str, float], float | None, float | None]:
     if predict_only:
         return {}, None, None
@@ -2030,6 +2036,15 @@ def _score(
         evidence_source_ids=tuple(ranked_source_ids),
     )
     metrics = _arm_metrics(metrics, arm, retrieval_available=retrieval_available)
+    if answer_failed:
+        # Keep what the run did measure -- the retriever ranked before the generator failed --
+        # and leave the answer unscored so it lands in `error_count`, not in the mean.
+        diagnostic = {
+            name: value
+            for name, value in metrics.items()
+            if name.startswith(("retrieval_", "joint_"))
+        }
+        return diagnostic, None, None
     score = metrics.get(sample_primary_metric(task_name), metrics.get("token_f1"))
     return metrics, score, metrics.get("exact_match")
 
@@ -2782,6 +2797,7 @@ def _metrics(
         "metrics": metric_rows,
         "exact_match": metric_rows.get("exact_match"),
         "question_count": len(samples),
+        "scored_question_count": len(scored),
         "error_count": error_count,
         "ingest_failure_count": ingest_failure_count,
         "abstentions": _abstentions(samples),
