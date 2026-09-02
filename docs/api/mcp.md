@@ -1,6 +1,6 @@
 # MCP API
 
-## Purpose
+## Surface
 
 The optional MCP adapter exposes exactly six typed tools over one injected synchronous `Memory`.
 It validates tool input, calls the matching SDK operation, and returns structured public values.
@@ -8,7 +8,7 @@ It does not own storage, provider selection, or the injected memory. Finalized m
 through ordinary content parts; live audio and vision packet ingestion, and `StreamEvent`
 reduction, stay Python-only because a tool call is a finite request.
 
-## Invocation
+## Start the adapter
 
 Install the MCP extra together with the extras required by the chosen backends, then host the
 server in the application that owns `Memory`:
@@ -30,20 +30,20 @@ with Memory.from_config(
     build_mcp_server(memory).run("stdio")
 ```
 
-The example uses the pinned Jina recipe; review its upstream code and license boundary in
-[configuration](../configuration.md#embedding-choices).
-
 ```text
 build_mcp_server(memory: Memory) -> MCPServer[None]
 ```
 
-`build_mcp_server` neither opens nor closes the supplied memory. Do not run another `Memory`, REST
-process, or MCP process against the same `data_dir`. Composition and process ownership are defined
-in [architecture](../architecture.md) and [configuration](../configuration.md).
+## Lifecycle and ownership
+
+`build_mcp_server` borrows `memory`; it neither opens nor closes it. The host must keep the owner
+alive for the server lifetime and close it during shutdown. Do not run another `Memory`, REST, or
+MCP owner against the same physical `data_dir`.
 
 MindBridge adds no authentication to any MCP transport. Stdio inherits local process permissions;
 an SSE or streamable-HTTP host must add authentication, authorization, TLS, request limits, and
-rate limits. MCP error `subject` is unredacted and may contain an owner-local path.
+rate limits. MCP error `subject` is unredacted and may contain an owner-local path. See
+[deployment](../deployment.md) for process and transport boundaries.
 
 ## Contract
 
@@ -152,6 +152,7 @@ The following Python operations have no MCP tool:
 | `search_with_trace` | Python and local-CLI diagnostics |
 | `speech`, `faces` | Owner-process media analysis |
 | `register_speaker`, `register_identity` | Owner-process identity naming |
+| `identity`, `unlink_identity` | Owner-process identity inspection and merge reversal |
 | `reinforce` | Owner-process feedback |
 | `reindex`, `optimize` | Owner-process index maintenance |
 

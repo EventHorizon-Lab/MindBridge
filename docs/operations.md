@@ -1,11 +1,25 @@
 # Operations
 
-MindBridge has no database service or worker queue. Operate the one process that owns a local
-`data_dir`, its model backends, and the filesystem containing that directory.
+Operate the process that owns `data_dir`, its model backends, and the local filesystem. MindBridge
+has no database service, worker queue, or background owner to manage separately.
+
+## Start and stop
+
+Start one owner with the same model and index recipes that created the store. Opening validates the
+SQLite schema and compatibility metadata, opens or creates Zvec, and drains durable index work
+before returning.
+
+Stop gracefully by calling `Memory.close()`. It rejects new operations, waits for active work,
+releases media leases, closes model and storage resources, and releases the directory lock. The
+`.mindbridge.lock` file remains; only its operating-system lock indicates ownership.
+
+Before first deployment or after composition changes, use the CLI doctor described in the
+[command-line reference](api/cli.md#doctor-and-explain). It checks configuration and loaders
+without writing memory. A remote doctor checks the REST liveness endpoint.
 
 ## Health
 
-The REST adapter exposes an unauthenticated liveness endpoint:
+The REST adapter exposes an unauthenticated liveness endpoint outside `/v1`:
 
 ```bash
 curl --fail http://127.0.0.1:8000/healthz
@@ -15,72 +29,79 @@ curl --fail http://127.0.0.1:8000/healthz
 {"status":"ok"}
 ```
 
-`/healthz` does not call a model or run retrieval. Opening the application proves only that the
-store, durable metadata, and index were openable at startup. For an end-to-end check, use a
-separate canary process and directory; do not add canary records to production memory.
+`/healthz` does not call a model, inspect pending outbox rows, or run retrieval. It proves only that
+the current process can serve the request; initial store and index opening happened before the app
+was constructed. Run any end-to-end canary against a separate directory so production memory is
+not polluted.
 
 ## Backup
 
-Use a stopped-process snapshot:
+Use a stopped-owner snapshot:
 
-1. Stop the owner gracefully so active calls finish and resources close.
-2. Verify that no process still uses the directory.
-3. Copy the complete directory, including any SQLite side files.
-4. Open and query the copy from a new temporary path with the same backend configuration.
-5. Restart the original owner.
+1. Stop the owner gracefully and verify that no process still holds the directory lock.
+2. Copy the complete directory, including SQLite side files if any remain.
+3. Store the snapshot with the MindBridge version and model/index configuration that created it.
+4. Restore the snapshot to a new temporary path.
+5. Open that copy with the recorded configuration and verify known text and media records.
+6. Restart the original owner.
 
-The `.mindbridge.lock` file is only the target of an operating-system lock. It normally remains
-after shutdown, and its presence does not mean an owner is alive.
+`state.sqlite3` and `assets/` are required. A smaller backup may omit `zvec/`, but restoring it then
+requires index rebuild time and enough free space. Never omit media: SQLite stores descriptors and
+transcripts, not the original bytes.
 
-SQLite and `assets/` are authoritative. A smaller backup may omit `zvec/`, but it must retain
-`state.sqlite3`, any SQLite side files present in the stopped snapshot, and all media under
-`assets/`. Test that rebuilding the omitted index fits the restore-time and free-space budget.
-SQLite cannot reconstruct missing media bytes.
+Do not treat a copied `.mindbridge.lock` file as evidence that a snapshot is busy. Do not copy only
+`state.sqlite3` from a running owner; use a proper SQLite-aware snapshot mechanism if downtime is
+not acceptable.
 
 ## Restore
 
-Restore while the target service is stopped:
+Restore into a new, empty path while the target service is stopped:
 
-1. Restore into a new, empty directory and apply the service account's ownership.
-2. Restore the complete snapshot, or restore SQLite plus `assets/` and leave `zvec/` absent.
-3. Start one `Memory` with the embedding, transcription, face, and index settings that created the
-   store.
-4. Verify known text and media searches before accepting traffic.
+1. Restore the complete snapshot, or restore `state.sqlite3` plus `assets/` and leave `zvec/`
+   absent.
+2. Apply the service account's ownership and restrictive permissions.
+3. Start exactly one `Memory` with the recorded embedding, transcription, face, and index settings.
+4. Verify known records with `get()` or `list()`, then verify representative text and media
+   searches.
+5. Route traffic to the restored owner only after those checks pass.
 
-When `zvec/` is absent, startup queues all authoritative embeddings and rebuilds the collection
-without embedding historical content again. Pending outbox work is replayed before the instance
-opens. An incompatible model, vector space, dimension, analysis space, schema, or unrecognized
-index recipe fails at open instead of mixing state.
+When `zvec/` is absent, startup durably queues all stored embeddings, creates the collection, and
+replays the queue without embedding historical content again. An unsupported schema or
+unrecognized model, vector-space, dimension, analysis-space, or index-recipe mismatch fails at
+open instead of mixing state.
 
-Restore with the original MindBridge version and configuration first. Perform a version upgrade as
-a separate backed-up step because a recognized recipe migration may re-embed records.
+Restore with the original MindBridge version and configuration first. Perform an upgrade as a
+separate backed-up step because a recognized embedding recipe migration may re-embed records.
 
-## Rebuild and optimize
+## Index maintenance and repair
 
-Use the only live owner of the directory and the same backend configuration as the store:
+Normal startup, add, delete, and search operations drain the SQLite outbox. Zvec also performs
+bounded automatic optimization after enough pending vectors or durable segments accumulate.
+
+From the live owner, rebuild or optimize explicitly when measurement or diagnosis justifies it:
 
 ```python
-from mindbridge import JinaOmniEmbedder, Memory
-
-with Memory(
-    "/var/lib/mindbridge/assistant",
-    embedder=JinaOmniEmbedder(),
-) as memory:
-    count = memory.reindex()
-    memory.optimize()
-    print(f"reindexed {count} memories")
+count = memory.reindex()
+memory.optimize()
+print(f"reindexed {count} memories")
 ```
 
-`reindex()` replaces the disposable Zvec collection from FP32 embeddings in SQLite, then replays
-the outbox to include writes committed during its scan. `optimize()` drains the outbox, merges
-staged Zvec vectors, and flushes the collection. Normal adds, deletes, searches, and startup also
-drain the outbox; routine index maintenance runs automatically.
+`reindex()` replaces the derived collection from SQLite FP32 embeddings and then replays writes
+committed during its scan. `optimize()` drains pending work, merges staged vectors, and flushes the
+collection. Neither operation repairs missing media or converts an incompatible embedding space.
 
-If Zvec cannot open or its files are corrupt, stop the owner, retain a backup, move only `zvec/`
-aside, and reopen the store. Keep the moved index until a known search succeeds. Never move SQLite
-or `assets/`, edit `search_index_queue`, or replace the index while a `Memory` is live.
+If Zvec cannot open or appears corrupt:
 
-Zvec process-wide resource settings may be set once before constructing any `Memory`:
+1. Stop the owner and retain a tested backup.
+2. Move only `zvec/` aside; do not touch `state.sqlite3` or `assets/`.
+3. Start one owner with the original configuration and allow startup to rebuild the index.
+4. Verify representative searches.
+5. Remove the moved index only after the verification succeeds.
+
+Never edit `search_index_queue`, replace `zvec/`, or move authoritative files while a `Memory` is
+live.
+
+Applications may set Zvec process-wide resources once, before constructing any `Memory`:
 
 ```python
 import zvec
@@ -88,35 +109,29 @@ import zvec
 zvec.init(query_threads=4, optimize_threads=2, memory_limit_mb=2048)
 ```
 
-MindBridge does not call `zvec.init`; the application owns that process-global policy. Account for
-MindBridge running several focused dense routes and one lexical route concurrently, with no more
-than four outer search workers per search.
+MindBridge does not call `zvec.init()`. Account for several focused dense routes plus one lexical
+route, with at most four outer search workers per search. Keep `IndexQuantization.NONE` unless
+measured capacity and retrieval results justify a lossy mode. Changing only quantization rebuilds
+Zvec from stored vectors; `RABITQ` requires dimensions from 64 through 4095 and native support.
 
-`IndexQuantization` changes only the derived Zvec collection. Keep `NONE` unless measured capacity
-and retrieval results justify a lossy mode. `RABITQ` requires an embedding dimension from 64 through
-4095 and native runtime support; changing quantization rebuilds the index without re-embedding
-records.
+## Capacity
 
-## Capacity signals
+Monitor:
 
-Track at least:
+- Bytes and free inodes for the whole directory, `state.sqlite3`, `assets/`, and `zvec/`.
+- Free space for a second index during rebuild or compaction.
+- Process file descriptors; Zvec checks headroom before durable work.
+- Startup, add, search, ask, reindex, optimize, and model latency.
+- Stable error codes and retryable reasons by operation.
+- Backup age, restore-test result, and observed recovery duration.
 
-- Bytes and free inodes for the whole directory, SQLite, `assets/`, and `zvec/` separately.
-- Free space for an index rebuild or compaction alongside the current index.
-- Process file-descriptor use; Zvec refuses work before exhausting the configured soft limit.
-- Add, search, and answer latency, plus model latency and failures by operation.
-- Startup, restore, reindex, and optimize duration.
-- REST status and stable error-code counts.
-
-Original media and FP32 embeddings are authoritative storage costs; index quantization does not
-remove those vectors from SQLite. Composite and long-text records also create bounded additional
-embedding documents.
+Original media and FP32 embeddings remain authoritative storage costs even when Zvec uses
+quantization. Composite and long-text records create bounded additional embedding documents.
 
 ## Telemetry
 
-MindBridge depends on `opentelemetry-api`. With no configured SDK, instrumentation is a no-op.
-Install the optional SDK and configure an exporter before constructing `Memory`, or inject a tracer
-with `Memory(..., tracer=...)`:
+MindBridge depends on `opentelemetry-api`; without an SDK, spans are no-ops. Install the existing
+observability extra and configure a provider before constructing `Memory`, or inject a tracer:
 
 ```bash
 uv add "mindbridge[local,observability]"
@@ -140,106 +155,61 @@ with Memory("./data", embedder=JinaOmniEmbedder()) as memory:
 provider.shutdown()
 ```
 
-Spans use `mindbridge.span.kind` to distinguish three levels:
+Every span sets `mindbridge.span.kind` to `operation`, `stage`, or `model`.
 
-| Kind | Names |
+| Level | Useful span names |
 | --- | --- |
-| Operation | Public operations such as `mindbridge.add`, `mindbridge.search`, `mindbridge.ask`, `mindbridge.delete`, `mindbridge.reindex`, and `mindbridge.optimize` |
-| Stage | `mindbridge.content.prepare`, `mindbridge.storage.*`, `mindbridge.index.*`, and `mindbridge.retrieval.rank` |
-| Model | `mindbridge.model.embedding`, `.transcription`, `.face`, `.generation`, `.formation`, and `.vision` |
+| Operation | `mindbridge.add`, `.add_many`, `.search`, `.ask`, `.delete`, `.reindex`, `.optimize` |
+| Stage | `mindbridge.content.prepare`, `.storage.*`, `.index.*`, `.retrieval.rank`, `.identity.*` |
+| Model | `mindbridge.model.embedding`, `.transcription`, `.face`, `.generation`, `.formation`, `.vision` |
 
-Each `add_stream` item produces an ordinary `mindbridge.add` operation. `search_with_trace` and
-speculative prefetch use ordinary `mindbridge.search` operations. `AsyncMemory` preserves tracing
-context through its worker thread.
+Each `add_stream()` item creates an ordinary `mindbridge.add` span. `search_with_trace()` and
+speculative prefetch use `mindbridge.search`. `AsyncMemory` preserves tracing context across its
+worker thread.
 
-Model spans record `gen_ai.operation.name`, `gen_ai.request.model`,
-`mindbridge.model.module`, `mindbridge.model.batch_size`, `mindbridge.input.modalities`, and
-`mindbridge.model.request_count`. When a provider reports usage, spans record standard GenAI
-input/output totals plus exact MindBridge modality attributes:
-
-```text
-mindbridge.token_usage.input_tokens.<text|image|video|audio|unattributed>
-mindbridge.token_usage.output_tokens.<text|image|video|audio|unattributed>
-```
-
-Operation spans roll up descendant model usage. Interpret these together:
+Model spans include request model, module, batch size, modalities, and
+`mindbridge.model.request_count`. Provider-reported usage is recorded without estimation:
 
 | Attribute | Meaning |
 | --- | --- |
-| `mindbridge.token_usage.expected_request_count` | Provider requests expected to report token usage. |
+| `mindbridge.token_usage.expected_request_count` | Requests expected to report token usage. |
 | `mindbridge.token_usage.reported_request_count` | Requests that supplied usage. |
-| `mindbridge.token_usage.complete` | Every expected request reported a usable total. |
-| `mindbridge.token_usage.total_tokens` | Exact total when complete; otherwise present only as an exact reported lower bound. |
+| `mindbridge.token_usage.complete` | Every expected request supplied a usable total. |
+| `mindbridge.token_usage.total_tokens` | Exact total when complete; otherwise only an exact reported lower bound. |
+| `mindbridge.token_usage.input_tokens.<modality>` | Exact input tokens for text, image, video, audio, or unattributed input. |
+| `mindbridge.token_usage.output_tokens.<modality>` | Exact output tokens for the same modality set. |
 | `mindbridge.token_usage.audio_seconds` | Provider- or runtime-reported processed audio duration. |
 
-MindBridge never estimates tokens from text length, media bytes, duration, or a different model's
-tokenizer. Local backends report request counts and available audio duration but do not invent
-token usage.
+Operation spans roll up descendant model usage. Local backends report request counts and available
+audio duration but do not invent token counts. Streaming generation records
+`mindbridge.model.time_to_first_token` after its first non-empty text delta. Providers may also
+record `gen_ai.response.time_to_first_chunk` and `gen_ai.response.finish_reasons`.
 
-Streaming generation additionally reports `mindbridge.model.time_to_first_token` for the first
-non-empty text delta. Providers may report `gen_ai.response.time_to_first_chunk` and
-`gen_ai.response.finish_reasons`. OpenAI grounding reports
-`mindbridge.grounding.media_elided_hits` and `mindbridge.grounding.dropped_hits` when request limits
-shrink retrieved evidence.
+Watch these degradation and recognition attributes:
 
-Two write-path counters make silent degradation visible. `mindbridge.embedding.elided_parts` counts
-retrieval keys an `add` could not embed because their media exceeds what the embedding model accepts
-inline; the memory is still stored and reachable through its remaining keys, and a write whose every
-key is refused fails instead. `mindbridge.embedding.video_sampled_inputs` counts embedding inputs
-whose video reached the model as four ordered stills because the model declared the prompt longer
-than its context — the memory keeps its video, only the vector behind it is built from stills.
+- `mindbridge.embedding.elided_parts` counts retrieval keys rejected because media exceeded the
+  embedding model's inline limit.
+- `mindbridge.embedding.video_sampled_inputs` counts video inputs embedded as four ordered stills
+  because the model's prompt exceeded its context.
+- `mindbridge.grounding.media_elided_hits` and `mindbridge.grounding.dropped_hits` count evidence
+  removed from OpenAI grounding requests.
+- `mindbridge.identity.faces` and `mindbridge.identity.speakers` report observations, distinct
+  identities, existing matches, creations, and cache status for each analyzed asset.
 
-### Identity recognition yield
+Spans never record memory text, media bytes, paths, IDs, metadata, model responses, or exception
+details. A failed span receives only error status. Use `search_with_trace()` for one retrieval
+investigation and the structured error envelope for failures.
 
-Face and speaker recognition each emit one `mindbridge.identity.faces` or
-`mindbridge.identity.speakers` span per asset, so a recognizer that runs and finds nothing is
-distinguishable from one that was never configured, and a cached re-read is distinguishable from
-both.
+## Upgrade
 
-| Attribute | Meaning |
-| --- | --- |
-| `mindbridge.identity.observations` | Face detections, or speaker segments, for the asset. Recorded when zero. |
-| `mindbridge.identity.identities` | Distinct identities those observations resolved to. |
-| `mindbridge.identity.matched_existing` | Observations that matched an identity already on file. |
-| `mindbridge.identity.created` | Identities this asset introduced. |
-| `mindbridge.identity.cached` | True when the counts were re-read from a stored analysis. |
-| `mindbridge.identity.evidence_assets` | Distinct assets in which this voice-and-face pair has co-occurred. |
-| `mindbridge.identity.evidence_required` | Co-occurrences required before the pair merges. |
-| `mindbridge.identity.linked` | Whether this asset's co-occurrence completed a merge. |
+Before changing MindBridge, model revisions, vector dimensions, transcription or face recipes, or
+index settings:
 
-Analysis reports success whether or not the recognizer can tell people apart, so these numbers are
-what separate recognition from its two silent failures. Zero observations means the detector ran and
-found nobody, usually a confidence threshold suited to posed photographs applied to wide-angle or
-egocentric footage. Many observations with almost no matches means the embeddings do not separate
-the people in the footage and every memory has met a stranger; the identities are real rows, and
-nothing later in the pipeline reports a problem.
+1. Create and restore-test a backup.
+2. Stop the owner.
+3. Upgrade code and configuration together.
+4. Start one owner and let only recognized schema or recipe migrations run.
+5. Verify records, media, retrieval, and telemetry before restoring traffic.
 
-Compare `created` against `matched_existing` before adjusting any similarity threshold. When a
-recognizer cannot separate people on the material at hand, no threshold value helps: lowering one
-converts fragmentation into wrong merges, and raising it turns every sighting into a new person.
-
-Spans do not record memory text, media bytes, paths, asset or memory IDs, metadata, model responses,
-or exception details. Failed spans receive only error status. For one retrieval investigation, use
-the opt-in `search_with_trace()` result or the local `search-with-trace` CLI command; candidate IDs
-are intentionally excluded from normal telemetry.
-
-## Failure interpretation
-
-| Signal | Check first |
-| --- | --- |
-| `validation_error` or REST 422 | Caller input, media type, event bounds, or unsupported modality. |
-| `model_error` | Backend configuration, credential, endpoint, timeout, response shape, or declared capability. |
-| `index_unavailable` | Zvec open, file descriptors, mutation, flush, search, or on-disk collection. |
-| `storage_error` | Directory ownership, filesystem, CAS, SQLite, schema, or compatibility metadata. |
-| `memory_not_found` or REST 404 | The record is absent from authoritative SQLite. |
-
-Stable errors expose `code`, optional `reason`, pipeline `stage`, retryability, and an optional
-`subject`. CLI, REST, and MCP envelopes also include a `trace_id`. Log those fields with request
-metadata, but do not log memory content, credentials, provider bodies, or local paths by default.
-
-## Upgrades
-
-Back up and restore-test the directory before changing MindBridge, model revisions, vector
-dimensions, transcription recipes, face recipes, or index settings. Startup applies only known
-schema and recipe migrations. Never bypass a compatibility failure by editing `PRAGMA user_version`,
-`store_metadata`, or the outbox manually.
+Never bypass compatibility checks by editing `PRAGMA user_version`, `store_metadata`, or the
+outbox.

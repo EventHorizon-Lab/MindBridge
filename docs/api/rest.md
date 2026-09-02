@@ -1,6 +1,6 @@
 # REST API
 
-## Purpose
+## Surface
 
 The optional FastAPI adapter exposes seven `Memory` operations under `/v1`. It validates transport
 input, calls the injected synchronous memory, and serializes the public SDK values; it is not a
@@ -13,7 +13,7 @@ have no client-streaming route; run `AsyncAudioStream`, `AsyncVisionStream`, or
 The generated FastAPI schema is the machine-readable contract. A running application serves it at
 `/openapi.json`, with Swagger UI at `/docs` and ReDoc at `/redoc`.
 
-## Invocation
+## Start the adapter
 
 Install the server extra together with the extras required by the chosen backends, construct one
 `Memory`, and inject it:
@@ -35,17 +35,9 @@ memory = Memory.from_config(
 app = create_app(memory=memory)
 ```
 
-The example uses the pinned Jina recipe; review its upstream code and license boundary in
-[configuration](../configuration.md#embedding-choices).
-
 ```text
 create_app(*, memory: Memory) -> fastapi.FastAPI
 ```
-
-`create_app` does not own or close `memory`. The host application must close the memory and its
-caller-owned provider clients at shutdown. Run exactly one owner for each physical `data_dir`.
-MindBridge adds no authentication; put the app behind the deployment's gateway, service mesh, or
-FastAPI/Starlette authentication middleware. See [deployment](../deployment.md).
 
 With the host running, the smallest write is:
 
@@ -56,6 +48,16 @@ curl --fail-with-body \
   http://127.0.0.1:8000/v1/memories
 ```
 
+## Lifecycle and ownership
+
+`create_app` borrows `memory`; it neither opens nor closes it. The host must keep that owner alive
+for the app lifetime and close it during shutdown. Run one process and one `Memory` for each
+physical `data_dir`; use a different directory for another owner.
+
+MindBridge adds no REST authentication. The host owns authentication, authorization, TLS, and
+request-rate policy. See [deployment](../deployment.md) for supported process shapes and
+[operations](../operations.md) for shutdown and recovery.
+
 ## Contract
 
 ### Content input
@@ -63,42 +65,23 @@ curl --fail-with-body \
 The `content`, `query`, and `question` fields accept either a trimmed, non-blank string or an
 ordered array of 1 through 16 strict content parts. Unknown fields are rejected.
 
-```json
-{"type":"input_text","text":"The prototype after the review"}
-```
-
-An image part supplies exactly one of `image_url` or `file_id`:
-
-```json
-{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}
-```
+| Part | Required fields | Source rule | Optional fields |
+| --- | --- | --- | --- |
+| `input_text` | `type`, `text` | `text` is trimmed and non-blank | none |
+| `input_image` | `type` | exactly one of `image_url`, `file_id` | none |
+| `input_file` | `type` | exactly one of `file_url`, `file_data`, `file_id` | `media_type`, `filename` |
 
 ```json
-{"type":"input_image","file_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
-```
-
-A file part supplies exactly one of `file_url`, `file_data`, or `file_id`:
-
-```json
-{
-  "type": "input_file",
-  "file_data": "UklGRg==",
-  "media_type": "audio/wav",
-  "filename": "note.wav"
-}
-```
-
-```json
-{
-  "type": "input_file",
-  "file_url": "data:video/mp4;base64,AAAA",
-  "media_type": "video/mp4",
-  "filename": "clip.mp4"
-}
-```
-
-```json
-{"type":"input_file","file_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","media_type":"video/*"}
+[
+  {"type": "input_text", "text": "At the station"},
+  {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+  {
+    "type": "input_file",
+    "file_data": "UklGRg==",
+    "media_type": "audio/wav",
+    "filename": "note.wav"
+  }
+]
 ```
 
 `image_url` and `file_url` accept only base64 `data:` URLs. `file_data` is raw base64 and requires
@@ -113,16 +96,16 @@ SDK validator and error contract.
 
 ### Endpoints
 
-| Method and path | Input | Success |
-| --- | --- | --- |
-| `GET /healthz` | none | `200 {"status":"ok"}` |
-| `POST /v1/memories` | `MemoryCreate` | `201 MemoryResponse` |
-| `POST /v1/memories/batch` | `MemoryBatchCreate` | `201 {"memories":[...]}` |
-| `GET /v1/memories` | `limit`, `cursor` query parameters | `200 PageResponse` |
-| `POST /v1/memories/search` | `QueryRequest` | `200 {"hits":[...]}` |
-| `GET /v1/memories/{memory_id}` | non-empty path value | `200 MemoryResponse` |
-| `DELETE /v1/memories/{memory_id}` | non-empty path value | `200 {"deleted":bool}` |
-| `POST /v1/answers` | `AnswerRequest` | `200 AnswerResponse` |
+| Method and path | Operation ID | Input | Success |
+| --- | --- | --- | --- |
+| `GET /healthz` | `health` | none | `200 {"status":"ok"}` |
+| `POST /v1/memories` | `createMemory` | `MemoryCreate` | `201 MemoryResponse` |
+| `POST /v1/memories/batch` | `createMemories` | `MemoryBatchCreate` | `201 {"memories":[...]}` |
+| `GET /v1/memories` | `listMemories` | `limit`, `cursor` query parameters | `200 PageResponse` |
+| `POST /v1/memories/search` | `searchMemories` | `QueryRequest` | `200 {"hits":[...]}` |
+| `GET /v1/memories/{memory_id}` | `getMemory` | non-empty path value | `200 MemoryResponse` |
+| `DELETE /v1/memories/{memory_id}` | `deleteMemory` | non-empty path value | `200 {"deleted":bool}` |
+| `POST /v1/answers` | `answer` | `AnswerRequest` | `200 AnswerResponse` |
 
 Request fields and defaults are:
 
@@ -147,8 +130,11 @@ An input `context` is an optional typed observation. `scope` is an optional retr
 coordinate frame and observer/subject anchor. SQLite authoritatively reapplies every scope filter
 after candidate retrieval.
 
+Create-request context:
+
 ```json
 {
+  "content": "The mug is on the kitchen table.",
   "context": {
     "basis": "observation",
     "source_id": "camera-1:frame-42",
@@ -162,9 +148,17 @@ after candidate retrieval.
       "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
       "position_uncertainty_m": 0.08
     }
-  },
+  }
+}
+```
+
+Search-request scope:
+
+```json
+{
+  "query": "Where was the mug?",
   "scope": {
-    "valid_at": "2026-08-26T12:00:00Z",
+    "valid_at": "2026-08-27T10:00:00Z",
     "known_at": "2026-08-27T12:00:00Z",
     "near": {"frame_id": "home/map", "anchor": "subject", "x": 2.0, "y": 1.0},
     "radius_m": 0.75
@@ -238,7 +232,7 @@ are never serialized.
 | `memory_not_found` | `memory_not_found` |
 | `speaker_not_found` | `speaker_not_found` |
 | `identity_not_found` | `identity_not_found` |
-| `model_error` | unset, `backend_not_configured`, `unsupported_modality`, `auth_failed`, `rate_limited`, `quota_exhausted`, `timeout`, `connection_failed`, `request_rejected`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed` |
+| `model_error` | unset, `backend_not_configured`, `unsupported_modality`, `model_failed`, `auth_failed`, `rate_limited`, `quota_exhausted`, `timeout`, `connection_failed`, `request_rejected`, `response_invalid`, `payload_too_large`, `asset_unavailable`, `asset_changed` |
 | `model_output_truncated` | `output_truncated` |
 | `storage_error` | unset, `data_dir_in_use`, `schema_unsupported`, `io_failed` |
 | `index_unavailable` | unset |
@@ -273,6 +267,7 @@ REST has no route for these Python operations:
 | `search_with_trace` | Owner-process retrieval diagnostics |
 | `speech`, `faces` | Owner-process media analysis |
 | `register_speaker`, `register_identity` | Owner-process identity naming |
+| `identity`, `unlink_identity` | Owner-process identity inspection and merge reversal |
 | `reinforce` | Owner-process feedback |
 | `reindex`, `optimize` | Owner-process index maintenance |
 

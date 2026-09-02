@@ -1,6 +1,6 @@
 # Command-line API
 
-## Purpose
+## Surface
 
 `mindbridge` runs one product operation in one process and emits one JSON result. Local commands
 dispatch to the corresponding `Memory` method, except for the diagnostic `doctor`; remote commands
@@ -10,7 +10,7 @@ JSON projection, and exit-code mapping, not storage or retrieval policy.
 Benchmark commands belong to the separate `mindbridge-bench` surface documented in
 [benchmarking](../benchmarking.md).
 
-## Invocation
+## Invoke the CLI
 
 ```text
 mindbridge [GLOBAL_OPTIONS] COMMAND [COMMAND_OPTIONS]
@@ -48,16 +48,21 @@ Use `mindbridge COMMAND --help` for the command-specific flags summarized below.
 | `-V`, `--version` | print the installed version |
 
 `--data-dir`, backend options, and tuning options apply only to `--embedder`; `--timeout` applies
-only to `--url`. Inapplicable options fail instead of being ignored. `--app` follows the same
-`MODULE:ATTR` convention as Uvicorn and adds the working directory to `sys.path`. The CLI closes
-the resulting local `Memory` after the command.
+only to `--url`. Inapplicable options fail instead of being ignored. `--app` follows the
+`MODULE:ATTR` convention and adds the working directory to `sys.path`.
 
 The listed flags are the complete direct-composition surface. Use `--app` for index quantization,
 face analysis, speaker/face thresholds, a custom backend, or any other `Memory` setting.
 
-Composition, model identity, credentials, and settings are documented once in
-[configuration](../configuration.md). One physical directory still has one live owner; see
-[architecture](../architecture.md).
+Composition, model identity, credentials, and settings are documented in
+[configuration](../configuration.md).
+
+## Lifecycle and ownership
+
+Local `--app` and `--embedder` commands open one `Memory`, perform one operation, and close it before
+exit. One physical `data_dir` may have only one live owner; when another process owns it, use
+`--url` or a different directory. Remote mode does not open local storage and never closes the
+server's owner.
 
 ## Contract
 
@@ -70,13 +75,8 @@ Composition, model identity, credentials, and settings are documented once in
 | `openai` | `--embedder`, `--answerer`, `--transcriber` | `text-embedding-3-small`, `gpt-5-mini`, `whisper-1` |
 
 Only `openai` accepts a model suffix, for example `--answerer openai:gpt-5-mini`. Recipe names form
-a closed table; other backends use `--app`. The pinned Jina weights are CC BY-NC 4.0. The OpenAI
-recipe constructs the official SDK client, which performs its own `OPENAI_API_KEY` lookup;
-MindBridge never reads or prints the credential.
-
-The Jina recipe executes upstream model code with `trust_remote_code=True`; its model and code
-revisions are both pinned. Review that code and the non-commercial weight license before selecting
-the recipe.
+a closed table; use `--app` for other backends. Provider trust, license, model identity, and
+credential behavior live in [configuration](../configuration.md).
 
 ### Commands
 
@@ -105,8 +105,9 @@ the recipe.
 Defaults match the SDK: `add`, `add-many`, and `add-stream` use `memory_type=semantic`; search uses
 `limit=10`; ask uses `limit=5`; list uses `limit=100`; optional retrieval roles and timestamps are
 unset. Timestamps must be timezone-aware ISO 8601 values. Cursors are opaque and passed through
-unchanged. `ask`, `speech`, and `faces` require the selected composition to supply their matching
-capabilities.
+unchanged. `ask` requires the selected composition to supply an answerer. `speech` and `faces`
+return an empty result without a model call when the record has no corresponding media; otherwise
+they require the matching capability.
 
 ### Content and JSONL input
 
@@ -162,7 +163,8 @@ values as JSON strings and datetimes as ISO 8601.
 Unless `--quiet` is set, commands write the resolved composition as one JSON document on stderr
 before executing. `--url` forwards successful owner response objects unchanged. Runtime
 failures write one [shared error envelope](rest.md#error-envelope) to stderr and nothing to stdout;
-remote envelopes, including `trace_id`, are forwarded unchanged.
+remote envelopes, including `trace_id`, are forwarded unchanged. Local CLI and MCP errors retain
+`subject`, including local paths; unauthenticated REST redacts storage subjects.
 
 ### Doctor and explain
 

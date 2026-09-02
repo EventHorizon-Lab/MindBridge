@@ -1,17 +1,16 @@
 # Python SDK
 
-## Purpose
+## Surface
 
 The supported root-import SDK is re-exported from `mindbridge`. `Memory` is the synchronous
 execution boundary, and `AsyncMemory` is its async facade. REST, MCP, and the product CLI expose
 subsets of these operations through their own adapters.
 
-One physical `data_dir` belongs to one live `Memory` instance. There are no tenant, user, request,
-or benchmark scope parameters. See [architecture](../architecture.md) for ownership and storage,
-[configuration](../configuration.md) for backend composition, and
-[operations](../operations.md) for lifecycle and observability.
+There are no tenant, user, request, or benchmark scope parameters. Physical `data_dir` separation
+is the isolation boundary. See [architecture](../architecture.md) for storage and consistency and
+[configuration](../configuration.md) for backend composition.
 
-## Invocation
+## Quick start
 
 Pass already-constructed backends directly:
 
@@ -37,12 +36,17 @@ with Memory.from_config(
     memory.add("Remember this")
 ```
 
-`Memory` owns and closes every backend object passed to it. A backend may still leave its
-caller-supplied provider client open; that ownership is adapter-specific. Prefer a context manager
-or call `close()` explicitly.
+## Lifecycle and ownership
 
-The Jina adapter used in these examples executes upstream model code at an immutable pinned
-revision. Review its trust and license constraints in [configuration](../configuration.md#embedding-choices).
+One physical `data_dir` may have one live `Memory` owner. A second owner fails immediately with
+`StorageError(reason="data_dir_in_use")`; use another directory or send work to the existing owner
+through REST. A `Memory` is also bound to the process that opened it and must not be used after
+`fork`.
+
+`Memory` owns and closes every backend passed to it. A backend can still leave a caller-supplied
+provider client open when that adapter documents separate ownership. Use `Memory` as a context
+manager, or call `close()`; repeated closes are harmless. See [operations](../operations.md) for
+backup, recovery, and telemetry.
 
 ## Contract
 
@@ -68,6 +72,7 @@ Memory(
     speaker_margin: float = 0.05,
     face_similarity: float = 0.363,
     face_margin: float = 0.05,
+    identity_link_min_assets: int = 2,
     tracer: opentelemetry.trace.Tracer | None = None,
 ) -> None
 ```
@@ -81,24 +86,15 @@ the supported provider configuration fields live in [configuration](../configura
 A plain `TranscriptionBackend` transcribes supported audio/video during `add` regardless of
 `index_speech`; `SpeechBackend` analysis and identity resolution stay behind the explicit flag.
 
-`vision_describer` and `former` have no declarative provider and are reachable only through
-direct construction or `MemoryPlugins`. `former` proposes typed memories after a source
-observation commits; omitting it keeps ordinary add behavior and makes no formation model call.
+`vision_describer` and `former` have no declarative provider and are reachable through direct
+construction or `MemoryPlugins`. `former` proposes typed memories only after the source observation
+commits. `identity_link_min_assets` is the number of distinct co-occurring assets required before a
+face and voice are bound; its default is `2`.
 
-Turn `index_speech` on for any corpus whose memories carry speech. Without it a video memory's
-indexed document is whatever text the caller supplied, which for clip-shaped ingestion is often a
-source identifier and nothing else, leaving the full-text route unable to match anything. On a
-15-unit, 187-question M3-Bench robot slice it moved the mean indexed document from 29 to 536
-characters and accuracy from 0.2086 to 0.3583 (paired mean +0.1497, 95% CI [+0.0857, +0.2123]),
-at unchanged generation token usage because the inlined media dominates the prompt either way.
-
-`evidence_budget_chars` decides how much evidence `ask()` grounds on. Retrieval scores separate the
-right memory from the rest only weakly, so the answering model performs the final selection and
-needs to see enough candidates. `None` grounds on exactly `limit`. An integer keeps those `limit`
-hits and then admits further ranked memories while the grounded evidence fits the budget, ranking
-the full rerank pool rather than `3 * limit`. Media is charged its modality's text equivalent —
-2000 characters for an image, 4000 for audio, 12 000 for video — because a media part costs a model
-far more than the few bytes of text on its record.
+Use `index_speech=True` when transcripts and resolved speaker names should become retrieval text.
+`evidence_budget_chars=None` grounds `ask()` on exactly `limit` hits. A positive integer may admit
+more ranked evidence while its text-equivalent cost fits the budget: 2,000 characters per image,
+4,000 per audio asset, and 12,000 per video asset.
 
 The two other construction boundaries are:
 
@@ -122,8 +118,8 @@ resolve_memory_config(
 ) -> MemoryComposition
 ```
 
-`MemoryPlugins` contains `embedder`, optional `answerer`, optional `transcriber`, optional
-`vision_describer`, optional `face_analyzer`, and optional `former`. `MemoryConfig` contains the value-only settings from the constructor;
+`MemoryPlugins` contains `embedder` plus optional `answerer`, `transcriber`, `vision_describer`,
+`face_analyzer`, and `former`. `MemoryConfig` contains the value-only constructor settings;
 `MemorySettings` is its public alias. `MemoryComposition` contains `data_dir`, `plugins`, and
 `settings`; call `close()` unless its plugins have been transferred to a `Memory`.
 
@@ -148,8 +144,9 @@ than it. Metadata is a JSON-compatible mapping with non-empty string keys. `Memo
 `semantic`, `episodic`, or `procedural`; see
 [memory types, time, and decay](../memory-types-time-and-decay.md).
 
-The stable memory ID covers the ordered canonical content, metadata, event start/end, and memory
-type. Repeating the same canonical input returns the same record without another model call.
+The stable memory ID covers ordered canonical content, media digests, metadata, event start/end,
+memory type, and optional observation context. Repeating the same canonical input returns the same
+record without another model call.
 
 `StreamInput` adds per-item values to a stream:
 
@@ -160,6 +157,9 @@ StreamInput(
     occurred_end: datetime | None = None,
     metadata: Mapping[str, object] | None = None,
     memory_type: MemoryType = MemoryType.SEMANTIC,
+    context: ObservationContext | None = None,
+    transcript: str | None = None,
+    description: str | None = None,
 )
 ```
 
@@ -284,15 +284,9 @@ Repeated `close()` calls are harmless.
 ### Cross-modal identity binding
 
 A face and a voice become one identity only after the same pair co-occurs in
-`identity_link_min_assets` distinct assets (default `2`). A single asset cannot separate "this
-face spoke" from "this face was listening to someone off camera", which is the ordinary case in
-egocentric capture: the wearer talks while somebody else fills the frame. Binding on one asset
-therefore attaches the wearer's voice to whoever happened to be visible. Set
-`identity_link_min_assets=1` to bind on first co-occurrence.
-
-Binding is recorded, not guessed at read time, so it is durable and reversible through
-`unlink_identity`. Recognizer yield per asset is reported under the `mindbridge.identity.*` span
-attributes, including when nothing was detected.
+`identity_link_min_assets` distinct assets. The default `2` avoids binding on a single ambiguous
+co-occurrence; set it to `1` only when first-observation binding is intended. Binding is durable
+and reversible through `unlink_identity`.
 
 ### AsyncMemory
 
@@ -332,6 +326,69 @@ Only one search runs at once and only the newest queued snapshot survives. `fina
 exact final revision and closes the helper. Snapshots reject mutable `Path` atoms; use `Blob` or
 `AssetRef`.
 
+### Async capture streams
+
+The three capture helpers share the same keyword parameters and defaults:
+
+```text
+AsyncCaptureStream(
+    memory: AsyncMemory,
+    *,
+    limit: int = 10,
+    memory_type: MemoryType | None = None,
+    reference_at: datetime | None = None,
+    max_streams: int = 32,
+) -> None
+AsyncAudioStream(
+    memory: AsyncMemory,
+    *,
+    limit: int = 10,
+    memory_type: MemoryType | None = None,
+    reference_at: datetime | None = None,
+    max_streams: int = 32,
+) -> None
+AsyncVisionStream(
+    memory: AsyncMemory,
+    *,
+    limit: int = 10,
+    memory_type: MemoryType | None = None,
+    reference_at: datetime | None = None,
+    max_streams: int = 32,
+) -> None
+
+AsyncCaptureStream.consume(
+    events: AsyncIterable[StreamEvent],
+) -> AsyncIterator[StreamCommit]
+AsyncAudioStream.consume(
+    packets: AsyncIterable[AudioStreamPacket],
+) -> AsyncIterator[StreamCommit]
+AsyncVisionStream.consume(
+    packets: AsyncIterable[VisionStreamPacket],
+) -> AsyncIterator[StreamCommit]
+```
+
+`AsyncCaptureStream` treats `update` as speculative retrieval, `final` as the durable write, and
+`cancel` as discard. `AsyncAudioStream` reduces `PCMChunk`, `VADPacket`, `ASRPartial`, and
+`AcousticBoundary`; `AsyncVisionStream` reduces `VisionFrame`, `VisionPartial`, and
+`SceneBoundary`. Up to `max_streams` independent `stream_id` values may be active. See
+[omni streaming and interaction memory](../omni-streaming-and-interaction-memory.md) for event
+semantics and complete examples.
+
+### Root import inventory
+
+These are the supported names exported by `mindbridge`:
+
+| Group | Names |
+| --- | --- |
+| Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
+| Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `FaceObservation`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal` |
+| Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
+| Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `SpatialAnchor`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
+| Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
+| Bundled adapters | `JinaOmniEmbedder`, `SentenceTransformersEmbedder`, `OpenAIModels`, `OpenCVFaceAnalyzer`, `FunASRTranscriber`, `FunASRRecipe`, `DEFAULT_FUNASR_MODEL_ID`, `DEFAULT_FUNASR_RECIPE` |
+| Exceptions | `MindBridgeError`, `ValidationError`, `MemoryNotFoundError`, `SpeakerNotFoundError`, `IdentityNotFoundError`, `ModelError`, `ModelOutputTruncatedError`, `StorageError`, `IndexUnavailableError` |
+
 ### Public values
 
 The principal immutable values are:
@@ -346,6 +403,7 @@ The principal immutable values are:
 | `AnswerResult` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `Page` | `items`, `next_cursor` |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
+| `IdentityProfile` | `identity_id`, `name`, `relationship` |
 | `FaceObservation` | `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
 | `SpatialContext` | `frame_id`, `anchor`, `x`, `y`, `z`, `orientation_xyzw`, `position_uncertainty_m` |
 | `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial` |
@@ -365,11 +423,9 @@ The principal immutable values are:
 | `RetrievalTrace` | `candidates`, `candidate_limit`, `exhaustive`, `ambiguous` |
 | `RetrievalCandidateTrace` | `memory_id`, `index_ids`, `dense_relevance`, `dense_confidence`, `lexical_relevance`, `lexical_rerank_bonus`, `lexical_match`, `gate_confidence`, `base_relevance`, `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`, `rejected_by` |
 
-`abstained` reports that the answerer returned the exact sentence the grounding prompt reserves for
-having no usable evidence. It is not a measure of how often a model declined to answer: a model that
-refuses in its own words is not abstaining by this definition, and on one EgoLifeQA slice 12 of 51
-answers read as refusals without using the sentence. Treat it as a protocol signal and measure
-refusal rate separately if that is the quantity needed.
+`abstained` is true only when the answerer returns MindBridge's reserved no-evidence sentence. A
+provider refusal expressed another way is an ordinary answer unless the adapter maps it to this
+protocol signal.
 
 Enum values are:
 
@@ -527,7 +583,8 @@ that license covers the weights, not MindBridge. `DEFAULT_FUNASR_MODEL_ID` and
 `DEFAULT_FUNASR_RECIPE` publish the default speech recipe.
 `FunASRRecipe.auto_model_arguments() -> dict[str, object]` returns its standard FunASR composition.
 
-`OpenAIModels` can fill embedding, generation, and transcription slots independently:
+`OpenAIModels` can fill embedding, generation, transcription, and formation capabilities. Pass the
+same object only to the slots it should serve:
 
 ```text
 OpenAIModels(
@@ -576,6 +633,7 @@ embed(
     inputs: Sequence[ModelInput | str],
     task: EmbedTask = EmbedTask.DOCUMENT,
 ) -> tuple[tuple[float, ...], ...]
+form(inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]
 answer(question: ModelInput | str, hits: Sequence[SearchHit]) -> AnswerResult
 stream_answer(
     question: ModelInput | str,

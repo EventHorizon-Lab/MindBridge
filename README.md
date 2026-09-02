@@ -1,46 +1,48 @@
 # MindBridge
 
-MindBridge is fast local multimodal memory for Python agents. It stores text, image, video, audio,
-and mixed observations in one embedded runtime, then retrieves them or grounds model answers in
-the stored evidence.
+MindBridge is an embedded multimodal memory library for Python agents. It stores text, image,
+video, audio, and mixed observations locally, then retrieves relevant records or grounds model
+answers in the stored evidence.
 
-SQLite is authoritative, media lives in a local content-addressed store, and Zvec is a rebuildable
-search projection. One physical `data_dir` has one live `Memory` owner.
+It runs in your process: SQLite is authoritative, media uses a local content-addressed store, and
+Zvec is a rebuildable search projection. One physical `data_dir` belongs to one live `Memory`
+owner, so separate memory domains use separate directories.
 
-## Get started
+## Install
 
-MindBridge supports Python 3.10 through 3.14. Install the bundled local embedding adapter:
+MindBridge supports Python 3.10 through 3.14. Choose the smallest install for your application:
 
-```bash
-uv add "mindbridge[local]"
-```
+- First local run, with bundled multimodal embedding: `uv add "mindbridge[local]"`
+- Application-supplied embedding backend: `uv add mindbridge`
+- OpenAI models, REST serving, or MCP transport: add the `openai`, `server`, or `mcp` extra
 
-```python
-from mindbridge import Memory
+The local recipe needs no model API key, but it downloads and executes a pinned Jina model whose
+weights are restricted to non-commercial use. Read the [quick start](docs/quickstart.md) before
+using that model with sensitive or commercial workloads. All install combinations are listed in
+[configuration](docs/configuration.md#install-only-the-surfaces-you-use).
 
-with Memory.from_config(
-    {
-        "data_dir": "./data/assistant",
-        "embedding": {"provider": "jina-omni"},
-    }
-) as memory:
-    memory.add("The spare key is in the blue toolbox.")
-    for hit in memory.search("Where is the spare key?"):
-        print(hit.score, hit.content)
-```
+## Start
 
-The bundled Jina model supports text and media, but its weights are licensed CC BY-NC 4.0 for
-non-commercial use. Use another embedding backend when that licence does not fit your application.
+Follow the [quick start](docs/quickstart.md) to install the local recipe and run one complete
+store-and-search example. No database service, cache, queue, or object store is required.
 
-## Documentation
+Then choose the page for your task:
 
-- [Quick start](docs/quickstart.md)
-- [Core concepts](docs/concepts.md)
-- [Configuration](docs/configuration.md)
-- [Python, REST, MCP, and CLI reference](docs/README.md#api-reference)
-- [Architecture, deployment, and operations](docs/README.md#operate-mindbridge)
+- [Core concepts](docs/concepts.md) — records, retrieval, persistence, and isolation
+- [Configuration](docs/configuration.md) — bundled providers and custom backends
+- [Python SDK](docs/api/python-sdk.md) — supported imports from `mindbridge`
+- [REST API](docs/api/rest.md) — the `/v1` HTTP surface
+- [MCP tools](docs/api/mcp.md) — the six supported tools
+- [Deployment and operations](docs/README.md#deploy-and-operate)
 - [Troubleshooting](docs/troubleshooting.md)
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) to develop MindBridge. MindBridge-authored code is licensed
-under the [Apache License 2.0](LICENSE); third-party benchmark material retains its
-[upstream terms](src/mindbridge/benchmarks/_official/NOTICE.md).
+The [documentation index](docs/README.md) owns the complete learning and reference map.
+
+## License
+
+MindBridge-authored code is available under the [Apache License 2.0](LICENSE). Models, datasets,
+and vendored benchmark material may use different terms; the bundled Jina weights are CC BY-NC
+4.0, and benchmark notices retain their
+[upstream licenses](src/mindbridge/benchmarks/_official/NOTICE.md).
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for repository setup and quality gates.
