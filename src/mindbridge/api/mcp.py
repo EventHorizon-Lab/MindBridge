@@ -18,7 +18,7 @@ from pydantic import AwareDatetime, BaseModel, Field, JsonValue, StringConstrain
 
 from mindbridge import Memory
 from mindbridge.api.content import Content, content_input
-from mindbridge.api.errors import error_message
+from mindbridge.api.messages import error_message
 from mindbridge.exceptions import MindBridgeError, ValidationError
 from mindbridge.types import (
     AbstentionReason,

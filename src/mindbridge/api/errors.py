@@ -13,6 +13,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException
 
+# Re-exported: the message table lives in a FastAPI-free module so MCP can share it.
+from mindbridge.api.messages import MESSAGE_BY_CODE as MESSAGE_BY_CODE
+from mindbridge.api.messages import error_message
 from mindbridge.exceptions import MindBridgeError, ValidationError
 
 _LOGGER = logging.getLogger(__name__)
@@ -75,18 +78,6 @@ STATUS_BY_CODE: Mapping[str, int] = {
     "model_output_truncated": status.HTTP_502_BAD_GATEWAY,
     "storage_error": status.HTTP_503_SERVICE_UNAVAILABLE,
     "index_unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
-}
-# One message per code, shared by REST and MCP so the two surfaces cannot drift apart. A raise
-# site's own message always wins; this is only what a bare raise says.
-MESSAGE_BY_CODE: Mapping[str, str] = {
-    "validation_error": "input is invalid",
-    "memory_not_found": "memory does not exist",
-    "speaker_not_found": "speaker does not exist",
-    "identity_not_found": "identity does not exist",
-    "model_error": "model operation failed",
-    "model_output_truncated": "model operation failed",
-    "storage_error": "memory storage is unavailable",
-    "index_unavailable": "memory index is unavailable",
 }
 
 
@@ -204,14 +195,6 @@ def error_response(
         content=body.model_dump(mode="json"),
         headers=headers,
     )
-
-
-def error_message(error: MindBridgeError) -> str:
-    """Return the author-written message, or the code's default when the raise site gave none."""
-    default = MESSAGE_BY_CODE.get(error.code)
-    # An unmapped public code is a MindBridge bug, not caller-actionable detail. REST pairs this
-    # message with HTTP 500 and MCP emits the same string.
-    return "memory operation failed" if default is None else (str(error) or default)
 
 
 def _public_error(error: MindBridgeError) -> tuple[int, str]:

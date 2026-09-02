@@ -176,7 +176,7 @@ def _server() -> None:
 
 
 def _mcp() -> None:
-    """Build the real MCP server and resolve the seven supported tool schemas."""
+    """Build the real MCP server and resolve the fourteen supported tool schemas."""
     import asyncio
 
     from mindbridge import Memory
@@ -190,12 +190,19 @@ def _mcp() -> None:
     tools = asyncio.run(server.list_tools())
     assert {tool.name for tool in tools} == {
         "add_memory",
+        "analyze_faces",
+        "analyze_speech",
         "ask_memory",
         "delete_memory",
+        "forget_identity",
+        "get_identity",
         "get_memory",
         "list_memories",
+        "register_identity",
+        "register_speaker",
         "reinforce_memories",
         "search_memories",
+        "unlink_identity",
     }
 
 
