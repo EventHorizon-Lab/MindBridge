@@ -1,60 +1,65 @@
 # Memory types, time, and decay
 
-MindBridge stores semantic, episodic, and procedural roles on the same durable record. An optional
-typed context refines that record into observations, entities, events, state, relations, affect,
-traits, and response policies carrying source evidence, confidence, and their own validity and
-transaction time. Event time, type filtering, optional temporal parsing, and optional decay all
-use the ordinary SQLite and Zvec path; they do not create separate stores or scopes.
+This page owns memory-role, event-time, typed-assertion, retrieval-scope, and ranking semantics.
+MindBridge stores semantic, episodic, and procedural roles on the same durable record, and an
+optional typed context refines that record into observations, entities, events, state, relations,
+affect, traits, and response policies carrying source evidence, confidence, and their own validity
+and transaction time. Every control below uses the ordinary SQLite record and Zvec projection path;
+none creates another store or isolation scope.
 
-| Control | Effect |
+| Control | Behavior |
 | --- | --- |
-| `memory_type` | Hard exact-role filter when supplied. |
-| `occurred_from` / `occurred_until` | Hard event-overlap filter. |
-| Temporal phrases in query text | Soft ranking signal relative to `reference_at`. |
-| Decay and reinforcement | Soft ranking signals; they never delete or rewrite content. |
+| `memory_type` | Hard exact-role filter when supplied |
+| `occurred_from` / `occurred_until` | Hard event-overlap filter |
+| `RetrievalScope` | Hard valid-time, known-time, and same-frame spatial filters |
+| Temporal phrases in query text | Soft event-time ranking signal relative to `reference_at` |
+| Reinforcement and decay | Soft ranking signals; content is never rewritten or deleted |
 
 ## Memory types
 
 | Type | Intended content | Kernel behavior |
 | --- | --- | --- |
-| `MemoryType.SEMANTIC` | Facts and stable application knowledge | Default type. |
-| `MemoryType.EPISODIC` | An event or observation | Usually paired with event time. |
-| `MemoryType.PROCEDURAL` | Instructions or reusable routines | Retrieved as evidence; never executed by MindBridge. |
+| `MemoryType.SEMANTIC` | Facts and stable application knowledge | Default type |
+| `MemoryType.EPISODIC` | Events and observations | Usually paired with event time |
+| `MemoryType.PROCEDURAL` | Instructions and reusable routines | Returned as evidence, never executed |
 
-The caller classifies content. MindBridge does not extract facts, segment episodes, or promote one
-type into another unless an explicit `FormationBackend` is configured, and even then formation
-proposes a separate typed record rather than rewriting the caller's role. Type is part of stable identity, so otherwise identical semantic, episodic, and
-procedural records have different IDs. `search` and `ask` accept an optional exact type filter.
+The caller classifies ordinary content. MindBridge does not extract facts, segment episodes, or
+promote one type into another unless an explicit `FormationBackend` is configured, and even then
+formation proposes a separate typed record rather than rewriting the caller's role. Memory type is
+part of stable identity, so otherwise identical semantic, episodic, and procedural records have
+different IDs. `search()` and `ask()` accept an optional exact type filter.
+
+Every snippet on this page assumes an open `memory`:
 
 ```python
 from datetime import datetime, timezone
 
-from mindbridge import JinaOmniEmbedder, Memory, MemoryType
+from mindbridge import MemoryType
 
-with Memory("./data/agent", embedder=JinaOmniEmbedder()) as memory:
-    memory.add(
-        "The deployment failed because the token expired.",
-        memory_type=MemoryType.EPISODIC,
-        occurred_at=datetime(2026, 8, 20, 9, tzinfo=timezone.utc),
-    )
-    memory.add(
-        "Refresh the token, retry once, then escalate.",
-        memory_type=MemoryType.PROCEDURAL,
-    )
+memory.add(
+    "The deployment failed because the token expired.",
+    memory_type=MemoryType.EPISODIC,
+    occurred_at=datetime(2026, 8, 20, 9, tzinfo=timezone.utc),
+)
+memory.add(
+    "Refresh the token, retry once, then escalate.",
+    memory_type=MemoryType.PROCEDURAL,
+)
 
-    episodes = memory.search(
-        "What failed last week?",
-        memory_type=MemoryType.EPISODIC,
-        reference_at=datetime(2026, 8, 27, 12, tzinfo=timezone.utc),
-    )
+episodes = memory.search(
+    "What failed last week?",
+    memory_type=MemoryType.EPISODIC,
+    reference_at=datetime(2026, 8, 27, 12, tzinfo=timezone.utc),
+)
 ```
 
-Metadata remains application data. A type or metadata value is not an authorization or isolation
-boundary.
+Use types to keep cognitive roles distinct, not to enforce access control. Metadata and types are
+application data; separate security domains require separate data directories.
 
 ## Typed context and formation
 
-Attach source context to an observation without leaving the common path:
+`ObservationContext` is caller input. It attaches provenance, confidence, optional world validity,
+and optional spatial pose to a source observation without leaving the common path:
 
 ```python
 from mindbridge import EvidenceBasis, ObservationContext
@@ -69,13 +74,34 @@ source = memory.add(
 )
 ```
 
+The returned record exposes the persisted `MemoryContext`. A source context has
+`MemoryKind.OBSERVATION`. An optional former may propose these derived kinds, each with the memory
+type the kernel assigns it:
+
+| Derived kind | Memory type | Meaning |
+| --- | --- | --- |
+| `ENTITY` | Semantic | A referenced person, object, or concept |
+| `EVENT` | Episodic | A formed event assertion |
+| `STATE` | Semantic | A value that can change over valid time |
+| `RELATION` | Semantic | A typed relation between subjects |
+| `AFFECT` | Episodic | A situated affect cue |
+| `TRAIT` | Semantic | A longer-horizon characteristic |
+| `RESPONSE_POLICY` | Procedural | Feedback-grounded response guidance |
+
 The source commits before any typed proposal is formed, so a formation model error leaves the
-observation durable and the formation retryable. Two kinds carry extra visibility rules:
+observation durable and the formation retryable. The former only proposes; the kernel validates
+source modality and spatial binding, assigns IDs, links evidence, versions conflicting state, and
+commits derived records. Two kinds carry extra visibility rules:
 
 - `MemoryKind.AFFECT` records a situated cue together with the source modality it came from, so a
   model cannot claim an audio cue for a source that has no audio.
 - `MemoryKind.TRAIT` stays hidden from active retrieval until two independent sources support the
-  same typed claim, combining their independent confidence with a noisy-OR projection.
+  same typed claim, combining their independent confidence with a noisy-OR projection. A trusted
+  `EvidenceBasis.USER_STATEMENT` trait is visible immediately.
+
+Keep raw observations even when an interpretation changes. Correct typed state with new evidence,
+or remove the incorrect derived record; do not present a derived rewrite as the original
+observation.
 
 See [omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) for the
 formation, affect, and spatial examples that arrive from capture streams.
@@ -95,15 +121,18 @@ An instant event is treated internally as a one-microsecond interval. A stored i
 when it overlaps the requested range; an event ending exactly at `occurred_from`, or starting
 exactly at `occurred_until`, does not match.
 
+Use these explicit bounds whenever records outside the interval must be excluded; temporal
+language in the query is a ranking signal, not a filter.
+
 ## Valid time and transaction time
 
 Raw occurrence and typed assertion time answer different questions:
 
-| Field | Meaning |
+| Field | Question answered |
 | --- | --- |
-| `occurred_at` / `occurred_end` | When the captured episode happened |
-| `MemoryContext.valid_from` / `valid_until` | When the assertion is true in the represented world |
-| `MemoryContext.recorded_at` / `retired_at` | When MindBridge knew that assertion version |
+| `occurred_at` / `occurred_end` | When did the captured episode happen? |
+| `MemoryContext.valid_from` / `valid_until` | When was this assertion true in the represented world? |
+| `MemoryContext.recorded_at` / `retired_at` | When did MindBridge know this assertion version? |
 
 Both validity columns and both transaction columns are stored on every typed version, so this is
 full bitemporal invalidation rather than a single timestamp. A formation backend is not required to
@@ -140,6 +169,33 @@ recalculates derived confidence and visibility, and removing the last evidence r
 unsupported derived record. Removing a superseding source, or deleting a derived assertion, rebuilds
 current validity segments from the remaining supported assertions. Source records are deleted only
 by an explicit caller action.
+
+### Spatial scope
+
+`RetrievalScope` carries the spatial filter on the same value:
+
+```python
+from mindbridge import RetrievalScope, SpatialAnchor, SpatialContext
+
+scope = RetrievalScope(
+    valid_at=event_time,
+    known_at=audit_time,
+    near=SpatialContext(
+        frame_id="home/map",
+        anchor=SpatialAnchor.SUBJECT,
+        x=2.0,
+        y=1.0,
+    ),
+    radius_m=0.75,
+)
+hits = memory.search("Where was the red toolbox?", scope=scope)
+```
+
+`near` and `radius_m` must be supplied together, and `radius_m` must be non-negative. Spatial
+search compares only matching coordinate frames and anchors, and position uncertainty expands the
+conservative intersection test. MindBridge infers no coordinate transform, so a scope in one frame
+never matches a memory stored in another, and it excludes every memory stored without a spatial
+context.
 
 ### Expiring a memory without deleting it
 
@@ -204,7 +260,10 @@ event end, event start, or last update time. The configured half-life applies ex
 with a nonzero floor, and repeated confirmations slow that decay. Public scores remain bounded to
 `[0, 1]`. Eligible confirmations also provide a small ranking boost when decay is disabled.
 
-Search never reinforces a result. Record positive application feedback explicitly:
+`search()` never reinforces a result. `ask()` does reinforce the evidence it cited, because
+answering is itself a usage signal; set `reinforce_on_answer=False` to turn that off, which
+measurement needs, since reinforcing mid-run makes one question's retrieval depend on which
+earlier questions answered. Record other positive application feedback explicitly:
 
 ```python
 used = memory.search("How should I recover the deployment?", limit=1)
@@ -212,9 +271,10 @@ if used and user_confirmed_helpful:
     memory.reinforce((used[0].id,))
 ```
 
-`reinforce` de-duplicates IDs, updates existing records, and caps confirmation count at 20.
-Confirmations after the query's ranking reference are ignored so evaluation cannot leak future
-feedback into the past.
+`reinforce()` de-duplicates IDs, skips missing records, and caps each record's confirmation count
+at 20. Confirmations after the query's ranking reference are ignored so evaluation cannot leak
+future feedback into the past.
 
-Use `search_with_trace()` when one query needs its temporal, reinforcement, and retention factors
-explained. Normal telemetry omits per-memory candidate identifiers.
+Reinforce only observed positive use or feedback. Use `search_with_trace()` when one query needs
+its temporal, reinforcement, retention, or rejection factors explained; normal telemetry omits
+per-memory candidate identifiers.

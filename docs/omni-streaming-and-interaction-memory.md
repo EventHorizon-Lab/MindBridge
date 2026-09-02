@@ -1,30 +1,41 @@
-# Omni streams, speculative recall, and interaction records
+# Omni streaming and interaction memory
 
-MindBridge distinguishes three states in a continuous application:
+MindBridge separates changing capture state from durable memory. `StreamEvent` is the explicit form
+of that separation:
 
-1. A changing query snapshot used only for speculative search.
-2. A completed observation that can be written durably.
-3. An application-derived record that cites the observation it came from.
+1. An `UPDATE` is a complete current snapshot used only for speculative search.
+2. A `FINAL` is a completed observation eligible for exactly one durable write.
+3. A `CANCEL` or end-of-stream before finality writes nothing.
 
-`StreamEvent` is the explicit form of those states: an `UPDATE` snapshot may drive speculative
-retrieval, a `FINAL` persists exactly once, and `CANCEL` or end-of-stream writes nothing.
 `AsyncAudioStream` and `AsyncVisionStream` map canonical capture values onto that contract.
 
-MindBridge does not capture sensors, reconnect streams, select frames, parse partial containers, or
-detect turn boundaries. Camera and microphone I/O, provider packet decoding, and pixel conversion
-remain adapter work. The application decides when an observation is complete and normalizes it to
-`ContentInput`.
+This page owns those lifecycle boundaries. Sensor capture, stream reconnection, provider packet
+decoding, pixel conversion, frame selection, and turn detection remain application or adapter
+work: the application decides when an observation is complete and normalizes it to `ContentInput`.
 
-The snippets assume an open memory plus already-read immutable media bytes. They show lifecycle and
-provenance boundaries; media capture and decoding remain application work.
+## Choose the smallest stream API
+
+| Need | API |
+| --- | --- |
+| Lazily add completed independent observations | `Memory.add_stream()` or `AsyncMemory.add_stream()` |
+| Search while one query snapshot is changing | `AsyncOmniPrefetch` |
+| Associate speculative snapshots with final commits | `AsyncCaptureStream` |
+| Normalize PCM, VAD, and ASR state | `AsyncAudioStream` |
+| Normalize encoded frames and visual descriptions | `AsyncVisionStream` |
+
+Use `add_stream()` unless the application benefits from speculative recall. Use the capture
+reducers only when explicit finality is available. Every reducer takes an `AsyncMemory`, written
+`async_memory` below; the synchronous snippets assume an open `memory` plus already-read immutable
+media bytes.
 
 ## Add completed observations
 
-`Memory.add_stream` consumes a lazy iterable of `ContentInput` or `StreamInput` values. Each item
-uses the ordinary `add` path and is durable and searchable before the next item is pulled. The
-stream is not one transaction: a later item or source failure leaves the committed prefix intact.
+`Memory.add_stream()` consumes a lazy iterable of `ContentInput` or `StreamInput` values. Each item
+uses the ordinary `add()` path and is durable and searchable before the next item is requested. The
+stream is not one transaction: a later source or item failure leaves the committed prefix intact.
 
-Use `StreamInput` for per-observation event time, metadata, or memory type:
+Use `StreamInput` when observations need independent event time, metadata, memory type, context,
+transcript, or visual description:
 
 ```python
 from datetime import datetime, timedelta, timezone
@@ -48,16 +59,17 @@ for source_record in memory.add_stream((observation,)):
     print(source_record.id)
 ```
 
-The async form accepts an `AsyncIterable` and yields through `async for`. Both forms preserve
-source backpressure and name a failing item's zero-based `contents[index]` in the public error.
+The async form accepts an `AsyncIterable` and yields with `async for`. Both forms preserve source
+backpressure and identify a failing item as zero-based `contents[index]` in the public error.
+
 Mutable ASR hypotheses, incomplete media, and repeatedly overwritten file paths are not completed
-observations; keep them out of durable ingestion.
+observations. Keep them out of durable `add_stream()` input.
 
 ## Prefetch a changing query
 
-`AsyncOmniPrefetch` wraps an open `AsyncMemory` (named `async_memory` below) and overlaps retrieval
-with an unfinished turn without storing its partial input. Every submission is a complete current
-snapshot, not a delta:
+`AsyncOmniPrefetch` wraps an open `AsyncMemory` and overlaps retrieval with an unfinished turn
+without storing its partial input. Every submission is the complete current query snapshot, not a
+delta:
 
 ```python
 from mindbridge import AsyncOmniPrefetch
@@ -83,21 +95,21 @@ because the file may change after submission. If a turn is abandoned, `await pre
 drops queued work and waits for any search already dispatched through `asyncio.to_thread`.
 Cancelling that task would not stop its synchronous model or index call, so the helper drains it.
 
-Speculative search does not reinforce returned memories. Call `reinforce` only after the
-application has observed positive use or feedback.
+Prefetch never stores or reinforces a snapshot. Call `reinforce` only after the application has
+observed positive use or feedback.
 
 ## Capture-event reducer
 
-`AsyncCaptureStream` provides the lifecycle that raw `add_stream` lacks. Every `StreamEvent` carries
-a `stream_id` (`"default"` when omitted), so microphones, cameras, and sessions may interleave
-without sharing speculative state. The same ID comes back on the resulting `StreamCommit`.
+`AsyncCaptureStream` provides the lifecycle that raw `add_stream()` lacks. Every `StreamEvent`
+carries a `stream_id` (`"default"` when omitted), so interleaved microphones, cameras, or sessions
+keep independent speculative state. The same ID comes back on the resulting `StreamCommit`.
 
-| Phase | Association | Payload | Retrieval | Durable write |
-| --- | --- | --- | --- | --- |
-| `UPDATE` | One `stream_id` | Complete current `ContentInput` snapshot | Speculative and coalesced | Never |
-| `FINAL` | One `stream_id` | Exact final `ContentInput` or `StreamInput` | Exact-final confirmation | Once |
-| `CANCEL` | One `stream_id` | No payload | Only that stream is discarded/drained | Never |
-| EOF before `FINAL` | All open IDs | — | Pending work is discarded/drained | Never |
+| Phase | Payload | Retrieval | Durable write |
+| --- | --- | --- | --- |
+| `UPDATE` | Complete current immutable `ContentInput` snapshot | Speculative and coalesced | Never |
+| `FINAL` | Exact final `ContentInput` or `StreamInput` | Exact-final confirmation | Once |
+| `CANCEL` | None | That stream alone is discarded and drained | Never |
+| EOF before `FINAL` | — | Every open stream is discarded and drained | Never |
 
 ```python
 from mindbridge import AsyncCaptureStream, StreamEvent, StreamPhase
@@ -110,18 +122,20 @@ async def camera_events():
     yield StreamEvent(StreamPhase.FINAL, right_clip, stream_id="camera-right")
 
 
-capture = AsyncCaptureStream(memory, limit=8)
+capture = AsyncCaptureStream(async_memory, limit=8)
 async for commit in capture.consume(camera_events()):
     print(commit.stream_id, commit.record.id, commit.prefetch, commit.retrieval_error)
 ```
 
-`max_streams` defaults to 32 and bounds the active prefetch workers. One worker runs at a time per
-ID; different IDs may search concurrently. A final or cancel boundary frees that ID.
+`max_streams` defaults to 32 and bounds the active prefetch workers. One search runs at a time per
+ID; different IDs may search concurrently. A final or cancel boundary frees that ID. The two packet
+reducers additionally accept `context=`, either a fixed `ObservationContext` or a callable read once
+per closed observation, because a capture stream outlives the observations it commits.
 
-If final retrieval fails, the final observation still commits and `StreamCommit.retrieval_error`
-carries a stable public code (or `retrieval_failed` for an unclassified exception). Task
-cancellation before the final commit writes nothing; once the exact-final write starts, cancellation
-waits for that commit and then propagates, so no worker writes after a cancelled task returned.
+If final retrieval fails, the observation still commits and `StreamCommit.retrieval_error` carries
+a stable public error code, or `retrieval_failed` for an unclassified exception. Cancellation before
+the final write starts stores nothing. Once that write starts, cancellation waits for the commit and
+then propagates, so no worker writes after a cancelled task has returned.
 
 ## Native audio protocol
 
@@ -153,7 +167,7 @@ async def audio_packets():
     yield AcousticBoundary(AudioBoundary.END, stream_id="headset")
 
 
-audio = AsyncAudioStream(memory, limit=8)
+audio = AsyncAudioStream(async_memory, limit=8)
 async for commit in audio.consume(audio_packets()):
     print(commit.stream_id, commit.record.id)
 ```
@@ -196,7 +210,7 @@ async def vision_packets():
     yield SceneBoundary(VisionBoundary.END, stream_id="camera-left")
 
 
-vision = AsyncVisionStream(memory, limit=8)
+vision = AsyncVisionStream(async_memory, limit=8)
 async for commit in vision.consume(vision_packets()):
     print(commit.stream_id, commit.record.id)
 ```
@@ -220,17 +234,17 @@ paths.
 
 ## Interaction-derived records
 
-Without a configured former, interaction memory is an application convention over existing
-records, not another store or a fourth `MemoryType`:
+Without a configured former, interaction memory is an application convention over the existing
+three memory types, not another store or a fourth type:
 
-| Derived information | Type |
+| Derived information | Memory type |
 | --- | --- |
 | Explicit preference or supported stable fact | `SEMANTIC` |
 | One situated interaction with event time | `EPISODIC` |
 | Response guidance supported by feedback | `PROCEDURAL` |
 
-Store the completed source observation first. Continuing with the `source_record` returned above, a
-later analysis can write an ordinary record whose metadata cites the source ID:
+Store the completed source observation first. Continuing with the `source_record` returned above,
+application analysis can then add an ordinary record whose metadata cites the source:
 
 ```python
 from mindbridge import MemoryType
@@ -246,12 +260,13 @@ guidance = memory.add(
 )
 ```
 
-MindBridge stores that metadata but does not interpret its provenance or confidence. On this
-path emotion, trait, and policy inference remain application work; the kernel does not run them
-automatically. Configuring a `FormationBackend` instead moves the same information into typed,
-kernel-validated records, as described next. Keep the source observation when a derived interpretation changes. Add corrected
-evidence or delete the incorrect derived record instead of presenting a rewrite as the original
-observation.
+On this manual path MindBridge stores that metadata but does not interpret its provenance,
+confidence, or evidence IDs; emotion, trait, and policy inference remain application work.
+Configuring a `FormationBackend` instead moves the same information into typed, kernel-validated
+records, as described next.
+
+Keep the source observation when a derived interpretation changes. Add corrected evidence or delete
+the incorrect derived record instead of presenting a rewrite as the original observation.
 
 Applications can query roles separately when one role must not crowd out another:
 
@@ -288,9 +303,9 @@ records, and records the durable formation recipe in one SQLite transaction. If 
 source stays durable and repeating the same add can complete the missing projection. `OpenAIModels`
 sends model content but never stable memory or CAS IDs, nor exact spatial values.
 
-The typed roles are `OBSERVATION`, `ENTITY`, `EVENT`, `STATE`, `RELATION`, `AFFECT`, `TRAIT`, and
-`RESPONSE_POLICY`. They refine the existing semantic, episodic, and procedural `MemoryType` roles;
-they do not create eight stores.
+The typed kinds refine the existing semantic, episodic, and procedural `MemoryType` roles; they do
+not create eight stores. Their meanings and assigned memory types are in
+[typed context and formation](memory-types-time-and-decay.md#typed-context-and-formation).
 
 ## Affect and personality evidence
 
@@ -316,46 +331,11 @@ letting one uncertain emotional episode personalize future behavior.
 Response policies are typed procedural evidence, never executable code. They require explicit
 feedback provenance before an application should use them to adapt companion behavior.
 
-## Spatial and historical retrieval
-
-`RetrievalScope` asks what was valid in the world, what MindBridge knew at the time, or what was
-nearby in one coordinate frame:
-
-```python
-from mindbridge import RetrievalScope, SpatialAnchor, SpatialContext
-
-scope = RetrievalScope(
-    valid_at=event_time,
-    known_at=audit_time,
-    near=SpatialContext(
-        frame_id="home/map",
-        anchor=SpatialAnchor.SUBJECT,
-        x=2.0,
-        y=1.0,
-    ),
-    radius_m=0.75,
-)
-hits = memory.search("Where was the red toolbox?", scope=scope)
-```
-
-Spatial search is same-frame and same-anchor only, and position uncertainty expands the conservative
-intersection test; MindBridge never guesses a coordinate transform. The `valid_at` and `known_at`
-axes are defined in
-[memory types, time, and decay](memory-types-time-and-decay.md#valid-time-and-transaction-time).
-The `occurred_from`/`occurred_until` filters remain separate and select raw event occurrence.
-
-## Graph evidence gate
-
-Formation introduces no graph database. Typed lineage and evidence links cover deterministic state
-maintenance without another service. A graph candidate is justified only when public-path benchmarks
-show that gold evidence is commonly retrieved at a larger K but displaced at the product K, the
-failure spans independent memory units, and a prototype improves retrieval and answer metrics
-without violating latency, storage, rebuild, and privacy budgets.
-
-If that gate passes, start with an additive entity/relation projection derived from authoritative
-SQLite records and rebuilt through the existing outbox lifecycle. It must not become a second source
-of truth, create logical account scopes, or learn from abandoned speculative queries. See the
-[competitive review](competitive-memory-systems.md) for the source audit and roadmap.
+A spatial pose recorded on a stream observation is retrieved with `RetrievalScope`; see
+[spatial scope](memory-types-time-and-decay.md#spatial-scope) for the same-frame rule and
+[valid time and transaction time](memory-types-time-and-decay.md#valid-time-and-transaction-time)
+for the historical axes. Formation introduces no graph database, and the gate a graph projection
+would have to pass is in the [competitive review](competitive-memory-systems.md).
 
 ## Observability
 

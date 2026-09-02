@@ -1,11 +1,10 @@
 # MCP API
 
-## Purpose
+## Surface
 
 The optional MCP adapter exposes exactly fourteen typed tools over one injected synchronous
-`Memory`.
-It validates tool input, calls the matching SDK operation, and returns structured public values.
-It does not own storage, provider selection, or the injected memory. Finalized media arrives
+`Memory`. It validates tool input, calls the matching SDK operation, and returns structured public
+values. It does not own storage, provider selection, or the injected memory. Finalized media arrives
 through ordinary content parts; live audio and vision packet ingestion, and `StreamEvent`
 reduction, stay Python-only because a tool call is a finite request.
 
@@ -15,7 +14,7 @@ merge, erase a person on request, and record which memories were useful. `build_
 inside the process that holds the `Memory` it is given and every tool is one call on it, so an
 embodied operation is no less reachable here than `add_memory` is.
 
-## Invocation
+## Start the adapter
 
 Install the MCP extra together with the extras required by the chosen backends, then host the
 server in the application that owns `Memory`:
@@ -37,20 +36,21 @@ with Memory.from_config(
     build_mcp_server(memory).run("stdio")
 ```
 
-The example uses the pinned Jina recipe; review its upstream code and license boundary in
-[configuration](../configuration.md#embedding-choices).
-
 ```text
 build_mcp_server(memory: Memory) -> MCPServer[None]
 ```
 
-`build_mcp_server` neither opens nor closes the supplied memory. Do not run another `Memory`, REST
-process, or MCP process against the same `data_dir`. Composition and process ownership are defined
-in [architecture](../architecture.md) and [configuration](../configuration.md).
+## Lifecycle and ownership
+
+`build_mcp_server` borrows `memory`; it neither opens nor closes it. The host must keep the owner
+alive for the server lifetime and close it during shutdown. Do not run another `Memory`, REST, or
+MCP owner against the same physical `data_dir`. Composition and process ownership are defined in
+[architecture](../architecture.md) and [configuration](../configuration.md).
 
 MindBridge adds no authentication to any MCP transport. Stdio inherits local process permissions;
 an SSE or streamable-HTTP host must add authentication, authorization, TLS, request limits, and
-rate limits. MCP error `subject` is unredacted and may contain an owner-local path.
+rate limits. MCP error `subject` is unredacted and may contain an owner-local path. See
+[deployment](../deployment.md) for process and transport boundaries.
 
 ## Contract
 
@@ -139,7 +139,7 @@ coordinate frames, units, or media sources; they are part of the tool schema, no
 `search_memories` with `explain=true` routes to `Memory.search_with_trace` and adds a `trace`
 object beside the unchanged `hits`. `trace.candidates` lists every candidate that was considered
 with its effective score components (`dense_relevance`, `dense_confidence`, `lexical_relevance`,
-`lexical_rerank_bonus`, `lexical_match`, `gate_confidence`, `base_relevance`,
+`lexical_rerank_bonus`, `lexical_match`, `gate_relevance`, `base_relevance`,
 `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`) and, when it
 did not become a hit, a `rejected_by` value of `stale_index`, `occurrence_range`, `missing_memory`,
 `memory_type`, `minimum_relevance`, `ambiguity`, or `limit`. `trace.candidate_limit` is how many
@@ -147,8 +147,8 @@ candidates were fetched, `trace.exhaustive` says whether that bound was reached,
 `trace.ambiguous` says whether the result was suppressed for being too close to call. Without
 `explain`, `trace` is `null` and no extra work is done.
 
-A `SearchHitResult.score` is `final_score`, but the relevance gate compares `gate_confidence`, which
-is a different quantity. Tuning a floor against the returned `score` therefore compares the wrong
+A `SearchHitResult.score` is `final_score`, but the relevance gate compares `gate_relevance`,
+which is a different quantity. Tuning a floor against the returned `score` therefore compares the wrong
 two numbers. The floor itself, `minimum_relevance`, and `ambiguity_margin` are fixed when the owner
 constructs `Memory`; no tool argument can widen them for one call, so an empty result is answered by
 reading `trace` and changing the query, filters, or the owner's configuration.
@@ -188,9 +188,8 @@ described above.
 ### Validation and errors
 
 Only the fourteen documented names and their exact top-level arguments are accepted. An unknown
-tool or
-top-level argument returns `validation_error/unknown_field`; schema and SDK input failures return
-`validation_error/input_invalid`. Unknown values are not echoed.
+tool or top-level argument returns `validation_error/unknown_field`; schema and SDK input failures
+return `validation_error/input_invalid`. Unknown values are not echoed.
 
 Failed tool calls set `isError` and their text content is exactly the same JSON envelope as
 [REST](rest.md#error-envelope), with nothing before or after it. One `JSON.parse` of the text
@@ -260,4 +259,5 @@ MCP has no aggregate framing budget, but each inline media value is bounded befo
 work. It has no local-path input, remote fetch, large-file upload tool, capture-stream tool,
 coordinate-frame transform, logical scope, or separate authentication policy; the MCP host owns
 transport access control. Configured model backends may
-impose a smaller aggregate budget, including the [OpenAI inline limits](python-sdk.md#bundled-adapters).
+impose a smaller aggregate budget, including the
+[OpenAI inline limits](python-sdk.md#bundled-adapters).

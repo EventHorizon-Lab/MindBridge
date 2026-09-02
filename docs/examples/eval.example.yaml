@@ -129,17 +129,24 @@ generation:
 #   # budget fails the whole batch rather than parsing partially.
 #   max_tokens: 4096
 
-# Retrieval and ranking behaviour. Defaults shown; every field is optional.
+# Retrieval and ranking behaviour. Every field is optional; the SDK defaults are named in the
+# comments, and only `evidence_budget_chars` below departs from them.
 settings:
-  # Index transcribed speech as retrievable text. Off by default; without it a video memory's
-  # searchable text is only what the visual path wrote.
+  # Index transcribed speech as retrievable text. On by default, and a no-op unless the speech
+  # slot is a SpeechBackend; without it a video memory's searchable text is only what the visual
+  # path wrote.
   index_speech: true
-  # Similarity floor for a hit. Lowering it trades precision for recall.
-  minimum_relevance: 0.55
-  # How close the top two hits must be before retrieval is treated as ambiguous.
+  # Relevance floor for a hit, default 0.10. Lowering it trades precision for recall. It gates
+  # `gate_relevance`, not the `score` a hit reports.
+  minimum_relevance: 0.10
+  # How close the top two hits must be before retrieval is treated as ambiguous. Default 0.01.
   ambiguity_margin: 0.01
-  # Character budget for evidence handed to the answerer. Unset means no widening.
+  # Character budget for evidence handed to the answerer. Default unset, which grounds on exactly
+  # `limit`; a budget only widens that window and never bounds it.
   evidence_budget_chars: 12000
+  # `reinforce_on_answer` is deliberately absent: the runner forces it off whatever this file
+  # says, because reinforcing mid-run makes one question's retrieval depend on which earlier
+  # questions answered, and under concurrency on the order their updates committed.
 
 # =============================================================================================
 # Harness-only section. These have no field in `MindBridgeConfig` and must not gain one:

@@ -1,14 +1,16 @@
 # Benchmarking
 
-MindBridge ships three benchmark commands:
+MindBridge provides one evaluation runner and two focused utilities. Use the evaluation runner for
+quality claims; use the utilities only for their narrower artifact or storage purpose.
 
-- `mindbridge-bench eval` runs pinned memory datasets through the public SDK.
-- `mindbridge-bench locomo-refined` writes raw predictions for an operator-provided LoCoMo-Refined
-  dataset.
-- `mindbridge-bench local-index` measures SQLite and Zvec without model or network variance.
+| Command | Use it for | Do not infer |
+| --- | --- | --- |
+| `mindbridge-bench eval` | Pinned datasets, official or explicitly identified scorers, confidence intervals, and run comparisons | That a score is leaderboard-comparable without checking its dataset, judge, and validity fields |
+| `mindbridge-bench locomo-refined` | Raw LoCoMo-Refined predictions for another evaluator | An integrated benchmark score |
+| `mindbridge-bench local-index` | SQLite-to-Zvec ingestion, recall, latency, throughput, and disk use | Embedding or answer quality |
 
-Every run requires a new physical data directory for each independent unit. Never benchmark
-against an application's live `data_dir`.
+Never point a benchmark at an application's live `data_dir`. One physical directory has one live
+MindBridge owner, and each independent benchmark unit needs its own new directory.
 
 ## Install and inspect tasks
 
@@ -18,6 +20,9 @@ From a repository checkout, install the model and dataset extras used by the eva
 uv sync --locked --default-index https://pypi.org/simple \
   --extra benchmarks --extra local --extra openai
 ```
+
+Media tasks also need `ffmpeg` and `ffprobe`, and M3-Bench web media needs `yt-dlp`. These are
+system tools, not Python dependencies this project manages.
 
 List the current task groups, pinned revisions, and local-data readiness:
 
@@ -544,7 +549,9 @@ breakdown family against that single table.
 
 Questions sharing one memory are clustered as one independent unit. Confidence intervals and
 regression significance remain unavailable when fewer than two independent units are present.
-Partial, failed, or unverified runs remain useful for development but are not leaderboard-comparable.
+`score_valid` is false for any task with an answer or ingest failure, so check it before quoting a
+task's score. Partial, failed, or unverified runs remain useful for development but are not
+leaderboard-comparable.
 
 `--compare` is a regression guard, not a baseline. It pairs the current `mindbridge` arm against a
 prior MindBridge run over identical dataset, scorer, and judge identities, using stable sample IDs;
@@ -566,23 +573,26 @@ isolated reruns. The cache is an optimization, not a substitute for the result a
 
 ## Isolation contract
 
-The built-in runner allocates this shape atomically:
+The built-in runner allocates one physical store per independent unit, atomically. Each component
+is the label base32-encoded, so no dataset identifier reaches the filesystem verbatim:
 
 ```text
 .benchmarks/data/
-└── benchmark-run/
-    ├── unit-a/  # SQLite, Zvec, and lock
-    └── unit-b/  # a different physical store
+└── benchmark-<encoded-task>/
+    └── run-<encoded-run-id>/
+        ├── unit-<encoded-unit-a>/  # SQLite, Zvec, and lock
+        └── unit-<encoded-unit-b>/  # a different physical store
 ```
 
-Labels belong to the harness and filesystem only. Do not pass them into `Memory.add`, store them as
-hidden product fields, or treat metadata as an isolation boundary. Distinct unit directories may
-run concurrently; the same directory has one live owner. Evaluation CUDA runs also take a
-per-device process lock unless an external scheduler owns admission control.
+Harness labels belong to the filesystem, not the product API. Do not pass them into `Memory.add`,
+store them as hidden product fields, or treat metadata as an isolation boundary. Distinct unit
+directories may run concurrently; the same directory has one live owner. Evaluation CUDA runs also
+take a per-device process lock unless an external scheduler owns admission control.
 
-Custom behavior benchmarks should use only the public SDK: create a directory, construct `Memory`,
+Custom behavior benchmarks must use only the public SDK: create a directory, construct `Memory`,
 ingest through `add` or `add_many`, query through `search` or `ask`, score public return values, and
-close the instance before archiving artifacts.
+close the instance before archiving artifacts. The local-index command is the only documented
+direct-adapter exception.
 
 ## Local-index microbenchmark
 

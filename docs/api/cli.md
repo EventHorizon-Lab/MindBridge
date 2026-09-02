@@ -38,9 +38,10 @@ Use `mindbridge COMMAND --help` for the command-specific flags summarized below.
 | `--data-dir PATH` | local directory for `--embedder`; default `.mindbridge` |
 | `--timeout SECONDS` | positive finite remote timeout for `--url`; default `30` |
 | `--answerer NAME` | generation recipe for `--embedder` |
+| `--former NAME` | formation recipe for `--embedder` |
 | `--transcriber NAME` | speech recipe for `--embedder` |
-| `--index-speech` | index transcripts on add for `--embedder` |
-| `--minimum-relevance FLOAT` | relevance floor; default `0.55` |
+| `--index-speech`, `--no-index-speech` | index transcripts on add for `--embedder`; default on |
+| `--minimum-relevance FLOAT` | relevance floor; default `0.10` |
 | `--ambiguity-margin FLOAT` | top-two gate when `limit=1`; default `0.01` |
 | `--decay-half-life-days FLOAT` | optional positive recency half-life; default none |
 | `--explain` | print resolved composition and execute no operation |
@@ -72,7 +73,7 @@ server's owner.
 | --- | --- | --- |
 | `jina-omni` | `--embedder` | pinned Jina Omni model, revision, and 1024 dimensions |
 | `funasr` | `--transcriber` | pinned FunASR model and component revisions |
-| `openai` | `--embedder`, `--answerer`, `--transcriber` | `text-embedding-3-small`, `gpt-5-mini`, `whisper-1` |
+| `openai` | `--embedder`, `--answerer`, `--former`, `--transcriber` | `text-embedding-3-small`, `gpt-5-mini` (generation and formation), `whisper-1` |
 
 Only `openai` accepts a model suffix, for example `--answerer openai:gpt-5-mini`. Recipe names form
 a closed table; use `--app` for other backends. Provider trust, license, model identity, and

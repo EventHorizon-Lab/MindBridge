@@ -32,7 +32,7 @@ Then choose the page for your task:
 - [Configuration](docs/configuration.md) — bundled providers and custom backends
 - [Python SDK](docs/api/python-sdk.md) — supported imports from `mindbridge`
 - [REST API](docs/api/rest.md) — the `/v1` HTTP surface
-- [MCP tools](docs/api/mcp.md) — the six supported tools
+- [MCP tools](docs/api/mcp.md) — the fourteen supported tools
 - [Deployment and operations](docs/README.md#deploy-and-operate)
 - [Troubleshooting](docs/troubleshooting.md)
 

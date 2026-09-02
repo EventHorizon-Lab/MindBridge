@@ -1,6 +1,6 @@
 # REST API
 
-## Purpose
+## Surface
 
 The optional FastAPI adapter exposes eight `Memory` operations under `/v1`. It validates transport
 input, calls the injected synchronous memory, and serializes the public SDK values; it is not a
@@ -13,7 +13,7 @@ have no client-streaming route; run `AsyncAudioStream`, `AsyncVisionStream`, or
 The generated FastAPI schema is the machine-readable contract. A running application serves it at
 `/openapi.json`, with Swagger UI at `/docs` and ReDoc at `/redoc`.
 
-## Invocation
+## Start the adapter
 
 Install the server extra together with the extras required by the chosen backends, construct one
 `Memory`, and inject it:
@@ -35,17 +35,9 @@ memory = Memory.from_config(
 app = create_app(memory=memory)
 ```
 
-The example uses the pinned Jina recipe; review its upstream code and license boundary in
-[configuration](../configuration.md#embedding-choices).
-
 ```text
 create_app(*, memory: Memory) -> fastapi.FastAPI
 ```
-
-`create_app` does not own or close `memory`. The host application must close the memory and its
-caller-owned provider clients at shutdown. Run exactly one owner for each physical `data_dir`.
-MindBridge adds no authentication; put the app behind the deployment's gateway, service mesh, or
-FastAPI/Starlette authentication middleware. See [deployment](../deployment.md).
 
 With the host running, the smallest write is:
 
@@ -56,6 +48,18 @@ curl --fail-with-body \
   http://127.0.0.1:8000/v1/memories
 ```
 
+## Lifecycle and ownership
+
+`create_app` borrows `memory`; it neither opens nor closes it. The host must keep that owner alive
+for the app lifetime and close it, together with its caller-owned provider clients, during
+shutdown. Run one process and one `Memory` for each physical `data_dir`; use a different directory
+for another owner.
+
+MindBridge adds no REST authentication. The host owns authentication, authorization, TLS, and
+request-rate policy, through its gateway, service mesh, or FastAPI/Starlette middleware. See
+[deployment](../deployment.md) for supported process shapes and [operations](../operations.md) for
+shutdown and recovery.
+
 ## Contract
 
 ### Content input
@@ -63,42 +67,23 @@ curl --fail-with-body \
 The `content`, `query`, and `question` fields accept either a trimmed, non-blank string or an
 ordered array of 1 through 16 strict content parts. Unknown fields are rejected.
 
-```json
-{"type":"input_text","text":"The prototype after the review"}
-```
-
-An image part supplies exactly one of `image_url` or `file_id`:
-
-```json
-{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}
-```
+| Part | Required fields | Source rule | Optional fields |
+| --- | --- | --- | --- |
+| `input_text` | `type`, `text` | `text` is trimmed and non-blank | none |
+| `input_image` | `type` | exactly one of `image_url`, `file_id` | none |
+| `input_file` | `type` | exactly one of `file_url`, `file_data`, `file_id` | `media_type`, `filename` |
 
 ```json
-{"type":"input_image","file_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
-```
-
-A file part supplies exactly one of `file_url`, `file_data`, or `file_id`:
-
-```json
-{
-  "type": "input_file",
-  "file_data": "UklGRg==",
-  "media_type": "audio/wav",
-  "filename": "note.wav"
-}
-```
-
-```json
-{
-  "type": "input_file",
-  "file_url": "data:video/mp4;base64,AAAA",
-  "media_type": "video/mp4",
-  "filename": "clip.mp4"
-}
-```
-
-```json
-{"type":"input_file","file_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","media_type":"video/*"}
+[
+  {"type": "input_text", "text": "At the station"},
+  {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+  {
+    "type": "input_file",
+    "file_data": "UklGRg==",
+    "media_type": "audio/wav",
+    "filename": "note.wav"
+  }
+]
 ```
 
 `image_url` and `file_url` accept only base64 `data:` URLs. `file_data` is raw base64 and requires
@@ -113,17 +98,17 @@ SDK validator and error contract.
 
 ### Endpoints
 
-| Method and path | Input | Success |
-| --- | --- | --- |
-| `GET /healthz` | none | `200 HealthResponse` |
-| `POST /v1/memories` | `MemoryCreate` | `201 MemoryResponse` |
-| `POST /v1/memories/batch` | `MemoryBatchCreate` | `201 {"memories":[...]}` |
-| `GET /v1/memories` | `limit`, `cursor` query parameters | `200 PageResponse` |
-| `POST /v1/memories/search` | `QueryRequest` | `200 {"hits":[...],"trace":null}` |
-| `POST /v1/memories/reinforce` | `ReinforceRequest` | `200 {"reinforced":int}` |
-| `GET /v1/memories/{memory_id}` | non-empty path value | `200 MemoryResponse` |
-| `DELETE /v1/memories/{memory_id}` | non-empty path value | `200 {"deleted":bool}` |
-| `POST /v1/answers` | `AnswerRequest` | `200 AnswerResponse` |
+| Method and path | Operation ID | Input | Success |
+| --- | --- | --- | --- |
+| `GET /healthz` | `health` | none | `200 HealthResponse` |
+| `POST /v1/memories` | `createMemory` | `MemoryCreate` | `201 MemoryResponse` |
+| `POST /v1/memories/batch` | `createMemories` | `MemoryBatchCreate` | `201 {"memories":[...]}` |
+| `GET /v1/memories` | `listMemories` | `limit`, `cursor` query parameters | `200 PageResponse` |
+| `POST /v1/memories/search` | `searchMemories` | `QueryRequest` | `200 {"hits":[...],"trace":null}` |
+| `POST /v1/memories/reinforce` | `reinforceMemories` | `ReinforceRequest` | `200 {"reinforced":int}` |
+| `GET /v1/memories/{memory_id}` | `getMemory` | non-empty path value | `200 MemoryResponse` |
+| `DELETE /v1/memories/{memory_id}` | `deleteMemory` | non-empty path value | `200 {"deleted":bool}` |
+| `POST /v1/answers` | `answer` | `AnswerRequest` | `200 AnswerResponse` |
 
 Request fields and defaults are:
 
@@ -149,8 +134,11 @@ An input `context` is an optional typed observation. `scope` is an optional retr
 coordinate frame and observer/subject anchor. SQLite authoritatively reapplies every scope filter
 after candidate retrieval.
 
+Create-request context:
+
 ```json
 {
+  "content": "The mug is on the kitchen table.",
   "context": {
     "basis": "observation",
     "source_id": "camera-1:frame-42",
@@ -164,9 +152,17 @@ after candidate retrieval.
       "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
       "position_uncertainty_m": 0.08
     }
-  },
+  }
+}
+```
+
+Search-request scope:
+
+```json
+{
+  "query": "Where was the mug?",
   "scope": {
-    "valid_at": "2026-08-26T12:00:00Z",
+    "valid_at": "2026-08-27T10:00:00Z",
     "known_at": "2026-08-27T12:00:00Z",
     "near": {"frame_id": "home/map", "anchor": "subject", "x": 2.0, "y": 1.0},
     "radius_m": 0.75
@@ -185,7 +181,7 @@ blindly. Unknown IDs are skipped, and `reinforced` counts the ones that existed.
 `POST /v1/memories/search` with `"explain": true` routes to `Memory.search_with_trace` and returns a
 `trace` object beside the unchanged `hits`. `trace.candidates` lists every candidate considered with
 its effective score components (`dense_relevance`, `dense_confidence`, `lexical_relevance`,
-`lexical_rerank_bonus`, `lexical_match`, `gate_confidence`, `base_relevance`,
+`lexical_rerank_bonus`, `lexical_match`, `gate_relevance`, `base_relevance`,
 `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`) and, when it
 did not become a hit, a `rejected_by` value of `stale_index`, `occurrence_range`, `missing_memory`,
 `memory_type`, `minimum_relevance`, `ambiguity`, or `limit`. `trace.candidate_limit` is how many
@@ -195,7 +191,7 @@ candidates were fetched, `trace.exhaustive` says whether that bound was reached,
 never carries evidence content.
 
 `SearchHitResponse.score` is the final ranking score, while the relevance gate compares
-`gate_confidence`, a different quantity, so a floor tuned against the returned `score` compares the
+`gate_relevance`, a different quantity, so a floor tuned against the returned `score` compares the
 wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the owner constructs
 `Memory` and no request field can widen them for one call; an empty result is answered by reading
 `trace` and changing the query, the filters, or the owner's configuration.
@@ -216,8 +212,10 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 
 `modality` is `text`, `image`, `video`, `audio`, or `omni`. `memory_type` is `semantic`,
 `episodic`, or `procedural`. `abstention_reason` is `no_evidence`, `insufficient_evidence`, or
-`null`. `abstained` reports that the answerer returned the exact sentence reserved for having no
-usable evidence, not that the model declined to answer in its own words. A response `context` is
+`null`. `abstained` reports that the answerer emitted the reserved `[insufficient_evidence]`
+token, or that grounding found no usable evidence at all; a model that declines in its own words
+some other way is an ordinary answer. See
+[the SDK contract](python-sdk.md#public-values) for the exact rule. A response `context` is
 the authoritative `MemoryContext`: typed kind and basis, confidence, valid and transaction time,
 visibility, lineage/source/evidence/supersession IDs, model recipe, optional
 subject/predicate/value, spatial pose, and affect cue fields. It is `null` on a raw record formed
@@ -365,8 +363,8 @@ names a tool. None of these is a REST limitation: the adapter runs in the proces
 | Serialized metadata for one memory | 262,144 UTF-8 bytes |
 | `file_id` or `filename` | 255 characters |
 
-`file_data` is bounded by the complete HTTP body. A data URL is also bounded by the 8,192-character
-source field. The transport has no local-path input, remote fetch, upload endpoint, client-streaming capture
-route, coordinate-frame transform, logical scope, or authentication policy. The owner-side Python input ceiling is 512 MiB per asset, but configured
-backends may be lower; the [OpenAI adapter](python-sdk.md#bundled-adapters) has smaller inline
-request budgets.
+`file_data` is bounded by the complete HTTP body. A data URL is also bounded by the
+8,192-character source field. The transport has no local-path input, remote fetch, upload endpoint,
+client-streaming capture route, coordinate-frame transform, logical scope, or authentication
+policy. The owner-side Python input ceiling is 512 MiB per asset, but configured backends may be
+lower; the [OpenAI adapter](python-sdk.md#bundled-adapters) has smaller inline request budgets.

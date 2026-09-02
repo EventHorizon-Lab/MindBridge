@@ -1,17 +1,20 @@
 # Configuration
 
-MindBridge has two composition paths over the same `Memory` kernel:
+Configuration has one job: compose model capabilities and local policy around one `Memory`.
+Storage and retrieval semantics stay the same whichever composition path you choose.
 
-- `Memory.from_config()` validates data and constructs bundled adapters.
-- `Memory(...)` accepts constructed protocol implementations and SDK clients.
+| Path | Choose it when |
+| --- | --- |
+| `Memory.from_config()` | Bundled providers and SDK-side credentials are enough |
+| `Memory.from_plugins()` | The application already groups constructed backends and settings |
+| `Memory(...)` | The application injects individual backends or owns SDK clients directly |
 
-Use declarative configuration for bundled providers. Use direct injection when the application
-owns clients, credentials, proxies, custom models, or adapter behavior.
+All three paths open the same embedded kernel. An `EmbeddingBackend` is required; generation,
+speech, face, vision-description, and formation capabilities are optional.
 
 ## Install only the surfaces you use
 
-The base package provides storage, public values, and adapter protocols. Optional extras add the
-heavy or protocol-specific runtimes:
+Optional extras add the heavy or protocol-specific runtimes:
 
 | Extra | Adds |
 | --- | --- |
@@ -24,7 +27,8 @@ heavy or protocol-specific runtimes:
 | `benchmarks` | Benchmark datasets, scorers, and telemetry |
 | `all` | Every optional surface |
 
-For example:
+The base package already contains local SQLite storage, the Zvec index, public values, and the
+backend protocols.
 
 ```bash
 uv add "mindbridge[local,openai]"
@@ -32,8 +36,8 @@ uv add "mindbridge[local,openai]"
 
 ## Declarative configuration
 
-`embedding` is the only required capability. `data_dir` defaults to `.mindbridge`; all other
-capability slots are optional.
+`Memory.from_config()` validates pure data and constructs adapters from a closed provider
+catalog. `data_dir` defaults to `.mindbridge`; `embedding` is the only required slot.
 
 ```python
 from mindbridge import Memory
@@ -61,9 +65,12 @@ with Memory.from_config(config) as memory:
     memory.add("Remember this.")
 ```
 
-`AsyncMemory.from_config()` accepts the same shape. `MindBridgeConfig.model_validate()` can
-validate it before opening storage. Unknown fields, unknown providers, and out-of-range values are
-rejected rather than ignored or coerced.
+`AsyncMemory.from_config()` accepts the same shape. Use `MindBridgeConfig.model_validate()` when a
+host needs validation before opening storage. Unknown fields, unknown providers, and out-of-range
+values are rejected rather than ignored or coerced; numeric and Boolean values are strict.
+Declarative configuration owns every adapter it creates and closes it with the memory.
+
+### Provider fields
 
 Bundled provider fields are, with "connection fields" meaning `base_url`, `api_key`, `timeout`,
 and `max_retries`:
@@ -143,10 +150,6 @@ absent because it caps answer evidence only. Formation is idempotent per source 
 formation recipe, so a model failure leaves the raw observation durable and the formation
 retryable. See [memory types, time, and decay](memory-types-time-and-decay.md) for the typed
 kinds and their visibility rules.
-
-`resolve_memory_config()` is available to hosts that need a `MemoryComposition` before opening
-storage. The caller must close that composition unless its plugins are transferred to one
-`Memory`; ordinary applications should prefer `Memory.from_config()`.
 
 ## Embedding choices
 
@@ -312,9 +315,12 @@ further ranked memories while the evidence fits, charging each media asset its m
 equivalent because a media part costs a model far more than its record's text. Because the `limit`
 hits are never dropped, this setting can only enlarge a prompt: to bound one, lower `limit` and
 leave the budget at `None`. Setting it also removes `limit`'s effect on prompt size, since the
-budget refills the window to the same width whatever `limit` was. A tracer is passed
-as the separate `tracer=` argument to
-`Memory.from_config()` or `Memory(...)`, not inside `settings`.
+budget refills the window to the same width whatever `limit` was.
+
+Pass an OpenTelemetry tracer through the separate `tracer=` argument of `Memory.from_config()` or
+`Memory(...)`; it is not a setting. See [operations](operations.md#telemetry) for exporter setup
+and [memory types, time, and decay](memory-types-time-and-decay.md#decay-and-reinforcement) for
+ranking semantics.
 
 `index_speech` is on by default. It only has an effect when `transcriber` is a `SpeechBackend`
 (`speech: funasr`), which has already run its analysis by the time `add` reaches the index, so
@@ -355,8 +361,8 @@ deployment's cameras.
 
 ## Direct adapter injection
 
-Construct adapters directly when the application must own an SDK client or use a custom protocol
-implementation:
+Direct injection is the boundary for custom protocols, custom SDK clients, proxies, or credentials
+that do not belong in declarative data:
 
 ```python
 from openai import OpenAI
@@ -381,6 +387,8 @@ caller-supplied SDK client open, so the outer client context remains the applica
 responsibility. Credentials, retries, timeouts, proxies, and connection pooling also remain SDK
 configuration.
 
+Two capability slots behave differently from the declarative catalog:
+
 - `former=` takes a `FormationBackend` directly, for a custom or non-bundled adapter that proposes
   typed memories after a raw observation commits. The declarative `formation` slot above builds the
   bundled OpenAI adapter for the same slot, and the command line fills it with `--former NAME`
@@ -394,5 +402,10 @@ configuration.
   the embedder lacks native image support and no external `VisionPartial` supplied a description,
   so speculative retrieval has a query before finality.
 
-For every constructor and protocol field, see the [Python API](api/python-sdk.md). For benchmark
-environment variables, see [benchmarking](benchmarking.md).
+Use `MemoryPlugins` with `Memory.from_plugins()` when these constructed adapters should travel as
+one value. `resolve_memory_config()` is for hosts that need a `MemoryComposition` before opening
+storage; close that composition unless its plugins are transferred to a `Memory`. Ordinary
+applications should prefer `Memory.from_config()`.
+
+For every constructor and protocol field, see the [Python SDK reference](api/python-sdk.md). For
+benchmark-only environment variables, see [benchmarking](benchmarking.md).
