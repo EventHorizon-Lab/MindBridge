@@ -71,6 +71,7 @@ from mindbridge.infrastructure.local.assets import (
 )
 from mindbridge.infrastructure.local.store import (
     IdentityLink,
+    IndexCandidate,
     IndexDocument,
     LocalStore,
     SpeechRollback,
@@ -175,17 +176,15 @@ _DEFAULT_CONFIG = MemoryConfig()
 _LEXICAL_MATCH_CONFIDENCE = 0.6
 _DECAY_REINFORCEMENT_LIMIT = 20
 _CONFIRMATION_WEIGHT = 0.05
-# What a full-text match contributes to the *ranking* score. It is deliberately far below the
-# confidence above: `lexical_relevance_by_rank` is a reciprocal rank, not a similarity, so at 0.6
-# the top full-text hit outranked every dense candidate under 0.6 cosine no matter how weak its
-# match actually was. Measured on ranked candidates replayed from two benchmark corpora, gold
-# recall at eight rose from 0.8239 to 0.8920 on Mem-Gallery and from 0.8194 to 0.9306 on
-# ATM-Bench when the rank proxy stopped winning that comparison. The floor is still non-zero so a
-# memory only the full-text route can reach stays orderable.
-_LEXICAL_RANK_RELEVANCE = 0.24
-# Covering every distinctive query term is evidence in a way that ranking first in the full-text
-# index is not, so a complete match ranks as near-certain rather than through the demoted rank
-# proxy, and a memory quoting the whole question cannot be buried by an unrelated dense neighbour.
+# Covering every distinctive query term is evidence in a way that placing well in the full-text
+# index is not, so a complete match ranks as near-certain and a memory quoting the whole question
+# cannot be buried by an unrelated dense neighbour. Nothing short of complete coverage enters the
+# ranking score through this branch. A general floor under every full-text hit used to, at 0.24,
+# but that compared an index-side quantity against a cosine, and how often it decided anything
+# turned entirely on where the configured embedder puts its cosines: replaying 841 dev queries,
+# the share of dense candidates it could outrank was 0.92% on LoCoMo-Refined, 8.48% on
+# Mem-Gallery and 50.26% on MemLens. Deleting it left R@1, R@5, R@10, R@20, R@100 and MRR
+# unchanged to four decimals on all three and the top ten identical on 99.87% of queries.
 # The threshold leaves slack for summation order; the coverage ratio is otherwise exactly one.
 # Across both replayed corpora two candidates in more than twenty thousand reached full coverage,
 # so this rescues the exact-phrase case without moving the measurement at all. The value sits
@@ -2099,7 +2098,7 @@ class Memory:
                 self._trace("mindbridge.storage.hydrate", kind="stage"),
                 _translate_storage_errors("hydrate search candidates"),
             ):
-                hydrated_documents = self._store.read_index_documents(index_ids)
+                hydrated_documents = self._store.read_index_candidates(index_ids)
             with _translate_index_errors("search memories"):
                 candidates, hydrated_documents = self._deepen_temporal_lexical_candidates(
                     candidates,
@@ -2126,7 +2125,7 @@ class Memory:
                     )
                 )
             candidate_parent_ids = tuple(
-                dict.fromkeys(document.embedding.memory_id for document in documents)
+                dict.fromkeys(document.memory_id for document in documents)
             )
             with _translate_storage_errors("apply search scope"):
                 active_count = len(
@@ -2196,7 +2195,6 @@ class Memory:
                     index_ids_by_memory,
                     dense_relevance,
                     dense_confidence,
-                    lexical_relevance_by_rank,
                     lexical_matches,
                 )
                 if memory_type is not None:
@@ -2207,7 +2205,6 @@ class Memory:
                         index_ids_by_memory,
                         dense_relevance,
                         dense_confidence,
-                        lexical_relevance_by_rank,
                         lexical_matches,
                     )
                     memories = tuple(
@@ -2224,12 +2221,12 @@ class Memory:
                     lexical_strength = (
                         lexical_relevance.get(memory_id, 0.0) if lexical_match else 0.0
                     )
-                    lexical_floor = (
+                    lexical_score = (
                         _LEXICAL_FULL_COVERAGE_RELEVANCE
+                        * lexical_relevance_by_rank.get(memory_id, 0.0)
                         if lexical_strength >= _LEXICAL_FULL_COVERAGE
-                        else _LEXICAL_RANK_RELEVANCE
+                        else 0.0
                     )
-                    lexical_score = lexical_floor * lexical_relevance_by_rank.get(memory_id, 0.0)
                     base = max(dense_relevance.get(memory_id, 0.0), lexical_score)
                     relevance = _bounded_scale(
                         base,
@@ -2326,21 +2323,21 @@ class Memory:
     def _deepen_temporal_lexical_candidates(
         self,
         candidates: _IndexCandidates,
-        documents: tuple[IndexDocument, ...],
+        documents: tuple[IndexCandidate, ...],
         *,
         lexical_query: str,
         temporal_range: tuple[datetime, datetime] | None,
         memory_type: MemoryType | None,
         route_limit: int,
         result_limit: int,
-    ) -> tuple[_IndexCandidates, tuple[IndexDocument, ...]]:
+    ) -> tuple[_IndexCandidates, tuple[IndexCandidate, ...]]:
         if temporal_range is None or not lexical_query or len(candidates.lexical) < route_limit:
             return candidates, documents
         lexical_by_id = {hit.id: hit for hit in candidates.lexical}
         qualified_parents = {
-            document.embedding.memory_id
+            document.memory_id
             for document in documents
-            if (hit := lexical_by_id.get(document.embedding.embedding_id)) is not None
+            if (hit := lexical_by_id.get(document.embedding_id)) is not None
             and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
             and _overlaps_temporal_range(
                 document.occurred_at,
@@ -2397,8 +2394,8 @@ class Memory:
             self._trace("mindbridge.storage.hydrate", kind="stage"),
             _translate_storage_errors("hydrate temporal lexical candidates"),
         ):
-            added = self._store.read_index_documents(added_ids)
-        by_id = {document.embedding.embedding_id: document for document in (*documents, *added)}
+            added = self._store.read_index_candidates(added_ids)
+        by_id = {document.embedding_id: document for document in (*documents, *added)}
         return updated, tuple(by_id.values())
 
     def _index_candidates(
@@ -2739,9 +2736,15 @@ class Memory:
         One asset's co-occurrence is not evidence that one person produced both. Egocentric
         capture is the adversarial case: the wearer speaks while a different person's face
         fills the frame, so a single clip would bind the listener's face to the wearer's voice
-        and nothing downstream could tell. Requiring the same pair across distinct assets
-        separates the two, because a wearer's voice pairs with many different faces and no
-        single pair accumulates, while a genuine speaker's pair recurs.
+        and nothing downstream could tell.
+
+        Counting assets raises the price of that mistake but does not prevent it. A wearer
+        talks to the same person across many clips, so the wrong pair accumulates as fast as a
+        genuine speaker's, and measurement on synthetic egocentric traffic confirms it: at the
+        default of two assets the wearer still binds to an interlocutor's face under every
+        ingestion order tried. What the count does buy is that a face seen once is never
+        bound, and `_link_asset_identity` keeps the damage to that one bind by refusing to let
+        an identity holding both modalities absorb anything further.
         """
         observed = self._store.record_identity_link_evidence(speaker_id, face_id, asset_id)
         corroborated = observed >= self._identity_link_min_assets
@@ -2801,9 +2804,17 @@ class Memory:
             return
         if not self._identity_link_is_corroborated(speaker_id, face_id, asset_id):
             return
-        # A fragment may legitimately rejoin an identity that already holds this modality; the
-        # store still refuses to fuse two identities that each hold both.
-        plan = self._store.identity_link_plan(speaker_id, face_id, allow_shared_modality=True)
+        # Only a voice-only and a face-only identity may fuse here. Letting a fragment rejoin
+        # an identity that already holds its modality is what turns one wrong cross-modal bind
+        # into a cascade: once a wearer's voice owns one interlocutor's face, that identity
+        # holds both modalities, and every later fragment (the interlocutor's own voice, then
+        # the next interlocutor's face) is a fragment rejoining it. Measured on synthetic
+        # egocentric traffic (one off-camera wearer, three interlocutors, random ingestion
+        # order), permitting it collapsed all four people into one identity every time;
+        # refusing it capped the damage at the single unavoidable first bind and raised
+        # correct merges from 0/3 to 2/3. `LocalStore` still offers the wider merge to a
+        # caller that has established the claim some other way.
+        plan = self._store.identity_link_plan(speaker_id, face_id)
         if plan is None:
             return
         memories, embeddings = self._relabelled_speaker_index(plan, speaker_id, operation)
@@ -2812,7 +2823,6 @@ class Memory:
                 speaker_id,
                 face_id,
                 expected=plan,
-                allow_shared_modality=True,
                 memories=memories,
                 embeddings=embeddings,
             )
@@ -5819,10 +5829,10 @@ def _search_outcome(
     return _SearchOutcome(hits=tuple(hits), trace=trace)
 
 
-def _parent_index_ids(documents: Sequence[IndexDocument]) -> dict[str, tuple[str, ...]]:
+def _parent_index_ids(documents: Sequence[IndexCandidate]) -> dict[str, tuple[str, ...]]:
     grouped: dict[str, builtins.list[str]] = {}
     for document in documents:
-        grouped.setdefault(document.embedding.memory_id, []).append(document.embedding.embedding_id)
+        grouped.setdefault(document.memory_id, []).append(document.embedding_id)
     return {memory_id: tuple(index_ids) for memory_id, index_ids in grouped.items()}
 
 
@@ -5831,7 +5841,6 @@ def _early_candidate_trace(
     index_ids: tuple[str, ...],
     dense_relevance: Mapping[str, float],
     dense_confidence: Mapping[str, float],
-    lexical_index_relevance: Mapping[str, float],
     lexical_matches: set[str],
     rejected_by: RetrievalRejection,
 ) -> RetrievalCandidateTrace:
@@ -5841,7 +5850,11 @@ def _early_candidate_trace(
         index_ids=index_ids,
         dense_relevance=dense_relevance.get(memory_id, 0.0),
         dense_confidence=dense_confidence.get(memory_id, 0.0),
-        lexical_relevance=(_LEXICAL_RANK_RELEVANCE * lexical_index_relevance.get(memory_id, 0.0)),
+        # `lexical_relevance` is the ranking score contribution, which needs the term coverage
+        # computed from content this candidate never had hydrated. Reporting the index-side
+        # strength in its place would make the two figures incomparable across dispositions --
+        # a rejected candidate would appear to carry more lexical evidence than a ranked one --
+        # so the unknown component stays `None` and `lexical_match` carries what is known.
         lexical_match=lexical_match,
         gate_confidence=max(
             dense_confidence.get(memory_id, 0.0),
@@ -5855,8 +5868,8 @@ def _extend_hydration_traces(
     target: builtins.list[RetrievalCandidateTrace] | None,
     candidates: _IndexCandidates,
     index_ids: Sequence[str],
-    hydrated_documents: Sequence[IndexDocument],
-    accepted_documents: Sequence[IndexDocument],
+    hydrated_documents: Sequence[IndexCandidate],
+    accepted_documents: Sequence[IndexCandidate],
     index_ids_by_memory: Mapping[str, tuple[str, ...]],
 ) -> None:
     if target is None:
@@ -5864,12 +5877,12 @@ def _extend_hydration_traces(
     (
         dense_relevance,
         dense_confidence,
-        lexical_index_relevance,
+        _lexical_index_relevance,
         lexical_matches,
     ) = _parent_index_signals(candidates, hydrated_documents)
     dense_by_id = {hit.id: hit for hit in candidates.dense}
     lexical_by_id = {hit.id: hit for hit in candidates.lexical}
-    hydrated_ids = {document.embedding.embedding_id for document in hydrated_documents}
+    hydrated_ids = {document.embedding_id for document in hydrated_documents}
     for index_id in index_ids:
         if index_id in hydrated_ids:
             continue
@@ -5895,7 +5908,7 @@ def _extend_hydration_traces(
                 rejected_by=RetrievalRejection.STALE_INDEX,
             )
         )
-    accepted_parent_ids = {document.embedding.memory_id for document in accepted_documents}
+    accepted_parent_ids = {document.memory_id for document in accepted_documents}
     for memory_id, parent_index_ids in index_ids_by_memory.items():
         if memory_id in accepted_parent_ids:
             continue
@@ -5905,7 +5918,6 @@ def _extend_hydration_traces(
                 parent_index_ids,
                 dense_relevance,
                 dense_confidence,
-                lexical_index_relevance,
                 lexical_matches,
                 RetrievalRejection.OCCURRENCE_RANGE,
             )
@@ -5919,7 +5931,6 @@ def _extend_missing_memory_traces(
     index_ids_by_memory: Mapping[str, tuple[str, ...]],
     dense_relevance: Mapping[str, float],
     dense_confidence: Mapping[str, float],
-    lexical_index_relevance: Mapping[str, float],
     lexical_matches: set[str],
 ) -> None:
     if target is None:
@@ -5933,7 +5944,6 @@ def _extend_missing_memory_traces(
                     index_ids_by_memory[memory_id],
                     dense_relevance,
                     dense_confidence,
-                    lexical_index_relevance,
                     lexical_matches,
                     RetrievalRejection.MISSING_MEMORY,
                 )
@@ -5947,7 +5957,6 @@ def _extend_memory_type_traces(
     index_ids_by_memory: Mapping[str, tuple[str, ...]],
     dense_relevance: Mapping[str, float],
     dense_confidence: Mapping[str, float],
-    lexical_index_relevance: Mapping[str, float],
     lexical_matches: set[str],
 ) -> None:
     if target is None:
@@ -5960,7 +5969,6 @@ def _extend_memory_type_traces(
                     index_ids_by_memory[memory.memory_id],
                     dense_relevance,
                     dense_confidence,
-                    lexical_index_relevance,
                     lexical_matches,
                     RetrievalRejection.MEMORY_TYPE,
                 )
@@ -6051,7 +6059,7 @@ def _extend_ranked_traces(
 
 def _parent_index_signals(
     candidates: _IndexCandidates,
-    documents: Sequence[IndexDocument],
+    documents: Sequence[IndexCandidate],
 ) -> tuple[dict[str, float], dict[str, float], dict[str, float], set[str]]:
     dense_by_id = {hit.id: hit for hit in candidates.dense}
     lexical_by_id = {hit.id: hit for hit in candidates.lexical}
@@ -6060,8 +6068,8 @@ def _parent_index_signals(
     lexical_relevance: dict[str, float] = {}
     lexical_matches: set[str] = set()
     for document in documents:
-        memory_id = document.embedding.memory_id
-        embedding_id = document.embedding.embedding_id
+        memory_id = document.memory_id
+        embedding_id = document.embedding_id
         dense_hit = dense_by_id.get(embedding_id)
         if dense_hit is not None:
             dense_relevance[memory_id] = max(

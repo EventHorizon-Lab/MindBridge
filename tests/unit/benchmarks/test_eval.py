@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from opentelemetry import trace
 
 import mindbridge.benchmarks.eval as eval_module
 from mindbridge import (
@@ -290,6 +291,7 @@ def test_result_table_includes_per_task_time_and_tokens() -> None:
                     "score": {"mean": 1.0, "confidence_interval_95": None},
                     "question_count": 2,
                     "error_count": 0,
+                    "ingest_failure_count": 0,
                     "performance": {
                         "duration_seconds": {"total": 2.5, "average": 1.25},
                         "token_usage": {"total_tokens": 30, "average_tokens": 15.0},
@@ -303,6 +305,33 @@ def test_result_table_includes_per_task_time_and_tokens() -> None:
     assert "avg ms" in output
     assert "30" in output
     assert "15.0" in output
+
+
+def test_result_table_reports_the_writes_that_invalidated_a_score() -> None:
+    # A run that loses every write still answers every question, so `error_count` stays zero and
+    # the score reads INVALID beside it with nothing saying why. One real run lost 7 784 writes to
+    # a transcription dependency that was not installed and printed exactly that.
+    output = eval_module._table(
+        {
+            "tasks": [
+                {
+                    "task": "fixture",
+                    "primary_metric": "accuracy",
+                    "score": {"mean": None, "confidence_interval_95": None},
+                    "question_count": 152,
+                    "error_count": 0,
+                    "ingest_failure_count": 7784,
+                    "performance": {
+                        "duration_seconds": {"total": 1.0, "average": 1.0},
+                        "token_usage": {"total_tokens": 1, "average_tokens": 1.0},
+                    },
+                }
+            ]
+        }
+    )
+
+    assert "unwritten" in output
+    assert "7784" in output
 
 
 def test_cluster_statistics_and_pairing_are_seeded() -> None:
@@ -663,15 +692,10 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
     pool = object.__new__(eval_module._BackendPool)
     settings = MemoryConfig(evidence_budget_chars=4_242, minimum_relevance=0.11)
-    for name, value in (
-        ("_settings", settings),
-        ("_embedder", None),
-        ("_answerer", None),
-        ("_transcriber", None),
-        ("_face_analyzer", None),
-        ("_tracer", None),
-    ):
-        setattr(pool, name, value)
+    pool._settings = settings
+    pool._tracer = trace.get_tracer(__name__)
+    for entry in fields(MemoryPlugins):
+        setattr(pool, f"_{entry.name}", None)
 
     pool.memory(Path("unused"))
 
@@ -683,6 +707,30 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
     for constructor in (Memory.__init__, AsyncMemory.__init__):
         unaccepted = declared - set(signature(constructor).parameters)
         assert not unaccepted, f"{constructor.__qualname__} has no keyword for {sorted(unaccepted)}"
+
+
+def test_backend_pool_forwards_every_capability_plugin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`former` was declared on `MemoryPlugins`, built by the SDK adapter, and used by `Memory`,
+    yet the harness never passed it, so no benchmark run has ever exercised derived-memory
+    formation. Deriving the expected keywords from the dataclass makes the next omission red."""
+    captured: dict[str, object] = {}
+
+    class Recorder:
+        def __init__(self, _data_dir: object, **values: object) -> None:
+            captured.update(values)
+
+    monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
+    pool = object.__new__(eval_module._BackendPool)
+    pool._settings = MemoryConfig()
+    pool._tracer = trace.get_tracer(__name__)
+    markers = {entry.name: object() for entry in fields(MemoryPlugins)}
+    for name, marker in markers.items():
+        setattr(pool, f"_{name}", marker)
+
+    pool.memory(Path("unused"))
+
+    for name, marker in markers.items():
+        assert captured[name] is marker, name
 
 
 def test_implementation_identity_tracks_editable_source_changes(
@@ -1852,3 +1900,125 @@ def test_metric_breakdowns_cover_every_catalog_task(tmp_path: Path) -> None:
 
 def _breakdown_arguments() -> SimpleNamespace:
     return SimpleNamespace(seed=1234, bootstrap_samples=8)
+
+
+def test_a_task_worded_refusal_counts_as_an_abstention() -> None:
+    # `AnswerResult.abstained` recognises the product's own refusal sentence, which it cannot do
+    # for a wording the task substituted. MEMLENS mandates "Insufficient information", so a real
+    # dev run reported 0 abstentions where 16 of 59 answers were refusals.
+    question = EvalQuestion(
+        "q1",
+        ("Where did she go?",),
+        ("the market",),
+        refusal="Insufficient information",
+    )
+
+    assert eval_module._declined("Insufficient information", question)
+    assert eval_module._declined("Insufficient information.", question)
+    assert not eval_module._declined("She went to the market.", question)
+    # A task that mandates nothing must not have refusals invented for it.
+    assert not eval_module._declined("Insufficient information", replace(question, refusal=None))
+
+
+def test_memlens_questions_declare_the_refusal_their_own_prompt_mandates(tmp_path: Path) -> None:
+    # Loading the real task, not the helper in isolation: a declaration the loader never attaches
+    # returns the reported refusal rate to zero while the model keeps refusing, and a test of the
+    # helper alone stays green through exactly that.
+    from mindbridge.benchmarks.prompts import MEMLENS_QUERY_PROMPT
+
+    dataset = tmp_path / "memlens.json"
+    dataset.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "q1",
+                    "question_type": "preference",
+                    "question": "What is my favorite color?",
+                    "answer": "Blue.",
+                    "question_date": "2025/01/15 (Wed) 10:00",
+                    "haystack_dates": ["2025/01/14 (Tue) 09:00"],
+                    "haystack_sessions": [
+                        [{"role": "user", "content": "My favorite color is blue."}]
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    auxiliary = tmp_path / "memlens" / "agent_subset_195.json"
+    auxiliary.parent.mkdir()
+    auxiliary.write_text(json.dumps({"n_questions": 1, "question_ids": ["q1"]}), encoding="utf-8")
+
+    loaded = load_task(
+        TASKS["memlens-32k"], root=tmp_path, dataset_path=dataset, verify_digest=False
+    )
+    question = loaded.units[0].questions[0]
+
+    assert MEMLENS_QUERY_PROMPT.refusal is not None
+    # Tied to the prompt text, so changing the mandated wording without the declaration fails.
+    assert f'"{MEMLENS_QUERY_PROMPT.refusal}"' in MEMLENS_QUERY_PROMPT.text
+    assert question.refusal == MEMLENS_QUERY_PROMPT.refusal
+    assert eval_module._declined(MEMLENS_QUERY_PROMPT.refusal, question)
+
+
+def test_mem_gallery_refusal_questions_declare_the_wording_their_constraint_mandates(
+    tmp_path: Path,
+) -> None:
+    # Loading the real task, for the same reason the MemLens case does: `AR` is the only one of
+    # the nine task types whose constraint overrides the refusal wording, so a declaration the
+    # loader never attaches reports zero refusals for it while the model keeps refusing.
+    from mindbridge.benchmarks.prompts import MEM_GALLERY_REFUSAL_PROMPT
+
+    dialog = tmp_path / "dialog"
+    dialog.mkdir()
+    (dialog / "topic.json").write_text(
+        json.dumps(
+            {
+                "character_profile": {
+                    "name": "Mira",
+                    "persona_summary": "A gardener.",
+                    "conversation_style": "warm",
+                },
+                "multi_session_dialogues": [
+                    {
+                        "session_id": "D1",
+                        "date": "2024-05-02",
+                        "dialogues": [
+                            {"round": "D1:1", "user": "I planted basil.", "assistant": "Nice."}
+                        ],
+                    }
+                ],
+                "human-annotated QAs": [
+                    {
+                        "point": "AR",
+                        "question": "What did I plant in the greenhouse?",
+                        "answer": "Not mentioned.",
+                        "session_id": ["D1"],
+                    },
+                    {
+                        "point": "FR",
+                        "question": "What did I plant?",
+                        "answer": "Basil.",
+                        "session_id": ["D1"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_task(
+        TASKS["mem-gallery"], root=tmp_path, dataset_path=dialog, verify_digest=False
+    )
+    by_point = {
+        question.metadata["point"]: question for unit in loaded.units for question in unit.questions
+    }
+
+    assert MEM_GALLERY_REFUSAL_PROMPT.refusal is not None
+    # Tied to the constraint text, so changing the mandated wording without the declaration fails.
+    assert MEM_GALLERY_REFUSAL_PROMPT.refusal in MEM_GALLERY_REFUSAL_PROMPT.text
+    assert by_point["AR"].refusal == MEM_GALLERY_REFUSAL_PROMPT.refusal
+    assert eval_module._declined(MEM_GALLERY_REFUSAL_PROMPT.refusal, by_point["AR"])
+    # The other eight types are asked without that constraint, so they must not claim it.
+    assert by_point["FR"].refusal is None
+    assert not eval_module._declined(MEM_GALLERY_REFUSAL_PROMPT.refusal, by_point["FR"])

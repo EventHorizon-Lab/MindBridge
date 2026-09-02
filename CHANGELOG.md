@@ -17,6 +17,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   all in 76 EgoLife frames, and a recognizer whose similarities do not separate the footage created
   4 026 identities from 4 731 observations, 84.1% of them seen exactly once.
 
+- A `formation` slot on the declarative configuration surface, selecting the bundled OpenAI former
+  so that entity, event, state, relation, affect, trait, and response-policy memories, their
+  validity intervals, spatial pose, and valence/arousal are reachable from `Memory.from_config()`
+  and from the benchmark harness. `FormationBackend` was implemented, composed by `MemoryPlugins`,
+  and used by `Memory`, but no declarative slot built one, so no `from_config` deployment and no
+  benchmark run had ever produced a derived memory. The slot stays absent by default because
+  formation adds an LLM round-trip to the write path.
 - `embedding.modalities` and `embedding.request_format` on the declarative OpenAI embedding slot,
   so a self-hosted multimodal embedding server can be composed from configuration instead of only
   from constructor injection. Defaults stay text-only and `input`-shaped.
@@ -164,6 +171,14 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- Grounded answer prompts no longer carry each hit's `memory_id`. The answer system prompt already
+  forbids answering with it, and a 64-hex identifier costs about 41 tokens per hit -- more than
+  that record's metadata and timestamps combined. Measured with `o200k_base` over four real
+  benchmark stores at the default `--recall-limit 20`, the user message drops 808-826 tokens per
+  question: 2 943 to 2 117 on locomo-refined, 4 692 to 3 871 on atm-hard, 7 414 to 6 594 on
+  m3-bench, 3 497 to 2 689 on mem-gallery. Hit content, occurrence times, memory type, and the
+  full application metadata are unchanged: metadata is the source-identity channel the system
+  prompt points at, and it costs only 8-12% of the prompt.
 - The benchmark harness request timeout now defaults to 300 seconds instead of 3 600. An hour
   bounds nothing a run cares about: a request the server never answers held its task for the full
   hour while the remaining workers idled, and the run reported the stall as elapsed time. The
@@ -193,6 +208,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   behaviour bound the wearer's voice to whoever was visible. The undocumented shortcut that let an
   asset's lone face adopt its lone voice inside the store write has been removed, leaving exactly
   one cross-modal entrance. Set `identity_link_min_assets=1` for the previous behaviour.
+  Counting assets bounds that mistake rather than removing it, because a wearer talks to the same
+  person across many clips and the wrong pair accumulates as fast as a genuine speaker's, so the
+  merge is also contained: only a voice-only and a face-only identity fuse on this path, and an
+  identity already holding both modalities absorbs nothing further. On synthetic egocentric
+  traffic with one off-camera wearer and three interlocutors, allowing the wider merge collapsed
+  all four people into a single identity under every ingestion order tried, while containing it
+  held the damage to the first bind and raised correct merges from 0 of 3 to 2 of 3.
 - The local schema is version 9. Version 8 directories upgrade in place, adding identity link
   evidence, an identity `relationship`, and the merge record that makes `unlink_identity` possible.
   Merges recorded before the upgrade have no such record and are therefore not reversible.
@@ -276,6 +298,10 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- The benchmark harness dropped the `former` and `vision_describer` plugins when building each
+  isolated store, so a configured formation backend was silently absent from every measured run.
+  Both are forwarded now, and a guard test derives the expected keywords from
+  `dataclasses.fields(MemoryPlugins)` so the next added slot fails instead of being dropped.
 - Remote product CLI requests now default to a finite 30-second timeout, configurable with the
   positive `--timeout SECONDS` option. Timeouts use the existing retryable `storage_error` envelope
   with `reason="timeout"` and `stage="request"` instead of leaving an agent blocked indefinitely.

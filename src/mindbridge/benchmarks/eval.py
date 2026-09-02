@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 from mindbridge import (
     DEFAULT_FUNASR_MODEL_ID,
     DEFAULT_FUNASR_RECIPE,
+    AbstentionReason,
     AnswerResult,
     AssetRef,
     AsyncMemory,
@@ -108,11 +109,13 @@ from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
     FaceBackend,
+    FormationBackend,
     GenerationBackend,
     ModelInput,
     SpeechAnalysis,
     SpeechBackend,
     TranscriptionBackend,
+    VisionDescriptionBackend,
 )
 from mindbridge.models.jina import (
     DEFAULT_JINA_DIMENSION,
@@ -474,6 +477,16 @@ class _BackendPool:
                 if plugins.face_analyzer is None
                 else cast(FaceBackend, _BorrowedFaceBackend(plugins.face_analyzer))
             )
+            self._former = (
+                None
+                if plugins.former is None
+                else cast(FormationBackend, _BorrowedBackend(plugins.former))
+            )
+            self._vision_describer = (
+                None
+                if plugins.vision_describer is None
+                else cast(VisionDescriptionBackend, _BorrowedBackend(plugins.vision_describer))
+            )
             self._settings = resolved.settings
             return
         try:
@@ -536,6 +549,8 @@ class _BackendPool:
             else None
         )
         self._face_analyzer = None
+        self._former = None
+        self._vision_describer = None
         self._settings = MemoryConfig(index_speech=self._transcriber is not None)
 
     def memory(self, data_dir: Path) -> AsyncMemory:
@@ -543,7 +558,9 @@ class _BackendPool:
         # dropped every setting added after it was written, which does not fail anything: the
         # evaluation simply measures the default policy while reporting the configured one.
         # `MemoryPlugins` cannot be used here because the shared-backend proxies are structural
-        # and its runtime protocol check reads attributes statically.
+        # and its runtime protocol check reads attributes statically. The capability keywords below
+        # stay explicit for the same reason, so a test derives the expected set from
+        # `fields(MemoryPlugins)` instead.
         policy = {entry.name: getattr(self._settings, entry.name) for entry in fields(MemoryConfig)}
         return AsyncMemory(
             data_dir,
@@ -551,6 +568,8 @@ class _BackendPool:
             answerer=self._answerer,
             transcriber=self._transcriber,
             face_analyzer=self._face_analyzer,
+            former=self._former,
+            vision_describer=self._vision_describer,
             tracer=self._tracer,
             **policy,
         )
@@ -1215,6 +1234,13 @@ def _cache_outcome(
     )
 
 
+def _declined(answer: str, question: EvalQuestion) -> bool:
+    """Report a refusal a task worded itself, which the product cannot recognise."""
+    return question.refusal is not None and answer.strip().rstrip(".") == (
+        question.refusal.strip().rstrip(".")
+    )
+
+
 async def _ingest(
     memory: AsyncMemory,
     items: Sequence[MemoryItem],
@@ -1305,9 +1331,15 @@ async def _answer_many(
                     max((hit.score for hit in result.hits), default=0.0),
                     tuple(hit.id for hit in result.hits),
                     tuple(_evidence(hit) for hit in result.hits),
-                    abstained=result.abstained,
+                    abstained=result.abstained or _declined(result.answer, question),
                     abstention_reason=(
-                        None if result.abstention_reason is None else result.abstention_reason.value
+                        result.abstention_reason.value
+                        if result.abstention_reason is not None
+                        else (
+                            AbstentionReason.INSUFFICIENT_EVIDENCE.value
+                            if _declined(result.answer, question)
+                            else None
+                        )
                     ),
                 )
         if on_answer is not None:
@@ -2640,6 +2672,7 @@ def _table(results: Mapping[str, object]) -> str:
                 ),
                 str(task["question_count"]),
                 str(task["error_count"]),
+                str(task["ingest_failure_count"]),
                 (
                     "—"
                     if isinstance(total_duration, bool)
@@ -2672,6 +2705,10 @@ def _table(results: Mapping[str, object]) -> str:
         "95% cluster CI",
         "n",
         "errors",
+        # A score reads INVALID whenever writes failed, and until this column existed the table
+        # said only "errors 0" beside it: answering had in fact succeeded, on an empty store. One
+        # run lost 7 784 writes to a missing transcription dependency and showed nothing.
+        "unwritten",
         "total s",
         "avg ms",
         "tokens",

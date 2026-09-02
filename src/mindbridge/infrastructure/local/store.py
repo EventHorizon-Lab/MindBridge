@@ -768,6 +768,27 @@ class IndexDocument:
 
 
 @dataclass(frozen=True, slots=True)
+class IndexCandidate:
+    """Ranking-path projection of an indexed embedding.
+
+    Retrieval ranks on index scores and event times; it never reads the stored vector or the
+    memory content. Hydrating a full ``IndexDocument`` for that would unpack and revalidate one
+    FP32 vector per candidate, which measured at twenty-one times the cost of the query that
+    produced the row. This projection reads the four columns ranking uses.
+    """
+
+    embedding_id: str
+    memory_id: str
+    occurred_at: datetime | None = None
+    occurred_end: datetime | None = None
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.embedding_id, "embedding_id")
+        _require_identifier(self.memory_id, "memory_id")
+        _require_interval(self.occurred_at, self.occurred_end)
+
+
+@dataclass(frozen=True, slots=True)
 class IdentityLink:
     """A validated face-and-voice merge that can be committed atomically."""
 
@@ -2389,6 +2410,38 @@ class LocalStore:
         for row in rows:
             document = _index_document_from_row(row)
             by_id[document.embedding.embedding_id] = document
+        return tuple(by_id[embedding_id] for embedding_id in embedding_ids if embedding_id in by_id)
+
+    def read_index_candidates(
+        self,
+        embedding_ids: Sequence[str],
+    ) -> tuple[IndexCandidate, ...]:
+        """Project indexed embeddings onto the columns ranking reads, preserving input order."""
+        if not embedding_ids:
+            return ()
+        for embedding_id in embedding_ids:
+            _require_identifier(embedding_id, "embedding_id")
+        by_id: dict[str, IndexCandidate] = {}
+        with self._connection() as connection:
+            for offset in range(0, len(embedding_ids), _SQLITE_PARAMETER_BATCH):
+                batch = embedding_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+                placeholders = ", ".join("?" for _embedding_id in batch)
+                for row in connection.execute(
+                    f"""
+                    SELECT e.embedding_id, e.memory_id, m.occurred_at, m.occurred_end
+                    FROM embeddings AS e
+                    JOIN memory_records AS m ON m.memory_id = e.memory_id
+                    WHERE e.embedding_id IN ({placeholders})
+                    """,
+                    tuple(batch),
+                ):
+                    candidate = IndexCandidate(
+                        embedding_id=_row_text(row, "embedding_id"),
+                        memory_id=_row_text(row, "memory_id"),
+                        occurred_at=_optional_datetime_from_row(row, "occurred_at"),
+                        occurred_end=_optional_datetime_from_row(row, "occurred_end"),
+                    )
+                    by_id[candidate.embedding_id] = candidate
         return tuple(by_id[embedding_id] for embedding_id in embedding_ids if embedding_id in by_id)
 
     def read_memory_index_documents(
