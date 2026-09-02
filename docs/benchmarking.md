@@ -101,13 +101,13 @@ benchmark:
 ```
 
 The `benchmark` mapping carries what `MindBridgeConfig` has no field for: judging, corpus
-acquisition, the corpus-shaped minimum video duration, and -- under `benchmark.run` -- every run
-tunable the flags expose. Anything that describes a model endpoint (its base URL, credential,
+acquisition, and -- under `benchmark.run` -- every run tunable the flags expose. Anything that describes a model endpoint (its base URL, credential,
 model name, modalities, timeout, token ceiling, and `extra_body`) stays in the product block that
 owns it, so no setting has two homes. See the annotated
 [example configuration](examples/eval.example.yaml) for every field with its purpose.
 
-`benchmark.run` mirrors the flags one for one: `tasks`, `limit`, `offset`, `seed`,
+`benchmark.run` mirrors the flags one for one: `tasks`, `arms`, `full_context_chars`, `limit`,
+`offset`, `seed`,
 `bootstrap_samples`, `batch_size`, `max_batch_size`, `unit_concurrency`, `request_concurrency`,
 `judge_concurrency`, `recall_limit`, `device`, `device_lock`, `use_cache`, `run_id`,
 `output_path`, `overwrite`, `log_samples`, `predict_only`, `download`, `allow_unverified_data`,
@@ -115,12 +115,16 @@ owns it, so no setting has two homes. See the annotated
 `task_data`, `media_root`, and `num_fewshot`. Each key's default is the value the unset flag
 produced, so an omitted key changes nothing.
 
+`--blind` is the one arm control that stays a flag. It labels a whole run as the no-memory
+control -- in the results document and in the response-cache namespace -- rather than describing
+a sweep, so it refuses to run alongside an arm selection made in the file.
+
 Only four inputs stay command-line-only. `--config` names this file; `--model` must be the
 literal `mindbridge`; and `--list-tasks` and `--check-integrity` are modes that do something
 other than evaluate, so they are actions rather than settings. The three `*-args` strings are
 shorthand whose every setting has a typed home in the file: `--model-args` writes
 `generation.base_url`, `generation.model`, `generation.timeout`, and
-`benchmark.generation.min_video_seconds`; `--gen-kwargs` writes `generation.max_tokens` and
+`generation.min_video_seconds`; `--gen-kwargs` writes `generation.max_tokens` and
 `generation.extra_body`; `--judge-model-args` writes `benchmark.judge`.
 
 Two generation controls are pinned rather than configurable. A reproducible sweep always sends

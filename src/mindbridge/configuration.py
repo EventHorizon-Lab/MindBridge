@@ -119,6 +119,12 @@ class _OpenAICompletionConfig(_OpenAIConfig):
 
 class OpenAIGenerationConfig(_OpenAICompletionConfig):
     video_limit: _PositiveInt | None = 8
+    # Below this duration a video is answered as four ordered stills instead. The option already
+    # existed on `OpenAIModels` and was unreachable from configuration, which left every caller
+    # that builds its models from a file -- the benchmark harness included -- unable to set the
+    # floor its endpoint needs. Answer-only, like `video_limit`, so it is not on the shared
+    # completion base that formation also reads.
+    min_video_seconds: _PositiveFloat | None = None
 
 
 class OpenAIFormationConfig(_OpenAICompletionConfig):
@@ -331,6 +337,8 @@ def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
     values = _completion_values(config)
     if config.video_limit != 8:
         values["generation_video_limit"] = config.video_limit
+    if config.min_video_seconds is not None:
+        values["generation_min_video_seconds"] = config.min_video_seconds
     return cast(GenerationBackend, _openai_factory(values))
 
 

@@ -647,12 +647,17 @@ class _BackendPool:
         self._tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
         if memory_config is not None:
             if memory_config.generation is not None:
+                # The harness owns both of these for a run: `--model-args` and the environment
+                # name the modalities, and the video floor belongs to the corpus rather than to
+                # the endpoint. Injecting them here is what makes the configured path honour
+                # them -- the resolved backends are built from this document, so a floor left
+                # only on `ModelConfig` would be reported in the result artifact while short
+                # videos still went to the endpoint whole.
+                update: dict[str, object] = {"modalities": config.generation_capabilities}
+                if config.generation_min_video_seconds is not None:
+                    update["min_video_seconds"] = config.generation_min_video_seconds
                 memory_config = memory_config.model_copy(
-                    update={
-                        "generation": memory_config.generation.model_copy(
-                            update={"modalities": config.generation_capabilities}
-                        )
-                    }
+                    update={"generation": memory_config.generation.model_copy(update=update)}
                 )
             resolved = resolve_memory_config(memory_config)
             self._resolved_config = resolved
@@ -3719,7 +3724,7 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     parser.add_argument("--model", default="mindbridge", help="evaluation adapter")
     parser.add_argument(
         "--arms",
-        default=DEFAULT_ARM,
+        default=None,
         help=(
             "comma-separated evaluation arms: mindbridge (the product), blind (no evidence), "
             "full-context (corpus stuffed into the prompt), random (shuffled candidates, "
@@ -3729,7 +3734,7 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--full-context-chars",
         type=_positive_int,
-        default=DEFAULT_FULL_CONTEXT_CHARS,
+        default=None,
         help="character budget the full-context arm stuffs into one prompt",
     )
     parser.add_argument(
@@ -3852,9 +3857,11 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     return parser
 
 
-def _selected_arms(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> tuple[str, ...]:
+def _selected_arms(
+    parser: argparse.ArgumentParser, parsed: argparse.Namespace, declared: str
+) -> tuple[str, ...]:
     """Resolve which arms this run answers, coupling `--blind` to the arm that has no evidence."""
-    arms = tuple(dict.fromkeys(part.strip() for part in parsed.arms.split(",") if part.strip()))
+    arms = tuple(dict.fromkeys(part.strip() for part in declared.split(",") if part.strip()))
     if not arms:
         parser.error("--arms must name at least one arm")
     unknown = tuple(name for name in arms if name not in ARMS)
@@ -3866,7 +3873,7 @@ def _selected_arms(parser: argparse.ArgumentParser, parsed: argparse.Namespace) 
     # response-cache namespace, so it has to select the arm that actually answers without
     # evidence. Leaving the product arm running under that label is how a memory-backed run gets
     # published as its own baseline.
-    if parsed.arms != DEFAULT_ARM and arms != ("blind",):
+    if declared != DEFAULT_ARM and arms != ("blind",):
         parser.error("--blind runs the blind arm alone; drop --arms or pass --arms blind")
     return ("blind",)
 
@@ -3879,8 +3886,8 @@ def _arguments(
 ) -> _Arguments:
     if parsed.model != "mindbridge":
         parser.error("--model must be mindbridge")
-    arms = _selected_arms(parser, parsed)
     run = (HarnessOverrides() if overrides is None else overrides).run
+    arms = _selected_arms(parser, parsed, _picked(parsed.arms, run.arms, DEFAULT_ARM))
     tasks_value = parsed.tasks or run.tasks
     if not tasks_value:
         parser.error("--tasks is required unless --list-tasks is used")
@@ -3894,6 +3901,9 @@ def _arguments(
     request_concurrency = _picked(parsed.request_concurrency, run.request_concurrency, 4)
     judge_concurrency = _picked(parsed.judge_concurrency, run.judge_concurrency, 8)
     recall_limit = _picked(parsed.recall_limit, run.recall_limit, 20)
+    full_context_chars = _picked(
+        parsed.full_context_chars, run.full_context_chars, DEFAULT_FULL_CONTEXT_CHARS
+    )
     bootstrap_samples = _picked(
         parsed.bootstrap_samples, run.bootstrap_samples, DEFAULT_BOOTSTRAP_SAMPLES
     )
@@ -3962,7 +3972,7 @@ def _arguments(
         bootstrap_samples=bootstrap_samples,
         model=parsed.model,
         arms=arms,
-        full_context_chars=parsed.full_context_chars,
+        full_context_chars=full_context_chars,
         model_args=parsed.model_args,
         memory_config=(
             None if parsed.memory_config is None else parsed.memory_config.expanduser().resolve()
@@ -4130,8 +4140,6 @@ def _model_config(
     if model != "mindbridge":
         raise ValueError("model must be mindbridge")
     config = ModelConfig.from_environment()
-    if overrides is not None:
-        config = config.with_overrides(overrides.generation)
     if memory_config is not None and memory_config.generation is not None:
         generation = memory_config.generation
         # `model` and `modalities` carry non-`None` schema defaults, so an absent value cannot be
@@ -4154,6 +4162,11 @@ def _model_config(
                 else config.generation_capabilities
             ),
             timeout_seconds=generation.timeout or config.timeout_seconds,
+            generation_min_video_seconds=(
+                config.generation_min_video_seconds
+                if generation.min_video_seconds is None
+                else generation.min_video_seconds
+            ),
         )
     allowed = {
         "base_url",

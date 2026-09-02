@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -66,21 +66,6 @@ class ModelConfig:
             generation_capabilities=_modalities(source.get("MINDBRIDGE_GENERATION_MODALITIES")),
         )
 
-    def with_overrides(self, overrides: GenerationOverrides) -> ModelConfig:
-        """Apply the configuration file's harness generation section over environment values.
-
-        The file wins wherever it declares a value; a field it leaves out keeps whatever the
-        environment supplied, and an absent environment keeps the module default.
-        """
-        return replace(
-            self,
-            generation_min_video_seconds=(
-                self.generation_min_video_seconds
-                if overrides.min_video_seconds is None
-                else overrides.min_video_seconds
-            ),
-        )
-
 
 def _float(value: str | None, default: float) -> float:
     try:
@@ -115,18 +100,6 @@ class _HarnessModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
 
-class GenerationOverrides(_HarnessModel):
-    """Generation inputs that belong to the harness rather than to the product.
-
-    Everything about the generation endpoint itself -- `base_url`, `api_key`, `model`,
-    `modalities`, `timeout` -- lives in the product `generation` block and is read from there;
-    repeating any of it here would create a second source of truth. What is left is the video
-    floor, which only a benchmark corpus has a reason to set.
-    """
-
-    min_video_seconds: Annotated[float, Field(strict=True, gt=0)] | None = None
-
-
 class JudgeOverrides(_HarnessModel):
     """Judge endpoint settings. Judging exists only in the harness, never in the product."""
 
@@ -158,6 +131,11 @@ class RunOverrides(_HarnessModel):
     """
 
     tasks: str | None = None
+    # Which arms answer, and the budget the full-context arm stuffs. A baseline sweep is exactly
+    # the thing a file describes and a flag does not, so both belong here; `--blind` stays
+    # command-line-only because it labels one run as the control rather than describing a sweep.
+    arms: str | None = None
+    full_context_chars: Annotated[int, Field(strict=True, gt=0)] | None = None
     output_path: Path | None = None
     run_id: str | None = None
     task_data: Mapping[str, Path] | None = None
@@ -195,12 +173,13 @@ class HarnessOverrides(_HarnessModel):
     """The `benchmark:` section of a harness configuration file.
 
     Every field is optional and every field wins over the matching environment variable. The
-    section is absent from `MindBridgeConfig` on purpose: credentials, judging, and corpus
-    acquisition are harness concerns, and putting them in the product schema would make them part
-    of the public contract.
+    section is absent from `MindBridgeConfig` on purpose: judging and corpus acquisition are
+    harness concerns, and putting them in the product schema would make them part of the public
+    contract. Nothing that describes a model endpoint appears here -- not even the short-video
+    floor, which is `generation.min_video_seconds` in the product block -- because a setting with
+    two homes is a setting whose effective value nobody can read off the file.
     """
 
-    generation: GenerationOverrides = Field(default_factory=GenerationOverrides)
     judge: JudgeOverrides = Field(default_factory=JudgeOverrides)
     download: DownloadOverrides = Field(default_factory=DownloadOverrides)
     run: RunOverrides = Field(default_factory=RunOverrides)

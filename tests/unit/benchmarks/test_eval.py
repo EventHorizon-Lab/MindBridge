@@ -2222,12 +2222,11 @@ generation:
   provider: openai
   model: configured-model
   api_key: config-generation-key
+  min_video_seconds: 2.5
 speech:
   provider: funasr
   device: cpu
 benchmark:
-  generation:
-    min_video_seconds: 2.5
   judge:
     model: config-judge
     base_url: https://judge.example/v1
@@ -2251,8 +2250,8 @@ benchmark:
     # The credential lives with the endpoint it authenticates, in the product block.
     assert config.generation.api_key is not None
     assert config.generation.api_key.get_secret_value() == "config-generation-key"
+    assert config.generation.min_video_seconds == 2.5
     # The harness section must not reach the product schema, which forbids unknown fields.
-    assert overrides.generation.min_video_seconds == 2.5
     assert overrides.judge.model == "config-judge"
     assert overrides.judge.timeout_seconds == 90.0
     assert overrides.download.hf_endpoint == "https://mirror.example"
@@ -2425,22 +2424,28 @@ def test_eval_generation_credential_prefers_the_file_over_the_environment(
     assert inherited.generation_api_key == "environment-key"
 
 
-def test_eval_harness_generation_section_carries_only_the_video_floor(tmp_path: Path) -> None:
+def test_eval_video_floor_has_exactly_one_home(tmp_path: Path) -> None:
+    """The floor is a generation-endpoint setting, so it lives in the product block only.
+
+    It reaches `ModelConfig` from there, which is what puts it in the result artifact and in the
+    cache namespace; naming it under `benchmark` must be rejected rather than quietly accepted in
+    a second place whose effective value nobody can read off the file.
+    """
     path = tmp_path / "eval.yaml"
     path.write_text(
-        "benchmark:\n  generation:\n    min_video_seconds: 4\n",
+        "generation:\n  provider: openai\n  min_video_seconds: 4\n",
         encoding="utf-8",
     )
 
     config, overrides = _load_memory_config(path)
 
-    assert overrides.generation.min_video_seconds == 4.0
+    assert config is not None and config.generation is not None
+    assert config.generation.min_video_seconds == 4.0
     resolved = _model_config("mindbridge", "", memory_config=config, overrides=overrides)
     assert resolved.generation_min_video_seconds == 4.0
-    # The credential belongs to the product block; naming it here must be rejected rather than
-    # quietly accepted in a second place.
+
     path.write_text(
-        "benchmark:\n  generation:\n    api_key: wrong-home\n",
+        "benchmark:\n  generation:\n    min_video_seconds: 4\n",
         encoding="utf-8",
     )
     with pytest.raises(ValidationError):
@@ -2782,6 +2787,128 @@ benchmark:
     assert arguments.regression_threshold == 0.25
     # `--gen-kwargs` normalisation must pick up the configured seed, not the default.
     assert "seed=7" in arguments.gen_kwargs
+
+
+class _StopResolving(Exception):
+    """Cut `_BackendPool.__init__` short once the document it would resolve has been captured."""
+
+
+def test_backend_pool_hands_the_configured_video_floor_to_the_resolved_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The floor must reach the document the backends are built from, not just the artifact.
+
+    `--config` always resolves a memory configuration, so the configured branch is the only one a
+    file-driven run takes. A floor recorded on `ModelConfig` alone would be reported in
+    `results.json` while short videos still went to the endpoint whole.
+    """
+    configured: list[MindBridgeConfig] = []
+
+    def resolve(config: MindBridgeConfig) -> object:
+        configured.append(config)
+        raise _StopResolving
+
+    monkeypatch.setattr(eval_module, "resolve_memory_config", resolve)
+    memory_config = MindBridgeConfig.model_validate(
+        {"embedding": {"provider": "openai"}, "generation": {"provider": "openai"}}
+    )
+
+    with pytest.raises(_StopResolving):
+        eval_module._BackendPool(
+            ModelConfig(generation_min_video_seconds=2.5),
+            device=None,
+            batch_size=1,
+            needs_speech=False,
+            seed=0,
+            memory_config=memory_config,
+        )
+
+    assert configured[0].generation is not None
+    assert configured[0].generation.min_video_seconds == 2.5
+
+
+def test_backend_pool_leaves_an_unset_video_floor_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent harness floor must not overwrite one the memory document declares itself."""
+    configured: list[MindBridgeConfig] = []
+
+    def resolve(config: MindBridgeConfig) -> object:
+        configured.append(config)
+        raise _StopResolving
+
+    monkeypatch.setattr(eval_module, "resolve_memory_config", resolve)
+    memory_config = MindBridgeConfig.model_validate(
+        {
+            "embedding": {"provider": "openai"},
+            "generation": {"provider": "openai", "min_video_seconds": 4.0},
+        }
+    )
+
+    with pytest.raises(_StopResolving):
+        eval_module._BackendPool(
+            ModelConfig(),
+            device=None,
+            batch_size=1,
+            needs_speech=False,
+            seed=0,
+            memory_config=memory_config,
+        )
+
+    assert configured[0].generation is not None
+    assert configured[0].generation.min_video_seconds == 4.0
+
+
+def test_eval_run_section_selects_the_baseline_arms(tmp_path: Path) -> None:
+    """A baseline sweep is what a file describes; the flag alone cannot be reused across runs."""
+    path = tmp_path / "eval.yaml"
+    path.write_text(
+        "benchmark:\n  run:\n    tasks: clbench\n    arms: mindbridge,full-context\n"
+        "    full_context_chars: 4096\n",
+        encoding="utf-8",
+    )
+    _, overrides = _load_memory_config(path)
+    parser = eval_module._build_parser("eval")
+    parsed = parser.parse_args(["--config", str(path)])
+
+    arguments = eval_module._arguments(parser, parsed, overrides=overrides)
+
+    assert arguments.arms == ("mindbridge", "full-context")
+    assert arguments.full_context_chars == 4096
+
+
+def test_eval_arm_flags_still_beat_the_run_section(tmp_path: Path) -> None:
+    path = tmp_path / "eval.yaml"
+    path.write_text(
+        "benchmark:\n  run:\n    tasks: clbench\n    arms: full-context\n"
+        "    full_context_chars: 4096\n",
+        encoding="utf-8",
+    )
+    _, overrides = _load_memory_config(path)
+    parser = eval_module._build_parser("eval")
+    parsed = parser.parse_args(
+        ["--config", str(path), "--arms", "random", "--full-context-chars", "512"]
+    )
+
+    arguments = eval_module._arguments(parser, parsed, overrides=overrides)
+
+    assert arguments.arms == ("random",)
+    assert arguments.full_context_chars == 512
+
+
+def test_eval_blind_rejects_a_configured_arm_selection(tmp_path: Path) -> None:
+    """`--blind` labels the whole run as the control, so a file naming another arm is a conflict."""
+    path = tmp_path / "eval.yaml"
+    path.write_text(
+        "benchmark:\n  run:\n    tasks: clbench\n    arms: mindbridge,full-context\n",
+        encoding="utf-8",
+    )
+    _, overrides = _load_memory_config(path)
+    parser = eval_module._build_parser("eval")
+    parsed = parser.parse_args(["--config", str(path), "--blind"])
+
+    with pytest.raises(SystemExit):
+        eval_module._arguments(parser, parsed, overrides=overrides)
 
 
 def test_eval_flags_still_beat_the_run_section(tmp_path: Path) -> None:
