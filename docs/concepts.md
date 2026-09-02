@@ -2,8 +2,9 @@
 
 MindBridge is an embedded memory library. The host application supplies content and model
 capabilities; one local `Memory` owns persistence, retrieval, and grounded-answer orchestration.
-This page gives the mental model. [Architecture](architecture.md) owns implementation invariants,
-and the [Python SDK](api/python-sdk.md) owns exact signatures.
+This page gives the mental model. Start with [product capabilities](product-capabilities.md) for the
+implemented use-case map. [Architecture](architecture.md) owns implementation invariants, and the
+[Python SDK](api/python-sdk.md) owns exact signatures.
 
 ## From input to evidence
 

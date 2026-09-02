@@ -251,30 +251,102 @@ Three properties of the baselines are load-bearing when quoting them:
   a corpus small enough for the pool to cover it, a random ranker can score near-perfect recall,
   and that is exactly the number worth printing next to the product's.
 
-## Catalog and primary metrics
+## Supported benchmark categories and primary metrics
 
-This table summarizes the current scorer registry. The task listing remains authoritative for
-concrete variants and source revisions.
+The executable catalog currently contains 17 benchmark families expanded to 31 concrete tasks.
+They fall into three dataset categories and one local systems microbenchmark. Classification follows
+the primary workload; several suites deliberately overlap categories.
 
-| Benchmark | Selector | Primary result | Official judge when required |
+| Category | What it measures | Use it when |
+| --- | --- | --- |
+| Behavioral and long-term memory | Multi-session recall, temporal reasoning, knowledge and preference updates, abstention, personalization, and long-context learning | Comparing the behavior of complete memory compositions on text or captioned histories |
+| Multimodal personal memory | Retrieval and answering over personal archives or conversations containing text, images, video, and email | Testing cross-modal evidence grounding in user histories |
+| Embodied, video, and spatial memory | Causal video histories, egocentric lifelog reasoning, temporal localization, grouped video reasoning, and fixed-scene episodic QA | Testing long-running agents, wearables, robots, video assistants, or spatial memories |
+| Local storage and retrieval | Direct SQLite-to-Zvec vector ingestion, exact-search recall, query latency, throughput, and disk growth | Isolating the embedded index from embedding, generation, and application behavior |
+
+All dataset benchmarks enter through:
+
+```bash
+uv run --frozen mindbridge-bench eval --tasks <selector>
+```
+
+Every `mindbridge` arm needs a generation provider. The tables name the additional judge required
+for an official primary result; `--predict-only` skips that judge and therefore cannot produce the
+judged primary result. A judge may reuse the generation endpoint, but a publication-comparable
+metric requires the named model. Selectors, variants, source revisions, and local readiness come
+from `mindbridge.benchmarks.task_catalog`; `--list-tasks` remains authoritative.
+
+### Behavioral and long-term memory
+
+| Benchmark and selector | What it measures and when to use it | Primary result and scoring requirement | Data requirement |
 | --- | --- | --- | --- |
-| LoCoMo-Refined | `locomo-refined` | `llm_judge` | `qwen3-14b` |
-| M3-Bench | `m3-bench` | `accuracy` | `gpt-4o-2024-11-20` |
-| Video-MME | `video-mme` | `accuracy` | -- |
-| Video-MME-v2 | `video-mme-v2` | `rating` | -- |
-| EgoLifeQA | `egolifeqa` | `accuracy` | -- |
-| EgoMemReason | `egomemreason` | `submission` | Official server scoring |
-| EgoTempo | `egotempo` | `accuracy` | `gemini-1.5-flash` |
-| MemLens | `memlens` | `accuracy` | `qwen3-235b-judge` |
-| MM-Lifelong | `mm-lifelong` | `answer_accuracy` | `gpt-5` |
-| SuperMemory-VQA | `supermemory-vqa` | `qa_accuracy` | -- |
-| ATM-Bench | `atm-bench` | `accuracy` | `gpt-5-mini` |
-| LongMemEval | `longmemeval-s` | `accuracy` | `gpt-4o-2024-08-06` |
-| CL-Bench | `clbench` | `solving_rate` | `gpt-5.1` |
-| BEAM | `beam` | `llm_judge_score` | `gpt-4.1-mini` |
-| PersonaMem-v3 | `personamem-v3` | `personamem_score` | `gpt-5.5` |
-| OpenEQA | `openeqa` | `llm_match` | `gpt-4-1106-preview` |
-| Mem-Gallery | `mem-gallery` | `f1` | `qwen2.5-72b-instruct` |
+| LoCoMo-Refined (`locomo-refined`) | Multi-session dialogue QA, temporal questions, captioned-image turns, and exact source-ID retrieval; use for conversational long-term memory | `llm_judge`; judge `qwen3-14b` | Pinned GitHub JSON; automatic |
+| MemLens (`memlens`: 32K/64K/128K/256K) | Information extraction, multi-session and temporal reasoning, knowledge updates, and refusal over dated conversations; use for scaling context length | `accuracy`; judge `qwen3-235b-judge` | Pinned Hugging Face JSON and 195-question subset; automatic; published captions need no runtime media |
+| LongMemEval (`longmemeval-s`) | User, assistant, and preference recall plus multi-session reasoning, updates, abstention, and exact turn-level retrieval; use for established long-term dialogue behaviors | `accuracy`; judge `gpt-4o-2024-08-06` | Pinned Hugging Face JSON; automatic |
+| BEAM (`beam`: 100K/500K/1M/10M) | Very-long dialogue with contradiction resolution, ordering, extraction, updates, summarization, and temporal reasoning; use for length scaling | `llm_judge_score`; judge `gpt-4.1-mini` | Pinned GitHub tier directories; automatic |
+| PersonaMem-v3 (`personamem-v3`) | Causally masked cross-app personalization, preference shifts, sycophancy, privacy, hallucination, and candidate ranking; use for personal-agent behavior | `personamem_score`; judged families use `gpt-5.5`, ranking rows are deterministic | Pinned Hugging Face backend JSON; automatic; scorer-only `profile.json` is excluded |
+| CL-Bench (`clbench`) | Learning a long reference document and following open-ended instructions; use for task-local context learning, not gold-source retrieval | `solving_rate`; judge `gpt-5.1` | Pinned Hugging Face JSONL; automatic |
+
+### Multimodal personal memory
+
+| Benchmark and selector | What it measures and when to use it | Primary result and scoring requirement | Data requirement |
+| --- | --- | --- | --- |
+| ATM-Bench (`atm-bench`: main/hard, raw/SGM) | Email, image, and video memory; needle-in-a-haystack, number/list, open-ended answers, and exact evidence-ID retrieval; use for personal archives | `accuracy`; `open_end` uses judge `gpt-5-mini`, number/list rows are deterministic | Pinned Hugging Face QA, email, media, and SGM artifacts; automatic; SGM variants use processed text instead of runtime media |
+| Mem-Gallery (`mem-gallery`) | Multi-session persona dialogue, image-grounded QA, temporal/knowledge/recall points, and exact clue-round retrieval; use for conversational image memory | `f1`; deterministic; optional official `llm_judge` uses `qwen2.5-72b-instruct` | Pinned Hugging Face dialogue JSON and images; automatic |
+
+### Embodied, video, and spatial memory
+
+| Benchmark and selector | What it measures and when to use it | Primary result and scoring requirement | Data requirement |
+| --- | --- | --- | --- |
+| EgoLifeQA (`egolifeqa`) | Multi-day causal video/audio memory, names, last occurrences, and temporal questions; use for wearable lifelogs | `accuracy`; deterministic choice scorer | Pinned Hugging Face annotations and EgoLife media; automatic |
+| EgoMemReason (`egomemreason`) | Multi-day egocentric reasoning with 4--10 choices; use to generate an official-server submission because public labels are withheld | `submission`; no local judge | Pinned Hugging Face annotations and EgoLife media; automatic |
+| EgoTempo (`egotempo`) | Open-ended temporal QA over Ego4D clips; use for temporal grounding rather than multi-session retrieval | `accuracy`; judge `gemini-1.5-flash` | Pinned GitHub annotations; media needs Ego4D authorization and AWS credentials |
+| MM-Lifelong (`mm-lifelong`: day/week/month) | Day-to-month video memory, multi-interval clues, temporal localization, and open-ended answers; use for duration scaling | `answer_accuracy`; judge `gpt-5` | Pinned Hugging Face annotations and split media; automatic |
+| SuperMemory-VQA (`supermemory-vqa`) | Causal multi-video memory, skill breakdowns, answerability, and unanswerable cases; use for lifelong video QA | `qa_accuracy`; deterministic choice scorer | Pinned Hugging Face annotations, transcripts, and video; automatic |
+| M3-Bench (`m3-bench`: robot/web) | Causal long-video memory and open-ended QA; use for robot and web-video histories | `accuracy`; judge `gpt-4o-2024-11-20` | Pinned GitHub annotations; robot media from Hugging Face, web media through `yt-dlp` |
+| Video-MME (`video-mme`) | Short, medium, and long cross-domain video understanding; use as a video-generation baseline, not as evidence of long-term memory alone | `accuracy`; deterministic choice scorer | Pinned Hugging Face Parquet and ZIP media; automatic |
+| Video-MME-v2 (`video-mme-v2`) | Four-question relevance/logic groups with level and reasoning-head breakdowns; use when grouped consistency matters | `rating` (0--100); deterministic grouped scorer | Pinned Hugging Face Parquet and media volumes; automatic |
+| OpenEQA (`openeqa`: HM3D/ScanNet) | Open-ended EM-EQA over fixed scene histories: spatial, recognition, localization, and world knowledge; use for spatial episodic memory | `llm_match`; judge `gpt-4-1106-preview` | Pinned GitHub questions; operator supplies extracted HM3D or licensed ScanNet frames |
+
+### Local storage and retrieval microbenchmark
+
+`uv run --frozen mindbridge-bench local-index` writes synthetic vectors directly to SQLite and
+Zvec. It needs no dataset, generation model, or judge and reports exact-search recall, ingestion,
+optimization and query latency, throughput, and disk use. It is the sole direct-adapter exception;
+its result supports local-index claims only, not end-to-end memory, embedding, or answer quality.
+
+### Result boundaries
+
+One `eval` result mixes upstream scores with MindBridge-specific diagnostics. Interpret each field
+at its declared boundary:
+
+| Boundary | What it covers | What the result can establish |
+| --- | --- | --- |
+| Upstream protocol | A catalog task's pinned release, adapter, scorer, and required judge | Only a metric marked `official_metric: true` is an upstream-protocol result |
+| MindBridge behavior | Public-SDK ingest, retrieval, answering, baseline arms, failures, latency, resources, and retrieval diagnostics | Product behavior under the recorded composition; custom diagnostics are not official metrics |
+| Dataset and adapter | Download, schema normalization, digest verification, causal cutoffs, and unit/question counts | Input readiness and identity, not memory quality |
+
+`mindbridge-bench locomo-refined` is an artifact utility, not another benchmark category: it emits
+raw LoCoMo-Refined predictions for an external evaluator and does not produce an integrated score.
+Likewise, `--list-tasks` and `--check-integrity` discover and validate inputs; they do not measure
+memory quality.
+
+Coverage is deliberately asymmetric:
+
+- **Single-hop and multi-hop:** LongMemEval declares single-session and multi-session types;
+  MemLens and BEAM declare multi-session reasoning. Other datasets may need several memories, but
+  the catalog does not relabel them as multi-hop without an upstream type.
+- **Time, updates, and conflicts:** LongMemEval, MemLens, and BEAM expose temporal or knowledge
+  update types; BEAM also exposes contradiction resolution. PersonaMem-v3 adds causal preference
+  shifts and sycophancy behavior. LoCoMo-Refined explicitly removed LoCoMo's adversarial category
+  5, so it must not be cited as adversarial coverage.
+- **Retrieval versus generation:** every dataset row measures generated answers. Exact
+  MindBridge source-ID recall is available only for LoCoMo-Refined, LongMemEval, ATM-Bench, and
+  Mem-Gallery. PersonaMem-v3's official candidate-ranking metrics rank answer slates and are not
+  source-ID recall for the MindBridge retriever.
+- **Open-ended versus open-domain:** open-ended scoring appears in many rows, while explicit
+  cross-domain or world-knowledge breakdowns come from Video-MME and OpenEQA. Do not infer
+  open-domain coverage from free-form answer format alone.
 
 EgoMemReason's public release has no answer key. A complete valid run writes an upload-ready
 `egomemreason_submission.json`; partial runs remain development artifacts. Video-MME-v2's grouped
@@ -282,8 +354,8 @@ EgoMemReason's public release has no answer key. A complete valid run writes an 
 
 Protocol boundaries that affect interpretation are explicit rather than approximated:
 
-- `longmemeval-s`, `clbench`, `beam`, and `personamem-v3` are text-only and need no media
-  preparation.
+- `locomo-refined`, `memlens`, `longmemeval-s`, `clbench`, `beam`, and `personamem-v3` need no
+  runtime media preparation; LoCoMo-Refined and MemLens ingest the releases' published captions.
 - CL-Bench has no separate question field. The adapter splits the final user turn at its last
   blank-line paragraph break and marks oversized residual questions with `question_unsliced`.
 - BEAM reports its per-rubric `llm_judge_score`. The `event_ordering` composite is absent because
@@ -372,12 +444,15 @@ Four choices decide whether a number here is comparable with the leaderboard:
   that period is not already its final character, and a mark outside 1-5 is clipped instead of
   rejected.
 
-## Text-only memory benchmarks
+## Benchmarks without runtime media preparation
 
-Four tasks read no media, so they need neither `ffmpeg` nor a preparation pass:
+Six benchmark families read text, structured annotations, or published captions without opening
+runtime media, so they need neither `ffmpeg` nor a preparation pass:
 
 | Task | Unit | Corpus | Official headline |
 | --- | --- | --- | --- |
+| `locomo-refined` | one conversation | multi-session dialogue plus published image captions | `llm_judge`, the official correctness judge |
+| `memlens-32k` … `memlens-256k` | one question | dated conversation sessions plus published image captions | `accuracy`, the official question-type judge |
 | `longmemeval-s` | one question | its own 50-session haystack | `accuracy`, the yes/no answer-check judge |
 | `clbench` | one task | the reference document behind its question | `solving_rate`, the binary rubric judge |
 | `beam-100k` … `beam-10m` | one conversation | the whole transcript | `llm_judge_score`, mean over rubric items |

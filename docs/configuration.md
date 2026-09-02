@@ -25,8 +25,8 @@ model runtimes and transports:
 | `server` | FastAPI and Uvicorn REST serving |
 | `mcp` | MCP server transport |
 | `observability` | OpenTelemetry SDK export support |
-| `benchmarks` | Benchmark datasets, scorers, and telemetry |
-| `all` | Every optional surface |
+| `benchmarks` | Benchmark download, parsing, scoring, and telemetry dependencies; datasets are downloaded separately |
+| `all` | The exact union of every optional surface |
 
 For example:
 
