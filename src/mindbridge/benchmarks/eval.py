@@ -23,10 +23,12 @@ from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile, gettempdir
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast, overload
 
+import yaml
 from opentelemetry import trace
 from opentelemetry.trace import Tracer
+from pydantic import SecretStr
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
@@ -87,7 +89,12 @@ from mindbridge.benchmarks.eval_telemetry import (
     ResourceSampler,
 )
 from mindbridge.benchmarks.isolation import BenchmarkRun
-from mindbridge.benchmarks.model_config import DEFAULT_TIMEOUT_SECONDS, ModelConfig
+from mindbridge.benchmarks.model_config import (
+    DEFAULT_TIMEOUT_SECONDS,
+    DownloadSettings,
+    HarnessOverrides,
+    ModelConfig,
+)
 from mindbridge.benchmarks.official_scorers import (
     SCORER_VERSION,
     JudgeMessage,
@@ -108,7 +115,6 @@ from mindbridge.benchmarks.official_scorers import (
 )
 from mindbridge.benchmarks.prepare_media import _has_audio, prepare_task_media
 from mindbridge.benchmarks.task_catalog import (
-    DEFAULT_BENCHMARKS_ROOT,
     TASKS,
     expand,
     listing,
@@ -641,12 +647,17 @@ class _BackendPool:
         self._tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
         if memory_config is not None:
             if memory_config.generation is not None:
+                # The harness owns both of these for a run: `--model-args` and the environment
+                # name the modalities, and the video floor belongs to the corpus rather than to
+                # the endpoint. Injecting them here is what makes the configured path honour
+                # them -- the resolved backends are built from this document, so a floor left
+                # only on `ModelConfig` would be reported in the result artifact while short
+                # videos still went to the endpoint whole.
+                update: dict[str, object] = {"modalities": config.generation_capabilities}
+                if config.generation_min_video_seconds is not None:
+                    update["min_video_seconds"] = config.generation_min_video_seconds
                 memory_config = memory_config.model_copy(
-                    update={
-                        "generation": memory_config.generation.model_copy(
-                            update={"modalities": config.generation_capabilities}
-                        )
-                    }
+                    update={"generation": memory_config.generation.model_copy(update=update)}
                 )
             resolved = resolve_memory_config(memory_config)
             self._resolved_config = resolved
@@ -797,11 +808,26 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
     """Parse one reproducible evaluation sweep and write its artifacts."""
     parser = _build_parser(prog)
     parsed = parser.parse_args(argv)
+    # The configuration file can name the corpus root, so it is read before the listing and
+    # before argument resolution derives the default output directory from that root.
+    config_path = (
+        None if parsed.memory_config is None else parsed.memory_config.expanduser().resolve()
+    )
+    try:
+        memory_config, overrides = _load_memory_config(config_path)
+    except ValueError as error:
+        parser.error(str(error))
+    download = DownloadSettings.resolve(
+        overrides.download,
+        benchmarks_root=parsed.benchmarks_root,
+        data_root=parsed.data_root,
+    )
+    download.apply_environment()
     list_mode = _list_mode(parsed)
     if list_mode is not None:
-        print(listing(parsed.benchmarks_root.expanduser().resolve(), list_mode))
+        print(listing(download.benchmarks_root, list_mode))
         return 0
-    arguments = _arguments(parser, parsed)
+    arguments = _arguments(parser, parsed, download, overrides=overrides)
     if parsed.check_integrity:
         manifest, manifest_directory = load_media_manifest(arguments.media_manifest)
         loaded = _load_tasks(arguments, manifest, manifest_directory)
@@ -826,13 +852,13 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         )
         return 0
     try:
-        memory_config = _load_memory_config(arguments.memory_config)
         base_config = _model_config(
             arguments.model,
             arguments.model_args,
             memory_config=memory_config,
+            overrides=overrides,
         )
-        judge_config = _judge_config(base_config, arguments)
+        judge_config = _judge_config(base_config, arguments, overrides=overrides)
     except ValueError as error:
         parser.error(str(error))
     _require_output(arguments.output_path, overwrite=arguments.overwrite)
@@ -3698,7 +3724,7 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     parser.add_argument("--model", default="mindbridge", help="evaluation adapter")
     parser.add_argument(
         "--arms",
-        default=DEFAULT_ARM,
+        default=None,
         help=(
             "comma-separated evaluation arms: mindbridge (the product), blind (no evidence), "
             "full-context (corpus stuffed into the prompt), random (shuffled candidates, "
@@ -3708,7 +3734,7 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--full-context-chars",
         type=_positive_int,
-        default=DEFAULT_FULL_CONTEXT_CHARS,
+        default=None,
         help="character budget the full-context arm stuffs into one prompt",
     )
     parser.add_argument(
@@ -3725,7 +3751,10 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         "--memory-config",
         dest="memory_config",
         type=Path,
-        help="JSON MindBridgeConfig; data_dir is replaced by isolated benchmark directories",
+        help=(
+            "YAML MindBridgeConfig plus an optional benchmark section; absent sections take "
+            "defaults and data_dir is replaced by isolated benchmark directories"
+        ),
     )
     parser.add_argument(
         "--judge-model-args",
@@ -3735,21 +3764,23 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     )
     parser.add_argument("--tasks", help="comma-separated task names or groups")
     parser.add_argument("--list-tasks", action="store_true", help="list task pins and readiness")
-    parser.add_argument("--benchmarks-root", type=Path, default=DEFAULT_BENCHMARKS_ROOT)
-    parser.add_argument("--data-root", type=Path, default=Path(".benchmarks/data"))
+    # Defaults are resolved after the configuration file is read, so an unset flag must stay
+    # distinguishable from one the caller typed.
+    parser.add_argument("--benchmarks-root", type=Path, default=None)
+    parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--output-path", "--output_path", type=Path)
     parser.add_argument("--run-id", type=_run_identifier)
     parser.add_argument(
         "--task-data",
         action="append",
-        default=[],
+        default=None,
         metavar="TASK=PATH",
         help="override one task's annotation path; repeatable",
     )
     parser.add_argument(
         "--media-root",
         action="append",
-        default=[],
+        default=None,
         metavar="TASK=PATH",
         help="override one task's media root; repeatable",
     )
@@ -3757,31 +3788,29 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--limit",
         type=_limit_value,
-        help="-1/all, a 0-1 fraction, or an absolute example count",
+        help="all (or -1), a 0-1 fraction, or an absolute example count",
     )
-    parser.add_argument("--offset", type=_nonnegative_int, default=0)
-    parser.add_argument("--num-fewshot", "--num_fewshot", type=_nonnegative_int, default=0)
+    parser.add_argument("--offset", type=_nonnegative_int, default=None)
+    parser.add_argument("--num-fewshot", "--num_fewshot", type=_nonnegative_int, default=None)
     parser.add_argument(
         "--gen-kwargs",
         "--gen_kwargs",
         default="",
         help="deterministic generation settings; supports max_tokens and enable_thinking",
     )
-    parser.add_argument("--batch-size", "--batch_size", "-b", default="auto")
-    parser.add_argument("--max-batch-size", "--max_batch_size", type=_positive_int, default=64)
-    parser.add_argument("--unit-concurrency", type=_positive_int, default=1)
-    parser.add_argument("--request-concurrency", type=_positive_int, default=4)
-    parser.add_argument("--judge-concurrency", type=_positive_int, default=8)
-    parser.add_argument("--recall-limit", type=_positive_int, default=20)
-    parser.add_argument("--seed", type=_seed_values, default=(0, 1234, 1234, 1234))
-    parser.add_argument(
-        "--bootstrap-samples", type=_positive_int, default=DEFAULT_BOOTSTRAP_SAMPLES
-    )
+    parser.add_argument("--batch-size", "--batch_size", "-b", default=None)
+    parser.add_argument("--max-batch-size", "--max_batch_size", type=_positive_int, default=None)
+    parser.add_argument("--unit-concurrency", type=_positive_int, default=None)
+    parser.add_argument("--request-concurrency", type=_positive_int, default=None)
+    parser.add_argument("--judge-concurrency", type=_positive_int, default=None)
+    parser.add_argument("--recall-limit", type=_positive_int, default=None)
+    parser.add_argument("--seed", type=_seed_values, default=None)
+    parser.add_argument("--bootstrap-samples", type=_positive_int, default=None)
     parser.add_argument("--device", help="local embedding/FunASR device: cpu, cuda, or cuda:N")
     parser.add_argument(
         "--device-lock",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="serialize local model pools that share one CUDA device",
     )
     parser.add_argument(
@@ -3806,31 +3835,33 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         type=Path,
         help="results.json from a --blind run of the same evaluation inputs",
     )
-    parser.add_argument("--fail-on-regression", action="store_true")
-    parser.add_argument("--regression-threshold", type=_nonnegative_float, default=0.0)
-    parser.add_argument("--predict-only", "--predict_only", "-x", action="store_true")
-    parser.add_argument("--log-samples", "--log_samples", action="store_true")
-    parser.add_argument("--allow-unverified-data", action="store_true")
+    parser.add_argument("--fail-on-regression", action="store_true", default=None)
+    parser.add_argument("--regression-threshold", type=_nonnegative_float, default=None)
+    parser.add_argument("--predict-only", "--predict_only", "-x", action="store_true", default=None)
+    parser.add_argument("--log-samples", "--log_samples", action="store_true", default=None)
+    parser.add_argument("--allow-unverified-data", action="store_true", default=None)
     parser.add_argument(
         "--download",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="download missing pinned annotations and selected media",
     )
-    parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--overwrite", action="store_true", default=None)
+    parser.add_argument("--quiet", action="store_true", default=None)
     parser.add_argument(
         "--verbosity",
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
-        default="INFO",
+        default=None,
     )
     parser.add_argument("--check-integrity", "--check_integrity", action="store_true")
     return parser
 
 
-def _selected_arms(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> tuple[str, ...]:
+def _selected_arms(
+    parser: argparse.ArgumentParser, parsed: argparse.Namespace, declared: str
+) -> tuple[str, ...]:
     """Resolve which arms this run answers, coupling `--blind` to the arm that has no evidence."""
-    arms = tuple(dict.fromkeys(part.strip() for part in parsed.arms.split(",") if part.strip()))
+    arms = tuple(dict.fromkeys(part.strip() for part in declared.split(",") if part.strip()))
     if not arms:
         parser.error("--arms must name at least one arm")
     unknown = tuple(name for name in arms if name not in ARMS)
@@ -3842,108 +3873,261 @@ def _selected_arms(parser: argparse.ArgumentParser, parsed: argparse.Namespace) 
     # response-cache namespace, so it has to select the arm that actually answers without
     # evidence. Leaving the product arm running under that label is how a memory-backed run gets
     # published as its own baseline.
-    if parsed.arms != DEFAULT_ARM and arms != ("blind",):
+    if declared != DEFAULT_ARM and arms != ("blind",):
         parser.error("--blind runs the blind arm alone; drop --arms or pass --arms blind")
     return ("blind",)
 
 
-def _arguments(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> _Arguments:
+def _arguments(
+    parser: argparse.ArgumentParser,
+    parsed: argparse.Namespace,
+    download: DownloadSettings | None = None,
+    overrides: HarnessOverrides | None = None,
+) -> _Arguments:
     if parsed.model != "mindbridge":
         parser.error("--model must be mindbridge")
-    arms = _selected_arms(parser, parsed)
-    if not parsed.tasks:
+    run = (HarnessOverrides() if overrides is None else overrides).run
+    arms = _selected_arms(parser, parsed, _picked(parsed.arms, run.arms, DEFAULT_ARM))
+    tasks_value = parsed.tasks or run.tasks
+    if not tasks_value:
         parser.error("--tasks is required unless --list-tasks is used")
-    if parsed.fail_on_regression and parsed.compare is None:
+    # A flag beats the file; the file beats the built-in default. Every constant below is the
+    # default the flag used to carry, moved here so that "unset" stays distinguishable.
+    offset = _picked(parsed.offset, run.offset, 0)
+    num_fewshot = _picked(parsed.num_fewshot, run.num_fewshot, 0)
+    batch_size = _picked(parsed.batch_size, run.batch_size, "auto")
+    max_batch_size = _picked(parsed.max_batch_size, run.max_batch_size, 64)
+    unit_concurrency = _picked(parsed.unit_concurrency, run.unit_concurrency, 1)
+    request_concurrency = _picked(parsed.request_concurrency, run.request_concurrency, 4)
+    judge_concurrency = _picked(parsed.judge_concurrency, run.judge_concurrency, 8)
+    recall_limit = _picked(parsed.recall_limit, run.recall_limit, 20)
+    full_context_chars = _picked(
+        parsed.full_context_chars, run.full_context_chars, DEFAULT_FULL_CONTEXT_CHARS
+    )
+    bootstrap_samples = _picked(
+        parsed.bootstrap_samples, run.bootstrap_samples, DEFAULT_BOOTSTRAP_SAMPLES
+    )
+    device = _picked(parsed.device, run.device, None)
+    device_lock = _picked(parsed.device_lock, run.device_lock, True)
+    use_cache = _picked(parsed.use_cache, run.use_cache, None)
+    compare = _picked(parsed.compare, run.compare, None)
+    fail_on_regression = _picked(parsed.fail_on_regression, run.fail_on_regression, False)
+    regression_threshold = _picked(parsed.regression_threshold, run.regression_threshold, 0.0)
+    predict_only = _picked(parsed.predict_only, run.predict_only, False)
+    log_samples = _picked(parsed.log_samples, run.log_samples, False)
+    allow_unverified = _picked(parsed.allow_unverified_data, run.allow_unverified_data, False)
+    download_inputs = _picked(parsed.download, run.download, True)
+    overwrite = _picked(parsed.overwrite, run.overwrite, False)
+    quiet = _picked(parsed.quiet, run.quiet, False)
+    verbosity = _picked(parsed.verbosity, run.verbosity, "INFO")
+    media_manifest = _picked(parsed.media_manifest, run.media_manifest, None)
+    if fail_on_regression and compare is None:
         parser.error("--fail-on-regression requires --compare")
-    if parsed.recall_limit > 100:
+    if recall_limit > 100:
         parser.error("--recall-limit must not exceed 100")
-    if parsed.num_fewshot:
+    if num_fewshot:
         parser.error("the supported memory benchmarks are zero-shot; --num_fewshot must be 0")
-    requested = tuple(part.strip() for part in parsed.tasks.split(",") if part.strip())
+    requested = tuple(part.strip() for part in tasks_value.split(",") if part.strip())
+    # `--seed` and `--limit` are argparse `type=` callables, which signal a bad value with
+    # `ArgumentTypeError`; that is not a `ValueError`, so a configured value has to be caught here
+    # explicitly or it escapes as an unhandled exception instead of a usage message.
     try:
+        seeds = _resolved_seeds(parsed.seed, run.seed)
+        limit = _resolved_limit(parsed.limit, run.limit)
+        declared_run_id = None if run.run_id is None else _run_identifier(run.run_id)
         tasks = expand(requested)
-        dataset_overrides = _assignments(parsed.task_data, tasks)
-        media_overrides = _assignments(parsed.media_root, tasks)
-        _parse_batch_size(parsed.batch_size)
-        gen_kwargs = _generation_kwargs(parsed.gen_kwargs, parsed.seed[0])
-    except ValueError as error:
+        dataset_overrides = _assignments(_overridden_paths(parsed.task_data, run.task_data), tasks)
+        media_overrides = _assignments(_overridden_paths(parsed.media_root, run.media_root), tasks)
+        _parse_batch_size(batch_size)
+        gen_kwargs = _generation_kwargs(parsed.gen_kwargs, seeds[0])
+    except (ValueError, argparse.ArgumentTypeError) as error:
         parser.error(str(error))
-    run_id = parsed.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    output = parsed.output_path or parsed.benchmarks_root / "results" / run_id
+    settings = (
+        DownloadSettings.resolve(benchmarks_root=parsed.benchmarks_root, data_root=parsed.data_root)
+        if download is None
+        else download
+    )
+    run_id = (
+        parsed.run_id or declared_run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    )
+    output = parsed.output_path or run.output_path or settings.benchmarks_root / "results" / run_id
     return _Arguments(
         tasks=tasks,
-        benchmarks_root=parsed.benchmarks_root.expanduser().resolve(),
-        data_root=parsed.data_root.expanduser().resolve(),
+        benchmarks_root=settings.benchmarks_root.expanduser().resolve(),
+        data_root=settings.data_root.expanduser().resolve(),
         output_path=output.expanduser().resolve(),
         run_id=run_id,
         dataset_overrides=dataset_overrides,
         media_overrides=media_overrides,
-        media_manifest=(
-            None if parsed.media_manifest is None else parsed.media_manifest.expanduser().resolve()
-        ),
-        limit=parsed.limit,
-        offset=parsed.offset,
-        batch_size=parsed.batch_size,
-        max_batch_size=parsed.max_batch_size,
-        unit_concurrency=parsed.unit_concurrency,
-        request_concurrency=parsed.request_concurrency,
-        recall_limit=parsed.recall_limit,
-        seed=parsed.seed[0],
-        seeds=parsed.seed,
-        bootstrap_samples=parsed.bootstrap_samples,
+        media_manifest=(None if media_manifest is None else media_manifest.expanduser().resolve()),
+        limit=limit,
+        offset=offset,
+        batch_size=batch_size,
+        max_batch_size=max_batch_size,
+        unit_concurrency=unit_concurrency,
+        request_concurrency=request_concurrency,
+        recall_limit=recall_limit,
+        seed=seeds[0],
+        seeds=seeds,
+        bootstrap_samples=bootstrap_samples,
         model=parsed.model,
         arms=arms,
-        full_context_chars=parsed.full_context_chars,
+        full_context_chars=full_context_chars,
         model_args=parsed.model_args,
         memory_config=(
             None if parsed.memory_config is None else parsed.memory_config.expanduser().resolve()
         ),
         judge_model_args=parsed.judge_model_args,
-        judge_concurrency=parsed.judge_concurrency,
+        judge_concurrency=judge_concurrency,
         gen_kwargs=gen_kwargs,
-        num_fewshot=parsed.num_fewshot,
-        use_cache=(None if parsed.use_cache is None else parsed.use_cache.expanduser().resolve()),
-        device=parsed.device,
-        device_lock=parsed.device_lock,
-        compare=parsed.compare,
+        num_fewshot=num_fewshot,
+        use_cache=(None if use_cache is None else use_cache.expanduser().resolve()),
+        device=device,
+        device_lock=device_lock,
+        compare=compare,
         blind=parsed.blind,
         blind_baseline=(
             None if parsed.blind_baseline is None else parsed.blind_baseline.expanduser().resolve()
         ),
-        fail_on_regression=parsed.fail_on_regression,
-        regression_threshold=parsed.regression_threshold,
-        predict_only=parsed.predict_only,
-        log_samples=parsed.log_samples,
-        allow_unverified_data=parsed.allow_unverified_data,
-        download=parsed.download,
-        overwrite=parsed.overwrite,
-        quiet=parsed.quiet or parsed.verbosity in {"ERROR", "CRITICAL"},
+        fail_on_regression=fail_on_regression,
+        regression_threshold=regression_threshold,
+        predict_only=predict_only,
+        log_samples=log_samples,
+        allow_unverified_data=allow_unverified,
+        download=download_inputs,
+        overwrite=overwrite,
+        quiet=quiet or verbosity in {"ERROR", "CRITICAL"},
     )
 
 
-def _load_memory_config(path: Path | None) -> MindBridgeConfig | None:
-    if path is None:
-        return None
+# What a configuration file that names no provider gets. These mirror the backends the harness
+# builds when `--config` is omitted entirely, so adding a file to set one unrelated knob does not
+# silently change which models run. Naming a section overrides the default for that section only.
+DEFAULT_CONFIG_SECTIONS: Mapping[str, Mapping[str, object]] = {
+    "embedding": {"provider": "jina-omni"},
+    "generation": {"provider": "openai"},
+}
+
+
+def _read_config_document(path: Path) -> Mapping[str, object]:
+    """Parse one harness configuration file, reporting where invalid YAML went wrong."""
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
     except OSError as error:
         raise ValueError(f"cannot read benchmark config {path}: {error}") from None
-    except json.JSONDecodeError as error:
-        raise ValueError(
-            f"benchmark config {path} is invalid JSON at line {error.lineno}, column {error.colno}"
-        ) from None
-    config = MindBridgeConfig.model_validate(value)
-    if config.generation is None:
-        raise ValueError("benchmark --config requires config.generation")
+    except yaml.YAMLError as error:
+        mark = getattr(error, "problem_mark", None)
+        location = "" if mark is None else f" at line {mark.line + 1}, column {mark.column + 1}"
+        raise ValueError(f"benchmark config {path} is invalid YAML{location}") from None
+    if document is None:
+        return {}
+    if not isinstance(document, Mapping):
+        raise ValueError(f"benchmark config {path} must be a mapping")
+    return document
+
+
+_Picked = TypeVar("_Picked")
+
+
+@overload
+def _picked(flag: _Picked | None, declared: _Picked | None, default: None) -> _Picked | None: ...
+
+
+@overload
+def _picked(flag: _Picked | None, declared: _Picked | None, default: _Picked) -> _Picked: ...
+
+
+def _picked(
+    flag: _Picked | None, declared: _Picked | None, default: _Picked | None
+) -> _Picked | None:
+    """Return the first supplied value: command line, then configuration file, then default."""
+    if flag is not None:
+        return flag
+    if declared is not None:
+        return declared
+    return default
+
+
+def _resolved_seeds(
+    flag: tuple[int, int, int, int] | None, declared: int | Sequence[int] | None
+) -> tuple[int, int, int, int]:
+    """Expand a configured seed the way `--seed` expands one: 1 or 3 values fill out to 4."""
+    if flag is not None:
+        return flag
+    if declared is None:
+        return (0, 1234, 1234, 1234)
+    values = (declared,) if isinstance(declared, int) else tuple(declared)
+    return _seed_values(",".join(str(value) for value in values))
+
+
+def _resolved_limit(
+    flag: int | float | None, declared: int | float | str | None
+) -> int | float | None:
+    """Accept the configured limit in the spellings the flag accepts, `all` included."""
+    if flag is not None:
+        return flag
+    if declared is None:
+        return None
+    return _limit_value(declared if isinstance(declared, str) else repr(declared))
+
+
+def _overridden_paths(
+    flag: Sequence[str] | None, declared: Mapping[str, Path] | None
+) -> tuple[str, ...]:
+    """Render both spellings of a per-task path override into the one `TASK=PATH` form."""
+    if flag:
+        return tuple(flag)
+    if not declared:
+        return ()
+    return tuple(f"{task}={path}" for task, path in declared.items())
+
+
+def _load_memory_config(
+    path: Path | None,
+) -> tuple[MindBridgeConfig | None, HarnessOverrides]:
+    """Load one harness configuration file into its product and harness halves.
+
+    The file is YAML, which parses the JSON files this flag used to take without a second code
+    path. The `benchmark:` mapping is the harness's own: credentials, judging, and corpus
+    acquisition have no field in `MindBridgeConfig` and must not gain one, because that schema is
+    a public contract and its credentials are deliberately kept off disk.
+    """
+    if path is None:
+        return None, HarnessOverrides()
+    values = dict(_read_config_document(path))
+    section = values.pop("benchmark", None)
+    if section is None:
+        section = {}
+    if not isinstance(section, Mapping):
+        raise ValueError(f"benchmark config {path} benchmark section must be a mapping")
+    overrides = HarnessOverrides.model_validate(section)
+    for name, default in DEFAULT_CONFIG_SECTIONS.items():
+        if values.get(name) is None:
+            values[name] = dict(default)
+    config = MindBridgeConfig.model_validate(values)
+    generation = config.generation
+    if generation is None:
+        raise ValueError("benchmark config generation cannot be null")
     conflicts = sorted(
-        {"max_tokens", "seed", "temperature"}.intersection(config.generation.extra_body or {})
+        {"max_tokens", "seed", "temperature"}.intersection(generation.extra_body or {})
     )
     if conflicts:
         raise ValueError(
             "benchmark config generation.extra_body cannot set benchmark controls: "
             + ", ".join(conflicts)
         )
-    return config
+    # A reproducible sweep pins sampling: the harness always sends temperature 0 and the seed
+    # `--seed` names. Declaring either here used to be accepted and then silently discarded, so
+    # the file said one thing and the run did another; say so instead.
+    pinned = sorted(name for name in ("temperature", "seed") if name in generation.model_fields_set)
+    if pinned:
+        raise ValueError(
+            "benchmark config generation cannot set "
+            + ", ".join(pinned)
+            + ": reproducible evaluation pins temperature to 0 and takes the seed from --seed "
+            "or benchmark.run.seed"
+        )
+    return config, overrides
 
 
 def _model_config(
@@ -3951,18 +4135,38 @@ def _model_config(
     arguments: str,
     *,
     memory_config: MindBridgeConfig | None = None,
+    overrides: HarnessOverrides | None = None,
 ) -> ModelConfig:
     if model != "mindbridge":
         raise ValueError("model must be mindbridge")
     config = ModelConfig.from_environment()
     if memory_config is not None and memory_config.generation is not None:
         generation = memory_config.generation
+        # `model` and `modalities` carry non-`None` schema defaults, so an absent value cannot be
+        # told apart from an explicit one by truthiness the way `base_url`/`timeout` can. Checking
+        # `model_fields_set` is what lets an env-only MINDBRIDGE_GENERATION_MODEL or
+        # MINDBRIDGE_GENERATION_MODALITIES survive a file that does not mention the field at all.
+        declared = generation.model_fields_set
         config = replace(
             config,
             generation_base_url=generation.base_url or config.generation_base_url,
-            generation_model=generation.model,
-            generation_capabilities=generation.modalities,
+            generation_api_key=(
+                config.generation_api_key
+                if generation.api_key is None
+                else generation.api_key.get_secret_value()
+            ),
+            generation_model=(generation.model if "model" in declared else config.generation_model),
+            generation_capabilities=(
+                generation.modalities
+                if "modalities" in declared
+                else config.generation_capabilities
+            ),
             timeout_seconds=generation.timeout or config.timeout_seconds,
+            generation_min_video_seconds=(
+                config.generation_min_video_seconds
+                if generation.min_video_seconds is None
+                else generation.min_video_seconds
+            ),
         )
     allowed = {
         "base_url",
@@ -3981,13 +4185,29 @@ def _model_config(
     return config
 
 
-def _judge_config(config: ModelConfig, arguments: _Arguments) -> _JudgeConfig:
+def _judge_config(
+    config: ModelConfig,
+    arguments: _Arguments,
+    *,
+    overrides: HarnessOverrides | None = None,
+) -> _JudgeConfig:
+    # The configuration file wins over the environment; either wins over falling back to the
+    # generation endpoint, which is what an unset judge has always meant.
+    declared = HarnessOverrides().judge if overrides is None else overrides.judge
     judge = _JudgeConfig(
-        model=os.getenv("MINDBRIDGE_JUDGE_MODEL", config.generation_model),
-        base_url=os.getenv("MINDBRIDGE_JUDGE_BASE_URL", config.generation_base_url),
-        api_key=os.getenv("MINDBRIDGE_JUDGE_API_KEY") or config.generation_api_key,
-        timeout_seconds=float(
-            os.getenv("MINDBRIDGE_JUDGE_TIMEOUT_SECONDS", str(config.timeout_seconds))
+        model=(declared.model or os.getenv("MINDBRIDGE_JUDGE_MODEL") or config.generation_model),
+        base_url=(
+            declared.base_url
+            or os.getenv("MINDBRIDGE_JUDGE_BASE_URL")
+            or config.generation_base_url
+        ),
+        api_key=(
+            declared.api_key or os.getenv("MINDBRIDGE_JUDGE_API_KEY") or config.generation_api_key
+        ),
+        timeout_seconds=(
+            declared.timeout_seconds
+            if declared.timeout_seconds is not None
+            else float(os.getenv("MINDBRIDGE_JUDGE_TIMEOUT_SECONDS", str(config.timeout_seconds)))
         ),
         concurrency=arguments.judge_concurrency,
     )
@@ -4046,7 +4266,7 @@ def _evaluation_memory_config(
     generation = config.generation
     if generation is None:
         return config
-    options = dict(item.split("=", 1) for item in arguments.gen_kwargs.split(","))
+    options = dict(item.split("=", 1) for item in arguments.gen_kwargs.split(",") if "=" in item)
     extra_body = None if generation.extra_body is None else dict(generation.extra_body)
     if "enable_thinking" in options:
         extra_body = {} if extra_body is None else extra_body
@@ -4057,6 +4277,13 @@ def _evaluation_memory_config(
     generation = generation.model_copy(
         update={
             "base_url": model.generation_base_url,
+            # `model` is the already-resolved credential (file, then MINDBRIDGE_GENERATION_API_KEY,
+            # then the SDK's own lookup): without repeating it here, an env-only credential is
+            # dropped the moment the file declares no `api_key`, since `model_copy(update=...)`
+            # only touches keys named in this dict and this field would otherwise stay `None`.
+            "api_key": (
+                None if model.generation_api_key is None else SecretStr(model.generation_api_key)
+            ),
             "model": model.generation_model,
             "timeout": model.timeout_seconds,
             "temperature": 0.0,
@@ -4320,10 +4547,16 @@ def _list_mode(parsed: argparse.Namespace) -> str | None:
 
 
 def _limit_value(value: str) -> int | float:
+    # `all` is the word the help text advertises and the word a reader reaches for; accepting only
+    # -1 made the documented spelling an error.
+    if value.strip().casefold() in {"all", "-1"}:
+        return -1
     try:
         parsed = float(value)
     except ValueError as error:
-        raise argparse.ArgumentTypeError("limit must be numeric") from error
+        raise argparse.ArgumentTypeError(
+            "limit must be `all`, -1, a positive fraction, or a count"
+        ) from error
     if not math.isfinite(parsed) or parsed == 0 or parsed < -1:
         raise argparse.ArgumentTypeError("limit must be -1, a positive fraction, or a count")
     if parsed < 0 and parsed != -1:

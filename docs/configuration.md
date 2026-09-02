@@ -65,30 +65,40 @@ with Memory.from_config(config) as memory:
 validate it before opening storage. Unknown fields, unknown providers, and out-of-range values are
 rejected rather than ignored or coerced.
 
-Bundled provider fields are:
+Bundled provider fields are, with "connection fields" meaning `base_url`, `api_key`, `timeout`,
+and `max_retries`:
 
 | Slot and provider | Required fields | Optional fields and defaults |
 | --- | --- | --- |
 | `embedding: jina-omni` | — | `dimension=1024`, `device=None`, `batch_size=32` |
 | `embedding: sentence-transformers` | `model`, `revision` | `dimension=None`, `device=None`, `batch_size=32` |
 | `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, `modalities=[text]` (at least one), `request_format=input`, plus connection fields |
-| `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `video_limit=8`, `extra_body=None`, plus connection fields |
+| `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `video_limit=8`, `min_video_seconds=None`, `extra_body=None`, plus connection fields |
 | `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
 | `speech: funasr` | — | `device=auto` |
 | `speech: openai` | — | `model=whisper-1`, `space=None`, plus connection fields |
 | `face: opencv` | `detector_model`, `recognizer_model` | `score_threshold=0.9`, `nms_threshold=0.3`, `top_k=5000`, `frame_interval_ms=1000`, `max_video_frames=300` |
 
-Every OpenAI slot accepts `base_url=None`, `timeout=None`, and `max_retries=None`. The official SDK
-then applies its own defaults and reads its standard credentials, including `OPENAI_API_KEY`.
-Declarative configuration intentionally has no credential field; an `api_key` entry is rejected.
-Inject a caller-owned SDK client when credentials must come from another source. Atomic generation
-modalities are `text`, `image`, `video`, and `audio`.
+Every OpenAI slot accepts `base_url=None`, `api_key=None`, `timeout=None`, and `max_retries=None`.
+The official SDK then applies its own defaults and, for an unset `api_key`, reads its standard
+credentials including `OPENAI_API_KEY`.
+
+Each slot builds its own client, so each takes its own `api_key`. That is what lets one
+composition point `embedding` at a local server and `generation` at a hosted one: a single
+environment variable cannot describe two endpoints with different credentials. The field is a
+Pydantic `SecretStr`, so the value is masked in `model_dump()`, in `repr()`, and therefore in
+anything that serialises a configuration -- but it is still a secret in a file. Prefer the SDK's
+environment lookup, or an injected caller-owned client, wherever the file would be committed or
+shared. Atomic generation modalities are `text`, `image`, `video`, and `audio`.
 
 Jina dimensions are `32`, `64`, `128`, `256`, `512`, or `1024`. Batch sizes and model token/video
 limits are positive; OpenAI timeouts are positive, retry counts are non-negative, temperature is
 from 0 through 2, and seed is from 0 through `2**63 - 1`. Face thresholds are from 0 through 1.
 `generation.video_limit` caps retrieved evidence videos in one answer request; question media has
-priority, and `None` disables that evidence-video count. `formation` has no `video_limit` because
+priority, and `None` disables that evidence-video count. `generation.min_video_seconds` answers a
+shorter video as four ordered stills instead, which is what an endpoint that rejects very short
+clips needs; it requires the model to accept images and is unset by default. `formation` has no
+`video_limit` or `min_video_seconds` because
 it shapes an answer rather than a formation proposal; the slot otherwise takes the same fields as
 `generation`, since the adapter derives its formation model and space from exactly those values.
 `generation` and `formation` are separate slots and separate clients: setting one never enables the
@@ -237,8 +247,8 @@ They are separate slots over separate clients, which is deliberate rather than i
   here: a capable remote answerer on the read path, a local former on the write path, or the
   reverse. Inject one caller-owned `OpenAI` client into `OpenAIModels` when a single pool matters
   more than declarative configuration.
-- `formation` accepts no `video_limit`: that field bounds retrieved evidence videos in an answer, and
-  a formation proposal is not an answer.
+- `formation` accepts no `video_limit` or `min_video_seconds`: both shape the media an answer
+  request carries, and a formation proposal is not an answer.
 
 ### Reachable is not default
 

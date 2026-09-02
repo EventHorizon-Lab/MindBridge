@@ -41,6 +41,7 @@ all = [
     "opentelemetry-sdk>=1.34,<2",
     "pillow>=10,<13",
     "pyarrow>=18,<26",
+    "pyyaml>=6,<7",
     "sentence-transformers[image,video]>=5.7,<6",
     "soundfile>=0.13,<1",
     "starlette>=0.46,<2",
@@ -55,6 +56,9 @@ benchmarks = [
     "nltk>=3.9,<4",
     "opentelemetry-sdk>=1.34,<2",
     "pyarrow>=18,<26",
+    # eval.py reads its harness configuration file as YAML, which also parses the JSON files the
+    # flag used to take.
+    "pyyaml>=6,<7",
 ]
 observability = [
     "opentelemetry-sdk>=1.34,<2",
@@ -116,6 +120,8 @@ dev = [
     # tests/test_package.py reads this file; tomllib is 3.11+. mypy also requires the
     # backport on 3.10, which is why the tests passed before anything declared it.
     "tomli>=2,<3; python_version < '3.11'",
+    # eval.py imports yaml; PyYAML ships no inline types, so the strict gate needs the stubs.
+    "types-PyYAML>=6,<7",
 ]
 
 [tool.hatch.build.targets.wheel]

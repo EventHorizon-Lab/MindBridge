@@ -37,6 +37,8 @@ owns the fact you need.
 - [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) — completed
   observations, speculative recall, and derived records.
 - [Benchmarking](benchmarking.md) — reproducible evaluation and local-index measurement.
+- [Annotated example configuration](examples/eval.example.yaml) — every configurable slot with
+  what it decides, and the order a run performs them in.
 - [Competitive memory-system review](competitive-memory-systems.md) — source audit of ABot,
   M3-Agent, VoiceMem, eMEM, MIRIX, Graphiti, Mem0, and TeleMem, plus the resulting gap roadmap.
 

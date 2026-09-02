@@ -12,6 +12,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SecretStr,
     StringConstraints,
 )
 from pydantic import (
@@ -64,6 +65,12 @@ class _ConfigModel(BaseModel):
 class _OpenAIConfig(_ConfigModel):
     provider: Literal["openai"]
     base_url: _Text | None = None
+    # Each OpenAI-compatible slot builds its own client, so each needs its own credential:
+    # without this field a composition pointing embedding at a local server and generation at a
+    # hosted one could only ever present the single key `OPENAI_API_KEY` names. `SecretStr` keeps
+    # the value out of `model_dump`, `repr`, and therefore out of anything that serialises a
+    # configuration. Leaving it unset falls back to the SDK's own environment lookup.
+    api_key: SecretStr | None = None
     timeout: _PositiveFloat | None = None
     max_retries: _NonNegativeInt | None = None
 
@@ -112,6 +119,12 @@ class _OpenAICompletionConfig(_OpenAIConfig):
 
 class OpenAIGenerationConfig(_OpenAICompletionConfig):
     video_limit: _PositiveInt | None = 8
+    # Below this duration a video is answered as four ordered stills instead. The option already
+    # existed on `OpenAIModels` and was unreachable from configuration, which left every caller
+    # that builds its models from a file -- the benchmark harness included -- unable to set the
+    # floor its endpoint needs. Answer-only, like `video_limit`, so it is not on the shared
+    # completion base that formation also reads.
+    min_video_seconds: _PositiveFloat | None = None
 
 
 class OpenAIFormationConfig(_OpenAICompletionConfig):
@@ -269,6 +282,7 @@ def _openai_values(config: _OpenAIConfig) -> dict[str, object]:
         key: value
         for key, value in {
             "base_url": config.base_url,
+            "api_key": None if config.api_key is None else config.api_key.get_secret_value(),
             "timeout": config.timeout,
             "max_retries": config.max_retries,
         }.items()
@@ -323,6 +337,8 @@ def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
     values = _completion_values(config)
     if config.video_limit != 8:
         values["generation_video_limit"] = config.video_limit
+    if config.min_video_seconds is not None:
+        values["generation_min_video_seconds"] = config.min_video_seconds
     return cast(GenerationBackend, _openai_factory(values))
 
 

@@ -223,6 +223,7 @@ class _OwnedClientModels(OpenAIModels):
 def _owned_openai_models(
     *,
     base_url: str | None = None,
+    api_key: str | None = None,
     timeout: float | None = None,
     max_retries: int | None = None,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
@@ -245,6 +246,7 @@ def _owned_openai_models(
         key: value
         for key, value in {
             "base_url": base_url,
+            "api_key": api_key,
             "timeout": timeout,
             "max_retries": max_retries,
         }.items()
