@@ -57,7 +57,37 @@ _FILE_DESCRIPTOR_RESERVE = 128
 _GROUP_OVERSAMPLE = 2
 _GROUP_FALLBACK_MINIMUM = 50
 _MAX_EMBEDDINGS_PER_MEMORY = 129
-_CJK_CHARACTER = re.compile(r"[\u3400-\u9fff]")
+# Scripts the `standard` tokenizer cannot split into words: Han and kana are written without
+# spaces, and Korean agglutinates particles onto the eojeol so whole-token matching misses.
+# Zvec offers only "standard", "whitespace", "ngram" and "jieba", and jieba segments Chinese only,
+# so everything here routes to the character-bigram field instead.
+_CJK_CHARACTER = re.compile(
+    "["
+    "\u1100-\u11ff"  # Hangul Jamo
+    "\u3040-\u30ff"  # Hiragana and Katakana
+    "\u3130-\u318f"  # Hangul Compatibility Jamo
+    "\u31f0-\u31ff"  # Katakana Phonetic Extensions
+    "\u3400-\u4dbf"  # CJK Unified Ideographs Extension A
+    "\u4e00-\u9fff"  # CJK Unified Ideographs
+    "\ua960-\ua97f"  # Hangul Jamo Extended-A
+    "\uac00-\ud7a3"  # Hangul Syllables
+    "\ud7b0-\ud7ff"  # Hangul Jamo Extended-B
+    "\uf900-\ufaff"  # CJK Compatibility Ideographs
+    "\uff66-\uff9f"  # Halfwidth Katakana
+    "\U00020000-\U0003ffff"  # CJK Unified Ideographs Extension B and later
+    "]"
+)
+# ponytail: bigrams only, so a one-character query matches nothing in the CJK field. Add
+# "ngram_min": 1 if single-character recall ever matters more than the precision it costs.
+_FTS_FIELDS = (
+    (_CONTENT_FIELD, "standard", ("lowercase", "ascii_folding", "stemmer"), ""),
+    (
+        _CONTENT_CJK_FIELD,
+        "ngram",
+        ("lowercase",),
+        '{"ngram_min": 2, "ngram_max": 2, "token_chars": ["letter", "digit"]}',
+    ),
+)
 
 
 class ZvecUnavailableError(RuntimeError):
@@ -655,23 +685,18 @@ class ZvecIndex:
         schema: object = self._zvec.CollectionSchema(
             name=_COLLECTION_NAME,
             fields=[
-                self._zvec.FieldSchema(
-                    name=_CONTENT_FIELD,
-                    data_type=self._zvec.DataType.STRING,
-                    nullable=False,
-                    index_param=self._zvec.FtsIndexParam(
-                        tokenizer_name="standard",
-                        filters=["lowercase", "ascii_folding", "stemmer"],
-                    ),
-                ),
-                self._zvec.FieldSchema(
-                    name=_CONTENT_CJK_FIELD,
-                    data_type=self._zvec.DataType.STRING,
-                    nullable=False,
-                    index_param=self._zvec.FtsIndexParam(
-                        tokenizer_name="jieba",
-                        filters=["lowercase"],
-                    ),
+                *(
+                    self._zvec.FieldSchema(
+                        name=name,
+                        data_type=self._zvec.DataType.STRING,
+                        nullable=False,
+                        index_param=self._zvec.FtsIndexParam(
+                            tokenizer_name=tokenizer,
+                            filters=list(filters),
+                            extra_params=extra_params,
+                        ),
+                    )
+                    for name, tokenizer, filters, extra_params in _FTS_FIELDS
                 ),
                 self._zvec.FieldSchema(
                     name=_MEMORY_ID_FIELD,
@@ -727,10 +752,7 @@ class ZvecIndex:
         fields = {field.name: field for field in native_schema.fields}
         if fields.keys() != _SCALAR_FIELDS:
             _schema_mismatch("scalar fields differ")
-        for name, tokenizer, filters in (
-            (_CONTENT_FIELD, "standard", ("lowercase", "ascii_folding", "stemmer")),
-            (_CONTENT_CJK_FIELD, "jieba", ("lowercase",)),
-        ):
+        for name, tokenizer, filters, extra_params in _FTS_FIELDS:
             content = fields[name]
             if (
                 content.data_type != self._zvec.DataType.STRING
@@ -739,6 +761,7 @@ class ZvecIndex:
                 or content.index_param.type != self._zvec.IndexType.FTS
                 or content.index_param.tokenizer_name != tokenizer
                 or tuple(content.index_param.filters) != filters
+                or content.index_param.extra_params != extra_params
             ):
                 _schema_mismatch(f"{name} FTS field differs")
         for name in (_MEMORY_ID_FIELD, _MEMORY_TYPE_FIELD, _SPACE_FIELD, _TASK_FIELD):
