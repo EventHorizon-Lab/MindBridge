@@ -414,7 +414,10 @@ ranker over the same candidate pool, not a shuffled sample, so it adds no varian
 Measured recall and the random-ranker expectation are only available for tasks whose adapter
 carries gold evidence source IDs; when it does not, `retrieval.gold_evidence_key` is `null`,
 `retrieval.unavailable_reason` says so, and the controls are reported as missing rather than
-quietly omitted.
+quietly omitted. Recall scores the retriever's own ranked list, recorded per sample as
+`ranked_source_ids` from a `search` at `RETRIEVAL_CANDIDATE_LIMIT`, never the evidence the
+generator cited; a labelled question whose run recorded no ranked list (a cached answer) is counted
+in `retrieval.unranked_labelled_question_count` instead of being scored as zero.
 
 ## Gold evidence per benchmark family
 

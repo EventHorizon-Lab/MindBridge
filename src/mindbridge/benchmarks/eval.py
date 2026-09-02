@@ -147,7 +147,7 @@ _GOLD_EVIDENCE_KEYS = ("evidence_ids", "clue_ids")
 _UNRESOLVED_EVIDENCE_KEY = "unresolved_evidence_ids"
 _RECALL_CUTOFFS = (1, 5, 10, 20)
 _MANDATORY_CONTROLS = ("random_ranker", "blind", "recall_at_20")
-EVAL_SCHEMA_VERSION = 9
+EVAL_SCHEMA_VERSION = 10
 EVAL_RUNNER_VERSION = "mindbridge_eval_official_v10"
 DEFAULT_ARM = "mindbridge"
 BASELINE_ARMS = ("blind", "full-context", "random")
@@ -327,6 +327,10 @@ class SampleResult:
     # `retrieval_candidates` is how deep the retriever's own ranked list actually went.
     candidate_count: int = 0
     retrieval_candidates: int = 0
+    # The retriever's own ranked source IDs, deepest first-party list the run produced. Task-level
+    # retrieval recall scores this list; `evidence` is what the generator cited, a different
+    # quantity that an earlier version of this harness scored under the same name.
+    ranked_source_ids: tuple[str, ...] = ()
     dropped_hits: int | None = None
     abstained: bool = False
     abstention_reason: str | None = None
@@ -358,6 +362,7 @@ class SampleResult:
             "sample_id": self.sample_id,
             "arm": self.arm,
             "retrieval_candidates": self.retrieval_candidates,
+            "ranked_source_ids": self.ranked_source_ids,
             "dropped_hits": self.dropped_hits,
             "task": self.task,
             "benchmark": self.benchmark,
@@ -1996,6 +2001,7 @@ def _sample(
         scorer_protocol=scorer_protocol(task.spec.name),
         arm=arm.name,
         retrieval_candidates=len(ranked_source_ids),
+        ranked_source_ids=tuple(ranked_source_ids),
     )
 
 
@@ -2862,8 +2868,13 @@ def _metadata_ids(metadata: Mapping[str, object], key: str) -> tuple[str, ...]:
 
 
 def _retrieved_sources(sample: SampleResult) -> tuple[str, ...]:
-    """Return the retrieved source IDs in rank order, deduplicated."""
-    return tuple(dict.fromkeys(item.source_id for item in sample.evidence if item.source_id).keys())
+    """Return the retriever's ranked source IDs in rank order, deduplicated.
+
+    This is the list `search(limit=RETRIEVAL_CANDIDATE_LIMIT)` returned, not `sample.evidence`:
+    evidence is narrowed to the hits the generator cited, so scoring it reported the generator's
+    citation behaviour under the name of retrieval recall.
+    """
+    return tuple(dict.fromkeys(source for source in sample.ranked_source_ids if source))
 
 
 def _retrieval_quality(
@@ -2908,7 +2919,25 @@ def _retrieval_quality(
                 "cannot be measured at these retrieval settings"
             ),
         }
-    labelled = tuple(sample for sample in samples if _metadata_ids(sample.metadata, key))
+    labelled_all = tuple(sample for sample in samples if _metadata_ids(sample.metadata, key))
+    # A labelled question whose run recorded no ranked list (a cached answer, or a harness that
+    # never issued the ranked query) is excluded and counted, never scored as recall zero.
+    labelled = tuple(sample for sample in labelled_all if sample.ranked_source_ids)
+    unranked = len(labelled_all) - len(labelled)
+    if not labelled:
+        return {
+            "gold_evidence_key": key,
+            "recall_limit": recall_limit,
+            "labelled_question_count": 0,
+            "unranked_labelled_question_count": unranked,
+            "recall_at_k": {},
+            "random_ranker_recall_at_k": {},
+            "unresolved_gold_evidence_ids": unresolved,
+            "unavailable_reason": (
+                "no labelled question carries the retriever's ranked source list, so retrieval "
+                "quality cannot be measured from this run"
+            ),
+        }
     measured: dict[int, list[ScoredValue]] = {cutoff: [] for cutoff in _RECALL_CUTOFFS}
     random_ranker: dict[int, list[ScoredValue]] = {cutoff: [] for cutoff in _RECALL_CUTOFFS}
     pool_sizes = []
@@ -2946,6 +2975,7 @@ def _retrieval_quality(
         "gold_evidence_key": key,
         "recall_limit": recall_limit,
         "labelled_question_count": len(labelled),
+        "unranked_labelled_question_count": unranked,
         "unresolved_gold_evidence_ids": unresolved,
         "recall_at_k": rows(measured),
         "random_ranker_recall_at_k": rows(random_ranker),

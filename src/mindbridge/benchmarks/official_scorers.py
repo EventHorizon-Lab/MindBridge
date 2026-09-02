@@ -339,10 +339,22 @@ def metric_is_official(task: str, metric: str, judge_model: str, *, uses_judge: 
     return judge_model_is_official(task, judge_model)
 
 
+_GOLD_SOURCE_KEYS = ("evidence_ids", "clue_ids")
+
+
 def retrieval_gold_ids(task: str, metadata: Mapping[str, object]) -> tuple[str, ...]:
-    """Return the gold source IDs one question's retrieval diagnostics score against."""
-    key = {"atm-bench": "evidence_ids", "mem-gallery": "clue_ids"}.get(_family_or_none(task) or "")
-    return () if key is None else _deduplicated_sources(_metadata_values(metadata, key))
+    """Return the gold source IDs one question's retrieval diagnostics score against.
+
+    Any adapter that labels a question with stored source IDs gets the ranked retrieval query and
+    a measured recall; keying this on two families left LoCoMo and LongMemEval, which carry exact
+    turn-level labels, with a recall number computed from the generator's citations instead.
+    """
+    del task
+    for key in _GOLD_SOURCE_KEYS:
+        sources = _deduplicated_sources(_metadata_values(metadata, key))
+        if sources:
+            return sources
+    return ()
 
 
 def local_scores(  # noqa: C901 - direct task dispatch mirrors official scorer families
