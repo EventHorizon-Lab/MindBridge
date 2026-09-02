@@ -2098,7 +2098,14 @@ def _resolved_asset(asset: AssetRef) -> tuple[Modality, str, Path]:
 
 def _normalized(values: Sequence[float], dimension: int) -> tuple[float, ...]:
     if len(values) != dimension:
-        raise ModelError("embedding response was invalid", reason="response_invalid", stage="embed")
+        # Name both widths: a declared dimension copied from another model's configuration fails
+        # every write, and "invalid" alone sent an operator hunting through the server instead.
+        raise ModelError(
+            "embedding response was invalid: the model returned "
+            f"{len(values)} values but the configured dimension is {dimension}",
+            reason="response_invalid",
+            stage="embed",
+        )
     vector = tuple(values)
     norm = math.hypot(*vector)
     if not math.isfinite(norm) or norm == 0.0:

@@ -1094,6 +1094,8 @@ def _execute(
 ) -> tuple[
     tuple[SampleResult, ...], float, Mapping[str, Mapping[str, object]], Mapping[str, object]
 ]:
+    global _first_ingest_failure_announced
+    _first_ingest_failure_announced = False
     needs_speech = any(
         isinstance(atom, Path)
         and _MODALITY_BY_SUFFIX.get(atom.suffix.casefold()) in {Modality.AUDIO, Modality.VIDEO}
@@ -1698,6 +1700,7 @@ async def _ingest(
         except IndexUnavailableError:
             raise
         except Exception as error:
+            _announce_first_ingest_failure(error, chunk[0].source_id)
             if on_failure is not None:
                 on_failure(_failure_detail(error, source_id=chunk[0].source_id))
             return 1
@@ -3586,6 +3589,30 @@ def _json_bytes(value: object, *, pretty: bool = False) -> bytes:
 
 def _announce(message: str) -> None:
     print(f"mindbridge-bench eval: {message}", file=sys.stderr)
+
+
+_first_ingest_failure_announced = False
+
+
+def _announce_first_ingest_failure(error: BaseException, source_id: str) -> None:
+    """Say once, immediately, that writes are failing.
+
+    Ingest failures are bisected, counted and reported in the final table's `unwritten` column,
+    which is right for a corpus with a few unreadable items and wrong for a misconfiguration that
+    fails every write: a run with an embedding dimension the model does not produce looked alive
+    for fourteen minutes while every store on the machine stayed empty. One line at the first
+    failure carries the error text the summary cannot.
+    """
+    global _first_ingest_failure_announced
+    if _first_ingest_failure_announced:
+        return
+    _first_ingest_failure_announced = True
+    detail = _failure_detail(error, source_id=source_id)
+    reason = "" if detail.reason is None else f"/{detail.reason}"
+    _announce(
+        f"first ingest failure at source {source_id} ({detail.code}{reason}): {error}"
+        " -- further failures are counted in the unwritten column"
+    )
 
 
 def _table(results: Mapping[str, object]) -> str:

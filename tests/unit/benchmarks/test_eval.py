@@ -1491,6 +1491,44 @@ async def test_ingest_records_the_failed_source_and_stable_error_detail() -> Non
 
 
 @pytest.mark.asyncio
+async def test_ingest_announces_the_first_failure_once_with_its_message(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Memory(_FakeMemory):
+        async def add_many(
+            self, contents: Sequence[object], **_kwargs: object
+        ) -> tuple[object, ...]:
+            del contents
+            raise ModelError(
+                "embedding response was invalid: the model returned 2048 values but the "
+                "configured dimension is 1536",
+                reason="response_invalid",
+                stage="embed",
+            )
+
+        async def add(self, content: object, **_kwargs: object) -> object:
+            del content
+            raise ModelError(
+                "embedding response was invalid: the model returned 2048 values but the "
+                "configured dimension is 1536",
+                reason="response_invalid",
+                stage="embed",
+            )
+
+    monkeypatch.setattr(eval_module, "_first_ingest_failure_announced", False)
+    items = tuple(MemoryItem(f"turn-{index}", ("content",)) for index in range(3))
+
+    count = await _ingest(cast(AsyncMemory, Memory([])), items, batch_size=3)
+
+    captured = capsys.readouterr().err
+    assert count == 3
+    assert captured.count("first ingest failure") == 1
+    assert "turn-0" in captured
+    assert "model_error/response_invalid" in captured
+    assert "returned 2048 values but the configured dimension is 1536" in captured
+
+
+@pytest.mark.asyncio
 async def test_judge_skips_samples_with_ingest_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     sample = replace(_egomem_sample(1), ingest_failure_count=1)
     calls = 0

@@ -2193,3 +2193,11 @@ def test_formation_prompt_states_every_source_rule_the_validator_enforces(
         memory_module._validate_formation_proposal(proposal, source)
 
     assert phrase in openai_backend._FORMATION_SYSTEM_PROMPT
+
+
+def test_embedding_width_mismatch_names_both_widths() -> None:
+    with pytest.raises(ModelError) as failure:
+        openai_backend._normalized((0.1, 0.2, 0.3), 2)
+
+    assert failure.value.reason == "response_invalid"
+    assert "returned 3 values but the configured dimension is 2" in str(failure.value)
