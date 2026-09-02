@@ -53,21 +53,118 @@ mindbridge-bench eval \
   --output-path .benchmarks/results/smoke
 ```
 
-`--limit` accepts an absolute unit count, a fraction between zero and one, or `-1` for all units.
-It is not always a question count: one memory unit may contain several questions. Use the emitted
-`question_count` when reporting sample size.
+`--limit` accepts an absolute unit count, a fraction between zero and one, or `all` (equivalently
+`-1`) for every unit. It is not always a question count: one memory unit may contain several
+questions. Use the emitted `question_count` when reporting sample size.
 
-Pass `--config memory.json` to use the same composition accepted by `Memory.from_config`; the
-runner replaces `data_dir` with isolated per-unit directories. See [configuration](configuration.md)
-for the JSON schema. `--device` overrides configured local-model devices, and `--model-args`
-overrides generation model, base URL, timeout, or the provider's minimum video duration.
+`--benchmarks-root` defaults to the checkout's `.benchmarks` directory, resolved from the
+repository rather than the process directory. The corpus is large and shared, so a run started
+inside a Git worktree reaches the one populated copy instead of reporting every task as missing
+against an empty sibling directory. `--data-root` defaults to `<benchmarks-root>/data`.
 
-The harness also reads `MINDBRIDGE_GENERATION_API_KEY`, `MINDBRIDGE_GENERATION_BASE_URL`,
-`MINDBRIDGE_GENERATION_MODEL`, `MINDBRIDGE_GENERATION_MODALITIES`, and
-`MINDBRIDGE_TIMEOUT_SECONDS`. The request timeout defaults to 300 seconds: a request the server
-never answers otherwise holds its task for the whole timeout while the remaining workers idle, and
-the run reports the stall as elapsed time rather than as a failure. Raise it only for a model whose
-legitimate responses exceed it.
+## Configuration file
+
+Pass `--config eval.yaml` to declare a run once instead of assembling it from environment
+variables. The document is YAML, which also parses the JSON this flag previously required.
+
+Its top level is the composition accepted by `Memory.from_config` -- see
+[configuration](configuration.md) for that schema -- plus one `benchmark` mapping the harness owns:
+
+```yaml
+embedding:
+  provider: openai
+  base_url: http://127.0.0.1:8000/v1
+  api_key: ...
+  model: local-embedder
+  dimension: 1536
+generation:
+  provider: openai
+  base_url: https://your-endpoint.example/v1
+  api_key: ...
+  model: qwen3.8-flash
+speech:
+  provider: funasr
+  device: cuda
+benchmark:
+  generation:
+    min_video_seconds: 2
+  judge:
+    model: qwen3.8-flash
+    base_url: https://judge.example/v1
+    api_key: ...
+    timeout_seconds: 600
+  download:
+    benchmarks_root: /corpus/.benchmarks
+    hf_home: /corpus/huggingface
+    hf_endpoint: https://huggingface.co
+    youtube_sleep_seconds: 30
+```
+
+The `benchmark` mapping carries what `MindBridgeConfig` has no field for: judging, corpus
+acquisition, the corpus-shaped minimum video duration, and -- under `benchmark.run` -- every run
+tunable the flags expose. Anything that describes a model endpoint (its base URL, credential,
+model name, modalities, timeout, token ceiling, and `extra_body`) stays in the product block that
+owns it, so no setting has two homes. See the annotated
+[example configuration](examples/eval.example.yaml) for every field with its purpose.
+
+`benchmark.run` mirrors the flags one for one: `tasks`, `limit`, `offset`, `seed`,
+`bootstrap_samples`, `batch_size`, `max_batch_size`, `unit_concurrency`, `request_concurrency`,
+`judge_concurrency`, `recall_limit`, `device`, `device_lock`, `use_cache`, `run_id`,
+`output_path`, `overwrite`, `log_samples`, `predict_only`, `download`, `allow_unverified_data`,
+`verbosity`, `quiet`, `compare`, `fail_on_regression`, `regression_threshold`, `media_manifest`,
+`task_data`, `media_root`, and `num_fewshot`. Each key's default is the value the unset flag
+produced, so an omitted key changes nothing.
+
+Only four inputs stay command-line-only. `--config` names this file; `--model` must be the
+literal `mindbridge`; and `--list-tasks` and `--check-integrity` are modes that do something
+other than evaluate, so they are actions rather than settings. The three `*-args` strings are
+shorthand whose every setting has a typed home in the file: `--model-args` writes
+`generation.base_url`, `generation.model`, `generation.timeout`, and
+`benchmark.generation.min_video_seconds`; `--gen-kwargs` writes `generation.max_tokens` and
+`generation.extra_body`; `--judge-model-args` writes `benchmark.judge`.
+
+Two generation controls are pinned rather than configurable. A reproducible sweep always sends
+`temperature` 0 and the seed the run declares, so `generation.temperature` and `generation.seed`
+are rejected instead of accepted and then overwritten. Set the seed with `benchmark.run.seed` or
+`--seed`. Turning a thinking model off is not a pinned control and belongs in the product block:
+
+```yaml
+generation:
+  provider: openai
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+```
+
+That is exactly what `--gen-kwargs enable_thinking=false` writes, so a file that declares it does
+not need the flag.
+
+Omitted sections take defaults rather than failing, and the defaults are the backends the harness
+builds with no `--config` at all: a `jina-omni` embedder and an `openai` generation endpoint. A
+file that sets only a judge therefore does not silently change which models run. The runner always
+replaces `data_dir` with isolated per-unit directories.
+
+`--device` overrides configured local-model devices, and `--model-args` overrides generation model,
+base URL, timeout, or the provider's minimum video duration.
+
+### Precedence
+
+Every setting resolves the same way: a command-line flag wins, then the configuration file, then
+the environment, then the built-in default. The file beats the environment because it is the
+reviewable artifact; a flag beats the file because it is typed for one run while a file is reused.
+
+The environment variables the file mirrors are `MINDBRIDGE_GENERATION_API_KEY`,
+`MINDBRIDGE_GENERATION_BASE_URL`, `MINDBRIDGE_GENERATION_MODEL`,
+`MINDBRIDGE_GENERATION_MODALITIES`, `MINDBRIDGE_TIMEOUT_SECONDS`, `MINDBRIDGE_JUDGE_API_KEY`,
+`MINDBRIDGE_JUDGE_BASE_URL`, `MINDBRIDGE_JUDGE_MODEL`, `MINDBRIDGE_JUDGE_TIMEOUT_SECONDS`,
+`MINDBRIDGE_BENCH_YOUTUBE_SLEEP_SECONDS`, `HF_HOME`, and `HF_ENDPOINT`. The last three are
+published back to the process environment once resolved, because `huggingface_hub` reads its cache
+directory and endpoint when it is first imported.
+
+The request timeout defaults to 300 seconds: a request the server never answers otherwise holds its
+task for the whole timeout while the remaining workers idle, and the run reports the stall as
+elapsed time rather than as a failure. Raise it only for a model whose legitimate responses exceed
+it.
 
 Open-ended tasks use a judge. Configure it separately when needed:
 
@@ -77,7 +174,8 @@ mindbridge-bench eval \
   --judge-model-args model=qwen3.8-27b,base_url=http://judge.example/v1,api_key=EMPTY
 ```
 
-Without `--judge-model-args`, the judge reuses the generation endpoint. Run
+Without `--judge-model-args` or a `benchmark.judge` mapping, the judge reuses the generation
+endpoint. Run
 `mindbridge-bench eval --help` for concurrency, cache, generation, and comparison options.
 
 Use `mindbridge-bench locomo-refined --help` when another evaluator needs raw LoCoMo-Refined

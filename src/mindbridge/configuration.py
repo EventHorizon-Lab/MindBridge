@@ -12,6 +12,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SecretStr,
     StringConstraints,
 )
 from pydantic import (
@@ -64,6 +65,12 @@ class _ConfigModel(BaseModel):
 class _OpenAIConfig(_ConfigModel):
     provider: Literal["openai"]
     base_url: _Text | None = None
+    # Each OpenAI-compatible slot builds its own client, so each needs its own credential:
+    # without this field a composition pointing embedding at a local server and generation at a
+    # hosted one could only ever present the single key `OPENAI_API_KEY` names. `SecretStr` keeps
+    # the value out of `model_dump`, `repr`, and therefore out of anything that serialises a
+    # configuration. Leaving it unset falls back to the SDK's own environment lookup.
+    api_key: SecretStr | None = None
     timeout: _PositiveFloat | None = None
     max_retries: _NonNegativeInt | None = None
 
@@ -269,6 +276,7 @@ def _openai_values(config: _OpenAIConfig) -> dict[str, object]:
         key: value
         for key, value in {
             "base_url": config.base_url,
+            "api_key": None if config.api_key is None else config.api_key.get_secret_value(),
             "timeout": config.timeout,
             "max_retries": config.max_retries,
         }.items()

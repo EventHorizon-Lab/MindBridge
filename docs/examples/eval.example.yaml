@@ -1,0 +1,257 @@
+# MindBridge evaluation configuration -- annotated example.
+#
+# Copy it, edit it, and pass it to the harness:
+#
+#   cp docs/examples/eval.example.yaml .benchmarks/configs/my-run.yaml
+#   mindbridge-bench eval --tasks locomo-refined --config .benchmarks/configs/my-run.yaml
+#
+# `.benchmarks/` is gitignored, so credentials you put under `.benchmarks/configs/` stay local.
+# Never edit this file with a real key: it is committed.
+#
+# ---------------------------------------------------------------------------------------------
+# How a run actually works
+# ---------------------------------------------------------------------------------------------
+# A benchmark task is a list of memory *units*. Each unit gets its own physical `data_dir`,
+# because one directory is one running MindBridge instance -- there is no logical scope that
+# substitutes for that isolation. Per unit, the harness:
+#
+#   1. WRITES the unit's content through the public SDK. Each observation is embedded by the
+#      `embedding` backend and committed to SQLite, which is authoritative; the Zvec vector index
+#      is derived from it and can always be rebuilt. Audio and the audio track of video first go
+#      through the `speech` backend to become text. If `formation` is declared, one extra LLM
+#      round-trip per observation proposes typed memories (entity, event, state, relation, ...)
+#      that are stored *alongside* the raw observation, never instead of it.
+#   2. READS by embedding the question and retrieving candidates, then hydrating them from SQLite
+#      so that stale index entries are dropped rather than returned.
+#   3. ANSWERS with the `generation` backend, given the retrieved evidence. For media evidence it
+#      re-fetches the original source file rather than a pre-cut derivative.
+#   4. SCORES the answer with the task's official scorer, and with a judge model for open-ended
+#      tasks.
+#
+# So the three blocks below are the three stages: `embedding` decides what can be found,
+# `speech` decides whether sound becomes searchable text, and `generation` decides what is said
+# about what was found.
+#
+# ---------------------------------------------------------------------------------------------
+# Where a setting may come from
+# ---------------------------------------------------------------------------------------------
+# Command-line flag  >  this file  >  environment variable  >  built-in default
+#
+# A flag wins because it is typed for one run; this file beats the environment because it is the
+# reviewable artifact. Every section is optional: an omitted section takes the same default the
+# harness uses with no `--config` at all, so adding this file to set one knob does not silently
+# change which models run.
+#
+# See docs/benchmarking.md for the flags and docs/configuration.md for the full product schema.
+
+# =============================================================================================
+# Product composition -- the same shape `Memory.from_config()` accepts.
+# `data_dir` is deliberately absent: the harness replaces it with per-unit directories.
+# =============================================================================================
+
+# What gets embedded, and therefore what can ever be retrieved. Retrieval quality is bounded
+# here, not in the ranker: content this backend cannot represent is content no ranking can
+# recover.
+embedding:
+  # `openai` reaches any OpenAI-compatible server, including a local vLLM.
+  # Alternatives: `jina-omni` (bundled local omni-modal model, the default) and
+  # `sentence-transformers` (requires `model` and `revision`).
+  provider: openai
+  base_url: http://127.0.0.1:8000/v1
+  # Local servers usually accept any non-empty string; omit the field to let the SDK read
+  # OPENAI_API_KEY instead.
+  api_key: local-server-ignores-this
+  model: your-embedding-model
+  # Must equal the server's real vector width. Read it back from the server rather than guessing:
+  #   curl -s $BASE_URL/embeddings -H 'Content-Type: application/json' \
+  #     -d '{"model":"your-embedding-model","input":"probe"}' \
+  #     | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["data"][0]["embedding"]))'
+  dimension: 1024
+  # Declaring a modality routes that kind of memory here. An empty set would build a Memory whose
+  # every write fails, so at least one is required; declaring one the server cannot accept makes
+  # those writes fail instead of falling back.
+  modalities: [text]
+  # `input` is the plain embeddings payload. `messages` is the request shape multimodal servers
+  # read media parts from -- switch to it when this model embeds images or video.
+  request_format: input
+  timeout: 600.0
+  max_retries: 3
+
+# Turns audio, and the audio track of video, into searchable text. Omit the block to skip
+# transcription entirely; media then contributes only what the visual path produces.
+speech:
+  # `funasr` runs locally and is pinned to the Fun-ASR-Nano recipe, so there is no model field.
+  # `--device` overrides this at the command line.
+  provider: funasr
+  device: auto
+
+# Answers questions from retrieved evidence. The harness overwrites `base_url`, `model`,
+# `timeout`, `modalities`, `temperature`, and `seed` from the resolved run settings, so declaring
+# them here is how you *supply* them -- they are not ignored, they are the source.
+generation:
+  provider: openai
+  base_url: https://your-endpoint.example/v1
+  # Every OpenAI-compatible slot carries its own credential, which is what lets `embedding` above
+  # talk to a local server while this one talks to a hosted endpoint. Unset falls back to
+  # MINDBRIDGE_GENERATION_API_KEY, then to the SDK's own OPENAI_API_KEY lookup. The value is a
+  # secret type: it never appears in `model_dump`, in a `repr`, or in a written results file.
+  api_key: replace-me
+  model: your-vlm
+  # Only declared modalities are sent to the model. Video here means the harness may hand it
+  # whole clips; without it, video evidence degrades to its transcript and captions.
+  modalities: [text, image, video]
+  # Omitted on purpose: the request then carries no token ceiling at all. Set a positive integer
+  # only to impose one. Note that a thinking model needs its reasoning budget inside any ceiling
+  # you set, or every response ends as `finish_reason=length`.
+  # max_tokens: 4096
+  # Cap on how many media evidence items one answer may carry.
+  video_limit: 8
+  # Anything else the endpoint accepts in the request body. This is where a thinking model is
+  # turned off -- reasoning models otherwise spend their whole budget before answering. It is the
+  # same setting `--gen-kwargs enable_thinking=false` writes, so declare it here and drop the flag.
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+  # `temperature` and `seed` are deliberately absent and are rejected if you add them: a
+  # reproducible sweep pins temperature to 0 and takes the seed from `benchmark.run.seed`.
+
+# Optional, and off by default: it adds an LLM round-trip to every write. It buys the typed
+# memory plane (entity, event, state, relation, affect, trait, response policy), each linked back
+# to its source as evidence. `modalities` gates which observations reach it -- a text-only
+# declaration means image and video sources never form anything.
+# formation:
+#   provider: openai
+#   base_url: https://your-endpoint.example/v1
+#   api_key: replace-me
+#   model: your-llm
+#   modalities: [text, image]
+#   # Formation returns JSON and treats a truncated response as a hard error, so too small a
+#   # budget fails the whole batch rather than parsing partially.
+#   max_tokens: 4096
+
+# Retrieval and ranking behaviour. Defaults shown; every field is optional.
+settings:
+  # Index transcribed speech as retrievable text. Off by default; without it a video memory's
+  # searchable text is only what the visual path wrote.
+  index_speech: true
+  # Similarity floor for a hit. Lowering it trades precision for recall.
+  minimum_relevance: 0.55
+  # How close the top two hits must be before retrieval is treated as ambiguous.
+  ambiguity_margin: 0.01
+  # Character budget for evidence handed to the answerer. Unset means no widening.
+  evidence_budget_chars: 12000
+
+# =============================================================================================
+# Harness-only section. These have no field in `MindBridgeConfig` and must not gain one:
+# credentials are deliberately kept out of the product schema, and judging and corpus
+# acquisition exist only in the benchmark harness.
+# =============================================================================================
+benchmark:
+  # Nothing about the generation endpoint itself lives here -- it is a product slot, configured
+  # above. Only the corpus-shaped knob does: some endpoints reject very short clips, and raising
+  # this floor makes the harness skip them instead of losing a whole observation to one rejected
+  # request.
+  # generation:
+  #   min_video_seconds: 2
+
+  # Judging exists only in the harness, so it has no product block. Omit this to reuse the
+  # generation endpoint, which is what an unset judge has always meant.
+  judge:
+    model: your-judge-model
+    base_url: https://your-endpoint.example/v1
+    api_key: replace-me
+    timeout_seconds: 600
+
+  # Where corpora are read from and downloaded to.
+  download:
+    # Defaults to the checkout's `.benchmarks`, resolved from the repository rather than the
+    # process directory -- a run started inside a Git worktree still reaches the one populated
+    # copy. Set it to share a corpus between checkouts.
+    # benchmarks_root: /corpus/.benchmarks
+    # Defaults to <benchmarks_root>/data.
+    # data_root: /corpus/.benchmarks/data
+    # Mirrors HF_HOME and HF_ENDPOINT. Both are published back to the process environment once
+    # resolved, because `huggingface_hub` reads them when it is first imported.
+    # hf_home: /corpus/huggingface
+    hf_endpoint: https://huggingface.co
+    # Throttle between YouTube-sourced media fetches, in seconds.
+    youtube_sleep_seconds: 30
+
+  # Every run tunable the command line exposes, so one file can describe a whole sweep. A flag
+  # still wins over anything here. Each key mirrors the flag of the same name; the value shown is
+  # the built-in default, so an omitted key behaves exactly as an unset flag.
+  run:
+    # Which tasks to run: names or groups, comma separated. Required, by flag or here.
+    tasks: locomo-refined,clbench
+    # `all` (or -1) for every unit, a 0-1 fraction, or an absolute count.
+    limit: all
+    offset: 0
+
+    # Throughput. `unit_concurrency` is the strongest lever: tasks run serially by design so that
+    # timing stays clean, and this overlaps the units inside one task.
+    unit_concurrency: 1
+    request_concurrency: 4
+    judge_concurrency: 8
+    batch_size: auto
+    max_batch_size: 64
+
+    # How many memories one question may retrieve. Capped at 100.
+    recall_limit: 20
+
+    # One integer, or three, or four. One value fills all four slots.
+    seed: 0
+    bootstrap_samples: 2000
+
+    # Local model placement. `device` overrides the devices declared in the blocks above;
+    # `device_lock` serialises pools that share one CUDA device.
+    device: null
+    device_lock: true
+
+    # Artifacts. `output_path` defaults to <benchmarks_root>/results/<run_id>, and `run_id`
+    # defaults to a UTC timestamp.
+    run_id: null
+    output_path: null
+    overwrite: false
+    log_samples: false
+    # Reuse model answers across runs; a directory or a .db file.
+    use_cache: null
+
+    # Skip scoring and only record predictions.
+    predict_only: false
+    # Fetch missing pinned annotations and selected media.
+    download: true
+    # Accept a corpus whose digest is not pinned. Off by default for a reason.
+    allow_unverified_data: false
+    verbosity: INFO
+    quiet: false
+
+    # Regression gate against a prior result directory or samples.jsonl.
+    compare: null
+    fail_on_regression: false
+    regression_threshold: 0.0
+
+    # Per-task input overrides, keyed by concrete task name.
+    # task_data:
+    #   clbench: /corpus/clbench/custom.json
+    # media_root:
+    #   egolifeqa: /corpus/egolife/videos
+    # media_manifest: /corpus/.benchmarks/results/prepared/media-manifest.json
+
+    # Zero-shot is the only supported setting for these benchmarks.
+    num_fewshot: 0
+
+# ---------------------------------------------------------------------------------------------
+# Not expressible here, and why
+# ---------------------------------------------------------------------------------------------
+# Only four kinds of input stay on the command line:
+#
+#   --config              this file's own path
+#   --model               must be the literal `mindbridge`
+#   --list-tasks          modes that do something other than evaluate, so they are actions
+#   --check-integrity     rather than settings
+#
+# The three `*-args` strings (--model-args, --gen-kwargs, --judge-model-args) are shorthand only.
+# Everything they can set has a typed home above: --model-args writes generation.base_url /
+# generation.model / generation.timeout and benchmark.generation.min_video_seconds,
+# --gen-kwargs writes generation.max_tokens and generation.extra_body, and --judge-model-args
+# writes benchmark.judge.
