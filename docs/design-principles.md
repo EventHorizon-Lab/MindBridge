@@ -1,19 +1,21 @@
 # Product goals and design principles
 
-MindBridge's product direction is an **Agentic Native Embodied Memory System**: the memory layer
-for agents that perceive and act in the physical world. Its primary product context is a household
-robot for emotional companionship. The same memory contract should also serve desktop robots and
-personal work assistants without requiring a separate architecture.
+MindBridge's product direction is an **Agentic Native Embodied Omni-Modal Memory System**: a memory
+layer designed as a native part of intelligent systems that perceive, reason, and act. Its
+reference product is an emotional companion robot. The same memory contract should also serve
+desktop robots, personal work assistants, chatbots, and voice agents without requiring a separate
+architecture.
 
 MindBridge is the memory system, not the robot, agent framework, sensor stack, or foundation model.
 It turns ordered text, image, video, and audio observations into durable memory that an agent can
 search, question, and trace back to evidence.
 
 > This page defines product direction and the criteria for future design decisions. It is not a
-> claim that every target is implemented in the current release. See [architecture](architecture.md)
-> for the implemented system and [plugin architecture](plugin-architecture.md) for today's extension
-> boundary. Where this page and an owning reference disagree, the reference wins and this page is
-> the page to fix.
+> claim that every target is implemented in the current release. See
+> [product capabilities](product-capabilities.md) for what ships today,
+> [architecture](architecture.md) for its invariants, and
+> [plugin architecture](plugin-architecture.md) for today's extension boundary. Where this page and
+> an owning reference disagree, the reference wins and this page is the page to fix.
 
 ## What the direction means
 
@@ -21,12 +23,22 @@ search, question, and trace back to evidence.
 | --- | --- |
 | Agentic Native | Memory semantics are a first-class agent capability, not a thin wrapper over a vector database. |
 | Embodied | Time, source media, identity signals, and other evidence from the physical world remain meaningful throughout storage and retrieval. |
+| Omni-Modal | Every supported modality works independently or in an arbitrary ordered combination under one memory contract. |
 | Memory System | MindBridge owns memory semantics, retrieval orchestration, and durable local consistency while models and transports remain replaceable. |
 
 The household companion is the reference product because it exercises the hardest requirements:
 long-lived personal context, mixed sensory input, low perceived latency, intermittent connectivity,
 sensitive data, and heterogeneous hardware. Other product forms are supported by generalizing this
 same path, not by adding product-specific forks.
+
+MindBridge pursues four product outcomes:
+
+| Outcome | Commitment |
+| --- | --- |
+| Stronger | Target state-of-the-art memory quality independently across text-only, image-text, video, audio, and omni routes. |
+| Faster | Measure and reduce the complete ingestion, retrieval, and answer path experienced by the agent. |
+| Leaner | Reduce model, compute, memory, storage, energy, and operational cost without trading away quality or durability. |
+| Developer- and agent-friendly | Keep the API concise, typed, discoverable, structured, and consistent across every public surface. |
 
 ## Design goals
 
@@ -38,8 +50,9 @@ modalities and the configured backend capabilities.
 
 | Available input | Intended route |
 | --- | --- |
-| Text | Text embedding, retrieval, and generation |
-| Image or video, with optional text | Native visual-text route |
+| Text only | Text embedding, retrieval, and generation |
+| Image with text | Native image-text route |
+| Video, with optional text | Native video-text route |
 | Audio, with optional text | Native audio-text route, or explicit transcription fallback when required |
 | Multiple media families | Omni route that retains every supported evidence type |
 
@@ -48,9 +61,10 @@ deployment can run it. Omni-first does not mean always invoking the largest mode
 request should remain on the text path, and absent modalities must not add work. Unsupported media
 must never be discarded silently.
 
-The core contract stays intentionally small. User-defined capture formats, sensor records, or
-application objects should be normalized into canonical content at an adapter boundary instead of
-expanding the public API to accept unvalidated `Any` values.
+Input form belongs to the user: capture formats, sensor records, interaction events, and application
+objects may be defined freely outside MindBridge. They normalize into canonical content at an
+adapter boundary so the core API remains small, typed, and validatable instead of accepting
+unvalidated `Any` values.
 
 ### End-to-end memory and search speed
 

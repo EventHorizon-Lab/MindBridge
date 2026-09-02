@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mindbridge"
 version = "0.2.0"
-description = "Fast local multimodal memory for Python agents"
+description = "Agentic native embodied omni-modal memory system"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 license = "Apache-2.0"

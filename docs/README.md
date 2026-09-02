@@ -7,21 +7,24 @@ have one place to stay current.
 
 | Goal | Start here | Continue with |
 | --- | --- | --- |
-| Try local memory | [Quick start](quickstart.md) | [Core concepts](concepts.md) |
+| Understand what MindBridge can do | [Product capabilities](product-capabilities.md) | [Design principles](design-principles.md) |
+| Try MindBridge end to end | [Quick start](quickstart.md) | [Core concepts](concepts.md) |
 | Build a Python integration | [Configuration](configuration.md) | [Python SDK](api/python-sdk.md) |
 | Expose memory to another process | [REST](api/rest.md), [MCP](api/mcp.md), or [CLI](api/cli.md) | [Deployment](deployment.md) |
 | Run a durable instance | [Architecture](architecture.md) | [Operations](operations.md) and [troubleshooting](troubleshooting.md) |
-| Evaluate retrieval quality | [Benchmarking](benchmarking.md) | [Competitive review](competitive-memory-systems.md) |
+| Evaluate memory quality | [Benchmarking](benchmarking.md) | [Example evaluation configuration](examples/eval.example.yaml) |
 | Understand or extend the design | [Design principles](design-principles.md) | [Plugin architecture](plugin-architecture.md) |
 
 ## Learn
 
-1. [Quick start](quickstart.md) — install MindBridge and run one local memory.
-2. [Core concepts](concepts.md) — understand records, content, retrieval, and directory ownership.
-3. [Configuration](configuration.md) — select bundled adapters or inject application backends.
-4. [Memory types, time, and decay](memory-types-time-and-decay.md) — control cognitive role and
+1. [Product capabilities](product-capabilities.md) — see the implemented product surface, use
+   cases, boundaries, and extension model.
+2. [Quick start](quickstart.md) — install MindBridge and exercise its core capabilities.
+3. [Core concepts](concepts.md) — understand records, content, retrieval, and directory ownership.
+4. [Configuration](configuration.md) — select bundled adapters or inject application backends.
+5. [Memory types, time, and decay](memory-types-time-and-decay.md) — control cognitive role and
    temporal ranking.
-5. [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) — ingest
+6. [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) — ingest
    completed observations and derive grounded interaction records.
 
 ## Integrate
@@ -53,8 +56,6 @@ have one place to stay current.
 - [Benchmarking](benchmarking.md) — reproducible behavior evaluation and local-index measurement.
 - [Annotated example configuration](examples/eval.example.yaml) — every evaluation slot and the
   order in which a run uses it.
-- [Competitive memory-system review](competitive-memory-systems.md) — evidence-backed comparison
-  and the design decisions it informed.
 
 For repository setup and quality gates, see [CONTRIBUTING.md](../CONTRIBUTING.md). When a fact
 changes, update its owning page and link to it elsewhere instead of copying it.

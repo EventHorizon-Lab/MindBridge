@@ -132,7 +132,7 @@ SQLite hydration.
 
 Typed lineage and evidence are a SQLite projection, not a graph database or traversal service. A
 future entity/relation search projection must remain derived and rebuildable and pass the evidence
-gate in the [competitive review](competitive-memory-systems.md).
+gate in the [benchmark protocol](benchmarking.md#mandatory-controls).
 
 ## Public and trust boundaries
 
