@@ -519,7 +519,10 @@ def test_an_application_target_that_is_not_a_memory_exits_ten(
     assert cast(dict[str, object], stderr[0])["reason"] == "app_invalid"
 
 
-@pytest.mark.parametrize(("option", "value"), (("--answerer", "openai"), ("--timeout", "1")))
+@pytest.mark.parametrize(
+    ("option", "value"),
+    (("--answerer", "openai"), ("--former", "openai"), ("--timeout", "1")),
+)
 def test_composition_specific_options_are_refused_by_other_compositions(
     option: str,
     value: str,
@@ -563,9 +566,43 @@ def test_recipes_pin_identity_to_the_constants_in_the_source() -> None:
     assert recipes.describe("openai:gpt-5-mini")["models"] == {
         "embedder": "gpt-5-mini",
         "answerer": "gpt-5-mini",
+        "former": "gpt-5-mini",
         "transcriber": "gpt-5-mini",
     }
     assert "OPENAI_API_KEY" in cast(str, recipes.describe("openai")["credential"])
+
+
+def test_the_former_flag_reaches_the_memory_it_composes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--former` is only wired if the constructed backend arrives as `Memory(former=...)`.
+
+    Asserting the `--explain` document instead would stay green while `_open_memory` dropped the
+    slot on the floor, which is the failure this flag was added to prevent.
+    """
+    from mindbridge import cli
+
+    sentinel = object()
+    captured: dict[str, object] = {}
+    # Parse before patching: `_parser` derives its defaults from `Memory`'s own signature.
+    arguments = cli._parser().parse_args(
+        ["--data-dir", str(tmp_path), "--embedder", "openai", "--former", "openai", "list"]
+    )
+    monkeypatch.setattr(recipes, "embedder", lambda name, **kw: object())
+    monkeypatch.setattr(recipes, "former", lambda name, **kw: sentinel)
+    monkeypatch.setattr(cli, "Memory", lambda *args, **kwargs: captured.update(kwargs))
+
+    cli._open_memory(arguments)
+
+    assert captured["former"] is sentinel
+
+
+def test_every_recipe_slot_has_a_command_line_flag() -> None:
+    """The four literals this used to need are now one list; keep the flag set derived from it."""
+    from mindbridge import cli
+
+    flags = {action.dest for action in cli._parser()._actions}
+    assert set(cli._SLOTS) <= flags
 
 
 def test_recipes_return_an_object_the_caller_owns() -> None:
@@ -589,7 +626,7 @@ class _SdkClient:
         self.close_calls += 1
 
 
-@pytest.mark.parametrize("slot", ("embedder", "answerer", "transcriber"))
+@pytest.mark.parametrize("slot", ("embedder", "answerer", "former", "transcriber"))
 def test_a_recipe_closes_the_sdk_client_it_constructed(
     slot: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

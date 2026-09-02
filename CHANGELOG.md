@@ -10,6 +10,29 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- A `formation` slot on the declarative configuration surface, plus `recipes.former` and a
+  `--former` command-line flag, so a `FormationBackend` is reachable from `Memory.from_config()`
+  and from the product CLI. `FormationBackend` was implemented, accepted by `MemoryPlugins`, and
+  called by `Memory` on every write, but nothing built one: no declarative deployment and no CLI
+  composition had ever produced a typed memory, and therefore none had ever revised a belief,
+  because the supersession rules fire only on the `STATE` and user-stated `TRAIT` kinds that only
+  formation emits. Formation stays absent by default: it adds a model round-trip per write.
+- `explain` on the search tool and the REST query, routing to `search_with_trace` and returning
+  the per-candidate trace beside unchanged hits. An empty result over a transport was previously
+  indistinguishable between nothing stored, everything below `minimum_relevance`, a `memory_type`
+  filter, and an unresolved top-two tie; the trace already named all four and only the SDK and CLI
+  could see it.
+- `reinforce` on MCP and REST, as `reinforce_memories` and `POST /v1/memories/reinforce`. The
+  ranking signals read `access_count`, but no transport could write it, so an agent driving
+  MindBridge over MCP or REST held the reinforcement factor at exactly 1.0 for the life of the
+  store while age-based decay, when enabled, still applied.
+- A `context` parameter on the audio and vision stream adapters, accepting a fixed
+  `ObservationContext` or a zero-argument callable sampled at each closed observation. `StreamInput`
+  has always carried a context, but neither adapter passed one, so every memory written through the
+  microphone and camera paths had a null spatial pose. The callable form exists because a capture
+  stream outlives the observations it commits: a moving robot's pose is not a property of the
+  stream.
+
 - Face and speaker writes now record `mindbridge.identity.observations` and
   `mindbridge.identity.matched_existing` on their storage span, so a recognizer that cannot tell
   people apart is visible at the write instead of only as a weak answer much later. Both failure
@@ -302,6 +325,43 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   isolated store, so a configured formation backend was silently absent from every measured run.
   Both are forwarded now, and a guard test derives the expected keywords from
   `dataclasses.fields(MemoryPlugins)` so the next added slot fails instead of being dropped.
+- - A cross-modal identity bind no longer cascades. The product link path passed
+  `allow_shared_modality=True`, so a fragment could rejoin an identity that already held its
+  modality; once a wearer's voice owned one face that identity held both, and every later fragment
+  rejoined it. Measured on synthetic egocentric traffic with one off-camera wearer and three
+  interlocutors, all four people collapsed into a single identity under every ingestion order
+  tried, 0 correct binds and 3 wrong. Refusing the wider merge caps the damage at the unavoidable
+  first bind: 2 correct, 1 wrong, 4 identities. `LocalStore` keeps the wider merge for a caller
+  that has established the claim another way. The representation, not the rule, remains the
+  binding constraint: on real M3-Bench voice exemplars, within-identity cosine 0.7385 against
+  nearest-other 0.7301.
+- A `scope.valid_at` search no longer discards every memory that carries no declared validity
+  interval. The predicate admitted such a record only when neither `valid_at` nor `near` was
+  given, so asking what held at any past or present instant returned nothing at all rather than
+  nothing relevant, for any corpus written through `add()` without a context. A record with no
+  interval is unbounded in both directions and now passes at every instant, matching how the
+  semantic path already treats a NULL interval. The spatial `near` filter still excludes records
+  with no pose, which is correct: they are not at any location.
+- Chinese, Japanese and Korean lexical retrieval. Term extraction matched an entire unsegmented
+  run as one token, so a multi-character Chinese query carried a highest-weight term that could
+  never match and could never reach full lexical coverage -- the one signal that performs
+  cross-route fusion. Runs are now removed before word splitting and re-emitted as characters and
+  adjacent bigrams, and 47 Chinese function characters join the noise set that previously held
+  only English stopwords. Separately, the index routed Japanese kanji to a Chinese word segmenter,
+  which returned nothing for them, and routed Korean to an English stemmer, which cannot match an
+  agglutinated eojeol; the full-text field for these scripts is now character bigrams, which
+  measured correct for all three languages with no cross-language false positives.
+- `ask()` now reinforces the evidence its answer cited, closing the loop the ranking signals were
+  written for. Reinforcement failures are suppressed: bookkeeping must not discard an answer that
+  has already been paid for. The new `reinforce_on_answer` setting turns it off, and the benchmark
+  harness composes every store with it off: reinforcing during a run makes one question's
+  retrieval depend on which earlier questions answered, and under concurrency on the order their
+  updates committed, so an evaluation would stop being reproducible from its seed.
+- Every MCP error now arrives as a bare JSON envelope. Errors raised inside a tool body were
+  prefixed by the runtime while errors raised by the middleware were not, so a client parsing the
+  text succeeded on argument rejections and failed on `memory_not_found`, `model_error` and
+  `storage_error` -- the recoverable ones.
+
 - Remote product CLI requests now default to a finite 30-second timeout, configurable with the
   positive `--timeout SECONDS` option. Timeouts use the existing retryable `storage_error` envelope
   with `reason="timeout"` and `stage="request"` instead of leaving an agent blocked indefinitely.
