@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import (
     EmbeddingBackend,
+    FormationBackend,
     GenerationBackend,
     SpeechBackend,
     TranscriptionBackend,
@@ -47,7 +48,7 @@ from mindbridge.types import Modality
 if TYPE_CHECKING:
     from openai import OpenAI
 
-Slot = Literal["embedder", "answerer", "transcriber"]
+Slot = Literal["embedder", "answerer", "former", "transcriber"]
 
 JINA_OMNI = "jina-omni"
 FUNASR = "funasr"
@@ -58,13 +59,15 @@ OPENAI = "openai"
 _SLOTS: Mapping[str, frozenset[str]] = {
     FUNASR: frozenset({"transcriber"}),
     JINA_OMNI: frozenset({"embedder"}),
-    OPENAI: frozenset({"embedder", "answerer", "transcriber"}),
+    OPENAI: frozenset({"embedder", "answerer", "former", "transcriber"}),
 }
 _PARAMETERIZED = frozenset({OPENAI})
 _PROBES: Mapping[str, str] = {JINA_OMNI: "weights", FUNASR: "import", OPENAI: "client"}
 _OPENAI_MODELS: Mapping[str, str] = {
     "embedder": DEFAULT_EMBEDDING_MODEL,
     "answerer": DEFAULT_GENERATION_MODEL,
+    # Formation proposes typed memories with the generation model, so it pins the same constant.
+    "former": DEFAULT_GENERATION_MODEL,
     "transcriber": DEFAULT_TRANSCRIPTION_MODEL,
 }
 # MindBridge never reads a credential. The official SDK performs its own documented lookup, so the
@@ -145,6 +148,11 @@ def answerer(name: str, *, load: bool = False) -> GenerationBackend:
     return cast(GenerationBackend, _build(name, slot="answerer", load=load))
 
 
+def former(name: str, *, load: bool = False) -> FormationBackend:
+    """Return the formation backend one recipe names; the caller owns and closes it."""
+    return cast(FormationBackend, _build(name, slot="former", load=load))
+
+
 def transcriber(name: str, *, load: bool = False) -> SpeechBackend | TranscriptionBackend:
     """Return the speech backend one recipe names; the caller owns and closes it."""
     return cast(
@@ -215,6 +223,7 @@ class _OwnedClientModels(OpenAIModels):
 def _owned_openai_models(
     *,
     base_url: str | None = None,
+    api_key: str | None = None,
     timeout: float | None = None,
     max_retries: int | None = None,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
@@ -237,6 +246,7 @@ def _owned_openai_models(
         key: value
         for key, value in {
             "base_url": base_url,
+            "api_key": api_key,
             "timeout": timeout,
             "max_retries": max_retries,
         }.items()
@@ -283,7 +293,8 @@ def _build(name: str, *, slot: Slot, load: bool) -> object:
     client = _openai_client()
     if slot == "embedder":
         return _OwnedClientModels(client, embedding_model=selected)
-    if slot == "answerer":
+    if slot in ("answerer", "former"):
+        # One adapter serves both: `formation_model` is the generation model it was given.
         return _OwnedClientModels(client, generation_model=selected)
     return _OwnedClientModels(client, transcription_model=selected)
 

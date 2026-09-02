@@ -329,6 +329,28 @@ def test_full_text_search_stems_folds_accents_and_routes_chinese(tmp_path: Path)
         assert index.lexical_search("项目复盘", limit=2)[0].id == "chinese"
 
 
+def test_full_text_search_routes_japanese_and_korean_off_the_chinese_segmenter(
+    tmp_path: Path,
+) -> None:
+    _require_zvec()
+    with ZvecIndex(tmp_path / "index", dimension=2) as index:
+        index.upsert(
+            [
+                _document("japanese", "昨日は東京で友達とラーメンを食べました", (1.0, 0.0)),
+                _document("korean", "어제 친구와 함께 서울에서 라면을 먹었습니다", (0.0, 1.0)),
+                _document("chinese", "今天在上海进行项目复盘", (1.0, 1.0)),
+            ]
+        )
+
+        # jieba misses 東京 inside a Japanese sentence and the English stemmer cannot split a
+        # Korean eojeol from its particle; the character-bigram field answers both.
+        assert [hit.id for hit in index.lexical_search("東京", limit=3)] == ["japanese"]
+        assert [hit.id for hit in index.lexical_search("ラーメン", limit=3)] == ["japanese"]
+        assert [hit.id for hit in index.lexical_search("서울", limit=3)] == ["korean"]
+        assert [hit.id for hit in index.lexical_search("라면", limit=3)] == ["korean"]
+        assert [hit.id for hit in index.lexical_search("项目复盘", limit=3)] == ["chinese"]
+
+
 def test_schema_optimizes_time_ranges_and_automatic_maintenance(tmp_path: Path) -> None:
     _require_zvec()
     with ZvecIndex(tmp_path / "index", dimension=2) as index:

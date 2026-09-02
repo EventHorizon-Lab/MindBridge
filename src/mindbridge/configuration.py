@@ -12,6 +12,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SecretStr,
     StringConstraints,
 )
 from pydantic import (
@@ -23,6 +24,7 @@ from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import (
     EmbeddingBackend,
     FaceBackend,
+    FormationBackend,
     GenerationBackend,
     SpeechBackend,
     TranscriptionBackend,
@@ -63,6 +65,12 @@ class _ConfigModel(BaseModel):
 class _OpenAIConfig(_ConfigModel):
     provider: Literal["openai"]
     base_url: _Text | None = None
+    # Each OpenAI-compatible slot builds its own client, so each needs its own credential:
+    # without this field a composition pointing embedding at a local server and generation at a
+    # hosted one could only ever present the single key `OPENAI_API_KEY` names. `SecretStr` keeps
+    # the value out of `model_dump`, `repr`, and therefore out of anything that serialises a
+    # configuration. Leaving it unset falls back to the SDK's own environment lookup.
+    api_key: SecretStr | None = None
     timeout: _PositiveFloat | None = None
     max_retries: _NonNegativeInt | None = None
 
@@ -98,14 +106,44 @@ class SentenceTransformersEmbeddingConfig(_ConfigModel):
     batch_size: _PositiveInt = 32
 
 
-class OpenAIGenerationConfig(_OpenAIConfig):
+class _OpenAICompletionConfig(_OpenAIConfig):
+    """Knobs `OpenAIModels` reads for any chat-completion role."""
+
     model: _Text = DEFAULT_GENERATION_MODEL
     modalities: frozenset[Modality] = frozenset({Modality.TEXT})
     temperature: _Temperature | None = None
     seed: _Seed | None = None
     max_tokens: _PositiveInt | None = None
-    video_limit: _PositiveInt | None = 8
     extra_body: Mapping[str, object] | None = None
+
+
+class OpenAIGenerationConfig(_OpenAICompletionConfig):
+    video_limit: _PositiveInt | None = 8
+    # Below this duration a video is answered as four ordered stills instead. The option already
+    # existed on `OpenAIModels` and was unreachable from configuration, which left every caller
+    # that builds its models from a file -- the benchmark harness included -- unable to set the
+    # floor its endpoint needs. Answer-only, like `video_limit`, so it is not on the shared
+    # completion base that formation also reads.
+    min_video_seconds: _PositiveFloat | None = None
+
+
+class OpenAIFormationConfig(_OpenAICompletionConfig):
+    """Chat-completion knobs for the adapter that proposes derived typed memories.
+
+    Formation is a separate LLM round-trip on the write path and usually wants its own model,
+    token budget, and endpoint, so it is its own slot rather than a reuse of `generation`;
+    leaving the slot out keeps that round-trip off, which is the default. It reads the same
+    completion knobs as generation, inherited here — `video_limit` is answer-only, so it is
+    absent, and `formation_model` and `formation_space` on the adapter are derived from exactly
+    these values, so there is nothing formation-specific to add.
+
+    Two inherited fields matter more here than they do for answering. `modalities` becomes
+    `formation_capabilities`, which gates which observations reach the former at all: an
+    observation whose modalities are not covered is skipped, silently and by design, so declare
+    the media the endpoint really accepts or image and video sources will never form anything.
+    And formation returns JSON, so a `max_tokens` truncation is a hard error rather than a
+    partial parse.
+    """
 
 
 class OpenAITranscriptionConfig(_OpenAIConfig):
@@ -145,6 +183,13 @@ class MindBridgeConfig(_ConfigModel):
     data_dir: Path = Path(".mindbridge")
     embedding: EmbeddingProviderConfig
     generation: OpenAIGenerationConfig | None = None
+    # Reachable, but never implicit, and omitted by default. Configuring `generation` must not
+    # enable formation: a former is an LLM call per observation on the write path, which a
+    # measurement says is the wrong default, and the only bundled one is a cloud call, which a
+    # local-first deployment should opt into rather than discover. Derived memories are also a
+    # union with the raw sources rather than a replacement for them. `vision_describer` has no
+    # bundled implementation at all, so it deliberately has no key here.
+    formation: OpenAIFormationConfig | None = None
     speech: SpeechProviderConfig | None = None
     face: OpenCVFaceConfig | None = None
     settings: MemorySettings = Field(default_factory=MemorySettings)
@@ -187,6 +232,9 @@ def resolve_memory_config(
         answerer = None if config.generation is None else _build_generation(config.generation)
         if answerer is not None:
             cleanup.callback(answerer.close)
+        former = None if config.formation is None else _build_formation(config.formation)
+        if former is not None:
+            cleanup.callback(former.close)
         transcriber = None if config.speech is None else _build_speech(config.speech)
         if transcriber is not None:
             cleanup.callback(transcriber.close)
@@ -198,6 +246,7 @@ def resolve_memory_config(
             answerer=answerer,
             transcriber=transcriber,
             face_analyzer=face,
+            former=former,
         )
         cleanup.pop_all()
     return MemoryComposition(config.data_dir, plugins, config.settings)
@@ -233,6 +282,7 @@ def _openai_values(config: _OpenAIConfig) -> dict[str, object]:
         key: value
         for key, value in {
             "base_url": config.base_url,
+            "api_key": None if config.api_key is None else config.api_key.get_secret_value(),
             "timeout": config.timeout,
             "max_retries": config.max_retries,
         }.items()
@@ -267,7 +317,7 @@ def _build_embedding(config: EmbeddingProviderConfig) -> EmbeddingBackend:
     )
 
 
-def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
+def _completion_values(config: _OpenAICompletionConfig) -> dict[str, object]:
     values = _openai_values(config)
     values.update(
         generation_model=config.model,
@@ -280,9 +330,21 @@ def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
         "generation_extra_body": config.extra_body,
     }
     values.update((key, value) for key, value in optional.items() if value is not None)
+    return values
+
+
+def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
+    values = _completion_values(config)
     if config.video_limit != 8:
         values["generation_video_limit"] = config.video_limit
+    if config.min_video_seconds is not None:
+        values["generation_min_video_seconds"] = config.min_video_seconds
     return cast(GenerationBackend, _openai_factory(values))
+
+
+def _build_formation(config: OpenAIFormationConfig) -> FormationBackend:
+    # The bundled adapter reads the generation controls for `form`; `video_limit` is answer-only.
+    return cast(FormationBackend, _openai_factory(_completion_values(config)))
 
 
 def _build_speech(config: SpeechProviderConfig) -> SpeechBackend | TranscriptionBackend:
@@ -314,6 +376,7 @@ __all__ = [
     "MemoryComposition",
     "MindBridgeConfig",
     "OpenAIEmbeddingConfig",
+    "OpenAIFormationConfig",
     "OpenAIGenerationConfig",
     "OpenAITranscriptionConfig",
     "OpenCVFaceConfig",

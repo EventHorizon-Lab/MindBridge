@@ -12,6 +12,10 @@ dist/
 .env
 .env.local
 .mindbridge/
+# Benchmark corpora, results, and run configurations. `.benchmarks/configs/` holds the files
+# passed to `mindbridge-bench eval --config`, which may carry endpoint credentials, so keep
+# this rule covering the whole directory. The committed template lives at
+# docs/examples/eval.example.yaml instead.
 .benchmarks/
 
 # Autoresearch workspaces and generated artifacts are local-only.
