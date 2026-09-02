@@ -19,6 +19,7 @@ from mindbridge.benchmarks.eval_adapters import MediaResolver, load_task
 from mindbridge.benchmarks.eval_cache import CachedAnswer, EvidenceInterval, ResponseCache
 from mindbridge.benchmarks.prepare_media import (
     _OPENEQA_FRAME_RATE,
+    _egolife_manifest,
     _lifelong_manifest,
     _m3_manifest,
     _openeqa_episode,
@@ -119,6 +120,64 @@ def test_m3_timestamp_drives_preparation_without_before_clip(
     _m3_manifest(dataset, media, tmp_path / "cache", None, 0, None)
 
     assert observed == [10.0]
+
+
+def test_egolife_ingests_reencoded_segments_at_the_declared_causal_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dataset = tmp_path / "EgoLifeQA_A1_JAKE.json"
+    dataset.write_text(
+        json.dumps(
+            [
+                {
+                    "ID": "q1",
+                    "query_time": {"date": "DAY1", "time": "00003000"},
+                    "type": "EntityLog",
+                    "need_audio": False,
+                    "need_name": False,
+                    "last_time": False,
+                    "question": "Where is it?",
+                    "choice_a": "a",
+                    "choice_b": "b",
+                    "choice_c": "c",
+                    "choice_d": "d",
+                    "answer": "A",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    day = tmp_path / "media" / "A1_JAKE" / "DAY1"
+    day.mkdir(parents=True)
+    source = day / "DAY1_A1_JAKE_00000000.mp4"
+    source.write_bytes(b"video")
+    requested: list[tuple[Path, tuple[float, ...]]] = []
+
+    def segment(
+        source_path: Path, boundaries: tuple[float, ...], cache: Path, _announce: object
+    ) -> tuple[tuple[float, float, Path], ...]:
+        requested.append((source_path, boundaries))
+        prepared = cache / "prepared.mp4"
+        prepared.parent.mkdir(parents=True, exist_ok=True)
+        prepared.write_bytes(b"reduced")
+        return ((0.0, boundaries[-1], prepared),)
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._segment_video", segment)
+    units = _egolife_manifest(
+        "egolifeqa", dataset, tmp_path / "media", tmp_path / "cache", None, 0, None
+    )
+
+    # One re-encode per source clip, and the indexed part is the reduced copy rather than the
+    # 20 fps original -- while the causal window still comes from the filename's timecode.
+    assert requested == [(source, (30.0,))]
+    assert units["A1_JAKE"] == [
+        {
+            "path": str((tmp_path / "cache" / "A1_JAKE" / "prepared.mp4").resolve()),
+            "source_id": "DAY1_A1_JAKE_00000000",
+            "start_seconds": 0.0,
+            "end_seconds": 30.0,
+        }
+    ]
 
 
 def test_evaluation_digest_tracks_media_root_content(tmp_path: Path) -> None:
