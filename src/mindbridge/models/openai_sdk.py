@@ -72,12 +72,15 @@ Allowed kinds and the fields each one additionally requires, all of them strings
 
 cue_modality, valence, and arousal belong to affect alone and must be omitted from every other
 kind. cue_modality is exactly one of text, image, video, or audio: the sensory channel the cue
-arrived on, not a description of it. An affect proposal must also carry valence from -1 to 1 and
-arousal from 0 to 1, because those two scalars are what make it an affect rather than an event.
+arrived on, not a description of it, and it must be one the observation itself carried -- a
+written report that someone sounded tired is a text cue, not an audio one. An affect proposal must
+also carry valence from -1 to 1 and arousal from 0 to 1, because those two scalars are what make
+it an affect rather than an event.
 
 valid_from, valid_until, and spatial are optional on any kind. Times must be timezone-aware ISO
 8601. Spatial values use frame_id, anchor, x, y, optional z, orientation_xyzw, and
-position_uncertainty_m.
+position_uncertainty_m. Give spatial only when the observation states its own frame, and then
+reuse that frame_id and anchor unchanged; never introduce a frame of your own.
 
 Keep affect cues from different modalities separate. Do not infer a stable trait from one
 transient cue, diagnose a person, invent missing facts, or resolve conflicting evidence by
@@ -1398,10 +1401,11 @@ def _formation_results(
     expected = tuple(f"observation_{index}" for index, _value in enumerate(inputs))
     if set(by_id) != set(expected):
         raise _invalid_formation_response()
-    if dropped:
-        span = trace.get_current_span()
-        if span.is_recording():
-            span.set_attribute(FORMATION_PROPOSALS_DROPPED, dropped)
+    # Recorded even at zero: absence of the attribute would otherwise be indistinguishable from
+    # formation never having run, which is the failure this signal exists to make visible.
+    span = trace.get_current_span()
+    if span.is_recording():
+        span.set_attribute(FORMATION_PROPOSALS_DROPPED, dropped)
     return tuple(by_id[memory_id] for memory_id in expected)
 
 

@@ -252,6 +252,17 @@ def mem_gallery_format_constraint(point: str) -> str:
     return f"\n\n{prompt.text}" if prompt is not None else ""
 
 
+def mem_gallery_refusal(point: str) -> str | None:
+    """Return the refusal wording one task type's constraint mandates, when it mandates one.
+
+    Only `AR` carries one -- its constraint tells the model to answer `Not mentioned.` when the
+    memories do not cover the question -- so the other eight task types report `None` and keep
+    the product's own abstention wording as the only signal.
+    """
+    prompt = _MEM_GALLERY_CONSTRAINTS.get(point.upper())
+    return prompt.refusal if prompt is not None else None
+
+
 CLBENCH_QUERY_PROMPT = PromptSpec(
     name="clbench_query",
     version="clbench_query_v1",

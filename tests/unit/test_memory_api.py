@@ -764,9 +764,14 @@ def test_explicit_event_range_stays_strict_after_temporal_fallback(tmp_path: Pat
         )
 
     assert [hit.id for hit in result.hits] == [allowed.id]
-    rejected = {candidate.memory_id: candidate.rejected_by for candidate in result.trace.candidates}
-    assert rejected[outside.id] is RetrievalRejection.OCCURRENCE_RANGE
-    assert rejected[allowed.id] is None
+    by_memory = {candidate.memory_id: candidate for candidate in result.trace.candidates}
+    assert by_memory[outside.id].rejected_by is RetrievalRejection.OCCURRENCE_RANGE
+    assert by_memory[allowed.id].rejected_by is None
+    # `lexical_relevance` is a ranking score contribution, and ranking never ran for the rejected
+    # candidate. Reporting the index-side strength in its place would make one disposition's
+    # figure larger than the other's for the same match, so the unknown component stays unset.
+    assert by_memory[outside.id].lexical_relevance is None
+    assert by_memory[outside.id].dense_relevance is not None
 
 
 @pytest.mark.parametrize(

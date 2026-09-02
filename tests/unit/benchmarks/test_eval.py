@@ -1959,3 +1959,66 @@ def test_memlens_questions_declare_the_refusal_their_own_prompt_mandates(tmp_pat
     assert f'"{MEMLENS_QUERY_PROMPT.refusal}"' in MEMLENS_QUERY_PROMPT.text
     assert question.refusal == MEMLENS_QUERY_PROMPT.refusal
     assert eval_module._declined(MEMLENS_QUERY_PROMPT.refusal, question)
+
+
+def test_mem_gallery_refusal_questions_declare_the_wording_their_constraint_mandates(
+    tmp_path: Path,
+) -> None:
+    # Loading the real task, for the same reason the MemLens case does: `AR` is the only one of
+    # the nine task types whose constraint overrides the refusal wording, so a declaration the
+    # loader never attaches reports zero refusals for it while the model keeps refusing.
+    from mindbridge.benchmarks.prompts import MEM_GALLERY_REFUSAL_PROMPT
+
+    dialog = tmp_path / "dialog"
+    dialog.mkdir()
+    (dialog / "topic.json").write_text(
+        json.dumps(
+            {
+                "character_profile": {
+                    "name": "Mira",
+                    "persona_summary": "A gardener.",
+                    "conversation_style": "warm",
+                },
+                "multi_session_dialogues": [
+                    {
+                        "session_id": "D1",
+                        "date": "2024-05-02",
+                        "dialogues": [
+                            {"round": "D1:1", "user": "I planted basil.", "assistant": "Nice."}
+                        ],
+                    }
+                ],
+                "human-annotated QAs": [
+                    {
+                        "point": "AR",
+                        "question": "What did I plant in the greenhouse?",
+                        "answer": "Not mentioned.",
+                        "session_id": ["D1"],
+                    },
+                    {
+                        "point": "FR",
+                        "question": "What did I plant?",
+                        "answer": "Basil.",
+                        "session_id": ["D1"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_task(
+        TASKS["mem-gallery"], root=tmp_path, dataset_path=dialog, verify_digest=False
+    )
+    by_point = {
+        question.metadata["point"]: question for unit in loaded.units for question in unit.questions
+    }
+
+    assert MEM_GALLERY_REFUSAL_PROMPT.refusal is not None
+    # Tied to the constraint text, so changing the mandated wording without the declaration fails.
+    assert MEM_GALLERY_REFUSAL_PROMPT.refusal in MEM_GALLERY_REFUSAL_PROMPT.text
+    assert by_point["AR"].refusal == MEM_GALLERY_REFUSAL_PROMPT.refusal
+    assert eval_module._declined(MEM_GALLERY_REFUSAL_PROMPT.refusal, by_point["AR"])
+    # The other eight types are asked without that constraint, so they must not claim it.
+    assert by_point["FR"].refusal is None
+    assert not eval_module._declined(MEM_GALLERY_REFUSAL_PROMPT.refusal, by_point["FR"])

@@ -15,6 +15,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+import mindbridge.memory as memory_module
 import mindbridge.models.openai_sdk as openai_backend
 from mindbridge._telemetry import (
     FORMATION_PROPOSALS_DROPPED,
@@ -45,10 +46,13 @@ from mindbridge.models.openai_sdk import UNKNOWN_ANSWER, OpenAIModels
 from mindbridge.types import (
     AbstentionReason,
     AssetRef,
+    FormationProposal,
     MemoryKind,
     Modality,
     ObservationContext,
     SearchHit,
+    SpatialAnchor,
+    SpatialContext,
 )
 
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
@@ -1876,3 +1880,53 @@ def test_a_malformed_proposal_does_not_discard_its_valid_siblings() -> None:
         if span.attributes is not None and FORMATION_PROPOSALS_DROPPED in span.attributes
     ]
     assert dropped == [2]
+
+
+@pytest.mark.parametrize(
+    ("proposal", "phrase"),
+    [
+        pytest.param(
+            FormationProposal(
+                kind=MemoryKind.AFFECT,
+                content="The speaker sounded exhausted",
+                subject="dad",
+                value="exhausted",
+                cue_modality=Modality.AUDIO,
+                valence=-0.6,
+                arousal=0.2,
+                confidence=0.8,
+            ),
+            "one the observation itself carried",
+            id="cue_modality",
+        ),
+        pytest.param(
+            FormationProposal(
+                kind=MemoryKind.EVENT,
+                content="The call happened in the kitchen",
+                spatial=SpatialContext(
+                    frame_id="house", anchor=SpatialAnchor.OBSERVER, x=1.0, y=2.0
+                ),
+                confidence=0.7,
+            ),
+            "reuse that frame_id and anchor unchanged",
+            id="spatial",
+        ),
+    ],
+)
+def test_formation_prompt_states_every_source_rule_the_validator_enforces(
+    proposal: FormationProposal, phrase: str
+) -> None:
+    # These two rules are enforced in `memory.py`, not by the adapter's shape checks, and they
+    # fail the whole `add()` after the source has committed -- so a proposal that breaks one is
+    # unrecoverable for the caller, and the prompt is the only place the model can learn the rule.
+    # Red in both directions: if the prompt drops the sentence, or if the validator drops the rule.
+    source = FormationInput(
+        memory_id="observation_0",
+        content=ModelInput(text="Dad sounded exhausted on the phone."),
+        context=ObservationContext(),
+    )
+
+    with pytest.raises(ModelError):
+        memory_module._validate_formation_proposal(proposal, source)
+
+    assert phrase in openai_backend._FORMATION_SYSTEM_PROMPT

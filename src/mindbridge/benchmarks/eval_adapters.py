@@ -979,6 +979,7 @@ def _mem_gallery(
     from mindbridge.benchmarks.prompts import (
         MEM_GALLERY_QUERY_PROMPT,
         mem_gallery_format_constraint,
+        mem_gallery_refusal,
     )
 
     units = []
@@ -995,6 +996,7 @@ def _mem_gallery(
                 media,
                 MEM_GALLERY_QUERY_PROMPT.text,
                 mem_gallery_format_constraint(question.point),
+                mem_gallery_refusal(question.point),
             )
             for question in topic.questions
         )
@@ -1030,6 +1032,7 @@ def _gallery_question(
     media: MediaResolver,
     prompt_template: str,
     format_constraint: str,
+    refusal: str | None,
 ) -> EvalQuestion:
     parts = _query_parts(
         prompt_template,
@@ -1047,6 +1050,7 @@ def _gallery_question(
         (question.reference_answer,),
         metadata={"point": question.point, "clue_ids": question.clue_round_ids},
         source_question=question.question,
+        refusal=refusal,
     )
 
 

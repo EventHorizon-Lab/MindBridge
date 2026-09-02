@@ -2195,7 +2195,6 @@ class Memory:
                     index_ids_by_memory,
                     dense_relevance,
                     dense_confidence,
-                    lexical_relevance_by_rank,
                     lexical_matches,
                 )
                 if memory_type is not None:
@@ -2206,7 +2205,6 @@ class Memory:
                         index_ids_by_memory,
                         dense_relevance,
                         dense_confidence,
-                        lexical_relevance_by_rank,
                         lexical_matches,
                     )
                     memories = tuple(
@@ -5843,7 +5841,6 @@ def _early_candidate_trace(
     index_ids: tuple[str, ...],
     dense_relevance: Mapping[str, float],
     dense_confidence: Mapping[str, float],
-    lexical_index_relevance: Mapping[str, float],
     lexical_matches: set[str],
     rejected_by: RetrievalRejection,
 ) -> RetrievalCandidateTrace:
@@ -5853,9 +5850,11 @@ def _early_candidate_trace(
         index_ids=index_ids,
         dense_relevance=dense_relevance.get(memory_id, 0.0),
         dense_confidence=dense_confidence.get(memory_id, 0.0),
-        # Ranking credit needs the term coverage, which is computed from content this candidate
-        # never had hydrated, so the trace reports the index-side strength it does know.
-        lexical_relevance=lexical_index_relevance.get(memory_id, 0.0),
+        # `lexical_relevance` is the ranking score contribution, which needs the term coverage
+        # computed from content this candidate never had hydrated. Reporting the index-side
+        # strength in its place would make the two figures incomparable across dispositions --
+        # a rejected candidate would appear to carry more lexical evidence than a ranked one --
+        # so the unknown component stays `None` and `lexical_match` carries what is known.
         lexical_match=lexical_match,
         gate_confidence=max(
             dense_confidence.get(memory_id, 0.0),
@@ -5878,7 +5877,7 @@ def _extend_hydration_traces(
     (
         dense_relevance,
         dense_confidence,
-        lexical_index_relevance,
+        _lexical_index_relevance,
         lexical_matches,
     ) = _parent_index_signals(candidates, hydrated_documents)
     dense_by_id = {hit.id: hit for hit in candidates.dense}
@@ -5919,7 +5918,6 @@ def _extend_hydration_traces(
                 parent_index_ids,
                 dense_relevance,
                 dense_confidence,
-                lexical_index_relevance,
                 lexical_matches,
                 RetrievalRejection.OCCURRENCE_RANGE,
             )
@@ -5933,7 +5931,6 @@ def _extend_missing_memory_traces(
     index_ids_by_memory: Mapping[str, tuple[str, ...]],
     dense_relevance: Mapping[str, float],
     dense_confidence: Mapping[str, float],
-    lexical_index_relevance: Mapping[str, float],
     lexical_matches: set[str],
 ) -> None:
     if target is None:
@@ -5947,7 +5944,6 @@ def _extend_missing_memory_traces(
                     index_ids_by_memory[memory_id],
                     dense_relevance,
                     dense_confidence,
-                    lexical_index_relevance,
                     lexical_matches,
                     RetrievalRejection.MISSING_MEMORY,
                 )
@@ -5961,7 +5957,6 @@ def _extend_memory_type_traces(
     index_ids_by_memory: Mapping[str, tuple[str, ...]],
     dense_relevance: Mapping[str, float],
     dense_confidence: Mapping[str, float],
-    lexical_index_relevance: Mapping[str, float],
     lexical_matches: set[str],
 ) -> None:
     if target is None:
@@ -5974,7 +5969,6 @@ def _extend_memory_type_traces(
                     index_ids_by_memory[memory.memory_id],
                     dense_relevance,
                     dense_confidence,
-                    lexical_index_relevance,
                     lexical_matches,
                     RetrievalRejection.MEMORY_TYPE,
                 )
