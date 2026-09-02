@@ -446,6 +446,7 @@ def _memory(
     transcriber: _FakeSpeech | None = None,
     decay_half_life_days: float | None = None,
     evidence_budget_chars: int | None = None,
+    reinforce_on_answer: bool = True,
 ) -> Memory:
     models = models or _FakeModels()
     return Memory(
@@ -455,6 +456,7 @@ def _memory(
         transcriber=models if transcriber is None else transcriber,
         decay_half_life_days=decay_half_life_days,
         evidence_budget_chars=evidence_budget_chars,
+        reinforce_on_answer=reinforce_on_answer,
     )
 
 
@@ -3387,6 +3389,36 @@ def test_index_quantization_change_rebuilds_without_reembedding(tmp_path: Path) 
         assert recipe.endswith("quantization-int8")
 
 
+def test_a_full_text_tokenizer_change_rebuilds_without_reembedding(tmp_path: Path) -> None:
+    """A tokenizer change rewrites derived documents and leaves every stored vector correct.
+
+    Version 9 ran a Chinese segmenter over the CJK full-text field, which returned nothing for
+    Japanese or Korean, so version 10 tokenizes that field into script-agnostic character
+    bigrams. Filing the superseded recipe alongside the ones that also invalidate the embeddings
+    would charge every existing store a full re-embed to fix a tokenizer, and the storage rules
+    require a missing index to rebuild without re-embedding stored content.
+    """
+    with Memory(tmp_path, embedder=_FakeModels()) as memory:
+        record = memory.add("preserved memory")
+    with LocalStore(tmp_path) as store:
+        store.set_metadata(
+            "index.recipe",
+            "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
+            "context-keys-v9:quantization-none",
+        )
+
+    reopened_models = _FakeModels()
+    with Memory(tmp_path, embedder=reopened_models):
+        assert record.id in _FakeIndex.instances[-1].documents
+
+    assert reopened_models.embed_inputs == []
+    with LocalStore(tmp_path) as store:
+        recipe = store.get_metadata("index.recipe")
+        assert recipe is not None
+        assert ":fts-stemmed-plus-bigram:" in recipe
+        assert recipe.endswith("context-keys-v10:quantization-none")
+
+
 def test_index_quantization_requires_the_public_enum(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="index_quantization"):
         Memory(
@@ -3791,6 +3823,81 @@ def test_ask_returns_only_retrieved_hits_the_answerer_used(tmp_path: Path) -> No
 
     assert result.answer == "grounded"
     assert result.hits == (models.answer_calls[-1][1][0],)
+
+
+def test_answering_reinforces_only_the_evidence_the_model_cited(tmp_path: Path) -> None:
+    """Answering has to move `access_count`, or decay only ever measures age.
+
+    `reinforce` was reachable from the public operation and the CLI and from nowhere else, so an
+    agent driving MindBridge over MCP or REST left every memory at zero for ever: the
+    reinforcement factor in `_ranking_signals` was pinned at 1.0, and turning on
+    `decay_half_life_days` degraded memories purely by age with no usage signal to hold up the
+    ones that keep answering questions. The set reinforced is the answer's own citations, so a
+    candidate that was retrieved and then not used earns nothing.
+    """
+
+    class CitingModels(_FakeModels):
+        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+            super().answer(question, hits)
+            return AnswerResult(answer="grounded", hits=(hits[0],))
+
+    models = CitingModels()
+    with _memory(tmp_path, models) as memory:
+        memory.add_many(("red first", "red second"))
+        result = memory.ask("red", limit=2)
+        retrieved = models.answer_calls[-1][1]
+        assert len(retrieved) == 2
+        cited, ignored = retrieved[0].id, retrieved[1].id
+        assert [hit.id for hit in result.hits] == [cited]
+
+        # Bookkeeping must never cost an answer that has already been generated and paid for.
+        original = memory._store.reinforce_memories
+
+        def _refuse(memory_ids: Sequence[str], *, accessed_at: datetime) -> int:
+            raise StorageError("reinforcement unavailable")
+
+        memory._store.reinforce_memories = _refuse  # type: ignore[method-assign]
+        try:
+            assert memory.ask("red", limit=2).answer == "grounded"
+        finally:
+            memory._store.reinforce_memories = original  # type: ignore[method-assign]
+
+    with LocalStore(tmp_path) as store:
+        used = store.read_memory(cited)
+        unused = store.read_memory(ignored)
+        assert used is not None and unused is not None
+        # One count, not two: the second answer's reinforcement was the one that failed.
+        assert used.access_count == 1
+        assert unused.access_count == 0
+        assert used.last_accessed_at is not None
+        assert unused.last_accessed_at is None
+
+
+def test_reinforce_on_answer_false_keeps_answering_free_of_side_effects(tmp_path: Path) -> None:
+    """Measurement needs answering to leave the ranking alone.
+
+    Reinforcing during an evaluation makes one question's retrieval depend on which earlier
+    questions already answered, and under concurrency on the order their updates committed, so a
+    run stops being reproducible from its seed. The benchmark harness therefore composes stores
+    with this off, and the flag has to reach the write rather than only the constructor.
+    """
+
+    class CitingModels(_FakeModels):
+        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+            super().answer(question, hits)
+            return AnswerResult(answer="grounded", hits=(hits[0],))
+
+    with _memory(tmp_path, CitingModels(), reinforce_on_answer=False) as memory:
+        memory.add_many(("red first", "red second"))
+        result = memory.ask("red", limit=2)
+        assert result.answer == "grounded"
+        cited = result.hits[0].id
+
+    with LocalStore(tmp_path) as store:
+        untouched = store.read_memory(cited)
+        assert untouched is not None
+        assert untouched.access_count == 0
+        assert untouched.last_accessed_at is None
 
 
 def test_startup_removes_a_cas_file_without_sqlite_metadata(tmp_path: Path) -> None:

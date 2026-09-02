@@ -15,7 +15,15 @@ import shutil
 import unicodedata
 import wave
 from collections import Counter, deque
-from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterable,
+    AsyncIterator,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, suppress
 from contextvars import copy_context
@@ -148,8 +156,19 @@ from mindbridge.types import (
 
 _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
 _INDEX_RECIPE_PREFIX = (
-    "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:context-keys-v9"
+    "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:context-keys-v10"
 )
+# Recipes whose stored embeddings are still correct, so the index is rebuilt from SQLite without
+# paying to embed the content again. A full-text tokenizer change belongs here and not below: it
+# rewrites the derived documents and leaves every vector untouched. Version 9 named its CJK field
+# `fts-dual-language` because it ran a Chinese segmenter, which returned nothing for Japanese or
+# Korean; version 10 tokenizes that field into script-agnostic character bigrams instead.
+_REINDEXABLE_INDEX_RECIPES = frozenset(
+    "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
+    f"context-keys-v9:quantization-{mode.value}"
+    for mode in IndexQuantization
+)
+# Recipes that also invalidate the stored embeddings, so reopening pays for a full re-embed.
 _LEGACY_INDEX_RECIPES = frozenset(
     {
         "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:single-vector-v2",
@@ -232,7 +251,39 @@ _NO_TRANSCRIPTION_SPACE = "none:asr-v1"
 _NO_FACE_SPACE = "none:face-v1"
 _ISO_DATE = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 _LEXICAL_TERM = re.compile(r"\w+")
-_CJK_CHARACTER = re.compile(r"[\u3400-\u9fff]")
+# Runs `\w+` cannot split into words, because they are written without spaces and no segmenter
+# is available here: Han ideographs (Chinese, and Japanese kanji) and Japanese kana. What follows
+# is character and adjacent-character bigram splitting, which is script-agnostic, so no Japanese
+# text is handed to a Chinese segmenter by being listed here.
+#
+# This is deliberately narrower than the identically named predicate in the Zvec index, which
+# also lists Hangul. The two answer different questions. The index one asks which documents need
+# the character-bigram full-text field instead of the English stemmer, and Korean needs it
+# because its particles agglutinate onto the eojeol. This one asks which runs `\w+` fails to
+# split at all, and Korean is space-delimited, so `\w+` already yields eojeol tokens here and
+# per-syllable Hangul terms would only dilute them.
+_UNSEGMENTED_RUN = re.compile(
+    "["
+    "\u3040-\u30ff"  # Hiragana and Katakana
+    "\u31f0-\u31ff"  # Katakana Phonetic Extensions
+    "\u3400-\u4dbf"  # CJK Unified Ideographs Extension A
+    "\u4e00-\u9fff"  # CJK Unified Ideographs
+    "\uf900-\ufaff"  # CJK Compatibility Ideographs
+    "\uff66-\uff9f"  # Halfwidth Katakana
+    "\U00020000-\U0003ffff"  # CJK Unified Ideographs Extension B and later
+    "]+"
+)
+# The Chinese counterpart of `_LEXICAL_NOISE_TERMS`: particles, copulas, prepositions,
+# conjunctions, pronouns, and interrogatives. Stripping them matters more than it does in
+# English, because every one of them otherwise carries IDF weight into the coverage ratio that
+# performs cross-route fusion, and a question is mostly these characters. Negation characters
+# are excluded on purpose; `_NEGATION_TERMS` weights those up rather than away.
+_CJK_NOISE_CHARACTERS = frozenset(
+    "的了着地得之吗呢吧啊呀嘛么们"
+    "是在就都也还把被给对从跟和与"
+    "或及而但因所以什谁哪怎何我你"
+    "他她它这那其请"
+)
 _NEGATION_TERMS = frozenset(
     {"no", "not", "never", "neither", "nor", "without", "不", "没", "未", "无", "非", "别"}
 )
@@ -474,6 +525,7 @@ class Memory:
         ambiguity_margin: float = _DEFAULT_CONFIG.ambiguity_margin,
         evidence_budget_chars: int | None = _DEFAULT_CONFIG.evidence_budget_chars,
         decay_half_life_days: float | None = _DEFAULT_CONFIG.decay_half_life_days,
+        reinforce_on_answer: bool = _DEFAULT_CONFIG.reinforce_on_answer,
         speaker_similarity: float = _DEFAULT_CONFIG.speaker_similarity,
         speaker_margin: float = _DEFAULT_CONFIG.speaker_margin,
         face_similarity: float = _DEFAULT_CONFIG.face_similarity,
@@ -507,6 +559,9 @@ class Memory:
         self._ambiguity_margin = _unit_interval(ambiguity_margin, "ambiguity_margin")
         self._evidence_budget = _evidence_budget(evidence_budget_chars)
         self._decay_half_life = _decay_half_life(decay_half_life_days)
+        if not isinstance(reinforce_on_answer, bool):
+            raise ValidationError("reinforce_on_answer must be a boolean")
+        self._reinforce_on_answer = reinforce_on_answer
 
         self._store = _open_store(self.data_dir)
         self._embedder = embedder
@@ -617,6 +672,7 @@ class Memory:
             ambiguity_margin=config.ambiguity_margin,
             evidence_budget_chars=config.evidence_budget_chars,
             decay_half_life_days=config.decay_half_life_days,
+            reinforce_on_answer=config.reinforce_on_answer,
             speaker_similarity=config.speaker_similarity,
             speaker_margin=config.speaker_margin,
             face_similarity=config.face_similarity,
@@ -1024,11 +1080,40 @@ class Memory:
             self._persist_transcripts(assets)
             result = self._answer(routed_question, routed_hits)
             used_ids = {hit.id for hit in result.hits}
+            grounding = tuple(hit for hit in hits if hit.id in used_ids)
+            self._reinforce_answered(grounding)
             return AnswerResult(
                 answer=result.answer,
-                hits=tuple(hit for hit in hits if hit.id in used_ids),
+                hits=grounding,
                 abstained=result.abstained,
                 abstention_reason=result.abstention_reason,
+            )
+
+    def _reinforce_answered(self, hits: Sequence[SearchHit]) -> None:
+        """Count the evidence an answer cited, so `access_count` is not permanently zero.
+
+        `_ranking_signals` scales a candidate by its access count and, when `decay_half_life_days`
+        is set, ages it by the time since it was last read. Nothing but the explicit `reinforce`
+        operation ever wrote either field, so for an agent driving MindBridge over MCP or REST the
+        reinforcement factor was pinned at 1.0 for ever and enabling decay degraded memories
+        purely by age, with no usage signal to hold up the ones that keep answering questions.
+        Answering is that signal, and this set is already narrowed to what the model cited.
+
+        `_write_lock` is reentrant and `ask` holds none of it at this point, so taking it here
+        cannot deadlock against the searches above, which release it before returning. A failure
+        is swallowed on purpose: this is bookkeeping, and losing it must not discard an answer
+        that has already been generated and paid for.
+
+        `reinforce_on_answer=False` turns it off, which measurement needs: reinforcing mid-run
+        makes one question's retrieval depend on which earlier questions answered, and under
+        concurrency on the order their updates committed.
+        """
+        if not hits or not self._reinforce_on_answer:
+            return
+        with suppress(Exception), self._write_lock:
+            self._store.reinforce_memories(
+                tuple(hit.id for hit in hits),
+                accessed_at=datetime.now(timezone.utc),
             )
 
     def get(self, memory_id: str) -> MemoryRecord:
@@ -2033,7 +2118,7 @@ class Memory:
         )
         vectors = tuple(dict.fromkeys(self._embed(model_inputs, task=EmbedTask.QUERY)))
         lexical_query = focused_text
-        if not (_lexical_terms(lexical_query) - _LEXICAL_NOISE_TERMS):
+        if not _lexical_query_terms(lexical_query):
             lexical_query = ""
         candidate_limit = max(_RERANK_CANDIDATES, limit * 3)
         candidate_ceiling = max(candidate_limit, limit * (_MAX_RETRIEVAL_KEYS + 1))
@@ -3806,6 +3891,7 @@ class AsyncMemory:
         ambiguity_margin: float = _DEFAULT_CONFIG.ambiguity_margin,
         evidence_budget_chars: int | None = _DEFAULT_CONFIG.evidence_budget_chars,
         decay_half_life_days: float | None = _DEFAULT_CONFIG.decay_half_life_days,
+        reinforce_on_answer: bool = _DEFAULT_CONFIG.reinforce_on_answer,
         speaker_similarity: float = _DEFAULT_CONFIG.speaker_similarity,
         speaker_margin: float = _DEFAULT_CONFIG.speaker_margin,
         face_similarity: float = _DEFAULT_CONFIG.face_similarity,
@@ -3827,6 +3913,7 @@ class AsyncMemory:
             ambiguity_margin=ambiguity_margin,
             evidence_budget_chars=evidence_budget_chars,
             decay_half_life_days=decay_half_life_days,
+            reinforce_on_answer=reinforce_on_answer,
             speaker_similarity=speaker_similarity,
             speaker_margin=speaker_margin,
             face_similarity=face_similarity,
@@ -3865,6 +3952,7 @@ class AsyncMemory:
             ambiguity_margin=config.ambiguity_margin,
             evidence_budget_chars=config.evidence_budget_chars,
             decay_half_life_days=config.decay_half_life_days,
+            reinforce_on_answer=config.reinforce_on_answer,
             speaker_similarity=config.speaker_similarity,
             speaker_margin=config.speaker_margin,
             face_similarity=config.face_similarity,
@@ -4365,6 +4453,27 @@ class AsyncCaptureStream:
         return await self._memory.add(item)
 
 
+StreamContext = ObservationContext | Callable[[], ObservationContext | None] | None
+"""Provenance for streamed observations: one fixed value, or a sampler read at each boundary."""
+
+
+def _stream_context(context: StreamContext) -> Callable[[], ObservationContext | None]:
+    """Normalize a fixed context or a per-observation sampler into one sampler.
+
+    A capture stream outlives the observations it commits, so a robot's pose is not a property
+    of the stream. A callable is read once per closed observation, which is the only moment at
+    which the adapter knows which interval the pose belongs to. A fixed `ObservationContext`
+    stays accepted because a static camera really does have one.
+    """
+    if context is None:
+        return lambda: None
+    if isinstance(context, ObservationContext):
+        return lambda: context
+    if not callable(context):
+        raise ValidationError("context must be an ObservationContext or a callable returning one")
+    return context
+
+
 class AsyncAudioStream:
     """Normalize PCM, VAD, ASR, and acoustic boundaries into associated capture events."""
 
@@ -4374,6 +4483,7 @@ class AsyncAudioStream:
         *,
         limit: int = 10,
         memory_type: MemoryType | None = None,
+        context: StreamContext = None,
         reference_at: datetime | None = None,
         max_streams: int = 32,
     ) -> None:
@@ -4381,6 +4491,8 @@ class AsyncAudioStream:
             raise ValidationError("memory must be an AsyncMemory")
         self._memory = memory
         self._max_streams = _positive_dimension(max_streams, "max_streams")
+        self._written_type = _optional_memory_type(memory_type) or MemoryType.SEMANTIC
+        self._context = _stream_context(context)
         capabilities = memory._memory._embedding_capabilities
         self._native_audio = Modality.AUDIO in capabilities
         self._native_text = Modality.TEXT in capabilities
@@ -4501,11 +4613,15 @@ class AsyncAudioStream:
         if state is None:
             return None
         occurred_at, occurred_end = _audio_interval(state, occurred_end)
+        # Sampled here, at the boundary, so the pose belongs to the interval being committed.
+        context = self._context()
         if state.pcm:
             item = StreamInput(
                 _pcm_blob(state),
                 occurred_at=occurred_at,
                 occurred_end=occurred_end,
+                memory_type=self._written_type,
+                context=context,
                 transcript=state.transcript or None,
             )
         elif state.transcript:
@@ -4513,6 +4629,8 @@ class AsyncAudioStream:
                 state.transcript,
                 occurred_at=occurred_at,
                 occurred_end=occurred_end,
+                memory_type=self._written_type,
+                context=context,
             )
         else:
             return StreamEvent(StreamPhase.CANCEL, stream_id=stream_id)
@@ -4528,6 +4646,7 @@ class AsyncVisionStream:
         *,
         limit: int = 10,
         memory_type: MemoryType | None = None,
+        context: StreamContext = None,
         reference_at: datetime | None = None,
         max_streams: int = 32,
     ) -> None:
@@ -4535,6 +4654,8 @@ class AsyncVisionStream:
             raise ValidationError("memory must be an AsyncMemory")
         self._memory = memory
         self._max_streams = _positive_dimension(max_streams, "max_streams")
+        self._written_type = _optional_memory_type(memory_type) or MemoryType.SEMANTIC
+        self._context = _stream_context(context)
         capabilities = memory._memory._embedding_capabilities
         self._native_image = Modality.IMAGE in capabilities
         self._native_text = Modality.TEXT in capabilities
@@ -4640,11 +4761,15 @@ class AsyncVisionStream:
             state.description = (
                 await asyncio.to_thread(self._memory._memory._describe_vision, (state.image,))
             )[0]
+        # Sampled here, at the boundary, so the pose belongs to the scene being committed.
+        context = self._context()
         if state.image is not None:
             item = StreamInput(
                 state.image,
                 occurred_at=state.occurred_at,
                 occurred_end=occurred_end,
+                memory_type=self._written_type,
+                context=context,
                 description=state.description or None,
             )
         elif state.description:
@@ -4652,6 +4777,8 @@ class AsyncVisionStream:
                 state.description,
                 occurred_at=state.occurred_at,
                 occurred_end=occurred_end,
+                memory_type=self._written_type,
+                context=context,
             )
         else:
             return StreamEvent(StreamPhase.CANCEL, stream_id=stream_id)
@@ -5694,7 +5821,9 @@ def _known_metadata_upgrade(
     if key == _STORE_METADATA_KEYS["space"] and stored in legacy_embedding_spaces:
         return True
     if key == _STORE_METADATA_KEYS["index"] and stored in (
-        _LEGACY_INDEX_RECIPES | {_index_recipe(mode) for mode in IndexQuantization}
+        _LEGACY_INDEX_RECIPES
+        | _REINDEXABLE_INDEX_RECIPES
+        | {_index_recipe(mode) for mode in IndexQuantization}
     ):
         return stored in _LEGACY_INDEX_RECIPES
     return None
@@ -6180,7 +6309,7 @@ def _lexical_relevance(
     query: str,
     memories: Sequence[StoredMemory],
 ) -> dict[str, float]:
-    query_terms = _lexical_terms(query) - _LEXICAL_NOISE_TERMS
+    query_terms = _lexical_query_terms(query)
     if not query_terms or not memories:
         return {}
     documents = {memory.memory_id: _lexical_terms(memory.content) for memory in memories}
@@ -6199,11 +6328,40 @@ def _lexical_relevance(
 
 
 def _lexical_terms(value: str) -> frozenset[str]:
+    """Split text into words, plus characters and adjacent-character bigrams for unspaced runs.
+
+    `\\w+` matches an entire CJK run as one token. That token is by construction the rarest term
+    in any corpus, so it took the largest IDF weight into the coverage ratio and could never
+    match anything, which put `_LEXICAL_FULL_COVERAGE` — the one term that actually fuses the
+    dense and full-text routes — permanently out of reach for every multi-character Chinese
+    query. Runs are therefore removed before word splitting rather than left alongside their
+    parts, and re-emitted as characters and bigrams: the dependency-free stand-in for a
+    segmenter, and the reason a query needs an adjacent pair to match rather than one character
+    that happens to appear somewhere.
+    """
     normalized = unicodedata.normalize("NFKC", value).casefold()
-    terms = {*_LEXICAL_TERM.findall(normalized), *_CJK_CHARACTER.findall(normalized)}
+    terms = set(_LEXICAL_TERM.findall(_UNSEGMENTED_RUN.sub(" ", normalized)))
+    for run in _UNSEGMENTED_RUN.findall(normalized):
+        terms.update(run)
+        terms.update(run[index : index + 2] for index in range(len(run) - 1))
     if _NEGATED_CONTRACTION.search(normalized) is not None:
         terms.add("not")
     return frozenset(terms)
+
+
+def _lexical_query_terms(value: str) -> frozenset[str]:
+    """Query terms with the scaffolding dropped, so coverage measures the distinctive ones.
+
+    A bigram is scaffolding only when both of its characters are, so `什么` goes and `的饮`
+    stays; otherwise a question's function words would keep full coverage unreachable through
+    the bigrams they appear in.
+    """
+    return frozenset(
+        term
+        for term in _lexical_terms(value)
+        if term not in _LEXICAL_NOISE_TERMS
+        and not all(character in _CJK_NOISE_CHARACTERS for character in term)
+    )
 
 
 def _temporal_factor(
