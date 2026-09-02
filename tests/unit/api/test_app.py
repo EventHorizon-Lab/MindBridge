@@ -31,8 +31,12 @@ from mindbridge.types import (
     Modality,
     ObservationContext,
     Page,
+    RetrievalCandidateTrace,
+    RetrievalRejection,
     RetrievalScope,
+    RetrievalTrace,
     SearchHit,
+    TracedSearchResult,
 )
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
@@ -151,6 +155,36 @@ class FakeMemory:
             )
         )
         return (_hit(),)
+
+    def search_with_trace(
+        self,
+        query: ContentInput,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> TracedSearchResult:
+        self._fail()
+        self.calls.append(
+            (
+                "search_with_trace",
+                query,
+                limit,
+                memory_type,
+                reference_at,
+                occurred_from,
+                occurred_until,
+            )
+        )
+        return TracedSearchResult(hits=(), trace=_trace())
+
+    def reinforce(self, memory_ids: Sequence[str]) -> int:
+        self._fail()
+        self.calls.append(("reinforce", tuple(memory_ids)))
+        return len(tuple(dict.fromkeys(memory_ids)))
 
     def ask(
         self,
@@ -669,6 +703,63 @@ def test_size_limit_runs_before_body_parsing() -> None:
     assert memory.calls == []
 
 
+def test_search_keeps_its_default_shape_and_explains_an_empty_result() -> None:
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory)) as client:
+        plain = client.post("/v1/memories/search", json={"query": "toolbox"})
+        explained = client.post("/v1/memories/search", json={"query": "toolbox", "explain": True})
+
+    assert plain.status_code == 200
+    assert plain.json()["hits"][0]["id"] == "memory_1"
+    assert plain.json()["trace"] is None
+    assert explained.status_code == 200
+    body = explained.json()
+    assert body["hits"] == []
+    assert body["trace"]["ambiguous"] is True
+    assert body["trace"]["candidate_limit"] == 50
+    assert body["trace"]["exhaustive"] is True
+    assert body["trace"]["candidates"] == [
+        {
+            "memory_id": "memory_1",
+            "index_ids": ["index_1"],
+            "dense_relevance": 0.42,
+            "dense_confidence": None,
+            "lexical_relevance": None,
+            "lexical_rerank_bonus": None,
+            "lexical_match": False,
+            "gate_confidence": 0.31,
+            "base_relevance": None,
+            "reinforcement_factor": None,
+            "temporal_factor": None,
+            "retention_factor": None,
+            "final_score": 0.4,
+            "rank": None,
+            "rejected_by": "minimum_relevance",
+        }
+    ]
+    assert memory.calls == [
+        ("search", "toolbox", 10, None, None, None, None),
+        ("search_with_trace", "toolbox", 10, None, None, None, None),
+    ]
+
+
+def test_reinforce_route_reaches_the_sdk_and_rejects_an_empty_list() -> None:
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory)) as client:
+        reinforced = client.post(
+            "/v1/memories/reinforce", json={"memory_ids": ["memory_1", "memory_1", "memory_2"]}
+        )
+        empty = client.post("/v1/memories/reinforce", json={"memory_ids": []})
+
+    assert reinforced.status_code == 200
+    assert reinforced.json() == {"reinforced": 2}
+    assert memory.calls == [("reinforce", ("memory_1", "memory_1", "memory_2"))]
+    assert empty.status_code == 422
+    assert empty.json()["code"] == "validation_error"
+
+
 def _record(
     memory_id: str,
     content: str,
@@ -690,6 +781,24 @@ def _record(
         occurred_at=occurred_at,
         occurred_end=occurred_end,
         metadata=metadata or {},
+    )
+
+
+def _trace() -> RetrievalTrace:
+    return RetrievalTrace(
+        candidates=(
+            RetrievalCandidateTrace(
+                memory_id="memory_1",
+                index_ids=("index_1",),
+                dense_relevance=0.42,
+                gate_confidence=0.31,
+                final_score=0.4,
+                rejected_by=RetrievalRejection.MINIMUM_RELEVANCE,
+            ),
+        ),
+        candidate_limit=50,
+        exhaustive=True,
+        ambiguous=True,
     )
 
 
