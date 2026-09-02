@@ -173,6 +173,32 @@ _MODALITY_BY_SUFFIX = {
     ".webm": Modality.VIDEO,
 }
 
+# The question-metadata fields each benchmark family groups its per-question
+# scores by, keyed by family so that one catalog task cannot drift from its
+# siblings. A family absent here reports no breakdown at all, which is
+# invisible in a results document, so `tests/unit/benchmarks/test_eval.py`
+# pins this table against the metadata the adapters actually emit.
+# `egomemreason` is deliberately absent: its public release has no answer key,
+# so every sample scores `None` and there is nothing to group.
+_BREAKDOWN_FIELDS: Mapping[str, tuple[str, ...]] = {
+    "locomo-refined": ("category",),
+    "m3-bench": ("question_types",),
+    "video-mme": ("duration", "domain", "task_type"),
+    "video-mme-v2": ("group_type", "level", "second_head", "third_head"),
+    "egolifeqa": ("day", "question_type"),
+    "egotempo": ("question_type",),
+    "memlens": ("question_type", "question_subtype"),
+    "mm-lifelong": ("question_type",),
+    "supermemory-vqa": ("skill",),
+    "atm-bench": ("qtype",),
+    "mem-gallery": ("point",),
+    "longmemeval": ("question_type",),
+    "clbench": ("context_category", "sub_category"),
+    "beam": ("category", "difficulty"),
+    "personamem-v3": ("task_family", "task_type"),
+    "openeqa": ("category",),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class _Arguments:
@@ -2683,20 +2709,7 @@ def _metric_breakdowns(
     arguments: _Arguments,
 ) -> dict[str, object]:
     family = task_family(task.spec.name)
-    fields = {
-        "locomo-refined": ("category",),
-        "m3-bench": ("question_types",),
-        "video-mme": ("duration", "domain", "task_type"),
-        "video-mme-v2": ("group_type", "level", "second_head", "third_head"),
-        "egolifeqa": ("day", "question_type"),
-        "egotempo": ("question_type",),
-        "memlens": ("question_type", "question_subtype"),
-        "mm-lifelong": ("question_type",),
-        "supermemory-vqa": ("skill",),
-        "atm-bench": ("qtype",),
-        "mem-gallery": ("point",),
-        "openeqa": ("category",),
-    }.get(family or "", ())
+    fields = _BREAKDOWN_FIELDS.get(family or "", ())
     result: dict[str, object] = {}
     for field_name in fields:
         grouped: dict[str, list[ScoredValue]] = {}
