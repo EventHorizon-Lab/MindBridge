@@ -75,7 +75,7 @@ from mindbridge.benchmarks.eval_statistics import (
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.mem_gallery import MemGalleryRound, MemGallerySession
 from mindbridge.benchmarks.model_config import ModelConfig
-from mindbridge.benchmarks.official_scorers import scorer_protocol
+from mindbridge.benchmarks.official_scorers import scorer_protocol, task_family
 from mindbridge.benchmarks.task_catalog import TASKS, TaskSpec, expand
 from mindbridge.benchmarks.video_mme_v2 import score_group_answers
 from mindbridge.models.base import EmbedTask, ModelInput, SpeechAnalysis, SpeechBackend
@@ -1955,6 +1955,97 @@ def test_metric_breakdowns_cover_every_catalog_task(tmp_path: Path) -> None:
     grouped = eval_module._metric_breakdowns(openeqa, (sample,), cast(Any, _breakdown_arguments()))
     assert "category" in grouped
     assert "object recognition" in cast(dict[str, object], grouped["category"])
+
+
+# The metadata fields each family groups its per-question scores by, written
+# from the adapters in `eval_adapters.py` -- which is what a real run puts in
+# `SampleResult.metadata` -- rather than read back off `_BREAKDOWN_FIELDS`, so
+# that a family losing its breakdown turns these tests red instead of silently
+# agreeing with the regression. That is how `longmemeval`, `clbench`, `beam`
+# and `personamem-v3` went a release reporting no breakdown at all. An empty
+# tuple means the family is expected to have no entry in the product table.
+_EXPECTED_BREAKDOWN_FIELDS: dict[str, tuple[str, ...]] = {
+    "locomo-refined": ("category",),
+    "m3-bench": ("question_types",),
+    "video-mme": ("duration", "domain", "task_type"),
+    "video-mme-v2": ("group_type", "level", "second_head", "third_head"),
+    "egolifeqa": ("day", "question_type"),
+    # No breakdown: the public release ships no answer key, so every sample
+    # scores `None` and there is nothing to group.
+    "egomemreason": (),
+    "egotempo": ("question_type",),
+    "memlens": ("question_type", "question_subtype"),
+    "mm-lifelong": ("question_type",),
+    "supermemory-vqa": ("skill",),
+    "atm-bench": ("qtype",),
+    "mem-gallery": ("point",),
+    "longmemeval": ("question_type",),
+    "clbench": ("context_category", "sub_category"),
+    "beam": ("category", "difficulty"),
+    "personamem-v3": ("task_family", "task_type"),
+    "openeqa": ("category",),
+}
+
+
+def _breakdown_task(family: str, tmp_path: Path) -> LoadedTask:
+    spec = next((spec for name, spec in TASKS.items() if task_family(name) == family), None)
+    assert spec is not None, f"no catalog task belongs to {family}"
+    return LoadedTask(
+        spec,
+        tmp_path / "dataset.json",
+        "0" * 64,
+        (EvalUnit("unit", (), (EvalQuestion("q1", ("question",), ("reference",)),)),),
+    )
+
+
+def _breakdown_sample(task: str, metadata: dict[str, object]) -> SampleResult:
+    return replace(_egomem_sample(1), task=task, score=1.0, metadata=metadata)
+
+
+@pytest.mark.parametrize("family", sorted(_EXPECTED_BREAKDOWN_FIELDS))
+def test_every_family_breaks_its_scores_down_by_its_own_metadata(
+    family: str, tmp_path: Path
+) -> None:
+    """Every field the product declares is one an adapter really emits."""
+    task = _breakdown_task(family, tmp_path)
+    fields_expected = _EXPECTED_BREAKDOWN_FIELDS[family]
+    sample = _breakdown_sample(task.spec.name, {name: f"{name}-value" for name in fields_expected})
+
+    breakdowns = eval_module._metric_breakdowns(task, (sample,), cast(Any, _breakdown_arguments()))
+
+    assert set(breakdowns) == set(fields_expected), family
+    for name in fields_expected:
+        cell = cast(dict[str, object], breakdowns[name])
+        assert f"{name}-value" in cell, f"{family}.{name}"
+
+
+def test_the_breakdown_table_is_exactly_the_fields_this_suite_pins() -> None:
+    # The behavioural test above only feeds the fields it expects, so a field
+    # name added to the product table that no adapter emits -- a rename, or a
+    # `question_type`/`question_types` slip -- would group nothing and stay
+    # invisible there. Compare the table itself so an addition has to be
+    # reviewed too, and so the families expected to have no entry really have
+    # none rather than an entry that happens to group nothing.
+    grouped = {family: fields for family, fields in _EXPECTED_BREAKDOWN_FIELDS.items() if fields}
+
+    assert grouped == eval_module._BREAKDOWN_FIELDS
+
+
+def test_the_breakdown_table_covers_every_catalog_family() -> None:
+    # A benchmark added to the catalog without a decision recorded here reports
+    # no breakdown at all, which is invisible in a results document.
+    assert {task_family(name) for name in TASKS} == set(_EXPECTED_BREAKDOWN_FIELDS)
+
+
+def test_an_unlabelled_beam_difficulty_is_left_out_of_the_breakdown(tmp_path: Path) -> None:
+    # BEAM publishes `difficulty` on some rows only. Grouping the rest under a
+    # literal "None" bucket would read as a difficulty tier in the report.
+    task = _breakdown_task("beam", tmp_path)
+    sample = _breakdown_sample(task.spec.name, {"category": "temporal", "difficulty": None})
+
+    breakdowns = eval_module._metric_breakdowns(task, (sample,), cast(Any, _breakdown_arguments()))
+
+    assert set(breakdowns) == {"category"}
 
 
 def _breakdown_arguments() -> SimpleNamespace:
