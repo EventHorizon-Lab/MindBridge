@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The optional FastAPI adapter exposes seven `Memory` operations under `/v1`. It validates transport
+The optional FastAPI adapter exposes eight `Memory` operations under `/v1`. It validates transport
 input, calls the injected synchronous memory, and serializes the public SDK values; it is not a
 separate storage or retrieval implementation.
 
@@ -119,7 +119,8 @@ SDK validator and error contract.
 | `POST /v1/memories` | `MemoryCreate` | `201 MemoryResponse` |
 | `POST /v1/memories/batch` | `MemoryBatchCreate` | `201 {"memories":[...]}` |
 | `GET /v1/memories` | `limit`, `cursor` query parameters | `200 PageResponse` |
-| `POST /v1/memories/search` | `QueryRequest` | `200 {"hits":[...]}` |
+| `POST /v1/memories/search` | `QueryRequest` | `200 {"hits":[...],"trace":null}` |
+| `POST /v1/memories/reinforce` | `ReinforceRequest` | `200 {"reinforced":int}` |
 | `GET /v1/memories/{memory_id}` | non-empty path value | `200 MemoryResponse` |
 | `DELETE /v1/memories/{memory_id}` | non-empty path value | `200 {"deleted":bool}` |
 | `POST /v1/answers` | `AnswerRequest` | `200 AnswerResponse` |
@@ -130,7 +131,8 @@ Request fields and defaults are:
 | --- | --- |
 | `MemoryCreate` | required `content`; optional `occurred_at`, `occurred_end`, `metadata`, `context`; `memory_type="semantic"` |
 | `MemoryBatchCreate` | `contents` with 1–100 items; optional per-item arrays `occurred_at`, `occurred_end`, `metadata`, `context`; `memory_type="semantic"` for the complete batch |
-| `QueryRequest` | required `query`; `limit=10`; optional `memory_type`, `reference_at`, `occurred_from`, `occurred_until`, `scope` |
+| `QueryRequest` | required `query`; `limit=10`; `explain=false`; optional `memory_type`, `reference_at`, `occurred_from`, `occurred_until`, `scope` |
+| `ReinforceRequest` | required `memory_ids` with 1–100 IDs |
 | `AnswerRequest` | required `question`; `limit=5`; optional `memory_type`, `reference_at`, `scope` |
 | List query | `limit=100`; optional opaque `cursor` |
 
@@ -174,7 +176,29 @@ after candidate retrieval.
 
 Creation is content-addressed and idempotent. Batch results preserve input order. Deletion is also
 idempotent: `deleted` reports whether a record existed. `ask` requires an answerer configured in
-the injected memory.
+the injected memory. Reinforcement is not idempotent: every call raises `access_count` for the named
+memories and moves the ranker's reinforcement factor, so a lost response must not be retried
+blindly. Unknown IDs are skipped, and `reinforced` counts the ones that existed.
+
+### Retrieval trace
+
+`POST /v1/memories/search` with `"explain": true` routes to `Memory.search_with_trace` and returns a
+`trace` object beside the unchanged `hits`. `trace.candidates` lists every candidate considered with
+its effective score components (`dense_relevance`, `dense_confidence`, `lexical_relevance`,
+`lexical_rerank_bonus`, `lexical_match`, `gate_confidence`, `base_relevance`,
+`reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`) and, when it
+did not become a hit, a `rejected_by` value of `stale_index`, `occurrence_range`, `missing_memory`,
+`memory_type`, `minimum_relevance`, `ambiguity`, or `limit`. `trace.candidate_limit` is how many
+candidates were fetched, `trace.exhaustive` says whether that bound was reached, and
+`trace.ambiguous` says whether the result was suppressed for being too close to call. Without
+`explain`, `trace` is `null` and no extra work is done. A trace names candidates and scores only; it
+never carries evidence content.
+
+`SearchHitResponse.score` is the final ranking score, while the relevance gate compares
+`gate_confidence`, a different quantity, so a floor tuned against the returned `score` compares the
+wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the owner constructs
+`Memory` and no request field can widen them for one call; an empty result is answered by reading
+`trace` and changing the query, the filters, or the owner's configuration.
 
 ### Response objects
 
@@ -183,6 +207,8 @@ the injected memory.
 | `AssetResponse` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name` |
 | `MemoryResponse` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context` |
 | `SearchHitResponse` | all memory fields plus `score` from 0 through 1 |
+| `SearchResponse` | `hits`, and `trace` when the request set `explain` |
+| `ReinforceResponse` | `reinforced` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResponse` | `items`, `next_cursor` |
 
@@ -270,10 +296,9 @@ REST has no route for these Python operations:
 | Operation | Boundary |
 | --- | --- |
 | `add_stream` | Send each completed observation to `POST /v1/memories` |
-| `search_with_trace` | Owner-process retrieval diagnostics |
+| `search_with_trace` | Send `POST /v1/memories/search` with `"explain": true` |
 | `speech`, `faces` | Owner-process media analysis |
 | `register_speaker`, `register_identity` | Owner-process identity naming |
-| `reinforce` | Owner-process feedback |
 | `reindex`, `optimize` | Owner-process index maintenance |
 
 Use the [Python SDK](python-sdk.md) in the owning process for those operations.

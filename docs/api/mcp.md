@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The optional MCP adapter exposes exactly six typed tools over one injected synchronous `Memory`.
+The optional MCP adapter exposes exactly seven typed tools over one injected synchronous `Memory`.
 It validates tool input, calls the matching SDK operation, and returns structured public values.
 It does not own storage, provider selection, or the injected memory. Finalized media arrives
 through ordinary content parts; live audio and vision packet ingestion, and `StreamEvent`
@@ -62,11 +62,12 @@ rejected. The MCP-specific media bounds are listed below.
 | Tool | Arguments and defaults | Structured result | Annotation |
 | --- | --- | --- | --- |
 | `add_memory` | required `content`; `occurred_at=None`; `occurred_end=None`; `metadata=None`; `memory_type="semantic"`; `context=None` | `MemoryResult` | idempotent write |
-| `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None` | `{"hits":[SearchHitResult,...]}` | retrieval |
+| `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None`; `explain=false` | `{"hits":[SearchHitResult,...],"trace":null}` | retrieval |
 | `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None` | `AnswerResponse` | retrieval |
 | `get_memory` | required `memory_id` | `MemoryResult` | read-only |
 | `list_memories` | `limit=100`; `cursor=None` | `PageResult` | read-only |
 | `delete_memory` | required `memory_id` | `{"deleted":bool}` | destructive, idempotent |
+| `reinforce_memories` | required `memory_ids`, 1 through 100 | `{"reinforced":int}` | write, not idempotent |
 
 All timestamps must be timezone-aware. An event end requires a start and must be later than it.
 Search event bounds are a half-open overlap filter; two bounds require
@@ -83,7 +84,32 @@ after candidate retrieval.
 answer are not marked read-only because their SDK path may persist lazy transcript caches; they are
 also not advertised as idempotent. Every tool has `open_world_hint=false`.
 `ask_memory` requires an answerer in the injected memory; without one it returns
-`model_error/backend_not_configured`.
+`model_error/backend_not_configured`. `reinforce_memories` accumulates: each call raises
+`access_count` for the named memories and moves the ranker's reinforcement factor, so it is
+published with `idempotent_hint=false` and a lost response must not be retried blindly. IDs that no
+longer exist are skipped, and `reinforced` counts the ones that did.
+
+Every tool and every tool argument carries a published description. Read those before guessing at
+coordinate frames, units, or media sources; they are part of the tool schema, not a separate guide.
+
+### Retrieval trace
+
+`search_memories` with `explain=true` routes to `Memory.search_with_trace` and adds a `trace`
+object beside the unchanged `hits`. `trace.candidates` lists every candidate that was considered
+with its effective score components (`dense_relevance`, `dense_confidence`, `lexical_relevance`,
+`lexical_rerank_bonus`, `lexical_match`, `gate_confidence`, `base_relevance`,
+`reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`) and, when it
+did not become a hit, a `rejected_by` value of `stale_index`, `occurrence_range`, `missing_memory`,
+`memory_type`, `minimum_relevance`, `ambiguity`, or `limit`. `trace.candidate_limit` is how many
+candidates were fetched, `trace.exhaustive` says whether that bound was reached, and
+`trace.ambiguous` says whether the result was suppressed for being too close to call. Without
+`explain`, `trace` is `null` and no extra work is done.
+
+A `SearchHitResult.score` is `final_score`, but the relevance gate compares `gate_confidence`, which
+is a different quantity. Tuning a floor against the returned `score` therefore compares the wrong
+two numbers. The floor itself, `minimum_relevance`, and `ambiguity_margin` are fixed when the owner
+constructs `Memory`; no tool argument can widen them for one call, so an empty result is answered by
+reading `trace` and changing the query, filters, or the owner's configuration.
 
 ### Result objects
 
@@ -94,6 +120,8 @@ Successful calls populate MCP `structuredContent`:
 | `AssetResult` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name` |
 | `MemoryResult` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context` |
 | `SearchHitResult` | all memory fields plus `score` |
+| `SearchResult` | `hits`, and `trace` when `explain=true` |
+| `ReinforceResult` | `reinforced` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResult` | `items`, `next_cursor` |
 
@@ -105,12 +133,13 @@ described above.
 
 ### Validation and errors
 
-Only the six documented names and their exact top-level arguments are accepted. An unknown tool or
+Only the seven documented names and their exact top-level arguments are accepted. An unknown tool or
 top-level argument returns `validation_error/unknown_field`; schema and SDK input failures return
 `validation_error/input_invalid`. Unknown values are not echoed.
 
-Failed tool calls set `isError` and carry the same JSON envelope as
-[REST](rest.md#error-envelope) in their text content:
+Failed tool calls set `isError` and their text content is exactly the same JSON envelope as
+[REST](rest.md#error-envelope), with nothing before or after it. One `JSON.parse` of the text
+succeeds for every failure, including `memory_not_found`, `model_error`, and `storage_error`:
 
 ```json
 {
@@ -149,13 +178,12 @@ The following Python operations have no MCP tool:
 | --- | --- |
 | `add_many` | Call `add_memory` per item or use the REST batch route |
 | `add_stream` | Call `add_memory` for each completed observation |
-| `search_with_trace` | Python and local-CLI diagnostics |
+| `search_with_trace` | Call `search_memories` with `explain=true` |
 | `speech`, `faces` | Owner-process media analysis |
 | `register_speaker`, `register_identity` | Owner-process identity naming |
-| `reinforce` | Owner-process feedback |
 | `reindex`, `optimize` | Owner-process index maintenance |
 
-`list_memories` is part of the six-tool surface and supports the same default page size and opaque
+`list_memories` is part of the seven-tool surface and supports the same default page size and opaque
 cursor contract as `Memory.list`.
 
 ### Input limits

@@ -170,6 +170,7 @@ alias):
 | `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1` |
 | `evidence_budget_chars` | `None` | Widen `ask` grounding while the evidence fits this budget; raises a floor, never a ceiling; `None` grounds on exactly `limit` |
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
+| `reinforce_on_answer` | `true` | Count the evidence `ask()` cited, so retrieval favours it later |
 | `speaker_similarity` | `0.78` | Voice identity match threshold |
 | `speaker_margin` | `0.05` | Voice identity ambiguity margin |
 | `face_similarity` | `0.363` | Face identity match threshold |
@@ -215,6 +216,9 @@ with OpenAI(timeout=30.0, max_retries=3) as client:
 caller-supplied SDK client open, so the outer client context remains the application's
 responsibility. Credentials, retries, timeouts, proxies, and connection pooling also remain SDK
 configuration.
+
+The `formation` slot is also reachable from the command line as `--former NAME`, which fills it
+from the same recipe table as `--embedder` and `--answerer`.
 
 One capability slot is reachable only this way, or through `MemoryPlugins`; no declarative
 provider selects it implicitly:

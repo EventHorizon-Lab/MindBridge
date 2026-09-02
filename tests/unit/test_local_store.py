@@ -16,7 +16,14 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge import EvidenceBasis, IdentityProfile, MemoryContext, MemoryKind
+from mindbridge import (
+    EvidenceBasis,
+    IdentityProfile,
+    MemoryContext,
+    MemoryKind,
+    SpatialAnchor,
+    SpatialContext,
+)
 from mindbridge.infrastructure.local import (
     DataDirectoryInUseError,
     LocalStore,
@@ -1778,3 +1785,53 @@ def test_no_similarity_floor_recovers_the_speakers_at_a_realistic_separability(
     without_margin, with_margin = outcomes[(0.78, 0.0)], outcomes[(0.78, 0.05)]
     assert with_margin[1] > without_margin[1]
     assert with_margin[2] < without_margin[2]
+
+
+def test_valid_at_keeps_records_without_a_declared_validity_interval(tmp_path: Path) -> None:
+    recorded_at = datetime(2026, 8, 27, 1, 2, 3, tzinfo=timezone.utc)
+    january = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    march = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    last_year = datetime(2025, 6, 1, tzinfo=timezone.utc)
+    plain = _memory("plain", "the user drank tea", created_at=recorded_at)
+    source = _memory("state-source", "tea evidence", created_at=recorded_at)
+    typed = _state_memory(
+        "typed",
+        source.memory_id,
+        "tea",
+        valid_from=january,
+        recorded_at=recorded_at,
+    )
+    elsewhere = SpatialContext(
+        frame_id="workshop",
+        anchor=SpatialAnchor.OBSERVER,
+        x=0.0,
+        y=0.0,
+        z=0.0,
+    )
+
+    with LocalStore(tmp_path) as store:
+        assert store.write_memories((plain, source, typed)) == (True, True, True)
+        selected = (plain.memory_id, typed.memory_id)
+        unscoped = store.read_memories(selected, active_only=True)
+        during = store.read_memories(selected, valid_at=march, active_only=True)
+        before = store.read_memories(selected, valid_at=last_year, active_only=True)
+        unknown = store.read_memories(
+            selected,
+            valid_at=march,
+            known_at=recorded_at - timedelta(microseconds=1),
+            active_only=True,
+        )
+        nowhere = store.read_memories(
+            selected,
+            near=elsewhere,
+            radius_m=1.0,
+            active_only=True,
+        )
+
+    # A record with no validity interval answers every `valid_at`, and only the typed interval
+    # can refuse one. A record with no pose is at no location, so `near` still drops both.
+    assert [memory.memory_id for memory in unscoped] == ["plain", "typed"]
+    assert [memory.memory_id for memory in during] == ["plain", "typed"]
+    assert [memory.memory_id for memory in before] == ["plain"]
+    assert unknown == ()
+    assert nowhere == ()

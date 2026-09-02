@@ -83,6 +83,12 @@ class MemoryConfig:
     # with this left at `None`.
     evidence_budget_chars: _PositiveInt | None = None
     decay_half_life_days: _PositiveFloat | None = None
+    # `ask` counts the evidence it cited, which is what keeps the reinforcement factor in
+    # `_ranking_signals` from being pinned at 1.0 for a caller that never calls `reinforce`.
+    # Measurement needs it off: reinforcing during a run makes one question's retrieval depend
+    # on which earlier questions already answered and, under concurrency, on the order their
+    # updates committed, so an evaluation stops being reproducible from its seed.
+    reinforce_on_answer: _StrictBool = True
     speaker_similarity: _UnitInterval = 0.78
     speaker_margin: _UnitInterval = 0.05
     face_similarity: _UnitInterval = 0.363

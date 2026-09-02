@@ -119,6 +119,10 @@ _QUERY_METAVAR: Mapping[str, str] = {
     "ask": "QUESTION",
 }
 _DEFAULT_REMOTE_TIMEOUT_SECONDS = 30.0
+# One list, because a slot added to `recipes` used to need remembering in four separate literals
+# here; the flag, the explain document, `doctor`, and the composition guard all derive from it.
+_SLOTS: tuple[str, ...] = ("embedder", "answerer", "former", "transcriber")
+_OPTIONAL_SLOTS: tuple[str, ...] = _SLOTS[1:]
 _TUNING: tuple[str, ...] = (
     "index_speech",
     "minimum_relevance",
@@ -241,7 +245,7 @@ def _resolve(arguments: argparse.Namespace) -> _Document:
         "data_dir": str(_data_dir(arguments)),
     }
     with _composing():
-        for slot in ("embedder", "answerer", "transcriber"):
+        for slot in _SLOTS:
             name = getattr(arguments, slot)
             if name is None:
                 document[slot] = None
@@ -257,7 +261,7 @@ def _reject_embedder_only_options(arguments: argparse.Namespace) -> None:
     """`--app` and `--url` compose elsewhere, so a knob meant for a recipe must not be ignored."""
     given = [
         f"--{name.replace('_', '-')}"
-        for name in ("data_dir", "answerer", "transcriber", *_TUNING)
+        for name in ("data_dir", *_OPTIONAL_SLOTS, *_TUNING)
         if getattr(arguments, name) != _MEMORY_DEFAULTS[name]
     ]
     if given:
@@ -277,6 +281,8 @@ def _open_memory(arguments: argparse.Namespace) -> Memory:
         backends["embedder"] = recipes.embedder(arguments.embedder)
         if arguments.answerer is not None:
             backends["answerer"] = recipes.answerer(arguments.answerer)
+        if arguments.former is not None:
+            backends["former"] = recipes.former(arguments.former)
         if arguments.transcriber is not None:
             backends["transcriber"] = recipes.transcriber(arguments.transcriber)
     try:
@@ -286,6 +292,7 @@ def _open_memory(arguments: argparse.Namespace) -> Memory:
             _data_dir(arguments),
             embedder=backends["embedder"],  # type: ignore[arg-type]
             answerer=backends.get("answerer"),  # type: ignore[arg-type]
+            former=backends.get("former"),  # type: ignore[arg-type]
             transcriber=backends.get("transcriber"),  # type: ignore[arg-type]
             index_speech=arguments.index_speech,
             minimum_relevance=arguments.minimum_relevance,
@@ -378,7 +385,7 @@ def _doctor(arguments: argparse.Namespace, composition: _Document) -> _Document:
     else:
         data_dir = _data_dir(arguments)
         state = _data_dir_state(data_dir)
-        for slot in ("embedder", "answerer", "transcriber"):
+        for slot in _SLOTS:
             name = getattr(arguments, slot)
             report[slot] = None if name is None else _probe(name, slot)
     return {
@@ -1377,7 +1384,7 @@ def _default(operation: str, parameter: str) -> object:
 
 
 _MEMORY_DEFAULTS: Mapping[str, object] = {
-    name: _default("__init__", name) for name in ("data_dir", "answerer", "transcriber", *_TUNING)
+    name: _default("__init__", name) for name in ("data_dir", *_OPTIONAL_SLOTS, *_TUNING)
 }
 
 
@@ -1407,6 +1414,7 @@ def _parser() -> argparse.ArgumentParser:
         help=f"remote request timeout (default: {_DEFAULT_REMOTE_TIMEOUT_SECONDS:g})",
     )
     parser.add_argument("--answerer", metavar="NAME", help="generation recipe, with --embedder")
+    parser.add_argument("--former", metavar="NAME", help="formation recipe, with --embedder")
     parser.add_argument("--transcriber", metavar="NAME", help="speech recipe, with --embedder")
     parser.add_argument("--index-speech", action="store_true", help="index transcripts on add")
     parser.add_argument(

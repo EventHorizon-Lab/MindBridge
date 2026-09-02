@@ -1129,8 +1129,12 @@ class LocalStore:
             for row in rows
             if not active_only
             or (
-                valid_at is None
-                and near is None
+                # A record with no `memory_semantics` row declares no validity interval, so it is
+                # valid at every `valid_at` exactly like a version row whose `valid_from` and
+                # `valid_until` are NULL; only recorded time can exclude it, and there `created_at`
+                # is the honest bound. `near` is separate and spatial: a record with no pose is not
+                # at any location, so it drops just as a semantic row without a pose does above.
+                near is None
                 and _row_text(row, "memory_id") not in semantic_ids
                 and (known_at is None or _parse_datetime(_row_text(row, "created_at")) <= known_at)
             )
