@@ -17,6 +17,7 @@ from typing import Any, cast
 
 import pytest
 from opentelemetry import trace
+from opentelemetry.trace import Tracer
 
 import mindbridge.benchmarks.eval as eval_module
 from mindbridge import (
@@ -626,7 +627,7 @@ def test_benchmark_speech_backend_satisfies_the_runtime_protocol() -> None:
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v9"
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v10"
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(device=None, seed=7, gen_kwargs="{}", recall_limit=8),
@@ -681,8 +682,9 @@ def test_backend_pool_warms_query_embedding_before_evaluation(
 
 
 def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A hand-written forwarding list drops new policy silently, which is worse than crashing:
-    the run measures the default while the artifact reports the configured value."""
+    """A hand-written forwarding list drops new policy or a new plugin silently, which is worse
+    than crashing: the run measures the default composition while the artifact reports the
+    configured one."""
     captured: dict[str, object] = {}
 
     class Recorder:
@@ -696,14 +698,23 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
     pool._tracer = trace.get_tracer(__name__)
     for entry in fields(MemoryPlugins):
         setattr(pool, f"_{entry.name}", None)
+    # Every declared plugin slot gets its own distinguishable sentinel, so a dropped or
+    # mis-mapped backend cannot pass by looking like its neighbour or like "not configured".
+    backends = {entry.name: f"backend:{entry.name}" for entry in fields(MemoryPlugins)}
+    pool._settings = settings
+    pool._tracer = cast(Tracer, None)
+    for name, value in backends.items():
+        setattr(pool, f"_{name}", value)
 
     pool.memory(Path("unused"))
 
     for entry in fields(MemoryConfig):
         assert captured[entry.name] == getattr(settings, entry.name), entry.name
-    # Deriving the forwarding from the dataclass is only safe while every declared field names
+    for name, value in backends.items():
+        assert captured[name] == value, name
+    # Deriving the forwarding from the dataclasses is only safe while every declared field names
     # a real constructor keyword; a field added without one would raise at call time instead.
-    declared = {entry.name for entry in fields(MemoryConfig)}
+    declared = {entry.name for entry in (*fields(MemoryConfig), *fields(MemoryPlugins))}
     for constructor in (Memory.__init__, AsyncMemory.__init__):
         unaccepted = declared - set(signature(constructor).parameters)
         assert not unaccepted, f"{constructor.__qualname__} has no keyword for {sorted(unaccepted)}"
@@ -976,7 +987,12 @@ def test_configured_backend_pool_lends_plugins_and_closes_the_owner(
         memory_config=memory_config,
     )
 
-    assert pool._settings is settings
+    # Every configured setting survives, except that measurement turns answer-time reinforcement
+    # off: reinforcing mid-run makes one question's retrieval depend on which earlier questions
+    # answered, so a run would stop being reproducible from its seed.
+    assert pool._settings == replace(settings, reinforce_on_answer=False)
+    assert settings.reinforce_on_answer is True
+    assert pool._settings.reinforce_on_answer is False
     assert configured[0].generation is not None
     assert configured[0].generation.modalities == frozenset({Modality.TEXT, Modality.IMAGE})
     assert pool._answerer is not None
@@ -986,6 +1002,49 @@ def test_configured_backend_pool_lends_plugins_and_closes_the_owner(
     assert closed == []
     pool.close()
     assert closed == [True]
+
+
+def test_backend_pool_borrows_every_configured_plugin_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Every declared plugin slot must survive the trip from configuration to the store.
+
+    A slot the pool never captures is silently absent: the artifact reports the configured
+    composition while the run measures the default one.
+    """
+    captured: dict[str, object] = {}
+    names = tuple(entry.name for entry in fields(MemoryPlugins))
+    plugins = SimpleNamespace(**{name: SimpleNamespace(marker=name) for name in names})
+    resolved = SimpleNamespace(
+        plugins=plugins,
+        settings=MemoryConfig(),
+        close=lambda: None,
+    )
+
+    class Recorder:
+        def __init__(self, _data_dir: object, **values: object) -> None:
+            captured.update(values)
+
+    monkeypatch.setattr(eval_module, "resolve_memory_config", lambda _config: resolved)
+    monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
+    pool = eval_module._BackendPool(
+        ModelConfig(),
+        device=None,
+        batch_size=1,
+        needs_speech=False,
+        seed=0,
+        memory_config=MindBridgeConfig.model_validate({"embedding": {"provider": "openai"}}),
+    )
+
+    pool.memory(tmp_path)
+
+    for name in names:
+        borrowed = captured[name]
+        assert borrowed is not None, name
+        # Borrowed, not the owner itself: a per-store close must not close a shared backend.
+        assert borrowed is not getattr(plugins, name), name
+        assert getattr(borrowed, "marker", None) == name, name
 
 
 def test_borrowed_face_backend_preserves_the_runtime_protocol() -> None:
