@@ -129,17 +129,22 @@ generation:
 #   # budget fails the whole batch rather than parsing partially.
 #   max_tokens: 4096
 
-# Retrieval and ranking behaviour. Defaults shown; every field is optional.
+# Retrieval and ranking behaviour. Every field is optional; non-default evaluation choices are
+# called out below.
 settings:
-  # Index transcribed speech as retrievable text. Off by default; without it a video memory's
+  # Index transcribed speech as retrievable text. On by default; without it a video memory's
   # searchable text is only what the visual path wrote.
   index_speech: true
   # Similarity floor for a hit. Lowering it trades precision for recall.
-  minimum_relevance: 0.55
+  minimum_relevance: 0.10
   # How close the top two hits must be before retrieval is treated as ambiguous.
   ambiguity_margin: 0.01
-  # Character budget for evidence handed to the answerer. Unset means no widening.
-  evidence_budget_chars: 12000
+  # Character budget for evidence handed to the answerer. Null is the default and means no
+  # widening beyond the requested recall limit.
+  evidence_budget_chars: null
+  # Evaluation override: production defaults to true, but a benchmark must not let one question's
+  # answer change the retrieval state seen by later or concurrent questions.
+  reinforce_on_answer: false
 
 # =============================================================================================
 # Harness-only section. These have no field in `MindBridgeConfig` and must not gain one:

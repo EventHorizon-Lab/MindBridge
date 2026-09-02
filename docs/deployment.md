@@ -1,14 +1,52 @@
 # Deployment
 
-MindBridge runs inside the host process. Deploy one live `Memory` owner for each physical
-`data_dir`; applications that need separate memory domains use separate directories.
+Deploy one live `Memory` owner per physical `data_dir`. Separate applications, tenants, or workers
+that require isolation must use separate directories.
 
-Prefer embedded Python when one application owns the memory. Add REST or MCP only when an existing
-host needs that protocol boundary; neither transport creates a second storage service.
+This page chooses and configures a topology. See [architecture](architecture.md) for invariants,
+[operations](operations.md) for runbooks, and [troubleshooting](troubleshooting.md) when startup or
+traffic fails.
+
+## Choose a topology
+
+| Need | Topology | Constraint |
+| --- | --- | --- |
+| One Python application owns memory | Embed `Memory` in that process | Keep one instance open and close it during shutdown. |
+| Other processes need HTTP | Expose the owner with `create_app()` | Run one ASGI worker for that directory and supply network controls outside MindBridge. |
+| One agent host needs tools | Run `build_mcp_server()` in the owner process | Prefer stdio; secure SSE or streamable HTTP as a network service. |
+| Independent workers need independent state | Give each worker a distinct directory | The directories are separate memory domains; they do not synchronize. |
+
+Do not place a Python owner, REST process, and MCP process over the same directory. Put the desired
+adapters around one constructed `Memory`, or have other processes call the existing REST owner.
+
+## Deployment checklist
+
+Before starting the owner, verify:
+
+- Python 3.10 through 3.14 and compatible 64-bit wheels exist for Zvec and every selected backend.
+- The data directory is on one local, durable filesystem with working SQLite WAL, file locking,
+  atomic rename, and durable writes.
+- The service account alone can read the directory, model credentials, and backups.
+- Disk capacity covers SQLite, original media, the derived index, and temporary rebuild or
+  compaction space.
+- RAM, accelerator memory, and file-descriptor limits cover model inference and the memory-mapped
+  index.
+- The embedding, transcription, face, and index recipes match an existing store.
+- A shutdown hook calls `Memory.close()` and closes caller-owned provider clients.
+
+Network filesystems and shared-volume multi-writer deployments are unsupported. On POSIX,
+MindBridge sets the top-level directory to `0700` and its SQLite, lock, staging, and asset files to
+restrictive modes. The operator still owns parent permissions, service accounts, disk encryption,
+backup access, and retention.
 
 ## Embedded Python
 
-Construct provider clients and backends explicitly, then close caller-owned clients separately:
+Install only the optional surfaces used by the application. This example uses the bundled local
+embedder and OpenAI generation adapter:
+
+```bash
+uv add "mindbridge[local,openai]"
+```
 
 ```python
 from openai import OpenAI
@@ -27,26 +65,22 @@ finally:
     client.close()
 ```
 
-`Memory` closes the backend objects supplied to it. `OpenAIModels` intentionally leaves supplied
-SDK clients open because the application may share them. Do not construct `Memory` before forking;
-a child process cannot use or close the parent's instance.
+Keep one `Memory` open for a long-running process. `Memory.close()` closes supplied backend objects;
+`OpenAIModels.close()` deliberately leaves caller-owned OpenAI clients open. Construct `Memory`
+after any process fork, never before it.
 
-The Jina adapter in this example runs pinned upstream model code and uses non-commercial weights;
-review [embedding choices](configuration.md#embedding-choices) before selecting it for deployment.
+The Jina adapter executes pinned upstream model code and uses non-commercial weights. Review
+[embedding choices](configuration.md#embedding-choices) before deploying it.
 
-For a long-running loop, keep one instance open. A local `mindbridge` CLI invocation opens and
-closes one instance per command; use the Python SDK or address a running REST owner with `--url`
-when repeated operations must share one process.
+## REST owner
 
-## REST service
-
-Install the optional server surface:
+Install the server surface with the selected model extras:
 
 ```bash
 uv add "mindbridge[local,openai,server]"
 ```
 
-Expose an application-owned instance:
+Compose one caller-owned instance in `my_application.py`:
 
 ```python
 from openai import OpenAI
@@ -63,75 +97,58 @@ memory = Memory(
 app = create_app(memory=memory)
 ```
 
-Run exactly one worker for that directory:
+Register framework shutdown handling for both `memory.close()` and `client.close()`, then run one
+worker:
 
 ```bash
 uvicorn my_application:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-The application must register shutdown handling for both `memory.close()` and `client.close()`.
-`create_app` does not own either resource.
+`create_app()` does not own or close either resource. It also adds no authentication,
+authorization, TLS, rate limiting, quota, or audit log. Bind to a trusted interface or put the app
+behind the deployment's existing gateway or middleware. Keep `/healthz` protected consistently; it
+reports liveness and the live composition's capability declaration, not model or retrieval
+readiness. The app publishes eight product routes under `/v1`.
 
-The REST adapter has no authentication, authorization, TLS, rate limiting, or audit log. Bind to a
-trusted interface or place it behind the application's existing gateway or middleware. That outer
-layer also owns request identity and retry policy. Do not retry a timed-out non-idempotent request
-blindly; adds are content-idempotent, but the caller still needs the returned stable ID.
+Do not retry a timed-out request blindly. Adds are content-idempotent, but the SQLite commit can
+precede a transport timeout or index failure; preserve or recover the stable returned ID.
 
-Never start multiple ASGI workers against one directory. Giving each worker a different directory
-is valid only when each is intentionally a separate memory domain.
+## MCP owner
 
-## MCP
+Install the MCP surface and pass it the same process-owned instance:
 
-Install the MCP extra and supply the same caller-owned instance:
-
-```python
-from mindbridge.api.mcp import build_mcp_server
-
-server = build_mcp_server(memory)
-server.run("stdio")
+```bash
+uv add "mindbridge[local,mcp]"
 ```
 
-`build_mcp_server` does not close `memory`. A stdio server inherits the host process user,
-filesystem access, environment, and model credentials; sandbox it as part of the host
-application.
+```python
+from mindbridge import Memory
+from mindbridge.api.mcp import build_mcp_server
 
-The returned server also accepts SSE and streamable-HTTP transports. If the host selects one, it
-must add authentication, authorization, TLS, request limits, and rate limiting. MindBridge adds
-none of those controls, and MCP error subjects can expose owner-local paths.
+with Memory.from_config(
+    {
+        "data_dir": "/var/lib/mindbridge/assistant",
+        "embedding": {"provider": "jina-omni"},
+    }
+) as memory:
+    build_mcp_server(memory).run("stdio")
+```
 
-## Edge and filesystem
+`build_mcp_server()` does not close `memory`. A stdio server inherits the host user's filesystem,
+environment, and model credentials. If the host chooses SSE or streamable HTTP, it must add
+authentication, authorization, TLS, request limits, and rate limiting. The server publishes
+fourteen tools; MCP error subjects may contain owner-local paths.
 
-Edge deployment uses the same embedded topology; no separate MindBridge service is required.
-Before selecting a device, verify:
+## Media and model placement
 
-- Python 3.10 through 3.14 and a compatible 64-bit Zvec wheel are available.
-- Wheels and runtime support exist for every selected optional model backend.
-- RAM and accelerator memory cover model inference, query batches, and Zvec's memory-mapped index.
-- Local storage covers SQLite, original media, authoritative FP32 embeddings, and the derived
-  index.
-- The filesystem provides reliable SQLite WAL, file locking, atomic rename, and durable local
-  writes.
+Python accepts regular local `Path` values, inline `Blob` bytes, and `AssetRef` values from the
+same data directory. REST and MCP accept inline data or stored asset IDs, never server paths or
+HTTP(S) URLs. Fetch remote media in application code so redirects, SSRF controls, credentials,
+timeouts, retries, download limits, and telemetry remain in the application's network policy.
 
-Keep the complete directory on one local durable filesystem. SQLite, `assets/`, `.mindbridge.lock`,
-and `zvec/` form one operational unit even though Zvec can be rebuilt. Network filesystems and
-shared-volume multi-writer topologies are not supported deployment shortcuts.
+After a successful add, MindBridge owns an immutable copy under `assets/`; the source file is no
+longer required. Keep SQLite and `assets/` together through backup and restore.
 
-On POSIX, startup sets the top-level directory to `0700`, and MindBridge creates its SQLite, lock,
-staging, and CAS files with restrictive permissions. The operator still owns parent-directory
-permissions, service accounts, disk encryption, backup access, and retention policy.
-
-Model placement is explicit. `JinaOmniEmbedder` and `SentenceTransformersEmbedder` accept a device;
-`FunASRTranscriber` delegates to `funasr.AutoModel`; generation may use a local or remote custom
-backend. MindBridge does not schedule GPUs, choose quantization, or move work between edge and cloud.
-
-## Media and network boundary
-
-Python accepts regular local `Path` values, inline `Blob` bytes, and `AssetRef` values from the same
-directory. REST and MCP accept inline data or stored asset IDs, never server paths or HTTP(S) URLs.
-
-Fetch remote media in application code using its established client. This keeps credentials,
-redirects, SSRF controls, timeouts, retries, download limits, and network telemetry in one policy
-boundary. After a successful add, the original source file may be removed because MindBridge has
-copied its immutable bytes into `assets/`.
-
-See [operations](operations.md) for health checks, backups, restore, repair, and telemetry.
+Model placement is explicit. Local adapters accept or delegate device selection; custom backends
+may use local or remote inference. MindBridge does not schedule GPUs, select quantization for
+models, or move work between edge and cloud.
