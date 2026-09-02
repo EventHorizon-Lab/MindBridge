@@ -34,6 +34,8 @@ def test_small_benchmark_reports_valid_metrics(tmp_path: Path) -> None:
     result = run_benchmark(tmp_path, rows=32, dimension=8, queries=4, k=3, seed=7)
 
     assert set(result) == {
+        "scope",
+        "excludes",
         "rows",
         "dimension",
         "queries",
@@ -53,6 +55,10 @@ def test_small_benchmark_reports_valid_metrics(tmp_path: Path) -> None:
     assert result["k"] == 3
     assert result["seed"] == 7
     assert result["quantization"] == "none"
+    # The microbenchmark must label itself so its numbers cannot be read as product ingest
+    # or search latency; the SDK-path figures come from ``mindbridge-bench eval``.
+    assert result["scope"] == "storage_microbenchmark"
+    assert "the public Memory API" in cast(tuple[str, ...], result["excludes"])
     assert cast(float, result["ingest_seconds"]) > 0.0
     assert cast(float, result["optimize_seconds"]) >= 0.0
     assert 0.0 <= cast(float, result["recall_at_k"]) <= 1.0

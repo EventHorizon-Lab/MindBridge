@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import multiprocessing
 import os
+import random
 import sqlite3
 import stat
 import struct
@@ -15,7 +16,14 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge import EvidenceBasis, IdentityProfile, MemoryContext, MemoryKind
+from mindbridge import (
+    EvidenceBasis,
+    IdentityProfile,
+    MemoryContext,
+    MemoryKind,
+    SpatialAnchor,
+    SpatialContext,
+)
 from mindbridge.infrastructure.local import (
     DataDirectoryInUseError,
     LocalStore,
@@ -24,6 +32,7 @@ from mindbridge.infrastructure.local import (
     StoredEmbedding,
     StoredMemory,
 )
+from mindbridge.infrastructure.local.store import _SCHEMA_VERSION
 from mindbridge.models.base import (
     FaceAnalysis,
     FaceEmbedding,
@@ -286,7 +295,7 @@ def test_schema_is_local_and_enforces_foreign_keys(tmp_path: Path) -> None:
                     "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
                 )
             )
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
             assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert "tenant" not in schema.casefold()
@@ -353,7 +362,7 @@ def test_schema_v1_is_migrated_atomically_with_text_modality(tmp_path: Path) -> 
         assert legacy.access_count == 0
         assert legacy.assets == ()
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -377,7 +386,7 @@ def test_schema_v2_is_migrated_without_losing_memories(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         assert store.read_memory("preserved") is not None
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -396,7 +405,7 @@ def test_schema_v3_adds_optional_speaker_names(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         with closing(sqlite3.connect(store.database_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(identities)")}
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
         assert "name" in columns
 
 
@@ -416,7 +425,7 @@ def test_schema_v5_adds_optional_event_end(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         with closing(sqlite3.connect(store.database_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(memory_records)")}
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
         assert "occurred_end" in columns
 
 
@@ -507,7 +516,7 @@ def test_schema_v7_adds_transactional_evidence_without_losing_records(tmp_path: 
 
     assert preserved is not None and preserved.content == "A red tool is in drawer two"
     assert {"source_group_id", "recorded_at", "retired_at"} <= columns
-    assert version == 9
+    assert version == _SCHEMA_VERSION
 
 
 @pytest.mark.skipif(sqlite3.sqlite_version_info < (3, 35), reason="DROP COLUMN needs SQLite 3.35")
@@ -543,7 +552,7 @@ def test_schema_v8_adds_identity_profiles_and_link_evidence(tmp_path: Path) -> N
     assert recorded == 1
     assert named == IdentityProfile(identity_id=face_id, name="Alice", relationship="neighbour")
     assert "contributed_modality" in alias_columns
-    assert version == 9
+    assert version == _SCHEMA_VERSION
 
 
 def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
@@ -1613,3 +1622,217 @@ def test_evidence_and_projection_share_one_transaction_time(tmp_path: Path) -> N
     assert before_retraction.confidence == pytest.approx(0.96)
     assert retracted.context.evidence_ids == (first.memory_id,)
     assert retracted.context.confidence == pytest.approx(0.8)
+
+
+def test_index_candidates_project_the_columns_ranking_reads(tmp_path: Path) -> None:
+    with LocalStore(tmp_path / "state.sqlite3") as store:
+        store.write_memories(
+            (_memory("first", content="winter"), _memory("second", content="summer")),
+            (
+                _embedding("embedding-first", "first"),
+                _embedding("embedding-second", "second"),
+            ),
+        )
+        # Input order is the ranking order, so the projection has to preserve it rather than
+        # return whatever order SQLite chose, and an unknown id has to drop out silently the way
+        # the full-document read does.
+        candidates = store.read_index_candidates(
+            ("embedding-second", "embedding-missing", "embedding-first")
+        )
+        documents = store.read_index_documents(("embedding-first",))
+
+    assert [candidate.memory_id for candidate in candidates] == ["second", "first"]
+    # The projection has to agree with the read it replaces on every column ranking consults.
+    assert candidates[1].embedding_id == documents[0].embedding.embedding_id
+    assert candidates[1].occurred_at == documents[0].occurred_at
+    assert candidates[1].occurred_end == documents[0].occurred_end
+
+
+def _unit(values: list[float]) -> list[float]:
+    scale = math.sqrt(math.fsum(value * value for value in values))
+    return [value / scale for value in values]
+
+
+def _speaker_population(
+    people: int,
+    per_person: int,
+    *,
+    shared: float = 0.42,
+    personal: float = 0.32,
+    seed: int = 5,
+) -> dict[tuple[int, int], tuple[float, ...]]:
+    """Speaker vectors laid out over three orthogonal blocks, at a controlled separability.
+
+    ``v = sqrt(shared)*g + sqrt(personal)*q_k + sqrt(rest)*n_i``. Two utterances of one speaker
+    have cosine ``shared + personal`` in expectation and two speakers have ``shared``; the
+    spread around both means comes from the random blocks, whose widths are their dimensions.
+
+    The four constants are fitted to a real corpus rather than chosen: an m3-bench-robot unit
+    (68 memories, 158 CAM++ voice exemplars, 192 dimensions) measures within-identity cosine
+    0.7385 +/- 0.0717 and 0.4244 +/- 0.2043 between identities, and this generator reproduces
+    0.7432 +/- 0.0716 and 0.4325 +/- 0.2043. Real speaker embeddings are that badly separated:
+    the two distributions are single broad humps that overlap, not two modes with a valley.
+    """
+    person_dimension, utterance_dimension = 3, 14
+    rest = 1.0 - shared - personal
+    generator = random.Random(seed)
+    directions = [
+        _unit([generator.gauss(0.0, 1.0) for _ in range(person_dimension)]) for _ in range(people)
+    ]
+    return {
+        (person, index): tuple(
+            [math.sqrt(shared)]
+            + [math.sqrt(personal) * value for value in directions[person]]
+            + [
+                math.sqrt(rest) * value
+                for value in _unit([generator.gauss(0.0, 1.0) for _ in range(utterance_dimension)])
+            ]
+        )
+        for person in range(people)
+        for index in range(per_person)
+    }
+
+
+def _cluster_speakers(
+    store: LocalStore,
+    population: dict[tuple[int, int], tuple[float, ...]],
+    *,
+    minimum_similarity: float,
+    minimum_margin: float,
+    order_seed: int = 1,
+) -> tuple[int, float, int, int]:
+    """Match a whole population one utterance at a time; return count, purity and pair recall.
+
+    Purity is reported beside the identity count on purpose. Alone it is worthless: a store
+    that files every utterance under its own identity scores a perfect 1.000.
+    """
+    keys = list(population)
+    random.Random(order_seed).shuffle(keys)
+    assigned: dict[str, list[int]] = {}
+    for position, key in enumerate(keys):
+        asset = _asset(f"utterance {position}".encode(), modality="audio", mime_type="audio/wav")
+        store.write_memory(
+            replace(
+                _memory(f"memory-{position}"),
+                content="",
+                modality="audio",
+                assets=(asset,),
+            )
+        )
+        speaker = store.write_speech(
+            asset.asset_id,
+            SpeechAnalysis(
+                turns=(SpeechTurn(0, 500, "spoken", "0"),),
+                speakers=(SpeakerEmbedding("0", population[key]),),
+            ),
+            model_id="cam++",
+            space_id="cam++:test",
+            minimum_similarity=minimum_similarity,
+            minimum_margin=minimum_margin,
+        )[0].speaker_id
+        assert speaker is not None
+        assigned.setdefault(speaker, []).append(key[0])
+    purity = math.fsum(
+        max(members.count(person) for person in set(members)) for members in assigned.values()
+    ) / len(keys)
+    linked = sum(
+        members.count(person) * (members.count(person) - 1) // 2
+        for members in assigned.values()
+        for person in set(members)
+    )
+    per_person = len(keys) // len({key[0] for key in keys})
+    gold = len({key[0] for key in keys}) * per_person * (per_person - 1) // 2
+    return len(assigned), purity, linked, gold
+
+
+def test_no_similarity_floor_recovers_the_speakers_at_a_realistic_separability(
+    tmp_path: Path,
+) -> None:
+    """Speaker matching trades purity against recall; no floor and margin buys both.
+
+    Six speakers say fourteen things each, at the separability measured on a real CAM++
+    population. A low floor merges strangers, a high floor files everyone separately, and the
+    shipped default sits at the second extreme: it keeps purity by declining to match. There
+    is no setting in between, because the within-speaker and between-speaker cosines overlap.
+
+    If this test ever fails because some grid point reaches both, the speaker representation
+    has genuinely improved and this characterisation is obsolete. Read the numbers in the
+    message before changing the assertion.
+    """
+    population = _speaker_population(6, 14)
+    outcomes = {}
+    for floor, margin in ((0.60, 0.05), (0.70, 0.0), (0.78, 0.0), (0.78, 0.05), (0.90, 0.05)):
+        with LocalStore(tmp_path / f"floor{floor}margin{margin}") as store:
+            outcomes[(floor, margin)] = _cluster_speakers(
+                store, population, minimum_similarity=floor, minimum_margin=margin
+            )
+
+    solved = {
+        setting: outcome
+        for setting, outcome in outcomes.items()
+        if outcome[1] >= 0.99 and outcome[2] >= outcome[3] // 2
+    }
+    assert not solved, f"a threshold recovered the speakers: {outcomes}"
+    # Both failure modes are present, so the grid really does span the trade-off.
+    assert min(outcome[1] for outcome in outcomes.values()) < 0.8
+    assert max(outcome[0] for outcome in outcomes.values()) > 6 * 6
+    # Purity on its own cannot see the second one: the strictest floor scores a perfect 1.000
+    # while linking almost nothing.
+    strictest = outcomes[(0.90, 0.05)]
+    assert strictest[1] == pytest.approx(1.0)
+    assert strictest[2] < strictest[3] // 20
+    # At one floor, the margin is the whole trade: it declines the matches whose runner-up is
+    # too close, which is most of them once the store holds rivals.
+    without_margin, with_margin = outcomes[(0.78, 0.0)], outcomes[(0.78, 0.05)]
+    assert with_margin[1] > without_margin[1]
+    assert with_margin[2] < without_margin[2]
+
+
+def test_valid_at_keeps_records_without_a_declared_validity_interval(tmp_path: Path) -> None:
+    recorded_at = datetime(2026, 8, 27, 1, 2, 3, tzinfo=timezone.utc)
+    january = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    march = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    last_year = datetime(2025, 6, 1, tzinfo=timezone.utc)
+    plain = _memory("plain", "the user drank tea", created_at=recorded_at)
+    source = _memory("state-source", "tea evidence", created_at=recorded_at)
+    typed = _state_memory(
+        "typed",
+        source.memory_id,
+        "tea",
+        valid_from=january,
+        recorded_at=recorded_at,
+    )
+    elsewhere = SpatialContext(
+        frame_id="workshop",
+        anchor=SpatialAnchor.OBSERVER,
+        x=0.0,
+        y=0.0,
+        z=0.0,
+    )
+
+    with LocalStore(tmp_path) as store:
+        assert store.write_memories((plain, source, typed)) == (True, True, True)
+        selected = (plain.memory_id, typed.memory_id)
+        unscoped = store.read_memories(selected, active_only=True)
+        during = store.read_memories(selected, valid_at=march, active_only=True)
+        before = store.read_memories(selected, valid_at=last_year, active_only=True)
+        unknown = store.read_memories(
+            selected,
+            valid_at=march,
+            known_at=recorded_at - timedelta(microseconds=1),
+            active_only=True,
+        )
+        nowhere = store.read_memories(
+            selected,
+            near=elsewhere,
+            radius_m=1.0,
+            active_only=True,
+        )
+
+    # A record with no validity interval answers every `valid_at`, and only the typed interval
+    # can refuse one. A record with no pose is at no location, so `near` still drops both.
+    assert [memory.memory_id for memory in unscoped] == ["plain", "typed"]
+    assert [memory.memory_id for memory in during] == ["plain", "typed"]
+    assert [memory.memory_id for memory in before] == ["plain"]
+    assert unknown == ()
+    assert nowhere == ()

@@ -13,7 +13,7 @@ owns the fact you need.
 
 - [Python SDK](api/python-sdk.md) — complete `mindbridge` root-import contract.
 - [REST API](api/rest.md) — `/v1` schemas, routes, errors, and limits.
-- [MCP tools](api/mcp.md) — six tool schemas and transport boundary.
+- [MCP tools](api/mcp.md) — fourteen tool schemas and transport boundary.
 - [Command line](api/cli.md) — commands, input forms, JSON output, and exit codes.
 
 ## Operate MindBridge
@@ -24,12 +24,21 @@ owns the fact you need.
 - [Security](../SECURITY.md) — trust boundaries, data exposure, and deployment hardening.
 - [Troubleshooting](troubleshooting.md) — diagnose common startup, retrieval, and model failures.
 
+## Understand the direction
+
+- [Product goals and design principles](design-principles.md) — the product target, the design
+  goals, and the criteria a change must answer. States direction, not implemented status.
+- [Plugin architecture](plugin-architecture.md) — the kernel/plugin boundary and the admission rule
+  a new public capability must satisfy.
+
 ## Go deeper
 
 - [Memory types, time, and decay](memory-types-time-and-decay.md) — role and ranking semantics.
 - [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) — completed
   observations, speculative recall, and derived records.
 - [Benchmarking](benchmarking.md) — reproducible evaluation and local-index measurement.
+- [Annotated example configuration](examples/eval.example.yaml) — every configurable slot with
+  what it decides, and the order a run performs them in.
 - [Competitive memory-system review](competitive-memory-systems.md) — source audit of ABot,
   M3-Agent, VoiceMem, eMEM, MIRIX, Graphiti, Mem0, and TeleMem, plus the resulting gap roadmap.
 

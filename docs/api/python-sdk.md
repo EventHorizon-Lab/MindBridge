@@ -81,9 +81,11 @@ the supported provider configuration fields live in [configuration](../configura
 A plain `TranscriptionBackend` transcribes supported audio/video during `add` regardless of
 `index_speech`; `SpeechBackend` analysis and identity resolution stay behind the explicit flag.
 
-`vision_describer` and `former` have no declarative provider and are reachable only through
-direct construction or `MemoryPlugins`. `former` proposes typed memories after a source
-observation commits; omitting it keeps ordinary add behavior and makes no formation model call.
+`vision_describer` has no declarative provider and is reachable only through direct construction
+or `MemoryPlugins`. `former` proposes typed memories after a source observation commits; omitting
+it keeps ordinary add behavior and makes no formation model call. The bundled OpenAI former is
+selected by the declarative `formation` slot, which stays off unless it is configured; see
+[configuration](../configuration.md#automatic-memory-formation).
 
 Turn `index_speech` on for any corpus whose memories carry speech. Without it a video memory's
 indexed document is whatever text the caller supplied, which for clip-shaped ingestion is often a
@@ -247,12 +249,14 @@ metadata, media, vectors, paths, or model output. `ask` requires an answerer and
 retrieved hits the answerer actually used.
 
 ```text
+capabilities -> MemoryCapabilities  # property
 get(memory_id: str) -> MemoryRecord
 speech(memory_id: str) -> tuple[SpeakerSegment, ...]
 faces(memory_id: str) -> tuple[FaceObservation, ...]
 register_speaker(speaker_id: str, name: str, *, relationship: str | None = None) -> None
 register_identity(identity_id: str, name: str, *, relationship: str | None = None) -> None
 identity(identity_id: str) -> IdentityProfile | None
+forget_identity(identity_id: str) -> IdentityErasure
 unlink_identity(alias_id: str) -> str | None
 reinforce(memory_ids: Sequence[str]) -> int
 list(*, limit: int = 100, cursor: str | None = None) -> Page
@@ -290,9 +294,44 @@ egocentric capture: the wearer talks while somebody else fills the frame. Bindin
 therefore attaches the wearer's voice to whoever happened to be visible. Set
 `identity_link_min_assets=1` to bind on first co-occurrence.
 
+Counting assets raises the price of that mistake without preventing it: a wearer talks to the same
+person across many clips, so the wrong pair accumulates as fast as a genuine speaker's. Binding is
+therefore also contained. Only a voice-only and a face-only identity may fuse, so an identity that
+already holds both modalities absorbs nothing further and one wrong bind cannot cascade into the
+next person. A fragment whose modality the identity already holds stays orphaned; merge it
+deliberately through the store if the claim is established some other way.
+
 Binding is recorded, not guessed at read time, so it is durable and reversible through
 `unlink_identity`. Recognizer yield per asset is reported under the `mindbridge.identity.*` span
 attributes, including when nothing was detected.
+
+`forget_identity` erases a person rather than a memory. It removes the profile, every face and
+voice exemplar, every merged alias, and the accumulated link evidence, and it rewrites the indexed
+documents so a registered name stops being searchable — erasing the rows alone would leave the
+name in the search projection. Memories, their content and their media survive, and a transcript
+keeps its words with the speaker attribution dropped: forgetting a person is not forgetting the
+evening. Face observation rows are deleted because their whole payload is a box plus the identity
+claim. The returned `IdentityErasure` reports what was destroyed, which is what an audit needs.
+
+Freed database cells are zero-filled and the write-ahead log is checkpointed, so the stored
+vectors are gone from the database and its log. Filesystem snapshots, backups and wear-levelled
+storage are not covered. `forget_identity` deliberately does **not** prevent a later encounter
+from minting a fresh identity for the same person: recognizing someone as previously-forgotten
+would require keeping the template the request destroys. A deployment that needs "never recognize
+this person again" needs a retained blocklist, which is the opposite of a deletion.
+
+`ObservationContext(place_id=...)` records the symbolic room-level place a memory was captured
+in, `RetrievalScope(place_id=...)` scopes retrieval to it, and `MemoryRecord.place_id` reads it
+back. This is a second spatial axis alongside `spatial`'s metric pose: a robot that cannot
+localise can still label a room, and "in the kitchen" is the question a household asks. The label
+is matched by equality and nothing normalises it beyond rejecting empty or untrimmed text, so a
+producer that writes both `kitchen` and `the kitchen` partitions its own store — which is why the
+value is readable rather than write-only. A place scope excludes memories with no place; it does
+not treat them as being everywhere.
+
+`capabilities` publishes what the composition declared — the modality set each backend accepts,
+the embedding model, space and dimension, the optional model identities, and whether speaker
+recognition and streaming generation are available. It is a field read: it cannot raise or block.
 
 ### AsyncMemory
 
@@ -363,7 +402,7 @@ The principal immutable values are:
 | `PrefetchResult` | positive `revision`, `hits` |
 | `TracedSearchResult` | `hits`, `trace` |
 | `RetrievalTrace` | `candidates`, `candidate_limit`, `exhaustive`, `ambiguous` |
-| `RetrievalCandidateTrace` | `memory_id`, `index_ids`, `dense_relevance`, `dense_confidence`, `lexical_relevance`, `lexical_rerank_bonus`, `lexical_match`, `gate_confidence`, `base_relevance`, `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`, `rejected_by` |
+| `RetrievalCandidateTrace` | `memory_id`, `index_ids`, `dense_relevance`, `dense_confidence`, `lexical_relevance`, `lexical_rerank_bonus`, `lexical_match`, `gate_relevance`, `base_relevance`, `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`, `rejected_by` |
 
 `abstained` reports that the answerer returned the exact sentence the grounding prompt reserves for
 having no usable evidence. It is not a measure of how often a model declined to answer: a model that
@@ -548,7 +587,7 @@ OpenAIModels(
     transcription_languages: Sequence[str] | None = None,
     embedding_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
     generation_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
-    transcription_capabilities: frozenset[Modality] = frozenset({Modality.AUDIO}),
+    transcription_capabilities: frozenset[Modality] = frozenset({Modality.AUDIO, Modality.VIDEO}),
     generation_seed: int | None = None,
     generation_temperature: float | None = None,
     generation_max_tokens: int | None = None,

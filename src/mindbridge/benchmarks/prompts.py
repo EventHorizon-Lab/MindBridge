@@ -17,6 +17,13 @@ class PromptSpec:
     purpose: str
     used_by: str
     text: str
+    # The exact refusal a dataset mandates, when it mandates one of its own. `AnswerResult`
+    # reports `abstained` for the product's own refusal sentence only, which is correct: the
+    # product cannot know what wording a caller told the model to use instead. A task that
+    # overrides the wording has to declare it here, or its run reports a refusal rate of zero
+    # while the model refuses. MEMLENS did exactly that: `results.json` said 0 abstentions on a
+    # dev split where 16 of 59 answers were refusals.
+    refusal: str | None = None
 
 
 EGOMEM_REASON_QUERY_PROMPT = PromptSpec(
@@ -35,6 +42,7 @@ MEMLENS_QUERY_PROMPT = PromptSpec(
     text=(
         '{question}\n\nIf the memories are insufficient, answer exactly "Insufficient information".'
     ),
+    refusal="Insufficient information",
 )
 
 VIDEO_MME_QUERY_PROMPT = PromptSpec(
@@ -195,6 +203,7 @@ MEM_GALLERY_REFUSAL_PROMPT = PromptSpec(
         "information about the question is not present in the conversation, reply with: "
         "“Not mentioned.”"
     ),
+    refusal="Not mentioned.",
 )
 
 MEM_GALLERY_CONFLICT_PROMPT = PromptSpec(
@@ -241,6 +250,17 @@ def mem_gallery_format_constraint(point: str) -> str:
     """
     prompt = _MEM_GALLERY_CONSTRAINTS.get(point.upper())
     return f"\n\n{prompt.text}" if prompt is not None else ""
+
+
+def mem_gallery_refusal(point: str) -> str | None:
+    """Return the refusal wording one task type's constraint mandates, when it mandates one.
+
+    Only `AR` carries one -- its constraint tells the model to answer `Not mentioned.` when the
+    memories do not cover the question -- so the other eight task types report `None` and keep
+    the product's own abstention wording as the only signal.
+    """
+    prompt = _MEM_GALLERY_CONSTRAINTS.get(point.upper())
+    return prompt.refusal if prompt is not None else None
 
 
 CLBENCH_QUERY_PROMPT = PromptSpec(

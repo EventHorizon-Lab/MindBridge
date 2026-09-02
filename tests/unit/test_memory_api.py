@@ -446,6 +446,9 @@ def _memory(
     transcriber: _FakeSpeech | None = None,
     decay_half_life_days: float | None = None,
     evidence_budget_chars: int | None = None,
+    minimum_relevance: float = MemoryConfig().minimum_relevance,
+    index_speech: bool = MemoryConfig().index_speech,
+    reinforce_on_answer: bool = True,
 ) -> Memory:
     models = models or _FakeModels()
     return Memory(
@@ -455,6 +458,9 @@ def _memory(
         transcriber=models if transcriber is None else transcriber,
         decay_half_life_days=decay_half_life_days,
         evidence_budget_chars=evidence_budget_chars,
+        minimum_relevance=minimum_relevance,
+        index_speech=index_speech,
+        reinforce_on_answer=reinforce_on_answer,
     )
 
 
@@ -764,9 +770,14 @@ def test_explicit_event_range_stays_strict_after_temporal_fallback(tmp_path: Pat
         )
 
     assert [hit.id for hit in result.hits] == [allowed.id]
-    rejected = {candidate.memory_id: candidate.rejected_by for candidate in result.trace.candidates}
-    assert rejected[outside.id] is RetrievalRejection.OCCURRENCE_RANGE
-    assert rejected[allowed.id] is None
+    by_memory = {candidate.memory_id: candidate for candidate in result.trace.candidates}
+    assert by_memory[outside.id].rejected_by is RetrievalRejection.OCCURRENCE_RANGE
+    assert by_memory[allowed.id].rejected_by is None
+    # `lexical_relevance` is a ranking score contribution, and ranking never ran for the rejected
+    # candidate. Reporting the index-side strength in its place would make one disposition's
+    # figure larger than the other's for the same match, so the unknown component stays unset.
+    assert by_memory[outside.id].lexical_relevance is None
+    assert by_memory[outside.id].dense_relevance is not None
 
 
 @pytest.mark.parametrize(
@@ -824,7 +835,10 @@ def test_search_with_trace_explains_bounded_candidates_without_evidence_content(
         index.dense_hits_override = (
             IndexHit(id=first_child, relevance=0.95, confidence=0.95),
             IndexHit(id=second_index, relevance=0.8, confidence=0.8),
-            IndexHit(id=weak_index, relevance=0.9, confidence=0.1),
+            # Weak on the one scale the floor reads. This used to be relevance 0.9 with
+            # confidence 0.1, which only rejected the candidate because the floor gated a
+            # separately rescaled quantity from the one that was ranked and reported.
+            IndexHit(id=weak_index, relevance=0.1, confidence=0.1),
             IndexHit(id="stale_candidate", relevance=0.99, confidence=0.99),
         )
         index.lexical_hits_override = ()
@@ -909,13 +923,17 @@ def test_search_with_trace_exposes_every_lexical_ranking_input(tmp_path: Path) -
         assert candidate.lexical_relevance is not None
         assert candidate.lexical_rerank_bonus is not None
         assert candidate.dense_relevance == 0
-        assert candidate.gate_confidence == pytest.approx(0.6)
         # The coverage bonus is a lift across the remaining headroom, never a clamped sum, so the
         # recorded bonus shrinks as the base rises and no candidate can reach exactly 1.0.
         base = max(candidate.dense_relevance, candidate.lexical_relevance)
         relevance = candidate.base_relevance
         assert relevance is not None
         assert relevance == pytest.approx(base + (1.0 - base) * 0.3)
+        # A full-text match used to be gated at a flat 0.6 here whatever its strength. There is no
+        # such constant now: the floor reads the score this candidate is reported at, so with no
+        # decay and no time window it is the relevance both routes were combined on.
+        assert candidate.gate_relevance == pytest.approx(relevance)
+        assert candidate.final_score == pytest.approx(relevance)
         assert candidate.lexical_rerank_bonus == pytest.approx(relevance - base)
         assert 0.0 < relevance < 1.0
     assert first_trace.base_relevance != second_trace.base_relevance
@@ -1156,7 +1174,15 @@ def test_temporal_search_reads_lexical_evidence_from_authoritative_time_range(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    with _memory(tmp_path, _FakeModels()) as memory:
+    # The floor is pinned rather than inherited, and it has to straddle a narrow window from
+    # both sides. Below it, the deepening loop stops early: it only looks past the top-k window
+    # while too few in-range candidates would survive the floor, and the weak candidate's
+    # deepening estimate is `_LEXICAL_FULL_COVERAGE_RELEVANCE * 0.5` = 0.375, so any floor under
+    # that lets the weak candidate satisfy the loop and the target is never reached. Above it,
+    # the target's own gate value is rejected and the search returns nothing -- which is what
+    # 0.55 now does, since the full-text contribution was rescaled to stop it depending on the
+    # embedder. Measured: 0.30 stops early, 0.55 returns empty, 0.40 reproduces the case.
+    with _memory(tmp_path, _FakeModels(), minimum_relevance=0.40) as memory:
         outside = memory.add_many(
             tuple(f"shared witness outside {index}" for index in range(130)),
             occurred_at=(datetime(2026, 1, 1, tzinfo=timezone.utc),) * 130,
@@ -1485,7 +1511,8 @@ def test_temporal_candidate_merge_keeps_the_best_vector_score() -> None:
 
 def test_ambiguity_gate_only_rejects_single_result_retrieval(tmp_path: Path) -> None:
     models = _FakeModels()
-    with _memory(tmp_path, models) as memory:
+    # Pinned because the hit scores below are chosen to straddle this floor.
+    with _memory(tmp_path, models, minimum_relevance=0.55) as memory:
         first = memory.add("first scene")
         second = memory.add("second scene")
         index = _FakeIndex.instances[-1]
@@ -1493,9 +1520,13 @@ def test_ambiguity_gate_only_rejects_single_result_retrieval(tmp_path: Path) -> 
         index.hits_override = (IndexHit(id=first.id, relevance=0.54),)
         assert memory.search("unrelated question") == ()
 
+        # A top-two pair inside `ambiguity_margin` on the one scale retrieval now ranks, gates,
+        # and reports on. The pair used to be separated by 0.01 in relevance and 0.005 in
+        # confidence, which pinned the margin to the rescaled quantity rather than to the scores
+        # the caller reads back.
         index.hits_override = (
             IndexHit(id=first.id, relevance=0.9, confidence=0.8),
-            IndexHit(id=second.id, relevance=0.89, confidence=0.795),
+            IndexHit(id=second.id, relevance=0.895, confidence=0.795),
         )
         assert [hit.id for hit in memory.search("which repeated scene?", limit=2)] == [
             first.id,
@@ -1516,7 +1547,7 @@ def test_ambiguity_gate_only_rejects_single_result_retrieval(tmp_path: Path) -> 
                 confidence=0.8,
                 lexical_match=True,
             ),
-            IndexHit(id=second.id, relevance=0.89, confidence=0.795),
+            IndexHit(id=second.id, relevance=0.895, confidence=0.795),
         )
         assert memory.search("first scene")[0].id == first.id
 
@@ -1855,7 +1886,9 @@ def test_explicit_speech_is_lazy_and_recognizes_a_speaker_across_recordings(
     embedder = _FakeEmbedder()
     transcriber = _FakeSpeech()
 
-    with Memory(tmp_path, embedder=embedder, transcriber=transcriber) as memory:
+    # `index_speech=False` is the subject: analysis deferred to `speech()`. The default-on path
+    # is covered by `test_speech_backend_analysis_is_indexed_by_default`.
+    with Memory(tmp_path, embedder=embedder, transcriber=transcriber, index_speech=False) as memory:
         first = memory.add(Blob(b"first recording", "audio/wav", "first.wav"))
         second = memory.add(Blob(b"second recording", "audio/wav", "second.wav"))
         assert transcriber.calls == []
@@ -2342,6 +2375,11 @@ def test_speaker_recognition_records_new_then_matched_identity_counts(tmp_path: 
         embedder=_FakeEmbedder(),
         transcriber=_FakeSpeech(),
         tracer=provider.get_tracer("test"),
+        # Deferred so recognition happens here and exactly one created-then-matched pair is
+        # emitted. With `index_speech` on, `add` recognizes and `speech()` re-reports the stored
+        # result with `cached=True`, so the same two yields arrive as four spans and this
+        # assertion cannot address the pair it is about.
+        index_speech=False,
     ) as memory:
         first = memory.add(Blob(b"first speech", "audio/wav", "first.wav"))
         second = memory.add(Blob(b"second speech", "audio/wav", "second.wav"))
@@ -2505,8 +2543,10 @@ def test_retrieval_projection_is_stable_across_opaque_speaker_ids(tmp_path: Path
     assert embedded[0] == embedded[1]
     assert indexed[0] == indexed[1]
     assert "spoken red wrench" in indexed[0][0]
-    assert '"speaker_id":"speaker_1"' in indexed[0][0]
-    assert '"speaker_id":"identity_' not in indexed[0][0]
+    # The projection is prose now, so assert the property rather than the encoding: an unnamed
+    # speaker appears under a stable alias and the per-run identity id never reaches the document.
+    assert "speaker_1" in indexed[0][0]
+    assert "identity_" not in indexed[0][0]
 
 
 def test_retrieval_projection_covers_atomic_embeddings_during_migration(tmp_path: Path) -> None:
@@ -2537,7 +2577,7 @@ def test_retrieval_projection_covers_atomic_embeddings_during_migration(tmp_path
         pass
 
     migrated_text = tuple(value.text for batch in migrated.embed_inputs for value in batch)
-    assert any('"speaker_id":"speaker_1"' in text for text in migrated_text)
+    assert any("speaker_1" in text for text in migrated_text)
     assert all(speaker_id not in text for text in migrated_text)
 
 
@@ -3142,10 +3182,14 @@ def test_add_many_hydrates_the_index_outbox_in_batches(
     connection_count = 0
 
     @contextmanager
-    def counted_connection(store: LocalStore) -> Iterator[sqlite3.Connection]:
+    def counted_connection(
+        store: LocalStore, *, secure_delete: bool = False
+    ) -> Iterator[sqlite3.Connection]:
+        # Mirrors `LocalStore._connection`, forwarding its keyword arguments. This test counts
+        # connections, so it must not change which kind of connection the store asked for.
         nonlocal connection_count
         connection_count += 1
-        with original_connection(store) as connection:
+        with original_connection(store, secure_delete=secure_delete) as connection:
             yield connection
 
     monkeypatch.setattr(LocalStore, "_connection", counted_connection)
@@ -3380,6 +3424,36 @@ def test_index_quantization_change_rebuilds_without_reembedding(tmp_path: Path) 
         recipe = store.get_metadata("index.recipe")
         assert recipe is not None
         assert recipe.endswith("quantization-int8")
+
+
+def test_a_full_text_tokenizer_change_rebuilds_without_reembedding(tmp_path: Path) -> None:
+    """A tokenizer change rewrites derived documents and leaves every stored vector correct.
+
+    Version 9 ran a Chinese segmenter over the CJK full-text field, which returned nothing for
+    Japanese or Korean, so version 10 tokenizes that field into script-agnostic character
+    bigrams. Filing the superseded recipe alongside the ones that also invalidate the embeddings
+    would charge every existing store a full re-embed to fix a tokenizer, and the storage rules
+    require a missing index to rebuild without re-embedding stored content.
+    """
+    with Memory(tmp_path, embedder=_FakeModels()) as memory:
+        record = memory.add("preserved memory")
+    with LocalStore(tmp_path) as store:
+        store.set_metadata(
+            "index.recipe",
+            "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
+            "context-keys-v9:quantization-none",
+        )
+
+    reopened_models = _FakeModels()
+    with Memory(tmp_path, embedder=reopened_models):
+        assert record.id in _FakeIndex.instances[-1].documents
+
+    assert reopened_models.embed_inputs == []
+    with LocalStore(tmp_path) as store:
+        recipe = store.get_metadata("index.recipe")
+        assert recipe is not None
+        assert ":fts-stemmed-plus-bigram:" in recipe
+        assert recipe.endswith("context-keys-v10:quantization-none")
 
 
 def test_index_quantization_requires_the_public_enum(tmp_path: Path) -> None:
@@ -3788,6 +3862,81 @@ def test_ask_returns_only_retrieved_hits_the_answerer_used(tmp_path: Path) -> No
     assert result.hits == (models.answer_calls[-1][1][0],)
 
 
+def test_answering_reinforces_only_the_evidence_the_model_cited(tmp_path: Path) -> None:
+    """Answering has to move `access_count`, or decay only ever measures age.
+
+    `reinforce` was reachable from the public operation and the CLI and from nowhere else, so an
+    agent driving MindBridge over MCP or REST left every memory at zero for ever: the
+    reinforcement factor in `_ranking_signals` was pinned at 1.0, and turning on
+    `decay_half_life_days` degraded memories purely by age with no usage signal to hold up the
+    ones that keep answering questions. The set reinforced is the answer's own citations, so a
+    candidate that was retrieved and then not used earns nothing.
+    """
+
+    class CitingModels(_FakeModels):
+        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+            super().answer(question, hits)
+            return AnswerResult(answer="grounded", hits=(hits[0],))
+
+    models = CitingModels()
+    with _memory(tmp_path, models) as memory:
+        memory.add_many(("red first", "red second"))
+        result = memory.ask("red", limit=2)
+        retrieved = models.answer_calls[-1][1]
+        assert len(retrieved) == 2
+        cited, ignored = retrieved[0].id, retrieved[1].id
+        assert [hit.id for hit in result.hits] == [cited]
+
+        # Bookkeeping must never cost an answer that has already been generated and paid for.
+        original = memory._store.reinforce_memories
+
+        def _refuse(memory_ids: Sequence[str], *, accessed_at: datetime) -> int:
+            raise StorageError("reinforcement unavailable")
+
+        memory._store.reinforce_memories = _refuse  # type: ignore[method-assign]
+        try:
+            assert memory.ask("red", limit=2).answer == "grounded"
+        finally:
+            memory._store.reinforce_memories = original  # type: ignore[method-assign]
+
+    with LocalStore(tmp_path) as store:
+        used = store.read_memory(cited)
+        unused = store.read_memory(ignored)
+        assert used is not None and unused is not None
+        # One count, not two: the second answer's reinforcement was the one that failed.
+        assert used.access_count == 1
+        assert unused.access_count == 0
+        assert used.last_accessed_at is not None
+        assert unused.last_accessed_at is None
+
+
+def test_reinforce_on_answer_false_keeps_answering_free_of_side_effects(tmp_path: Path) -> None:
+    """Measurement needs answering to leave the ranking alone.
+
+    Reinforcing during an evaluation makes one question's retrieval depend on which earlier
+    questions already answered, and under concurrency on the order their updates committed, so a
+    run stops being reproducible from its seed. The benchmark harness therefore composes stores
+    with this off, and the flag has to reach the write rather than only the constructor.
+    """
+
+    class CitingModels(_FakeModels):
+        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+            super().answer(question, hits)
+            return AnswerResult(answer="grounded", hits=(hits[0],))
+
+    with _memory(tmp_path, CitingModels(), reinforce_on_answer=False) as memory:
+        memory.add_many(("red first", "red second"))
+        result = memory.ask("red", limit=2)
+        assert result.answer == "grounded"
+        cited = result.hits[0].id
+
+    with LocalStore(tmp_path) as store:
+        untouched = store.read_memory(cited)
+        assert untouched is not None
+        assert untouched.access_count == 0
+        assert untouched.last_accessed_at is None
+
+
 def test_startup_removes_a_cas_file_without_sqlite_metadata(tmp_path: Path) -> None:
     asset_store = AssetStore(tmp_path)
     orphan = asset_store.materialize_bytes(
@@ -3917,11 +4066,12 @@ def test_the_transcript_marker_names_no_modality(tmp_path: Path) -> None:
         record = memory.add(Blob(b"kitchen recording", "video/mp4", "kitchen.mp4"))
         indexed = _FakeIndex.instances[-1].documents[record.id].content
 
-    # One lexical match on its own reaches `_LEXICAL_MATCH_CONFIDENCE`, which is above the default
-    # weak-evidence floor, so every word of the marker is a term that makes this memory visible to
-    # any query containing it. A marker naming a modality both mislabels a video transcript as
-    # audio and hands each media memory a free match on an ordinary English word.
-    assert MemoryConfig().minimum_relevance < memory_module._LEXICAL_MATCH_CONFIDENCE
+    # A full-text match covering every distinctive query term reaches
+    # `_LEXICAL_FULL_COVERAGE_RELEVANCE` on its own, which is above the default weak-evidence
+    # floor, so every word of the marker is a term that makes this memory visible to any query
+    # containing it. A marker naming a modality both mislabels a video transcript as audio and
+    # hands each media memory a free match on an ordinary English word.
+    assert MemoryConfig().minimum_relevance < memory_module._LEXICAL_FULL_COVERAGE_RELEVANCE
     assert "spoken red wrench" in indexed
     assert not {"audio", "video"} & set(re.findall(r"\w+", indexed.casefold()))
 
@@ -3981,10 +4131,59 @@ def test_text_only_add_never_reaches_the_transcriber(tmp_path: Path) -> None:
     assert models.embed_batches == [("red wrench on the bench",)]
 
 
-def test_speech_backend_analysis_stays_behind_the_index_speech_opt_in(tmp_path: Path) -> None:
+def test_speech_backend_analysis_is_indexed_by_default(tmp_path: Path) -> None:
+    """`index_speech` defaults on: a configured `SpeechBackend` reaches the index document.
+
+    Off by default, a video memory's lexical document was the empty string, so the whole
+    dense+lexical union collapsed to its dense half for every speech-bearing asset.
+    """
     speech = _FakeSpeech()
 
     with _memory(tmp_path, transcriber=speech) as memory:
+        record = memory.add(Blob(b"kitchen recording", "video/mp4", "kitchen.mp4"))
+
+    assert speech.calls != []
+    assert record.content != ""
+
+
+def test_indexed_speech_is_not_re_analyzed_when_speech_is_read_back(tmp_path: Path) -> None:
+    """`index_speech` moves the speech cost to `add`; it must not duplicate it.
+
+    `speech()` still reports one `mindbridge.identity.speakers` span per asset so a recognizer's
+    yield stays observable, but the span carries `cached=True` and no model call or write follows
+    it. Without the cache the analysis would run twice for any caller that both writes and reads.
+    """
+    provider, exporter = _identity_recorder()
+    speech = _FakeSpeech()
+    with Memory(
+        tmp_path,
+        embedder=_FakeModels(),
+        transcriber=speech,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        record = memory.add(Blob(b"kitchen recording", "video/mp4", "kitchen.mp4"))
+        calls_after_add = len(speech.calls)
+        settled = len(exporter.get_finished_spans())
+        memory.speech(record.id)
+        memory.speech(record.id)
+    provider.shutdown()
+
+    assert calls_after_add == 1
+    assert len(speech.calls) == 1, "reading speech back must not re-analyze the asset"
+    replayed = exporter.get_finished_spans()[settled:]
+    names = [span.name for span in replayed]
+    assert names.count("mindbridge.model.transcription") == 0
+    assert names.count("mindbridge.storage.write") == 0
+    identity = [span for span in replayed if span.name == "mindbridge.identity.speakers"]
+    assert identity, "a cached read still reports the recognizer yield"
+    assert all((span.attributes or {})["mindbridge.identity.cached"] for span in identity)
+
+
+def test_index_speech_opt_out_keeps_a_speech_backend_off_the_write_path(tmp_path: Path) -> None:
+    """The opt-out is the contract that used to be the default, and it must stay reachable."""
+    speech = _FakeSpeech()
+
+    with _memory(tmp_path, transcriber=speech, index_speech=False) as memory:
         record = memory.add(Blob(b"kitchen recording", "video/mp4", "kitchen.mp4"))
 
     assert speech.calls == []
@@ -4065,7 +4264,9 @@ def test_vlm_generation_recognizes_complete_speaker_identity_in_parallel(
     models = ParallelModels(capabilities=capabilities)
     speech = IdentitySpeech()
 
-    with _memory(tmp_path, models, transcriber=speech) as memory:
+    # Deferred so recognition is still outstanding at `ask` time, which is what this test
+    # observes running in parallel with query embedding.
+    with _memory(tmp_path, models, transcriber=speech, index_speech=False) as memory:
         record = memory.add(
             (
                 "red recording",
@@ -4598,3 +4799,218 @@ def test_identity_matching_reports_a_detector_that_found_nothing(tmp_path: Path)
         if span.attributes is not None and IDENTITY_OBSERVATIONS in span.attributes
     ]
     assert [attributes[IDENTITY_OBSERVATIONS] for attributes in recorded] == [0]
+
+
+def test_capabilities_declares_what_a_composition_can_do(tmp_path: Path) -> None:
+    """A caller and an agent must be able to ask, not infer, what this composition supports.
+
+    Nothing published this before, so the library itself reached
+    `self._memory._memory._embedding_capabilities` to learn it. When internal code needs two
+    underscores to find a fact, an external caller has no route at all: `/healthz` returned
+    `{"status": "ok"}` and no transport could report which modalities would actually work.
+    """
+    models = _FakeModels()
+    with Memory(tmp_path, embedder=models, answerer=models) as memory:
+        declared = memory.capabilities
+
+        assert declared.embedding == models.embedding_capabilities
+        assert declared.generation == models.generation_capabilities
+        assert declared.embedding_model == models.embedding_model
+        assert declared.embedding_space == models.embedding_space
+        assert declared.embedding_dimension == models.embedding_dimension
+        # Optional backends this composition did not supply read as absent rather than raising.
+        assert declared.vision == frozenset()
+        assert declared.vision_model is None
+        assert declared.formation == frozenset()
+        assert declared.speaker_recognition is False
+
+    speech = _FakeSpeech()
+    with _memory(tmp_path / "speech", transcriber=speech) as memory:
+        assert memory.capabilities.speaker_recognition is True
+        assert memory.capabilities.transcription == speech.transcription_capabilities
+
+
+def test_forget_identity_erases_the_person_and_their_name_from_the_index(tmp_path: Path) -> None:
+    """ "Forget that" must remove the biometric template AND the name it was indexed under.
+
+    `delete()` reaches memories cleanly but never touched `identities` or `identity_exemplars`,
+    and no public verb removed them, so a household robot asked to forget someone kept their face
+    and voice vectors forever. Erasing only the rows is not enough either: the indexed document
+    carries the registered name, so the search projection would still answer to "Alice".
+
+    The family's memories survive. Forgetting a person is not forgetting the evening.
+    """
+    # `index_speech` on is what puts the speech section -- and therefore the registered name --
+    # into the indexed document, which is the leak this verb has to close.
+    with _memory(tmp_path, transcriber=_FakeSpeech()) as memory:
+        record = memory.add(Blob(b"first speech", "audio/wav", "first.wav"))
+        speaker_id = memory.speech(record.id)[0].speaker_id
+        assert speaker_id is not None
+        memory.register_speaker(speaker_id, "Alice")
+        assert "Alice" in memory.get(record.id).content
+
+        erasure = memory.forget_identity(speaker_id)
+
+        assert erasure.identity_id == speaker_id
+        assert erasure.voice_exemplars >= 1
+        # The identity no longer resolves under any of its ids.
+        assert memory.identity(speaker_id) is None
+        # The memory and its media survive; only the person is gone from it.
+        surviving = memory.get(record.id)
+        assert surviving.id == record.id
+        assert surviving.assets
+        assert "Alice" not in surviving.content, "the indexed name must not survive the erasure"
+        # The transcript itself is evidence and stays.
+        assert "spoken red wrench" in surviving.content
+        with pytest.raises(IdentityNotFoundError):
+            memory.forget_identity(speaker_id)
+
+
+def test_ranking_does_not_hydrate_stored_embedding_vectors(tmp_path: Path) -> None:
+    # Ranking reads index scores and event times; the stored FP32 vector and the memory content
+    # are never consulted. Hydrating them anyway unpacked and revalidated one vector per
+    # candidate, which measured at twenty-one times the cost of the query that produced the row.
+    # Failing the full-document read proves ranking reaches the projection instead: reverting the
+    # search path to `read_index_documents` turns this red.
+    with Memory(tmp_path, embedder=_FakeEmbedder()) as memory:
+        memory.add("a stored fact about winter")
+        memory.add("an unrelated fact about summer")
+        # `add` drains the search-index outbox, which legitimately needs whole documents. Only
+        # the ranking path that follows is under test.
+        store = memory._store
+        calls: list[int] = []
+        original = store.read_index_documents
+
+        def _refuse(embedding_ids: Sequence[str]) -> tuple[IndexDocument, ...]:
+            calls.append(len(embedding_ids))
+            raise AssertionError("ranking hydrated whole index documents")
+
+        store.read_index_documents = _refuse  # type: ignore[method-assign]
+        try:
+            hits = memory.search("winter", limit=5)
+        finally:
+            store.read_index_documents = original  # type: ignore[method-assign]
+
+    assert calls == []
+    assert [hit.content for hit in hits][:1] == ["a stored fact about winter"]
+
+
+def _scripted(script: dict[str, tuple[str, str]], ref: AssetRef) -> tuple[str, str]:
+    """Look up a clip's (speaker, visible face) by the blob name the test gave it."""
+    assert ref.name is not None
+    return script[ref.name]
+
+
+class _ScriptedSpeech:
+    """A speech backend whose speaker vector is chosen per asset by a clip script."""
+
+    transcription_capabilities = frozenset({Modality.AUDIO, Modality.VIDEO})
+    transcription_model = "scripted-cam"
+    transcription_space = "scripted-cam:speech:test"
+
+    def __init__(self, script: dict[str, tuple[str, str]], voices: Sequence[str]) -> None:
+        self.script = script
+        self.voices = tuple(voices)
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+        return tuple(
+            SpeechAnalysis(
+                turns=(SpeechTurn(0, 900, "talking", "0"),),
+                speakers=(
+                    SpeakerEmbedding("0", _one_hot(self.voices, _scripted(self.script, ref)[0])),
+                ),
+            )
+            for ref in assets
+        )
+
+    def close(self) -> None:
+        return None
+
+
+class _ScriptedFace:
+    """A face backend whose face vector is chosen per asset by the same clip script."""
+
+    face_capabilities = frozenset({Modality.IMAGE, Modality.VIDEO})
+    face_model = "scripted-sface"
+    face_space = "scripted-sface:test"
+    face_analysis_space = "scripted-yunet:test"
+
+    def __init__(self, script: dict[str, tuple[str, str]], faces: Sequence[str]) -> None:
+        self.script = script
+        self.faces = tuple(faces)
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[FaceAnalysis, ...]:
+        return tuple(
+            FaceAnalysis(
+                (
+                    FaceEmbedding(
+                        "face-0",
+                        _one_hot(self.faces, _scripted(self.script, ref)[1]),
+                        (0.1, 0.1, 0.4, 0.5),
+                        100,
+                    ),
+                )
+            )
+            for ref in assets
+        )
+
+    def close(self) -> None:
+        return None
+
+
+def _one_hot(members: Sequence[str], member: str) -> tuple[float, ...]:
+    return tuple(1.0 if other == member else 0.0 for other in members)
+
+
+def test_a_wearer_voice_binding_one_face_does_not_cascade_to_everybody(tmp_path: Path) -> None:
+    """One unavoidable cross-modal mistake must not consume every other person.
+
+    Egocentric footage puts an off-camera wearer's voice in the same clip as whoever is in
+    frame, and `identity_link_min_assets` cannot separate the two, because the wearer talks
+    to the same person across many clips and that wrong pair accumulates exactly as fast as
+    a genuine speaker's. What is avoidable is the cascade that follows: the moment the
+    wearer's voice owns an interlocutor's face, that identity holds both modalities, and
+    permitting fragments to rejoin it hands it the interlocutor's own voice and then the
+    next interlocutor's face, until one identity is everybody.
+
+    The script below runs the wearer talking to A and then to B, with each of them also
+    speaking on camera. The wearer will bind to A's face; B must survive it intact.
+    """
+    script = {
+        "wearer-a-0.mp4": ("wearer", "a"),
+        "a-speaks-0.mp4": ("a", "a"),
+        "wearer-a-1.mp4": ("wearer", "a"),
+        "a-speaks-1.mp4": ("a", "a"),
+        "wearer-b-0.mp4": ("wearer", "b"),
+        "b-speaks-0.mp4": ("b", "b"),
+        "wearer-b-1.mp4": ("wearer", "b"),
+        "b-speaks-1.mp4": ("b", "b"),
+    }
+    voice_ids: dict[str, str] = {}
+    face_ids: dict[str, str] = {}
+
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_ScriptedSpeech(script, ("wearer", "a", "b")),
+        face_analyzer=_ScriptedFace(script, ("a", "b")),
+    ) as memory:
+        for name, (speaker, seen) in script.items():
+            record = memory.add(Blob(name.encode() * 4, "video/mp4", name))
+            observed = memory.faces(record.id)[0].identity_id
+            heard = memory.speech(record.id)[0].speaker_id
+            assert heard is not None
+            voice_ids.setdefault(speaker, heard)
+            face_ids.setdefault(seen, observed)
+        resolve = memory._store.resolve_identity_id
+        voices = {person: resolve(value) for person, value in voice_ids.items()}
+        faces = {person: resolve(value) for person, value in face_ids.items()}
+
+    # B speaks on camera twice, so B's own voice and face still merge.
+    assert faces["b"] == voices["b"]
+    # The wearer took A's face, and that is where it stops: B is not swallowed, and A's own
+    # voice is left orphaned rather than folded into the identity that already owns A's face.
+    assert faces["a"] == voices["wearer"]
+    assert faces["b"] != faces["a"]
+    assert voices["a"] != faces["a"]
+    assert len(set(voices.values()) | set(faces.values())) == 3

@@ -208,7 +208,15 @@ encoded video through `AsyncCaptureStream` when a full clip is required.
 With native image embedding, frame changes drive speculative retrieval directly. With a text-only
 embedder, `VisionPartial` drives retrieval and its final value attaches to the keyframe through
 `StreamInput.description`. Without a partial, a configured `VisionDescriptionBackend` describes the
-final frame once. With none of those routes, finalization fails instead of discarding the frame.
+final frame once, before finalization, so speculative retrieval has a query to work with. With none
+of those routes, finalization fails instead of discarding the frame.
+
+That early call is the text-only case only. It is a scheduling choice, not the condition for
+describing at all: `add` and `add_many` call a configured describer for **every** embedder whenever
+a visual asset still has no description, and union the text into the stored and indexed document
+regardless of embedder capability, because what the lexical document contains is a separate question
+from which modality the embedder accepts. Configuring no describer stays an exact no-op on both
+paths.
 
 ## Interaction-derived records
 

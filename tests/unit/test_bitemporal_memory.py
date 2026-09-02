@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
@@ -14,6 +14,7 @@ from mindbridge import (
     MemoryKind,
     ObservationContext,
     RetrievalScope,
+    ValidationError,
 )
 
 
@@ -212,18 +213,19 @@ def test_known_at_never_leaks_a_later_unformed_record(tmp_path: Path) -> None:
         assert memory.get(source.id) == source
 
 
-def test_valid_at_excludes_records_without_typed_validity(tmp_path: Path) -> None:
+def test_valid_at_keeps_records_without_typed_validity(tmp_path: Path) -> None:
     with Memory(tmp_path, embedder=TinyEmbedder(), minimum_relevance=0) as memory:
-        memory.add("undated raw observation")
+        observation = memory.add("undated raw observation")
 
-        assert (
-            memory.search(
-                "undated raw observation",
-                limit=10,
-                scope=RetrievalScope(valid_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
-            )
-            == ()
+        # An observation declares no validity interval, so no `valid_at` can refute it. Dropping
+        # it would turn every historical question into a silent empty answer.
+        hits = memory.search(
+            "undated raw observation",
+            limit=10,
+            scope=RetrievalScope(valid_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
         )
+
+        assert [hit.id for hit in hits] == [observation.id]
 
 
 def test_get_keeps_provenance_for_a_fully_retired_state(tmp_path: Path) -> None:
@@ -389,3 +391,40 @@ def test_one_source_can_form_the_same_state_in_disjoint_intervals(tmp_path: Path
             memory,
             RetrievalScope(valid_at=datetime(2026, 3, 15, tzinfo=timezone.utc)),
         ) == {"tea"}
+
+
+def test_expired_observation_validity_soft_forgets_without_a_former(tmp_path: Path) -> None:
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=2)
+    with Memory(tmp_path, embedder=TinyEmbedder(), minimum_relevance=0) as memory:
+        expired = memory.add(
+            "the guest wifi password is swordfish",
+            context=ObservationContext(valid_from=start, valid_until=now - timedelta(days=1)),
+        )
+        live = memory.add(
+            "the front door code is 1234",
+            context=ObservationContext(valid_from=start),
+        )
+
+        # Default retrieval drops the expired record; identity reads keep it.
+        assert [hit.id for hit in memory.search("password code", limit=10)] == [live.id]
+        assert memory.get(expired.id).content == "the guest wifi password is swordfish"
+        assert {record.id for record in memory.list(limit=10).items} == {expired.id, live.id}
+
+        # A scope inside the expired window still reaches it.
+        inside = start + timedelta(hours=1)
+        assert expired.id in {
+            hit.id
+            for hit in memory.search(
+                "password code", limit=10, scope=RetrievalScope(valid_at=inside)
+            )
+        }
+
+
+def test_valid_until_requires_valid_from() -> None:
+    try:
+        ObservationContext(valid_until=datetime.now(timezone.utc))
+    except ValidationError as error:
+        assert "valid_until must be later than valid_from" in str(error)
+    else:  # pragma: no cover - the contract is that this raises
+        raise AssertionError("valid_until alone must be rejected")

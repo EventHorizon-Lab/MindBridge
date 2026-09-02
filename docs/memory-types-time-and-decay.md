@@ -102,8 +102,14 @@ Raw occurrence and typed assertion time answer different questions:
 | Field | Meaning |
 | --- | --- |
 | `occurred_at` / `occurred_end` | When the captured episode happened |
-| `MemoryContext.valid_from` / `valid_until` | When a formed assertion is true in the represented world |
+| `MemoryContext.valid_from` / `valid_until` | When the assertion is true in the represented world |
 | `MemoryContext.recorded_at` / `retired_at` | When MindBridge knew that assertion version |
+
+Both validity columns and both transaction columns are stored on every typed version, so this is
+full bitemporal invalidation rather than a single timestamp. A formation backend is not required to
+reach them: `add(..., context=ObservationContext(valid_from=..., valid_until=...))` writes the same
+validity axis directly, and correcting an assertion later sets `retired_at` on the version it
+replaces instead of rewriting it.
 
 `RetrievalScope(valid_at=..., known_at=...)` combines the last two axes. `valid_at` selects an
 assertion whose half-open world interval contains that instant; `known_at` selects the transaction
@@ -134,6 +140,34 @@ recalculates derived confidence and visibility, and removing the last evidence r
 unsupported derived record. Removing a superseding source, or deleting a derived assertion, rebuilds
 current validity segments from the remaining supported assertions. Source records are deleted only
 by an explicit caller action.
+
+### Expiring a memory without deleting it
+
+Because default retrieval considers only active validity, an explicit `valid_until` is a soft
+forget. Give the observation a validity interval that ends, and after that instant the record stops
+appearing in default `search` and `ask` while `get` and `list` still return it and its context:
+
+```python
+from datetime import datetime, timedelta, timezone
+
+from mindbridge import ObservationContext
+
+now = datetime.now(timezone.utc)
+expiring = memory.add(
+    "The guest wifi password is swordfish.",
+    context=ObservationContext(valid_from=now, valid_until=now + timedelta(days=1)),
+)
+```
+
+`valid_until` requires `valid_from`; supplying an end alone raises `ValidationError`, because a
+world interval with no beginning cannot be placed on the validity axis. The end is exclusive and
+must be later than the start.
+
+This is the right tool when a fact was true and stopped being true — a temporary access code, a
+guest who has left, a plan that has been superseded. It is not a privacy control: the content,
+assets, embedding, and typed context all remain on disk and remain readable, and a
+`RetrievalScope(valid_at=...)` inside the expired window still retrieves the record, which is the
+point of keeping it. Use `delete` when the bytes must go.
 
 ## Temporal phrases
 

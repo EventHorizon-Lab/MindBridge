@@ -9,6 +9,7 @@ import unicodedata
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import cast
 
 _DIRECT_CHOICE = re.compile(r"(?:option\s+)?[([]?([A-J])[]).]?", re.IGNORECASE)
 _EXPLICIT_CHOICE = re.compile(
@@ -109,7 +110,8 @@ def summarize(
     interval = None
     if len(clusters) > 1:
         bootstrapped = _cluster_bootstrap(clusters, seed=seed, samples=bootstrap_samples)
-        low, high = _percentile(bootstrapped, 0.025), _percentile(bootstrapped, 0.975)
+        low = cast(float, percentile(bootstrapped, 0.025))
+        high = cast(float, percentile(bootstrapped, 0.975))
         if clamp is not None:
             low, high = max(clamp[0], low), min(clamp[1], high)
         interval = [low, high]
@@ -230,11 +232,13 @@ def _cluster_bootstrap(
     return tuple(sorted(draws))
 
 
-def _percentile(values: Sequence[float], probability: float) -> float:
+def percentile(values: Sequence[float], probability: float) -> float | None:
+    """Return the linearly interpolated quantile, or ``None`` for no observations."""
     if not values:
-        raise ValueError("percentile needs values")
-    position = probability * (len(values) - 1)
+        return None
+    ordered = sorted(values)
+    position = probability * (len(ordered) - 1)
     lower = int(position)
-    upper = min(lower + 1, len(values) - 1)
+    upper = min(lower + 1, len(ordered) - 1)
     weight = position - lower
-    return values[lower] * (1 - weight) + values[upper] * weight
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight

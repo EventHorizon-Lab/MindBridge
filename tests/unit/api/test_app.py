@@ -26,13 +26,18 @@ from mindbridge.types import (
     AssetRef,
     Blob,
     ContentInput,
+    MemoryCapabilities,
     MemoryRecord,
     MemoryType,
     Modality,
     ObservationContext,
     Page,
+    RetrievalCandidateTrace,
+    RetrievalRejection,
     RetrievalScope,
+    RetrievalTrace,
     SearchHit,
+    TracedSearchResult,
 )
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
@@ -59,12 +64,30 @@ ASSET = AssetRef(
 )
 
 
+# Every modality, because `frozenset` iterates in hash order and enum members hash by identity:
+# with five values an unsorted serializer produces the documented order once in 120 runs.
+CAPABILITIES = MemoryCapabilities(
+    embedding=frozenset(Modality),
+    embedding_model="jina-v5-omni",
+    embedding_space="space_1",
+    embedding_dimension=1024,
+    generation=frozenset({Modality.TEXT}),
+    generation_model="qwen3-omni",
+    speaker_recognition=True,
+)
+
+
 class FakeMemory:
     def __init__(self, failure: Exception | None = None) -> None:
         self.calls: list[tuple[object, ...]] = []
         self.close_count = 0
         self.failure = failure
         self.deleted = True
+        self.declared = CAPABILITIES
+
+    @property
+    def capabilities(self) -> MemoryCapabilities:
+        return self.declared
 
     def add(
         self,
@@ -152,6 +175,36 @@ class FakeMemory:
         )
         return (_hit(),)
 
+    def search_with_trace(
+        self,
+        query: ContentInput,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> TracedSearchResult:
+        self._fail()
+        self.calls.append(
+            (
+                "search_with_trace",
+                query,
+                limit,
+                memory_type,
+                reference_at,
+                occurred_from,
+                occurred_until,
+            )
+        )
+        return TracedSearchResult(hits=(), trace=_trace())
+
+    def reinforce(self, memory_ids: Sequence[str]) -> int:
+        self._fail()
+        self.calls.append(("reinforce", tuple(memory_ids)))
+        return len(tuple(dict.fromkeys(memory_ids)))
+
     def ask(
         self,
         question: ContentInput,
@@ -238,7 +291,7 @@ def test_resource_routes_map_the_public_memory_values() -> None:
         deleted = client.delete("/v1/memories/memory_1")
         openapi = client.get("/openapi.json").json()
 
-    assert health.json() == {"status": "ok"}
+    assert health.json()["status"] == "ok"
     assert created.status_code == 201
     assert created.json()["content"] == "The toolbox is blue."
     assert created.json()["memory_type"] == "episodic"
@@ -559,6 +612,68 @@ def test_status_follows_whether_the_same_call_can_ever_succeed(
     )
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    [
+        # One oversized-input condition, one status, whichever side noticed it. This used to be
+        # 413 from the request middleware and 502 from the provider path.
+        (ModelError("asset exceeds the request budget", reason="payload_too_large"), 413),
+        # Not retryable, so it must not claim to be transient with 503.
+        (StorageError("failed to read memory", reason="io_failed"), 500),
+    ],
+)
+def test_one_reason_answers_with_one_status(failure: Exception, expected_status: int) -> None:
+    with TestClient(create_app(memory=FakeMemory(failure))) as client:
+        response = client.get("/v1/memories/memory_1")
+
+    assert response.status_code == expected_status
+    assert response.json()["retryable"] is False
+    assert response.headers.get("Retry-After") is None
+
+
+def test_health_reports_the_live_composition() -> None:
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory)) as client:
+        body = client.get("/healthz").json()
+
+    assert body["status"] == "ok"
+    assert body["capabilities"] == {
+        "embedding": ["audio", "image", "omni", "text", "video"],
+        "embedding_model": "jina-v5-omni",
+        "embedding_space": "space_1",
+        "embedding_dimension": 1024,
+        "generation": ["text"],
+        "transcription": [],
+        "vision": [],
+        "face": [],
+        "formation": [],
+        "generation_model": "qwen3-omni",
+        "transcription_space": None,
+        "vision_model": None,
+        "face_model": None,
+        "formation_model": None,
+        "speaker_recognition": True,
+        "streaming_generation": False,
+    }
+
+
+def test_health_reads_the_injected_memory_rather_than_a_captured_snapshot() -> None:
+    memory = FakeMemory()
+    memory.declared = MemoryCapabilities(
+        embedding=frozenset({Modality.TEXT}),
+        embedding_model="text-embedder",
+        embedding_space="space_2",
+        embedding_dimension=8,
+    )
+
+    with TestClient(create_app(memory=memory)) as client:
+        body = client.get("/healthz").json()
+
+    assert body["capabilities"]["embedding_space"] == "space_2"
+    assert body["capabilities"]["embedding"] == ["text"]
+    assert body["capabilities"]["speaker_recognition"] is False
+
+
 def test_error_envelope_reports_reason_stage_and_subject() -> None:
     failure = ModelError(
         "local media asset is unavailable",
@@ -669,6 +784,63 @@ def test_size_limit_runs_before_body_parsing() -> None:
     assert memory.calls == []
 
 
+def test_search_keeps_its_default_shape_and_explains_an_empty_result() -> None:
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory)) as client:
+        plain = client.post("/v1/memories/search", json={"query": "toolbox"})
+        explained = client.post("/v1/memories/search", json={"query": "toolbox", "explain": True})
+
+    assert plain.status_code == 200
+    assert plain.json()["hits"][0]["id"] == "memory_1"
+    assert plain.json()["trace"] is None
+    assert explained.status_code == 200
+    body = explained.json()
+    assert body["hits"] == []
+    assert body["trace"]["ambiguous"] is True
+    assert body["trace"]["candidate_limit"] == 50
+    assert body["trace"]["exhaustive"] is True
+    assert body["trace"]["candidates"] == [
+        {
+            "memory_id": "memory_1",
+            "index_ids": ["index_1"],
+            "dense_relevance": 0.42,
+            "dense_confidence": None,
+            "lexical_relevance": None,
+            "lexical_rerank_bonus": None,
+            "lexical_match": False,
+            "gate_relevance": 0.31,
+            "base_relevance": None,
+            "reinforcement_factor": None,
+            "temporal_factor": None,
+            "retention_factor": None,
+            "final_score": 0.4,
+            "rank": None,
+            "rejected_by": "minimum_relevance",
+        }
+    ]
+    assert memory.calls == [
+        ("search", "toolbox", 10, None, None, None, None),
+        ("search_with_trace", "toolbox", 10, None, None, None, None),
+    ]
+
+
+def test_reinforce_route_reaches_the_sdk_and_rejects_an_empty_list() -> None:
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory)) as client:
+        reinforced = client.post(
+            "/v1/memories/reinforce", json={"memory_ids": ["memory_1", "memory_1", "memory_2"]}
+        )
+        empty = client.post("/v1/memories/reinforce", json={"memory_ids": []})
+
+    assert reinforced.status_code == 200
+    assert reinforced.json() == {"reinforced": 2}
+    assert memory.calls == [("reinforce", ("memory_1", "memory_1", "memory_2"))]
+    assert empty.status_code == 422
+    assert empty.json()["code"] == "validation_error"
+
+
 def _record(
     memory_id: str,
     content: str,
@@ -690,6 +862,24 @@ def _record(
         occurred_at=occurred_at,
         occurred_end=occurred_end,
         metadata=metadata or {},
+    )
+
+
+def _trace() -> RetrievalTrace:
+    return RetrievalTrace(
+        candidates=(
+            RetrievalCandidateTrace(
+                memory_id="memory_1",
+                index_ids=("index_1",),
+                dense_relevance=0.42,
+                gate_relevance=0.31,
+                final_score=0.4,
+                rejected_by=RetrievalRejection.MINIMUM_RELEVANCE,
+            ),
+        ),
+        candidate_limit=50,
+        exhaustive=True,
+        ambiguous=True,
     )
 
 

@@ -58,8 +58,13 @@ For backup and recovery procedures, see [operations](operations.md).
 
 ## Search returns no hits
 
-An empty tuple is a valid search result. Candidates below `minimum_relevance` are rejected; an
-unresolved top-two tie may also be withheld when `limit=1`.
+An empty tuple is a valid search result. Candidates whose gate confidence falls below
+`minimum_relevance` are rejected; an unresolved top-two tie may also be withheld when `limit=1`.
+
+`minimum_relevance` is not compared against the `score` on a returned `SearchHit`. That score is
+the final ranking score, while the gate compares a separate gate confidence, so tuning the floor
+against observed scores gives the wrong value. `search_with_trace()` reports both per candidate;
+use it rather than inferring the threshold from hits that were returned.
 
 Before lowering thresholds:
 
