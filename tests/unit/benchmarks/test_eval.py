@@ -16,6 +16,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.trace import Tracer
 
 import mindbridge.benchmarks.eval as eval_module
 from mindbridge import (
@@ -73,7 +75,7 @@ from mindbridge.benchmarks.eval_statistics import (
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.mem_gallery import MemGalleryRound, MemGallerySession
 from mindbridge.benchmarks.model_config import ModelConfig
-from mindbridge.benchmarks.official_scorers import scorer_protocol
+from mindbridge.benchmarks.official_scorers import scorer_protocol, task_family
 from mindbridge.benchmarks.task_catalog import TASKS, TaskSpec, expand
 from mindbridge.benchmarks.video_mme_v2 import score_group_answers
 from mindbridge.models.base import EmbedTask, ModelInput, SpeechAnalysis, SpeechBackend
@@ -290,6 +292,7 @@ def test_result_table_includes_per_task_time_and_tokens() -> None:
                     "score": {"mean": 1.0, "confidence_interval_95": None},
                     "question_count": 2,
                     "error_count": 0,
+                    "ingest_failure_count": 0,
                     "performance": {
                         "duration_seconds": {"total": 2.5, "average": 1.25},
                         "token_usage": {"total_tokens": 30, "average_tokens": 15.0},
@@ -313,6 +316,47 @@ def test_result_table_includes_per_task_time_and_tokens() -> None:
     assert "avg ms" in output
     assert "30" in output
     assert "15.0" in output
+
+
+def test_result_table_reports_the_writes_that_invalidated_a_score() -> None:
+    # A run that loses every write still answers every question, so `error_count` stays zero and
+    # the score reads INVALID beside it with nothing saying why. One real run lost 7 784 writes to
+    # a transcription dependency that was not installed and printed exactly that.
+    output = eval_module._table(
+        {
+            "tasks": [
+                {
+                    "task": "fixture",
+                    "primary_metric": "accuracy",
+                    "score": {"mean": None, "confidence_interval_95": None},
+                    "question_count": 152,
+                    "error_count": 0,
+                    "ingest_failure_count": 7784,
+                    # `_table` refuses to render a task row with no controls block, so a
+                    # score can never be printed without the baselines that make it
+                    # interpretable. This row is about the writes column, so the controls
+                    # are all absent and correctly report themselves as missing.
+                    "controls": {
+                        "random_ranker": None,
+                        "recall_at_1": None,
+                        "recall_at_20": None,
+                        "blind": None,
+                        "is_blind_run": False,
+                        "missing": ["random_ranker", "blind", "recall_at_20"],
+                        "interpretable": False,
+                        "reason": "fixture reports a score without random_ranker, blind, recall_at_20",
+                    },
+                    "performance": {
+                        "duration_seconds": {"total": 1.0, "average": 1.0},
+                        "token_usage": {"total_tokens": 1, "average_tokens": 1.0},
+                    },
+                }
+            ]
+        }
+    )
+
+    assert "unwritten" in output
+    assert "7784" in output
 
 
 def test_cluster_statistics_and_pairing_are_seeded() -> None:
@@ -607,7 +651,7 @@ def test_benchmark_speech_backend_satisfies_the_runtime_protocol() -> None:
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v9"
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v10"
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(device=None, seed=7, gen_kwargs="{}", recall_limit=8, blind=False),
@@ -662,8 +706,9 @@ def test_backend_pool_warms_query_embedding_before_evaluation(
 
 
 def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A hand-written forwarding list drops new policy silently, which is worse than crashing:
-    the run measures the default while the artifact reports the configured value."""
+    """A hand-written forwarding list drops new policy or a new plugin silently, which is worse
+    than crashing: the run measures the default composition while the artifact reports the
+    configured one."""
     captured: dict[str, object] = {}
 
     class Recorder:
@@ -673,26 +718,54 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
     pool = object.__new__(eval_module._BackendPool)
     settings = MemoryConfig(evidence_budget_chars=4_242, minimum_relevance=0.11)
-    for name, value in (
-        ("_settings", settings),
-        ("_embedder", None),
-        ("_answerer", None),
-        ("_transcriber", None),
-        ("_face_analyzer", None),
-        ("_tracer", None),
-    ):
-        setattr(pool, name, value)
+    pool._settings = settings
+    pool._tracer = trace.get_tracer(__name__)
+    for entry in fields(MemoryPlugins):
+        setattr(pool, f"_{entry.name}", None)
+    # Every declared plugin slot gets its own distinguishable sentinel, so a dropped or
+    # mis-mapped backend cannot pass by looking like its neighbour or like "not configured".
+    backends = {entry.name: f"backend:{entry.name}" for entry in fields(MemoryPlugins)}
+    pool._settings = settings
+    pool._tracer = cast(Tracer, None)
+    for name, value in backends.items():
+        setattr(pool, f"_{name}", value)
 
     pool.memory(Path("unused"))
 
     for entry in fields(MemoryConfig):
         assert captured[entry.name] == getattr(settings, entry.name), entry.name
-    # Deriving the forwarding from the dataclass is only safe while every declared field names
+    for name, value in backends.items():
+        assert captured[name] == value, name
+    # Deriving the forwarding from the dataclasses is only safe while every declared field names
     # a real constructor keyword; a field added without one would raise at call time instead.
-    declared = {entry.name for entry in fields(MemoryConfig)}
+    declared = {entry.name for entry in (*fields(MemoryConfig), *fields(MemoryPlugins))}
     for constructor in (Memory.__init__, AsyncMemory.__init__):
         unaccepted = declared - set(signature(constructor).parameters)
         assert not unaccepted, f"{constructor.__qualname__} has no keyword for {sorted(unaccepted)}"
+
+
+def test_backend_pool_forwards_every_capability_plugin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`former` was declared on `MemoryPlugins`, built by the SDK adapter, and used by `Memory`,
+    yet the harness never passed it, so no benchmark run has ever exercised derived-memory
+    formation. Deriving the expected keywords from the dataclass makes the next omission red."""
+    captured: dict[str, object] = {}
+
+    class Recorder:
+        def __init__(self, _data_dir: object, **values: object) -> None:
+            captured.update(values)
+
+    monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
+    pool = object.__new__(eval_module._BackendPool)
+    pool._settings = MemoryConfig()
+    pool._tracer = trace.get_tracer(__name__)
+    markers = {entry.name: object() for entry in fields(MemoryPlugins)}
+    for name, marker in markers.items():
+        setattr(pool, f"_{name}", marker)
+
+    pool.memory(Path("unused"))
+
+    for name, marker in markers.items():
+        assert captured[name] is marker, name
 
 
 def test_implementation_identity_tracks_editable_source_changes(
@@ -939,7 +1012,12 @@ def test_configured_backend_pool_lends_plugins_and_closes_the_owner(
         memory_config=memory_config,
     )
 
-    assert pool._settings is settings
+    # Every configured setting survives, except that measurement turns answer-time reinforcement
+    # off: reinforcing mid-run makes one question's retrieval depend on which earlier questions
+    # answered, so a run would stop being reproducible from its seed.
+    assert pool._settings == replace(settings, reinforce_on_answer=False)
+    assert settings.reinforce_on_answer is True
+    assert pool._settings.reinforce_on_answer is False
     assert configured[0].generation is not None
     assert configured[0].generation.modalities == frozenset({Modality.TEXT, Modality.IMAGE})
     assert pool._answerer is not None
@@ -949,6 +1027,49 @@ def test_configured_backend_pool_lends_plugins_and_closes_the_owner(
     assert closed == []
     pool.close()
     assert closed == [True]
+
+
+def test_backend_pool_borrows_every_configured_plugin_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Every declared plugin slot must survive the trip from configuration to the store.
+
+    A slot the pool never captures is silently absent: the artifact reports the configured
+    composition while the run measures the default one.
+    """
+    captured: dict[str, object] = {}
+    names = tuple(entry.name for entry in fields(MemoryPlugins))
+    plugins = SimpleNamespace(**{name: SimpleNamespace(marker=name) for name in names})
+    resolved = SimpleNamespace(
+        plugins=plugins,
+        settings=MemoryConfig(),
+        close=lambda: None,
+    )
+
+    class Recorder:
+        def __init__(self, _data_dir: object, **values: object) -> None:
+            captured.update(values)
+
+    monkeypatch.setattr(eval_module, "resolve_memory_config", lambda _config: resolved)
+    monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
+    pool = eval_module._BackendPool(
+        ModelConfig(),
+        device=None,
+        batch_size=1,
+        needs_speech=False,
+        seed=0,
+        memory_config=MindBridgeConfig.model_validate({"embedding": {"provider": "openai"}}),
+    )
+
+    pool.memory(tmp_path)
+
+    for name in names:
+        borrowed = captured[name]
+        assert borrowed is not None, name
+        # Borrowed, not the owner itself: a per-store close must not close a shared backend.
+        assert borrowed is not getattr(plugins, name), name
+        assert getattr(borrowed, "marker", None) == name, name
 
 
 def test_borrowed_face_backend_preserves_the_runtime_protocol() -> None:
@@ -1861,5 +1982,218 @@ def test_metric_breakdowns_cover_every_catalog_task(tmp_path: Path) -> None:
     assert "object recognition" in cast(dict[str, object], grouped["category"])
 
 
+# The metadata fields each family groups its per-question scores by, written
+# from the adapters in `eval_adapters.py` -- which is what a real run puts in
+# `SampleResult.metadata` -- rather than read back off `_BREAKDOWN_FIELDS`, so
+# that a family losing its breakdown turns these tests red instead of silently
+# agreeing with the regression. That is how `longmemeval`, `clbench`, `beam`
+# and `personamem-v3` went a release reporting no breakdown at all. An empty
+# tuple means the family is expected to have no entry in the product table.
+_EXPECTED_BREAKDOWN_FIELDS: dict[str, tuple[str, ...]] = {
+    "locomo-refined": ("category",),
+    "m3-bench": ("question_types",),
+    "video-mme": ("duration", "domain", "task_type"),
+    "video-mme-v2": ("group_type", "level", "second_head", "third_head"),
+    "egolifeqa": ("day", "question_type"),
+    # No breakdown: the public release ships no answer key, so every sample
+    # scores `None` and there is nothing to group.
+    "egomemreason": (),
+    "egotempo": ("question_type",),
+    "memlens": ("question_type", "question_subtype"),
+    "mm-lifelong": ("question_type",),
+    "supermemory-vqa": ("skill",),
+    "atm-bench": ("qtype",),
+    "mem-gallery": ("point",),
+    "longmemeval": ("question_type",),
+    "clbench": ("context_category", "sub_category"),
+    "beam": ("category", "difficulty"),
+    "personamem-v3": ("task_family", "task_type"),
+    "openeqa": ("category",),
+}
+
+
+def _breakdown_task(family: str, tmp_path: Path) -> LoadedTask:
+    spec = next((spec for name, spec in TASKS.items() if task_family(name) == family), None)
+    assert spec is not None, f"no catalog task belongs to {family}"
+    return LoadedTask(
+        spec,
+        tmp_path / "dataset.json",
+        "0" * 64,
+        (EvalUnit("unit", (), (EvalQuestion("q1", ("question",), ("reference",)),)),),
+    )
+
+
+def _breakdown_sample(task: str, metadata: dict[str, object]) -> SampleResult:
+    return replace(_egomem_sample(1), task=task, score=1.0, metadata=metadata)
+
+
+@pytest.mark.parametrize("family", sorted(_EXPECTED_BREAKDOWN_FIELDS))
+def test_every_family_breaks_its_scores_down_by_its_own_metadata(
+    family: str, tmp_path: Path
+) -> None:
+    """Every field the product declares is one an adapter really emits."""
+    task = _breakdown_task(family, tmp_path)
+    fields_expected = _EXPECTED_BREAKDOWN_FIELDS[family]
+    sample = _breakdown_sample(task.spec.name, {name: f"{name}-value" for name in fields_expected})
+
+    breakdowns = eval_module._metric_breakdowns(task, (sample,), cast(Any, _breakdown_arguments()))
+
+    assert set(breakdowns) == set(fields_expected), family
+    for name in fields_expected:
+        cell = cast(dict[str, object], breakdowns[name])
+        assert f"{name}-value" in cell, f"{family}.{name}"
+
+
+def test_the_breakdown_table_is_exactly_the_fields_this_suite_pins() -> None:
+    # The behavioural test above only feeds the fields it expects, so a field
+    # name added to the product table that no adapter emits -- a rename, or a
+    # `question_type`/`question_types` slip -- would group nothing and stay
+    # invisible there. Compare the table itself so an addition has to be
+    # reviewed too, and so the families expected to have no entry really have
+    # none rather than an entry that happens to group nothing.
+    grouped = {family: fields for family, fields in _EXPECTED_BREAKDOWN_FIELDS.items() if fields}
+
+    assert grouped == eval_module._BREAKDOWN_FIELDS
+
+
+def test_the_breakdown_table_covers_every_catalog_family() -> None:
+    # A benchmark added to the catalog without a decision recorded here reports
+    # no breakdown at all, which is invisible in a results document.
+    assert {task_family(name) for name in TASKS} == set(_EXPECTED_BREAKDOWN_FIELDS)
+
+
+def test_an_unlabelled_beam_difficulty_is_left_out_of_the_breakdown(tmp_path: Path) -> None:
+    # BEAM publishes `difficulty` on some rows only. Grouping the rest under a
+    # literal "None" bucket would read as a difficulty tier in the report.
+    task = _breakdown_task("beam", tmp_path)
+    sample = _breakdown_sample(task.spec.name, {"category": "temporal", "difficulty": None})
+
+    breakdowns = eval_module._metric_breakdowns(task, (sample,), cast(Any, _breakdown_arguments()))
+
+    assert set(breakdowns) == {"category"}
+
+
 def _breakdown_arguments() -> SimpleNamespace:
     return SimpleNamespace(seed=1234, bootstrap_samples=8, recall_limit=20, blind=False)
+
+
+def test_a_task_worded_refusal_counts_as_an_abstention() -> None:
+    # `AnswerResult.abstained` recognises the product's own refusal sentence, which it cannot do
+    # for a wording the task substituted. MEMLENS mandates "Insufficient information", so a real
+    # dev run reported 0 abstentions where 16 of 59 answers were refusals.
+    question = EvalQuestion(
+        "q1",
+        ("Where did she go?",),
+        ("the market",),
+        refusal="Insufficient information",
+    )
+
+    assert eval_module._declined("Insufficient information", question)
+    assert eval_module._declined("Insufficient information.", question)
+    assert not eval_module._declined("She went to the market.", question)
+    # A task that mandates nothing must not have refusals invented for it.
+    assert not eval_module._declined("Insufficient information", replace(question, refusal=None))
+
+
+def test_memlens_questions_declare_the_refusal_their_own_prompt_mandates(tmp_path: Path) -> None:
+    # Loading the real task, not the helper in isolation: a declaration the loader never attaches
+    # returns the reported refusal rate to zero while the model keeps refusing, and a test of the
+    # helper alone stays green through exactly that.
+    from mindbridge.benchmarks.prompts import MEMLENS_QUERY_PROMPT
+
+    dataset = tmp_path / "memlens.json"
+    dataset.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "q1",
+                    "question_type": "preference",
+                    "question": "What is my favorite color?",
+                    "answer": "Blue.",
+                    "question_date": "2025/01/15 (Wed) 10:00",
+                    "haystack_dates": ["2025/01/14 (Tue) 09:00"],
+                    "haystack_sessions": [
+                        [{"role": "user", "content": "My favorite color is blue."}]
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    auxiliary = tmp_path / "memlens" / "agent_subset_195.json"
+    auxiliary.parent.mkdir()
+    auxiliary.write_text(json.dumps({"n_questions": 1, "question_ids": ["q1"]}), encoding="utf-8")
+
+    loaded = load_task(
+        TASKS["memlens-32k"], root=tmp_path, dataset_path=dataset, verify_digest=False
+    )
+    question = loaded.units[0].questions[0]
+
+    assert MEMLENS_QUERY_PROMPT.refusal is not None
+    # Tied to the prompt text, so changing the mandated wording without the declaration fails.
+    assert f'"{MEMLENS_QUERY_PROMPT.refusal}"' in MEMLENS_QUERY_PROMPT.text
+    assert question.refusal == MEMLENS_QUERY_PROMPT.refusal
+    assert eval_module._declined(MEMLENS_QUERY_PROMPT.refusal, question)
+
+
+def test_mem_gallery_refusal_questions_declare_the_wording_their_constraint_mandates(
+    tmp_path: Path,
+) -> None:
+    # Loading the real task, for the same reason the MemLens case does: `AR` is the only one of
+    # the nine task types whose constraint overrides the refusal wording, so a declaration the
+    # loader never attaches reports zero refusals for it while the model keeps refusing.
+    from mindbridge.benchmarks.prompts import MEM_GALLERY_REFUSAL_PROMPT
+
+    dialog = tmp_path / "dialog"
+    dialog.mkdir()
+    (dialog / "topic.json").write_text(
+        json.dumps(
+            {
+                "character_profile": {
+                    "name": "Mira",
+                    "persona_summary": "A gardener.",
+                    "conversation_style": "warm",
+                },
+                "multi_session_dialogues": [
+                    {
+                        "session_id": "D1",
+                        "date": "2024-05-02",
+                        "dialogues": [
+                            {"round": "D1:1", "user": "I planted basil.", "assistant": "Nice."}
+                        ],
+                    }
+                ],
+                "human-annotated QAs": [
+                    {
+                        "point": "AR",
+                        "question": "What did I plant in the greenhouse?",
+                        "answer": "Not mentioned.",
+                        "session_id": ["D1"],
+                    },
+                    {
+                        "point": "FR",
+                        "question": "What did I plant?",
+                        "answer": "Basil.",
+                        "session_id": ["D1"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_task(
+        TASKS["mem-gallery"], root=tmp_path, dataset_path=dialog, verify_digest=False
+    )
+    by_point = {
+        question.metadata["point"]: question for unit in loaded.units for question in unit.questions
+    }
+
+    assert MEM_GALLERY_REFUSAL_PROMPT.refusal is not None
+    # Tied to the constraint text, so changing the mandated wording without the declaration fails.
+    assert MEM_GALLERY_REFUSAL_PROMPT.refusal in MEM_GALLERY_REFUSAL_PROMPT.text
+    assert by_point["AR"].refusal == MEM_GALLERY_REFUSAL_PROMPT.refusal
+    assert eval_module._declined(MEM_GALLERY_REFUSAL_PROMPT.refusal, by_point["AR"])
+    # The other eight types are asked without that constraint, so they must not claim it.
+    assert by_point["FR"].refusal is None
+    assert not eval_module._declined(MEM_GALLERY_REFUSAL_PROMPT.refusal, by_point["FR"])

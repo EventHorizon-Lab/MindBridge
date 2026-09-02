@@ -92,11 +92,24 @@ class MemoryConfig:
     ambiguity_margin: _UnitInterval = 0.01
     # `ask` grounds on `limit` memories and then keeps admitting lower-ranked ones while the
     # evidence stays inside this character budget. Retrieval scores separate the right memory
-    # from the rest only weakly, so the answering model does the final selection and needs to
-    # see enough candidates; the budget is what keeps that from becoming an unbounded prompt.
-    # `None` grounds on exactly `limit`.
+    # from the rest only weakly, so the answering model does the final selection and benefits
+    # from seeing more candidates. `None` grounds on exactly `limit`.
+    #
+    # This raises a floor; it is not a ceiling. The `limit` hits are kept unconditionally, so the
+    # prompt is bounded by `limit` times the size of a memory and setting this can only make it
+    # larger. On LoCoMo-Refined it turns a 20-memory window into 56.3 and the answer prompt from
+    # 2 856 tokens to 7 648 for a score change of 0.003, inside that task's 0.029 noise. Nor is
+    # `limit` a token control once this is set: at limit 3 and limit 20 the same budget refills
+    # the window to the same 56.3 memories, Jaccard 0.986. Bound a prompt by lowering `limit`
+    # with this left at `None`.
     evidence_budget_chars: _PositiveInt | None = None
     decay_half_life_days: _PositiveFloat | None = None
+    # `ask` counts the evidence it cited, which is what keeps the reinforcement factor in
+    # `_ranking_signals` from being pinned at 1.0 for a caller that never calls `reinforce`.
+    # Measurement needs it off: reinforcing during a run makes one question's retrieval depend
+    # on which earlier questions already answered and, under concurrency, on the order their
+    # updates committed, so an evaluation stops being reproducible from its seed.
+    reinforce_on_answer: _StrictBool = True
     # UNPROVENANCED AND KNOWN-WRONG IN THE SAFE DIRECTION. Kept only because every alternative
     # available without a measurement is wrong in the unsafe direction. Do not tune this by
     # intuition; the calibration plan is in `docs/configuration.md`.

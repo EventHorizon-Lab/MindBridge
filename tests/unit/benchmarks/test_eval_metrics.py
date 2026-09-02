@@ -192,19 +192,6 @@ async def test_ingest_traces_one_span_per_accepted_batch_with_its_item_count() -
     assert cast(float, ingest["items_per_second"]) > 0.0
 
 
-async def test_blind_control_writes_nothing_through_the_same_public_path() -> None:
-    class _Memory:
-        async def add_many(self, contents: Sequence[object], **_kwargs: object) -> tuple[Any, ...]:
-            raise AssertionError("the blind control must not write")
-
-        async def add(self, content: object, **_kwargs: object) -> object:
-            raise AssertionError("the blind control must not write")
-
-    items = (MemoryItem("source", ("text",)),)
-
-    assert await eval_module._ingest(cast(Any, _Memory()), items, batch_size=1, blind=True) == 0
-
-
 # --- family 2: search latency at p50/p95/p99 with throughput --------------------------------
 
 
@@ -504,6 +491,9 @@ def test_table_prints_missing_controls_instead_of_only_a_score() -> None:
                     "duration_seconds": {"total": 2.5, "average": 1.25},
                     "token_usage": {"total_tokens": 30, "average_tokens": 15.0},
                 },
+                # `_table` reports the writes that invalidated a score; a row
+                # without this key cannot render.
+                "ingest_failure_count": 0,
                 "controls": {
                     "random_ranker": None,
                     "recall_at_1": None,
@@ -545,6 +535,9 @@ def test_table_shows_the_control_values_when_they_are_present() -> None:
                     "duration_seconds": {"total": 2.5, "average": 1.25},
                     "token_usage": {"total_tokens": 30, "average_tokens": 15.0},
                 },
+                # `_table` reports the writes that invalidated a score; a row
+                # without this key cannot render.
+                "ingest_failure_count": 0,
                 "controls": {
                     "random_ranker": {"20": {"mean": 0.9941}},
                     "recall_at_1": {"mean": 0.5},

@@ -2,7 +2,8 @@
 
 ## Purpose
 
-The optional MCP adapter exposes fourteen typed tools over one injected synchronous `Memory`.
+The optional MCP adapter exposes exactly fourteen typed tools over one injected synchronous
+`Memory`.
 It validates tool input, calls the matching SDK operation, and returns structured public values.
 It does not own storage, provider selection, or the injected memory. Finalized media arrives
 through ordinary content parts; live audio and vision packet ingestion, and `StreamEvent`
@@ -68,11 +69,12 @@ rejected. The MCP-specific media bounds are listed below.
 | Tool | Arguments and defaults | Structured result | Annotation |
 | --- | --- | --- | --- |
 | `add_memory` | required `content`; `occurred_at=None`; `occurred_end=None`; `metadata=None`; `memory_type="semantic"`; `context=None` | `MemoryResult` | idempotent write |
-| `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None` | `{"hits":[SearchHitResult,...]}` | may persist |
+| `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None`; `explain=false` | `{"hits":[SearchHitResult,...],"trace":null}` | may persist |
 | `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None` | `AnswerResponse` | may persist |
 | `get_memory` | required `memory_id` | `MemoryResult` | read-only |
 | `list_memories` | `limit=100`; `cursor=None` | `PageResult` | read-only |
 | `delete_memory` | required `memory_id` | `{"deleted":bool}` | destructive, idempotent |
+| `reinforce_memories` | required `memory_ids`, 1 through 100 | `{"reinforced":int}` | write, not idempotent |
 | `analyze_speech` | required `memory_id` | `{"segments":[SpeakerSegment,...]}` | may persist |
 | `analyze_faces` | required `memory_id` | `{"observations":[FaceObservation,...]}` | may persist |
 | `register_speaker` | required `speaker_id`, `name`; `relationship=None` | `{"registered":true}` | idempotent write |
@@ -80,7 +82,6 @@ rejected. The MCP-specific media bounds are listed below.
 | `get_identity` | required `identity_id` | `{"identity":IdentityProfile\|null}` | read-only |
 | `unlink_identity` | required `alias_id` | `{"restored_identity_id":str\|null}` | destructive, idempotent |
 | `forget_identity` | required `identity_id` | `{"erasure":IdentityErasure}` | destructive, not idempotent |
-| `reinforce_memories` | required `memory_ids`, 1 through 100 | `{"reinforced":int}` | may persist |
 
 All timestamps must be timezone-aware. An event end requires a start and must be later than it.
 Search event bounds are a half-open overlap filter; two bounds require
@@ -120,13 +121,37 @@ The embodied and identity tools follow the SDK operation they dispatch to:
   transcript keeps its words with the speaker attribution dropped. It cannot be undone, and the
   second call reports `identity_not_found` because the person is already gone, which is why it is
   the one tool advertised as destructive and not idempotent.
-- `reinforce_memories` records cumulative positive feedback, so repeating a call reinforces again.
-  Duplicate IDs count once and unknown IDs are skipped, so `reinforced` below the number sent
-  means the rest do not exist.
+- `reinforce_memories` records cumulative positive feedback: each call raises `access_count` for
+  the named memories and moves the ranker's reinforcement factor, so it is published with
+  `idempotent_hint=false` and a lost response must not be retried blindly. Duplicate IDs count
+  once and unknown IDs are skipped, so `reinforced` below the number sent means the rest do not
+  exist.
 
 Tool descriptions are published through `inspect.cleandoc`, so the text an agent reads is
 identical on every supported interpreter. CPython 3.13 strips a docstring's common indentation at
 compile time and earlier versions do not, and the description is public contract.
+
+Every tool and every tool argument carries a published description. Read those before guessing at
+coordinate frames, units, or media sources; they are part of the tool schema, not a separate guide.
+
+### Retrieval trace
+
+`search_memories` with `explain=true` routes to `Memory.search_with_trace` and adds a `trace`
+object beside the unchanged `hits`. `trace.candidates` lists every candidate that was considered
+with its effective score components (`dense_relevance`, `dense_confidence`, `lexical_relevance`,
+`lexical_rerank_bonus`, `lexical_match`, `gate_confidence`, `base_relevance`,
+`reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`) and, when it
+did not become a hit, a `rejected_by` value of `stale_index`, `occurrence_range`, `missing_memory`,
+`memory_type`, `minimum_relevance`, `ambiguity`, or `limit`. `trace.candidate_limit` is how many
+candidates were fetched, `trace.exhaustive` says whether that bound was reached, and
+`trace.ambiguous` says whether the result was suppressed for being too close to call. Without
+`explain`, `trace` is `null` and no extra work is done.
+
+A `SearchHitResult.score` is `final_score`, but the relevance gate compares `gate_confidence`, which
+is a different quantity. Tuning a floor against the returned `score` therefore compares the wrong
+two numbers. The floor itself, `minimum_relevance`, and `ambiguity_margin` are fixed when the owner
+constructs `Memory`; no tool argument can widen them for one call, so an empty result is answered by
+reading `trace` and changing the query, filters, or the owner's configuration.
 
 ### Result objects
 
@@ -137,6 +162,8 @@ Successful calls populate MCP `structuredContent`:
 | `AssetResult` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name` |
 | `MemoryResult` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context` |
 | `SearchHitResult` | all memory fields plus `score` |
+| `SearchResult` | `hits`, and `trace` when `explain=true` |
+| `ReinforceResult` | `reinforced` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResult` | `items`, `next_cursor` |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
@@ -160,12 +187,14 @@ described above.
 
 ### Validation and errors
 
-Only the fourteen documented names and their exact top-level arguments are accepted. An unknown tool or
+Only the fourteen documented names and their exact top-level arguments are accepted. An unknown
+tool or
 top-level argument returns `validation_error/unknown_field`; schema and SDK input failures return
 `validation_error/input_invalid`. Unknown values are not echoed.
 
-Failed tool calls set `isError` and carry the same JSON envelope as
-[REST](rest.md#error-envelope) in their text content:
+Failed tool calls set `isError` and their text content is exactly the same JSON envelope as
+[REST](rest.md#error-envelope), with nothing before or after it. One `JSON.parse` of the text
+succeeds for every failure, including `memory_not_found`, `model_error`, and `storage_error`:
 
 ```json
 {
@@ -205,7 +234,7 @@ none is withheld because it touches owner-process state, since every tool alread
 | --- | --- |
 | `add_stream` | **Transport limitation.** It consumes a lazy iterable and yields records as it goes, and one tool call is a finite request with one response, so a stream cannot be started, fed, and drained through it. Call `add_memory` for each completed observation, or use the SDK for a live source. |
 | `add_many` | Every item is already reachable through `add_memory`, so this buys one model batch rather than a capability. Its parallel arrays must line up with `contents` position by position, and a misalignment stores real memories under the wrong timestamps, which is a worse failure than slower ingestion. Use `POST /v1/memories/batch` for bulk loading. |
-| `search_with_trace` | The trace is candidate-level retrieval diagnostics -- score components and rejection reasons, without evidence content. It tells an agent nothing it can act on and would dominate the response. Use the SDK or the CLI when diagnosing retrieval. |
+| `search_with_trace` | No tool of its own, because the same trace is reachable from the tool that produces the hits: call `search_memories` with `explain=true`. Use the SDK or the CLI when diagnosing retrieval outside an agent loop. |
 | `reindex` | Rebuilds the whole search projection from SQLite. The duration grows with the store and has no upper bound, so it does not belong behind a client that expects one timely response. It is also an operator decision, not a caller's. |
 | `optimize` | Merges staged vectors into the index. An agent has no basis for deciding when that is worth doing, and the operator scheduling it has the CLI. |
 

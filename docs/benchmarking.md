@@ -83,6 +83,46 @@ Without `--judge-model-args`, the judge reuses the generation endpoint. Run
 Use `mindbridge-bench locomo-refined --help` when another evaluator needs raw LoCoMo-Refined
 predictions and a manifest instead of the integrated scores and confidence intervals from `eval`.
 
+## Baseline arms
+
+A MindBridge score on its own is unattributable: it does not say how much of the answer came from
+memory rather than from the generator's prior, and a retrieval score does not say whether the
+ranking carried any information. `--arms` runs the baselines that answer those questions beside
+the product, sharing one ingest per unit:
+
+```bash
+mindbridge-bench eval \
+  --tasks atm-bench-easy \
+  --arms mindbridge,blind,full-context,random \
+  --full-context-chars 24000
+```
+
+| Arm | Answers from | Retrieval | Reports |
+| --- | --- | --- | --- |
+| `mindbridge` | `Memory.ask` over retrieved evidence | the product's | every metric |
+| `blind` | the generator's prior, with no evidence | none | answer metrics only |
+| `full-context` | the corpus stuffed into one prompt, oldest first, under `--full-context-chars` | none | answer metrics only |
+| `random` | nothing; it generates no answer | a seeded uniform shuffle of the same ranked candidates | retrieval metrics only |
+
+The default is `mindbridge` alone. Each arm tags its samples and its task row with `arm`, and
+`results.json` records every selected arm's definition -- prompt version, budget, and random seed
+-- under `arms`. Sample IDs of a non-default arm are prefixed with its name, so `samples.jsonl`
+stays one row per answered question per arm.
+
+Three properties of the baselines are load-bearing when quoting them:
+
+- **The two generating baselines are outside the product path by construction.** `Memory.ask`
+  abstains before it reaches the model when no hit survives grounding, so neither could exist
+  through it. They call the configured generation model with a harness-owned prompt, versioned as
+  `mindbridge_blind_v1` and `mindbridge_full_context_v1`, and are scored and judged by the same
+  scorers as the product arm. No baseline number is ever stamped `official_metric`.
+- **They are text-only.** Media in a question is dropped from the blind prompt, and media in a
+  corpus is not stuffed, so on a video or audio task both arms are lower bounds.
+- **`random` shuffles the retriever's own candidate pool.** It holds pool membership fixed and
+  randomizes order, which isolates the ranking. It is not a random draw from the whole corpus: on
+  a corpus small enough for the pool to cover it, a random ranker can score near-perfect recall,
+  and that is exactly the number worth printing next to the product's.
+
 ## Datasets and prepared media
 
 By default, the runner downloads missing pinned inputs and verifies published digests when one is
@@ -336,11 +376,34 @@ than that is inside the run-to-run noise band and is not a result. `--compare` r
 Each completed `eval` output directory contains:
 
 - `samples.jsonl`: one prediction and its native metrics, evidence intervals, retrieval diagnostics,
-  and structured failure fields per sample.
-- `results.json`: dataset and implementation pins, aggregate metrics, confidence intervals,
-  performance, token usage, abstentions, mandatory controls, the noise floor, resource usage, and a
-  digest of `samples.jsonl`.
-- `egomemreason_submission.json`: only for a complete, valid EgoMemReason run.
+  and structured failure fields per sample, per arm.
+- `results.json`: dataset and implementation pins, arm definitions, aggregate metrics, confidence
+  intervals, performance, token usage, abstentions, mandatory controls, the noise floor, resource
+  usage, and a digest of `samples.jsonl`.
+- `egomemreason_submission.json`: only for a complete, valid EgoMemReason run, from the
+  `mindbridge` arm.
+
+Three result fields carry a caveat that decides whether they can be quoted:
+
+- **`official_metric` means the pinned upstream protocol publishes that metric and, for a judged
+  one, that the required judge produced it.** The retrieval and joint diagnostics -- `retrieval_*`
+  and `joint_*` -- are MindBridge's own and are never official, however faithful the rest of the
+  run was. `official_scorers.py` holds the per-family registry that decides this.
+- **`abstentions` undercounts.** It counts two things: the opaque marker the answer backend emits
+  when it declines, and -- for a task whose own prompt mandates a refusal wording -- an answer
+  equal to that wording. A model that refuses in its own free wording, on a task that mandates
+  none, is still not counted. Measured under the older exact-sentence detector, an EgoLifeQA slice
+  reported 2 of 51 while 14 of 51 answers read as refusals; treat the field as a lower bound and
+  read the predictions before drawing a conclusion about refusal rates.
+- **`retrieval_*` scores the retriever's ranked candidate list, not the answer's evidence.** The
+  runner takes the top `retrieval_candidate_limit` (100) hits in score order through `search`, so
+  a miss there is a retrieval failure. What the answer actually grounded on is separate:
+  `evidence` is the answer's hits, and `dropped_hits` counts what the answerer's inline context
+  budget removed. A gold that is in the candidate list but not in `evidence` is budget loss, not
+  retrieval loss. A replayed answer from `--use-cache` carries no retrieval metrics: the cache
+  stores answers, not candidate lists. `ref_at_300` stays a property of the answer's evidence.
+
+`performance` is aggregated per task across every arm of that task, not per arm.
 
 Prompts, references, and raw judge responses are retained only with `--log-samples`. Treat that
 option as sensitive: benchmark artifacts can contain source content, retrieved evidence, and model
@@ -381,7 +444,9 @@ Questions sharing one memory are clustered as one independent unit. Confidence i
 regression significance remain unavailable when fewer than two independent units are present.
 Partial, failed, or unverified runs remain useful for development but are not leaderboard-comparable.
 
-Compare a run with an equivalent baseline using stable sample IDs:
+`--compare` is a regression guard, not a baseline. It pairs the current `mindbridge` arm against a
+prior MindBridge run over identical dataset, scorer, and judge identities, using stable sample IDs;
+it cannot say how much of a score came from memory. Use `--arms` for that.
 
 ```bash
 mindbridge-bench eval \

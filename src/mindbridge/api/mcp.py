@@ -32,6 +32,7 @@ from mindbridge.types import (
     Modality,
     ObservationContext,
     RetrievalScope,
+    RetrievalTrace,
     SearchHit,
     SpeakerSegment,
 )
@@ -51,6 +52,14 @@ _IDEMPOTENT_WRITE = ToolAnnotations(
     read_only_hint=False,
     destructive_hint=False,
     idempotent_hint=True,
+    open_world_hint=False,
+)
+# Reinforcement accumulates: each call raises `access_count` and moves the ranking factor, so a
+# repeated call is not the same as one call and the honest hint is `idempotent_hint=False`.
+_COUNTED_WRITE = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=False,
     open_world_hint=False,
 )
 _DELETE = ToolAnnotations(
@@ -80,6 +89,7 @@ _TOOL_ARGUMENTS = {
             "occurred_from",
             "occurred_until",
             "scope",
+            "explain",
         }
     ),
     "ask_memory": frozenset({"question", "limit", "memory_type", "reference_at", "scope"}),
@@ -95,6 +105,55 @@ _TOOL_ARGUMENTS = {
     "forget_identity": frozenset({"identity_id"}),
     "reinforce_memories": frozenset({"memory_ids"}),
 }
+# Prose the six tool schemas share. MCP publishes these verbatim, so an agent reads them before it
+# guesses at frames, units, or media sources.
+_CONTENT_DESCRIPTION = (
+    "The memory content: a non-blank string, or 1 through 16 ordered parts (`input_text`,"
+    " `input_image`, `input_file`). Media must arrive as a base64 `data:` URL or as a `file_id`"
+    " already stored in this data directory; remote URLs, local paths, and `file:` URLs are"
+    " rejected, so fetch media before calling."
+)
+_QUERY_DESCRIPTION = (
+    "What to look for: a non-blank string, or 1 through 16 ordered parts for a mixed-modal query"
+    " (an image plus words). Media follows the same base64 `data:` URL or stored `file_id` rule as"
+    " `add_memory`."
+)
+_MEMORY_TYPE_FILTER_DESCRIPTION = (
+    "Restrict results to `semantic`, `episodic`, or `procedural` memories. Null considers every"
+    " type; a wrong guess here is a common cause of an empty result."
+)
+_REFERENCE_AT_DESCRIPTION = (
+    "The timezone-aware instant that relative language in the query ('yesterday', 'last week')"
+    " is resolved against, and the instant recency is scored from. Defaults to now."
+)
+_SCOPE_DESCRIPTION = (
+    "Optional retrieval filter. `valid_at` selects world validity and `known_at` selects the"
+    " transaction version known at that time. `near` and `radius_m` must be supplied together:"
+    " `near` is a pose in a named coordinate frame (`frame_id`, `anchor` of observer or subject,"
+    " metres for `x`/`y`/`z`, `orientation_xyzw` as a unit quaternion) and `radius_m` is metres."
+    " Spatial filtering only matches memories stored with a spatial context in the same frame and"
+    " anchor, so it excludes every plain text memory."
+)
+_MEMORY_ID_DESCRIPTION = (
+    "The `id` a previous `add_memory`, `search_memories`, or `list_memories` result returned."
+)
+# Prose the identity tool schemas share. An identity ID and a memory ID are different vocabularies,
+# and passing one where the other belongs is the mistake these strings exist to prevent.
+_SPEAKER_ID_DESCRIPTION = (
+    "A `speaker_id` from an `analyze_speech` segment. It names one recognized voice, never a"
+    " stored memory."
+)
+_IDENTITY_ID_DESCRIPTION = (
+    "An `identity_id` from `analyze_faces` or `analyze_speech`, or a `speaker_id`: a merged alias"
+    " resolves to the person it was bound into. It never names a stored memory."
+)
+_PERSON_NAME_DESCRIPTION = (
+    "What to call this person, as a non-blank name. Registering again replaces the stored name."
+)
+_RELATIONSHIP_DESCRIPTION = (
+    "How this person relates to the caller ('sister', 'colleague'). Null leaves any recorded"
+    " relationship as it is rather than clearing it."
+)
 # The error envelope MCP shares with REST.
 _ERROR_FIELDS = frozenset(
     {"code", "reason", "retryable", "stage", "subject", "message", "trace_id", "issues"}
@@ -150,6 +209,8 @@ class PageResult(BaseModel):
 
 class SearchResult(BaseModel):
     hits: tuple[SearchHitResult, ...]
+    # Null unless the call asked for it, so the default result keeps the shape agents already read.
+    trace: RetrievalTrace | None = None
 
 
 class AnswerResponse(BaseModel):
@@ -197,7 +258,7 @@ class ReinforceResult(BaseModel):
 
 
 def build_mcp_server(memory: Memory) -> MCPServer[None]:
-    """Expose the agent tool surface without taking ownership of ``memory``.
+    """Expose the typed agent tool surface without taking ownership of ``memory``.
 
     Every tool is one call on the injected ``Memory``: the embodied and identity tools are
     reachable here for the same reason the common-path tools are, because this server runs in the
@@ -214,14 +275,63 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
     @server.tool(annotations=_IDEMPOTENT_WRITE)
     @_stable_errors
     def add_memory(
-        content: Content,
-        occurred_at: AwareDatetime | None = None,
-        occurred_end: AwareDatetime | None = None,
-        metadata: dict[str, JsonValue] | None = None,
-        memory_type: MemoryType = MemoryType.SEMANTIC,
-        context: ObservationContext | None = None,
+        content: Annotated[Content, Field(description=_CONTENT_DESCRIPTION)],
+        occurred_at: Annotated[
+            AwareDatetime | None,
+            Field(
+                description=(
+                    "When the remembered event happened, as a timezone-aware timestamp. Omit for a"
+                    " timeless fact; without it the memory never matches a search occurrence"
+                    " window."
+                )
+            ),
+        ] = None,
+        occurred_end: Annotated[
+            AwareDatetime | None,
+            Field(
+                description=(
+                    "End of the remembered interval, timezone-aware. Requires `occurred_at` and"
+                    " must be later than it."
+                )
+            ),
+        ] = None,
+        metadata: Annotated[
+            dict[str, JsonValue] | None,
+            Field(
+                description=(
+                    "Application-owned JSON stored verbatim with the record, at most 262,144 UTF-8"
+                    " bytes serialized. It is not searched, and it is not an access-control or"
+                    " isolation boundary."
+                )
+            ),
+        ] = None,
+        memory_type: Annotated[
+            MemoryType,
+            Field(
+                description=(
+                    "`semantic` for a standing fact, `episodic` for something that happened,"
+                    " `procedural` for how to do something. Search can filter on it."
+                )
+            ),
+        ] = MemoryType.SEMANTIC,
+        context: Annotated[
+            ObservationContext | None,
+            Field(
+                description=(
+                    "Typed provenance for this observation: basis, source ID, confidence, validity"
+                    " window, and optional spatial pose. Omit it unless the caller actually knows"
+                    " these; `scope` filters at search time only match memories that carry them."
+                )
+            ),
+        ] = None,
     ) -> MemoryResult:
-        """Store one memory and return its stable record."""
+        """Store one memory and return its stable record.
+
+        Call this to persist something the agent should be able to recall in a later session.
+        Writes durable local state and may call the configured embedding backend. Storage is
+        content-addressed, so re-adding identical content returns the existing record instead of a
+        duplicate and retrying a call whose response was lost is safe.
+        """
         record = memory.add(
             content_input(content),
             occurred_at=occurred_at,
@@ -235,17 +345,78 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
     @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
     @_stable_errors
     def search_memories(
-        query: Content,
-        limit: _Limit = 10,
-        memory_type: MemoryType | None = None,
-        reference_at: AwareDatetime | None = None,
-        occurred_from: AwareDatetime | None = None,
-        occurred_until: AwareDatetime | None = None,
-        scope: RetrievalScope | None = None,
+        query: Annotated[Content, Field(description=_QUERY_DESCRIPTION)],
+        limit: Annotated[
+            _Limit,
+            Field(
+                description=(
+                    "Maximum hits to return, 1 through 100. It caps the result; it cannot raise a"
+                    " candidate above the relevance gate, so it never turns an empty result into a"
+                    " non-empty one."
+                )
+            ),
+        ] = 10,
+        memory_type: Annotated[
+            MemoryType | None, Field(description=_MEMORY_TYPE_FILTER_DESCRIPTION)
+        ] = None,
+        reference_at: Annotated[
+            AwareDatetime | None, Field(description=_REFERENCE_AT_DESCRIPTION)
+        ] = None,
+        occurred_from: Annotated[
+            AwareDatetime | None,
+            Field(
+                description=(
+                    "Keep only memories whose event interval overlaps at or after this"
+                    " timezone-aware instant. Memories stored without `occurred_at` never match."
+                )
+            ),
+        ] = None,
+        occurred_until: Annotated[
+            AwareDatetime | None,
+            Field(
+                description=(
+                    "Exclusive upper bound of the same half-open overlap filter; with"
+                    " `occurred_from` it must be strictly later."
+                )
+            ),
+        ] = None,
+        scope: Annotated[RetrievalScope | None, Field(description=_SCOPE_DESCRIPTION)] = None,
+        explain: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Also return `trace`: every candidate considered, with its score components"
+                    " and, when it did not become a hit, the `rejected_by` reason"
+                    " (`minimum_relevance`, `ambiguity`, `memory_type`, `occurrence_range`,"
+                    " `missing_memory`, `stale_index`, or `limit`). Ask for it when `hits` is"
+                    " empty or shorter than expected; `hits` itself is identical either way."
+                )
+            ),
+        ] = False,
     ) -> SearchResult:
-        """Find the most relevant local memories."""
-        hits = memory.search(
-            content_input(query),
+        """Rank stored memories against a query and return the matching records.
+
+        Call this to find out what is stored before answering from your own context, or to gather
+        evidence you will read yourself; use `ask_memory` when you want MindBridge to write the
+        answer. Returns at most `limit` hits, best first, and never invents one: empty `hits` means
+        nothing cleared the relevance gate, and `explain=true` reports which stage discarded each
+        candidate. Stores no memory and is safe to retry, though it may cache a transcript for
+        media it had to transcribe.
+        """
+        content = content_input(query)
+        if not explain:
+            hits = memory.search(
+                content,
+                limit=limit,
+                memory_type=memory_type,
+                reference_at=reference_at,
+                occurred_from=occurred_from,
+                occurred_until=occurred_until,
+                scope=scope,
+            )
+            return SearchResult(hits=tuple(_search_hit_result(hit) for hit in hits))
+        traced = memory.search_with_trace(
+            content,
             limit=limit,
             memory_type=memory_type,
             reference_at=reference_at,
@@ -253,18 +424,50 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
             occurred_until=occurred_until,
             scope=scope,
         )
-        return SearchResult(hits=tuple(_search_hit_result(hit) for hit in hits))
+        return SearchResult(
+            hits=tuple(_search_hit_result(hit) for hit in traced.hits),
+            trace=traced.trace,
+        )
 
     @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
     @_stable_errors
     def ask_memory(
-        question: Content,
-        limit: _Limit = 5,
-        memory_type: MemoryType | None = None,
-        reference_at: AwareDatetime | None = None,
-        scope: RetrievalScope | None = None,
+        question: Annotated[
+            Content,
+            Field(
+                description=(
+                    "The question to answer, as a non-blank string or 1 through 16 ordered parts."
+                    " It is also the retrieval query, so phrase it the way the memory would be"
+                    " worded."
+                )
+            ),
+        ],
+        limit: Annotated[
+            _Limit,
+            Field(
+                description=(
+                    "Maximum memories read as evidence, 1 through 100. More evidence costs more"
+                    " model input and can be truncated by the configured evidence budget."
+                )
+            ),
+        ] = 5,
+        memory_type: Annotated[
+            MemoryType | None, Field(description=_MEMORY_TYPE_FILTER_DESCRIPTION)
+        ] = None,
+        reference_at: Annotated[
+            AwareDatetime | None, Field(description=_REFERENCE_AT_DESCRIPTION)
+        ] = None,
+        scope: Annotated[RetrievalScope | None, Field(description=_SCOPE_DESCRIPTION)] = None,
     ) -> AnswerResponse:
-        """Answer only from retrieved local memories."""
+        """Answer a question using only the memories retrieved for it.
+
+        Requires a generation backend in the host process: without one every call fails with
+        `model_error/backend_not_configured`, so use `search_memories` if you are not sure one is
+        configured. Returns the answer with the hits it used; `abstained` is true when the answerer
+        reported no usable evidence, and the answer is then a fixed sentence rather than a guess.
+        Stores no memory, but each call spends another generation, so retry only on a retryable
+        error.
+        """
         result = memory.ask(
             content_input(question),
             limit=limit,
@@ -281,14 +484,40 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
 
     @server.tool(annotations=_READ_ONLY)
     @_stable_errors
-    def get_memory(memory_id: _Identifier) -> MemoryResult:
-        """Read one memory by its stable identifier."""
+    def get_memory(
+        memory_id: Annotated[_Identifier, Field(description=_MEMORY_ID_DESCRIPTION)],
+    ) -> MemoryResult:
+        """Read one memory by its stable identifier.
+
+        Call this to re-read a record whose ID you already hold, not to discover memories. Fails
+        with `memory_not_found` when the ID never existed or was deleted, and that verdict is
+        permanent, so retrying an unknown ID never starts working. Changes nothing.
+        """
         return _memory_result(memory.get(memory_id))
 
     @server.tool(annotations=_READ_ONLY)
     @_stable_errors
-    def list_memories(limit: _Limit = 100, cursor: _Cursor | None = None) -> PageResult:
-        """List newest memories through an opaque stable cursor."""
+    def list_memories(
+        limit: Annotated[
+            _Limit,
+            Field(description="Maximum records in this page, 1 through 100."),
+        ] = 100,
+        cursor: Annotated[
+            _Cursor | None,
+            Field(
+                description=(
+                    "The `next_cursor` from the previous page, passed back unchanged. Its contents"
+                    " are opaque; a null `next_cursor` means the listing is complete."
+                )
+            ),
+        ] = None,
+    ) -> PageResult:
+        """Page through every stored memory, newest first.
+
+        Call this to inventory what is stored when you have no query; use `search_memories` when
+        you know what you are looking for. Changes nothing and is safe to retry, but a page is a
+        snapshot: memories added or deleted while you page can appear twice or not at all.
+        """
         page = memory.list(limit=limit, cursor=cursor)
         return PageResult(
             items=tuple(_memory_result(record) for record in page.items),
@@ -297,9 +526,41 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
 
     @server.tool(annotations=_DELETE)
     @_stable_errors
-    def delete_memory(memory_id: _Identifier) -> DeleteResult:
-        """Idempotently delete one memory."""
+    def delete_memory(
+        memory_id: Annotated[_Identifier, Field(description=_MEMORY_ID_DESCRIPTION)],
+    ) -> DeleteResult:
+        """Permanently delete one memory and any media only it referenced.
+
+        Call this when the caller asked for the memory to be forgotten. There is no undo and no
+        tombstone to read back. It is idempotent, so retrying is safe: `deleted` reports whether a
+        record existed, and a second call on the same ID returns `false`.
+        """
         return DeleteResult(deleted=memory.delete(memory_id))
+
+    @server.tool(annotations=_COUNTED_WRITE)
+    @_stable_errors
+    def reinforce_memories(
+        memory_ids: Annotated[
+            tuple[_Identifier, ...],
+            Field(
+                min_length=1,
+                max_length=100,
+                description=(
+                    "IDs of memories that were actually useful, from a previous result. Duplicates"
+                    " count once; IDs that no longer exist are skipped."
+                ),
+            ),
+        ],
+    ) -> ReinforceResult:
+        """Record that these memories were useful, so retrieval favours them later.
+
+        Call this after a memory helped you answer, and only then: it is the sole way to move the
+        ranker's reinforcement factor away from its neutral value. It writes durable state and its
+        effect accumulates, so two calls count twice; do not repeat one whose outcome you are
+        unsure of. Content, timestamps, and metadata are untouched. Returns how many of the
+        supplied IDs existed.
+        """
+        return ReinforceResult(reinforced=memory.reinforce(memory_ids))
 
     _register_embodied_tools(server, memory)
     return server
@@ -314,7 +575,9 @@ def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
 
     @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
     @_stable_errors
-    def analyze_speech(memory_id: _Identifier) -> SpeechResult:
+    def analyze_speech(
+        memory_id: Annotated[_Identifier, Field(description=_MEMORY_ID_DESCRIPTION)],
+    ) -> SpeechResult:
         """Transcribe one stored memory's audio and video, and resolve who spoke.
 
         Call this to learn what was said in a memory whose content is speech, or which person
@@ -331,7 +594,9 @@ def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
 
     @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
     @_stable_errors
-    def analyze_faces(memory_id: _Identifier) -> FacesResult:
+    def analyze_faces(
+        memory_id: Annotated[_Identifier, Field(description=_MEMORY_ID_DESCRIPTION)],
+    ) -> FacesResult:
         """Detect the faces in one stored memory's images and video, and resolve who was seen.
 
         Call this to learn which people appear in a visual memory. Observations cover only this
@@ -350,9 +615,11 @@ def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
     @server.tool(annotations=_IDEMPOTENT_WRITE)
     @_stable_errors
     def register_speaker(
-        speaker_id: _Identifier,
-        name: _Identifier,
-        relationship: _Identifier | None = None,
+        speaker_id: Annotated[_Identifier, Field(description=_SPEAKER_ID_DESCRIPTION)],
+        name: Annotated[_Identifier, Field(description=_PERSON_NAME_DESCRIPTION)],
+        relationship: Annotated[
+            _Identifier | None, Field(description=_RELATIONSHIP_DESCRIPTION)
+        ] = None,
     ) -> RegisterResult:
         """Name the person behind one `speaker_id` from `analyze_speech`.
 
@@ -368,9 +635,11 @@ def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
     @server.tool(annotations=_IDEMPOTENT_WRITE)
     @_stable_errors
     def register_identity(
-        identity_id: _Identifier,
-        name: _Identifier,
-        relationship: _Identifier | None = None,
+        identity_id: Annotated[_Identifier, Field(description=_IDENTITY_ID_DESCRIPTION)],
+        name: Annotated[_Identifier, Field(description=_PERSON_NAME_DESCRIPTION)],
+        relationship: Annotated[
+            _Identifier | None, Field(description=_RELATIONSHIP_DESCRIPTION)
+        ] = None,
     ) -> RegisterResult:
         """Name the person behind one `identity_id` from `analyze_faces` or `analyze_speech`.
 
@@ -385,7 +654,9 @@ def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
 
     @server.tool(annotations=_READ_ONLY)
     @_stable_errors
-    def get_identity(identity_id: _Identifier) -> IdentityResult:
+    def get_identity(
+        identity_id: Annotated[_Identifier, Field(description=_IDENTITY_ID_DESCRIPTION)],
+    ) -> IdentityResult:
         """Read the name and relationship recorded for one identity or speaker ID.
 
         Call this to turn an `identity_id` or `speaker_id` from a face or speech result into who
@@ -397,7 +668,17 @@ def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
 
     @server.tool(annotations=_DELETE)
     @_stable_errors
-    def unlink_identity(alias_id: _Identifier) -> UnlinkResult:
+    def unlink_identity(
+        alias_id: Annotated[
+            _Identifier,
+            Field(
+                description=(
+                    "The identity that was merged into another and should become its own again:"
+                    " the `identity_id` the person says is not them."
+                )
+            ),
+        ],
+    ) -> UnlinkResult:
         """Reverse one face-and-voice merge, restoring `alias_id` as its own identity.
 
         Call this when a person says the system has confused them with someone else. Returns the
@@ -413,7 +694,9 @@ def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
 
     @server.tool(annotations=_ERASE)
     @_stable_errors
-    def forget_identity(identity_id: _Identifier) -> ForgetResult:
+    def forget_identity(
+        identity_id: Annotated[_Identifier, Field(description=_IDENTITY_ID_DESCRIPTION)],
+    ) -> ForgetResult:
         """Erase one person: their biometric template, their aliases, and their indexed name.
 
         Call this when a person asks to be forgotten, and `delete_memory` to forget an event
@@ -428,23 +711,6 @@ def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
         the first call failed.
         """
         return ForgetResult(erasure=memory.forget_identity(identity_id))
-
-    @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
-    @_stable_errors
-    def reinforce_memories(
-        memory_ids: Annotated[tuple[_Identifier, ...], Field(min_length=1, max_length=100)],
-    ) -> ReinforceResult:
-        """Record that these memories were actually useful, so retrieval favors them later.
-
-        Call this after using retrieved memories to answer or act, with the IDs that were used.
-        Duplicate IDs count once and unknown IDs are skipped; `reinforced` reports how many
-        existing memories were updated, so a count below the number of IDs sent means the rest do
-        not exist.
-
-        Side effects: this is cumulative positive feedback, not a flag, so retrying the same call
-        reinforces the same memories again. Send at most 100 IDs per call.
-        """
-        return ReinforceResult(reinforced=memory.reinforce(memory_ids))
 
 
 def _stable_errors(
@@ -495,10 +761,16 @@ async def _strict_tool_arguments(
         context.method == "tools/call"
         and isinstance(result, dict)
         and result.get("isError") is True
-        and not _has_error_code(result)
     ):
-        return _error_result(
-            "validation_error", "tool arguments are invalid", reason="input_invalid"
+        # A tool body signals failure by raising, and the MCP runtime prefixes that message with
+        # "Error executing tool <name>: ". Re-emit the envelope on its own so one bare `json.loads`
+        # of the text works for every failure, including the recoverable ones an agent parses to
+        # decide whether to retry.
+        envelope = _stable_envelope(result)
+        return _envelope_result(
+            envelope
+            if envelope is not None
+            else _envelope("validation_error", "tool arguments are invalid", reason="input_invalid")
         )
     return result
 
@@ -515,6 +787,7 @@ def _memory_result(record: MemoryRecord) -> MemoryResult:
         occurred_end=record.occurred_end,
         metadata=cast(dict[str, JsonValue], dict(record.metadata)),
         context=record.context,
+        place_id=record.place_id,
     )
 
 
@@ -531,6 +804,7 @@ def _search_hit_result(hit: SearchHit) -> SearchHitResult:
         occurred_end=hit.occurred_end,
         metadata=cast(dict[str, JsonValue], dict(hit.metadata)),
         context=hit.context,
+        place_id=hit.place_id,
     )
 
 
@@ -605,21 +879,21 @@ def _error_result(
     reason: str | None = None,
     issues: Sequence[Mapping[str, object]] = (),
 ) -> CallToolResult:
+    return _envelope_result(_envelope(code, message, reason=reason, issues=issues))
+
+
+def _envelope_result(envelope: Mapping[str, object]) -> CallToolResult:
     return CallToolResult(
-        content=[
-            TextContent(
-                type="text",
-                text=json.dumps(_envelope(code, message, reason=reason, issues=issues)),
-            )
-        ],
+        content=[TextContent(type="text", text=json.dumps(dict(envelope)))],
         is_error=True,
     )
 
 
-def _has_error_code(result: Mapping[str, object]) -> bool:
+def _stable_envelope(result: Mapping[str, object]) -> dict[str, object] | None:
+    """Recover the envelope a tool raised, ignoring any prefix the MCP runtime added to it."""
     content = result.get("content")
     if not isinstance(content, list):
-        return False
+        return None
     for item in content:
         if not isinstance(item, Mapping) or not isinstance(item.get("text"), str):
             continue
@@ -634,5 +908,5 @@ def _has_error_code(result: Mapping[str, object]) -> bool:
             and envelope.get("code") in _STABLE_ERROR_CODES
             and isinstance(envelope.get("message"), str)
         ):
-            return True
-    return False
+            return envelope
+    return None

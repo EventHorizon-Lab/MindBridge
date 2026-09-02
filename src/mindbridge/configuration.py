@@ -115,10 +115,21 @@ class OpenAIGenerationConfig(_OpenAICompletionConfig):
 
 
 class OpenAIFormationConfig(_OpenAICompletionConfig):
-    """Formation reads the same completion knobs; `video_limit` is answer-only, so it is absent.
+    """Chat-completion knobs for the adapter that proposes derived typed memories.
 
-    `formation_model` and `formation_space` on the adapter are derived from exactly these values,
-    so the fields here are the whole surface — there is nothing formation-specific to add.
+    Formation is a separate LLM round-trip on the write path and usually wants its own model,
+    token budget, and endpoint, so it is its own slot rather than a reuse of `generation`;
+    leaving the slot out keeps that round-trip off, which is the default. It reads the same
+    completion knobs as generation, inherited here — `video_limit` is answer-only, so it is
+    absent, and `formation_model` and `formation_space` on the adapter are derived from exactly
+    these values, so there is nothing formation-specific to add.
+
+    Two inherited fields matter more here than they do for answering. `modalities` becomes
+    `formation_capabilities`, which gates which observations reach the former at all: an
+    observation whose modalities are not covered is skipped, silently and by design, so declare
+    the media the endpoint really accepts or image and video sources will never form anything.
+    And formation returns JSON, so a `max_tokens` truncation is a hard error rather than a
+    partial parse.
     """
 
 
@@ -159,14 +170,15 @@ class MindBridgeConfig(_ConfigModel):
     data_dir: Path = Path(".mindbridge")
     embedding: EmbeddingProviderConfig
     generation: OpenAIGenerationConfig | None = None
+    # Reachable, but never implicit, and omitted by default. Configuring `generation` must not
+    # enable formation: a former is an LLM call per observation on the write path, which a
+    # measurement says is the wrong default, and the only bundled one is a cloud call, which a
+    # local-first deployment should opt into rather than discover. Derived memories are also a
+    # union with the raw sources rather than a replacement for them. `vision_describer` has no
+    # bundled implementation at all, so it deliberately has no key here.
+    formation: OpenAIFormationConfig | None = None
     speech: SpeechProviderConfig | None = None
     face: OpenCVFaceConfig | None = None
-    # Reachable, but never implicit. Configuring `generation` must not enable formation: a former
-    # is an LLM call per observation on the write path, which a measurement says is the wrong
-    # default, and the only bundled one is a cloud call, which a local-first deployment should opt
-    # into rather than discover. `vision_describer` has no bundled implementation at all, so it
-    # deliberately has no key here.
-    former: OpenAIFormationConfig | None = None
     settings: MemorySettings = Field(default_factory=MemorySettings)
 
 
@@ -207,15 +219,15 @@ def resolve_memory_config(
         answerer = None if config.generation is None else _build_generation(config.generation)
         if answerer is not None:
             cleanup.callback(answerer.close)
+        former = None if config.formation is None else _build_formation(config.formation)
+        if former is not None:
+            cleanup.callback(former.close)
         transcriber = None if config.speech is None else _build_speech(config.speech)
         if transcriber is not None:
             cleanup.callback(transcriber.close)
         face = None if config.face is None else _build_face(config.face)
         if face is not None:
             cleanup.callback(face.close)
-        former = None if config.former is None else _build_formation(config.former)
-        if former is not None:
-            cleanup.callback(former.close)
         plugins = MemoryPlugins(
             embedder=embedder,
             answerer=answerer,
@@ -315,6 +327,7 @@ def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
 
 
 def _build_formation(config: OpenAIFormationConfig) -> FormationBackend:
+    # The bundled adapter reads the generation controls for `form`; `video_limit` is answer-only.
     return cast(FormationBackend, _openai_factory(_completion_values(config)))
 
 

@@ -38,7 +38,9 @@ from mindbridge._telemetry import (
 from mindbridge.benchmarks.eval_statistics import percentile
 
 BENCHMARK_TASK = "mindbridge.benchmark.task"
+BENCHMARK_SAMPLE = "mindbridge.benchmark.sample"
 BENCHMARK_TASK_SPAN = "mindbridge.benchmark.run"
+BENCHMARK_ANSWER_SPAN = "mindbridge.benchmark.answer"
 BENCHMARK_JUDGE_SPAN = "mindbridge.benchmark.judge"
 BENCHMARK_INGEST_SPAN = "mindbridge.benchmark.ingest"
 BENCHMARK_INGEST_ITEMS = "mindbridge.benchmark.ingest.items"
@@ -58,6 +60,14 @@ TRANSCRIPTION_MODULE = "transcription"
 # One int per span keeps a 100k-question run under a megabyte; past the cap the percentiles
 # stop being exact and say so through ``latency_complete``.
 _MAX_RETAINED_DURATIONS = 200_000
+
+
+@dataclass(frozen=True, slots=True)
+class SampleGrounding:
+    """How much retrieved evidence one answer's inline context budget removed."""
+
+    dropped_hits: int
+    media_elided_hits: int
 
 
 @dataclass(slots=True)
@@ -384,6 +394,8 @@ class EvaluationTelemetry(SpanProcessor):
     def __init__(self) -> None:
         self._lock = Lock()
         self._span_tasks: dict[int, str] = {}
+        self._span_samples: dict[int, str] = {}
+        self._samples: dict[str, _TaskTelemetry] = {}
         self._tasks: dict[str, _TaskTelemetry] = {}
         self._provider = TracerProvider()
         self._provider.add_span_processor(self)
@@ -392,15 +404,21 @@ class EvaluationTelemetry(SpanProcessor):
     def on_start(self, span: Span, parent_context: Context | None = None) -> None:
         attributes = span.attributes or {}
         task = _string_attribute(attributes, BENCHMARK_TASK)
+        sample = _string_attribute(attributes, BENCHMARK_SAMPLE)
         parent_context_value = trace.get_current_span(parent_context).get_span_context()
         parent = 0 if parent_context_value is None else parent_context_value.span_id
         with self._lock:
             if task is None:
                 task = self._span_tasks.get(parent)
+            if sample is None:
+                sample = self._span_samples.get(parent)
+            span_context = span.get_span_context()
+            if span_context is None:
+                return
             if task is not None:
-                span_context = span.get_span_context()
-                if span_context is not None:
-                    self._span_tasks[span_context.span_id] = task
+                self._span_tasks[span_context.span_id] = task
+            if sample is not None:
+                self._span_samples[span_context.span_id] = sample
 
     def on_end(self, span: ReadableSpan) -> None:
         span_context = span.get_span_context()
@@ -410,13 +428,29 @@ class EvaluationTelemetry(SpanProcessor):
             task = self._span_tasks.pop(span_id, None) or _string_attribute(
                 attributes, BENCHMARK_TASK
             )
+            sample = self._span_samples.pop(span_id, None) or _string_attribute(
+                attributes, BENCHMARK_SAMPLE
+            )
             if task is not None:
                 self._tasks.setdefault(task, _TaskTelemetry()).add(span)
+            if sample is not None:
+                self._samples.setdefault(sample, _TaskTelemetry()).add(span)
 
     def result(self, task: str, *, question_count: int) -> Mapping[str, object]:
         with self._lock:
             values = self._tasks.get(task, _TaskTelemetry())
             return values.json(question_count)
+
+    def sample_grounding(self, sample_id: str) -> SampleGrounding | None:
+        """Return one answer's budget loss, or None when no answer span was recorded."""
+        with self._lock:
+            values = self._samples.get(sample_id)
+        if values is None:
+            return None
+        return SampleGrounding(
+            dropped_hits=values.dropped_hits,
+            media_elided_hits=values.media_elided_hits,
+        )
 
     def shutdown(self) -> None:
         """Release the private provider; aggregation itself has no exporter."""

@@ -13,7 +13,7 @@ owns the fact you need.
 
 - [Python SDK](api/python-sdk.md) — complete `mindbridge` root-import contract.
 - [REST API](api/rest.md) — `/v1` schemas, routes, errors, and limits.
-- [MCP tools](api/mcp.md) — six tool schemas and transport boundary.
+- [MCP tools](api/mcp.md) — fourteen tool schemas and transport boundary.
 - [Command line](api/cli.md) — commands, input forms, JSON output, and exit codes.
 
 ## Operate MindBridge

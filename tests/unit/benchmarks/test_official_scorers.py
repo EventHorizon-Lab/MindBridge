@@ -20,8 +20,11 @@ from mindbridge.benchmarks.official_scorers import (
     judge_model_is_official,
     judge_plan,
     local_scores,
+    metric_is_official,
+    metric_is_upstream,
     official_judge_model,
     parse_judge_response,
+    retrieval_gold_ids,
     task_family,
     task_primary_metric,
 )
@@ -757,3 +760,53 @@ def test_openeqa_marks_scale_and_clip_exactly_as_upstream() -> None:
         "llm_match": 1.0,
         "llm_match_score_1_5": 5.0,
     }
+
+
+@pytest.mark.parametrize(
+    ("task", "metric", "upstream"),
+    [
+        # Published by the pinned scorers.
+        ("atm-bench-hard", "accuracy", True),
+        ("mem-gallery", "f1", True),
+        ("mm-lifelong", "ref_at_300", True),
+        ("personamem-v3", "ndcg_graded@5", True),
+        ("personamem-v3", "pr_combined_personalization_score", True),
+        ("openeqa-hm3d", "llm_match_score_1_5", True),
+        # Invented here. `_official/atm_score.py` has only `deterministic_accuracy` and
+        # `list_jaccard_score`; Mem-Gallery publishes no retrieval or exact-match number.
+        ("atm-bench-hard", "retrieval_recall@10", False),
+        ("atm-bench-hard", "retrieval_recall@gt", False),
+        ("atm-bench-hard", "joint_partial@10", False),
+        ("mem-gallery", "retrieval_precision@10", False),
+        ("mem-gallery", "exact_match", False),
+        ("personamem-v3", "negative_in_top1", False),
+        # Scored only by the private submission server.
+        ("egomemreason", "accuracy", False),
+        # No family at all.
+        ("fixture", "accuracy", False),
+    ],
+)
+def test_only_pinned_upstream_metrics_are_official(task: str, metric: str, upstream: bool) -> None:
+    assert metric_is_upstream(task, metric) is upstream
+    assert (
+        metric_is_official(task, metric, official_judge_model(task) or "", uses_judge=False)
+        is upstream
+    )
+
+
+def test_a_faithful_judge_cannot_bless_an_invented_metric() -> None:
+    # The right judge makes the judged metric official; it says nothing about the diagnostics
+    # computed beside it.
+    assert metric_is_official("atm-bench", "accuracy", "gpt-5-mini", uses_judge=True) is True
+    assert metric_is_official("atm-bench", "accuracy", "gpt-4o", uses_judge=True) is False
+    assert (
+        metric_is_official("atm-bench", "retrieval_recall@10", "gpt-5-mini", uses_judge=True)
+        is False
+    )
+
+
+def test_retrieval_gold_ids_names_each_family_key() -> None:
+    assert retrieval_gold_ids("atm-bench", {"evidence_ids": ["a", "b", "a"]}) == ("a", "b")
+    assert retrieval_gold_ids("mem-gallery", {"clue_ids": ["c"]}) == ("c",)
+    assert retrieval_gold_ids("mem-gallery", {"evidence_ids": ["c"]}) == ()
+    assert retrieval_gold_ids("locomo-refined", {"evidence_ids": ["c"]}) == ()

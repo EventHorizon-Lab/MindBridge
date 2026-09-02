@@ -14,6 +14,7 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    StringConstraints,
     model_validator,
 )
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -37,12 +38,17 @@ from mindbridge.types import (
     ObservationContext,
     Page,
     RetrievalScope,
+    RetrievalTrace,
     SearchHit,
+    TracedSearchResult,
 )
 
 _MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
 _Limit = Annotated[int, Field(strict=True, ge=1, le=100)]
 _MemoryId = Annotated[str, PathParameter(min_length=1)]
+# The same identifier inside a request body, where `PathParameter` does not apply. Constrained
+# here rather than only in the SDK so a malformed ID fails validation on every route alike.
+_BodyMemoryId = Annotated[str, StringConstraints(min_length=1, pattern=r"^\S(?:.*\S)?$")]
 
 
 class MemoryCreate(StrictModel):
@@ -71,6 +77,7 @@ class QueryRequest(StrictModel):
     occurred_from: AwareDatetime | None = None
     occurred_until: AwareDatetime | None = None
     scope: RetrievalScope | None = None
+    explain: bool = False
 
     @model_validator(mode="after")
     def validate_occurrence_range(self) -> QueryRequest:
@@ -81,6 +88,10 @@ class QueryRequest(StrictModel):
         ):
             raise ValueError("occurred_until must be later than occurred_from")
         return self
+
+
+class ReinforceRequest(StrictModel):
+    memory_ids: Annotated[list[_BodyMemoryId], Field(min_length=1, max_length=100)]
 
 
 class AnswerRequest(StrictModel):
@@ -128,6 +139,8 @@ class MemoryBatchResponse(_ResponseModel):
 
 class SearchResponse(_ResponseModel):
     hits: tuple[SearchHitResponse, ...]
+    # Null unless the request asked for it, so the default response keeps the shape clients read.
+    trace: RetrievalTrace | None = None
 
 
 class AnswerResponse(_ResponseModel):
@@ -139,6 +152,10 @@ class AnswerResponse(_ResponseModel):
 
 class DeleteResponse(_ResponseModel):
     deleted: bool
+
+
+class ReinforceResponse(_ResponseModel):
+    reinforced: int
 
 
 class PageResponse(_ResponseModel):
@@ -210,6 +227,18 @@ class _Memory(Protocol):
         scope: RetrievalScope | None = None,
     ) -> tuple[SearchHit, ...]: ...
 
+    def search_with_trace(
+        self,
+        query: ContentInput,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> TracedSearchResult: ...
+
     def ask(
         self,
         question: ContentInput,
@@ -219,6 +248,8 @@ class _Memory(Protocol):
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
     ) -> AnswerResult: ...
+
+    def reinforce(self, memory_ids: Sequence[str]) -> int: ...
 
     def get(self, memory_id: str) -> MemoryRecord: ...
 
@@ -275,13 +306,31 @@ def create_app(
     memory: _Memory,
 ) -> FastAPI:
     """Create an unauthenticated API over one caller-owned memory instance."""
+    app = FastAPI(title="MindBridge", version="0.2.0")
+    register_error_handlers(app)
+    app.add_middleware(_RequestBodyLimit)
+
+    @app.get(
+        "/healthz",
+        response_model=HealthResponse,
+        operation_id="health",
+        responses=error_responses(status.HTTP_500_INTERNAL_SERVER_ERROR),
+    )
+    def health() -> HealthResponse:
+        # Read from the injected instance on every call, so a composition swapped behind this
+        # process is reported rather than a snapshot taken at construction.
+        return HealthResponse(capabilities=_capabilities_response(memory.capabilities))
+
+    app.include_router(_v1_router(memory))
+    return app
+
+
+def _v1_router(memory: _Memory) -> APIRouter:
+    """Register every `/v1` route against one caller-owned memory instance."""
 
     def current_service() -> _Memory:
         return memory
 
-    app = FastAPI(title="MindBridge", version="0.2.0")
-    register_error_handlers(app)
-    app.add_middleware(_RequestBodyLimit)
     router = APIRouter(prefix="/v1")
     standard_statuses = (
         status.HTTP_413_CONTENT_TOO_LARGE,
@@ -296,15 +345,6 @@ def create_app(
         status.HTTP_502_BAD_GATEWAY,
     )
     not_found_errors = error_responses(*standard_statuses, status.HTTP_404_NOT_FOUND)
-
-    @app.get(
-        "/healthz",
-        response_model=HealthResponse,
-        operation_id="health",
-        responses=error_responses(status.HTTP_500_INTERNAL_SERVER_ERROR),
-    )
-    def health() -> HealthResponse:
-        return HealthResponse(capabilities=_capabilities_response(current_service().capabilities))
 
     @router.post(
         "/memories",
@@ -364,19 +404,16 @@ def create_app(
         responses=model_errors,
     )
     def search_memories(request: QueryRequest) -> SearchResponse:
-        return SearchResponse.model_validate(
-            {
-                "hits": current_service().search(
-                    content_input(request.query),
-                    limit=request.limit,
-                    memory_type=request.memory_type,
-                    reference_at=request.reference_at,
-                    occurred_from=request.occurred_from,
-                    occurred_until=request.occurred_until,
-                    scope=request.scope,
-                )
-            }
-        )
+        return _search(current_service(), request)
+
+    @router.post(
+        "/memories/reinforce",
+        response_model=ReinforceResponse,
+        operation_id="reinforceMemories",
+        responses=standard_errors,
+    )
+    def reinforce_memories(request: ReinforceRequest) -> ReinforceResponse:
+        return ReinforceResponse(reinforced=current_service().reinforce(request.memory_ids))
 
     @router.get(
         "/memories/{memory_id}",
@@ -413,8 +450,33 @@ def create_app(
             )
         )
 
-    app.include_router(router)
-    return app
+    return router
+
+
+def _search(service: _Memory, request: QueryRequest) -> SearchResponse:
+    """Route one search to the traced SDK operation only when the caller asked to see the trace."""
+    content = content_input(request.query)
+    if not request.explain:
+        hits = service.search(
+            content,
+            limit=request.limit,
+            memory_type=request.memory_type,
+            reference_at=request.reference_at,
+            occurred_from=request.occurred_from,
+            occurred_until=request.occurred_until,
+            scope=request.scope,
+        )
+        return SearchResponse.model_validate({"hits": hits})
+    traced = service.search_with_trace(
+        content,
+        limit=request.limit,
+        memory_type=request.memory_type,
+        reference_at=request.reference_at,
+        occurred_from=request.occurred_from,
+        occurred_until=request.occurred_until,
+        scope=request.scope,
+    )
+    return SearchResponse.model_validate({"hits": traced.hits, "trace": traced.trace})
 
 
 def _capabilities_response(capabilities: MemoryCapabilities) -> CapabilitiesResponse:

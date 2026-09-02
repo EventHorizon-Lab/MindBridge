@@ -141,6 +141,65 @@ _OFFICIAL_JUDGE_MODELS = {
     "openeqa": "gpt-4-1106-preview",
 }
 
+# Metrics the pinned upstream protocol reports itself. `metric_is_official` reads this registry
+# positively: a metric absent from its family's entry is a MindBridge diagnostic, never an
+# upstream number. The families that publish no deterministic metric beyond their judge output
+# are still listed, so an empty entry means "judge metrics only" rather than "not yet audited".
+_OFFICIAL_METRICS: dict[str, frozenset[str]] = {
+    # `evaluate.py` keeps the F1 and BLEU-1 of the accepted reference beside its judge label.
+    "locomo-refined": frozenset({"llm_judge", "token_f1", "bleu_1"}),
+    "m3-bench": frozenset({"accuracy"}),
+    "video-mme": frozenset({"accuracy"}),
+    # The leaderboard rating and the per-question accuracy it is built from.
+    "video-mme-v2": frozenset({"accuracy", "question_accuracy", "rating"}),
+    "egolifeqa": frozenset({"accuracy"}),
+    # Scored by the private submission server; nothing here is an upstream number.
+    "egomemreason": frozenset(),
+    "egotempo": frozenset({"accuracy", "judge_score_0_5"}),
+    "memlens": frozenset({"accuracy"}),
+    # `Ref@300` is MM-Lifelong's own quantized temporal IoU.
+    "mm-lifelong": frozenset({"answer_accuracy", "judge_score_0_5", "ref_at_300"}),
+    "supermemory-vqa": frozenset({"qa_accuracy", "answerability"}),
+    # `_official/atm_score.py` publishes `deterministic_accuracy` and `list_jaccard_score`, both
+    # reported here as `accuracy`, plus the open-ended judge. Its retrieval and joint metrics are
+    # MindBridge diagnostics and are deliberately absent.
+    "atm-bench": frozenset({"accuracy"}),
+    "mem-gallery": frozenset({"llm_judge", "f1", "bleu", "bleu_1", "bleu_2"}),
+    "longmemeval": frozenset({"accuracy"}),
+    "clbench": frozenset({"solving_rate", "requirement_ratio"}),
+    "beam": frozenset({"llm_judge_score"}),
+    # Everything `_official/personamem_v3_scoring.py` emits: the unified rubric's `pr_` dims
+    # (see `_OFFICIAL_METRIC_PREFIXES`), the four task-specific judges' coercions, the ranking
+    # metrics `compute_ranking_metrics` reports, and the 0-1 aggregate headline.
+    "personamem-v3": frozenset(
+        {
+            "personamem_score",
+            "recall@1",
+            "recall@3",
+            "recall@5",
+            "hit@1",
+            "hit@3",
+            "mrr",
+            "ndcg_graded@5",
+            "sycophancy_caved",
+            "sycophancy_resistance_0_10",
+            "used_outdated_stance",
+            "preference_shift_consistency",
+            "deep_motivation_alignment",
+            "surface_query_satisfaction",
+            "preference_alignment",
+            "telegraph_avoidance_fail",
+            "privacy_leak_fail",
+            "abstention_quality_0_10",
+        }
+    ),
+    "openeqa": frozenset({"llm_match", "llm_match_score_1_5"}),
+}
+
+# One family scores an open dimension vocabulary upstream: `score_unified_rubric` names every
+# rubric dim it was given, so the prefix it stamps them with is the registry entry.
+_OFFICIAL_METRIC_PREFIXES: dict[str, tuple[str, ...]] = {"personamem-v3": ("pr_",)}
+
 _JUDGE_METRICS = {
     "locomo-refined": frozenset({"llm_judge"}),
     "m3-bench": frozenset({"accuracy"}),
@@ -256,14 +315,34 @@ def judge_model_is_official(task: str, model: str) -> bool:
     return actual_key.endswith(expected_key)
 
 
-def metric_is_official(task: str, metric: str, judge_model: str, *, uses_judge: bool) -> bool:
-    """Report protocol fidelity per metric instead of blessing a whole task at once."""
+def metric_is_upstream(task: str, metric: str) -> bool:
+    """Report whether the pinned upstream protocol publishes this metric at all."""
     family = _family_or_none(task)
     if family is None:
         return False
-    if metric not in _JUDGE_METRICS.get(family, ()) or not uses_judge:
+    if metric in _OFFICIAL_METRICS.get(family, frozenset()):
+        return True
+    return metric.startswith(_OFFICIAL_METRIC_PREFIXES.get(family, ()))
+
+
+def metric_is_official(task: str, metric: str, judge_model: str, *, uses_judge: bool) -> bool:
+    """Report protocol fidelity per metric instead of blessing a whole task at once.
+
+    A metric is official only when upstream publishes it and, for judged metrics, the required
+    judge produced it. Metrics this harness invents -- the retrieval and joint diagnostics above
+    all -- are never official, however faithful the rest of the protocol was.
+    """
+    if not metric_is_upstream(task, metric):
+        return False
+    if metric not in _JUDGE_METRICS.get(_family_or_none(task) or "", ()) or not uses_judge:
         return True
     return judge_model_is_official(task, judge_model)
+
+
+def retrieval_gold_ids(task: str, metadata: Mapping[str, object]) -> tuple[str, ...]:
+    """Return the gold source IDs one question's retrieval diagnostics score against."""
+    key = {"atm-bench": "evidence_ids", "mem-gallery": "clue_ids"}.get(_family_or_none(task) or "")
+    return () if key is None else _deduplicated_sources(_metadata_values(metadata, key))
 
 
 def local_scores(  # noqa: C901 - direct task dispatch mirrors official scorer families

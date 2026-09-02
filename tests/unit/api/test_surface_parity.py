@@ -55,6 +55,7 @@ SHARED_OPERATIONS: dict[str, tuple[str | None, str | None]] = {
     "get": ("getMemory", "get_memory"),
     "list": ("listMemories", "list_memories"),
     "delete": ("deleteMemory", "delete_memory"),
+    "reinforce": ("reinforceMemories", "reinforce_memories"),
     "speech": (None, "analyze_speech"),
     "faces": (None, "analyze_faces"),
     "register_speaker": (None, "register_speaker"),
@@ -62,7 +63,6 @@ SHARED_OPERATIONS: dict[str, tuple[str | None, str | None]] = {
     "identity": (None, "get_identity"),
     "unlink_identity": (None, "unlink_identity"),
     "forget_identity": (None, "forget_identity"),
-    "reinforce": (None, "reinforce_memories"),
 }
 # Operations no transport exposes, each with the reason. `docs/design-principles.md` requires a
 # transport gap to be documented rather than silently left out, and the union of this and
@@ -77,6 +77,16 @@ UNEXPOSED_OPERATIONS: dict[str, str] = {
 # Not operations: construction, lifecycle, and the capability declaration REST reports in
 # `/healthz`.
 NON_OPERATIONS = frozenset({"capabilities", "close", "from_config", "from_plugins"})
+# Transport fields that select between two SDK operations instead of naming an argument to one.
+# `explain` routes the same search to `search_with_trace`, which takes no extra argument itself.
+ROUTING_FIELDS: dict[str, frozenset[str]] = {"search": frozenset({"explain"})}
+# `search_with_trace` has no route or tool of its own; the search surfaces reach it through
+# `explain`, so the adapter protocol must still declare it exactly as the SDK does. The MCP-only
+# operations are absent from the REST protocol by design, so they are not part of it.
+PROTOCOL_OPERATIONS = (
+    *(operation for operation, (route, _tool) in SHARED_OPERATIONS.items() if route is not None),
+    "search_with_trace",
+)
 # Body models are matched to their route by `operation_id`; a route without one takes its arguments
 # from query or path parameters instead.
 REST_REQUEST_MODELS: dict[str, type[BaseModel]] = {
@@ -84,6 +94,7 @@ REST_REQUEST_MODELS: dict[str, type[BaseModel]] = {
     "createMemories": rest.MemoryBatchCreate,
     "searchMemories": rest.QueryRequest,
     "answer": rest.AnswerRequest,
+    "reinforceMemories": rest.ReinforceRequest,
 }
 
 
@@ -168,7 +179,7 @@ def test_transport_defaults_match_the_sdk(operation: str) -> None:
 @pytest.mark.parametrize("operation", sorted(SHARED_OPERATIONS))
 def test_transport_fields_name_sdk_arguments(operation: str) -> None:
     operation_id, tool = SHARED_OPERATIONS[operation]
-    allowed = _sdk_parameters(operation)
+    allowed = _sdk_parameters(operation) | ROUTING_FIELDS.get(operation, frozenset())
 
     if operation_id is not None:
         assert _rest_fields(operation_id) <= allowed, operation
@@ -244,9 +255,7 @@ def test_tool_descriptions_are_normalized_whatever_the_interpreter_did() -> None
 
 def test_the_rest_adapter_protocol_matches_the_sdk_it_dispatches_to() -> None:
     """D3: mypy does not compare defaults across a structural protocol, so this does."""
-    for operation, (operation_id, _tool) in SHARED_OPERATIONS.items():
-        if operation_id is None:
-            continue
+    for operation in PROTOCOL_OPERATIONS:
         declared = inspect.signature(getattr(rest._Memory, operation))
         real = inspect.signature(getattr(Memory, operation))
         assert set(declared.parameters) == set(real.parameters), operation

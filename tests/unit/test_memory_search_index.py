@@ -23,7 +23,13 @@ import pytest
 
 from mindbridge import Memory
 from mindbridge.exceptions import ModelError
-from mindbridge.memory import _MAX_TEXT_CHARACTERS, _speech_retrieval_text
+from mindbridge.memory import (
+    _LEXICAL_FULL_COVERAGE,
+    _LEXICAL_FULL_COVERAGE_RELEVANCE,
+    _MAX_TEXT_CHARACTERS,
+    _lexical_relevance,
+    _speech_retrieval_text,
+)
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.types import AssetRef, Blob, Modality
 
@@ -259,7 +265,7 @@ def test_a_weak_lexical_match_cannot_smuggle_an_anticorrelated_memory_past_the_f
 ) -> None:
     cosines = {"anticorrelated": -1.0, "ordinary": 0.2}
     query = "zibaldone quokka nephoscope"
-    for floor, expected in ((0.55, False), (0.10, True)):
+    for floor in (0.55, 0.10):
         directory = tmp_path / f"floor-{floor}"
         with Memory(
             directory,
@@ -269,15 +275,22 @@ def test_a_weak_lexical_match_cannot_smuggle_an_anticorrelated_memory_past_the_f
             opposite = memory.add("anticorrelated zibaldone drift")
             memory.add("ordinary weather notes")
 
-            hits = memory.search(query)
-            by_id = {hit.id: hit for hit in hits}
+            traced = memory.search_with_trace(query)
+            by_id = {hit.id: hit for hit in traced.hits}
             # One shared rare term used to earn a flat 0.6 gate confidence regardless of how weak
-            # the match was, so a document pointing the other way cleared the default floor.
-            assert (opposite.id in by_id) is expected
-            assert all(hit.score >= floor for hit in hits)
-            if expected:
-                # Admitted, but at its real strength rather than a confident-looking constant.
-                assert by_id[opposite.id].score < 0.5
+            # the match was, so a document pointing the other way cleared the default floor. It is
+            # now scored on its real strength, which for a single partial term is ~0.075 -- below
+            # even the permissive floor, so it is rejected at both. That is a stronger guarantee
+            # than this test originally asserted: it used to be admitted at 0.10 and merely
+            # scored honestly. A full-coverage lexical match still survives a floor well above
+            # the old constant, which `test_the_lexical_route_survives_...` pins.
+            assert opposite.id not in by_id
+            assert all(hit.score >= floor for hit in traced.hits)
+            candidate = next(
+                trace for trace in traced.trace.candidates if trace.memory_id == opposite.id
+            )
+            assert candidate.lexical_match is True, "it did match lexically"
+            assert candidate.gate_relevance is not None and candidate.gate_relevance < 0.10
 
 
 def test_the_lexical_route_survives_a_floor_above_the_old_flat_constant(tmp_path: Path) -> None:
@@ -447,6 +460,41 @@ class _VideoTranscriber:
         return None
 
 
+_ANSWER = "用户最喜欢的饮料是可乐"
+_DECOY = "今天的天气是晴朗的"
+# Every distinctive character of the question, none of its adjacent pairs but 用户.
+_SHUFFLED = "最新饮品, 料酒和喜茶, 用户很欢迎"
+
+
+class _ChineseDense:
+    """An embedder that scores the decoy above the answer, so only coverage can reorder them."""
+
+    embedding_model = "fake-chinese-dense"
+    embedding_space = "fake-chinese-dense:2:test"
+    embedding_dimension = 2
+    embedding_capabilities = frozenset({Modality.TEXT})
+
+    def embed(
+        self,
+        inputs: Sequence[ModelInput],
+        task: EmbedTask = EmbedTask.DOCUMENT,
+    ) -> tuple[tuple[float, ...], ...]:
+        cosines = {_ANSWER: 0.50, _DECOY: 0.74, _SHUFFLED: 0.40}
+        return tuple(
+            (cosine, math.sqrt(1.0 - cosine * cosine))
+            for cosine in (
+                next(
+                    (value for text, value in cosines.items() if text in single.text),
+                    1.0,
+                )
+                for single in inputs
+            )
+        )
+
+    def close(self) -> None:
+        return None
+
+
 def test_a_transcribed_video_falls_back_instead_of_failing_the_write(tmp_path: Path) -> None:
     """A route exists, so the write must take it rather than fail before inference.
 
@@ -472,3 +520,53 @@ def test_a_transcribed_video_falls_back_instead_of_failing_the_write(tmp_path: P
         assert Modality.VIDEO not in document.modalities
         # And it is lexically reachable by the words that were spoken.
         assert record.id in _lexical_matches(memory, "kettle whistled")
+
+
+def test_a_chinese_question_can_reach_full_lexical_coverage(tmp_path: Path) -> None:
+    """A Chinese query must be able to fuse the two routes, which needs full term coverage.
+
+    `\\w+` matched an entire Chinese sentence as one token, so every multi-character Chinese
+    query carried a term that is by construction the rarest in the corpus and can never match.
+    It took the largest IDF weight into the coverage ratio, which put `_LEXICAL_FULL_COVERAGE`
+    permanently out of reach -- and that lift is the only term that performs cross-route fusion.
+    Chinese retrieval was therefore stuck on the demoted rank proxy and lost to any mediocre
+    dense neighbour, in the product's largest market.
+
+    The dense route here is deliberately wrong: the decoy shares only function characters yet
+    scores the higher cosine. Only the coverage lift can rescue the memory that answers.
+
+    The third memory is why single characters are not enough on their own. It reuses every
+    distinctive character of the question in unrelated words, so a character-only tokenizer
+    scores it as complete a match as the answer. Adjacent-character bigrams are what tell them
+    apart without a segmenter.
+    """
+    with Memory(tmp_path, embedder=_ChineseDense()) as memory:
+        answer = memory.add(_ANSWER)
+        decoy = memory.add(_DECOY)
+        shuffled = memory.add(_SHUFFLED)
+
+        traced = memory.search_with_trace("用户最喜欢的饮料是什么")
+        scored = {candidate.memory_id: candidate for candidate in traced.trace.candidates}
+
+        # The decoy is the stronger dense candidate and shares only 的 and 是 with the question.
+        decoy_dense = scored[decoy.id].dense_relevance
+        answer_dense = scored[answer.id].dense_relevance
+        assert decoy_dense is not None
+        assert answer_dense is not None
+        assert decoy_dense > answer_dense
+
+        # The full-coverage floor, not the rank proxy: the answer covers every distinctive term
+        # of the question, so its lexical contribution is the near-certain one.
+        assert scored[answer.id].lexical_relevance == pytest.approx(
+            _LEXICAL_FULL_COVERAGE_RELEVANCE
+        )
+        # Same characters, different words: a match, but not a complete one. Read the coverage
+        # ratio itself, because the score the rank proxy carries it into is also small.
+        assert scored[shuffled.id].lexical_match
+        coverage = _lexical_relevance(
+            "用户最喜欢的饮料是什么",
+            memory._store.read_memories([answer.id, shuffled.id]),
+        )
+        assert coverage[answer.id] == pytest.approx(1.0)
+        assert coverage[shuffled.id] < _LEXICAL_FULL_COVERAGE
+        assert [hit.content for hit in traced.hits] == [_ANSWER, _DECOY, _SHUFFLED]

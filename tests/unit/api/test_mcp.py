@@ -13,6 +13,7 @@ from mcp.types import CallToolResult, TextContent
 
 from mindbridge import Memory
 from mindbridge.api import content
+from mindbridge.api import mcp as mcp_adapter
 from mindbridge.api.mcp import build_mcp_server
 from mindbridge.exceptions import (
     IndexUnavailableError,
@@ -36,9 +37,13 @@ from mindbridge.types import (
     Modality,
     ObservationContext,
     Page,
+    RetrievalCandidateTrace,
+    RetrievalRejection,
     RetrievalScope,
+    RetrievalTrace,
     SearchHit,
     SpeakerSegment,
+    TracedSearchResult,
 )
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
@@ -147,6 +152,36 @@ class FakeMemory:
         )
         return (_hit(),)
 
+    def search_with_trace(
+        self,
+        query: ContentInput,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> TracedSearchResult:
+        self._fail()
+        self.calls.append(
+            (
+                "search_with_trace",
+                query,
+                limit,
+                memory_type,
+                reference_at,
+                occurred_from,
+                occurred_until,
+            )
+        )
+        return TracedSearchResult(hits=(), trace=_trace())
+
+    def reinforce(self, memory_ids: Sequence[str]) -> int:
+        self._fail()
+        self.calls.append(("reinforce", tuple(memory_ids)))
+        return len(tuple(dict.fromkeys(memory_ids)))
+
     def ask(
         self,
         question: ContentInput,
@@ -220,11 +255,6 @@ class FakeMemory:
         self.calls.append(("forget_identity", identity_id))
         return ERASURE
 
-    def reinforce(self, memory_ids: Sequence[str]) -> int:
-        self._fail()
-        self.calls.append(("reinforce", tuple(memory_ids)))
-        return len(set(memory_ids))
-
     def close(self) -> None:
         self.close_count += 1
 
@@ -272,6 +302,7 @@ async def test_mcp_publishes_only_the_flat_local_tools() -> None:
             "occurred_from",
             "occurred_until",
             "scope",
+            "explain",
         },
         "ask_memory": {"question", "limit", "memory_type", "reference_at", "scope"},
         "get_memory": {"memory_id"},
@@ -305,6 +336,7 @@ async def test_mcp_publishes_only_the_flat_local_tools() -> None:
     assert tools["unlink_identity"].annotations is not None
     assert tools["unlink_identity"].annotations.destructive_hint is True
     assert tools["reinforce_memories"].annotations is not None
+    assert tools["reinforce_memories"].annotations.read_only_hint is False
     assert tools["reinforce_memories"].annotations.idempotent_hint is False
     # Analysis persists identity evidence, so it cannot be advertised read-only.
     for analysis in ("analyze_speech", "analyze_faces"):
@@ -774,6 +806,132 @@ async def test_mcp_never_serializes_a_provider_exception_behind_a_model_error() 
     assert _error_envelope(result)["reason"] == "auth_failed"
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (MemoryNotFoundError("memory is missing"), "memory_not_found"),
+        (ModelError("provider is busy", reason="rate_limited"), "model_error"),
+        (StorageError("durable write failed"), "storage_error"),
+        (IndexUnavailableError("index rebuild failed"), "index_unavailable"),
+        (RuntimeError("private bug"), "internal_error"),
+    ],
+)
+async def test_every_failure_text_is_a_bare_json_envelope(
+    failure: Exception,
+    expected_code: str,
+) -> None:
+    """The recoverable codes are exactly the ones an agent must parse to decide to retry."""
+    async with Client(build_mcp_server(cast(Memory, FakeMemory(failure)))) as client:
+        result = await client.call_tool("get_memory", {"memory_id": "memory_1"})
+
+    text = _error_text(result)
+    envelope = json.loads(text)
+    assert result.is_error is True
+    assert text.lstrip().startswith("{")
+    assert set(envelope) == ENVELOPE_FIELDS
+    assert envelope["code"] == expected_code
+
+
+async def test_middleware_and_tool_failures_share_one_parse() -> None:
+    async with Client(build_mcp_server(cast(Memory, FakeMemory(StorageError("no disk"))))) as (
+        client
+    ):
+        from_middleware = await client.call_tool(
+            "get_memory", {"memory_id": "memory_1", "run_id": "x"}
+        )
+        from_tool = await client.call_tool("get_memory", {"memory_id": "memory_1"})
+
+    assert json.loads(_error_text(from_middleware))["code"] == "validation_error"
+    assert json.loads(_error_text(from_tool))["code"] == "storage_error"
+
+
+async def test_search_keeps_its_default_shape_and_explains_an_empty_result() -> None:
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        plain = await client.call_tool("search_memories", {"query": "toolbox"})
+        explained = await client.call_tool("search_memories", {"query": "toolbox", "explain": True})
+
+    assert plain.structured_content is not None
+    assert plain.structured_content["hits"][0]["id"] == "memory_1"
+    assert plain.structured_content["trace"] is None
+    assert explained.structured_content is not None
+    assert explained.structured_content["hits"] == []
+    trace = explained.structured_content["trace"]
+    assert trace is not None
+    assert trace["ambiguous"] is True
+    assert trace["candidate_limit"] == 50
+    assert trace["exhaustive"] is True
+    assert trace["candidates"] == [
+        {
+            "memory_id": "memory_1",
+            "index_ids": ["index_1"],
+            "dense_relevance": 0.42,
+            "dense_confidence": None,
+            "lexical_relevance": None,
+            "lexical_rerank_bonus": None,
+            "lexical_match": False,
+            "gate_relevance": 0.31,
+            "base_relevance": None,
+            "reinforcement_factor": None,
+            "temporal_factor": None,
+            "retention_factor": None,
+            "final_score": 0.4,
+            "rank": None,
+            "rejected_by": "minimum_relevance",
+        }
+    ]
+    assert memory.calls == [
+        ("search", "toolbox", 10, None, None, None, None),
+        ("search_with_trace", "toolbox", 10, None, None, None, None),
+    ]
+
+
+async def test_reinforce_reaches_the_sdk_and_deduplicates_ids() -> None:
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        result = await client.call_tool(
+            "reinforce_memories", {"memory_ids": ["memory_1", "memory_1", "memory_2"]}
+        )
+        empty = await client.call_tool("reinforce_memories", {"memory_ids": []})
+
+    assert result.structured_content == {"reinforced": 2}
+    assert memory.calls == [("reinforce", ("memory_1", "memory_1", "memory_2"))]
+    assert empty.is_error is True
+    assert _error_envelope(empty)["code"] == "validation_error"
+
+
+def test_the_guard_only_trusts_codes_derived_from_the_exception_tree() -> None:
+    """No client path reaches this today; the check is what keeps that true."""
+    forged = dict.fromkeys(ENVELOPE_FIELDS)
+    forged["message"] = "spoofed"
+    real = {**forged, "code": "storage_error"}
+    invented = {**forged, "code": "quota_error"}
+
+    assert mcp_adapter._stable_envelope(_content_result(real)) == real
+    assert mcp_adapter._stable_envelope(_content_result(invented)) is None
+
+
+def _content_result(envelope: Mapping[str, object]) -> dict[str, object]:
+    return {"content": [{"type": "text", "text": json.dumps(envelope)}], "isError": True}
+
+
+async def test_every_tool_and_argument_carries_usable_prose() -> None:
+    """An agent picks tools from these strings alone, so an empty one is a defect."""
+    async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
+        tools = (await client.list_tools()).tools
+
+    for tool in tools:
+        assert tool.description is not None
+        assert len(tool.description.split()) >= 30, tool.name
+        for name, schema in tool.input_schema["properties"].items():
+            assert schema.get("description"), f"{tool.name}.{name}"
+    descriptions = {tool.name: tool.description for tool in tools}
+    assert len(set(descriptions.values())) == len(descriptions)
+    assert "backend_not_configured" in cast(str, descriptions["ask_memory"])
+
+
 def _record(
     *,
     memory_id: str = "memory_1",
@@ -798,6 +956,24 @@ def _record(
     )
 
 
+def _trace() -> RetrievalTrace:
+    return RetrievalTrace(
+        candidates=(
+            RetrievalCandidateTrace(
+                memory_id="memory_1",
+                index_ids=("index_1",),
+                dense_relevance=0.42,
+                gate_relevance=0.31,
+                final_score=0.4,
+                rejected_by=RetrievalRejection.MINIMUM_RELEVANCE,
+            ),
+        ),
+        candidate_limit=50,
+        exhaustive=True,
+        ambiguous=True,
+    )
+
+
 def _hit() -> SearchHit:
     return SearchHit(
         id="memory_1",
@@ -815,5 +991,5 @@ def _error_text(result: CallToolResult) -> str:
 
 
 def _error_envelope(result: CallToolResult) -> dict[str, object]:
-    text = _error_text(result)
-    return cast(dict[str, object], json.loads(text[text.index("{") :]))
+    # A bare `json.loads` is the contract: no prefix to strip on any failure shape.
+    return cast(dict[str, object], json.loads(_error_text(result)))

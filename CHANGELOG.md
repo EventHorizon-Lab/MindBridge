@@ -10,6 +10,29 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- A `formation` slot on the declarative configuration surface, plus `recipes.former` and a
+  `--former` command-line flag, so a `FormationBackend` is reachable from `Memory.from_config()`
+  and from the product CLI. `FormationBackend` was implemented, accepted by `MemoryPlugins`, and
+  called by `Memory` on every write, but nothing built one: no declarative deployment and no CLI
+  composition had ever produced a typed memory, and therefore none had ever revised a belief,
+  because the supersession rules fire only on the `STATE` and user-stated `TRAIT` kinds that only
+  formation emits. Formation stays absent by default: it adds a model round-trip per write.
+- `explain` on the search tool and the REST query, routing to `search_with_trace` and returning
+  the per-candidate trace beside unchanged hits. An empty result over a transport was previously
+  indistinguishable between nothing stored, everything below `minimum_relevance`, a `memory_type`
+  filter, and an unresolved top-two tie; the trace already named all four and only the SDK and CLI
+  could see it.
+- `reinforce` on MCP and REST, as `reinforce_memories` and `POST /v1/memories/reinforce`. The
+  ranking signals read `access_count`, but no transport could write it, so an agent driving
+  MindBridge over MCP or REST held the reinforcement factor at exactly 1.0 for the life of the
+  store while age-based decay, when enabled, still applied.
+- A `context` parameter on the audio and vision stream adapters, accepting a fixed
+  `ObservationContext` or a zero-argument callable sampled at each closed observation. `StreamInput`
+  has always carried a context, but neither adapter passed one, so every memory written through the
+  microphone and camera paths had a null spatial pose. The callable form exists because a capture
+  stream outlives the observations it commits: a moving robot's pose is not a property of the
+  stream.
+
 - Face and speaker writes now record `mindbridge.identity.observations` and
   `mindbridge.identity.matched_existing` on their storage span, so a recognizer that cannot tell
   people apart is visible at the write instead of only as a weak answer much later. Both failure
@@ -17,6 +40,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   all in 76 EgoLife frames, and a recognizer whose similarities do not separate the footage created
   4 026 identities from 4 731 observations, 84.1% of them seen exactly once.
 
+- A `formation` slot on the declarative configuration surface, selecting the bundled OpenAI former
+  so that entity, event, state, relation, affect, trait, and response-policy memories, their
+  validity intervals, spatial pose, and valence/arousal are reachable from `Memory.from_config()`
+  and from the benchmark harness. `FormationBackend` was implemented, composed by `MemoryPlugins`,
+  and used by `Memory`, but no declarative slot built one, so no `from_config` deployment and no
+  benchmark run had ever produced a derived memory. The slot stays absent by default because
+  formation adds an LLM round-trip to the write path.
 - `embedding.modalities` and `embedding.request_format` on the declarative OpenAI embedding slot,
   so a self-hosted multimodal embedding server can be composed from configuration instead of only
   from constructor injection. Defaults stay text-only and `input`-shaped.
@@ -215,6 +245,14 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   without one. Differences on the single scale are roughly twice as large, so the same margin
   triggers less often. The default is unchanged and unretuned.
 
+- Grounded answer prompts no longer carry each hit's `memory_id`. The answer system prompt already
+  forbids answering with it, and a 64-hex identifier costs about 41 tokens per hit -- more than
+  that record's metadata and timestamps combined. Measured with `o200k_base` over four real
+  benchmark stores at the default `--recall-limit 20`, the user message drops 808-826 tokens per
+  question: 2 943 to 2 117 on locomo-refined, 4 692 to 3 871 on atm-hard, 7 414 to 6 594 on
+  m3-bench, 3 497 to 2 689 on mem-gallery. Hit content, occurrence times, memory type, and the
+  full application metadata are unchanged: metadata is the source-identity channel the system
+  prompt points at, and it costs only 8-12% of the prompt.
 - The benchmark harness request timeout now defaults to 300 seconds instead of 3 600. An hour
   bounds nothing a run cares about: a request the server never answers held its task for the full
   hour while the remaining workers idled, and the run reported the stall as elapsed time. The
@@ -244,6 +282,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   behaviour bound the wearer's voice to whoever was visible. The undocumented shortcut that let an
   asset's lone face adopt its lone voice inside the store write has been removed, leaving exactly
   one cross-modal entrance. Set `identity_link_min_assets=1` for the previous behaviour.
+  Counting assets bounds that mistake rather than removing it, because a wearer talks to the same
+  person across many clips and the wrong pair accumulates as fast as a genuine speaker's, so the
+  merge is also contained: only a voice-only and a face-only identity fuse on this path, and an
+  identity already holding both modalities absorbs nothing further. On synthetic egocentric
+  traffic with one off-camera wearer and three interlocutors, allowing the wider merge collapsed
+  all four people into a single identity under every ingestion order tried, while containing it
+  held the damage to the first bind and raised correct merges from 0 of 3 to 2 of 3.
 - The local schema is version 9. Version 8 directories upgrade in place, adding identity link
   evidence, an identity `relationship`, and the merge record that makes `unlink_identity` possible.
   Merges recorded before the upgrade have no such record and are therefore not reversible.
@@ -355,6 +400,47 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `ObservationContext(valid_from=..., valid_until=...)` is documented for the first time, including
   that `valid_from` is mandatory.
 
+- The benchmark harness dropped the `former` and `vision_describer` plugins when building each
+  isolated store, so a configured formation backend was silently absent from every measured run.
+  Both are forwarded now, and a guard test derives the expected keywords from
+  `dataclasses.fields(MemoryPlugins)` so the next added slot fails instead of being dropped.
+- A cross-modal identity bind no longer cascades. The product link path passed
+  `allow_shared_modality=True`, so a fragment could rejoin an identity that already held its
+  modality; once a wearer's voice owned one face that identity held both, and every later fragment
+  rejoined it. Measured on synthetic egocentric traffic with one off-camera wearer and three
+  interlocutors, all four people collapsed into a single identity under every ingestion order
+  tried, 0 correct binds and 3 wrong. Refusing the wider merge caps the damage at the unavoidable
+  first bind: 2 correct, 1 wrong, 4 identities. `LocalStore` keeps the wider merge for a caller
+  that has established the claim another way. The representation, not the rule, remains the
+  binding constraint: on real M3-Bench voice exemplars, within-identity cosine 0.7385 against
+  nearest-other 0.7301.
+- A `scope.valid_at` search no longer discards every memory that carries no declared validity
+  interval. The predicate admitted such a record only when neither `valid_at` nor `near` was
+  given, so asking what held at any past or present instant returned nothing at all rather than
+  nothing relevant, for any corpus written through `add()` without a context. A record with no
+  interval is unbounded in both directions and now passes at every instant, matching how the
+  semantic path already treats a NULL interval. The spatial `near` filter still excludes records
+  with no pose, which is correct: they are not at any location.
+- Chinese, Japanese and Korean lexical retrieval. Term extraction matched an entire unsegmented
+  run as one token, so a multi-character Chinese query carried a highest-weight term that could
+  never match and could never reach full lexical coverage -- the one signal that performs
+  cross-route fusion. Runs are now removed before word splitting and re-emitted as characters and
+  adjacent bigrams, and 47 Chinese function characters join the noise set that previously held
+  only English stopwords. Separately, the index routed Japanese kanji to a Chinese word segmenter,
+  which returned nothing for them, and routed Korean to an English stemmer, which cannot match an
+  agglutinated eojeol; the full-text field for these scripts is now character bigrams, which
+  measured correct for all three languages with no cross-language false positives.
+- `ask()` now reinforces the evidence its answer cited, closing the loop the ranking signals were
+  written for. Reinforcement failures are suppressed: bookkeeping must not discard an answer that
+  has already been paid for. The new `reinforce_on_answer` setting turns it off, and the benchmark
+  harness composes every store with it off: reinforcing during a run makes one question's
+  retrieval depend on which earlier questions answered, and under concurrency on the order their
+  updates committed, so an evaluation would stop being reproducible from its seed.
+- Every MCP error now arrives as a bare JSON envelope. Errors raised inside a tool body were
+  prefixed by the runtime while errors raised by the middleware were not, so a client parsing the
+  text succeeded on argument rejections and failed on `memory_not_found`, `model_error` and
+  `storage_error` -- the recoverable ones.
+
 - Remote product CLI requests now default to a finite 30-second timeout, configurable with the
   positive `--timeout SECONDS` option. Timeouts use the existing retryable `storage_error` envelope
   with `reason="timeout"` and `stage="request"` instead of leaving an agent blocked indefinitely.
@@ -426,9 +512,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - `Memory.list` is documented as defaulting to `limit=100`, not 50.
 - The three enforced Python input limits are recorded: 128 content parts, 65,536 characters per text
   value, and `limit` between 1 and 100 for `search`, `search_with_trace`, `ask`, and `list`.
-- `occurred_end` is in the `MemoryRecord` field table in the concepts guide, `reinforce` is recorded
-  as having no REST route and no MCP tool, and a full-text match is documented as scoring 0.6
-  confidence and so clearing the default `minimum_relevance` regardless of vector distance.
+- `occurred_end` is in the `MemoryRecord` field table in the concepts guide.
 - `docs/api/cli.md` is now a reference for a shipped command rather than a contract for a pending
   one, and the remaining documentation no longer describes the product CLI as missing. The old
   "one CLI with two command families" design is corrected to two console scripts forming one
@@ -476,7 +560,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - No built-in user authentication, rate limiting, quotas, or secure-erasure guarantee.
 - The CLI has no `--format` flag, configuration file, `MINDBRIDGE_*` composition variable, plugin
   registry, backend registration by name, streaming output, interactive prompt, `serve` command, or
-  named `SentenceTransformersEmbedder` recipe. `--url` mode covers the seven routed operations plus
-  `doctor`; the other nine CLI commands exit 10 and name the surfaces that do support them.
+  named `SentenceTransformersEmbedder` recipe. `--url` mode covers seven of the routed operations plus
+  `doctor`; the other twelve CLI commands exit 10 and name the surfaces that do support them.
   `add-stream` reads finite JSONL lazily but collects return records until EOF to preserve the
   one-document stdout contract; unbounded sources use the Python SDK.

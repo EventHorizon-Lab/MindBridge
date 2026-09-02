@@ -213,18 +213,19 @@ def test_known_at_never_leaks_a_later_unformed_record(tmp_path: Path) -> None:
         assert memory.get(source.id) == source
 
 
-def test_valid_at_excludes_records_without_typed_validity(tmp_path: Path) -> None:
+def test_valid_at_keeps_records_without_typed_validity(tmp_path: Path) -> None:
     with Memory(tmp_path, embedder=TinyEmbedder(), minimum_relevance=0) as memory:
-        memory.add("undated raw observation")
+        observation = memory.add("undated raw observation")
 
-        assert (
-            memory.search(
-                "undated raw observation",
-                limit=10,
-                scope=RetrievalScope(valid_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
-            )
-            == ()
+        # An observation declares no validity interval, so no `valid_at` can refute it. Dropping
+        # it would turn every historical question into a silent empty answer.
+        hits = memory.search(
+            "undated raw observation",
+            limit=10,
+            scope=RetrievalScope(valid_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
         )
+
+        assert [hit.id for hit in hits] == [observation.id]
 
 
 def test_get_keeps_provenance_for_a_fully_retired_state(tmp_path: Path) -> None:
