@@ -1,6 +1,6 @@
 # MCP API
 
-## Purpose
+## Surface
 
 The optional MCP adapter exposes exactly fourteen typed tools over one injected synchronous
 `Memory`.
@@ -15,7 +15,7 @@ merge, erase a person on request, and record which memories were useful. `build_
 inside the process that holds the `Memory` it is given and every tool is one call on it, so an
 embodied operation is no less reachable here than `add_memory` is.
 
-## Invocation
+## Start the adapter
 
 Install the MCP extra together with the extras required by the chosen backends, then host the
 server in the application that owns `Memory`:
@@ -37,20 +37,20 @@ with Memory.from_config(
     build_mcp_server(memory).run("stdio")
 ```
 
-The example uses the pinned Jina recipe; review its upstream code and license boundary in
-[configuration](../configuration.md#embedding-choices).
-
 ```text
 build_mcp_server(memory: Memory) -> MCPServer[None]
 ```
 
-`build_mcp_server` neither opens nor closes the supplied memory. Do not run another `Memory`, REST
-process, or MCP process against the same `data_dir`. Composition and process ownership are defined
-in [architecture](../architecture.md) and [configuration](../configuration.md).
+## Lifecycle and ownership
+
+`build_mcp_server` borrows `memory`; it neither opens nor closes it. The host must keep the owner
+alive for the server lifetime and close it during shutdown. Do not run another `Memory`, REST, or
+MCP owner against the same physical `data_dir`.
 
 MindBridge adds no authentication to any MCP transport. Stdio inherits local process permissions;
 an SSE or streamable-HTTP host must add authentication, authorization, TLS, request limits, and
-rate limits. MCP error `subject` is unredacted and may contain an owner-local path.
+rate limits. MCP error `subject` is unredacted and may contain an owner-local path. See
+[deployment](../deployment.md) for process and transport boundaries.
 
 ## Contract
 
@@ -68,15 +68,15 @@ rejected. The MCP-specific media bounds are listed below.
 
 | Tool | Arguments and defaults | Structured result | Annotation |
 | --- | --- | --- | --- |
-| `add_memory` | required `content`; `occurred_at=None`; `occurred_end=None`; `metadata=None`; `memory_type="semantic"`; `context=None` | `MemoryResult` | idempotent write |
-| `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None`; `explain=false` | `{"hits":[SearchHitResult,...],"trace":null}` | may persist |
-| `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None` | `AnswerResponse` | may persist |
+| `add_memory` | required `content`; `occurred_at=None`; `occurred_end=None`; `metadata=None`; `memory_type="semantic"`; `context=None` | `MemoryResult` | write, idempotent |
+| `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None`; `explain=false` | `{"hits":[SearchHitResult,...],"trace":null}` | write, not idempotent |
+| `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None` | `AnswerResponse` | write, not idempotent |
 | `get_memory` | required `memory_id` | `MemoryResult` | read-only |
 | `list_memories` | `limit=100`; `cursor=None` | `PageResult` | read-only |
 | `delete_memory` | required `memory_id` | `{"deleted":bool}` | destructive, idempotent |
 | `reinforce_memories` | required `memory_ids`, 1 through 100 | `{"reinforced":int}` | write, not idempotent |
-| `analyze_speech` | required `memory_id` | `{"segments":[SpeakerSegment,...]}` | may persist |
-| `analyze_faces` | required `memory_id` | `{"observations":[FaceObservation,...]}` | may persist |
+| `analyze_speech` | required `memory_id` | `{"segments":[SpeakerSegment,...]}` | write, not idempotent |
+| `analyze_faces` | required `memory_id` | `{"observations":[FaceObservation,...]}` | write, not idempotent |
 | `register_speaker` | required `speaker_id`, `name`; `relationship=None` | `{"registered":true}` | idempotent write |
 | `register_identity` | required `identity_id`, `name`; `relationship=None` | `{"registered":true}` | idempotent write |
 | `get_identity` | required `identity_id` | `{"identity":IdentityProfile\|null}` | read-only |
@@ -88,31 +88,33 @@ Search event bounds are a half-open overlap filter; two bounds require
 `occurred_until > occurred_from`. `memory_type` is `semantic`, `episodic`, or `procedural`.
 Pagination cursors are opaque and must be passed back unchanged.
 
-`context` carries typed observation basis, source ID, confidence, validity, and optional spatial
-pose. `scope.valid_at` selects world validity and `scope.known_at` selects the transaction
-version known then; `scope.near` and `scope.radius_m` must appear together, and their frame ID
-and observer/subject anchor must match the stored spatial context. SQLite reapplies both filters
-after candidate retrieval.
+`context` carries typed observation basis, source ID, confidence, validity, optional spatial pose,
+and optional symbolic `place_id`. `scope.valid_at` selects world validity and `scope.known_at`
+selects the transaction version known then; `scope.place_id` matches the stored label exactly;
+`scope.near` and `scope.radius_m` must appear together, and their frame ID and observer/subject
+anchor must match the stored spatial context. SQLite reapplies every filter after candidate
+retrieval.
 
 `add_memory` is content-addressed. `delete_memory` reports whether a record existed. Search,
 answer, and the two analysis tools are not marked read-only because their SDK path persists lazy
 transcript caches and identity evidence; they are also not advertised as idempotent. Every tool
 has `open_world_hint=false`. `ask_memory` requires an answerer in the injected memory; without one
-it returns `model_error/backend_not_configured`.
+it returns `model_error/backend_not_configured`. With the default `reinforce_on_answer=True`, it
+also reinforces the hits the answerer cites.
 
 The embodied and identity tools follow the SDK operation they dispatch to:
 
 - `analyze_speech` and `analyze_faces` read one stored memory's assets. Results cover that
   memory's audio and video, or image and video, assets and are not paged, because the bound is
   the stored media rather than a caller limit. A memory with no matching asset returns an empty
-  result instead of failing. Both need a configured backend: without a speech-capable
-  transcription backend or a face backend the call returns `model_error`.
+  result instead of failing. When matching media exists, the operation needs a speech-capable
+  transcription backend or a face backend and returns `model_error` when it is unavailable.
 - `register_speaker` names a recognized voice and `register_identity` names an identity that may
   also have been seen. Both replace an existing name and both leave a recorded `relationship`
   intact when the argument is omitted; there is deliberately no way to clear one. An unknown ID
   returns `speaker_not_found` or `identity_not_found`.
-- `get_identity` follows merge aliases and returns `identity: null` when nothing has been
-  registered for an existing ID.
+- `get_identity` follows merge aliases and returns `identity: null` when no registered profile is
+  found, including for an unknown ID.
 - `unlink_identity` reverses one face-and-voice merge and returns the restored ID, or `null` when
   no record names which modality was contributed. It resets that pair's accumulated evidence and
   does not suppress the pair: a voice and face that keep co-occurring are merged again.
@@ -139,7 +141,7 @@ coordinate frames, units, or media sources; they are part of the tool schema, no
 `search_memories` with `explain=true` routes to `Memory.search_with_trace` and adds a `trace`
 object beside the unchanged `hits`. `trace.candidates` lists every candidate that was considered
 with its effective score components (`dense_relevance`, `dense_confidence`, `lexical_relevance`,
-`lexical_rerank_bonus`, `lexical_match`, `gate_confidence`, `base_relevance`,
+`lexical_rerank_bonus`, `lexical_match`, `gate_relevance`, `base_relevance`,
 `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`) and, when it
 did not become a hit, a `rejected_by` value of `stale_index`, `occurrence_range`, `missing_memory`,
 `memory_type`, `minimum_relevance`, `ambiguity`, or `limit`. `trace.candidate_limit` is how many
@@ -147,7 +149,7 @@ candidates were fetched, `trace.exhaustive` says whether that bound was reached,
 `trace.ambiguous` says whether the result was suppressed for being too close to call. Without
 `explain`, `trace` is `null` and no extra work is done.
 
-A `SearchHitResult.score` is `final_score`, but the relevance gate compares `gate_confidence`, which
+A `SearchHitResult.score` is `final_score`, but the relevance gate compares `gate_relevance`, which
 is a different quantity. Tuning a floor against the returned `score` therefore compares the wrong
 two numbers. The floor itself, `minimum_relevance`, and `ambiguity_margin` are fixed when the owner
 constructs `Memory`; no tool argument can widen them for one call, so an empty result is answered by
@@ -160,9 +162,9 @@ Successful calls populate MCP `structuredContent`:
 | Object | Fields |
 | --- | --- |
 | `AssetResult` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name` |
-| `MemoryResult` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context` |
+| `MemoryResult` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context`, `place_id` |
 | `SearchHitResult` | all memory fields plus `score` |
-| `SearchResult` | `hits`, and `trace` when `explain=true` |
+| `SearchResult` | `hits`, `trace`; `trace` is `null` unless `explain=true` |
 | `ReinforceResult` | `reinforced` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResult` | `items`, `next_cursor` |
@@ -174,7 +176,7 @@ Successful calls populate MCP `structuredContent`:
 The last four are the SDK dataclasses `Memory.speech`, `Memory.faces`, `Memory.identity`, and
 `Memory.forget_identity` return, published field for field rather than reshaped:
 `bounding_box` is `[x, y, width, height]` normalized within the frame, `identity_score` and
-`speaker_name` are absent until an identity is resolved and named, and `observed_at_ms` is the
+`speaker_name` are `null` until an identity is resolved and named, and `observed_at_ms` is the
 offset within a video. A `speaker_id` or `identity_id` from either analysis tool is accepted by
 `get_identity`, `register_speaker`, `register_identity`, `unlink_identity`, and
 `forget_identity`.
@@ -188,8 +190,7 @@ described above.
 ### Validation and errors
 
 Only the fourteen documented names and their exact top-level arguments are accepted. An unknown
-tool or
-top-level argument returns `validation_error/unknown_field`; schema and SDK input failures return
+tool or top-level argument returns `validation_error/unknown_field`; schema and SDK input failures return
 `validation_error/input_invalid`. Unknown values are not echoed.
 
 Failed tool calls set `isError` and their text content is exactly the same JSON envelope as

@@ -1,16 +1,17 @@
 # Command-line API
 
-## Purpose
+## Surface
 
-`mindbridge` runs one product operation in one process and emits one JSON result. Local commands
-dispatch to the corresponding `Memory` method, except for the diagnostic `doctor`; remote commands
-forward to a running owner's `/v1` route. The CLI owns argument decoding, composition selection,
-JSON projection, and exit-code mapping, not storage or retrieval policy.
+`mindbridge` provides 19 SDK operation commands plus `doctor`; each invocation runs one command in
+one process and emits one JSON result. Local commands dispatch to the corresponding `Memory`
+method, except for the diagnostic `doctor`; remote commands forward to a running owner's `/v1`
+route. The CLI owns argument decoding, composition selection, JSON projection, and exit-code
+mapping, not storage or retrieval policy.
 
 Benchmark commands belong to the separate `mindbridge-bench` surface documented in
 [benchmarking](../benchmarking.md).
 
-## Invocation
+## Invoke the CLI
 
 ```text
 mindbridge [GLOBAL_OPTIONS] COMMAND [COMMAND_OPTIONS]
@@ -38,9 +39,10 @@ Use `mindbridge COMMAND --help` for the command-specific flags summarized below.
 | `--data-dir PATH` | local directory for `--embedder`; default `.mindbridge` |
 | `--timeout SECONDS` | positive finite remote timeout for `--url`; default `30` |
 | `--answerer NAME` | generation recipe for `--embedder` |
+| `--former NAME` | formation recipe for `--embedder`; omit it to disable formation |
 | `--transcriber NAME` | speech recipe for `--embedder` |
-| `--index-speech` | index transcripts on add for `--embedder` |
-| `--minimum-relevance FLOAT` | relevance floor; default `0.55` |
+| `--index-speech`, `--no-index-speech` | enable or disable transcript indexing; default enabled |
+| `--minimum-relevance FLOAT` | relevance floor; default `0.10` |
 | `--ambiguity-margin FLOAT` | top-two gate when `limit=1`; default `0.01` |
 | `--decay-half-life-days FLOAT` | optional positive recency half-life; default none |
 | `--explain` | print resolved composition and execute no operation |
@@ -48,16 +50,21 @@ Use `mindbridge COMMAND --help` for the command-specific flags summarized below.
 | `-V`, `--version` | print the installed version |
 
 `--data-dir`, backend options, and tuning options apply only to `--embedder`; `--timeout` applies
-only to `--url`. Inapplicable options fail instead of being ignored. `--app` follows the same
-`MODULE:ATTR` convention as Uvicorn and adds the working directory to `sys.path`. The CLI closes
-the resulting local `Memory` after the command.
+only to `--url`. Inapplicable options fail instead of being ignored. `--app` follows the
+`MODULE:ATTR` convention and adds the working directory to `sys.path`.
 
 The listed flags are the complete direct-composition surface. Use `--app` for index quantization,
 face analysis, speaker/face thresholds, a custom backend, or any other `Memory` setting.
 
-Composition, model identity, credentials, and settings are documented once in
-[configuration](../configuration.md). One physical directory still has one live owner; see
-[architecture](../architecture.md).
+Composition, model identity, credentials, and settings are documented in
+[configuration](../configuration.md).
+
+## Lifecycle and ownership
+
+Local `--app` and `--embedder` commands open one `Memory`, perform one operation, and close it before
+exit. One physical `data_dir` may have only one live owner; when another process owns it, use
+`--url` or a different directory. Remote mode does not open local storage and never closes the
+server's owner.
 
 ## Contract
 
@@ -67,16 +74,13 @@ Composition, model identity, credentials, and settings are documented once in
 | --- | --- | --- |
 | `jina-omni` | `--embedder` | pinned Jina Omni model, revision, and 1024 dimensions |
 | `funasr` | `--transcriber` | pinned FunASR model and component revisions |
-| `openai` | `--embedder`, `--answerer`, `--transcriber` | `text-embedding-3-small`, `gpt-5-mini`, `whisper-1` |
+| `openai` | `--embedder`, `--answerer`, `--former`, `--transcriber` | `text-embedding-3-small`, `gpt-5-mini`, `gpt-5-mini`, `whisper-1` |
 
-Only `openai` accepts a model suffix, for example `--answerer openai:gpt-5-mini`. Recipe names form
-a closed table; other backends use `--app`. The pinned Jina weights are CC BY-NC 4.0. The OpenAI
-recipe constructs the official SDK client, which performs its own `OPENAI_API_KEY` lookup;
-MindBridge never reads or prints the credential.
-
-The Jina recipe executes upstream model code with `trust_remote_code=True`; its model and code
-revisions are both pinned. Review that code and the non-commercial weight license before selecting
-the recipe.
+Only `openai` accepts a model suffix, for example `--former openai:gpt-5-mini`. Selecting a former
+opts into one formation model call after each source observation commits; omitting `--former`
+keeps formation off. Recipe names form a closed table; use `--app` for other backends. Provider
+trust, license, model identity, and credential behavior live in
+[configuration](../configuration.md).
 
 ### Commands
 
@@ -94,6 +98,7 @@ the recipe.
 | `register-speaker` | `SPEAKER_ID NAME`; `--relationship` | `{}` | no |
 | `register-identity` | `IDENTITY_ID NAME`; `--relationship` | `{}` | no |
 | `identity` | `IDENTITY_ID` | `{"identity":{...}}` or `{"identity":null}` | no |
+| `forget-identity` | `IDENTITY_ID` | erasure counts | no |
 | `unlink-identity` | `ALIAS_ID` | `{"restored_identity_id":...}` | no |
 | `reinforce` | one or more `MEMORY_ID` values | `{"reinforced":int}` | no |
 | `list` | `--limit`; `--cursor` | `{"items":[...],"next_cursor":...}` | yes |
@@ -105,8 +110,10 @@ the recipe.
 Defaults match the SDK: `add`, `add-many`, and `add-stream` use `memory_type=semantic`; search uses
 `limit=10`; ask uses `limit=5`; list uses `limit=100`; optional retrieval roles and timestamps are
 unset. Timestamps must be timezone-aware ISO 8601 values. Cursors are opaque and passed through
-unchanged. `ask`, `speech`, and `faces` require the selected composition to supply their matching
-capabilities.
+unchanged. `ask` requires the selected composition to supply an answerer. `speech` and `faces`
+return an empty result without a model call when the record has no corresponding media; otherwise
+they require the matching capability. With the default `reinforce_on_answer=True`, `ask` also
+reinforces the hits the answerer cites; use `--app` to construct a memory with that policy disabled.
 
 ### Content and JSONL input
 
@@ -137,6 +144,10 @@ literal value, `@PATH`, or stdin. Each non-blank line is an object with required
 optional `occurred_at`, `occurred_end`, `metadata`, and `context`; unknown fields are rejected.
 `--memory-type` applies to every line.
 
+The CLI context decoder accepts `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`,
+and `spatial`; its scope decoder accepts `valid_at`, `known_at`, `near`, and `radius_m`. It does not
+currently accept `place_id`; use the Python, REST, or MCP surface for symbolic place input.
+
 ```bash
 mindbridge --embedder jina-omni add "The mug is on the table" \
   --context '{"basis":"observation","source_id":"camera-1:42","confidence":0.94}'
@@ -159,10 +170,14 @@ memory, hit, answer, page, and deletion field vocabulary as [REST response objec
 carry `context` when typed semantics exist, identically in local and `--url` mode, with enum
 values as JSON strings and datetimes as ISO 8601.
 
+`forget-identity` returns `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`,
+`face_observations`, and `speech_segments`, matching the fields of `IdentityErasure`.
+
 Unless `--quiet` is set, commands write the resolved composition as one JSON document on stderr
 before executing. `--url` forwards successful owner response objects unchanged. Runtime
 failures write one [shared error envelope](rest.md#error-envelope) to stderr and nothing to stdout;
-remote envelopes, including `trace_id`, are forwarded unchanged.
+remote envelopes, including `trace_id`, are forwarded unchanged. Local CLI and MCP errors retain
+`subject`, including local paths; unauthenticated REST redacts storage subjects.
 
 ### Doctor and explain
 
@@ -209,8 +224,9 @@ exit 130 use their conventional plain stderr diagnostics.
 ### Operations without a remote route
 
 With `--url`, only `add`, `add-many`, `search`, `ask`, `get`, `list`, `delete`, and `doctor` are
-available. Other commands exit 10 with `unsupported_in_remote_mode`; their SDK operations have no
-REST route. The complete route boundary is listed in
+available. Other commands exit 10 with `unsupported_in_remote_mode`. Their SDK operations have no
+REST route except `reinforce`: REST exposes `POST /v1/memories/reinforce`, but the CLI does not
+currently wire that route into remote mode. The complete route boundary is listed in
 [REST operations without a route](rest.md#operations-without-a-route).
 
 ### Input limits
