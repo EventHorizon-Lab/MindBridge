@@ -23,6 +23,7 @@ from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import (
     EmbeddingBackend,
     FaceBackend,
+    FormationBackend,
     GenerationBackend,
     SpeechBackend,
     TranscriptionBackend,
@@ -98,14 +99,27 @@ class SentenceTransformersEmbeddingConfig(_ConfigModel):
     batch_size: _PositiveInt = 32
 
 
-class OpenAIGenerationConfig(_OpenAIConfig):
+class _OpenAICompletionConfig(_OpenAIConfig):
+    """Knobs `OpenAIModels` reads for any chat-completion role."""
+
     model: _Text = DEFAULT_GENERATION_MODEL
     modalities: frozenset[Modality] = frozenset({Modality.TEXT})
     temperature: _Temperature | None = None
     seed: _Seed | None = None
     max_tokens: _PositiveInt | None = None
-    video_limit: _PositiveInt | None = 8
     extra_body: Mapping[str, object] | None = None
+
+
+class OpenAIGenerationConfig(_OpenAICompletionConfig):
+    video_limit: _PositiveInt | None = 8
+
+
+class OpenAIFormationConfig(_OpenAICompletionConfig):
+    """Formation reads the same completion knobs; `video_limit` is answer-only, so it is absent.
+
+    `formation_model` and `formation_space` on the adapter are derived from exactly these values,
+    so the fields here are the whole surface — there is nothing formation-specific to add.
+    """
 
 
 class OpenAITranscriptionConfig(_OpenAIConfig):
@@ -147,6 +161,12 @@ class MindBridgeConfig(_ConfigModel):
     generation: OpenAIGenerationConfig | None = None
     speech: SpeechProviderConfig | None = None
     face: OpenCVFaceConfig | None = None
+    # Reachable, but never implicit. Configuring `generation` must not enable formation: a former
+    # is an LLM call per observation on the write path, which a measurement says is the wrong
+    # default, and the only bundled one is a cloud call, which a local-first deployment should opt
+    # into rather than discover. `vision_describer` has no bundled implementation at all, so it
+    # deliberately has no key here.
+    former: OpenAIFormationConfig | None = None
     settings: MemorySettings = Field(default_factory=MemorySettings)
 
 
@@ -193,11 +213,15 @@ def resolve_memory_config(
         face = None if config.face is None else _build_face(config.face)
         if face is not None:
             cleanup.callback(face.close)
+        former = None if config.former is None else _build_formation(config.former)
+        if former is not None:
+            cleanup.callback(former.close)
         plugins = MemoryPlugins(
             embedder=embedder,
             answerer=answerer,
             transcriber=transcriber,
             face_analyzer=face,
+            former=former,
         )
         cleanup.pop_all()
     return MemoryComposition(config.data_dir, plugins, config.settings)
@@ -267,7 +291,7 @@ def _build_embedding(config: EmbeddingProviderConfig) -> EmbeddingBackend:
     )
 
 
-def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
+def _completion_values(config: _OpenAICompletionConfig) -> dict[str, object]:
     values = _openai_values(config)
     values.update(
         generation_model=config.model,
@@ -280,9 +304,18 @@ def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
         "generation_extra_body": config.extra_body,
     }
     values.update((key, value) for key, value in optional.items() if value is not None)
+    return values
+
+
+def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
+    values = _completion_values(config)
     if config.video_limit != 8:
         values["generation_video_limit"] = config.video_limit
     return cast(GenerationBackend, _openai_factory(values))
+
+
+def _build_formation(config: OpenAIFormationConfig) -> FormationBackend:
+    return cast(FormationBackend, _openai_factory(_completion_values(config)))
 
 
 def _build_speech(config: SpeechProviderConfig) -> SpeechBackend | TranscriptionBackend:
@@ -314,6 +347,7 @@ __all__ = [
     "MemoryComposition",
     "MindBridgeConfig",
     "OpenAIEmbeddingConfig",
+    "OpenAIFormationConfig",
     "OpenAIGenerationConfig",
     "OpenAITranscriptionConfig",
     "OpenCVFaceConfig",

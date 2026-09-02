@@ -13,22 +13,81 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException
 
-from mindbridge.exceptions import (
-    IdentityNotFoundError,
-    IndexUnavailableError,
-    MemoryNotFoundError,
-    MindBridgeError,
-    ModelError,
-    SpeakerNotFoundError,
-    StorageError,
-    ValidationError,
-)
+from mindbridge.exceptions import MindBridgeError, ValidationError
 
 _LOGGER = logging.getLogger(__name__)
 _RETRY_AFTER_SECONDS = "1"
 # Subjects for these codes describe server state, not caller input, so an unauthenticated client
 # gets the code, reason, and stage without the local path or row the failure names.
 _PRIVATE_SUBJECT_CODES = frozenset({"index_unavailable", "internal_error", "storage_error"})
+
+# The whole transport mapping, keyed by `reason` alone. Keying on the reason rather than on the
+# exception class or the raise site is the contract: one condition gets one status wherever it is
+# raised from, so a raise site cannot invent a second answer for a condition already mapped, and
+# adding a reason means adding a row here. `MindBridgeError.reason` is a closed vocabulary; a
+# reason with no row falls back to its code, which is deliberately coarse.
+REASON_STATUS: Mapping[str, int] = {
+    "memory_not_found": status.HTTP_404_NOT_FOUND,
+    "speaker_not_found": status.HTTP_404_NOT_FOUND,
+    "identity_not_found": status.HTTP_404_NOT_FOUND,
+    # The request body and one inline media value are the same condition seen from two sides, and
+    # both are fixed by sending less, so both say 413 rather than blaming the provider with 502.
+    "payload_too_large": status.HTTP_413_CONTENT_TOO_LARGE,
+    "input_invalid": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "unknown_field": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "unsupported_modality": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "unexpected": status.HTTP_500_INTERNAL_SERVER_ERROR,
+    "schema_unsupported": status.HTTP_500_INTERNAL_SERVER_ERROR,
+    # `io_failed` is the coarse label the storage wrapper puts on any failure it cannot classify,
+    # programming errors included, and it is deliberately not retryable. 503 would tell a client
+    # the opposite, so it says 500. `instance_unusable` is the same shape: a closed or forked
+    # instance cannot be revived by the caller repeating the call.
+    "io_failed": status.HTTP_500_INTERNAL_SERVER_ERROR,
+    "instance_unusable": status.HTTP_500_INTERNAL_SERVER_ERROR,
+    "backend_not_configured": status.HTTP_501_NOT_IMPLEMENTED,
+    "auth_failed": status.HTTP_502_BAD_GATEWAY,
+    "quota_exhausted": status.HTTP_502_BAD_GATEWAY,
+    "request_rejected": status.HTTP_502_BAD_GATEWAY,
+    "response_invalid": status.HTTP_502_BAD_GATEWAY,
+    "output_truncated": status.HTTP_502_BAD_GATEWAY,
+    "asset_unavailable": status.HTTP_502_BAD_GATEWAY,
+    "asset_changed": status.HTTP_502_BAD_GATEWAY,
+    "model_failed": status.HTTP_502_BAD_GATEWAY,
+    # Every retryable reason lands here, and `test_every_retryable_reason_says_503` proves it:
+    # an agent that reads 503 plus `Retry-After` must not have to also read the reason.
+    "connection_failed": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "timeout": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "rate_limited": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "data_dir_in_use": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "flush_failed": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "index_missing": status.HTTP_503_SERVICE_UNAVAILABLE,
+}
+# The fallback for the raise sites that pass no reason at all. Coarse on purpose: it says only
+# whether the failure is upstream or local, which is all an unclassified raise can honestly say.
+STATUS_BY_CODE: Mapping[str, int] = {
+    "mindbridge_error": status.HTTP_500_INTERNAL_SERVER_ERROR,
+    "internal_error": status.HTTP_500_INTERNAL_SERVER_ERROR,
+    "validation_error": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "memory_not_found": status.HTTP_404_NOT_FOUND,
+    "speaker_not_found": status.HTTP_404_NOT_FOUND,
+    "identity_not_found": status.HTTP_404_NOT_FOUND,
+    "model_error": status.HTTP_502_BAD_GATEWAY,
+    "model_output_truncated": status.HTTP_502_BAD_GATEWAY,
+    "storage_error": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "index_unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
+}
+# One message per code, shared by REST and MCP so the two surfaces cannot drift apart. A raise
+# site's own message always wins; this is only what a bare raise says.
+MESSAGE_BY_CODE: Mapping[str, str] = {
+    "validation_error": "input is invalid",
+    "memory_not_found": "memory does not exist",
+    "speaker_not_found": "speaker does not exist",
+    "identity_not_found": "identity does not exist",
+    "model_error": "model operation failed",
+    "model_output_truncated": "model operation failed",
+    "storage_error": "memory storage is unavailable",
+    "index_unavailable": "memory index is unavailable",
+}
 
 
 class ErrorIssue(BaseModel):
@@ -147,37 +206,25 @@ def error_response(
     )
 
 
+def error_message(error: MindBridgeError) -> str:
+    """Return the author-written message, or the code's default when the raise site gave none."""
+    default = MESSAGE_BY_CODE.get(error.code)
+    # An unmapped public code is a MindBridge bug, not caller-actionable detail. REST pairs this
+    # message with HTTP 500 and MCP emits the same string.
+    return "memory operation failed" if default is None else (str(error) or default)
+
+
 def _public_error(error: MindBridgeError) -> tuple[int, str]:
     """Map a public failure onto a status that says whether the same call can ever succeed."""
-    if isinstance(error, ValidationError):
-        return status.HTTP_422_UNPROCESSABLE_CONTENT, str(error) or "input is invalid"
-    if isinstance(error, MemoryNotFoundError):
-        return status.HTTP_404_NOT_FOUND, str(error) or "memory does not exist"
-    if isinstance(error, SpeakerNotFoundError):
-        return status.HTTP_404_NOT_FOUND, str(error) or "speaker does not exist"
-    if isinstance(error, IdentityNotFoundError):
-        return status.HTTP_404_NOT_FOUND, str(error) or "identity does not exist"
-    if isinstance(error, ModelError):
-        return _model_status(error), str(error) or "model operation failed"
-    if isinstance(error, IndexUnavailableError):
-        return _storage_status(error), str(error) or "memory index is unavailable"
-    if isinstance(error, StorageError):
-        return _storage_status(error), str(error) or "memory storage is unavailable"
-    return status.HTTP_500_INTERNAL_SERVER_ERROR, "memory operation failed"
+    return _public_status(error), error_message(error)
 
 
-def _model_status(error: ModelError) -> int:
-    if error.reason == "backend_not_configured":
-        return status.HTTP_501_NOT_IMPLEMENTED
-    if error.reason == "unsupported_modality":
-        return status.HTTP_422_UNPROCESSABLE_CONTENT
-    return status.HTTP_503_SERVICE_UNAVAILABLE if error.retryable else status.HTTP_502_BAD_GATEWAY
-
-
-def _storage_status(error: StorageError) -> int:
-    if error.reason == "schema_unsupported":
-        return status.HTTP_500_INTERNAL_SERVER_ERROR
-    return status.HTTP_503_SERVICE_UNAVAILABLE
+def _public_status(error: MindBridgeError) -> int:
+    if error.reason is not None:
+        status_code = REASON_STATUS.get(error.reason)
+        if status_code is not None:
+            return status_code
+    return STATUS_BY_CODE.get(error.code, status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 def _http_error(status_code: int) -> tuple[str, str]:

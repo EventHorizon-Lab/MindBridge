@@ -115,8 +115,10 @@ from mindbridge.types import (
     EvidenceBasis,
     FaceObservation,
     FormationProposal,
+    IdentityErasure,
     IdentityProfile,
     IndexQuantization,
+    MemoryCapabilities,
     MemoryContext,
     MemoryKind,
     MemoryRecord,
@@ -171,8 +173,6 @@ _RERANK_CANDIDATES = 100
 _RANK_FLOOR = 0.3
 _RANK_CEILING = 1.5
 _DEFAULT_CONFIG = MemoryConfig()
-# Confidence a full-text match earns on its own, which is what the `minimum_relevance` gate reads.
-_LEXICAL_MATCH_CONFIDENCE = 0.6
 _DECAY_REINFORCEMENT_LIMIT = 20
 _CONFIRMATION_WEIGHT = 0.05
 # What a full-text match contributes to the *ranking* score. It is deliberately far below the
@@ -576,7 +576,7 @@ class Memory:
         except Exception as error:
             self._close_models_and_store()
             raise IndexUnavailableError(
-                "failed to open the local search index", stage="open"
+                "failed to open the local search index", stage="open", reason="index_missing"
             ) from error
 
         self._closed = False
@@ -973,7 +973,7 @@ class Memory:
             )
             temporal_range = _temporal_range(temporal_text, reference)
             scope = _retrieval_scope(scope)
-            search = partial(
+            prepared_search = partial(
                 self._search_prepared,
                 prepared,
                 # Without a budget the answer grounds on `limit` hits, so ranking three times
@@ -992,6 +992,17 @@ class Memory:
                 require_unambiguous=limit == 1,
                 capture_trace=False,
             )
+
+            def search() -> _SearchOutcome:
+                # `search()` opens a `mindbridge.search` operation span; `ask` reaches the same
+                # retrieval plane directly, so without this the only retrieval span inside `ask`
+                # is `mindbridge.index.search` -- the index lookup alone, excluding query
+                # embedding and content preparation. Reporting that as "search latency" would name
+                # a quantity nobody experiences, which is the failure the design doc's end-to-end
+                # rule exists to prevent. One stage span per `ask`, covering the whole leg.
+                with self._trace("mindbridge.retrieve", kind="stage"):
+                    return prepared_search()
+
             speech_assets = self._answer_speech_assets(prepared.assets)
             if speech_assets and all(
                 Modality(asset.modality) in self._embedding_capabilities for asset in speech_assets
@@ -1032,6 +1043,36 @@ class Memory:
                 abstention_reason=result.abstention_reason,
             )
 
+    @property
+    def capabilities(self) -> MemoryCapabilities:
+        """What this composition supports, from the same declarations routing reads.
+
+        Published so a caller does not have to construct a probe write to find out, and so a
+        transport can report the composition instead of a bare liveness flag.
+        """
+        return MemoryCapabilities(
+            embedding=self._embedding_capabilities,
+            embedding_model=self._embedding_model,
+            embedding_space=self._space_id,
+            embedding_dimension=self._embedding_dimension,
+            generation=self._generation_capabilities,
+            transcription=self._transcription_capabilities,
+            vision=self._vision_capabilities,
+            face=self._face_capabilities,
+            formation=self._formation_capabilities,
+            # The contracts substitute a `"none"` sentinel for an absent backend because the
+            # space and recipe digests hash these strings. That sentinel is an implementation
+            # detail, so the published value is absent when the backend is, keyed on the backend
+            # itself rather than on the string -- a real model could be named "none".
+            generation_model=getattr(self._answerer, "generation_model", None),
+            transcription_space=(None if self._transcriber is None else self._transcription_space),
+            vision_model=None if self._vision_describer is None else self._vision_model,
+            face_model=None if self._face_analyzer is None else self._face_model,
+            formation_model=None if self._former is None else self._formation_model,
+            speaker_recognition=isinstance(self._transcriber, SpeechBackend),
+            streaming_generation=isinstance(self._answerer, StreamingGenerationBackend),
+        )
+
     def get(self, memory_id: str) -> MemoryRecord:
         """Return one memory or raise `MemoryNotFoundError`."""
         with (
@@ -1066,7 +1107,8 @@ class Memory:
                 return ()
             if not isinstance(self._transcriber, SpeechBackend):
                 raise ModelError(
-                    "configured transcription backend does not provide speaker recognition"
+                    "configured transcription backend does not provide speaker recognition",
+                    reason="backend_not_configured",
                 )
             self._lease_assets(speech_assets, operation.leased)
             operation.persisted.update(asset.asset_id for asset in speech_assets)
@@ -1095,7 +1137,7 @@ class Memory:
             if not visual_assets:
                 return ()
             if not isinstance(self._face_analyzer, FaceBackend):
-                raise ModelError("no face backend is configured")
+                raise ModelError("no face backend is configured", reason="backend_not_configured")
             unsupported = {
                 Modality(asset.modality)
                 for asset in visual_assets
@@ -1103,7 +1145,10 @@ class Memory:
             }
             if unsupported:
                 names = ", ".join(sorted(modality.value for modality in unsupported))
-                raise ModelError(f"configured face backend does not support: {names}")
+                raise ModelError(
+                    f"configured face backend does not support: {names}",
+                    reason="unsupported_modality",
+                )
             self._lease_assets(visual_assets, operation.leased)
             operation.persisted.update(asset.asset_id for asset in visual_assets)
             self._recognize_faces(visual_assets, operation)
@@ -1247,6 +1292,73 @@ class Memory:
                     raise SpeakerNotFoundError(f"speaker does not exist: {requested_id}")
                 raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
             self._drain_outbox()
+
+    def forget_identity(self, identity_id: str) -> IdentityErasure:
+        """Erase a person: their biometric template, their aliases, and their indexed name.
+
+        `delete` removes a memory; this removes a *person* from every memory. Both are needed,
+        because they answer different requests: "forget that evening" and "forget me". Erasing
+        the identity rows alone would not honour the second one, since a registered name is
+        written into the indexed document, so the search projection would still answer to it.
+
+        Memories, their content and their media survive, and a transcript keeps its words with
+        the speaker attribution dropped. Forgetting a person is not forgetting the evening.
+
+        This does **not** stop a later encounter from minting a fresh identity for the same
+        person: recognising someone as previously-forgotten would require keeping the template
+        this destroys. A deployment that wants "never recognise this person again" needs a
+        retained blocklist, which is the opposite of a deletion and must not be spelled like one.
+        """
+        requested_id = _identifier(identity_id, "identity_id")
+        with (
+            self._trace("mindbridge.forget_identity", kind="operation"),
+            self._operation() as operation,
+            self._write_lock,
+        ):
+            with _translate_storage_errors("read identity memories"):
+                normalized_id = self._store.resolve_identity_id(requested_id)
+                memory_ids = (
+                    None
+                    if normalized_id is None
+                    else self._store.identity_memory_ids(normalized_id)
+                )
+            if normalized_id is None or memory_ids is None:
+                raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
+            memories: tuple[StoredMemory, ...] = ()
+            embeddings: tuple[StoredEmbedding, ...] = ()
+            if memory_ids:
+                with _translate_storage_errors("read identity memories"):
+                    stored = self._store.read_memories(memory_ids)
+                indexed = tuple(
+                    memory
+                    for memory in stored
+                    if any(
+                        f"[speech identities:{asset.asset_id}]\n" in memory.content
+                        for asset in memory.assets
+                        if asset.modality in {"audio", "video"}
+                    )
+                )
+                if indexed:
+                    # `speaker_name=None` is what drops the name from the projection. The rebuilt
+                    # documents are handed to the store so the erasure and the reindex commit in
+                    # one transaction: a crash between them would leave the name searchable for a
+                    # person whose template was already gone.
+                    memories, embeddings = self._refresh_speaker_memories(
+                        indexed,
+                        speaker_id=normalized_id,
+                        speaker_name=None,
+                        operation=operation,
+                    )
+            with _translate_storage_errors("forget identity"):
+                erasure = self._store.forget_identity(
+                    normalized_id,
+                    memories=memories,
+                    embeddings=embeddings,
+                )
+            if erasure is None:
+                raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
+            self._drain_outbox()
+            return erasure
 
     def reinforce(self, memory_ids: Sequence[str]) -> int:
         """Record explicit positive feedback for existing memories."""
@@ -1466,7 +1578,7 @@ class Memory:
         except (AssetTooLargeError, OSError, ValueError):
             raise ValidationError("media input could not be safely materialized") from None
         except AssetStoreError as error:
-            raise StorageError("failed to materialize media input") from error
+            raise StorageError("failed to materialize media input", reason="io_failed") from error
 
         operation.leased.append(candidate)
         operation.cleanup.append(candidate)
@@ -1511,7 +1623,9 @@ class Memory:
             getattr(candidate, name) != getattr(stored, name)
             for name in ("modality", "mime_type", "size_bytes", "sha256", "relative_path")
         ):
-            raise StorageError("content-addressed media metadata is inconsistent")
+            raise StorageError(
+                "content-addressed media metadata is inconsistent", reason="asset_changed"
+            )
 
     def _add_prepared(
         self,
@@ -1544,6 +1658,18 @@ class Memory:
                         reversible=True,
                     )
                 batched = tuple(asset for memory in missing for asset in memory.content.assets)
+                # Derived visual text can rescue media this embedder cannot take, so it has to
+                # exist before the fallback guard below decides the write is impossible.
+                described = self._pending_visual_descriptions(
+                    tuple(memory.content for memory in missing)
+                )
+                missing = [
+                    replace(
+                        memory,
+                        content=self._with_visual_descriptions(memory.content, described),
+                    )
+                    for memory in missing
+                ]
                 fallback = Modality.AUDIO not in self._embedding_capabilities
                 if fallback:
                     for memory in missing:
@@ -1551,6 +1677,7 @@ class Memory:
                             memory.content,
                             self._embedding_capabilities,
                             "embedding",
+                            transcribable=self._transcript_fallback(memory.content.assets),
                         )
                 if fallback:
                     self._cache_audio_transcripts(
@@ -1586,6 +1713,14 @@ class Memory:
                         occurred_end=memory.occurred_end,
                         created_at=now,
                         updated_at=now,
+                        # Only an `ObservationContext` carries a place: it is what the caller
+                        # supplies at capture time. `MemoryContext` is the formed-semantics shape
+                        # and deliberately has none.
+                        place_id=(
+                            memory.context.place_id
+                            if isinstance(memory.context, ObservationContext)
+                            else None
+                        ),
                         context=_stored_memory_context(memory, recorded_at=now),
                     )
                     for memory in missing
@@ -1628,7 +1763,7 @@ class Memory:
                     self._persist_transcripts(operation)
         rows_by_id = {memory.memory_id: memory for memory in authoritative}
         if rows_by_id.keys() != unique.keys():
-            raise StorageError("written memories could not be read from SQLite")
+            raise StorageError("written memories could not be read from SQLite", reason="io_failed")
         return tuple(self._memory_record(rows_by_id[memory.memory_id]) for memory in prepared)
 
     def _form_sources(
@@ -1833,6 +1968,80 @@ class Memory:
         return replace(
             memory,
             content=self._embedding_content(content, operation),
+        )
+
+    def _pending_visual_descriptions(self, contents: Sequence[_PreparedContent]) -> dict[str, str]:
+        """Describe every yet-undescribed visual asset in one write, in one model call.
+
+        Deriving the text is a paid call, so it follows from `vision_describer` being configured
+        and from nothing else. Whether it is *indexed* is not a capability question -- see
+        `_with_visual_descriptions`. Only the write path calls this: `_embedding_content` is
+        shared with the query path, where describing an image query would buy a call per search.
+        """
+        if self._vision_describer is None:
+            return {}
+        assets = tuple(
+            {
+                asset.asset_id: asset
+                for content in contents
+                for asset in content.assets
+                if Modality(asset.modality) in self._vision_capabilities
+                and f"[visual description:{asset.asset_id}]\n" not in content.text
+            }.values()
+        )
+        if not assets:
+            return {}
+        descriptions = self._vision_descriptions(
+            tuple(self._resolved_model_input(_asset_content(asset)) for asset in assets)
+        )
+        return dict(zip((asset.asset_id for asset in assets), descriptions, strict=True))
+
+    def _with_visual_descriptions(
+        self,
+        prepared: _PreparedContent,
+        descriptions: Mapping[str, str],
+    ) -> _PreparedContent:
+        """Union derived visual text into the indexed document, whatever the embedder can take.
+
+        Routing media to the embedder is a capability decision; what a memory's full-text document
+        contains is not. Describing an image only when the embedder could not take one made the
+        recommended omni composition the one that stored the empty string as its whole BM25
+        document, so a stronger embedder deleted the lexical half of the dense+lexical union.
+        Union does not lose here; replacement does.
+        """
+        sections = tuple(
+            f"[visual description:{asset.asset_id}]\n{descriptions[asset.asset_id]}"
+            for asset in prepared.assets
+            if asset.asset_id in descriptions
+            and f"[visual description:{asset.asset_id}]\n" not in prepared.text
+        )
+        if not sections:
+            return prepared
+        # A description is derived convenience, not the caller's content, so one that does not fit
+        # is omitted rather than allowed to fail a write whose own text is inside the limit. The
+        # asset is still stored and still embedded; each description that did land carries its
+        # `[visual description:<asset_id>]` marker, so which ones are present is inspectable
+        # through `get`. Failing here instead would make a long note plus an image unstorable for
+        # no reason the caller could act on.
+        kept: list[str] = []
+        text = prepared.text
+        for section in sections:
+            candidate = "\n\n".join(value for value in (text, section) if value)
+            if len(candidate) > _MAX_TEXT_CHARACTERS:
+                continue
+            text = candidate
+            kept.append(section)
+        if not kept:
+            return prepared
+        sections = tuple(kept)
+        return replace(
+            prepared,
+            text=text,
+            canonical_parts=(
+                *prepared.canonical_parts,
+                *(("visual_description", section) for section in sections),
+            ),
+            visual_description=True,
         )
 
     @contextmanager
@@ -2136,6 +2345,14 @@ class Memory:
                         known_at=None if scope is None else scope.known_at,
                         near=None if scope is None else scope.near,
                         radius_m=None if scope is None else scope.radius_m,
+                        # Passed here for consistency with every other scope axis, which all
+                        # reach both reads. This one is the survivor count that drives candidate
+                        # widening; no constructed corpus (30 or 120 memories) could make its
+                        # absence change a result, so it is unproven rather than proven needed.
+                        # Kept because omitting one axis at one of two sites is the anomaly a
+                        # reader would have to explain, and because narrowing a count can only
+                        # widen the search. The hydration site below is mutation-covered.
+                        place_id=None if scope is None else scope.place_id,
                         active_only=True,
                     )
                 )
@@ -2186,6 +2403,7 @@ class Memory:
                     known_at=None if scope is None else scope.known_at,
                     near=None if scope is None else scope.near,
                     radius_m=None if scope is None else scope.radius_m,
+                    place_id=None if scope is None else scope.place_id,
                     active_only=True,
                 )
             with self._trace("mindbridge.retrieval.rank", kind="stage"):
@@ -2236,10 +2454,6 @@ class Memory:
                         1.0 + _MAX_LEXICAL_RERANK_BONUS * lexical_strength,
                     )
                     lexical_rerank_bonus = relevance - base
-                    gate_confidence = max(
-                        dense_confidence.get(memory_id, 0.0),
-                        _LEXICAL_MATCH_CONFIDENCE if lexical_match else 0.0,
-                    )
                     (
                         final_score,
                         reinforcement_factor,
@@ -2252,14 +2466,41 @@ class Memory:
                         temporal_range=temporal_range,
                         decay_half_life=self._decay_half_life,
                     )
+                    # `minimum_relevance` gates evidence quality on the relevance scale: how well
+                    # this memory matches, times how sure the observation itself was. It used to
+                    # gate dense *confidence*, `(1 + cosine) / 2`, which made the 0.55 default
+                    # admit cosine 0.15 and reject 0.05 while the caller read cosine back; and any
+                    # full-text hit was handed a flat 0.6 there whatever its match strength, so one
+                    # shared rare term carried a document at cosine -1.0 past the default floor and
+                    # no floor above 0.6 could keep the lexical route at all. Both routes now
+                    # contribute on this one scale and scale with match strength.
+                    #
+                    # The gate takes the signals the *query* asked about and leaves out the ones it
+                    # did not. Temporal proximity is in: a caller who asks "in 2024" made the year
+                    # part of the question, so overlapping it is evidence and missing it is not,
+                    # and the boost is what lets an in-window full-text hit clear a floor its bare
+                    # rank could not. Reinforcement and `decay_half_life_days` retention are out:
+                    # neither is anything the query mentioned. They are bounded below by
+                    # `_RANK_FLOOR`, so with retention inside the gate a *perfectly* relevant
+                    # memory decayed to 0.30 and to 0.09 once a window also missed it, under the
+                    # 0.10 default — turning "prefer recent" into "hide old" for exactly the
+                    # caller who enabled decay and then asked about last year. A long-lived
+                    # personal memory may rank an old event last; it may not stop returning it.
+                    #
+                    # The cost is that `SearchHit.score` carries every factor and so can sit below
+                    # the floor the caller set. `search_with_trace` reports the gated quantity as
+                    # `gate_relevance`, beside the `retention_factor` that moved the score off it.
+                    gate_relevance = relevance
+                    if temporal_factor is not None:
+                        gate_relevance = _bounded_scale(gate_relevance, temporal_factor)
                     if memory.context is not None:
                         final_score *= memory.context.confidence
-                        gate_confidence *= memory.context.confidence
+                        gate_relevance *= memory.context.confidence
                     ranked.append(
                         (
                             memory,
                             final_score,
-                            gate_confidence,
+                            gate_relevance,
                             lexical_match,
                         )
                     )
@@ -2272,7 +2513,7 @@ class Memory:
                         lexical_relevance=lexical_score,
                         lexical_rerank_bonus=lexical_rerank_bonus,
                         lexical_match=lexical_match,
-                        gate_confidence=gate_confidence,
+                        gate_relevance=gate_relevance,
                         base_relevance=relevance,
                         reinforcement_factor=reinforcement_factor,
                         temporal_factor=temporal_factor,
@@ -2337,11 +2578,20 @@ class Memory:
         if temporal_range is None or not lexical_query or len(candidates.lexical) < route_limit:
             return candidates, documents
         lexical_by_id = {hit.id: hit for hit in candidates.lexical}
+        # A heuristic proxy for "worth deepening for", NOT a bound on the gate. It cannot be one:
+        # the gate scores a full-text candidate from `lexical_relevance_by_rank`, a reciprocal
+        # rank over the final candidate set, while `hit.relevance` here is the index's own
+        # similarity -- and the rank a deepened candidate ends up with depends on the deepening
+        # this decision is choosing whether to do. Tightening the proxy toward the gate's real
+        # ceiling was tried and made it too permissive: the loop then stopped at a nearer weak
+        # candidate and never reached a stronger in-range one outside the first window, which
+        # `test_temporal_search_reads_lexical_evidence_from_authoritative_time_range` catches.
+        # Treat this threshold as tuned, and re-run that test before changing it.
         qualified_parents = {
             document.embedding.memory_id
             for document in documents
             if (hit := lexical_by_id.get(document.embedding.embedding_id)) is not None
-            and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
+            and _LEXICAL_FULL_COVERAGE_RELEVANCE * hit.relevance >= self._minimum_relevance
             and _overlaps_temporal_range(
                 document.occurred_at,
                 document.occurred_end,
@@ -2369,7 +2619,7 @@ class Memory:
             hit
             for hit in lexical
             if hit.id in in_range
-            and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
+            and _LEXICAL_FULL_COVERAGE_RELEVANCE * hit.relevance >= self._minimum_relevance
         )
         while len(qualified) < required and len(lexical) >= search_limit and search_limit < total:
             search_limit = min(search_limit * 2, total)
@@ -2383,7 +2633,7 @@ class Memory:
                 hit
                 for hit in lexical
                 if hit.id in in_range
-                and _LEXICAL_MATCH_CONFIDENCE * hit.relevance >= self._minimum_relevance
+                and _LEXICAL_FULL_COVERAGE_RELEVANCE * hit.relevance >= self._minimum_relevance
             )
         updated = _IndexCandidates(
             dense=candidates.dense,
@@ -2469,6 +2719,15 @@ class Memory:
         fallback = {Modality.AUDIO}
         if prepared.visual_description:
             fallback.update((Modality.IMAGE, Modality.VIDEO))
+        if any(asset.transcript for asset in prepared.assets):
+            # By here the transcript is attached to the asset, so the speech can stand in for a
+            # video the embedder refuses. `_fallback_unsupported` already agreed a route exists on
+            # the strength of it being derivable; this is the same decision once the text is in
+            # hand, and without it the write raises after paying for the transcription. Read from
+            # the assets rather than `prepared.audio_transcript`, which the transcript-derivation
+            # path does not set -- the audio route never needed it, since AUDIO is unconditionally
+            # in the fallback set above, and `_derived_text` reads the assets too.
+            fallback.add(Modality.VIDEO)
         if missing <= fallback:
             text = _derived_text(value.text, prepared.assets)
             assets = tuple(asset for asset in value.assets if asset.modality not in missing)
@@ -2496,15 +2755,23 @@ class Memory:
             and media <= self._embedding_capabilities
         ):
             return prepared
+        rescues = self._transcript_fallback(prepared.assets)
         unsupported = _fallback_unsupported(
             prepared,
             self._embedding_capabilities,
             "embedding",
+            transcribable=rescues,
         )
         if Modality.AUDIO in unsupported:
             if prepared.audio_transcript:
                 return prepared
             _require_audio_transcription(self._transcription_capabilities)
+        elif Modality.VIDEO in unsupported and Modality.VIDEO in rescues:
+            # The embedder cannot take the video but the transcriber can read it, so the speech
+            # becomes the embedding key. The frames are not embedded in this composition -- the
+            # honest cost of the route -- while the asset stays stored and on the record.
+            if prepared.audio_transcript:
+                return prepared
         elif unsupported & {Modality.IMAGE, Modality.VIDEO} or not self._derives_transcripts(
             prepared.assets
         ):
@@ -2573,7 +2840,9 @@ class Memory:
             try:
                 assets = tuple(by_id[asset.id] for asset in hit.assets)
             except KeyError:
-                raise StorageError("memory references missing media metadata") from None
+                raise StorageError(
+                    "memory references missing media metadata", reason="asset_unavailable"
+                ) from None
             prepared_hits.append(
                 _PreparedContent(
                     text=hit.content,
@@ -2650,7 +2919,10 @@ class Memory:
         self._recognize_faces(face_assets, operation)
         text = _face_identity_text(prepared.text, face_assets, operation.face_observations)
         if len(text) > _MAX_TEXT_CHARACTERS:
-            raise ModelError("face identity evidence exceeded the supported text length")
+            raise ModelError(
+                "face identity evidence exceeded the supported text length",
+                reason="payload_too_large",
+            )
         return replace(prepared, text=text)
 
     def _recognize_faces(
@@ -2659,7 +2931,7 @@ class Memory:
         operation: _OperationAssets,
     ) -> None:
         if not isinstance(self._face_analyzer, FaceBackend):
-            raise ModelError("no face backend is configured")
+            raise ModelError("no face backend is configured", reason="backend_not_configured")
         face_assets = tuple(
             {
                 asset.asset_id: asset
@@ -2850,7 +3122,7 @@ class Memory:
         assets: Sequence[AssetRef],
     ) -> tuple[FaceAnalysis, ...]:
         if not isinstance(self._face_analyzer, FaceBackend):
-            raise ModelError("no face backend is configured")
+            raise ModelError("no face backend is configured", reason="backend_not_configured")
         with self._model_trace(
             "face",
             "face_recognition",
@@ -2863,11 +3135,11 @@ class Memory:
             except MindBridgeError:
                 raise
             except Exception as error:
-                raise ModelError("failed to analyze face input") from error
+                raise ModelError("failed to analyze face input", reason="model_failed") from error
             if len(analyses) != len(assets) or any(
                 not isinstance(analysis, FaceAnalysis) for analysis in analyses
             ):
-                raise ModelError("face model returned invalid output")
+                raise ModelError("face model returned invalid output", reason="response_invalid")
             return tuple(analyses)
 
     def _transcribable_assets(
@@ -2891,6 +3163,17 @@ class Memory:
             return ()
         return self._transcribable_assets(assets)
 
+    def _transcript_fallback(self, assets: Sequence[StoredAsset]) -> frozenset[Modality]:
+        """Modalities a derived transcript can rescue for an embedder that cannot take them.
+
+        Empty when a `SpeechBackend` is configured: that composition indexes the same text through
+        the `index_speech` opt-in instead, so claiming the rescue here would let a write past the
+        guard and then fail later with no transcript in hand.
+        """
+        if not self._derives_transcripts(assets):
+            return frozenset()
+        return self._transcription_capabilities & {Modality.AUDIO, Modality.VIDEO}
+
     def _derives_transcripts(self, assets: Sequence[StoredAsset]) -> bool:
         # A SpeechBackend indexes the same text through the explicit `index_speech` opt-in, so its
         # add-time analysis cost stays behind that flag instead of being taken twice.
@@ -2911,7 +3194,10 @@ class Memory:
         )
         text = _speech_identity_text(base, speech_assets, operation.speech_segments)
         if len(text) > _MAX_TEXT_CHARACTERS:
-            raise ModelError("speaker identity evidence exceeded the supported text length")
+            raise ModelError(
+                "speaker identity evidence exceeded the supported text length",
+                reason="payload_too_large",
+            )
         return replace(prepared, text=text)
 
     def _recognize_speech(
@@ -2922,7 +3208,10 @@ class Memory:
         reversible: bool = False,
     ) -> None:
         if not isinstance(self._transcriber, SpeechBackend):
-            raise ModelError("configured transcription backend cannot analyze speakers")
+            raise ModelError(
+                "configured transcription backend cannot analyze speakers",
+                reason="backend_not_configured",
+            )
         speech_assets = tuple(
             {
                 asset.asset_id: asset
@@ -3038,7 +3327,9 @@ class Memory:
             tuple(asset for asset in assets if asset.asset_id not in operation.speech_segments),
         )
         if len(text) > _MAX_TEXT_CHARACTERS:
-            raise ModelError("audio transcription exceeded the supported text length")
+            raise ModelError(
+                "audio transcription exceeded the supported text length", reason="payload_too_large"
+            )
         return replace(prepared, text=text, assets=assets)
 
     def _cache_audio_transcripts(
@@ -3080,11 +3371,15 @@ class Memory:
             except MindBridgeError:
                 raise
             except Exception as error:
-                raise ModelError("failed to transcribe audio input") from error
+                raise ModelError(
+                    "failed to transcribe audio input", reason="model_failed"
+                ) from error
             if len(generated) != len(refs) or any(
                 not isinstance(transcript, str) for transcript in generated
             ):
-                raise ModelError("transcription model returned invalid output")
+                raise ModelError(
+                    "transcription model returned invalid output", reason="response_invalid"
+                )
             cached = tuple(
                 (asset_id, transcript.strip())
                 for asset_id, transcript in zip(missing, generated, strict=True)
@@ -3128,7 +3423,10 @@ class Memory:
         assets: Sequence[AssetRef],
     ) -> tuple[SpeechAnalysis, ...]:
         if not isinstance(self._transcriber, SpeechBackend):
-            raise ModelError("configured transcription backend cannot analyze speakers")
+            raise ModelError(
+                "configured transcription backend cannot analyze speakers",
+                reason="backend_not_configured",
+            )
         with self._model_trace(
             "transcription",
             "transcription",
@@ -3142,11 +3440,11 @@ class Memory:
             except MindBridgeError:
                 raise
             except Exception as error:
-                raise ModelError("failed to analyze speech input") from error
+                raise ModelError("failed to analyze speech input", reason="model_failed") from error
             if len(analyses) != len(assets) or any(
                 not isinstance(analysis, SpeechAnalysis) for analysis in analyses
             ):
-                raise ModelError("speech model returned invalid output")
+                raise ModelError("speech model returned invalid output", reason="response_invalid")
             return tuple(analyses)
 
     def _resolved_model_input(self, prepared: _PreparedContent) -> ModelInput:
@@ -3222,41 +3520,55 @@ class Memory:
             raise ValidationError("vision description requires at least one image")
         with self._operation() as operation:
             prepared = tuple(self._prepare_content(image, operation) for image in images)
-            inputs = tuple(self._resolved_model_input(value) for value in prepared)
-            unsupported = frozenset(
-                modality
-                for value in inputs
-                for modality in value.modalities - self._vision_capabilities
+            return self._vision_descriptions(
+                tuple(self._resolved_model_input(value) for value in prepared)
             )
-            if unsupported:
-                names = ", ".join(sorted(modality.value for modality in unsupported))
+
+    def _vision_descriptions(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+        if self._vision_describer is None:
+            raise ModelError(
+                "vision description backend is not configured",
+                reason="backend_not_configured",
+            )
+        inputs = tuple(inputs)
+        unsupported = frozenset(
+            modality
+            for value in inputs
+            for modality in value.modalities - self._vision_capabilities
+        )
+        if unsupported:
+            names = ", ".join(sorted(modality.value for modality in unsupported))
+            raise ModelError(
+                f"configured vision model does not support: {names}",
+                reason="unsupported_modality",
+            )
+        with self._model_trace(
+            "vision",
+            "vision.description",
+            model=self._vision_model,
+            batch_size=len(inputs),
+            modalities=(modality for value in inputs for modality in value.modalities),
+        ):
+            mark_model_requests(1)
+            try:
+                descriptions = self._vision_describer.describe(inputs)
+            except MindBridgeError:
+                raise
+            except Exception as error:
                 raise ModelError(
-                    f"configured vision model does not support: {names}",
-                    reason="unsupported_modality",
-                )
-            with self._model_trace(
-                "vision",
-                "vision.description",
-                model=self._vision_model,
-                batch_size=len(inputs),
-                modalities=(modality for value in inputs for modality in value.modalities),
-            ):
-                mark_model_requests(1)
-                try:
-                    descriptions = self._vision_describer.describe(inputs)
-                except MindBridgeError:
-                    raise
-                except Exception as error:
-                    raise ModelError("failed to describe vision input") from error
-            if len(descriptions) != len(inputs) or any(
-                not isinstance(description, str) or not description.strip()
-                for description in descriptions
-            ):
-                raise ModelError("vision model returned invalid output")
-            normalized = tuple(description.strip() for description in descriptions)
-            if any(len(description) > _MAX_TEXT_CHARACTERS for description in normalized):
-                raise ModelError("vision description exceeded the supported text length")
-            return normalized
+                    "failed to describe vision input", reason="model_failed"
+                ) from error
+        if len(descriptions) != len(inputs) or any(
+            not isinstance(description, str) or not description.strip()
+            for description in descriptions
+        ):
+            raise ModelError("vision model returned invalid output", reason="response_invalid")
+        normalized = tuple(description.strip() for description in descriptions)
+        if any(len(description) > _MAX_TEXT_CHARACTERS for description in normalized):
+            raise ModelError(
+                "vision description exceeded the supported text length", reason="payload_too_large"
+            )
+        return normalized
 
     def _embed(
         self,
@@ -3277,9 +3589,12 @@ class Memory:
             except MindBridgeError:
                 raise
             except Exception as error:
-                raise ModelError("failed to embed memory input") from error
+                raise ModelError("failed to embed memory input", reason="model_failed") from error
             if len(vectors) != len(inputs):
-                raise ModelError("embedding model returned the wrong number of vectors")
+                raise ModelError(
+                    "embedding model returned the wrong number of vectors",
+                    reason="response_invalid",
+                )
             return tuple(
                 _normalized_vector(vector, self._embedding_dimension) for vector in vectors
             )
@@ -3321,7 +3636,10 @@ class Memory:
                             used_hits = completed.value
                             break
                         if not isinstance(part, str):
-                            raise ModelError("generation model returned an invalid answer chunk")
+                            raise ModelError(
+                                "generation model returned an invalid answer chunk",
+                                reason="response_invalid",
+                            )
                         if part:
                             if not parts and current_model_request_count():
                                 trace.get_current_span().set_attribute(
@@ -3330,10 +3648,15 @@ class Memory:
                             parts.append(part)
                     answer = "".join(parts)
                     if not answer.strip():
-                        raise ModelError("generation model returned an invalid answer")
+                        raise ModelError(
+                            "generation model returned an invalid answer", reason="response_invalid"
+                        )
                     if isinstance(used_hits, AnswerResult):
                         if used_hits.answer != answer:
-                            raise ModelError("generation model returned an invalid answer")
+                            raise ModelError(
+                                "generation model returned an invalid answer",
+                                reason="response_invalid",
+                            )
                         result = used_hits
                     elif used_hits is None:
                         grounded = tuple(hits)
@@ -3345,9 +3668,15 @@ class Memory:
                         if abstention_reason is not None and not isinstance(
                             abstention_reason, AbstentionReason
                         ):
-                            raise ModelError("generation model returned invalid abstention status")
+                            raise ModelError(
+                                "generation model returned invalid abstention status",
+                                reason="response_invalid",
+                            )
                     else:
-                        raise ModelError("generation model returned invalid grounding hits")
+                        raise ModelError(
+                            "generation model returned invalid grounding hits",
+                            reason="response_invalid",
+                        )
                     if not isinstance(used_hits, AnswerResult):
                         reason = abstention_reason if isinstance(used_hits, tuple) else None
                         result = AnswerResult(
@@ -3361,9 +3690,13 @@ class Memory:
             except MindBridgeError:
                 raise
             except Exception as error:
-                raise ModelError("failed to generate a grounded answer") from error
+                raise ModelError(
+                    "failed to generate a grounded answer", reason="model_failed"
+                ) from error
             if not isinstance(result, AnswerResult):
-                raise ModelError("generation model returned an invalid answer")
+                raise ModelError(
+                    "generation model returned an invalid answer", reason="response_invalid"
+                )
             return result
 
     def _memory_record(self, memory: StoredMemory) -> MemoryRecord:
@@ -3378,6 +3711,7 @@ class Memory:
             modality=Modality(memory.modality),
             memory_type=MemoryType(memory.memory_type),
             context=memory.context,
+            place_id=memory.place_id,
         )
 
     def _search_hit(self, memory: StoredMemory, relevance: float) -> SearchHit:
@@ -3393,6 +3727,7 @@ class Memory:
             modality=Modality(memory.modality),
             memory_type=MemoryType(memory.memory_type),
             context=memory.context,
+            place_id=memory.place_id,
         )
 
     def _asset_ref(self, asset: StoredAsset) -> AssetRef:
@@ -3419,7 +3754,7 @@ class Memory:
         try:
             self._assets.acquire(unique)
         except AssetStoreError as error:
-            raise StorageError("failed to lease local media") from error
+            raise StorageError("failed to lease local media", reason="io_failed") from error
         leased.extend(unique)
 
     def _queue_asset_cleanup(self, assets: Sequence[StoredAsset]) -> None:
@@ -3458,11 +3793,14 @@ class Memory:
                 if asset_id in unreferenced:
                     with _translate_storage_errors("delete orphaned media metadata"):
                         if not self._store.delete_asset_if_unreferenced(asset_id):
-                            raise StorageError("orphaned media became referenced during cleanup")
+                            raise StorageError(
+                                "orphaned media became referenced during cleanup",
+                                reason="io_failed",
+                            )
                 remaining = index + 1
         except AssetStoreError as error:
             self._queue_asset_cleanup(assets[remaining:])
-            raise StorageError("failed to clean up orphaned media") from error
+            raise StorageError("failed to clean up orphaned media", reason="io_failed") from error
         except BaseException:
             self._queue_asset_cleanup(assets[remaining:])
             raise
@@ -3479,7 +3817,7 @@ class Memory:
         try:
             physical_ids = self._assets.list_ids()
         except AssetStoreError as error:
-            raise StorageError("failed to scan local media") from error
+            raise StorageError("failed to scan local media", reason="io_failed") from error
         with _translate_storage_errors("reconcile local media"):
             tracked_ids = {asset.asset_id for asset in self._store.read_assets(physical_ids)}
         for asset_id in physical_ids:
@@ -3488,14 +3826,16 @@ class Memory:
             try:
                 self._assets.delete_id(asset_id)
             except AssetStoreError as error:
-                raise StorageError("failed to delete untracked local media") from error
+                raise StorageError(
+                    "failed to delete untracked local media", reason="io_failed"
+                ) from error
 
     def _delete_orphan_assets(self, orphaned: Sequence[StoredAsset]) -> None:
         for asset in orphaned:
             try:
                 self._assets.delete(asset)
             except AssetStoreError as error:
-                raise StorageError("failed to delete orphaned media") from error
+                raise StorageError("failed to delete orphaned media", reason="io_failed") from error
             with _translate_storage_errors("delete orphaned media metadata"):
                 self._store.delete_asset_if_unreferenced(asset.asset_id)
 
@@ -3557,7 +3897,10 @@ class Memory:
             with _translate_storage_errors("acknowledge the search-index outbox"):
                 acknowledged = self._store.acknowledge_index_operations(operations)
             if acknowledged != len(operations):
-                raise StorageError("search-index outbox changed while it was being acknowledged")
+                raise StorageError(
+                    "search-index outbox changed while it was being acknowledged",
+                    reason="flush_failed",
+                )
 
     def _index_documents(self) -> Iterator[IndexDocument]:
         after: tuple[datetime, str] | None = None
@@ -3725,14 +4068,14 @@ class Memory:
     def _require_open(self) -> None:
         self._require_owner_process()
         if self._closed or self._closing:
-            raise StorageError("Memory is closed")
+            raise StorageError("Memory is closed", reason="instance_unusable")
 
     @contextmanager
     def _operation(self) -> Iterator[_OperationAssets]:
         self._require_owner_process()
         with self._lifecycle:
             if self._closed or self._closing:
-                raise StorageError("Memory is closed")
+                raise StorageError("Memory is closed", reason="instance_unusable")
             self._active_operations += 1
         failed = False
         assets = _OperationAssets(
@@ -3773,7 +4116,8 @@ class Memory:
     def _require_owner_process(self) -> None:
         if os.getpid() != self._owner_pid:
             raise StorageError(
-                "Memory cannot be used after fork; create a new instance with a different data_dir"
+                "Memory cannot be used after fork; create a new instance with a different data_dir",
+                reason="instance_unusable",
             )
 
 
@@ -4023,6 +4367,11 @@ class AsyncMemory:
             reference_at=reference_at,
             scope=scope,
         )
+
+    @property
+    def capabilities(self) -> MemoryCapabilities:
+        """The composition's declared capabilities; read from memory, so no thread is needed."""
+        return self._memory.capabilities
 
     async def get(self, memory_id: str) -> MemoryRecord:
         return await asyncio.to_thread(self._memory.get, memory_id)
@@ -4318,7 +4667,7 @@ class AsyncCaptureStream:
             item.transcript is None and item.description is None
         ):
             return item.content if isinstance(item, StreamInput) else item
-        capabilities = self._memory._memory._embedding_capabilities
+        capabilities = self._memory.capabilities.embedding
         if Modality.TEXT not in capabilities:
             return item.content
         routed: builtins.list[ContentAtom] = [
@@ -5123,11 +5472,18 @@ def _fallback_unsupported(
     prepared: _PreparedContent,
     supported: frozenset[Modality],
     operation: str,
+    *,
+    transcribable: frozenset[Modality] = frozenset(),
 ) -> frozenset[Modality]:
     unsupported = _prepared_modalities(prepared) - supported
     fallback = {Modality.AUDIO}
     if prepared.visual_description:
         fallback.update((Modality.IMAGE, Modality.VIDEO))
+    # This runs before any transcript exists, so a derived one cannot be seen yet -- only its
+    # possibility. `transcribable` is the modality set a transcript could still rescue, which is
+    # why a video reaching a video-less embedder is no longer fatal when the transcriber can read
+    # it. Empty by default, so a caller that does not pass it keeps the previous behaviour.
+    fallback.update(transcribable & {Modality.AUDIO, Modality.VIDEO})
     fatal = set(unsupported - fallback)
     if Modality.TEXT not in supported:
         fatal.update(unsupported & fallback)
@@ -5358,6 +5714,20 @@ def _retrieval_text(text: str, asset_ids: frozenset[str]) -> str:
 
 
 def _speech_retrieval_text(payload: str, asset_id: str) -> str | None:
+    """Project stored speech evidence into the prose the derived index and embedding should carry.
+
+    Stored content keeps the JSON, because the answering model reads it as structured evidence and
+    needs the timings and scores. The derived projections do not: as JSON, `start_ms`, `end_ms`,
+    `speaker_id` and `identity_score` all became BM25 tokens surrounding the words someone
+    actually said, and the embedder encoded the schema along with the speech. Index content is the
+    only lever that moves the R@20 ceiling, so the projection carries the utterance and who said
+    it and nothing else.
+
+    An unstable per-run `identity_*` id is still replaced by a stable `speaker_N` alias, which is
+    what this function existed for: without it a recognizer that re-minted a person rewrote every
+    document that mentioned them. A named speaker is projected under their name, which is also the
+    token a caller would search for.
+    """
     try:
         evidence = json.loads(payload)
         if not isinstance(evidence, dict) or evidence.get("asset_id") != asset_id:
@@ -5366,20 +5736,27 @@ def _speech_retrieval_text(payload: str, asset_id: str) -> str | None:
         if not isinstance(segments, list):
             return None
         aliases: dict[str, str] = {}
-        normalized = []
-        changed = False
+        lines = []
         for segment in segments:
             if not isinstance(segment, dict) or "speaker_id" not in segment:
                 return None
             speaker_id = segment.get("speaker_id")
             if isinstance(speaker_id, str) and speaker_id.startswith("identity_"):
                 speaker_id = aliases.setdefault(speaker_id, f"speaker_{len(aliases) + 1}")
-                changed = True
-            normalized.append({**segment, "speaker_id": speaker_id})
-        if not changed:
+            name = segment.get("speaker_name")
+            speaker = name if isinstance(name, str) and name.strip() else speaker_id
+            spoken = segment.get("text")
+            said = spoken.strip() if isinstance(spoken, str) else ""
+            if not isinstance(speaker, str) or not speaker.strip():
+                if said:
+                    lines.append(said)
+                continue
+            lines.append(f"{speaker.strip()}: {said}" if said else speaker.strip())
+        if not lines:
+            # Nothing was said, so there is no prose to carry. Leaving the payload alone keeps an
+            # empty analysis byte-identical to what it was before this projection existed.
             return payload
-        evidence = {**evidence, "segments": normalized}
-        return json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+        return "\n".join(lines)
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -5558,9 +5935,9 @@ def _metadata_from_json(value: str) -> Mapping[str, object]:
     try:
         decoded: object = json.loads(value)
     except ValueError as error:
-        raise StorageError("stored memory metadata is invalid") from error
+        raise StorageError("stored memory metadata is invalid", reason="unexpected") from error
     if not isinstance(decoded, dict) or any(not isinstance(key, str) for key in decoded):
-        raise StorageError("stored memory metadata is not an object")
+        raise StorageError("stored memory metadata is not an object", reason="unexpected")
     return cast(dict[str, object], decoded)
 
 
@@ -5757,6 +6134,16 @@ def _budgeted_hits(
     """
     taken = {hit.id for hit in selected}
     used = sum(_evidence_cost(hit) for hit in selected)
+    # No near-duplicate suppression here, and that is a measured decision rather than an
+    # omission. Character-trigram Jaccard -- the measure VoiceMem uses for this at 0.30 -- cannot
+    # separate a restatement from a log entry, because in this domain the bands overlap outright:
+    # rephrasings of one fact score 0.635-0.836, while "dad took his medication at 8am" against
+    # "...at 9am" scores 0.806, "the bicycle was in the shed on monday" against "...tuesday"
+    # 0.737, and a temperature reading against the next day's 0.860. Five such pairs were tested
+    # and all five fell inside the restatement band, so no threshold exists that keeps them.
+    # Collapsing a medication time or a temperature series is information loss a companion memory
+    # cannot afford, and it is strictly worse than the wasted budget it would save. A working
+    # version needs a measure that reads the *differing* span rather than the shared template.
     extra: list[SearchHit] = []
     for hit in hits:
         if hit.id in taken:
@@ -5843,9 +6230,9 @@ def _early_candidate_trace(
         dense_confidence=dense_confidence.get(memory_id, 0.0),
         lexical_relevance=(_LEXICAL_RANK_RELEVANCE * lexical_index_relevance.get(memory_id, 0.0)),
         lexical_match=lexical_match,
-        gate_confidence=max(
-            dense_confidence.get(memory_id, 0.0),
-            _LEXICAL_MATCH_CONFIDENCE if lexical_match else 0.0,
+        gate_relevance=max(
+            dense_relevance.get(memory_id, 0.0),
+            _LEXICAL_RANK_RELEVANCE * lexical_index_relevance.get(memory_id, 0.0),
         ),
         rejected_by=rejected_by,
     )
@@ -5883,14 +6270,12 @@ def _extend_hydration_traces(
                 dense_relevance=None if dense_hit is None else dense_hit.relevance,
                 dense_confidence=dense_hit_confidence,
                 lexical_relevance=(
-                    None
-                    if lexical_hit is None
-                    else _LEXICAL_MATCH_CONFIDENCE * lexical_hit.relevance
+                    None if lexical_hit is None else _LEXICAL_RANK_RELEVANCE * lexical_hit.relevance
                 ),
                 lexical_match=lexical_hit is not None,
-                gate_confidence=max(
-                    dense_hit_confidence or 0.0,
-                    _LEXICAL_MATCH_CONFIDENCE if lexical_hit is not None else 0.0,
+                gate_relevance=max(
+                    0.0 if dense_hit is None else dense_hit.relevance,
+                    0.0 if lexical_hit is None else _LEXICAL_RANK_RELEVANCE * lexical_hit.relevance,
                 ),
                 rejected_by=RetrievalRejection.STALE_INDEX,
             )
@@ -5977,7 +6362,7 @@ def _record_ranked_trace(
     lexical_relevance: float,
     lexical_rerank_bonus: float,
     lexical_match: bool,
-    gate_confidence: float,
+    gate_relevance: float,
     base_relevance: float,
     reinforcement_factor: float,
     temporal_factor: float | None,
@@ -5994,7 +6379,7 @@ def _record_ranked_trace(
         lexical_relevance=lexical_relevance,
         lexical_rerank_bonus=lexical_rerank_bonus,
         lexical_match=lexical_match,
-        gate_confidence=gate_confidence,
+        gate_relevance=gate_relevance,
         base_relevance=base_relevance,
         reinforcement_factor=reinforcement_factor,
         temporal_factor=temporal_factor,
@@ -6444,7 +6829,9 @@ def _normalized_vector(values: Sequence[float], dimension: int) -> tuple[float, 
     vector = tuple(float(value) for value in values)
     norm = math.hypot(*vector)
     if not math.isfinite(norm) or norm == 0.0:
-        raise ModelError("embedding model returned a non-finite or zero vector")
+        raise ModelError(
+            "embedding model returned a non-finite or zero vector", reason="response_invalid"
+        )
     if math.isclose(norm, 1.0, rel_tol=1e-6, abs_tol=1e-12):
         return vector
     return tuple(value / norm for value in vector)
@@ -6493,6 +6880,9 @@ def _translate_storage_errors(action: str) -> Iterator[None]:
     except MindBridgeError:
         raise
     except Exception as error:
+        # `io_failed` is this wrapper's pre-existing contract and a test pins it. It is coarse by
+        # design -- the wrapper catches whatever any storage action raised -- and deliberately not
+        # in `RETRYABLE_REASONS`, so a caller does not retry a failure it cannot know is transient.
         raise StorageError(f"failed to {action}", reason="io_failed") from error
 
 

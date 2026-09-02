@@ -1,8 +1,8 @@
-"""Focused checks for the six local-memory MCP tools."""
+"""Focused checks for the local-memory MCP tools."""
 
 import base64
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
@@ -12,7 +12,7 @@ from mcp import Client
 from mcp.types import CallToolResult, TextContent
 
 from mindbridge import Memory
-from mindbridge.api import mcp as mcp_adapter
+from mindbridge.api import content
 from mindbridge.api.mcp import build_mcp_server
 from mindbridge.exceptions import (
     IndexUnavailableError,
@@ -28,6 +28,9 @@ from mindbridge.types import (
     AssetRef,
     Blob,
     ContentInput,
+    FaceObservation,
+    IdentityErasure,
+    IdentityProfile,
     MemoryRecord,
     MemoryType,
     Modality,
@@ -35,6 +38,7 @@ from mindbridge.types import (
     Page,
     RetrievalScope,
     SearchHit,
+    SpeakerSegment,
 )
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
@@ -50,6 +54,32 @@ ENVELOPE_FIELDS = {
     "trace_id",
     "issues",
 }
+SEGMENT = SpeakerSegment(
+    asset_id="b" * 64,
+    start_ms=0,
+    end_ms=1500,
+    text="Where is the toolbox?",
+    speaker_id="speaker_1",
+    speaker_name="Ann",
+    identity_score=0.82,
+)
+FACE = FaceObservation(
+    asset_id="c" * 64,
+    bounding_box=(0.1, 0.2, 0.3, 0.4),
+    identity_id="identity_1",
+    identity_name="Ann",
+    identity_score=0.77,
+    observed_at_ms=250,
+)
+ERASURE = IdentityErasure(
+    identity_id="identity_1",
+    alias_ids=("identity_4",),
+    face_exemplars=3,
+    voice_exemplars=2,
+    face_observations=7,
+    speech_segments=11,
+)
+PROFILE = IdentityProfile(identity_id="identity_1", name="Ann", relationship="daughter")
 ASSET = AssetRef(
     id="asset_image",
     modality=Modality.IMAGE,
@@ -66,6 +96,8 @@ class FakeMemory:
         self.calls: list[tuple[object, ...]] = []
         self.close_count = 0
         self.failure = failure
+        self.profile: IdentityProfile | None = PROFILE
+        self.restored: str | None = "identity_3"
 
     def add(
         self,
@@ -143,6 +175,56 @@ class FakeMemory:
         self.calls.append(("delete", memory_id))
         return True
 
+    def speech(self, memory_id: str) -> tuple[SpeakerSegment, ...]:
+        self._fail()
+        self.calls.append(("speech", memory_id))
+        return (SEGMENT,)
+
+    def faces(self, memory_id: str) -> tuple[FaceObservation, ...]:
+        self._fail()
+        self.calls.append(("faces", memory_id))
+        return (FACE,)
+
+    def register_speaker(
+        self,
+        speaker_id: str,
+        name: str,
+        *,
+        relationship: str | None = None,
+    ) -> None:
+        self._fail()
+        self.calls.append(("register_speaker", speaker_id, name, relationship))
+
+    def register_identity(
+        self,
+        identity_id: str,
+        name: str,
+        *,
+        relationship: str | None = None,
+    ) -> None:
+        self._fail()
+        self.calls.append(("register_identity", identity_id, name, relationship))
+
+    def identity(self, identity_id: str) -> IdentityProfile | None:
+        self._fail()
+        self.calls.append(("identity", identity_id))
+        return self.profile
+
+    def unlink_identity(self, alias_id: str) -> str | None:
+        self._fail()
+        self.calls.append(("unlink_identity", alias_id))
+        return self.restored
+
+    def forget_identity(self, identity_id: str) -> IdentityErasure:
+        self._fail()
+        self.calls.append(("forget_identity", identity_id))
+        return ERASURE
+
+    def reinforce(self, memory_ids: Sequence[str]) -> int:
+        self._fail()
+        self.calls.append(("reinforce", tuple(memory_ids)))
+        return len(set(memory_ids))
+
     def close(self) -> None:
         self.close_count += 1
 
@@ -151,7 +233,7 @@ class FakeMemory:
             raise self.failure
 
 
-async def test_mcp_publishes_only_the_six_flat_local_tools() -> None:
+async def test_mcp_publishes_only_the_flat_local_tools() -> None:
     server = build_mcp_server(cast(Memory, FakeMemory()))
 
     async with Client(server) as client:
@@ -164,6 +246,14 @@ async def test_mcp_publishes_only_the_six_flat_local_tools() -> None:
         "get_memory",
         "list_memories",
         "delete_memory",
+        "analyze_speech",
+        "analyze_faces",
+        "register_speaker",
+        "register_identity",
+        "get_identity",
+        "unlink_identity",
+        "forget_identity",
+        "reinforce_memories",
     }
     assert {name: set(tool.input_schema["properties"]) for name, tool in tools.items()} == {
         "add_memory": {
@@ -187,6 +277,14 @@ async def test_mcp_publishes_only_the_six_flat_local_tools() -> None:
         "get_memory": {"memory_id"},
         "list_memories": {"limit", "cursor"},
         "delete_memory": {"memory_id"},
+        "analyze_speech": {"memory_id"},
+        "analyze_faces": {"memory_id"},
+        "register_speaker": {"speaker_id", "name", "relationship"},
+        "register_identity": {"identity_id", "name", "relationship"},
+        "get_identity": {"identity_id"},
+        "unlink_identity": {"alias_id"},
+        "forget_identity": {"identity_id"},
+        "reinforce_memories": {"memory_ids"},
     }
     assert tools["get_memory"].annotations is not None
     assert tools["get_memory"].annotations.read_only_hint is True
@@ -198,6 +296,21 @@ async def test_mcp_publishes_only_the_six_flat_local_tools() -> None:
     assert tools["ask_memory"].annotations.read_only_hint is False
     assert tools["delete_memory"].annotations is not None
     assert tools["delete_memory"].annotations.destructive_hint is True
+    assert tools["get_identity"].annotations is not None
+    assert tools["get_identity"].annotations.read_only_hint is True
+    assert tools["register_speaker"].annotations is not None
+    assert tools["register_speaker"].annotations.idempotent_hint is True
+    # Reversing a merge discards the alias's evidence, and reinforcement accumulates, so neither
+    # may claim to be a safe no-op on retry.
+    assert tools["unlink_identity"].annotations is not None
+    assert tools["unlink_identity"].annotations.destructive_hint is True
+    assert tools["reinforce_memories"].annotations is not None
+    assert tools["reinforce_memories"].annotations.idempotent_hint is False
+    # Analysis persists identity evidence, so it cannot be advertised read-only.
+    for analysis in ("analyze_speech", "analyze_faces"):
+        annotations = tools[analysis].annotations
+        assert annotations is not None
+        assert annotations.read_only_hint is False
     published = json.dumps({name: tool.input_schema for name, tool in tools.items()})
     assert all(field not in published for field in ("tenant_id", "user_id", "run_id"))
 
@@ -250,6 +363,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
         "occurred_end": None,
         "metadata": {"room": "workshop"},
         "context": None,
+        "place_id": None,
     }
     assert searched.structured_content is not None
     assert searched.structured_content["hits"][0]["score"] == 0.9
@@ -287,6 +401,133 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
         ("delete", "memory_1"),
     ]
     assert memory.close_count == 0
+
+
+async def test_mcp_dispatches_the_embodied_and_identity_operations() -> None:
+    """An agent driving a robot can ask who spoke and who was seen, and name them."""
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        speech = await client.call_tool("analyze_speech", {"memory_id": "memory_1"})
+        faces = await client.call_tool("analyze_faces", {"memory_id": "memory_1"})
+        named_speaker = await client.call_tool(
+            "register_speaker",
+            {"speaker_id": "speaker_1", "name": "Ann", "relationship": "daughter"},
+        )
+        named_identity = await client.call_tool(
+            "register_identity",
+            {"identity_id": "identity_1", "name": "Ann"},
+        )
+        identity = await client.call_tool("get_identity", {"identity_id": "identity_1"})
+        unlinked = await client.call_tool("unlink_identity", {"alias_id": "identity_3"})
+        reinforced = await client.call_tool(
+            "reinforce_memories",
+            {"memory_ids": ["memory_1", "memory_2", "memory_1"]},
+        )
+
+    assert speech.structured_content == {
+        "segments": [
+            {
+                "asset_id": "b" * 64,
+                "start_ms": 0,
+                "end_ms": 1500,
+                "text": "Where is the toolbox?",
+                "speaker_id": "speaker_1",
+                "speaker_name": "Ann",
+                "identity_score": 0.82,
+            }
+        ]
+    }
+    assert faces.structured_content == {
+        "observations": [
+            {
+                "asset_id": "c" * 64,
+                "bounding_box": [0.1, 0.2, 0.3, 0.4],
+                "identity_id": "identity_1",
+                "identity_name": "Ann",
+                "identity_score": 0.77,
+                "observed_at_ms": 250,
+            }
+        ]
+    }
+    assert named_speaker.structured_content == {"registered": True}
+    assert named_identity.structured_content == {"registered": True}
+    assert identity.structured_content == {
+        "identity": {
+            "identity_id": "identity_1",
+            "name": "Ann",
+            "relationship": "daughter",
+        }
+    }
+    assert unlinked.structured_content == {"restored_identity_id": "identity_3"}
+    assert reinforced.structured_content == {"reinforced": 2}
+    assert memory.calls == [
+        ("speech", "memory_1"),
+        ("faces", "memory_1"),
+        ("register_speaker", "speaker_1", "Ann", "daughter"),
+        # An omitted relationship stays omitted rather than clearing the recorded one.
+        ("register_identity", "identity_1", "Ann", None),
+        ("identity", "identity_1"),
+        ("unlink_identity", "identity_3"),
+        ("reinforce", ("memory_1", "memory_2", "memory_1")),
+    ]
+
+
+async def test_mcp_reports_an_absent_identity_and_an_irreversible_merge_structurally() -> None:
+    """The two "nothing to report" answers are typed nulls, not prose an agent must read."""
+    memory = FakeMemory()
+    memory.profile = None
+    memory.restored = None
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        identity = await client.call_tool("get_identity", {"identity_id": "identity_9"})
+        unlinked = await client.call_tool("unlink_identity", {"alias_id": "identity_9"})
+
+    assert identity.is_error is False
+    assert identity.structured_content == {"identity": None}
+    assert unlinked.is_error is False
+    assert unlinked.structured_content == {"restored_identity_id": None}
+
+
+async def test_mcp_erases_a_person_and_reports_what_was_destroyed() -> None:
+    """ "Forget me" is an agent-facing request wherever "who was that" is."""
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        forgotten = await client.call_tool("forget_identity", {"identity_id": "identity_1"})
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+    assert forgotten.structured_content == {
+        "erasure": {
+            "identity_id": "identity_1",
+            "alias_ids": ["identity_4"],
+            "face_exemplars": 3,
+            "voice_exemplars": 2,
+            "face_observations": 7,
+            "speech_segments": 11,
+        }
+    }
+    assert memory.calls == [("forget_identity", "identity_1")]
+    # A second call reports the person as unknown, so this is destructive and not idempotent.
+    annotations = tools["forget_identity"].annotations
+    assert annotations is not None
+    assert annotations.destructive_hint is True
+    assert annotations.idempotent_hint is False
+
+
+async def test_reinforce_bounds_its_input_before_memory() -> None:
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        empty = await client.call_tool("reinforce_memories", {"memory_ids": []})
+        oversize = await client.call_tool(
+            "reinforce_memories",
+            {"memory_ids": [f"memory_{index}" for index in range(101)]},
+        )
+
+    assert _error_envelope(empty)["code"] == "validation_error"
+    assert _error_envelope(oversize)["code"] == "validation_error"
+    assert memory.calls == []
 
 
 async def test_mcp_maps_ordered_openai_parts_and_returns_safe_asset_metadata() -> None:
@@ -395,7 +636,7 @@ async def test_mcp_bounds_inline_media_before_memory(
     part: dict[str, object],
 ) -> None:
     memory = FakeMemory()
-    monkeypatch.setattr(mcp_adapter, "_MAX_INLINE_MEDIA_BYTES", 2)
+    monkeypatch.setattr(content, "MAX_INLINE_MEDIA_BYTES", 2)
 
     async with Client(build_mcp_server(cast(Memory, memory))) as client:
         result = await client.call_tool("add_memory", {"content": [part]})

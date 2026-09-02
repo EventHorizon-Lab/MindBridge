@@ -294,6 +294,16 @@ def test_result_table_includes_per_task_time_and_tokens() -> None:
                         "duration_seconds": {"total": 2.5, "average": 1.25},
                         "token_usage": {"total_tokens": 30, "average_tokens": 15.0},
                     },
+                    "controls": {
+                        "random_ranker": None,
+                        "recall_at_1": None,
+                        "recall_at_20": None,
+                        "blind": None,
+                        "is_blind_run": False,
+                        "missing": ["random_ranker", "blind", "recall_at_20"],
+                        "interpretable": False,
+                        "reason": "fixture reports a score without its controls",
+                    },
                 }
             ]
         }
@@ -600,7 +610,7 @@ def test_response_cache_namespace_changes_with_runner_recipe(
     assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v9"
     arguments = cast(
         eval_module._Arguments,
-        SimpleNamespace(device=None, seed=7, gen_kwargs="{}", recall_limit=8),
+        SimpleNamespace(device=None, seed=7, gen_kwargs="{}", recall_limit=8, blind=False),
     )
     before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
 
@@ -843,6 +853,7 @@ def test_eval_config_reuses_the_declarative_memory_schema(tmp_path: Path) -> Non
             device="cuda:1",
             recall_limit=20,
             model="mindbridge",
+            blind=False,
         ),
     )
     effective = eval_module._evaluation_memory_config(loaded, model, arguments)
@@ -1851,4 +1862,4 @@ def test_metric_breakdowns_cover_every_catalog_task(tmp_path: Path) -> None:
 
 
 def _breakdown_arguments() -> SimpleNamespace:
-    return SimpleNamespace(seed=1234, bootstrap_samples=8)
+    return SimpleNamespace(seed=1234, bootstrap_samples=8, recall_limit=20, blind=False)

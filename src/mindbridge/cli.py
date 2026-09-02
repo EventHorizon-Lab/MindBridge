@@ -100,6 +100,7 @@ OPERATIONS: tuple[str, ...] = (
     "register_speaker",
     "register_identity",
     "identity",
+    "forget_identity",
     "unlink_identity",
     "reinforce",
     "list",
@@ -610,6 +611,19 @@ def _identity_profile(memory: Memory, arguments: argparse.Namespace) -> _Documen
     }
 
 
+def _forget_identity(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    erasure = memory.forget_identity(arguments.identity_id)
+    # The audit record is the point: an operator running this needs to see what was destroyed.
+    return {
+        "identity_id": erasure.identity_id,
+        "alias_ids": list(erasure.alias_ids),
+        "face_exemplars": erasure.face_exemplars,
+        "voice_exemplars": erasure.voice_exemplars,
+        "face_observations": erasure.face_observations,
+        "speech_segments": erasure.speech_segments,
+    }
+
+
 def _unlink_identity(memory: Memory, arguments: argparse.Namespace) -> _Document:
     return {"restored_identity_id": memory.unlink_identity(arguments.alias_id)}
 
@@ -652,6 +666,7 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "register-speaker": _register_speaker,
     "register-identity": _register_identity,
     "identity": _identity_profile,
+    "forget-identity": _forget_identity,
     "unlink-identity": _unlink_identity,
     "reinforce": _reinforce,
     "list": _list,
@@ -1228,6 +1243,7 @@ def _memory_document(record: MemoryRecord | SearchHit) -> _Document:
         "occurred_end": _encode_optional_time(record.occurred_end),
         "metadata": dict(record.metadata),
         "context": _context_document(record.context),
+        "place_id": record.place_id,
     }
     if isinstance(record, SearchHit):
         document["score"] = record.score
@@ -1408,7 +1424,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--answerer", metavar="NAME", help="generation recipe, with --embedder")
     parser.add_argument("--transcriber", metavar="NAME", help="speech recipe, with --embedder")
-    parser.add_argument("--index-speech", action="store_true", help="index transcripts on add")
+    # Derived from the SDK default, never hardcoded: `_reject_embedder_only_options` compares this
+    # against `_MEMORY_DEFAULTS`, so a literal here silently rejects every --app/--url invocation
+    # the moment the SDK default moves. `BooleanOptionalAction` also supplies --no-index-speech.
+    parser.add_argument(
+        "--index-speech",
+        action=argparse.BooleanOptionalAction,
+        default=_MEMORY_DEFAULTS["index_speech"],
+        help="index transcripts on add (default: %(default)s)",
+    )
     parser.add_argument(
         "--minimum-relevance",
         type=float,
@@ -1491,6 +1515,11 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     identity.add_argument("--relationship", help="how this person relates to the owner")
     profile = commands.add_parser("identity", help="read one identity's name and relationship")
     profile.add_argument("identity_id", metavar="IDENTITY_ID")
+    forget = commands.add_parser(
+        "forget-identity",
+        help="erase a person: their face and voice templates, aliases, and indexed name",
+    )
+    forget.add_argument("identity_id", metavar="IDENTITY_ID")
     unlink = commands.add_parser("unlink-identity", help="reverse one face/voice merge")
     unlink.add_argument("alias_id", metavar="ALIAS_ID")
     reinforce = commands.add_parser("reinforce", help="record positive feedback")

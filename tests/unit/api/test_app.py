@@ -26,6 +26,7 @@ from mindbridge.types import (
     AssetRef,
     Blob,
     ContentInput,
+    MemoryCapabilities,
     MemoryRecord,
     MemoryType,
     Modality,
@@ -59,12 +60,30 @@ ASSET = AssetRef(
 )
 
 
+# Every modality, because `frozenset` iterates in hash order and enum members hash by identity:
+# with five values an unsorted serializer produces the documented order once in 120 runs.
+CAPABILITIES = MemoryCapabilities(
+    embedding=frozenset(Modality),
+    embedding_model="jina-v5-omni",
+    embedding_space="space_1",
+    embedding_dimension=1024,
+    generation=frozenset({Modality.TEXT}),
+    generation_model="qwen3-omni",
+    speaker_recognition=True,
+)
+
+
 class FakeMemory:
     def __init__(self, failure: Exception | None = None) -> None:
         self.calls: list[tuple[object, ...]] = []
         self.close_count = 0
         self.failure = failure
         self.deleted = True
+        self.declared = CAPABILITIES
+
+    @property
+    def capabilities(self) -> MemoryCapabilities:
+        return self.declared
 
     def add(
         self,
@@ -238,7 +257,7 @@ def test_resource_routes_map_the_public_memory_values() -> None:
         deleted = client.delete("/v1/memories/memory_1")
         openapi = client.get("/openapi.json").json()
 
-    assert health.json() == {"status": "ok"}
+    assert health.json()["status"] == "ok"
     assert created.status_code == 201
     assert created.json()["content"] == "The toolbox is blue."
     assert created.json()["memory_type"] == "episodic"
@@ -557,6 +576,68 @@ def test_status_follows_whether_the_same_call_can_ever_succeed(
     assert (response.headers.get("Retry-After") is not None) is (
         expected_retryable and expected_status == 503
     )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    [
+        # One oversized-input condition, one status, whichever side noticed it. This used to be
+        # 413 from the request middleware and 502 from the provider path.
+        (ModelError("asset exceeds the request budget", reason="payload_too_large"), 413),
+        # Not retryable, so it must not claim to be transient with 503.
+        (StorageError("failed to read memory", reason="io_failed"), 500),
+    ],
+)
+def test_one_reason_answers_with_one_status(failure: Exception, expected_status: int) -> None:
+    with TestClient(create_app(memory=FakeMemory(failure))) as client:
+        response = client.get("/v1/memories/memory_1")
+
+    assert response.status_code == expected_status
+    assert response.json()["retryable"] is False
+    assert response.headers.get("Retry-After") is None
+
+
+def test_health_reports_the_live_composition() -> None:
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory)) as client:
+        body = client.get("/healthz").json()
+
+    assert body["status"] == "ok"
+    assert body["capabilities"] == {
+        "embedding": ["audio", "image", "omni", "text", "video"],
+        "embedding_model": "jina-v5-omni",
+        "embedding_space": "space_1",
+        "embedding_dimension": 1024,
+        "generation": ["text"],
+        "transcription": [],
+        "vision": [],
+        "face": [],
+        "formation": [],
+        "generation_model": "qwen3-omni",
+        "transcription_space": None,
+        "vision_model": None,
+        "face_model": None,
+        "formation_model": None,
+        "speaker_recognition": True,
+        "streaming_generation": False,
+    }
+
+
+def test_health_reads_the_injected_memory_rather_than_a_captured_snapshot() -> None:
+    memory = FakeMemory()
+    memory.declared = MemoryCapabilities(
+        embedding=frozenset({Modality.TEXT}),
+        embedding_model="text-embedder",
+        embedding_space="space_2",
+        embedding_dimension=8,
+    )
+
+    with TestClient(create_app(memory=memory)) as client:
+        body = client.get("/healthz").json()
+
+    assert body["capabilities"]["embedding_space"] == "space_2"
+    assert body["capabilities"]["embedding"] == ["text"]
+    assert body["capabilities"]["speaker_recognition"] is False
 
 
 def test_error_envelope_reports_reason_stage_and_subject() -> None:

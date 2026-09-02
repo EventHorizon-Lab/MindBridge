@@ -59,7 +59,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - Per-record event-time and metadata sequences on `add_many`, retaining one embedding batch and one
   SQLite transaction.
 - Crash-recoverable index replay and rebuild from SQLite without re-embedding stored content.
-- An optional resource-oriented REST API under `/v1` and six typed MCP tools over a caller-supplied
+- An optional resource-oriented REST API under `/v1` and fourteen typed MCP tools over a
+  caller-supplied
   `Memory`; the documented MCP invocation uses stdio.
 - One ordered multimodal contract across Python, REST, and MCP; response assets expose stable
   metadata without leaking local paths over wire protocols.
@@ -163,6 +164,56 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   one that was never configured.
 
 ### Changed
+
+- **Breaking:** `minimum_relevance` now gates evidence relevance — the cosine the dense route
+  reports, or the demoted full-text contribution when only the lexical route matched, times the
+  observation's own confidence — and its default moves from `0.55` to `0.10`. It previously gated
+  a rescaled `(1 + cosine) / 2`
+  confidence, so `0.55` admitted cosine 0.10 and rejected 0.05, and any full-text match was handed
+  a flat gate value of `0.6` regardless of its dense similarity or rank. A document at cosine -1.0
+  to the query was therefore returned at the default floor and reported as `score 0.825`, and any
+  floor above `0.6` silently deleted the entire lexical recall route — which is why the knob was
+  never tunable. `0.10` reproduces the previous effective floor exactly, so retrieval behaviour is
+  preserved rather than quietly tightened.
+
+  The gate takes the signals the query asked about — retrieval relevance and temporal proximity —
+  and leaves out reinforcement and `decay_half_life_days` retention, which the query never
+  mentioned. Those still shape `SearchHit.score`, so **an admitted hit can report a score below
+  the floor**. Both factors are bounded below by `0.3`, so with retention inside the gate a
+  perfectly relevant memory decayed to `0.30`, and to `0.09` once a dated question's window also
+  missed it, under the `0.10` default: "prefer recent" silently became "hide old" for the
+  deployment that enabled decay and then asked about last year. `search_with_trace` reports the
+  gated quantity as `gate_relevance` beside the factors that moved the score off it.
+
+- **Breaking:** `RetrievalCandidateTrace.gate_confidence` is renamed `gate_relevance`. The field
+  carries the value the gate compared against `minimum_relevance` — a `final_score` for a ranked
+  candidate, a relevance-space estimate for one rejected before ranking — and no longer carries a
+  confidence.
+
+- `index_speech` now defaults to `True`. A configured `SpeechBackend` has already produced its
+  analysis by the time `add` reaches the index, so reusing that text costs no extra model call and
+  no extra token; with the flag off, a video memory's lexical index document could be as short as
+  29 characters. The flag remains a no-op unless a `SpeechBackend` is configured, and
+  `--no-index-speech` is the CLI opt-out.
+
+- `add` and `add_many` now run a configured `vision_describer` for any visual asset that has no
+  description yet, and union its text into the stored and indexed document for every embedder. The
+  describer previously ran only from `AsyncVisionStream`, and only when the embedder lacked native
+  image support, so an image-only write stored an empty lexical document — including, and
+  especially, under the recommended omni composition. A composition with no describer configured
+  produces a byte-identical write.
+
+- `speaker_similarity` keeps its `0.78` default, now documented rather than unexplained, with a
+  calibration plan. Upstream's own `yesOrno_thr = 0.31` for the pinned CAM++ recipe was evaluated
+  and rejected: it is calibrated for a single pair, while `_accepted_identity` accepts on a `max`
+  over up to 20 exemplars, where mutually orthogonal random 192-d impostors already reach 0.28. The
+  threshold is knowingly wrong in the safe direction, because splitting one speaker costs recall
+  while merging two people discloses one person's memories to another.
+
+- `ambiguity_margin` is now compared on the score scale in both branches of the ambiguity check,
+  which previously used score differences with a time window and gate-confidence differences
+  without one. Differences on the single scale are roughly twice as large, so the same margin
+  triggers less often. The default is unchanged and unretuned.
 
 - The benchmark harness request timeout now defaults to 300 seconds instead of 3 600. An hour
   bounds nothing a run cares about: a request the server never answers held its task for the full
@@ -275,6 +326,34 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   never linked.
 
 ### Fixed
+
+- Abstention is now detected structurally instead of by exact equality against one English
+  sentence, so a refusal is still reported when the model re-punctuates it, wraps it in emphasis,
+  appends an explanation, or answers in another language. The grounded prompt requests an opaque
+  marker built from `AbstentionReason.INSUFFICIENT_EVIDENCE`, so the prompt and the detector cannot
+  drift apart. The marker is an instrument, not a sentence: a refusal still reports
+  `UNKNOWN_ANSWER` as `AnswerResult.answer`, so a caller that shows or speaks the answer is
+  unaffected, and only the bracketed form counts as a refusal anywhere in an answer — evidence
+  that merely quotes the word `insufficient_evidence` is not one. Streaming yields raw deltas, so
+  a consumer that streams should render on `abstained`. Note that `benchmarks/prompts.py` supplies
+  its own abstention sentinel for memlens, so abstention counts from a memlens run remain
+  unusable.
+
+- The formation prompt now states the range of every bounded field — `confidence` 0 to 1,
+  `valence` -1 to 1, `arousal` 0 to 1 — and a test asserts it does. One out-of-range value fails
+  the whole `add`, and the same omission previously led models to emit a 1-5 scale.
+
+- `--index-speech` derives its default from the SDK instead of hardcoding it, and gains
+  `--no-index-speech`. With a literal default, `_reject_embedder_only_options` compared an
+  always-`False` argument against the SDK default and rejected every `--app` and `--url`
+  invocation with `option_not_applicable` as soon as that default changed.
+
+- `docs/design-principles.md` and `docs/plugin-architecture.md` are restored after being deleted,
+  corrected against the code: the extension surface is seven protocols plus one optional rather
+  than five, MCP's tools covered the common path but no embodied or identity operation, and a
+  dead `architecture.md` anchor is repointed. Caller-asserted validity via
+  `ObservationContext(valid_from=..., valid_until=...)` is documented for the first time, including
+  that `valid_from` is mandatory.
 
 - Remote product CLI requests now default to a finite 30-second timeout, configurable with the
   positive `--timeout SECONDS` option. Timeouts use the existing retryable `storage_error` envelope

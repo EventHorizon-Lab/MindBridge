@@ -310,7 +310,7 @@ def test_results_mark_proxy_judge_metrics_nonofficial(tmp_path: Path) -> None:
     )
     arguments = cast(
         eval_module._Arguments,
-        SimpleNamespace(seed=7, bootstrap_samples=20),
+        SimpleNamespace(seed=7, bootstrap_samples=20, recall_limit=20, blind=False),
     )
 
     result = _metrics(task, (sample,), arguments)

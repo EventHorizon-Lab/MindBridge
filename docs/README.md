@@ -24,6 +24,13 @@ owns the fact you need.
 - [Security](../SECURITY.md) — trust boundaries, data exposure, and deployment hardening.
 - [Troubleshooting](troubleshooting.md) — diagnose common startup, retrieval, and model failures.
 
+## Understand the direction
+
+- [Product goals and design principles](design-principles.md) — the product target, the design
+  goals, and the criteria a change must answer. States direction, not implemented status.
+- [Plugin architecture](plugin-architecture.md) — the kernel/plugin boundary and the admission rule
+  a new public capability must satisfy.
+
 ## Go deeper
 
 - [Memory types, time, and decay](memory-types-time-and-decay.md) — role and ranking semantics.

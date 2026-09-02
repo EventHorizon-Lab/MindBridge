@@ -458,6 +458,7 @@ def _locomo(
 
     units = []
     for conversation in _selected(load_locomo_refined(dataset), limit, offset):
+        stored = {turn.dialog_id for turn in conversation.turns}
         memories = tuple(
             MemoryItem(
                 turn.dialog_id,
@@ -478,7 +479,22 @@ def _locomo(
                 question.question_id,
                 (_free_text_prompt(question.question),),
                 question.reference_answers,
-                metadata={"category": question.category},
+                metadata={
+                    "category": question.category,
+                    # The release's `evidence` names the dialogue turns that carry the
+                    # answer as `dia_id` values, and `dia_id` is this unit's memory
+                    # source ID, so gold evidence is exact here rather than derived.
+                    # Published IDs are matched against the stored turns rather than
+                    # trusted: an ID that names no turn is reported separately, so a
+                    # vocabulary mismatch surfaces as a join failure instead of a
+                    # believable recall number.
+                    "evidence_ids": tuple(
+                        value for value in question.evidence_dialog_ids if value in stored
+                    ),
+                    "unresolved_evidence_ids": tuple(
+                        value for value in question.evidence_dialog_ids if value not in stored
+                    ),
+                },
                 source_question=question.question,
             )
             for question in conversation.questions
@@ -1148,21 +1164,30 @@ def _longmemeval(
 
     units = []
     for question in _selected(load_longmemeval(dataset), limit, offset):
-        memories = tuple(
-            item
-            for session in question.sessions
-            for turn in session.turns
-            if turn.content.strip()
-            for item in _text_memories(
-                turn.turn_id,
-                f"[{session.occurred_at.isoformat()}] {turn.role}: {turn.content}",
-                occurred_at=session.occurred_at,
-            )
-        )
+        # The release marks the answer-bearing turn itself (`has_answer`), which is
+        # finer than the `answer_session_ids` it also publishes, so gold evidence is
+        # exact here. It is collected while the memories are built because one turn
+        # over the part limit is stored as several `_B####` blocks and every block of
+        # a marked turn is gold; reconstructing that split afterwards would guess at
+        # a convention this loop already knows.
+        memories: list[MemoryItem] = []
+        answer_ids: list[str] = []
+        for session in question.sessions:
+            for turn in session.turns:
+                if not turn.content.strip():
+                    continue
+                items = _text_memories(
+                    turn.turn_id,
+                    f"[{session.occurred_at.isoformat()}] {turn.role}: {turn.content}",
+                    occurred_at=session.occurred_at,
+                )
+                memories.extend(items)
+                if turn.has_answer:
+                    answer_ids.extend(item.source_id for item in items)
         units.append(
             EvalUnit(
                 question.question_id,
-                memories,
+                tuple(memories),
                 (
                     EvalQuestion(
                         question.question_id,
@@ -1171,6 +1196,7 @@ def _longmemeval(
                         metadata={
                             "question_type": question.question_type,
                             "abstention": question.abstention,
+                            "evidence_ids": tuple(answer_ids),
                             "answer_session_ids": tuple(
                                 session.session_id
                                 for session in question.sessions

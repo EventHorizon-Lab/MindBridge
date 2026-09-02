@@ -1,46 +1,31 @@
-"""Minimal MCP tools backed by one local memory boundary."""
+"""The typed MCP tool surface over one local memory boundary."""
 
 from __future__ import annotations
 
-import base64
-import binascii
+import inspect
 import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from functools import wraps
-from typing import Annotated, Any, Literal, ParamSpec, TypeAlias, TypeVar, cast
+from typing import Annotated, Any, ParamSpec, TypeVar, cast
 from uuid import uuid4
 
 from mcp.server import MCPServer
 from mcp.server.context import CallNext, HandlerResult, ServerMiddleware, ServerRequestContext
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
-from pydantic import (
-    AwareDatetime,
-    BaseModel,
-    ConfigDict,
-    Field,
-    JsonValue,
-    StringConstraints,
-    model_validator,
-)
+from pydantic import AwareDatetime, BaseModel, Field, JsonValue, StringConstraints
 
 from mindbridge import Memory
-from mindbridge.exceptions import (
-    IdentityNotFoundError,
-    IndexUnavailableError,
-    MemoryNotFoundError,
-    MindBridgeError,
-    ModelError,
-    SpeakerNotFoundError,
-    StorageError,
-    ValidationError,
-)
+from mindbridge.api.content import Content, content_input
+from mindbridge.api.errors import error_message
+from mindbridge.exceptions import MindBridgeError, ValidationError
 from mindbridge.types import (
     AbstentionReason,
     AssetRef,
-    Blob,
-    ContentInput,
+    FaceObservation,
+    IdentityErasure,
+    IdentityProfile,
     MemoryContext,
     MemoryRecord,
     MemoryType,
@@ -48,38 +33,15 @@ from mindbridge.types import (
     ObservationContext,
     RetrievalScope,
     SearchHit,
+    SpeakerSegment,
 )
 
 _LOGGER = logging.getLogger(__name__)
-_MAX_INLINE_MEDIA_BYTES = 8 * 1024 * 1024
-_Text = Annotated[
-    str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=65_536),
-]
 _Identifier = Annotated[str, StringConstraints(min_length=1, pattern=r"^\S(?:.*\S)?$")]
 _Limit = Annotated[int, Field(strict=True, ge=1, le=100)]
 _Cursor = Annotated[str, StringConstraints(min_length=1)]
-_PartId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
-_MediaType = Annotated[
-    str,
-    StringConstraints(
-        strip_whitespace=True,
-        to_lower=True,
-        pattern=r"^[a-z0-9!#$&^_.+-]+/(?:\*|[a-z0-9!#$&^_.+-]+)$",
-    ),
-]
-_Filename = Annotated[
-    str,
-    StringConstraints(
-        strip_whitespace=True,
-        min_length=1,
-        max_length=255,
-        pattern=r"^[^/\\\x00-\x1f\x7f]+$",
-    ),
-]
-_Source = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8_192)]
 _READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
-_RETRIEVAL = ToolAnnotations(
+_NON_IDEMPOTENT_WRITE = ToolAnnotations(
     read_only_hint=False,
     destructive_hint=False,
     idempotent_hint=False,
@@ -95,6 +57,14 @@ _DELETE = ToolAnnotations(
     read_only_hint=False,
     destructive_hint=True,
     idempotent_hint=True,
+    open_world_hint=False,
+)
+# Erasure is destructive and, unlike a delete, cannot be repeated: the second call reports the
+# person as unknown, so a retry after a dropped response is not the same call.
+_ERASE = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=True,
+    idempotent_hint=False,
     open_world_hint=False,
 )
 _TOOL_ARGUMENTS = {
@@ -116,6 +86,14 @@ _TOOL_ARGUMENTS = {
     "get_memory": frozenset({"memory_id"}),
     "list_memories": frozenset({"limit", "cursor"}),
     "delete_memory": frozenset({"memory_id"}),
+    "analyze_speech": frozenset({"memory_id"}),
+    "analyze_faces": frozenset({"memory_id"}),
+    "register_speaker": frozenset({"speaker_id", "name", "relationship"}),
+    "register_identity": frozenset({"identity_id", "name", "relationship"}),
+    "get_identity": frozenset({"identity_id"}),
+    "unlink_identity": frozenset({"alias_id"}),
+    "forget_identity": frozenset({"identity_id"}),
+    "reinforce_memories": frozenset({"memory_ids"}),
 }
 # The error envelope MCP shares with REST.
 _ERROR_FIELDS = frozenset(
@@ -138,72 +116,6 @@ _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
 
-class _InputModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
-class _InputText(_InputModel):
-    type: Literal["input_text"]
-    text: _Text
-
-
-class _InputImage(_InputModel):
-    type: Literal["input_image"]
-    image_url: _Source | None = None
-    file_id: _PartId | None = None
-
-    @model_validator(mode="after")
-    def require_one_source(self) -> _InputImage:
-        _one_source(image_url=self.image_url, file_id=self.file_id)
-        if self.image_url is not None:
-            _validate_data_url(self.image_url)
-            if self.image_url.startswith("data:"):
-                media_type, _data = _decode_data_url(self.image_url)
-                if not media_type.startswith("image/"):
-                    raise ValueError("input_image data must have an image media type")
-        return self
-
-
-class _InputFile(_InputModel):
-    type: Literal["input_file"]
-    file_url: _Source | None = None
-    file_data: str | None = None
-    file_id: _PartId | None = None
-    media_type: _MediaType | None = None
-    filename: _Filename | None = None
-
-    @model_validator(mode="after")
-    def require_one_source(self) -> _InputFile:
-        _one_source(file_url=self.file_url, file_data=self.file_data, file_id=self.file_id)
-        if self.media_type is not None and self.media_type.split("/", 1)[0] not in {
-            "image",
-            "video",
-            "audio",
-        }:
-            raise ValueError("media_type must be image, video, or audio")
-        if self.file_url is not None:
-            _validate_data_url(self.file_url)
-            if self.file_url.startswith("data:") and self.media_type is not None:
-                embedded_type, _data = _decode_data_url(self.file_url)
-                if not _media_type_matches(self.media_type, embedded_type):
-                    raise ValueError("media_type contradicts the data URL")
-        if self.file_data is not None:
-            if self.media_type is None:
-                raise ValueError("media_type is required with file_data")
-            if self.media_type.endswith("/*"):
-                raise ValueError("file_data requires a concrete media_type")
-            _decode_base64(self.file_data)
-        return self
-
-
-_InputPart: TypeAlias = Annotated[
-    _InputText | _InputImage | _InputFile,
-    Field(discriminator="type"),
-]
-_Parts = Annotated[tuple[_InputPart, ...], Field(min_length=1, max_length=16)]
-_Content: TypeAlias = _Text | _Parts
-
-
 class AssetResult(BaseModel):
     id: str
     modality: Modality
@@ -224,6 +136,7 @@ class MemoryResult(BaseModel):
     occurred_end: AwareDatetime | None
     metadata: dict[str, JsonValue]
     context: MemoryContext | None = None
+    place_id: str | None = None
 
 
 class SearchHitResult(MemoryResult):
@@ -250,8 +163,46 @@ class DeleteResult(BaseModel):
     deleted: bool
 
 
+# The embodied and identity results carry the public dataclasses directly. Pydantic derives their
+# schema from the same definition the SDK returns, so a field cannot drift between the two.
+# `forget_identity` wraps rather than returning `IdentityErasure` directly because the MCP SDK
+# cannot build a schema for a slotted dataclass as a top-level return type: it reads the slot
+# descriptors as defaults, rejects them, and silently publishes no output schema at all.
+class SpeechResult(BaseModel):
+    segments: tuple[SpeakerSegment, ...]
+
+
+class FacesResult(BaseModel):
+    observations: tuple[FaceObservation, ...]
+
+
+class IdentityResult(BaseModel):
+    identity: IdentityProfile | None
+
+
+class RegisterResult(BaseModel):
+    registered: bool
+
+
+class UnlinkResult(BaseModel):
+    restored_identity_id: str | None
+
+
+class ForgetResult(BaseModel):
+    erasure: IdentityErasure
+
+
+class ReinforceResult(BaseModel):
+    reinforced: int
+
+
 def build_mcp_server(memory: Memory) -> MCPServer[None]:
-    """Expose six typed agent tools without taking ownership of ``memory``."""
+    """Expose the agent tool surface without taking ownership of ``memory``.
+
+    Every tool is one call on the injected ``Memory``: the embodied and identity tools are
+    reachable here for the same reason the common-path tools are, because this server runs in the
+    process that holds it.
+    """
     server: MCPServer[None] = MCPServer(
         "mindbridge",
         title="MindBridge Memory",
@@ -263,7 +214,7 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
     @server.tool(annotations=_IDEMPOTENT_WRITE)
     @_stable_errors
     def add_memory(
-        content: _Content,
+        content: Content,
         occurred_at: AwareDatetime | None = None,
         occurred_end: AwareDatetime | None = None,
         metadata: dict[str, JsonValue] | None = None,
@@ -272,7 +223,7 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
     ) -> MemoryResult:
         """Store one memory and return its stable record."""
         record = memory.add(
-            _content_input(content),
+            content_input(content),
             occurred_at=occurred_at,
             occurred_end=occurred_end,
             metadata=metadata,
@@ -281,10 +232,10 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
         )
         return _memory_result(record)
 
-    @server.tool(annotations=_RETRIEVAL)
+    @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
     @_stable_errors
     def search_memories(
-        query: _Content,
+        query: Content,
         limit: _Limit = 10,
         memory_type: MemoryType | None = None,
         reference_at: AwareDatetime | None = None,
@@ -294,7 +245,7 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
     ) -> SearchResult:
         """Find the most relevant local memories."""
         hits = memory.search(
-            _content_input(query),
+            content_input(query),
             limit=limit,
             memory_type=memory_type,
             reference_at=reference_at,
@@ -304,10 +255,10 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
         )
         return SearchResult(hits=tuple(_search_hit_result(hit) for hit in hits))
 
-    @server.tool(annotations=_RETRIEVAL)
+    @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
     @_stable_errors
     def ask_memory(
-        question: _Content,
+        question: Content,
         limit: _Limit = 5,
         memory_type: MemoryType | None = None,
         reference_at: AwareDatetime | None = None,
@@ -315,7 +266,7 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
     ) -> AnswerResponse:
         """Answer only from retrieved local memories."""
         result = memory.ask(
-            _content_input(question),
+            content_input(question),
             limit=limit,
             memory_type=memory_type,
             reference_at=reference_at,
@@ -350,7 +301,150 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
         """Idempotently delete one memory."""
         return DeleteResult(deleted=memory.delete(memory_id))
 
+    _register_embodied_tools(server, memory)
     return server
+
+
+def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
+    """Register the embodied and identity tools on an existing server.
+
+    Split from `build_mcp_server` only to keep each registration function readable; the two sets
+    dispatch to the same injected memory.
+    """
+
+    @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
+    @_stable_errors
+    def analyze_speech(memory_id: _Identifier) -> SpeechResult:
+        """Transcribe one stored memory's audio and video, and resolve who spoke.
+
+        Call this to learn what was said in a memory whose content is speech, or which person
+        said it. Segments are returned per asset in time order and cover only this one memory's
+        audio and video assets; there is no page cursor because the bound is the stored media. A
+        memory with no audio or video returns no segments rather than failing.
+
+        Side effects: caches the transcript and records the voice as identity evidence, so an
+        identical retry is safe but may resolve a speaker an earlier call left unnamed.
+        `speaker_id` is stable and accepted by `register_speaker` and `get_identity`. Fails with
+        `model_error` when the configured transcription backend cannot recognize speakers.
+        """
+        return SpeechResult(segments=memory.speech(memory_id))
+
+    @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
+    @_stable_errors
+    def analyze_faces(memory_id: _Identifier) -> FacesResult:
+        """Detect the faces in one stored memory's images and video, and resolve who was seen.
+
+        Call this to learn which people appear in a visual memory. Observations cover only this
+        one memory's image and video assets, each with a frame-normalized bounding box and, for
+        video, the offset it was observed at; there is no page cursor because the bound is the
+        stored media. A memory with no image or video returns no observations rather than failing.
+
+        Side effects: records the face as identity evidence and may bind it to a voice already
+        seen with it, so an identical retry is safe but may resolve an identity an earlier call
+        left unnamed; `unlink_identity` reverses a binding. `identity_id` is stable and accepted
+        by `register_identity` and `get_identity`. Fails with `model_error` when no face backend
+        is configured or when it does not support the stored modality.
+        """
+        return FacesResult(observations=memory.faces(memory_id))
+
+    @server.tool(annotations=_IDEMPOTENT_WRITE)
+    @_stable_errors
+    def register_speaker(
+        speaker_id: _Identifier,
+        name: _Identifier,
+        relationship: _Identifier | None = None,
+    ) -> RegisterResult:
+        """Name the person behind one `speaker_id` from `analyze_speech`.
+
+        Call this once a conversation establishes who a recognized voice belongs to. Repeating it
+        replaces the name, so retrying is safe; omitting `relationship` leaves any recorded
+        relationship intact rather than clearing it. Naming a speaker also rewrites the stored
+        memories that quote them, so later searches can find the person by name. Fails with
+        `speaker_not_found` when the ID is not a recognized speaker.
+        """
+        memory.register_speaker(speaker_id, name, relationship=relationship)
+        return RegisterResult(registered=True)
+
+    @server.tool(annotations=_IDEMPOTENT_WRITE)
+    @_stable_errors
+    def register_identity(
+        identity_id: _Identifier,
+        name: _Identifier,
+        relationship: _Identifier | None = None,
+    ) -> RegisterResult:
+        """Name the person behind one `identity_id` from `analyze_faces` or `analyze_speech`.
+
+        Call this for an identity that may have been seen as well as heard; use
+        `register_speaker` only for a voice-only speaker ID. Repeating it replaces the name, so
+        retrying is safe; omitting `relationship` leaves any recorded relationship intact rather
+        than clearing it. Fails with `identity_not_found` when the ID is not a recognized
+        identity.
+        """
+        memory.register_identity(identity_id, name, relationship=relationship)
+        return RegisterResult(registered=True)
+
+    @server.tool(annotations=_READ_ONLY)
+    @_stable_errors
+    def get_identity(identity_id: _Identifier) -> IdentityResult:
+        """Read the name and relationship recorded for one identity or speaker ID.
+
+        Call this to turn an `identity_id` or `speaker_id` from a face or speech result into who
+        the person is. Merge aliases are followed, so an ID that was bound into another identity
+        resolves to that person. Returns `identity: null` when the ID exists but nothing has been
+        registered for it; reads nothing else and changes nothing.
+        """
+        return IdentityResult(identity=memory.identity(identity_id))
+
+    @server.tool(annotations=_DELETE)
+    @_stable_errors
+    def unlink_identity(alias_id: _Identifier) -> UnlinkResult:
+        """Reverse one face-and-voice merge, restoring `alias_id` as its own identity.
+
+        Call this when a person says the system has confused them with someone else. Returns the
+        restored identity ID, or `restored_identity_id: null` when the merge cannot be reversed
+        because no record names which modality was contributed, and repeating the call is safe
+        because a reversed merge stays reversed.
+
+        Side effects: the restored identity keeps no name or relationship and the pair's
+        accumulated evidence is reset. This does not suppress the pair: if the same voice and face
+        keep appearing together they will be corroborated and merged again.
+        """
+        return UnlinkResult(restored_identity_id=memory.unlink_identity(alias_id))
+
+    @server.tool(annotations=_ERASE)
+    @_stable_errors
+    def forget_identity(identity_id: _Identifier) -> ForgetResult:
+        """Erase one person: their biometric template, their aliases, and their indexed name.
+
+        Call this when a person asks to be forgotten, and `delete_memory` to forget an event
+        instead. Memories, their content and their media survive: a transcript keeps its words
+        with the speaker attribution dropped, because forgetting a person is not forgetting the
+        evening. The result counts what was destroyed, as the audit record for the request.
+
+        Side effects: this destroys the face and voice templates and cannot be undone, so a later
+        encounter mints a fresh unnamed identity for the same person rather than recognizing them
+        as forgotten. Retrying is not safe in the sense that matters here: the second call fails
+        with `identity_not_found` because the person is already gone, which is not evidence that
+        the first call failed.
+        """
+        return ForgetResult(erasure=memory.forget_identity(identity_id))
+
+    @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
+    @_stable_errors
+    def reinforce_memories(
+        memory_ids: Annotated[tuple[_Identifier, ...], Field(min_length=1, max_length=100)],
+    ) -> ReinforceResult:
+        """Record that these memories were actually useful, so retrieval favors them later.
+
+        Call this after using retrieved memories to answer or act, with the IDs that were used.
+        Duplicate IDs count once and unknown IDs are skipped; `reinforced` reports how many
+        existing memories were updated, so a count below the number of IDs sent means the rest do
+        not exist.
+
+        Side effects: this is cumulative positive feedback, not a flag, so retrying the same call
+        reinforces the same memories again. Send at most 100 IDs per call.
+        """
+        return ReinforceResult(reinforced=memory.reinforce(memory_ids))
 
 
 def _stable_errors(
@@ -363,6 +457,10 @@ def _stable_errors(
         except Exception as error:
             raise ToolError(_error_json(error)) from None
 
+    # The MCP SDK publishes `__doc__` verbatim, and CPython 3.13 strips a docstring's common
+    # indentation at compile time while earlier versions keep it. Without this, the published
+    # tool description -- which is public contract -- would differ by interpreter.
+    guarded.__doc__ = None if operation.__doc__ is None else inspect.cleandoc(operation.__doc__)
     return guarded
 
 
@@ -454,99 +552,6 @@ def _asset_result(asset: AssetRef) -> AssetResult:
     )
 
 
-def _content_input(content: _Content) -> ContentInput:
-    if isinstance(content, str):
-        return content
-    atoms: list[str | Blob | AssetRef] = []
-    for part in content:
-        if isinstance(part, _InputText):
-            atoms.append(part.text)
-        elif isinstance(part, _InputImage):
-            if part.file_id is not None:
-                atoms.append(AssetRef(id=part.file_id, modality=Modality.IMAGE))
-            else:
-                atoms.append(_data_blob(cast(str, part.image_url), media_type="image/*", name=None))
-        elif part.file_id is not None:
-            atoms.append(_file_reference(part.file_id, part.media_type))
-        elif part.file_data is not None:
-            atoms.append(
-                Blob(
-                    data=_decode_base64(part.file_data),
-                    media_type=cast(str, part.media_type),
-                    name=part.filename,
-                )
-            )
-        else:
-            atoms.append(
-                _data_blob(
-                    cast(str, part.file_url),
-                    media_type=part.media_type,
-                    name=part.filename,
-                )
-            )
-    return tuple(atoms)
-
-
-def _file_reference(file_id: str, media_type: str | None) -> AssetRef:
-    if media_type is None:
-        return AssetRef(id=file_id)
-    if media_type.endswith("/*"):
-        return AssetRef(id=file_id, modality=Modality(media_type.split("/", 1)[0]))
-    return AssetRef(id=file_id, media_type=media_type)
-
-
-def _data_blob(
-    value: str,
-    *,
-    media_type: str | None = None,
-    name: str | None,
-) -> Blob:
-    embedded_type, data = _decode_data_url(value)
-    if media_type is not None and not _media_type_matches(media_type, embedded_type):
-        raise ValueError("media_type contradicts the data URL")
-    return Blob(data=data, media_type=embedded_type, name=name)
-
-
-def _one_source(**sources: object) -> None:
-    if sum(source is not None for source in sources.values()) != 1:
-        raise ValueError(f"exactly one of {', '.join(sources)} is required")
-
-
-def _media_type_matches(expected: str, actual: str) -> bool:
-    return expected == actual or (
-        expected.endswith("/*") and expected.split("/", 1)[0] == actual.split("/", 1)[0]
-    )
-
-
-def _validate_data_url(value: str) -> None:
-    if not value.startswith("data:"):
-        raise ValueError("remote URLs are not accepted; fetch media before calling MindBridge")
-    _decode_data_url(value)
-
-
-def _decode_data_url(value: str) -> tuple[str, bytes]:
-    header, separator, payload = value.partition(",")
-    if not separator or not header.endswith(";base64"):
-        raise ValueError("data URL must contain base64 media bytes")
-    media_type = header.removeprefix("data:").removesuffix(";base64").lower()
-    if not media_type or "/" not in media_type:
-        raise ValueError("data URL must declare a media type")
-    return media_type, _decode_base64(payload)
-
-
-def _decode_base64(value: str) -> bytes:
-    maximum_encoded = 4 * ((_MAX_INLINE_MEDIA_BYTES + 2) // 3)
-    if len(value) > maximum_encoded:
-        raise ValueError(f"inline media must not exceed {_MAX_INLINE_MEDIA_BYTES} bytes")
-    try:
-        data = base64.b64decode(value, validate=True)
-    except (binascii.Error, ValueError) as error:
-        raise ValueError("file_data must be valid base64") from error
-    if len(data) > _MAX_INLINE_MEDIA_BYTES:
-        raise ValueError(f"inline media must not exceed {_MAX_INLINE_MEDIA_BYTES} bytes")
-    return data
-
-
 def _error_json(error: Exception) -> str:
     return json.dumps(_tool_error(error), separators=(",", ":"))
 
@@ -555,7 +560,7 @@ def _tool_error(error: Exception) -> dict[str, object]:
     if isinstance(error, MindBridgeError):
         return _envelope(
             error.code,
-            _error_message(error),
+            error_message(error),
             reason=error.reason,
             retryable=error.retryable,
             stage=error.stage,
@@ -569,26 +574,6 @@ def _tool_error(error: Exception) -> dict[str, object]:
         "the memory operation failed unexpectedly",
         reason="unexpected",
     )
-
-
-def _error_message(error: MindBridgeError) -> str:
-    if isinstance(error, ValidationError):
-        return str(error) or "input is invalid"
-    if isinstance(error, MemoryNotFoundError):
-        return str(error) or "memory does not exist"
-    if isinstance(error, SpeakerNotFoundError):
-        return str(error) or "speaker does not exist"
-    if isinstance(error, IdentityNotFoundError):
-        return str(error) or "identity does not exist"
-    if isinstance(error, ModelError):
-        return str(error) or "model operation failed"
-    if isinstance(error, IndexUnavailableError):
-        return str(error) or "memory index is unavailable"
-    if isinstance(error, StorageError):
-        return str(error) or "memory storage is unavailable"
-    # An unmapped public error is a MindBridge bug, not caller-actionable detail; REST says the
-    # same thing with HTTP 500.
-    return "memory operation failed"
 
 
 def _envelope(
