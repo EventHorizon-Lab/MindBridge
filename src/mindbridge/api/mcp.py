@@ -105,7 +105,7 @@ _TOOL_ARGUMENTS = {
     "forget_identity": frozenset({"identity_id"}),
     "reinforce_memories": frozenset({"memory_ids"}),
 }
-# Prose the six tool schemas share. MCP publishes these verbatim, so an agent reads them before it
+# Prose the tool schemas share. MCP publishes these verbatim, so an agent reads them before it
 # guesses at frames, units, or media sources.
 _CONTENT_DESCRIPTION = (
     "The memory content: a non-blank string, or 1 through 16 ordered parts (`input_text`,"

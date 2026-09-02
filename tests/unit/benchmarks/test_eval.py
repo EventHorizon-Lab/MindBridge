@@ -875,6 +875,19 @@ def test_configured_devices_are_locked_in_physical_order(
     assert eval_module._evaluation_devices(None, config) == ("cuda:1", "cuda:0")
 
 
+def test_text_only_runs_do_not_lock_the_speech_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = MindBridgeConfig.model_validate(
+        {
+            "embedding": {"provider": "openai", "model": "embed", "dimension": 4},
+            "speech": {"provider": "funasr", "device": "cuda:1"},
+        }
+    )
+    monkeypatch.setattr(eval_module, "_physical_cuda_identity", lambda device: device)
+
+    assert eval_module._evaluation_devices(None, config, needs_speech=True) == ("cuda:1",)
+    assert eval_module._evaluation_devices(None, config, needs_speech=False) == ()
+
+
 def test_model_base_url_override_replaces_environment_operation_urls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

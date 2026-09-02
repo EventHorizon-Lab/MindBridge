@@ -1124,7 +1124,7 @@ def _execute(
         memory_factory: MemoryFactory
         arm_specs = tuple(_Arm(name) for name in arguments.arms)
         all_cached = response_cache is not None and _all_cached(response_cache, loaded, arm_specs)
-        devices = _evaluation_devices(arguments.device, memory_config)
+        devices = _evaluation_devices(arguments.device, memory_config, needs_speech=needs_speech)
         with ExitStack() as device_locks:
             for device in devices:
                 device_locks.enter_context(
@@ -4314,13 +4314,18 @@ def _evaluation_memory_config(
 def _evaluation_devices(
     explicit: str | None,
     config: MindBridgeConfig | None,
+    *,
+    needs_speech: bool = True,
 ) -> tuple[str | None, ...]:
     if config is None:
         return (explicit,)
     configured = []
     if config.embedding.provider in {"jina-omni", "sentence-transformers"}:
         configured.append(explicit or config.embedding.device or "auto")
-    if config.speech is not None and config.speech.provider == "funasr":
+    # The speech backend is only constructed when a unit carries audio or video, so a text-only
+    # run must not hold the GPU lock for a model it never loads: that lock serialized every
+    # text task behind one video run on a shared card.
+    if needs_speech and config.speech is not None and config.speech.provider == "funasr":
         configured.append(explicit or config.speech.device)
     devices: dict[str, str | None] = {}
     for device in sorted(set(configured)):
