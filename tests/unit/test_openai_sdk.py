@@ -1031,6 +1031,43 @@ def test_answer_serializes_temporal_and_metadata_evidence() -> None:
     assert answer.answer == "It arrived on August 26."
 
 
+def test_answer_instructs_the_reader_to_resolve_relative_time() -> None:
+    systems: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        systems.append(json.loads(request.content)["messages"][0]["content"])
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "Two weeks ago, on 20 August 2026."},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    hit = SearchHit(
+        id="memory_1",
+        content="grandpa visited",
+        score=0.9,
+        created_at=NOW,
+        occurred_at=datetime(2026, 8, 20, 9, tzinfo=timezone.utc),
+    )
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        _model(_sdk_client(client)).answer("How long ago did grandpa visit?", (hit,))
+
+    assert systems == [openai_backend._GROUNDED_SYSTEM_PROMPT]
+    assert systems[0].endswith(
+        "Each memory carries the time it happened (`occurred_at`, or `created_at` when the event "
+        "time is unknown) and the question carries the reference time it is asked at; resolve "
+        "every relative time expression against those timestamps and state the resolved date or "
+        "duration explicitly."
+    )
+
+
 def test_answer_can_pin_sampling_for_reproducible_evaluation() -> None:
     requests: list[dict[str, object]] = []
 
