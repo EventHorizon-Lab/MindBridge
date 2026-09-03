@@ -1201,6 +1201,34 @@ class SearchHit:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingCapture:
+    """One record that is durable but not yet searchable, and why it is still waiting.
+
+    `Memory.pending_captures` returns these. A memory ID that is absent from the result is not
+    pending: it is either settled or unknown, and `get` distinguishes the two. `attempts` and
+    `last_error` are the failure state a poisoned record accumulates, so an operator can see the
+    reason without opening SQLite.
+    """
+
+    memory_id: str
+    enqueued_at: datetime
+    attempts: int = 0
+    last_error: str | None = None
+
+    def __post_init__(self) -> None:
+        _text(self.memory_id, "memory_id")
+        _require_aware(self.enqueued_at, "enqueued_at")
+        if self.enqueued_at is None:
+            raise ValidationError("enqueued_at must include a timezone")
+        if isinstance(self.attempts, bool) or not isinstance(self.attempts, int):
+            raise ValidationError("attempts must be an integer")
+        if self.attempts < 0:
+            raise ValidationError("attempts must not be negative")
+        if self.last_error is not None and not isinstance(self.last_error, str):
+            raise ValidationError("last_error must be text")
+
+
+@dataclass(frozen=True, slots=True)
 class PrefetchResult:
     """The newest completed speculative search for one streaming turn."""
 

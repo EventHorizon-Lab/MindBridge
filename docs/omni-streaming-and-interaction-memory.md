@@ -71,9 +71,13 @@ the SQLite commit; the record becomes searchable when the host calls `settle()`.
 for observation in burst:
     memory.capture(observation)
 
-while memory.pending_captures():
-    memory.settle(limit=32)
+while memory.settle(limit=32):
+    pass
 ```
+
+Loop on what `settle()` returns rather than on `pending_captures()`: a record that reached the
+retry ceiling stays queued on purpose, so a loop that waits for the queue to empty never ends.
+`pending_captures()` is how you then see which record it is and why.
 
 **Contract:** keep `add()` where a caller needs the record searchable on return, and keep the
 enrichment loop explicit. Nothing else settles for you, so an application that never calls

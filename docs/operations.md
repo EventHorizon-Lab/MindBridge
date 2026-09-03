@@ -100,10 +100,17 @@ live.
 
 `capture_queue` is deferred enrichment rather than index work, and no operation drains it
 implicitly. A host that uses `capture()` owns the loop that calls `settle()`, and
-`pending_captures()` is the number to alarm on: a queue that only grows means the loop stopped, and
-those records stay unsearchable until it resumes. Drain it before a planned shutdown, because a
-queued row survives restart and its attempt count and last error explain a record that never
-settles.
+`pending_captures()` is what to alarm on: it returns up to `limit` queued records oldest first,
+each with its `enqueued_at`, `attempts`, and `last_error`, so a result that stays at the limit
+means the loop stopped and those records are unsearchable until it resumes. Drain it before a
+planned shutdown, because a queued row survives restart.
+
+A record whose `attempts` reached the `settle(max_attempts=...)` ceiling — three by default — is
+skipped rather than retried, so it stops holding up the records behind it while staying queued and
+visible with the reason it failed. Fix the cause and raise the ceiling for one call to retry it.
+With a formation backend configured, `add()` also holds a queue row for the moment between its
+commit and its formation, so a short-lived entry under a live writer is expected rather than a
+stalled loop.
 
 `memory_operations` is an append-only audit log of every applied control-plane operation.
 `operations()` reads it newest first and `rollback(operation_id)` reverses one; neither is
@@ -174,6 +181,16 @@ Every span sets `mindbridge.span.kind` to `operation`, `stage`, or `model`.
 Each `add_stream()` item creates an ordinary `mindbridge.add` span. `search_with_trace()` and
 speculative prefetch use `mindbridge.search`. `AsyncMemory` preserves tracing context across its
 worker thread.
+
+Capture acknowledgement, settle duration, and time to searchable are three different numbers and
+are measured separately. `mindbridge.capture` and `mindbridge.settle` are distinct operation
+spans, and the settle span carries the capture-to-searchable interval its batch closed:
+
+| Attribute | Meaning |
+| --- | --- |
+| `mindbridge.capture.records_settled` | Records this call made searchable. |
+| `mindbridge.capture.records_failed` | Records that failed and kept their queue row. |
+| `mindbridge.capture.max_time_to_searchable_ms` | Longest capture-to-searchable interval this call closed. Absent when nothing settled. |
 
 Model spans include request model, module, batch size, modalities, and
 `mindbridge.model.request_count`. Provider-reported usage is recorded without estimation:

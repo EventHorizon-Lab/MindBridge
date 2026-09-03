@@ -26,6 +26,7 @@ from mindbridge.types import (
     MemoryContext,
     MemoryKind,
     Modality,
+    PendingCapture,
     SpatialAnchor,
     SpatialContext,
     SpeakerSegment,
@@ -982,14 +983,26 @@ class LocalStore:
         self,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
+        *,
+        formation_pending_at: datetime | None = None,
     ) -> tuple[bool, ...]:
-        """Create or update a batch with one commit and one durability sync."""
+        """Create or update a batch with one commit and one durability sync.
+
+        `formation_pending_at` enqueues each written memory for the follow-up work the caller has
+        not done yet, in the same transaction that makes the record durable. The strong `add()`
+        path uses it so a crash between this commit and formation leaves a queue row the next
+        `settle()` finds, instead of a searchable record nothing will ever form. The row carries
+        no state of its own: a queued record that already has vectors owes formation only, which
+        is what `read_embedding` tells the settler.
+        """
         supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
             memories,
             embeddings,
         )
         if not supplied_memories:
             return ()
+        if formation_pending_at is not None:
+            _require_aware(formation_pending_at, "formation_pending_at")
         with self._transaction() as connection:
             transaction_memory_ids: set[str] = set()
             created_flags = []
@@ -1003,6 +1016,14 @@ class LocalStore:
                     )
                 )
                 transaction_memory_ids.add(memory.memory_id)
+                if formation_pending_at is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO capture_queue (memory_id, enqueued_at) VALUES (?, ?)
+                        ON CONFLICT (memory_id) DO NOTHING
+                        """,
+                        (memory.memory_id, _datetime_text(formation_pending_at)),
+                    )
             for embedding in supplied_embeddings:
                 self._write_embedding(connection, embedding)
         return tuple(created_flags)
@@ -1057,7 +1078,7 @@ class LocalStore:
         """Store one captured record's derived content and vectors while it stays queued.
 
         Returns false when the record is not queued, so a settlement that lost a race writes
-        nothing. The queue row is removed by `complete_capture` once every deferred stage,
+        nothing. The queue row is removed by `complete_captures` once every deferred stage,
         formation included, has succeeded; a retry after a later failure re-runs this write, which
         is an idempotent upsert of the same derived content and vectors.
         """
@@ -1081,15 +1102,23 @@ class LocalStore:
                 self._write_embedding(connection, embedding)
         return True
 
-    def complete_capture(self, memory_id: str) -> bool:
-        """Remove one capture from the queue after every deferred stage succeeded."""
-        _require_identifier(memory_id, "memory_id")
+    def complete_captures(self, memory_ids: Sequence[str]) -> int:
+        """Remove captures from the queue after every deferred stage succeeded."""
+        selected = tuple(dict.fromkeys(memory_ids))
+        for memory_id in selected:
+            _require_identifier(memory_id, "memory_id")
+        if not selected:
+            return 0
+        removed = 0
         with self._transaction() as connection:
-            cursor = connection.execute(
-                "DELETE FROM capture_queue WHERE memory_id = ?",
-                (memory_id,),
-            )
-        return cursor.rowcount > 0
+            for offset in range(0, len(selected), _SQLITE_PARAMETER_BATCH):
+                batch = selected[offset : offset + _SQLITE_PARAMETER_BATCH]
+                removed += connection.execute(
+                    f"DELETE FROM capture_queue WHERE memory_id IN "
+                    f"({', '.join('?' for _value in batch)})",
+                    batch,
+                ).rowcount
+        return removed
 
     def record_capture_failure(self, memory_id: str, error: str) -> None:
         """Count one failed settlement and store its reason, leaving the row queued."""
@@ -1109,10 +1138,19 @@ class LocalStore:
         *,
         limit: int = 100,
         memory_ids: Sequence[str] | None = None,
-    ) -> tuple[str, ...]:
-        """Return queued capture IDs in enqueue order, optionally restricted to given IDs."""
+        max_attempts: int | None = None,
+    ) -> tuple[PendingCapture, ...]:
+        """Return queued captures in enqueue order, optionally restricted or attempt-capped.
+
+        `max_attempts` excludes rows that already failed that many times. They stay queued and
+        stay visible, so one poisoned record cannot block every record enqueued after it.
+        """
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit must be a positive integer")
+        if max_attempts is not None and (
+            isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1
+        ):
+            raise ValueError("max_attempts must be a positive integer")
         if memory_ids is not None:
             if not memory_ids:
                 return ()
@@ -1127,36 +1165,42 @@ class LocalStore:
                 for offset in range(0, len(selected), _SQLITE_PARAMETER_BATCH)
             ]
         )
-        queued: list[str] = []
+        queued: list[PendingCapture] = []
         with self._read_transaction() as connection:
             for batch in batches:
-                restriction = (
-                    ""
+                clauses = (
+                    []
                     if batch is None
-                    else f"WHERE memory_id IN ({', '.join('?' for _value in batch)})"
+                    else [f"memory_id IN ({', '.join('?' for _value in batch)})"]
                 )
+                if max_attempts is not None:
+                    clauses.append("attempts < ?")
+                restriction = f"WHERE {' AND '.join(clauses)}" if clauses else ""
                 queued.extend(
-                    _row_text(row, "memory_id")
+                    PendingCapture(
+                        memory_id=_row_text(row, "memory_id"),
+                        enqueued_at=_parse_datetime(_row_text(row, "enqueued_at")),
+                        attempts=int(row["attempts"]),
+                        last_error=row["last_error"],
+                    )
                     for row in connection.execute(
                         f"""
-                        SELECT memory_id
+                        SELECT memory_id, enqueued_at, attempts, last_error
                         FROM capture_queue
                         {restriction}
                         ORDER BY enqueued_at, memory_id
                         LIMIT ?
                         """,
-                        (*(batch or ()), limit - len(queued)),
+                        (
+                            *(batch or ()),
+                            *(() if max_attempts is None else (max_attempts,)),
+                            limit - len(queued),
+                        ),
                     ).fetchall()
                 )
                 if len(queued) >= limit:
                     break
         return tuple(queued[:limit])
-
-    def pending_capture_count(self) -> int:
-        """Return how many captured records are still waiting for enrichment."""
-        with self._connection() as connection:
-            row = connection.execute("SELECT COUNT(*) AS pending FROM capture_queue").fetchone()
-        return int(row["pending"])
 
     def apply_formation(
         self,

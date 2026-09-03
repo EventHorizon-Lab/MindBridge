@@ -19,6 +19,15 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   choose between dropping them and stalling its own loop. `add()` and `add_many()` settle a queued
   record they encounter, so their searchable-on-return contract is unchanged, and `search()`,
   `ask()`, and `compile()` never settle: time to searchable stays under host control.
+  `pending_captures()` returns `PendingCapture` values — `memory_id`, `enqueued_at`, `attempts`,
+  and `last_error` — and takes an optional `memory_ids` filter, so a caller can ask whether one
+  record is searchable yet and an operator can see why one is not. `settle()` attempts every
+  record it read rather than stopping at the first failure, and its `max_attempts` ceiling
+  (default 3) skips a record that has already failed that often, so one poisoned capture cannot
+  block the queue; `capture()` applies the embedder-capability check `add()` applies, so such a
+  record is refused before it becomes durable. With a formation backend configured, `add()` holds
+  a queue row from its write transaction until formation returns, so a crash in between leaves
+  work the next `settle()` completes without re-embedding.
 - `Memory.compile()` and `AsyncMemory.compile()`, a context compiler that runs the existing
   retrieval kernel once and returns a `ContextBundle`: actors, episodes, facts, procedures, affect
   cues, and traits selected within a `ContextBudget`, plus the lineage conflicts it reports without

@@ -3023,10 +3023,14 @@ def test_add_many_deduplicates_one_model_and_store_batch(
         store: LocalStore,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
+        *,
+        formation_pending_at: datetime | None = None,
     ) -> tuple[bool, ...]:
         batch = tuple(memories)
         store_batches.append(tuple(memory.memory_id for memory in batch))
-        result: tuple[bool, ...] = original(store, batch, embeddings)
+        result: tuple[bool, ...] = original(
+            store, batch, embeddings, formation_pending_at=formation_pending_at
+        )
         return result
 
     monkeypatch.setattr(LocalStore, "write_memories", counted_write)
@@ -3218,8 +3222,10 @@ def test_concurrent_adds_share_one_durable_index_flush(
         store: LocalStore,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
+        *,
+        formation_pending_at: datetime | None = None,
     ) -> tuple[bool, ...]:
-        result = original(store, memories, embeddings)
+        result = original(store, memories, embeddings, formation_pending_at=formation_pending_at)
         committed.wait(timeout=3)
         return result
 
@@ -3265,8 +3271,12 @@ def test_reindex_replays_an_add_committed_after_its_sqlite_scan(
         store: LocalStore,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
+        *,
+        formation_pending_at: datetime | None = None,
     ) -> tuple[bool, ...]:
-        result = original_write(store, memories, embeddings)
+        result = original_write(
+            store, memories, embeddings, formation_pending_at=formation_pending_at
+        )
         add_committed.set()
         return result
 
