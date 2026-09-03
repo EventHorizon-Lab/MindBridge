@@ -89,20 +89,38 @@ supported provider configuration fields live in [configuration](../configuration
 A plain `TranscriptionBackend` transcribes supported audio/video during `add` regardless of
 `index_speech`; `SpeechBackend` analysis and identity resolution stay behind the explicit flag.
 
-`vision_describer` has no declarative provider and is reachable only through direct construction
-or `MemoryPlugins`. `former` proposes typed memories after a source observation commits; omitting
-it keeps ordinary add behavior and makes no formation model call. The bundled OpenAI former is
-selected by the declarative `formation` slot, which stays off unless it is configured; see
+`vision_describer` captions a visual memory so it has a full-text document at all; without one an
+image-only memory is reachable by the dense route alone. It is selected by the declarative `vision`
+slot, which stays off unless it is configured, or supplied directly through `MemoryPlugins`; see
+[configuration](../configuration.md#visual-descriptions). The bundled `OpenAIModels.describe`
+captions one batch per chat completion, sends a video as four locally decoded stills rather than
+the file, accepts only exactly one non-empty caption per input, and retries one malformed reply
+once. A describer failure never fails the write: the memory is stored without a caption and the
+batch is counted on the vision span as `mindbridge.vision.failed_batches`.
+
+`former` proposes typed memories after a source observation commits; omitting it keeps ordinary
+add behavior and makes no formation model call. The bundled OpenAI former is selected by the
+declarative `formation` slot, which stays off unless it is configured; see
 [configuration](../configuration.md#automatic-memory-formation). `consolidator` proposes the
 control-plane operations `consolidate()` applies; the bundled OpenAI backend is selected by the
 declarative `consolidation` slot, which stays off unless it is configured, and omitting it leaves
 `consolidate()` unavailable and every other operation unchanged. See
 [configuration](../configuration.md#agentic-memory-management).
 
-Use `index_speech=True` when transcripts and resolved speaker names should become retrieval text.
-`evidence_budget_chars=None` grounds `ask()` on exactly `limit` hits. A positive integer may admit
-more ranked evidence while its text-equivalent cost fits the budget: 2,000 characters per image,
-4,000 per audio asset, and 12,000 per video asset.
+`index_speech` is on by default and is a no-op unless `transcriber` is a `SpeechBackend`, whose
+analysis has already run by the time `add` reaches the index. Set it to `False` to keep transcripts
+and resolved speaker names out of retrieval text and out of `add`-time identity matching.
+
+`ask()` grounds on the top of the ranking, except that a modality present in the retrieved hits
+and absent from the first `limit` of them contributes its best hit in the last slot, so one
+modality cannot shut the others out.
+
+`evidence_budget_chars=None` grounds `ask()` on exactly `limit` hits. A positive integer keeps
+those hits and then admits more ranked evidence while its text-equivalent cost fits the budget:
+2,000 characters per image, 4,000 per audio asset, and 12,000 per video asset. It raises a floor
+rather than imposing a ceiling, so bound a prompt by lowering `limit` and leaving the budget unset.
+The per-setting semantics and calibration notes live in
+[configuration](../configuration.md#local-memory-settings).
 
 `reinforce_on_answer=True` records positive feedback for the hits an answerer actually cites.
 Set it to `False` for evaluations that require one question not to change later rankings.
@@ -737,9 +755,14 @@ The principal immutable values are:
 | `RetrievalCandidateTrace` | `memory_id`, `index_ids`, `dense_relevance`, `dense_confidence`, `lexical_relevance`, `lexical_rerank_bonus`, `lexical_match`, `gate_relevance`, `base_relevance`, `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`, `rejected_by` |
 | `MemoryCapabilities` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `consolidation_model`, `speaker_recognition`, `streaming_generation`; `operations` property and `document()` |
 
-`abstained` is true only when the answerer returns MindBridge's reserved no-evidence sentence. A
-provider refusal expressed another way is an ordinary answer unless the adapter maps it to this
-protocol signal.
+`abstained` is a protocol signal, not a refusal rate. The bundled grounded prompt asks for the
+opaque token `[insufficient_evidence]`, and the adapter reports `abstained` when that bracketed
+token appears anywhere in the answer, when the bare token is the whole answer, or when the answer
+starts with the English fallback sentence. A model that refuses in its own words some other way is
+still an ordinary answer. `abstention_reason` is `no_evidence` when retrieval returned nothing and
+`insufficient_evidence` when hits were retrieved but could not ground an answer; the reported
+`answer` is the readable fallback sentence rather than the token. Measure refusal rate separately
+if that is the quantity needed.
 
 Enum values are:
 
@@ -810,11 +833,17 @@ ConsolidationBackend.consolidate(
 Required properties are `embedding_capabilities`, `embedding_model`, `embedding_space`, and
 `embedding_dimension` for embedding; `transcription_capabilities`, `transcription_model`, and
 `transcription_space` for transcription and speech; `face_capabilities`, `face_model`,
-`face_space`, and `face_analysis_space` for faces; `vision_capabilities` and `vision_model` for
-visual description; `formation_capabilities`, `formation_model`, and `formation_space` for
-formation; `consolidation_model` and `consolidation_recipe` for consolidation; and
-`generation_capabilities` for generation. Every base protocol except the optional
-streaming extension implements `close()`.
+`face_space`, and `face_analysis_space` for faces; `vision_capabilities`, `vision_model`, and
+`vision_space` for visual description; `formation_capabilities`, `formation_model`, and
+`formation_space` for formation; `consolidation_model` and `consolidation_recipe` for
+consolidation; and `generation_capabilities` for generation. Every base protocol except the
+optional streaming extension implements `close()`.
+
+A `*_space` value identifies the whole derivation recipe, not the model: `vision_space` must change
+when a describer's prompt changes, because captions are cached per `(asset content, vision_space)`
+in the local store and re-serving one written under a superseded prompt is invisible inside a
+searchable document. `OpenAIModels.vision_space` digests the model, its generation controls, and the
+bundled caption prompt.
 
 `form` receives one `FormationInput` per committed source and returns one proposal tuple per
 input, in the same order. A former never writes storage: the kernel validates each proposal

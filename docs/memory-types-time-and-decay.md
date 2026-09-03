@@ -1,30 +1,35 @@
 # Memory types, time, and decay
 
 This page owns memory-role, event-time, typed-assertion, retrieval-scope, and ranking semantics.
-These controls all use the same SQLite record and Zvec projection path; none creates another store
-or isolation scope.
+MindBridge stores semantic, episodic, and procedural roles on the same durable record, and an
+optional typed context refines that record into observations, entities, events, state, relations,
+affect, traits, and response policies carrying source evidence, confidence, and their own validity
+and transaction time. Every control below uses the ordinary SQLite record and Zvec projection path;
+none creates another store or isolation scope.
 
 | Control | Behavior |
 | --- | --- |
 | `memory_type` | Hard exact-role filter when supplied |
 | `occurred_from` / `occurred_until` | Hard event-overlap filter |
 | `RetrievalScope` | Hard valid-time, known-time, symbolic-place, and same-frame metric filters |
-| Temporal phrases in query text | Soft event-time ranking signal |
+| Temporal phrases in query text | Soft event-time ranking signal relative to `reference_at` |
 | Reinforcement and decay | Soft ranking signals; content is never rewritten or deleted |
 
 ## Memory types
 
-| Type | Store | Kernel behavior |
+| Type | Intended content | Kernel behavior |
 | --- | --- | --- |
 | `MemoryType.SEMANTIC` | Facts and stable application knowledge | Default type |
 | `MemoryType.EPISODIC` | Events and observations | Usually paired with event time |
 | `MemoryType.PROCEDURAL` | Instructions and reusable routines | Returned as evidence, never executed |
 
-**Contract:** The caller classifies ordinary content. MindBridge does not promote one type into
-another unless an explicit `FormationBackend` creates a separate derived record. Memory type is
-part of stable identity, and `search()` and `ask()` accept an optional exact type filter.
+The caller classifies ordinary content. MindBridge does not extract facts, segment episodes, or
+promote one type into another unless an explicit `FormationBackend` is configured, and even then
+formation proposes a separate typed record rather than rewriting the caller's role. Memory type is
+part of stable identity, so otherwise identical semantic, episodic, and procedural records have
+different IDs. `search()` and `ask()` accept an optional exact type filter.
 
-The snippets below assume an open `memory`:
+Every snippet on this page assumes an open `memory`:
 
 ```python
 from datetime import datetime, timezone
@@ -48,8 +53,8 @@ episodes = memory.search(
 )
 ```
 
-**Guidance:** Use types to keep cognitive roles distinct, not to enforce access control. Metadata
-and types are application data; separate security domains require separate data directories.
+Use types to keep cognitive roles distinct, not to enforce access control. Metadata and types are
+application data; separate security domains require separate data directories.
 
 ## Event time and strict filters
 
@@ -60,10 +65,12 @@ as a substitute when event time is absent.
 `search(..., occurred_from=..., occurred_until=...)` applies a hard half-open overlap filter. Either
 bound may be omitted. Supplying any bound excludes records without event time. An interval ending
 at `occurred_from`, or starting at `occurred_until`, does not match; an instant matches when its
-timestamp falls inside the requested range.
+timestamp falls inside the requested range, and is treated internally as a one-microsecond
+interval.
 
-**Contract:** SQLite rechecks the event range after Zvec candidate selection. Use these explicit
-bounds whenever records outside the interval must be excluded.
+**Contract:** MindBridge pushes the filter into Zvec for candidate selection and rechecks it after
+SQLite hydration, because SQLite is authoritative. Use these explicit bounds whenever records
+outside the interval must be excluded.
 
 ## Temporal phrases
 
@@ -81,7 +88,10 @@ time is used. When no explicit reference is passed, `Today is <date>` may anchor
 includes the resolved reference in generation input when relative time is involved.
 
 For a detected range, retrieval considers both in-range and global candidates. In-range events are
-boosted, nearby events decay smoothly with distance, and records without event time are downranked.
+boosted; events outside the range and records without event time keep the score their relevance
+earned and are neither downranked nor gated out. The signal is deliberately additive, because event
+boundaries may be noisy and a relevant memory that happened at the wrong time is still the answer
+more often than a well-timed irrelevant one.
 
 **Guidance:** Use temporal language for natural recall where event boundaries may be noisy. Use
 `occurred_from` and `occurred_until` for strict exclusion.
@@ -118,16 +128,16 @@ propose these derived kinds:
 | `TRAIT` | Semantic | A longer-horizon characteristic |
 | `RESPONSE_POLICY` | Procedural | Feedback-grounded response guidance |
 
-**Contract:** The source commits before formation. The former only proposes; the kernel validates
+The source commits before any typed proposal is formed, so a formation model error leaves the
+observation durable and the formation retryable. The former only proposes; the kernel validates
 source modality and spatial binding, assigns IDs, links evidence, versions conflicting state, and
-commits derived records. A formation failure leaves the source durable, and repeating the same add
-can complete the missing formation recipe.
+commits derived records. Two kinds carry extra visibility rules:
 
-Formation never rewrites the caller's source record. `AFFECT` must name a cue modality present in
-that source. A model-inferred `TRAIT` remains hidden from active retrieval until two independent
-sources support the same normalized claim; a trusted `USER_STATEMENT` can be visible immediately.
-Deleting evidence recomputes derived confidence and visibility, and removes a derived record when
-no support remains. Source observations are deleted only by an explicit caller action.
+- `MemoryKind.AFFECT` records a situated cue together with the source modality it came from, so a
+  model cannot claim an audio cue for a source that has no audio.
+- `MemoryKind.TRAIT` stays hidden from active retrieval until two independent sources support the
+  same typed claim, combining their independent confidence with a noisy-OR projection. A trusted
+  `EvidenceBasis.USER_STATEMENT` trait is visible immediately.
 
 ### Naming a person is a typed assertion
 
@@ -161,7 +171,7 @@ original observation.
 
 ## Valid time and transaction time
 
-Occurrence time and typed assertion time answer different questions:
+Raw occurrence and typed assertion time answer different questions:
 
 | Field | Question answered |
 | --- | --- |
@@ -182,6 +192,21 @@ version, and excludes raw records created after `known_at`. Evidence links carry
 recorded/retired bounds, so a historical result never exposes support added later. Each evidence
 change and its semantic projection share one monotonically allocated transaction instant even when
 the device wall clock repeats.
+
+```python
+from mindbridge import RetrievalScope
+
+what_we_believed_then = memory.search(
+    "What drink did Alex prefer?",
+    scope=RetrievalScope(valid_at=event_time, known_at=audit_time),
+)
+```
+
+Overlapping state assertions share a deterministic lineage keyed by kind, normalized subject,
+predicate, and spatial frame/anchor. A later assertion retires the previous transaction version and
+splits any unaffected before/after validity segments into carry-forward versions, which is what
+supports bounded backfill and A to B to A evolution. Assertions conflict only within one SQLite
+write batch; equal wall-clock timestamps in separate transactions are still ordered.
 
 ### Spatial scope
 
@@ -377,9 +402,10 @@ Decay is disabled by default. Enable it with a positive `decay_half_life_days` s
 changes query-time ranking only; it does not delete or rewrite records, assets, embeddings, or
 outbox rows.
 
-Retention is anchored to the newest eligible explicit reinforcement, otherwise event end, event
-start, or last update time. Repeated confirmations slow decay. Confirmations also provide a small
-ranking boost when decay is disabled, and public scores remain in `[0, 1]`.
+When enabled, retention uses the most recent eligible explicit reinforcement; otherwise it uses
+event end, event start, or last update time. The configured half-life applies exponential decay
+with a nonzero floor, and repeated confirmations slow that decay. Public scores remain bounded to
+`[0, 1]`. Eligible confirmations also provide a small ranking boost when decay is disabled.
 
 Search never reinforces a hit. `ask()` does reinforce the hits its answerer actually cited,
 because a citation is observed utility rather than retrieval: something read the evidence and
@@ -393,9 +419,10 @@ if used and user_confirmed_helpful:
     memory.reinforce((used[0].id,))
 ```
 
-`reinforce()` de-duplicates IDs, ignores missing records, and caps each record's confirmation count
-at 20. A confirmation later than the query's ranking reference is ignored for that query, which
-prevents future feedback from leaking into historical evaluation.
+`reinforce()` de-duplicates IDs, skips missing records, and caps each record's confirmation count
+at 20. Confirmations after the query's ranking reference are ignored so evaluation cannot leak
+future feedback into the past.
 
-**Guidance:** Reinforce only observed positive use or feedback. Use `search_with_trace()` when one
-query needs its temporal, reinforcement, retention, or rejection factors explained.
+Reinforce only observed positive use or feedback. Use `search_with_trace()` when one query needs
+its temporal, reinforcement, retention, or rejection factors explained; normal telemetry omits
+per-memory candidate identifiers.

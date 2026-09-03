@@ -14,6 +14,7 @@ from pydantic import (
     Field,
     SecretStr,
     StringConstraints,
+    field_validator,
 )
 from pydantic import (
     ValidationError as PydanticValidationError,
@@ -29,6 +30,7 @@ from mindbridge.models.base import (
     GenerationBackend,
     SpeechBackend,
     TranscriptionBackend,
+    VisionDescriptionBackend,
 )
 from mindbridge.models.funasr import FunASRTranscriber
 from mindbridge.models.jina import DEFAULT_JINA_DIMENSION, JinaOmniEmbedder
@@ -147,6 +149,36 @@ class OpenAIFormationConfig(_OpenAICompletionConfig):
     """
 
 
+class OpenAIVisionConfig(_OpenAICompletionConfig):
+    """Chat-completion knobs for the adapter that captions visual memories for the text index.
+
+    A memory whose content is one image has no words, so its full-text document is empty and the
+    lexical half of retrieval cannot reach it however good the embedder is. This slot pays one
+    chat completion per write batch to derive that text; the caption is unioned into the indexed
+    document beside whatever the caller wrote, never substituted for it, and the asset is still
+    embedded natively. Leaving the slot out keeps the write path exactly as cheap as it is today:
+    no describer is constructed, and the derived-text branch returns its input unchanged.
+
+    Like `formation` this is its own slot and its own client rather than a reuse of `generation`,
+    because captioning usually wants a smaller model than answering and because configuring an
+    answerer must never start spending on writes. `modalities` is the visual capability set and
+    accepts only `image` and `video`; an asset outside it is left undescribed. Video is described
+    from four ordered stills decoded locally rather than by uploading the clip, so it costs
+    four image parts per memory; that is why the default is image alone.
+    """
+
+    modalities: Annotated[frozenset[Modality], Field(min_length=1)] = frozenset({Modality.IMAGE})
+
+    @field_validator("modalities")
+    @classmethod
+    def _visual_modalities_only(cls, value: frozenset[Modality]) -> frozenset[Modality]:
+        # `Memory` rejects the same set at construction. Rejecting it here means a host that
+        # validates a document before opening storage sees it too.
+        if value - {Modality.IMAGE, Modality.VIDEO}:
+            raise ValueError("must contain only image or video")
+        return value
+
+
 class OpenAIConsolidationConfig(_OpenAICompletionConfig):
     """Chat-completion knobs for the backend that proposes control-plane operations.
 
@@ -199,13 +231,13 @@ class MindBridgeConfig(_ConfigModel):
     data_dir: Path = Path(".mindbridge")
     embedding: EmbeddingProviderConfig
     generation: OpenAIGenerationConfig | None = None
-    # Reachable, but never implicit, and omitted by default. Configuring `generation` must not
-    # enable formation: a former is an LLM call per observation on the write path, which a
-    # measurement says is the wrong default, and the only bundled one is a cloud call, which a
-    # local-first deployment should opt into rather than discover. Derived memories are also a
-    # union with the raw sources rather than a replacement for them. `vision_describer` has no
-    # bundled implementation at all, so it deliberately has no key here.
+    # Both reachable, but never implicit, and omitted by default. Configuring `generation` must
+    # not enable either one: a former is an LLM call per observation and a describer an LLM call
+    # per visual, both on the write path, and the only bundled adapters are cloud calls, which a
+    # local-first deployment should opt into rather than discover. What each derives is also a
+    # union with the raw sources rather than a replacement for them.
     formation: OpenAIFormationConfig | None = None
+    vision: OpenAIVisionConfig | None = None
     # The agentic memory control plane. Same rule as `formation`: reachable, never implicit. A
     # deployment that never sets it keeps `consolidate()` unavailable and everything else
     # unchanged, which is what a host that only recalls should get.
@@ -256,6 +288,9 @@ def resolve_memory_config(
         former = None if config.formation is None else _build_formation(config.formation)
         if former is not None:
             cleanup.callback(former.close)
+        describer = None if config.vision is None else _build_vision(config.vision)
+        if describer is not None:
+            cleanup.callback(describer.close)
         consolidator = _build_consolidation(
             config,
             answerer=answerer,
@@ -274,6 +309,7 @@ def resolve_memory_config(
             embedder=embedder,
             answerer=answerer,
             transcriber=transcriber,
+            vision_describer=describer,
             face_analyzer=face,
             former=former,
             consolidator=consolidator,
@@ -377,6 +413,11 @@ def _build_formation(config: OpenAIFormationConfig) -> FormationBackend:
     return cast(FormationBackend, _openai_factory(_completion_values(config)))
 
 
+def _build_vision(config: OpenAIVisionConfig) -> VisionDescriptionBackend:
+    # `describe` reads the same generation controls; its capability set is the visual one.
+    return cast(VisionDescriptionBackend, _openai_factory(_completion_values(config)))
+
+
 def _build_consolidation(
     config: MindBridgeConfig,
     *,
@@ -431,6 +472,7 @@ __all__ = [
     "OpenAIFormationConfig",
     "OpenAIGenerationConfig",
     "OpenAITranscriptionConfig",
+    "OpenAIVisionConfig",
     "OpenCVFaceConfig",
     "SentenceTransformersEmbeddingConfig",
     "SpeechProviderConfig",

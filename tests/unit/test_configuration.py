@@ -2,24 +2,31 @@ from __future__ import annotations
 
 import inspect
 import json
+import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
+import httpx2 as httpx
 import openai
 import pytest
 from _feature_support import TinyEmbedder
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import ValidationError as PydanticValidationError
 
 import mindbridge.configuration as configuration
+import mindbridge.models.openai_sdk as openai_sdk
 import mindbridge.recipes as recipes_module
 from mindbridge import (
     AnswerResult,
+    Blob,
     EvidenceBasis,
     FormationInput,
     FormationProposal,
@@ -37,6 +44,7 @@ from mindbridge import (
     ObservationContext,
     SearchHit,
 )
+from mindbridge._telemetry import MODEL_MODULE, TOKEN_TOTAL, VISION_BATCHES_FAILED
 from mindbridge.configuration import resolve_memory_config
 from mindbridge.exceptions import ValidationError
 from mindbridge.memory import declared_capabilities
@@ -240,7 +248,8 @@ def test_a_former_is_declaratively_reachable_but_never_implicit(
         MindBridgeConfig.model_validate(
             {**base, "formation": {"provider": "openai", "video_limit": 4}}
         )
-    # `vision_describer` has no bundled implementation, so it deliberately has no key at all.
+    # The declarative name for the describer slot is `vision`, matching `generation` and
+    # `formation`; the plugin field name is not a configuration key.
     with pytest.raises(PydanticValidationError, match="extra_forbidden"):
         MindBridgeConfig.model_validate({**base, "vision_describer": {"provider": "openai"}})
 
@@ -786,3 +795,248 @@ def test_composition_closes_the_optional_former(tmp_path: Path) -> None:
     composition.close()
 
     assert former.closed is True
+
+
+def _caption_response(*captions: str) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"content": json.dumps({"descriptions": list(captions)})},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1_200, "completion_tokens": 24, "total_tokens": 1_224},
+        },
+    )
+
+
+def _openai_slot_stub(
+    monkeypatch: pytest.MonkeyPatch,
+    http_client: httpx.Client,
+) -> None:
+    """Route the embedding slot to `TinyEmbedder` and every completion slot to the real adapter.
+
+    The point of this test is the wiring, so the describer has to be the bundled `OpenAIModels`
+    that `resolve_memory_config` really builds; only its HTTP transport is faked.
+    """
+
+    def build(**values: object) -> object:
+        if "generation_model" not in values:
+            return TinyEmbedder()
+        return openai_sdk.OpenAIModels(
+            openai.OpenAI(
+                api_key="test-key",
+                base_url="https://vision.example.test/v1",
+                http_client=http_client,
+                max_retries=0,
+            ),
+            **cast(Any, values),
+        )
+
+    monkeypatch.setattr(recipes_module, "_owned_openai_models", build)
+
+
+def test_declarative_vision_slot_captions_an_image_into_the_lexical_document(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An image-only memory used to be stored with an empty full-text document, because the
+    derived-text write path existed with nothing able to feed it: `VisionDescriptionBackend` had
+    no bundled implementation and therefore no declarative key. This asserts the whole chain --
+    a `vision` block builds a describer, `add` calls it, the caption lands in the document BM25
+    actually matches on, and the write-path tokens are reported under their own model module so a
+    run can tell captioning cost from answering cost.
+    """
+    payloads: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return _caption_response("a red bicycle leaning on a fence")
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http_client:
+        _openai_slot_stub(monkeypatch, http_client)
+        with Memory.from_config(
+            {
+                "data_dir": tmp_path,
+                "embedding": {"provider": "openai", "model": "tiny-test", "dimension": 4},
+                "vision": {
+                    "provider": "openai",
+                    "model": "caption-model",
+                    "modalities": ["image"],
+                },
+            },
+            tracer=provider.get_tracer("test"),
+        ) as memory:
+            picture = memory.add(Blob(b"bicycle-frame", "image/png"))
+            # A second document so the full-text index scores against a corpus.
+            garden = memory.add("the garden at noon")
+            traced = memory.search_with_trace("bicycle")
+            stored = memory.get(picture.id).content
+    provider.shutdown()
+
+    matched = {
+        candidate.memory_id
+        for candidate in traced.trace.candidates
+        if candidate.lexical_match and candidate.memory_id is not None
+    }
+    assert picture.id in matched
+    assert garden.id not in matched
+    assert stored == (
+        f"[visual description:{picture.assets[0].id}]\na red bicycle leaning on a fence"
+    )
+
+    # One completion for the batch, and nothing identifying in it: the caption is indexed beside
+    # the caller's own text, so a memory ID, a file name, or a store path in the prompt would be
+    # provenance leaked into a searchable document.
+    assert len(payloads) == 1
+    serialized = json.dumps(payloads[0])
+    assert picture.id not in serialized
+    assert picture.assets[0].id not in serialized
+    assert str(tmp_path) not in serialized
+
+    # `token_usage.by_module` is what the benchmark harness aggregates, so description tokens are
+    # separable from answer tokens without a schema change.
+    vision_spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if (span.attributes or {}).get(MODEL_MODULE) == "vision"
+    ]
+    assert len(vision_spans) == 1
+    attributes = vision_spans[0].attributes
+    assert attributes is not None
+    assert attributes[TOKEN_TOTAL] == 1_224
+    assert attributes["gen_ai.request.model"] == "caption-model"
+
+
+def test_the_vision_slot_stays_off_unless_it_is_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Describing is a model call per visual on the write path, so a composition that omits the
+    slot must stay byte-for-byte what it is today -- including one that configures `generation`,
+    which must never opt a deployment into spending on writes."""
+    calls: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        return _caption_response("never asked for")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http_client:
+        _openai_slot_stub(monkeypatch, http_client)
+        composition = resolve_memory_config(
+            {
+                "data_dir": tmp_path,
+                "embedding": {"provider": "openai", "model": "tiny-test", "dimension": 4},
+                "generation": {"provider": "openai", "model": "answer-model"},
+            }
+        )
+        try:
+            assert composition.plugins.vision_describer is None
+            with Memory.from_plugins(
+                tmp_path, plugins=composition.plugins, config=composition.settings
+            ) as memory:
+                picture = memory.add(Blob(b"bicycle-frame", "image/png"))
+                assert memory.get(picture.id).content == ""
+                # No describer means no caption to cache, and the caption table must stay empty:
+                # the store-side cache costs a read on every visual write, so a composition
+                # without the slot must not pay for one either.
+                with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+                    cached = connection.execute(
+                        "SELECT count(*) FROM visual_descriptions"
+                    ).fetchone()[0]
+        finally:
+            composition.close()
+
+    assert calls == []
+    assert cached == 0
+
+
+def test_the_vision_slot_accepts_only_visual_modalities(tmp_path: Path) -> None:
+    base = {"data_dir": tmp_path, "embedding": {"provider": "openai"}}
+
+    for modalities in (["text", "image"], ["audio"], []):
+        with pytest.raises(PydanticValidationError):
+            MindBridgeConfig.model_validate(
+                {**base, "vision": {"provider": "openai", "modalities": modalities}}
+            )
+
+    # `video_limit` shapes an answer, not a caption, so it is not part of this slot either.
+    with pytest.raises(PydanticValidationError, match="extra_forbidden"):
+        MindBridgeConfig.model_validate(
+            {**base, "vision": {"provider": "openai", "video_limit": 4}}
+        )
+
+    described = MindBridgeConfig.model_validate(
+        {**base, "vision": {"provider": "openai", "modalities": ["image", "video"]}}
+    ).vision
+    assert described is not None
+    assert described.modalities == frozenset({Modality.IMAGE, Modality.VIDEO})
+    # Image alone by default: a video costs four sampled stills, so it is opted into.
+    assert MindBridgeConfig.model_validate(
+        {**base, "vision": {"provider": "openai"}}
+    ).vision.modalities == frozenset({Modality.IMAGE})  # type: ignore[union-attr]
+
+
+def test_a_failing_describer_never_fails_the_write_it_was_decorating(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The caller handed us an observation to store; losing the caption must not lose the memory.
+
+    Both `describe` attempts return HTTP 200 with malformed JSON, which is what the round's
+    endpoint did on 3 of 24 single-image calls. Before the fail-open this raised out of `add`,
+    and an ingesting harness reported the whole batch as unwritten memories -- a far larger loss
+    than the empty document a missing caption leaves behind.
+    """
+    sent: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": '{"descriptions": ['},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http_client:
+        _openai_slot_stub(monkeypatch, http_client)
+        with Memory.from_config(
+            {
+                "data_dir": tmp_path,
+                "embedding": {"provider": "openai", "model": "tiny-test", "dimension": 4},
+                "vision": {"provider": "openai", "model": "caption-model"},
+            },
+            tracer=provider.get_tracer("test"),
+        ) as memory:
+            picture = memory.add(Blob(b"bicycle-frame", "image/png"))
+            stored = memory.get(picture.id)
+    provider.shutdown()
+
+    assert stored.content == ""
+    assert stored.assets[0].modality is Modality.IMAGE
+    assert len(sent) == 2
+
+    # Not silent: the harness reads counters off model spans, so this is where a run can see how
+    # much derived text it did not get.
+    vision_spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if (span.attributes or {}).get(MODEL_MODULE) == "vision"
+    ]
+    assert len(vision_spans) == 1
+    attributes = vision_spans[0].attributes
+    assert attributes is not None
+    assert attributes[VISION_BATCHES_FAILED] == 1

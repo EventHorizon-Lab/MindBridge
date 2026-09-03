@@ -62,7 +62,8 @@ composition change keeps advertising the composition it was built with;
 
 `build_mcp_server` borrows `memory`; it neither opens nor closes it. The host must keep the owner
 alive for the server lifetime and close it during shutdown. Do not run another `Memory`, REST, or
-MCP owner against the same physical `data_dir`.
+MCP owner against the same physical `data_dir`. Composition and process ownership are defined in
+[architecture](../architecture.md) and [configuration](../configuration.md).
 
 MindBridge adds no authentication to any MCP transport. Stdio inherits local process permissions;
 an SSE or streamable-HTTP host must add authentication, authorization, TLS, request limits, and
@@ -301,4 +302,5 @@ MCP has no aggregate framing budget, but each inline media value is bounded befo
 work. It has no local-path input, remote fetch, large-file upload tool, capture-stream tool,
 coordinate-frame transform, logical scope, or separate authentication policy; the MCP host owns
 transport access control. Configured model backends may
-impose a smaller aggregate budget, including the [OpenAI inline limits](python-sdk.md#bundled-adapters).
+impose a smaller aggregate budget, including the
+[OpenAI inline limits](python-sdk.md#bundled-adapters).

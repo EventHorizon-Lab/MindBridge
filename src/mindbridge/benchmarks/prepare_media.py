@@ -100,7 +100,11 @@ def _prepared_manifest(
             "units": _video_manifest(spec.name, dataset, media_root, cache, limit, offset, announce)
         }
     if spec.name in {"egolifeqa", "egomemreason"}:
-        return {"units": _egolife_manifest(spec.name, dataset, media_root, limit, offset)}
+        return {
+            "units": _egolife_manifest(
+                spec.name, dataset, media_root, cache, limit, offset, announce
+            )
+        }
     if spec.name.startswith("mm-lifelong-"):
         return {
             "units": _lifelong_manifest(spec, media_root, cache, announce),
@@ -496,9 +500,21 @@ def _egolife_manifest(
     task_name: str,
     dataset: Path,
     media_root: Path,
+    cache: Path,
     limit: Limit,
     offset: int,
+    announce: Callable[[str], None] | None,
 ) -> dict[str, list[dict[str, object]]]:
+    """Map every EgoLife clip preceding the query horizon to one re-encoded segment.
+
+    The release publishes 20 fps 1408x1408 clips, so a single 30 s clip reaches an inline model
+    route as roughly 19 MiB of base64 -- over the 20 MiB per-item cap for 1175 of the 2090 clips a
+    200-question EgoLifeQA slice ingests, which costs those memories their video vector without
+    failing the write. Every other video task already answers this by re-encoding through
+    `_VIDEO_FILTER` (fps=1, at most 640x360); routing EgoLife the same way takes one measured clip
+    from 14.1 MB to 1.3 MB. Each source file is one clip, so the boundary list is a single value
+    and the causal window stays the one the filename declares.
+    """
     horizons: dict[str, int]
     if task_name == "egolifeqa":
         from mindbridge.benchmarks.egolife_qa import load_egolife_qa
@@ -520,8 +536,15 @@ def _egolife_manifest(
         for path in sorted((media_root / identity).glob("DAY*/*.mp4")):
             start = _egolife_start(path)
             end = start + _SEGMENT_SECONDS
-            if end * 1_000 <= horizon_ms:
-                parts.append(_path_part(path.resolve(), path.stem, start, end))
+            if end * 1_000 > horizon_ms:
+                continue
+            segments = _segment_video(
+                path,
+                (float(_SEGMENT_SECONDS),),
+                cache / _component(identity),
+                announce,
+            )
+            parts.append(_path_part(segments[0][2], path.stem, start, end))
         if not parts:
             raise FileNotFoundError(
                 f"no complete EgoLife clip for {identity} precedes the selected query horizon"
@@ -981,18 +1004,28 @@ def _segment_video(
         ]
         if cuts:
             times = ",".join(f"{value:.3f}" for value in cuts)
-            command.extend(("-force_key_frames", times, "-segment_times", times))
-        command.extend(
-            (
-                "-f",
-                "segment",
-                "-segment_format",
-                "mp4",
-                "-reset_timestamps",
-                "1",
-                str(output),
+            command.extend(
+                (
+                    "-force_key_frames",
+                    times,
+                    "-segment_times",
+                    times,
+                    "-f",
+                    "segment",
+                    "-segment_format",
+                    "mp4",
+                    "-reset_timestamps",
+                    "1",
+                    str(output),
+                )
             )
-        )
+        else:
+            # With nothing to cut, the segment muxer is not just unnecessary but wrong: given no
+            # `-segment_times` it splits at every keyframe it happens to see, and `-tune
+            # zerolatency` emits them often. One 30 s EgoLife clip came back as 13 + 17 frames.
+            # A single boundary means one output file, which is what any source at or below one
+            # segment length asks for.
+            command.append(str(working / "segment-00000.mp4"))
         _run_ffmpeg(command, source)
         produced = tuple(sorted(working.glob("segment-*.mp4")))
         if len(produced) != len(expected) or any(not path.stat().st_size for path in produced):

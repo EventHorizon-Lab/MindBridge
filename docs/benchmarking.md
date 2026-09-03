@@ -5,47 +5,50 @@ quality claims; use the utilities only for their narrower artifact or storage pu
 
 | Command | Use it for | Do not infer |
 | --- | --- | --- |
-| `mindbridge-bench eval` | Pinned datasets, official or explicitly identified scorers, confidence intervals, and run comparisons | A score is leaderboard-comparable without checking its dataset, judge, and validity fields |
+| `mindbridge-bench eval` | Pinned datasets, official or explicitly identified scorers, confidence intervals, and run comparisons | That a score is leaderboard-comparable without checking its dataset, judge, and validity fields |
 | `mindbridge-bench locomo-refined` | Raw LoCoMo-Refined predictions for another evaluator | An integrated benchmark score |
 | `mindbridge-bench local-index` | SQLite-to-Zvec ingestion, recall, latency, throughput, and disk use | Embedding or answer quality |
 
 Never point a benchmark at an application's live `data_dir`. One physical directory has one live
-MindBridge owner, and each independent benchmark unit needs its own directory.
+MindBridge owner, and each independent benchmark unit needs its own new directory.
 
-## Install the benchmark environment
+## Install and inspect tasks
 
-From the repository root, install the benchmark, local-model, and OpenAI-compatible model extras:
+From a repository checkout, install the model and dataset extras used by the evaluation harness:
 
 ```bash
 uv sync --locked --default-index https://pypi.org/simple \
   --extra benchmarks --extra local --extra openai
-uv run --frozen mindbridge-bench --help
 ```
 
-Media tasks also require `ffmpeg` and `ffprobe`. M3-Bench web media requires `yt-dlp`. These are
-system tools, not Python dependencies managed by this project.
+Media tasks also need `ffmpeg` and `ffprobe`, and M3-Bench web media needs `yt-dlp`. These are
+system tools, not Python dependencies this project manages.
 
-## Discover tasks before downloading
-
-The catalog is executable documentation. List its groups, concrete task names, pinned revisions,
-and local readiness without downloading anything:
+List the current task groups, pinned revisions, and local-data readiness:
 
 ```bash
-uv run --frozen mindbridge-bench eval --list-tasks
+mindbridge-bench eval --list-tasks
 ```
 
-`--tasks` accepts a concrete task, a group such as `m3-bench`, a comma-separated selection, or a
-glob such as `video-*`. Prefer the listing over copying a task name or revision from this page.
+The catalog currently covers LoCoMo-Refined, M3-Bench, Video-MME and Video-MME-v2,
+EgoLifeQA, EgoMemReason, EgoTempo, MemLens, MM-Lifelong, SuperMemory-VQA, ATM-Bench,
+Mem-Gallery, LongMemEval, CL-Bench, BEAM, PersonaMem-v3, and OpenEQA. Use the listing command
+instead of copying task names from this page; it is generated from the catalog used by the
+runner.
 
-If inputs are already present, validate their schema and digests without creating a run directory,
-loading a model, or contacting a provider:
+Review each printed repository and revision before downloading data. Upstream terms vary:
+LoCoMo-Refined and PersonaMem-v3 are CC BY-NC 4.0, MM-Lifelong is academic-only and restricts
+redistribution or modification without prior approval, and CL-Bench carries an evaluation-only
+license that forbids training, fine-tuning or distilling on the corpus. MindBridge's license does
+not replace those terms; see the
+[scorer notices](../src/mindbridge/benchmarks/_official/NOTICE.md).
+
+## Run an evaluation
+
+Set credentials for the OpenAI-compatible generation endpoint, then select a task or group:
 
 ```bash
-uv run --frozen mindbridge-bench eval \
-  --tasks locomo-refined \
-  --check-integrity \
-  --no-download
-```
+export OPENAI_API_KEY="..."
 
 The JSON response reports `unit_count`, `question_count`, `dataset_sha256`, and
 `evaluation_sha256` for each selected task.
@@ -95,9 +98,12 @@ uv run --frozen mindbridge-bench eval \
   --tasks locomo-refined \
   --limit 10 \
   --seed 42 \
-  --output-path .benchmarks/results/locomo-qwen3-14b
+  --output-path .benchmarks/results/smoke
 ```
 
+`--limit` accepts an absolute unit count, a fraction between zero and one, or `all` (equivalently
+`-1`) for every unit. It is not always a question count: one memory unit may contain several
+questions. Use the emitted `question_count` when reporting sample size.
 The runner also accepts `--judge-model-args model=...,base_url=...,api_key=...,timeout_seconds=...`.
 Avoid putting a real key on a shared machine's command line. A non-official judge is allowed, but
 the affected metric is recorded with `official_metric: false`.
@@ -176,6 +182,9 @@ generation:
     chat_template_kwargs:
       enable_thinking: false
 ```
+
+That is exactly what `--gen-kwargs enable_thinking=false` writes, so a file that declares it does
+not need the flag.
 
 Omitted sections use the same defaults as a run without `--config`: a `jina-omni` embedder and an
 `openai` generation endpoint. The runner always replaces `data_dir` with isolated per-unit
@@ -374,52 +383,57 @@ the [scorer notices](../src/mindbridge/benchmarks/_official/NOTICE.md).
 
 ## Acquire and prepare data
 
-The runner downloads missing pinned annotations and supported media by default. Start with one task
-and a small limit: the `all` group can require hundreds of gigabytes.
+The runner downloads missing pinned annotations and supported media by default, and verifies a
+published digest when one is available. Start with one task and a small limit: the `all` group can
+require hundreds of gigabytes. Long videos are prepared as deterministic bounded clips cached under
+`.benchmarks/.prepared/`; preparation needs `ffmpeg` and `ffprobe`, and M3-Bench web media also
+needs `yt-dlp`.
 
 Use `--no-download` for an offline run. Override operator-managed inputs explicitly:
 
 ```bash
-uv run --frozen mindbridge-bench eval \
+mindbridge-bench eval \
   --tasks video-mme \
   --task-data video-mme=/datasets/video-mme/test.parquet \
   --media-root video-mme=/datasets/video-mme/videos \
-  --allow-unverified-data \
-  --limit 10 \
-  --output-path .benchmarks/results/video-mme-local
+  --allow-unverified-data
 ```
 
-`--allow-unverified-data` applies only to a selected task whose annotation path was overridden with
-`--task-data`; it bypasses that pinned dataset digest check. Media and all resolved inputs still
-contribute to `input_sha256` and `evaluation_sha256` in the result.
+`--allow-unverified-data` is required when an override does not match the catalog digest. The
+result records the resolved dataset and memory digests so such a run cannot be silently confused
+with the pinned release.
 
-Long videos are prepared as deterministic bounded clips and cached under
-`.benchmarks/.prepared/`. When preparation runs, the effective manifest is written to
-`OUTPUT/media-manifest.json`. A supplied `--media-manifest FILE` may provide prepared clips or text,
-but causal tasks require source intervals; only observations ending at or before a question cutoff
-are ingested. Relative paths are resolved from the supplied manifest.
+For a prepared causal stream, pass `--media-manifest FILE`. Causal tasks require source intervals;
+the runner ingests only observations ending at or before the question cutoff. Relative paths are
+resolved from the manifest file. When the runner prepares media itself, it writes
+`OUTPUT/media-manifest.json`; use that generated file as the format reference before supplying an
+operator-authored replacement.
 
-Some datasets need operator action:
+## OpenEQA episode histories
 
-- EgoTempo requires Ego4D authorization and AWS credentials.
-- OpenEQA publishes questions separately from episode histories. Supply HM3D or ScanNet frame
-  directories through `--media-root`, or place them under the catalog path shown by
-  `--list-tasks`. The runner accepts either a split directory or its `data/frames` parent.
-- A partial OpenEQA extraction fails with the count of missing selected episodes. OpenEQA limits
-  episodes, encodes frame histories at one frame per second, and adapts EM-EQA only; it does not
-  register the active-navigation A-EQA protocol.
+`openeqa-hm3d` and `openeqa-scannet` read one pinned question file --
+`data/open-eqa-v0.json`, 1,636 questions over 152 episodes -- but its episode histories are
+published separately and are not downloadable from here. Extract them into the catalog's own
+location, `.benchmarks/openeqa/data/frames/<split>/`, and the task runs with no extra flag;
+otherwise point at them:
 
-## Read and compare results
+```bash
+mindbridge-bench eval \
+  --tasks openeqa-hm3d \
+  --media-root openeqa-hm3d=/datasets/open-eqa/data/frames/hm3d-v0 \
+  --limit 1
+```
 
-A completed evaluation directory contains:
+A partial extraction fails rather than scoring the episodes that happen to be present, and the
+message names how many of the selected episodes are absent.
 
-- `samples.jsonl`: one prediction, metric set, evidence intervals, retrieval diagnostics, and
-  structured failure fields per question;
-- `results.json`: run and implementation identities, input digests, primary and secondary metric
-  summaries, cluster confidence intervals, performance, token use, abstentions, and
-  `samples_sha256`;
-- `media-manifest.json`: only when the runner prepared media;
-- `egomemreason_submission.json`: only for a complete valid EgoMemReason run.
+| Task | Episodes | Questions | Episode histories |
+| --- | --- | --- | --- |
+| `openeqa-hm3d` | 63 | 557 | 12 GB of RGB frames from the tarball the upstream `data/README.md` links, or re-extracted from HM3D with the Habitat simulator |
+| `openeqa-scannet` | 89 | 1,079 | ScanNet's own signed terms of use, then `data/scannet/extract-frames.py` for 62 GB and roughly eight hours |
+
+Either layout is accepted: the split directory itself, or the parent `data/frames` the upstream
+README documents.
 
 The following adapter and measurement details determine what the artifacts mean.
 
@@ -555,7 +569,14 @@ ranker over the same candidate pool, not a shuffled sample, so it adds no varian
 Measured recall and the random-ranker expectation are only available for tasks whose adapter
 carries gold evidence source IDs; when it does not, `retrieval.gold_evidence_key` is `null`,
 `retrieval.unavailable_reason` says so, and the controls are reported as missing rather than
-quietly omitted.
+quietly omitted. `performance.token_usage` also carries a `product` block: the tokens MindBridge itself spent
+(embedding, generation, transcription, description), summed only over modules whose usage is
+complete. The console table prints those with a trailing `*` when the run total is null because the
+judge omitted usage on some requests; the cost axis needs the product number and it is measured.
+Recall scores the retriever's own ranked list, recorded per sample as
+`ranked_source_ids` from a `search` at `RETRIEVAL_CANDIDATE_LIMIT`, never the evidence the
+generator cited; a labelled question whose run recorded no ranked list (a cached answer) is counted
+in `retrieval.unranked_labelled_question_count` instead of being scored as zero.
 
 ## Gold evidence per benchmark family
 
@@ -643,6 +664,18 @@ Three result fields carry a caveat that decides whether they can be quoted:
   none, is still not counted. Measured under the older exact-sentence detector, an EgoLifeQA slice
   reported 2 of 51 while 14 of 51 answers read as refusals; treat the field as a lower bound and
   read the predictions before drawing a conclusion about refusal rates.
+- **A task whose query prompt mandates a format or a refusal wording puts that wording into
+  retrieval, not only into generation.** `EvalQuestion.content` is what the runner passes to
+  `Memory.ask`, and `ask` takes one content input for both legs, so the instruction is matched
+  against memory alongside the question. MEMLENS is the extreme case: every one of its queries
+  carries `Answer with the exact amount (e.g., "$45.00") only.` and `answer exactly "Insufficient
+  information".`, so a retrieval rule keyed on literals the asker named -- numbers, dates, quoted
+  spans -- engages on 100 % of its questions on the strength of the template rather than the
+  question. The bare question is preserved as `EvalQuestion.source_question` and is what the
+  scorers and judges read, but no public surface routes it to retrieval while keeping the template
+  for generation. Read any retrieval-side result on a templated task as measuring the template
+  too, the same way the `[source_id: ...]` marker the runner prefixes to every stored memory is
+  part of what the full-text index sees.
 - **`retrieval_*` scores the retriever's ranked candidate list, not the answer's evidence.** The
   runner takes the top `retrieval_candidate_limit` (100) hits in score order through `search`, so
   a miss there is a retrieval failure. What the answer actually grounded on is separate:
@@ -665,8 +698,8 @@ Before reporting a number, check these task fields:
 | `dataset_sha256`, `evaluation_sha256`, `scorer_protocol`, and `judge_model` | Establish whether two runs are comparable |
 
 Prompts, references, and raw judge responses are retained only with `--log-samples`. Treat that
-option as sensitive because artifacts can contain licensed source content, retrieved evidence, and
-model responses.
+option as sensitive: benchmark artifacts can contain source content, retrieved evidence, and model
+responses.
 
 The runner fixes seeds and generation temperature, records model endpoints and scorer protocols,
 and marks whether each metric used the required official judge. A provider may still change an
@@ -711,26 +744,18 @@ it cannot say how much of a score came from memory. Use `--arms` for that.
 Compare a candidate with an equivalent baseline using stable sample IDs:
 
 ```bash
-uv run --frozen mindbridge-bench eval \
+mindbridge-bench eval \
   --tasks locomo-refined \
   --compare .benchmarks/results/baseline \
   --fail-on-regression \
-  --regression-threshold 0.01 \
-  --output-path .benchmarks/results/candidate
+  --regression-threshold 0.01
 ```
 
-Comparison rejects incompatible sample schemas, evaluation inputs, scorer protocols, judge
-identities, or scored sample IDs. `--fail-on-regression` exits nonzero when the upper endpoint of
-the candidate-minus-baseline 95% cluster interval is less than the negative threshold; any answer
-or ingest failure also produces a nonzero exit.
+The comparison rejects incompatible dataset, scorer, or judge identities. Any answer or ingest
+failure also makes `--fail-on-regression` exit nonzero.
 
-Use `--use-cache .benchmarks/response-cache` to reuse deterministic generation and judge responses
-across isolated reruns. The cache namespace includes implementation, model, task, and runner
-identities; it is an optimization, not a result artifact.
-
-For a publishable run, keep immutable model identifiers and report hardware, task selection,
-digests, recall limit, judge, seed, and whether the index was cold, warm, or optimized. Partial or
-unverified runs are suitable for development, not leaderboard comparison.
+Use `--use-cache .benchmarks/response-cache` to persist deterministic generation responses across
+isolated reruns. The cache is an optimization, not a substitute for the result artifacts.
 
 ## Produce raw LoCoMo-Refined predictions
 
@@ -779,7 +804,8 @@ throughput come from the `ingest` block of an `eval` run, which drives the publi
 
 ## Preserve isolation and artifacts
 
-The evaluation runner allocates one physical store per independent unit:
+The evaluation runner allocates one physical store per independent unit, atomically. Each path
+component is the label base32-encoded, so no dataset identifier reaches the filesystem verbatim:
 
 ```text
 .benchmarks/data/
@@ -789,12 +815,45 @@ The evaluation runner allocates one physical store per independent unit:
         └── unit-<encoded-unit-b>/  # a different physical store
 ```
 
-Harness labels belong to the filesystem, not the product API. Do not encode benchmark, account,
-request, or user scope as hidden fields or metadata. Distinct directories may run concurrently;
-the same directory has one live owner. CUDA evaluations also take a per-device process lock unless
-an external scheduler owns admission control.
+Harness labels belong to the filesystem, not the product API. Do not pass them into `Memory.add`,
+store them as hidden product fields, or treat metadata as an isolation boundary. Distinct unit
+directories may run concurrently; the same directory has one live owner. Evaluation CUDA runs also
+take a per-device process lock unless an external scheduler owns admission control.
 
-Custom behavior benchmarks must call the public `mindbridge` SDK. The local-index command is the
-only documented direct-adapter exception. Benchmark directories may contain licensed data,
-embeddings, prompts, and responses, so restrict their permissions and publish only artifacts the
-upstream terms allow.
+Custom behavior benchmarks must use only the public SDK: create a directory, construct `Memory`,
+ingest through `add` or `add_many`, query through `search` or `ask`, score public return values, and
+close the instance before archiving artifacts. The local-index command is the only documented
+direct-adapter exception.
+
+## Local-index microbenchmark
+
+The synthetic benchmark isolates the SQLite-to-Zvec storage path:
+
+```bash
+mindbridge-bench local-index \
+  --data-dir .benchmarks/local-index/trial-001 \
+  --rows 1000 \
+  --dimension 128 \
+  --queries 20 \
+  --k 10 \
+  --seed 42 \
+  --quantization none
+```
+
+`--data-dir` must be empty. The JSON result reports ingest and optimization time, recall at `k`
+against exact search, query latency percentiles and throughput, plus SQLite, Zvec, and total bytes.
+Run each quantization mode against a separate directory.
+
+This command deliberately measures local adapters directly, which is the narrow storage
+microbenchmark exception in `AGENTS.md`, not a second product API. Its JSON therefore labels
+itself with `scope: storage_microbenchmark` and an `excludes` list. Its `ingest_seconds` is a
+synthetic-vector storage number and is not the product ingest figure: it never embeds, routes a
+modality, prepares media, grounds an answer, or touches `Memory`. The product ingest latency and
+throughput come from the `ingest` block of an `eval` run, which drives the public SDK.
+
+## Artifact safety
+
+Benchmark directories may contain licensed dataset content, embeddings, prompts, and responses.
+Apply the upstream terms reviewed before download, restrict artifact permissions, and remove the
+artifacts when the experiment no longer needs them. Do not publish raw samples merely because the
+aggregate metric is publishable.

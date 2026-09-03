@@ -10,7 +10,7 @@ import sqlite3
 import struct
 import unicodedata
 import uuid
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -34,7 +34,12 @@ from mindbridge.types import (
     SpeakerSegment,
 )
 
-_SCHEMA_VERSION = 12
+_SCHEMA_VERSION = 13
+# `visual_descriptions` is the newest step, so a store one migration behind is at this version.
+# Derived rather than written out because parallel work on this repository renumbers schema steps:
+# moving this one is then a change to `_SCHEMA_VERSION` alone. Whoever adds the *next* step must
+# pin this to its own literal, because it will no longer be the last.
+_PRE_VISUAL_DESCRIPTION_VERSION = _SCHEMA_VERSION - 1
 _SQLITE_PARAMETER_BATCH = 900
 # Kinds whose claims can contradict inside one lineage. This must stay the set the context
 # compiler reports conflicts for; `tests/unit/test_memory_control_plane.py` asserts they agree,
@@ -66,6 +71,7 @@ _REQUIRED_TABLES = frozenset(
         "identity_link_evidence",
         "speech_analyses",
         "speech_segments",
+        "visual_descriptions",
         "store_metadata",
         "formation_runs",
         "memory_evidence",
@@ -467,7 +473,24 @@ CREATE INDEX memory_records_place_idx
     WHERE place_id IS NOT NULL
 """
 
-_SCHEMA_V12 = f"""
+# A derived caption is a paid model call whose output is indexed text, so it is cached per asset
+# *content* -- `media_assets` enforces `asset_id = sha256`, so this key is the asset's own digest
+# and a second memory over the same bytes reuses the row. `space_id` is the describer's
+# `vision_space`, which covers the prompt as well as the model, and it is part of the primary key
+# rather than a plain column (as on `speech_analyses`) so two describers can hold their own caption
+# for one asset instead of the newer recipe evicting the older one.
+_VISUAL_DESCRIPTION_DDL = """
+CREATE TABLE visual_descriptions (
+    asset_id TEXT NOT NULL REFERENCES media_assets (asset_id) ON DELETE CASCADE,
+    space_id TEXT NOT NULL CHECK (length(trim(space_id)) > 0),
+    model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
+    description TEXT NOT NULL CHECK (length(trim(description)) > 0),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (asset_id, space_id)
+)
+"""
+
+_SCHEMA_CURRENT = f"""
 BEGIN IMMEDIATE;
 
 CREATE TABLE memory_records (
@@ -534,7 +557,9 @@ CREATE INDEX search_index_queue_order_idx
 
 {_INDEX_TRIGGERS}
 
-PRAGMA user_version = 12;
+{_VISUAL_DESCRIPTION_DDL};
+
+PRAGMA user_version = {_SCHEMA_VERSION};
 COMMIT;
 """
 
@@ -1132,7 +1157,6 @@ class LocalStore:
             _reproject_named_identities(
                 connection,
                 tuple(memory.memory_id for memory in supplied_memories),
-                changed_at=datetime.now(timezone.utc),
             )
         return tuple(created_flags)
 
@@ -1437,7 +1461,6 @@ class LocalStore:
                 connection,
                 tuple(memory.memory_id for memory in supplied_memories)
                 + tuple(memory_id for memory_id, _source, _confidence in evidence),
-                changed_at=completed_at,
             )
             connection.executemany(
                 """
@@ -1542,7 +1565,7 @@ class LocalStore:
             )
             # Independent evidence is what makes an inferred naming assertion visible, so it is
             # also what can move the projection.
-            _reproject_named_identities(connection, (memory_id,), changed_at=recorded_at)
+            _reproject_named_identities(connection, (memory_id,))
             return added
 
     def apply_control_operation(
@@ -1600,11 +1623,7 @@ class LocalStore:
             forgotten = _set_forgotten(connection, forget_ids, forgotten_at=operation.applied_at)
             _require_every(forgotten, forget_ids, "forget")
             changed.extend(forgotten)
-            _reproject_named_identities(
-                connection,
-                (*changed, *correct_ids, *forget_ids),
-                changed_at=operation.applied_at,
-            )
+            _reproject_named_identities(connection, (*changed, *correct_ids, *forget_ids))
             applied = replace(
                 operation,
                 changed_ids=tuple(dict.fromkeys(changed)),
@@ -1676,7 +1695,6 @@ class LocalStore:
                     *(entry if isinstance(entry, str) else entry[0] for entry in restore_versions),
                     *clear_forgotten,
                 ),
-                changed_at=reverted_at,
             )
             connection.execute(
                 "UPDATE memory_operations SET rolled_back_at = ? WHERE operation_id = ?",
@@ -1800,29 +1818,80 @@ class LocalStore:
                 context=contexts.get(_row_text(row, "memory_id")),
             )
             for row in rows
-            if not active_only
-            or (
-                row["forgotten_at"] is None
-                and (
-                    (
-                        # A record with no `memory_semantics` row declares no validity interval, so
-                        # it is valid at every `valid_at` exactly like a version row whose
-                        # `valid_from` and `valid_until` are NULL; only recorded time can exclude
-                        # it, and there `created_at` is the honest bound. `near` is separate and
-                        # spatial: a record with no pose is not at any location, so it drops just
-                        # as a semantic row without a pose does above.
-                        near is None
-                        and _row_text(row, "memory_id") not in semantic_ids
-                        and (
-                            known_at is None
-                            or _parse_datetime(_row_text(row, "created_at")) <= known_at
-                        )
-                    )
-                    or _row_text(row, "memory_id") in contexts
-                )
+            if _memory_in_scope(
+                row,
+                active_only=active_only,
+                known_at=known_at,
+                near=near,
+                semantic_ids=semantic_ids,
+                scoped_ids=contexts.keys(),
             )
         }
         return tuple(by_id[memory_id] for memory_id in memory_ids if memory_id in by_id)
+
+    def count_memories(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        valid_at: datetime | None = None,
+        known_at: datetime | None = None,
+        near: SpatialContext | None = None,
+        radius_m: float | None = None,
+        place_id: str | None = None,
+        active_only: bool = False,
+    ) -> int:
+        """Count what `read_memories` would return for the same arguments.
+
+        Applies every scope predicate through the same selection pass, and reads neither
+        content, media assets, nor typed context rows: a caller that only needs the number of
+        surviving memories must not pay for the records.
+        """
+        if not memory_ids:
+            return 0
+        for memory_id in memory_ids:
+            _require_identifier(memory_id, "memory_id")
+        _require_optional_identifier(place_id, "place_id")
+        place_clause = "" if place_id is None else "AND place_id = ?"
+        place_parameters: tuple[object, ...] = () if place_id is None else (place_id,)
+        by_id: dict[str, sqlite3.Row] = {}
+        with self._read_transaction() as connection:
+            for offset in range(0, len(memory_ids), _SQLITE_PARAMETER_BATCH):
+                batch = memory_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+                placeholders = ", ".join("?" for _memory_id in batch)
+                for row in connection.execute(
+                    f"""
+                    SELECT memory_id, created_at, forgotten_at
+                    FROM memory_records
+                    WHERE memory_id IN ({placeholders})
+                    {place_clause}
+                    """,
+                    (*batch, *place_parameters),
+                ).fetchall():
+                    by_id[_row_text(row, "memory_id")] = row
+            scoped, semantic_ids = _select_memory_contexts(
+                connection,
+                tuple(memory_ids),
+                valid_at=valid_at,
+                known_at=known_at,
+                near=near,
+                radius_m=radius_m,
+                active_only=active_only,
+            )
+        surviving = {
+            memory_id
+            for memory_id, row in by_id.items()
+            if _memory_in_scope(
+                row,
+                active_only=active_only,
+                known_at=known_at,
+                near=near,
+                semantic_ids=semantic_ids,
+                scoped_ids=scoped.keys(),
+            )
+        }
+        # Counted per requested ID, not per distinct row, because `read_memories` repeats a
+        # memory that its caller asked for twice.
+        return sum(1 for memory_id in memory_ids if memory_id in surviving)
 
     def embedding_ids_in_range(
         self,
@@ -1970,11 +2039,7 @@ class LocalStore:
             return ()
         with self._transaction() as connection:
             changed = _set_forgotten(connection, ids, forgotten_at=forgotten_at)
-            _reproject_named_identities(
-                connection,
-                changed,
-                changed_at=forgotten_at or datetime.now(timezone.utc),
-            )
+            _reproject_named_identities(connection, changed)
             return changed
 
     def delete_memory(self, memory_id: str) -> bool:
@@ -2137,7 +2202,7 @@ class LocalStore:
                 kind,
                 changed_at=changed_at,
             )
-        _reproject_identities(connection, named_identities, changed_at=changed_at)
+        _reproject_identities(connection, named_identities)
         unreferenced = self._read_unreferenced_assets(
             connection,
             tuple(dict.fromkeys(linked_ids)),
@@ -2224,6 +2289,78 @@ class LocalStore:
             cursor = connection.executemany(
                 "UPDATE media_assets SET transcript = ? WHERE asset_id = ?",
                 ((text, asset_id) for asset_id, text in supplied),
+            )
+        return cursor.rowcount
+
+    def read_visual_descriptions(
+        self,
+        asset_ids: Sequence[str],
+        *,
+        space_id: str,
+    ) -> dict[str, str]:
+        """Return the cached caption for every supplied asset described in this vision space.
+
+        Batched because the write path describes a whole `add_many` at once, and an asset with no
+        caption in this space is simply absent rather than an error: a miss is the normal state.
+        """
+        _require_identifier(space_id, "vision space_id")
+        for asset_id in asset_ids:
+            _sha256(asset_id)
+        if not asset_ids:
+            return {}
+        unique_ids = tuple(dict.fromkeys(asset_ids))
+        found: dict[str, str] = {}
+        with self._connection() as connection:
+            for offset in range(0, len(unique_ids), _SQLITE_PARAMETER_BATCH):
+                batch = unique_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+                placeholders = ", ".join("?" for _asset_id in batch)
+                found.update(
+                    (_row_text(row, "asset_id"), _row_text(row, "description"))
+                    for row in connection.execute(
+                        f"""
+                        SELECT asset_id, description
+                        FROM visual_descriptions
+                        WHERE space_id = ? AND asset_id IN ({placeholders})
+                        """,
+                        (space_id, *batch),
+                    ).fetchall()
+                )
+        return found
+
+    def write_visual_descriptions(
+        self,
+        descriptions: Mapping[str, str],
+        *,
+        model_id: str,
+        space_id: str,
+    ) -> int:
+        """Cache derived captions for stored assets in one durable SQLite transaction.
+
+        An asset already described in this space keeps its stored caption: the point of the row is
+        that two ingests of one picture build the same document, so a concurrent writer that
+        described the same bytes first wins and the later caption is dropped.
+        """
+        _require_identifier(model_id, "vision model_id")
+        _require_identifier(space_id, "vision space_id")
+        for asset_id, description in descriptions.items():
+            _sha256(asset_id)
+            if not isinstance(description, str) or not description.strip():
+                raise ValueError("visual description must not be blank")
+        if not descriptions:
+            return 0
+        now = _datetime_text(datetime.now(timezone.utc))
+        with self._transaction() as connection:
+            cursor = connection.executemany(
+                """
+                INSERT INTO visual_descriptions (
+                    asset_id, space_id, model_id, description, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (asset_id, space_id) DO NOTHING
+                """,
+                (
+                    (asset_id, space_id, model_id, description, now)
+                    for asset_id, description in descriptions.items()
+                ),
             )
         return cursor.rowcount
 
@@ -3060,7 +3197,7 @@ class LocalStore:
             )
             connection.execute("DELETE FROM identities WHERE identity_id = ?", (source,))
             if _has_naming_assertion(connection, target):
-                _reproject_identities(connection, (target,), changed_at=_parse_datetime(now))
+                _reproject_identities(connection, (target,))
             self._replace_memory_embeddings(
                 connection,
                 supplied_memories,
@@ -3192,7 +3329,7 @@ class LocalStore:
                 modality=modality,
             )
             if _has_naming_assertion(connection, target):
-                _reproject_identities(connection, (target,), changed_at=_parse_datetime(now))
+                _reproject_identities(connection, (target,))
             self._replace_memory_embeddings(
                 connection,
                 supplied_memories,
@@ -3781,6 +3918,10 @@ class LocalStore:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version == 11:
                 _migrate_v11(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            # Last rung, which is what `_PRE_VISUAL_DESCRIPTION_VERSION` assumes.
+            if version == _PRE_VISUAL_DESCRIPTION_VERSION:
+                _migrate_visual_descriptions(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
@@ -4522,7 +4663,7 @@ def _create_schema(
     if existing_tables:
         raise UnsupportedSchemaError("local data directory contains an unversioned SQLite schema")
     try:
-        connection.executescript(_SCHEMA_V12)
+        connection.executescript(_SCHEMA_CURRENT)
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -4761,6 +4902,21 @@ def _migrate_v11(connection: sqlite3.Connection) -> None:
         for statement in _OPERATION_INTENT_REBUILD_DDL:
             connection.execute(statement)
         connection.execute("PRAGMA user_version = 12")
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def _migrate_visual_descriptions(connection: sqlite3.Connection) -> None:
+    """Add the caption cache to an existing store. Purely additive: no row is read or rewritten."""
+    has_descriptions = "visual_descriptions" in _table_names(connection)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if not has_descriptions:
+            connection.execute(_VISUAL_DESCRIPTION_DDL)
+        connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         connection.commit()
     except BaseException:
         if connection.in_transaction:
@@ -5389,8 +5545,6 @@ def _naming_assertion_identities(
 def _reproject_identities(
     connection: sqlite3.Connection,
     identity_ids: Sequence[str],
-    *,
-    changed_at: datetime,
 ) -> tuple[str, ...]:
     """Recompute `identities.name` from each identity's current visible naming assertion.
 
@@ -5398,8 +5552,14 @@ def _reproject_identities(
     retired, hidden, re-pointed or deleted, the registry is recomputed in the same transaction,
     so `identities.name` is never a name no visible assertion supports. Returns the identities
     whose projection actually moved, which is what a caller has to repaint indexed text for.
+
+    `identities.updated_at` is transaction time and is taken here rather than from the caller.
+    Every path that moves the projection carries a semantic time of its own -- a record's
+    `recorded_at`, an operation's `applied_at`, a `forgotten_at` a host may deliberately backdate
+    -- and none of them says when this row changed. Stamping one of those could put `updated_at`
+    before the row's own `created_at`, which the schema refuses.
     """
-    now = _datetime_text(changed_at)
+    now = _datetime_text(datetime.now(timezone.utc))
     changed: list[str] = []
     for identity_id in dict.fromkeys(identity_ids):
         current = connection.execute(
@@ -5434,14 +5594,12 @@ def _reproject_identities(
 def _reproject_named_identities(
     connection: sqlite3.Connection,
     memory_ids: Sequence[str],
-    *,
-    changed_at: datetime,
 ) -> tuple[str, ...]:
     """Reproject every identity named by one of these records. The projection hook."""
     identity_ids = _naming_assertion_identities(connection, memory_ids)
     if not identity_ids:
         return ()
-    return _reproject_identities(connection, identity_ids, changed_at=changed_at)
+    return _reproject_identities(connection, identity_ids)
 
 
 def _rebind_unlinked_claims(
@@ -6126,7 +6284,42 @@ def _memory_from_row(
     )
 
 
-def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydration pass
+def _memory_in_scope(
+    row: sqlite3.Row,
+    *,
+    active_only: bool,
+    known_at: datetime | None,
+    near: SpatialContext | None,
+    semantic_ids: frozenset[str],
+    scoped_ids: Collection[str],
+) -> bool:
+    """Decide whether one `memory_records` row survives the requested scope.
+
+    `row` needs only `memory_id`, `created_at`, and `forgotten_at`, so both the scoped hydration
+    and the scoped count reach this one predicate.
+    """
+    if not active_only:
+        return True
+    # Forgetting is a column, not a deletion: the row stays readable by ID and drops out of every
+    # active slate, whatever its validity interval or pose says.
+    if row["forgotten_at"] is not None:
+        return False
+    memory_id = _row_text(row, "memory_id")
+    if memory_id in scoped_ids:
+        return True
+    # A record with no `memory_semantics` row declares no validity interval, so it is valid at
+    # every `valid_at` exactly like a version row whose `valid_from` and `valid_until` are NULL;
+    # only recorded time can exclude it, and there `created_at` is the honest bound. `near` is
+    # separate and spatial: a record with no pose is not at any location, so it drops just as a
+    # semantic row without a pose does in the selection pass.
+    return (
+        near is None
+        and memory_id not in semantic_ids
+        and (known_at is None or _parse_datetime(_row_text(row, "created_at")) <= known_at)
+    )
+
+
+def _select_memory_contexts(  # noqa: C901 - one authoritative bitemporal selection pass
     connection: sqlite3.Connection,
     memory_ids: Sequence[str],
     *,
@@ -6135,7 +6328,12 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
     near: SpatialContext | None = None,
     radius_m: float | None = None,
     active_only: bool = False,
-) -> tuple[dict[str, MemoryContext], frozenset[str]]:
+) -> tuple[dict[str, tuple[sqlite3.Row, SpatialContext | None]], frozenset[str]]:
+    """Choose the one current version row per memory and apply every scope predicate.
+
+    Shared by `read_memories` and `count_memories` so a scoped count cannot drift from the
+    scoped hydration it predicts.
+    """
     if not memory_ids:
         return {}, frozenset()
     if (near is None) != (radius_m is None):
@@ -6157,7 +6355,6 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
     query_known_at = known_at or datetime.now(timezone.utc)
 
     rows: list[sqlite3.Row] = []
-    evidence: dict[str, list[str]] = {}
     for offset in range(0, len(memory_ids), _SQLITE_PARAMETER_BATCH):
         batch = memory_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
         placeholders = ", ".join("?" for _memory_id in batch)
@@ -6183,27 +6380,6 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
                 tuple(batch),
             ).fetchall()
         )
-        evidence_time = (
-            "retired_at IS NULL"
-            if known_at is None
-            else "recorded_at <= ? AND (retired_at IS NULL OR retired_at > ?)"
-        )
-        evidence_parameters: tuple[object, ...] = tuple(batch)
-        if known_at is not None:
-            known_text = _datetime_text(known_at)
-            evidence_parameters += (known_text, known_text)
-        for row in connection.execute(
-            f"""
-            SELECT memory_id, source_memory_id
-            FROM memory_evidence
-            WHERE memory_id IN ({placeholders}) AND {evidence_time}
-            ORDER BY memory_id, position
-            """,
-            evidence_parameters,
-        ).fetchall():
-            evidence.setdefault(_row_text(row, "memory_id"), []).append(
-                _row_text(row, "source_memory_id")
-            )
 
     semantic_ids = frozenset(_row_text(row, "semantic_memory_id") for row in rows)
     selected: dict[str, sqlite3.Row] = {}
@@ -6225,7 +6401,7 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
             continue
         selected[memory_id] = row
 
-    contexts: dict[str, MemoryContext] = {}
+    scoped: dict[str, tuple[sqlite3.Row, SpatialContext | None]] = {}
     for memory_id, row in selected.items():
         spatial: SpatialContext | None = None
         if row["spatial_frame_id"] is not None:
@@ -6266,6 +6442,32 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
             tolerance += near.position_uncertainty_m or 0.0
             if distance > tolerance:
                 continue
+        scoped[memory_id] = (row, spatial)
+    return scoped, semantic_ids
+
+
+def _read_memory_contexts(
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+    *,
+    valid_at: datetime | None = None,
+    known_at: datetime | None = None,
+    near: SpatialContext | None = None,
+    radius_m: float | None = None,
+    active_only: bool = False,
+) -> tuple[dict[str, MemoryContext], frozenset[str]]:
+    scoped, semantic_ids = _select_memory_contexts(
+        connection,
+        memory_ids,
+        valid_at=valid_at,
+        known_at=known_at,
+        near=near,
+        radius_m=radius_m,
+        active_only=active_only,
+    )
+    evidence = _read_memory_evidence(connection, tuple(scoped), known_at=known_at)
+    contexts: dict[str, MemoryContext] = {}
+    for memory_id, (row, spatial) in scoped.items():
         retired_at = _optional_datetime_from_row(row, "retired_at")
         if known_at is not None and retired_at is not None and known_at < retired_at:
             retired_at = None
@@ -6296,6 +6498,40 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
             arousal=None if row["arousal"] is None else float(row["arousal"]),
         )
     return contexts, semantic_ids
+
+
+def _read_memory_evidence(
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+    *,
+    known_at: datetime | None,
+) -> dict[str, list[str]]:
+    evidence: dict[str, list[str]] = {}
+    evidence_time = (
+        "retired_at IS NULL"
+        if known_at is None
+        else "recorded_at <= ? AND (retired_at IS NULL OR retired_at > ?)"
+    )
+    for offset in range(0, len(memory_ids), _SQLITE_PARAMETER_BATCH):
+        batch = memory_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+        placeholders = ", ".join("?" for _memory_id in batch)
+        parameters: tuple[object, ...] = tuple(batch)
+        if known_at is not None:
+            known_text = _datetime_text(known_at)
+            parameters += (known_text, known_text)
+        for row in connection.execute(
+            f"""
+            SELECT memory_id, source_memory_id
+            FROM memory_evidence
+            WHERE memory_id IN ({placeholders}) AND {evidence_time}
+            ORDER BY memory_id, position
+            """,
+            parameters,
+        ).fetchall():
+            evidence.setdefault(_row_text(row, "memory_id"), []).append(
+                _row_text(row, "source_memory_id")
+            )
+    return evidence
 
 
 def _access_count(value: object) -> int:

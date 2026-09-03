@@ -127,8 +127,7 @@ adapters directly.
 Stable Python imports are re-exported from `mindbridge`. Stable REST routes are under `/v1`, with
 one error envelope documented in [the REST reference](docs/api/rest.md). The MCP adapter exposes
 fifteen tools documented in [the MCP reference](docs/api/mcp.md). Update tests and docs in the
-same
-change whenever any surface changes.
+same change whenever any surface changes.
 
 The embedded release is a breaking line from the former service architecture. Do not restore
 removed scoping parameters, service configuration, or compatibility aliases. Applications that

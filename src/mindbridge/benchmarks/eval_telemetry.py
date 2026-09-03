@@ -33,6 +33,7 @@ from mindbridge._telemetry import (
     TOKEN_REPORTED_REQUEST_COUNT,
     TOKEN_TOTAL,
     TRACER_NAME,
+    VISION_BATCHES_FAILED,
     token_modality_attribute,
 )
 from mindbridge.benchmarks.eval_statistics import percentile
@@ -55,6 +56,7 @@ ANSWER_SPAN = "mindbridge.ask"
 SEARCH_SPAN = "mindbridge.retrieve"
 TRANSCRIPTION_SPAN = "mindbridge.model.transcription"
 TRANSCRIPTION_MODULE = "transcription"
+JUDGE_MODULE = "judge"
 
 # ponytail: per-span durations are retained so p50/p95/p99 are exact rather than estimated.
 # One int per span keeps a 100k-question run under a megabyte; past the cap the percentiles
@@ -248,6 +250,7 @@ class _TaskTelemetry:
     tokens_by_module: dict[str, _Tokens] = field(default_factory=dict)
     media_elided_hits: int = 0
     dropped_hits: int = 0
+    vision_failed_batches: int = 0
     ingest_items: int = 0
 
     def add(self, span: ReadableSpan) -> None:
@@ -273,8 +276,31 @@ class _TaskTelemetry:
             self.tokens.add(attributes)
             self.media_elided_hits += _int_attribute(attributes, GROUNDING_MEDIA_ELIDED) or 0
             self.dropped_hits += _int_attribute(attributes, GROUNDING_HITS_DROPPED) or 0
+            self.vision_failed_batches += _int_attribute(attributes, VISION_BATCHES_FAILED) or 0
             module = _string_attribute(attributes, MODEL_MODULE) or "unknown"
             self.tokens_by_module.setdefault(module, _Tokens()).add(attributes)
+
+    def _product_tokens_json(self, question_count: int) -> dict[str, object]:
+        """Sum the modules MindBridge itself spends, leaving the judge out.
+
+        `token_usage.complete` is an AND over every module, so one judge request without usage
+        nulled the whole task's total while the product's own cost -- embedding, generation,
+        transcription, description -- was fully reported. The cost axis needs that number.
+        """
+        modules = {
+            name: value for name, value in self.tokens_by_module.items() if name != JUDGE_MODULE
+        }
+        complete = all(
+            value.complete and value.expected_request_count == value.reported_request_count
+            for value in modules.values()
+        )
+        total = sum(value.total_tokens for value in modules.values())
+        return {
+            "modules": sorted(modules),
+            "complete": complete,
+            "total_tokens": total if complete else None,
+            "average_tokens": total / question_count if complete and question_count else None,
+        }
 
     def _ingest_json(self) -> dict[str, object]:
         """Report accepted input to durable, searchable memory plus sustained throughput.
@@ -380,11 +406,16 @@ class _TaskTelemetry:
                     name: value.json(question_count)
                     for name, value in sorted(self.tokens_by_module.items())
                 },
+                "product": self._product_tokens_json(question_count),
             },
             "grounding": {
                 "media_elided_hits": self.media_elided_hits,
                 "dropped_hits": self.dropped_hits,
             },
+            # Write-path loss, not answer-path loss, so it is its own block: a describer whose
+            # reply could not be used leaves a media memory with no full-text document, which is
+            # invisible in a token count because a failed batch reports no tokens.
+            "vision": {"failed_batches": self.vision_failed_batches},
         }
 
 
