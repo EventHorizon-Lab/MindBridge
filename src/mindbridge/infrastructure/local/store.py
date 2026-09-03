@@ -681,6 +681,16 @@ class UnsupportedSchemaError(RuntimeError):
     """Raised when the data directory has an unknown or incomplete schema."""
 
 
+class StaleOperationError(RuntimeError):
+    """Raised when a control-plane operation's preconditions moved before it committed.
+
+    The control plane reads and validates records, then applies them in a later transaction. The
+    apply transaction re-checks the preconditions the proposal was built on; when a target or
+    cited source was forgotten, corrected, deleted, or already linked in between, nothing is
+    written and the caller reports the proposal as stale rather than partially applying it.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class StoredAsset:
     """Immutable metadata for one content-addressed local media asset."""
@@ -1271,6 +1281,7 @@ class LocalStore:
         completed_at: datetime,
         operation: StoredOperation | None = None,
         forget_ids: Sequence[str] = (),
+        require_active: Sequence[str] = (),
     ) -> bool:
         """Commit derived records, evidence, and source completion in one transaction.
 
@@ -1279,6 +1290,9 @@ class LocalStore:
         is written and the derived record stays open to further independent evidence.
         `forget_ids` is consolidation forgetting: sources the derived record replaces in ordinary
         recall, retired in this same commit and cleared again by rolling the operation back.
+        `require_active` names memories that must still exist and still be un-forgotten inside
+        this transaction; if any moved since the caller validated it, nothing is written and
+        `StaleOperationError` is raised.
         """
         supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
             memories,
@@ -1297,6 +1311,7 @@ class LocalStore:
                 and _active_operation_id(connection, operation.operation_key) is not None
             ):
                 return False
+            _require_active(connection, require_active)
             if any(
                 connection.execute(
                     """
@@ -1439,11 +1454,18 @@ class LocalStore:
         reinforce: Sequence[tuple[str, str]] = (),
         correct_ids: Sequence[str] = (),
         forget_ids: Sequence[str] = (),
+        require_active: Sequence[str] = (),
     ) -> StoredOperation | None:
         """Apply one already-validated operation and its log row in one transaction.
 
         The caller owns policy; this only executes the supplied effects. It returns `None` when
         the operation key is already applied and not rolled back.
+
+        `require_active` names memories the caller validated and that must still exist and still
+        be un-forgotten here. That check and the all-or-nothing effect check below are what make
+        the gap between validation and this transaction safe: a target or source that moved in
+        between raises `StaleOperationError` with nothing written, so the log never claims an
+        effect that did not happen.
         """
         for memory_id, source_memory_id in reinforce:
             _require_identifier(memory_id, "memory_id")
@@ -1453,22 +1475,27 @@ class LocalStore:
         with self._transaction() as connection:
             if _active_operation_id(connection, operation.operation_key) is not None:
                 return None
+            _require_active(connection, require_active)
             changed: list[str] = []
             linked: list[tuple[str, str]] = []
             for memory_id, source_memory_id in reinforce:
-                if _add_memory_evidence(
+                if not _add_memory_evidence(
                     connection,
                     memory_id,
                     source_memory_id,
                     confidence=_asserted_confidence(connection, memory_id),
                     recorded_at=operation.applied_at,
                 ):
-                    changed.append(memory_id)
-                    linked.append((memory_id, source_memory_id))
-            changed.extend(
-                _retire_memory_versions(connection, correct_ids, retired_at=operation.applied_at)
+                    raise StaleOperationError(f"{source_memory_id} already supports {memory_id}")
+                changed.append(memory_id)
+                linked.append((memory_id, source_memory_id))
+            retired = _retire_memory_versions(
+                connection, correct_ids, retired_at=operation.applied_at
             )
+            _require_every(retired, correct_ids, "retire")
+            changed.extend(retired)
             forgotten = _set_forgotten(connection, forget_ids, forgotten_at=operation.applied_at)
+            _require_every(forgotten, forget_ids, "forget")
             changed.extend(forgotten)
             applied = replace(
                 operation,
@@ -4616,6 +4643,25 @@ def _add_memory_evidence(
         return True
     _refresh_evidence_projection(connection, memory_id, tx_time)
     return True
+
+
+def _require_active(connection: sqlite3.Connection, memory_ids: Sequence[str]) -> None:
+    """Fail the transaction unless every named memory still exists and is still un-forgotten."""
+    for memory_id in dict.fromkeys(memory_ids):
+        _require_identifier(memory_id, "memory_id")
+        row = connection.execute(
+            "SELECT 1 FROM memory_records WHERE memory_id = ? AND forgotten_at IS NULL",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            raise StaleOperationError(f"{memory_id} is no longer active")
+
+
+def _require_every(changed: Sequence[str], requested: Sequence[str], effect: str) -> None:
+    """Fail the transaction unless every requested target actually took the effect."""
+    if set(changed) != set(requested):
+        missing = sorted(set(requested) - set(changed))
+        raise StaleOperationError(f"could not {effect} {', '.join(missing)}")
 
 
 def _set_forgotten(

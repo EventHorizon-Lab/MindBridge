@@ -139,7 +139,7 @@ _QUERY_METAVAR: Mapping[str, str] = {
 _DEFAULT_REMOTE_TIMEOUT_SECONDS = 30.0
 # One list, because a slot added to `recipes` used to need remembering in four separate literals
 # here; the flag, the explain document, `doctor`, and the composition guard all derive from it.
-_SLOTS: tuple[str, ...] = ("embedder", "answerer", "former", "transcriber")
+_SLOTS: tuple[str, ...] = ("embedder", "answerer", "former", "consolidator", "transcriber")
 _OPTIONAL_SLOTS: tuple[str, ...] = _SLOTS[1:]
 _TUNING: tuple[str, ...] = (
     "index_speech",
@@ -301,6 +301,8 @@ def _open_memory(arguments: argparse.Namespace) -> Memory:
             backends["answerer"] = recipes.answerer(arguments.answerer)
         if arguments.former is not None:
             backends["former"] = recipes.former(arguments.former)
+        if arguments.consolidator is not None:
+            backends["consolidator"] = recipes.consolidator(arguments.consolidator)
         if arguments.transcriber is not None:
             backends["transcriber"] = recipes.transcriber(arguments.transcriber)
     try:
@@ -311,6 +313,7 @@ def _open_memory(arguments: argparse.Namespace) -> Memory:
             embedder=backends["embedder"],  # type: ignore[arg-type]
             answerer=backends.get("answerer"),  # type: ignore[arg-type]
             former=backends.get("former"),  # type: ignore[arg-type]
+            consolidator=backends.get("consolidator"),  # type: ignore[arg-type]
             transcriber=backends.get("transcriber"),  # type: ignore[arg-type]
             index_speech=arguments.index_speech,
             minimum_relevance=arguments.minimum_relevance,
@@ -447,6 +450,7 @@ def _doctor_capabilities(loaded: Mapping[str, object]) -> _Document | None:
             answerer=cast(Any, loaded.get("answerer")),
             transcriber=cast(Any, loaded.get("transcriber")),
             former=cast(Any, loaded.get("former")),
+            consolidator=cast(Any, loaded.get("consolidator")),
         )
     except MindBridgeError:
         # A backend that declares an invalid contract is already reported per slot above; the
@@ -1700,6 +1704,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--answerer", metavar="NAME", help="generation recipe, with --embedder")
     parser.add_argument("--former", metavar="NAME", help="formation recipe, with --embedder")
+    parser.add_argument(
+        "--consolidator", metavar="NAME", help="consolidation recipe, with --embedder"
+    )
     parser.add_argument("--transcriber", metavar="NAME", help="speech recipe, with --embedder")
     # Derived from the SDK default, never hardcoded: `_reject_embedder_only_options` compares this
     # against `_MEMORY_DEFAULTS`, so a literal here silently rejects every --app/--url invocation

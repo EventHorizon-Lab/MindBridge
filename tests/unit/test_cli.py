@@ -569,6 +569,7 @@ def test_recipes_pin_identity_to_the_constants_in_the_source() -> None:
         "embedder": "gpt-5-mini",
         "answerer": "gpt-5-mini",
         "former": "gpt-5-mini",
+        "consolidator": "gpt-5-mini",
         "transcriber": "gpt-5-mini",
     }
     assert "OPENAI_API_KEY" in cast(str, recipes.describe("openai")["credential"])
@@ -597,6 +598,26 @@ def test_the_former_flag_reaches_the_memory_it_composes(
     cli._open_memory(arguments)
 
     assert captured["former"] is sentinel
+
+
+def test_the_consolidator_flag_reaches_the_memory_it_composes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without this the shipped `mindbridge consolidate` command needed `--app` to work at all."""
+    from mindbridge import cli
+
+    sentinel = object()
+    captured: dict[str, object] = {}
+    arguments = cli._parser().parse_args(
+        ["--data-dir", str(tmp_path), "--embedder", "openai", "--consolidator", "openai", "list"]
+    )
+    monkeypatch.setattr(recipes, "embedder", lambda name, **kw: object())
+    monkeypatch.setattr(recipes, "consolidator", lambda name, **kw: sentinel)
+    monkeypatch.setattr(cli, "Memory", lambda *args, **kwargs: captured.update(kwargs))
+
+    cli._open_memory(arguments)
+
+    assert captured["consolidator"] is sentinel
 
 
 def test_every_recipe_slot_has_a_command_line_flag() -> None:

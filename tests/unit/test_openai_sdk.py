@@ -534,6 +534,113 @@ def test_consolidation_refuses_an_ungrounded_or_malformed_operation(
     assert failure.value.stage == "consolidate"
 
 
+def test_consolidation_carries_declared_evidence_media_as_native_parts(tmp_path: Path) -> None:
+    """A native image or audio memory with no description must not reach the slow plane empty."""
+    audio = _asset(tmp_path, "audio-1", Modality.AUDIO, "audio/wav", b"RIFFwave-bytes")
+    image = _asset(tmp_path, "image-1", Modality.IMAGE, "image/png", b"png-bytes")
+    evidence = (
+        MemoryRecord(id="raw-1", content="The lamp looks on.", created_at=NOW),
+        MemoryRecord(
+            id="audio-memory",
+            content="",
+            created_at=NOW,
+            assets=(audio,),
+            modality=Modality.AUDIO,
+        ),
+        MemoryRecord(
+            id="image-memory",
+            content="",
+            created_at=NOW,
+            assets=(image,),
+            modality=Modality.IMAGE,
+        ),
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        parts = json.loads(request.content)["messages"][1]["content"]
+        assert [part["type"] for part in parts] == [
+            "text",
+            "text",
+            "text",
+            "input_audio",
+            "text",
+            "image_url",
+        ]
+        assert json.loads(parts[0]["text"]) == {"trigger": "evidence"}
+        assert json.loads(parts[2]["text"])["evidence"]["media_order"] == ["media_0"]
+        assert json.loads(parts[4]["text"])["evidence"]["media_order"] == ["media_1"]
+        assert parts[5]["image_url"]["url"].startswith("data:image/png;base64,")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "content": json.dumps(
+                                {"operations": [{"intent": "forget", "targets": [1]}]}
+                            )
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 30,
+                    "completion_tokens": 3,
+                    "total_tokens": 33,
+                    "prompt_tokens_details": {
+                        "text_tokens": 10,
+                        "audio_tokens": 12,
+                        "image_tokens": 8,
+                    },
+                },
+            },
+        )
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        provider.get_tracer("test").start_as_current_span("model"),
+    ):
+        applied = _model(_sdk_client(client)).consolidate(
+            evidence,
+            trigger=MemoryTrigger.EVIDENCE,
+        )
+    provider.shutdown()
+
+    assert applied[0].target_ids == ("audio-memory",)
+    # The recorded input modalities are the ones the request actually carried, not text alone.
+    attributes = exporter.get_finished_spans()[0].attributes
+    assert attributes is not None
+    assert attributes[token_modality_attribute("input", "audio")] == 12
+    assert attributes[token_modality_attribute("input", "image")] == 8
+
+
+def test_consolidation_leaves_out_media_the_model_does_not_declare(tmp_path: Path) -> None:
+    audio = _asset(tmp_path, "audio-1", Modality.AUDIO, "audio/wav", b"RIFFwave-bytes")
+    evidence = (
+        MemoryRecord(
+            id="audio-memory",
+            content="Sam laughed.",
+            created_at=NOW,
+            assets=(audio,),
+            modality=Modality.AUDIO,
+        ),
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        assert isinstance(content, str)
+        assert json.loads(content)["evidence"][0]["media_order"] == []
+        return _completion({"operations": []})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client), generation_capabilities=frozenset({Modality.TEXT}))
+        assert model.consolidate(evidence, trigger=MemoryTrigger.EVIDENCE) == ()
+
+
 def test_consolidation_recipe_identifies_every_generation_control() -> None:
     baseline = OpenAIModels().consolidation_recipe
     variants = {

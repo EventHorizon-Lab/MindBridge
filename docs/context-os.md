@@ -138,7 +138,10 @@ The reasoning backend may change, but the proposal vocabulary and kernel validat
 
 Every proposal names its evidence, model and recipe, expected effect, and idempotency identity. The
 kernel rejects unsupported, unauthorized, internally inconsistent, or stale proposals. The loop
-never writes SQLite directly.
+never writes SQLite directly. All four rejections are enforced, not aspirational: a proposal may
+name targets only inside the window the kernel gathered for it, must be eligible in every target
+it names or be refused whole, and is re-checked inside the apply transaction so a target that was
+forgotten, corrected, or deleted since validation is refused as stale rather than half-applied.
 
 `FormationBackend` is the seed of this plane: it proposes typed state from one committed
 observation while the kernel validates and persists it. `ConsolidationBackend` is the plane itself:
@@ -282,8 +285,9 @@ defaults or justify superiority claims.
 3. Generalize formation into one bounded memory-management loop with structured proposals,
    replay, rollback, and privacy tests. Done: the operation log and authority tests
    (`consolidate()`, `forget()`, `rollback()`, `operations()`), the durable trigger
-   (`consolidation_candidates()`), consolidation forgetting as one reversible operation, and
-   replay of a logged sequence against a fresh store, covered as a test rather than as an
+   (`consolidation_candidates()`), consolidation forgetting as one reversible operation, the
+   declarative `consolidation` slot that makes the loop reachable without a Python app loader,
+   and replay of a logged sequence against a fresh store, covered as a test rather than as an
    `apply(operation)` surface. Open: companion-scenario privacy tests; a post-hoc outcome field,
    without which only rollback success of the slow-loop measurements is derivable; and identity
    merge and split, which stay outside the operation log until the identity-governance round.

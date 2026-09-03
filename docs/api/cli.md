@@ -40,6 +40,7 @@ Use `mindbridge COMMAND --help` for the command-specific flags summarized below.
 | `--timeout SECONDS` | positive finite remote timeout for `--url`; default `30` |
 | `--answerer NAME` | generation recipe for `--embedder` |
 | `--former NAME` | formation recipe for `--embedder`; omit it to disable formation |
+| `--consolidator NAME` | consolidation recipe for `--embedder`; omit it to disable `consolidate` |
 | `--transcriber NAME` | speech recipe for `--embedder` |
 | `--index-speech`, `--no-index-speech` | enable or disable transcript indexing; default enabled |
 | `--minimum-relevance FLOAT` | relevance floor; default `0.10` |
@@ -74,13 +75,14 @@ server's owner.
 | --- | --- | --- |
 | `jina-omni` | `--embedder` | pinned Jina Omni model, revision, and 1024 dimensions |
 | `funasr` | `--transcriber` | pinned FunASR model and component revisions |
-| `openai` | `--embedder`, `--answerer`, `--former`, `--transcriber` | `text-embedding-3-small`, `gpt-5-mini`, `gpt-5-mini`, `whisper-1` |
+| `openai` | `--embedder`, `--answerer`, `--former`, `--consolidator`, `--transcriber` | `text-embedding-3-small`, `gpt-5-mini`, `gpt-5-mini`, `gpt-5-mini`, `whisper-1` |
 
 Only `openai` accepts a model suffix, for example `--former openai:gpt-5-mini`. Selecting a former
 opts into one formation model call after each source observation commits; omitting `--former`
-keeps formation off. Recipe names form a closed table; use `--app` for other backends. Provider
-trust, license, model identity, and credential behavior live in
-[configuration](../configuration.md).
+keeps formation off. `--consolidator` is what the `consolidate` command needs, and it costs
+nothing until that command runs: unlike a former it is not on the write path. Recipe names form a
+closed table; use `--app` for other backends. Provider trust, license, model identity, and
+credential behavior live in [configuration](../configuration.md).
 
 ### Commands
 

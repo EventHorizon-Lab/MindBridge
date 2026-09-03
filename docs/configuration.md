@@ -10,7 +10,8 @@ retrieval semantics stay the same whichever path you choose.
 | `Memory(...)` | The application injects individual backends or owns SDK clients directly |
 
 **Contract:** All three paths open the same embedded kernel. `EmbeddingBackend` is required;
-generation, speech, face, vision-description, and formation capabilities are optional.
+generation, speech, face, vision-description, formation, and consolidation capabilities are
+optional.
 
 ## Install only the surfaces you use
 
@@ -83,6 +84,7 @@ In this table, connection fields are `base_url`, `api_key`, `timeout`, and `max_
 | `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, `modalities=[text]` (at least one), `request_format=input`, plus connection fields |
 | `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `video_limit=8`, `min_video_seconds=None`, `extra_body=None`, plus connection fields |
 | `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
+| `consolidation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
 | `speech: funasr` | — | `device=auto` |
 | `speech: openai` | — | `model=whisper-1`, `space=None`, plus connection fields |
 | `face: opencv` | `detector_model`, `recognizer_model` | `score_threshold=0.9`, `nms_threshold=0.3`, `top_k=5000`, `frame_interval_ms=1000`, `max_video_frames=300` |
@@ -100,8 +102,8 @@ from 0 through 2; seed is from 0 through `2**63 - 1`; face thresholds are from 0
 
 `generation.video_limit` caps retrieved evidence videos in one answer request; question media has
 priority, and `None` disables that count. `generation.min_video_seconds` sends a shorter video as
-four ordered stills and requires image support. Formation has neither field because they shape
-answer evidence, not formation proposals.
+four ordered stills and requires image support. Formation and consolidation have neither field
+because they shape answer evidence, not proposals.
 
 ## Embedding choices
 
@@ -172,6 +174,45 @@ invalid individual proposals are dropped and counted by
 `mindbridge.formation.dropped_proposals`. See
 [memory types, time, and decay](memory-types-time-and-decay.md) for the resulting typed records and
 visibility rules.
+
+## Agentic memory management
+
+The optional `consolidation` slot builds the bundled OpenAI-compatible `ConsolidationBackend`,
+which is what `consolidate()` needs. It reads the same completion knobs as `formation`:
+
+```python
+with Memory.from_config(
+    {
+        "data_dir": "./data/assistant",
+        "embedding": {"provider": "jina-omni"},
+        "consolidation": {
+            "provider": "openai",
+            "model": "gpt-5-mini",
+            "modalities": ["text", "image", "audio"],
+            "max_tokens": 4096,
+        },
+    }
+) as memory:
+    for candidate in memory.consolidation_candidates():
+        memory.consolidate(evidence_ids=candidate.memory_ids, trigger=candidate.trigger)
+```
+
+Consolidation stays off when the slot is omitted, and `consolidate()` then raises
+`ModelError(reason="backend_not_configured")` while every other operation is unchanged. Declaring
+it flips `consolidate` on in the capability document that `/healthz`, the MCP server
+instructions, and `mindbridge doctor` publish. Unlike formation it is not on the write path: it
+runs only when a host calls `consolidate()`.
+
+`modalities` becomes the media the backend attaches to its request. Evidence assets in a declared
+modality travel natively, so an image or audio memory with no derived description is readable by
+the loop rather than an empty `content` string it can only propose forgetting; assets in an
+undeclared modality are left out instead of failing the pass.
+
+When `consolidation` declares exactly the same values as `generation` or `formation`, the
+composition reuses that adapter rather than opening a second client against the same endpoint.
+Any difference — a different model, endpoint, or credential — builds its own. See
+[the memory management loop](memory-types-time-and-decay.md#memory-management-loop) for what a
+consolidator may propose and what the kernel refuses.
 
 ## Local memory settings
 
@@ -253,10 +294,10 @@ with OpenAI(timeout=30.0, max_retries=3) as client:
 `Memory` closes the adapter objects passed to it. `OpenAIModels.close()` leaves a caller-supplied
 OpenAI client open, so the outer client context remains the application's responsibility.
 
-`former=` accepts a custom `FormationBackend`; declarative `formation: openai` supplies the bundled
-adapter for the same slot. `vision_describer=` accepts a `VisionDescriptionBackend` and
-`consolidator=` a `ConsolidationBackend`; both are available only through direct injection or
-`MemoryPlugins`, because MindBridge bundles no declarative provider for either.
+`former=` accepts a custom `FormationBackend` and `consolidator=` a `ConsolidationBackend`;
+declarative `formation: openai` and `consolidation: openai` supply the bundled adapter for those
+slots. `vision_describer=` accepts a `VisionDescriptionBackend` and is available only through
+direct injection or `MemoryPlugins`, because MindBridge bundles no declarative provider for it.
 
 `OpenAIModels` implements both reasoning protocols on its generation client, so one adapter can
 fill `answerer=`, `former=`, and `consolidator=`:

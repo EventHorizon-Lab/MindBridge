@@ -22,6 +22,7 @@ from pydantic import (
 import mindbridge.recipes as recipes
 from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import (
+    ConsolidationBackend,
     EmbeddingBackend,
     FaceBackend,
     FormationBackend,
@@ -146,6 +147,21 @@ class OpenAIFormationConfig(_OpenAICompletionConfig):
     """
 
 
+class OpenAIConsolidationConfig(_OpenAICompletionConfig):
+    """Chat-completion knobs for the backend that proposes control-plane operations.
+
+    Declared like `formation` and off unless it is configured: consolidation is a paid reasoning
+    call over a bounded evidence set, and a deployment that only wants recall should not start
+    making it. When these values match a `generation` or `formation` slot exactly, the composition
+    reuses that adapter instead of opening a second client against the same endpoint.
+
+    `modalities` matters here for the same reason it does for formation: it becomes
+    `generation_capabilities`, which decides which evidence media the adapter attaches to the
+    request. A native image or audio memory with no derived description is otherwise opaque to
+    the loop, which can then only propose forgetting it.
+    """
+
+
 class OpenAITranscriptionConfig(_OpenAIConfig):
     model: _Text = DEFAULT_TRANSCRIPTION_MODEL
     space: _Text | None = None
@@ -190,6 +206,10 @@ class MindBridgeConfig(_ConfigModel):
     # union with the raw sources rather than a replacement for them. `vision_describer` has no
     # bundled implementation at all, so it deliberately has no key here.
     formation: OpenAIFormationConfig | None = None
+    # The agentic memory control plane. Same rule as `formation`: reachable, never implicit. A
+    # deployment that never sets it keeps `consolidate()` unavailable and everything else
+    # unchanged, which is what a host that only recalls should get.
+    consolidation: OpenAIConsolidationConfig | None = None
     speech: SpeechProviderConfig | None = None
     face: OpenCVFaceConfig | None = None
     settings: MemorySettings = Field(default_factory=MemorySettings)
@@ -209,6 +229,7 @@ class MemoryComposition:
             self.plugins.face_analyzer,
             self.plugins.vision_describer,
             self.plugins.transcriber,
+            self.plugins.consolidator,
             self.plugins.former,
             self.plugins.answerer,
             self.plugins.embedder,
@@ -235,6 +256,14 @@ def resolve_memory_config(
         former = None if config.formation is None else _build_formation(config.formation)
         if former is not None:
             cleanup.callback(former.close)
+        consolidator = _build_consolidation(
+            config,
+            answerer=answerer,
+            former=former,
+        )
+        # Only close it here when it is its own adapter; a reused one is already registered.
+        if consolidator is not None and id(consolidator) not in {id(answerer), id(former)}:
+            cleanup.callback(consolidator.close)
         transcriber = None if config.speech is None else _build_speech(config.speech)
         if transcriber is not None:
             cleanup.callback(transcriber.close)
@@ -247,6 +276,7 @@ def resolve_memory_config(
             transcriber=transcriber,
             face_analyzer=face,
             former=former,
+            consolidator=consolidator,
         )
         cleanup.pop_all()
     return MemoryComposition(config.data_dir, plugins, config.settings)
@@ -347,6 +377,27 @@ def _build_formation(config: OpenAIFormationConfig) -> FormationBackend:
     return cast(FormationBackend, _openai_factory(_completion_values(config)))
 
 
+def _build_consolidation(
+    config: MindBridgeConfig,
+    *,
+    answerer: GenerationBackend | None,
+    former: FormationBackend | None,
+) -> ConsolidationBackend | None:
+    """Build the consolidation adapter, reusing an identical generation or formation client.
+
+    `OpenAIModels` implements every reasoning protocol on one generation client, so a slot that
+    declares exactly the same completion values wants that same object, not a second HTTP client
+    and connection pool against the same endpoint.
+    """
+    if config.consolidation is None:
+        return None
+    values = _completion_values(config.consolidation)
+    for built, declared in ((answerer, config.generation), (former, config.formation)):
+        if built is not None and declared is not None and _completion_values(declared) == values:
+            return cast(ConsolidationBackend, built)
+    return cast(ConsolidationBackend, _openai_factory(values))
+
+
 def _build_speech(config: SpeechProviderConfig) -> SpeechBackend | TranscriptionBackend:
     if isinstance(config, FunASRSpeechConfig):
         return FunASRTranscriber(device=config.device)
@@ -375,6 +426,7 @@ __all__ = [
     "JinaEmbeddingConfig",
     "MemoryComposition",
     "MindBridgeConfig",
+    "OpenAIConsolidationConfig",
     "OpenAIEmbeddingConfig",
     "OpenAIFormationConfig",
     "OpenAIGenerationConfig",

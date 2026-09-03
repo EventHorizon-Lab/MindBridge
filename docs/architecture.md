@@ -188,8 +188,11 @@ proposes typed semantics from one committed observation. A `ConsolidationBackend
 reinforcement, consolidation, correction, or cognitive forgetting over a bounded set of records
 that already exist. Neither writes SQLite: the kernel validates every field, applies only the
 effect the declared intent allows, and commits each operation with an append-only
-`memory_operations` row that `Memory.rollback()` can reverse. Physical deletion is not a proposable
-intent.
+`memory_operations` row that `Memory.rollback()` can reverse. A consolidation proposal may name
+targets only inside the evidence window the kernel gathered for it, must be eligible in every
+target it names or be refused whole, and has those preconditions re-checked inside the apply
+transaction, so a record that moved since validation is refused as stale rather than half
+applied. Physical deletion is not a proposable intent.
 
 Applications may inject backend objects directly or use `MemoryPlugins` and `Memory.from_plugins()`.
 `Memory.from_config()` validates the bundled provider catalog and delegates to the same kernel.
