@@ -118,6 +118,7 @@ from mindbridge.models.base import (
 )
 from mindbridge.plugins import MemoryConfig, MemoryPlugins
 from mindbridge.types import (
+    KIND_MEMORY_TYPES,
     AbstentionReason,
     AcousticBoundary,
     AnswerResult,
@@ -6877,11 +6878,7 @@ def _observation_from_record(record: MemoryRecord) -> ObservationContext:
 
 
 def _formation_memory_type(kind: MemoryKind) -> MemoryType:
-    if kind in {MemoryKind.EVENT, MemoryKind.AFFECT}:
-        return MemoryType.EPISODIC
-    if kind is MemoryKind.RESPONSE_POLICY:
-        return MemoryType.PROCEDURAL
-    return MemoryType.SEMANTIC
+    return KIND_MEMORY_TYPES.get(kind, MemoryType.SEMANTIC)
 
 
 def _validate_formation_proposal(

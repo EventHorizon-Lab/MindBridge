@@ -489,7 +489,17 @@ def test_every_budget_bound_that_removed_evidence_is_named_with_its_count() -> N
         ("budget_excluded", "1 candidates did not fit 1 items and 16000 chars"),
         ("budget_excluded", "1 candidates older than the requested freshness window"),
         ("budget_excluded", "1 candidates outside the requested memory types"),
-        ("section_empty", "no procedural memory was included"),
+        (
+            "section_empty",
+            "the affect section is empty: memory_types kept only procedural, semantic, and"
+            " affect carries only episodic memory",
+        ),
+        (
+            "section_empty",
+            "the episodes section is empty: memory_types kept only procedural, semantic, and"
+            " episodes carries only episodic memory",
+        ),
+        ("section_empty", "the procedures section is empty: no procedural memory was included"),
     ]
     # Ordering is stable, so a caller can diff two bundles.
     assert (
@@ -508,6 +518,34 @@ def test_every_budget_bound_that_removed_evidence_is_named_with_its_count() -> N
             freshness=timedelta(days=1),
         ).unknowns
     )
+
+
+def test_a_memory_type_filter_names_the_sections_it_emptied() -> None:
+    """A `{semantic}` request loses affect and procedures, and the bundle says which filter did.
+
+    Kind `affect` is stored `episodic` and kind `response_policy` `procedural`, so those two
+    sections cannot be filled under a `{semantic}` request however well their records rank. The
+    reader has to be able to map the loss back to the section, not only to the type.
+    """
+    bundle = _compile(
+        (
+            _hit("fact", score=0.9),
+            _hit("mood", score=0.8, kind=MemoryKind.AFFECT, memory_type=MemoryType.EPISODIC),
+            _hit("recipe", score=0.7, memory_type=MemoryType.PROCEDURAL),
+        ),
+        memory_types=frozenset({MemoryType.SEMANTIC}),
+    )
+
+    assert bundle.facts == (bundle.hits[0],)
+    assert (bundle.affect, bundle.procedures) == ((), ())
+    assert [item.detail for item in bundle.unknowns if item.kind.value == "section_empty"] == [
+        "the affect section is empty: memory_types kept only semantic, and affect carries only"
+        " episodic memory",
+        "the episodes section is empty: memory_types kept only semantic, and episodes carries"
+        " only episodic memory",
+        "the procedures section is empty: memory_types kept only semantic, and procedures"
+        " carries only procedural memory",
+    ]
 
 
 def test_a_full_candidate_window_is_named_beside_what_the_bundle_lost() -> None:

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, TypeAlias
 
 from mindbridge.exceptions import ValidationError
@@ -55,6 +56,19 @@ class MemoryKind(str, Enum):
     AFFECT = "affect"
     TRAIT = "trait"
     RESPONSE_POLICY = "response_policy"
+
+
+# The `MemoryType` a validated formation proposal of each kind is stored as. Kernel policy, kept
+# beside the two enums because two readers depend on it and must not drift: `memory.py` applies it
+# when it writes a formed record, and the context compiler reads it back to know which bundle
+# sections a `memory_types` filter can empty. A kind absent here is stored as `SEMANTIC`.
+KIND_MEMORY_TYPES: Mapping[MemoryKind, MemoryType] = MappingProxyType(
+    {
+        MemoryKind.EVENT: MemoryType.EPISODIC,
+        MemoryKind.AFFECT: MemoryType.EPISODIC,
+        MemoryKind.RESPONSE_POLICY: MemoryType.PROCEDURAL,
+    }
+)
 
 
 class ContextUnknownKind(str, Enum):

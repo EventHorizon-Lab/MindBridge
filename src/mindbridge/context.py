@@ -15,6 +15,7 @@ from types import MappingProxyType
 from typing import TypeAlias
 
 from mindbridge.types import (
+    KIND_MEMORY_TYPES,
     ContextBudget,
     ContextBundle,
     ContextConflict,
@@ -66,6 +67,23 @@ _TYPE_SECTIONS: Mapping[MemoryType, str] = MappingProxyType(
         MemoryType.SEMANTIC: "facts",
         MemoryType.EPISODIC: "episodes",
         MemoryType.PROCEDURAL: "procedures",
+    }
+)
+# Which memory types can reach each section at all. A kind-keyed section is fed by whatever type
+# a formed record of that kind is stored as, a type-keyed one by its own type. This is what lets a
+# `memory_types` filter name the sections it emptied instead of only the types it dropped: kind
+# `affect` is stored `episodic`, so a `{semantic}` request cannot fill `affect` however it ranks.
+_SECTION_MEMORY_TYPES: Mapping[str, frozenset[MemoryType]] = MappingProxyType(
+    {
+        name: frozenset(
+            {
+                KIND_MEMORY_TYPES.get(kind, MemoryType.SEMANTIC)
+                for kind, section in _KIND_SECTIONS.items()
+                if section == name
+            }
+            | {memory_type for memory_type, section in _TYPE_SECTIONS.items() if section == name}
+        )
+        for name in _SECTIONS
     }
 )
 # Kinds that assert one value about one subject, so two of them in a lineage can disagree.
@@ -172,7 +190,7 @@ def compile_context(
         unknowns=_unknowns(
             unknowns,
             budget,
-            included,
+            sections,
             excluded,
             omitted,
             skipped=skipped,
@@ -259,7 +277,7 @@ def _section(hit: SearchHit) -> str:
 def _unknowns(
     supplied: Sequence[ContextUnknown],
     budget: ContextBudget,
-    included: Sequence[SearchHit],
+    sections: Mapping[str, tuple[SearchHit, ...]],
     excluded: Mapping[str, int],
     omitted: int,
     *,
@@ -297,16 +315,7 @@ def _unknowns(
                 ),
             )
         )
-    if budget.memory_types is not None:
-        present = {hit.memory_type for hit in included}
-        found.extend(
-            ContextUnknown(
-                kind=ContextUnknownKind.SECTION_EMPTY,
-                detail=f"no {memory_type.value} memory was included",
-            )
-            for memory_type in sorted(budget.memory_types)
-            if memory_type not in present
-        )
+    found.extend(_section_empty(budget, sections))
     if skipped:
         found.append(
             ContextUnknown(
@@ -318,6 +327,45 @@ def _unknowns(
             )
         )
     return tuple(sorted(found, key=lambda item: (item.kind.value, item.detail)))
+
+
+def _section_empty(
+    budget: ContextBudget,
+    sections: Mapping[str, tuple[SearchHit, ...]],
+) -> tuple[ContextUnknown, ...]:
+    """Name each section a `memory_types` request left empty, and why it is empty.
+
+    Only a request that named types gets these: without one an empty section means the store
+    holds nothing for it, which is not a statement about this request. With one, an empty
+    section is either a section the filter can never fill -- its records carry a type the
+    request excluded -- or one the filter admits and no candidate reached.
+    """
+    requested = budget.memory_types
+    if requested is None:
+        return ()
+    present = frozenset(hit.memory_type for section in sections.values() for hit in section)
+    keyed = frozenset(_TYPE_SECTIONS.values())
+    found: list[ContextUnknown] = []
+    for name in _SECTIONS:
+        if sections[name]:
+            continue
+        feeds = _SECTION_MEMORY_TYPES[name]
+        if feeds.isdisjoint(requested):
+            detail = (
+                f"the {name} section is empty: memory_types kept only"
+                f" {_type_names(requested)}, and {name} carries only"
+                f" {_type_names(feeds)} memory"
+            )
+        elif name in keyed and feeds <= requested and feeds.isdisjoint(present):
+            detail = f"the {name} section is empty: no {_type_names(feeds)} memory was included"
+        else:
+            continue
+        found.append(ContextUnknown(kind=ContextUnknownKind.SECTION_EMPTY, detail=detail))
+    return tuple(found)
+
+
+def _type_names(memory_types: frozenset[MemoryType]) -> str:
+    return ", ".join(memory_type.value for memory_type in sorted(memory_types))
 
 
 def _conflicts(

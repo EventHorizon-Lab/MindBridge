@@ -130,6 +130,13 @@ stay empty in a composition with neither a `FormationBackend` nor a `Consolidati
 `episodes`, `facts`, and `procedures` are keyed on `MemoryType`, which every record carries, and
 populate without either.
 
+`memory_types` filters the record's own `MemoryType`, and a kind is stored as a type: kind `event`
+and `affect` as `episodic`, `response_policy` as `procedural`, everything else as `semantic`. A
+section is therefore reachable only for the types its kinds are stored as, so a `{semantic}`
+request cannot fill `affect`, `episodes`, or `procedures` however well their records rank. Each
+such section is named in `unknowns` as a `section_empty` entry saying which filter emptied it,
+rather than leaving the reader to map a dropped type back to the section they lost.
+
 The bundle also carries no person link. Identity lives asset-keyed in the speech and face tables,
 reachable through `speech()` and `faces()`, and no `identity_id` exists on a memory, a hit, or a
 `MemoryContext`. Cross-modal person linkage in a bundle needs that edge; it is a known gap rather
@@ -154,7 +161,7 @@ a thin bundle explains itself instead of looking like an empty store.
 | `kind` | When it appears |
 | --- | --- |
 | `budget_excluded` | Counted candidates a bound removed, or that did not fit the budget |
-| `section_empty` | A `memory_types` value the request asked for that no included hit carries |
+| `section_empty` | A bundle section a `memory_types` request left empty, naming the section and whether the filter excluded every type it carries or the ranking simply reached none |
 | `scope_empty` | A `scope` was supplied and retrieval matched nothing; the entry names the bounds |
 | `modality_unsupported` | The goal carries media this composition's embedder cannot search |
 | `stage_skipped` | An optional stage the `max_latency_ms` deadline skipped |
