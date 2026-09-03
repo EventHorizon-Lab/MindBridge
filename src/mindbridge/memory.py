@@ -1715,17 +1715,16 @@ class Memory:
                 return False
             row = logged[0]
             operation = load_operation(row.operation_json)
-            if operation.intent is MemoryIntent.CONSOLIDATE:
-                # Deleting first keeps a lost race idempotent: a second rollback finds nothing to
-                # delete and the log claim below is what decides the return value.
-                for created in row.created_ids:
-                    with _translate_storage_errors("roll back a consolidation"):
-                        _deleted, orphaned = self._store.delete_memory_with_assets(created)
-                    self._queue_asset_cleanup(orphaned)
             with _translate_storage_errors("roll back a memory operation"):
-                reverted = self._store.rollback_operation(
+                # One transaction: the created records disappear in the same commit that marks
+                # the operation rolled back, so a crash between the two cannot leave an active
+                # operation whose recorded output is gone.
+                reverted, orphaned = self._store.rollback_operation(
                     row.operation_id,
                     rolled_back_at=datetime.now(timezone.utc),
+                    delete_memory_ids=(
+                        row.created_ids if operation.intent is MemoryIntent.CONSOLIDATE else ()
+                    ),
                     # `linked` is the evidence this operation actually inserted, so a link that
                     # predated it survives the reversal. Records deleted above take their own.
                     retire_evidence=row.linked,
@@ -1736,6 +1735,7 @@ class Memory:
                         row.changed_ids if operation.intent is MemoryIntent.FORGET else ()
                     ),
                 )
+            self._queue_asset_cleanup(orphaned)
             self._drain_outbox()
             return reverted
 
@@ -2448,6 +2448,13 @@ class Memory:
         with self._speech_index_guard(operation, enabled=speech_indexed):
             if speech_indexed:
                 self._recognize_speech(speech_assets, operation, reversible=True)
+            # Same order as `_add_prepared`: derived visual text has to exist before the fallback
+            # guard decides whether this embedder can take the media at all.
+            described = self._pending_visual_descriptions((memory.content,))
+            memory = replace(
+                memory,
+                content=self._with_visual_descriptions(memory.content, described),
+            )
             if Modality.AUDIO not in self._embedding_capabilities:
                 _fallback_unsupported(memory.content, self._embedding_capabilities, "embedding")
                 if not memory.content.audio_transcript:
@@ -2470,7 +2477,9 @@ class Memory:
                 _translate_storage_errors("settle captured memory"),
             ):
                 # The captured row already carries its assets and its observation context, so
-                # this commit replaces only the derived text and adds the queued vectors.
+                # this commit replaces only the derived text and adds the queued vectors. The
+                # queue row survives it: formation is still owed, and a former failure below must
+                # leave the record retryable rather than searchable but silently unformed.
                 committed = self._store.settle_capture(
                     replace(enriched, context=None),
                     tuple(
@@ -2497,6 +2506,8 @@ class Memory:
                     self._persist_transcripts(operation)
         if committed:
             self._form_sources((self._memory_record(enriched),), operation=operation)
+            with _translate_storage_errors("complete captured memory"):
+                self._store.complete_capture(row.memory_id)
 
     def _form_sources(
         self,

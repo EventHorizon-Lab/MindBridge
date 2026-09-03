@@ -32,7 +32,7 @@ from mindbridge.infrastructure.local import (
     StoredEmbedding,
     StoredMemory,
 )
-from mindbridge.infrastructure.local.store import _SCHEMA_VERSION
+from mindbridge.infrastructure.local.store import _SCHEMA_VERSION, StoredOperation
 from mindbridge.models.base import (
     FaceAnalysis,
     FaceEmbedding,
@@ -1889,3 +1889,44 @@ def test_valid_at_keeps_records_without_a_declared_validity_interval(tmp_path: P
     assert [memory.memory_id for memory in before] == ["plain"]
     assert unknown == ()
     assert nowhere == ()
+
+
+def test_rolling_back_an_operation_deletes_its_records_in_the_same_transaction(
+    tmp_path: Path,
+) -> None:
+    applied_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        store.write_memories(
+            (_memory("kept"), _memory("created")),
+            (_embedding("e-kept", "kept"), _embedding("e-created", "created")),
+        )
+        logged = store.apply_control_operation(
+            StoredOperation(
+                operation_key="op-1",
+                intent="forget",
+                trigger="manual",
+                operation_json="{}",
+                applied_at=applied_at,
+            ),
+            forget_ids=("kept",),
+        )
+        assert logged is not None
+
+        reverted, orphaned = store.rollback_operation(
+            logged.operation_id,
+            rolled_back_at=applied_at + timedelta(minutes=1),
+            clear_forgotten=("kept",),
+            delete_memory_ids=("created",),
+        )
+
+        assert reverted is True and orphaned == ()
+        assert store.read_memory("created") is None
+        kept = store.read_memory("kept")
+        assert kept is not None and kept.forgotten_at is None
+        assert store.read_operations(operation_id=logged.operation_id)[0].rolled_back_at is not None
+        assert store.rollback_operation(
+            logged.operation_id,
+            rolled_back_at=applied_at + timedelta(minutes=2),
+            delete_memory_ids=("kept",),
+        ) == (False, ())
+        assert store.read_memory("kept") is not None

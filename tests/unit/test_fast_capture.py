@@ -275,3 +275,64 @@ def test_the_capture_operations_reach_the_command_line() -> None:
     assert {"capture", "settle", "pending_captures"} <= set(cli.OPERATIONS)
     assert {"capture", "settle", "pending-captures"} <= set(cli.COMMANDS)
     assert {"capture", "settle", "pending-captures"} <= set(cli._LOCAL)
+
+
+class FlakyFormer(CountingFormer):
+    """A former that fails on its first call and behaves on the next."""
+
+    def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+        if self.calls == 0:
+            self.calls += 1
+            raise RuntimeError("simulated formation outage")
+        return super().form(inputs)
+
+
+def test_a_formation_failure_keeps_the_capture_queued_until_it_forms(tmp_path: Path) -> None:
+    former = FlakyFormer()
+    with Memory(
+        tmp_path, embedder=CountingEmbedder(), former=former, minimum_relevance=0
+    ) as memory:
+        record = memory.capture("the spare key is in the blue toolbox")
+
+        with pytest.raises(ModelError) as failure:
+            memory.settle()
+
+        # The record is embedded and searchable, but formation is still owed, so the queue row
+        # survives with the failure recorded instead of the source staying silently unformed.
+        assert failure.value.subject == record.id
+        assert {hit.id for hit in memory.search("spare key")} == {record.id}
+        assert memory.pending_captures() == 1
+        assert _queue_rows(tmp_path)[0][1] == 1
+
+        assert memory.settle() == 1
+        assert memory.pending_captures() == 0
+        assert former.calls == 2
+        derived = [
+            item
+            for item in memory.list().items
+            if item.context is not None and item.context.kind is MemoryKind.ENTITY
+        ]
+        assert len(derived) == 1 and derived[0].context is not None
+        assert derived[0].context.evidence_ids == (record.id,)
+
+
+def test_settling_describes_an_image_a_text_only_embedder_cannot_take(tmp_path: Path) -> None:
+    from test_streaming_observations import RecordingVisionDescriber
+
+    describer = RecordingVisionDescriber()
+    with Memory(
+        tmp_path,
+        embedder=CountingEmbedder(capabilities=frozenset({Modality.TEXT})),
+        vision_describer=describer,
+        minimum_relevance=0,
+    ) as memory:
+        record = memory.capture(("the red toolbox", Blob(b"frame", "image/png")))
+        assert describer.inputs == []
+
+        assert memory.settle() == 1
+
+        settled = memory.get(record.id)
+        assert len(describer.inputs) == 1
+        assert "[visual description:" in settled.content
+        assert "automatically described red toolbox" in settled.content
+        assert {hit.id for hit in memory.search("red toolbox")} == {record.id}

@@ -1054,21 +1054,23 @@ class LocalStore:
         memory: StoredMemory,
         embeddings: Iterable[StoredEmbedding] = (),
     ) -> bool:
-        """Store one captured record's derived content and vectors and clear its queue row.
+        """Store one captured record's derived content and vectors while it stays queued.
 
-        Returns false when the record was not queued, so a concurrent settlement cannot commit
-        the same enrichment twice.
+        Returns false when the record is not queued, so a settlement that lost a race writes
+        nothing. The queue row is removed by `complete_capture` once every deferred stage,
+        formation included, has succeeded; a retry after a later failure re-runs this write, which
+        is an idempotent upsert of the same derived content and vectors.
         """
         supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
             (memory,),
             embeddings,
         )
         with self._transaction() as connection:
-            cursor = connection.execute(
-                "DELETE FROM capture_queue WHERE memory_id = ?",
+            queued = connection.execute(
+                "SELECT 1 FROM capture_queue WHERE memory_id = ?",
                 (memory.memory_id,),
-            )
-            if not cursor.rowcount:
+            ).fetchone()
+            if queued is None:
                 return False
             self._write_memory(
                 connection,
@@ -1078,6 +1080,16 @@ class LocalStore:
             for embedding in supplied_embeddings:
                 self._write_embedding(connection, embedding)
         return True
+
+    def complete_capture(self, memory_id: str) -> bool:
+        """Remove one capture from the queue after every deferred stage succeeded."""
+        _require_identifier(memory_id, "memory_id")
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "DELETE FROM capture_queue WHERE memory_id = ?",
+                (memory_id,),
+            )
+        return cursor.rowcount > 0
 
     def record_capture_failure(self, memory_id: str, error: str) -> None:
         """Count one failed settlement and store its reason, leaving the row queued."""
@@ -1363,13 +1375,18 @@ class LocalStore:
         retire_evidence: Sequence[tuple[str, str]] = (),
         restore_versions: Sequence[str] = (),
         clear_forgotten: Sequence[str] = (),
-    ) -> bool:
+        delete_memory_ids: Sequence[str] = (),
+    ) -> tuple[bool, tuple[StoredAsset, ...]]:
         """Apply the caller's reversal and mark one operation rolled back, atomically.
 
-        Returns `False` when the operation is unknown or already rolled back, in which case no
-        reversal is applied.
+        Returns `(False, ())` when the operation is unknown or already rolled back, in which case
+        no reversal is applied. Otherwise the second value lists the assets that the deleted
+        records were the last to reference; index cleanup follows through the durable outbox.
         """
         _require_aware(rolled_back_at, "rolled_back_at")
+        for memory_id in delete_memory_ids:
+            _require_identifier(memory_id, "memory_id")
+        unreferenced: list[StoredAsset] = []
         with self._transaction() as connection:
             row = connection.execute(
                 """
@@ -1379,8 +1396,11 @@ class LocalStore:
                 (operation_id,),
             ).fetchone()
             if row is None:
-                return False
+                return False, ()
             reverted_at = max(rolled_back_at, _parse_datetime(_row_text(row, "applied_at")))
+            for memory_id in dict.fromkeys(delete_memory_ids):
+                _deleted, orphaned = self._delete_memory(connection, memory_id)
+                unreferenced.extend(orphaned)
             _retire_memory_evidence(connection, retire_evidence, retired_at=reverted_at)
             _restore_memory_versions(connection, restore_versions, recorded_at=reverted_at)
             _set_forgotten(connection, clear_forgotten, forgotten_at=None)
@@ -1388,7 +1408,7 @@ class LocalStore:
                 "UPDATE memory_operations SET rolled_back_at = ? WHERE operation_id = ?",
                 (_datetime_text(reverted_at), operation_id),
             )
-        return True
+        return True, tuple({asset.asset_id: asset for asset in unreferenced}.values())
 
     def read_operations(
         self,
@@ -1686,114 +1706,122 @@ class LocalStore:
         """Delete one memory and return its assets that no remaining memory references."""
         _require_identifier(memory_id, "memory_id")
         with self._transaction() as connection:
-            linked_ids = [
-                _row_text(row, "asset_id")
-                for row in connection.execute(
-                    "SELECT asset_id FROM memory_assets WHERE memory_id = ? ORDER BY position",
-                    (memory_id,),
-                ).fetchall()
-            ]
-            target_semantic = connection.execute(
-                """
-                SELECT lineage_id, kind, basis
-                FROM memory_semantics WHERE memory_id = ?
-                """,
+            return self._delete_memory(connection, memory_id)
+
+    def _delete_memory(
+        self,
+        connection: sqlite3.Connection,
+        memory_id: str,
+    ) -> tuple[bool, tuple[StoredAsset, ...]]:
+        """Delete one memory inside the caller's transaction; see `delete_memory_with_assets`."""
+        linked_ids = [
+            _row_text(row, "asset_id")
+            for row in connection.execute(
+                "SELECT asset_id FROM memory_assets WHERE memory_id = ? ORDER BY position",
                 (memory_id,),
-            ).fetchone()
-            reconciled: set[tuple[str, str]] = set()
-            if target_semantic is not None and (
-                _row_text(target_semantic, "kind") == MemoryKind.STATE.value
-                or (
-                    _row_text(target_semantic, "kind") == MemoryKind.TRAIT.value
-                    and _row_text(target_semantic, "basis") == EvidenceBasis.USER_STATEMENT.value
+            ).fetchall()
+        ]
+        target_semantic = connection.execute(
+            """
+            SELECT lineage_id, kind, basis
+            FROM memory_semantics WHERE memory_id = ?
+            """,
+            (memory_id,),
+        ).fetchone()
+        reconciled: set[tuple[str, str]] = set()
+        if target_semantic is not None and (
+            _row_text(target_semantic, "kind") == MemoryKind.STATE.value
+            or (
+                _row_text(target_semantic, "kind") == MemoryKind.TRAIT.value
+                and _row_text(target_semantic, "basis") == EvidenceBasis.USER_STATEMENT.value
+            )
+        ):
+            reconciled.add(
+                (
+                    _row_text(target_semantic, "lineage_id"),
+                    _row_text(target_semantic, "kind"),
                 )
+            )
+        dependent_rows = connection.execute(
+            """
+            SELECT e.memory_id, e.recorded_at, s.lineage_id, s.kind, s.basis
+            FROM memory_evidence AS e
+            JOIN memory_semantics AS s ON s.memory_id = e.memory_id
+            WHERE e.source_memory_id = ? AND e.retired_at IS NULL
+            ORDER BY e.memory_id
+            """,
+            (memory_id,),
+        ).fetchall()
+        for dependent in dependent_rows:
+            if _row_text(dependent, "kind") == MemoryKind.STATE.value or (
+                _row_text(dependent, "kind") == MemoryKind.TRAIT.value
+                and _row_text(dependent, "basis") == EvidenceBasis.USER_STATEMENT.value
             ):
                 reconciled.add(
                     (
-                        _row_text(target_semantic, "lineage_id"),
-                        _row_text(target_semantic, "kind"),
+                        _row_text(dependent, "lineage_id"),
+                        _row_text(dependent, "kind"),
                     )
                 )
-            dependent_rows = connection.execute(
-                """
-                SELECT e.memory_id, e.recorded_at, s.lineage_id, s.kind, s.basis
-                FROM memory_evidence AS e
-                JOIN memory_semantics AS s ON s.memory_id = e.memory_id
-                WHERE e.source_memory_id = ? AND e.retired_at IS NULL
-                ORDER BY e.memory_id
-                """,
-                (memory_id,),
-            ).fetchall()
-            for dependent in dependent_rows:
-                if _row_text(dependent, "kind") == MemoryKind.STATE.value or (
-                    _row_text(dependent, "kind") == MemoryKind.TRAIT.value
-                    and _row_text(dependent, "basis") == EvidenceBasis.USER_STATEMENT.value
-                ):
-                    reconciled.add(
-                        (
-                            _row_text(dependent, "lineage_id"),
-                            _row_text(dependent, "kind"),
-                        )
-                    )
-            affected_ids = [_row_text(row, "memory_id") for row in dependent_rows]
-            for lineage_id, kind in reconciled:
-                affected_ids.extend(
-                    _row_text(row, "memory_id")
-                    for row in connection.execute(
-                        """
-                        SELECT memory_id FROM memory_semantics
-                        WHERE lineage_id = ? AND kind = ?
-                        """,
-                        (lineage_id, kind),
-                    ).fetchall()
-                )
-            changed_at = _next_semantic_transaction_time(
-                connection,
-                datetime.now(timezone.utc),
-                affected_ids,
+        affected_ids = [_row_text(row, "memory_id") for row in dependent_rows]
+        for lineage_id, kind in reconciled:
+            affected_ids.extend(
+                _row_text(row, "memory_id")
+                for row in connection.execute(
+                    """
+                    SELECT memory_id FROM memory_semantics
+                    WHERE lineage_id = ? AND kind = ?
+                    """,
+                    (lineage_id, kind),
+                ).fetchall()
+            )
+        changed_at = _next_semantic_transaction_time(
+            connection,
+            datetime.now(timezone.utc),
+            affected_ids,
+        )
+        connection.execute(
+            """
+            UPDATE memory_evidence SET retired_at = ?
+            WHERE source_memory_id = ? AND retired_at IS NULL
+            """,
+            (_datetime_text(changed_at), memory_id),
+        )
+        for dependent in dependent_rows:
+            dependent_id = _row_text(dependent, "memory_id")
+            evidence_count, _confidence = _evidence_summary(connection, dependent_id)
+            if evidence_count:
+                _refresh_evidence_projection(connection, dependent_id, changed_at)
+                continue
+            linked_ids.extend(
+                _row_text(row, "asset_id")
+                for row in connection.execute(
+                    """
+                    SELECT asset_id FROM memory_assets
+                    WHERE memory_id = ? ORDER BY position
+                    """,
+                    (dependent_id,),
+                ).fetchall()
             )
             connection.execute(
-                """
-                UPDATE memory_evidence SET retired_at = ?
-                WHERE source_memory_id = ? AND retired_at IS NULL
-                """,
-                (_datetime_text(changed_at), memory_id),
-            )
-            for dependent in dependent_rows:
-                dependent_id = _row_text(dependent, "memory_id")
-                evidence_count, _confidence = _evidence_summary(connection, dependent_id)
-                if evidence_count:
-                    _refresh_evidence_projection(connection, dependent_id, changed_at)
-                    continue
-                linked_ids.extend(
-                    _row_text(row, "asset_id")
-                    for row in connection.execute(
-                        """
-                        SELECT asset_id FROM memory_assets
-                        WHERE memory_id = ? ORDER BY position
-                        """,
-                        (dependent_id,),
-                    ).fetchall()
-                )
-                connection.execute(
-                    "DELETE FROM memory_records WHERE memory_id = ?",
-                    (dependent_id,),
-                )
-            cursor = connection.execute(
                 "DELETE FROM memory_records WHERE memory_id = ?",
-                (memory_id,),
+                (dependent_id,),
             )
-            for lineage_id, kind in sorted(reconciled):
-                _rebuild_reconciled_lineage(
-                    connection,
-                    lineage_id,
-                    kind,
-                    changed_at=changed_at,
-                )
-            unreferenced = self._read_unreferenced_assets(
+        cursor = connection.execute(
+            "DELETE FROM memory_records WHERE memory_id = ?",
+            (memory_id,),
+        )
+        for lineage_id, kind in sorted(reconciled):
+            _rebuild_reconciled_lineage(
                 connection,
-                tuple(dict.fromkeys(linked_ids)),
+                lineage_id,
+                kind,
+                changed_at=changed_at,
             )
+        unreferenced = self._read_unreferenced_assets(
+            connection,
+            tuple(dict.fromkeys(linked_ids)),
+        )
         return cursor.rowcount > 0, unreferenced
 
     def read_asset(self, asset_id: str) -> StoredAsset | None:
