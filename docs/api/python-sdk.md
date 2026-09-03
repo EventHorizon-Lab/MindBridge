@@ -99,6 +99,10 @@ and voice are bound; its default is `2`.
 analysis has already run by the time `add` reaches the index. Set it to `False` to keep transcripts
 and resolved speaker names out of retrieval text and out of `add`-time identity matching.
 
+`ask()` grounds on the top of the ranking, except that a modality present in the retrieved hits
+and absent from the first `limit` of them contributes its best hit in the last slot, so one
+modality cannot shut the others out.
+
 `evidence_budget_chars=None` grounds `ask()` on exactly `limit` hits. A positive integer keeps
 those hits and then admits more ranked evidence while its text-equivalent cost fits the budget:
 2,000 characters per image, 4,000 per audio asset, and 12,000 per video asset. It raises a floor

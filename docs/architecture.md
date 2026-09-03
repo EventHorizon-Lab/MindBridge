@@ -106,7 +106,10 @@ bitemporal, spatial, and memory-type filters pass. Composite records use an aggr
 plus bounded, de-duplicated text and media keys, and long text contributes bounded overlapping
 contextual keys. A query uses its complete aggregate plus bounded keys focused on the first text
 atom and query media. Dense routes and the lexical route may run concurrently, with at most four
-outer search workers.
+outer search workers. Every route runs at a fixed candidate depth that does not depend on the
+requested `limit`, so a narrow request returns the prefix of a wider one and each hit reports the
+same score at both. A scope that leaves fewer survivors than the request asked for still widens the
+pool.
 
 Ranking combines the strongest dense evidence with bounded lexical, temporal, ambiguity, and
 optional decay signals. `RetrievalScope` filters apply as authoritative SQLite checks rather than

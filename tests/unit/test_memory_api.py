@@ -1358,29 +1358,39 @@ def test_lexical_candidate_confidence_does_not_decay_with_its_result_rank(
     assert [hit.id for hit in hits] == [exact.id]
 
 
-def test_ask_round_robins_modalities_before_filling_grounding_slots(tmp_path: Path) -> None:
+def test_ask_grounds_in_score_order_with_one_slot_per_present_modality(tmp_path: Path) -> None:
+    """The window is the top of the ranking, plus a floor for any modality it left out.
+
+    Grounding used to pop one hit per modality in turn, capping every modality at
+    `ceil(limit / m)` however the scores fell. On this round's mem-gallery library that rebuilt
+    31 % of a 20-hit window out of lower-ranked hits and cost 1.93 pp of gold recall the ranking
+    had already found, so the guarantee is now a floor rather than a rotation: exactly one image
+    is promoted here, into the last slot, and the nine best text hits keep theirs.
+    """
     models = _FakeModels()
-    with _memory(tmp_path, models) as memory:
+    with _memory(tmp_path / "mixed", models) as memory:
+        texts = tuple(memory.add(f"text evidence {index}") for index in range(15))
         images = tuple(
             memory.add((f"image evidence {index}", Blob(str(index).encode(), "image/png")))
-            for index in range(4)
+            for index in range(5)
         )
-        texts = tuple(memory.add(f"text evidence {index}") for index in range(2))
-        index = _FakeIndex.instances[-1]
-        index.dense_hits_override = tuple(
-            IndexHit(id=record.id, relevance=0.99 - rank / 100, confidence=0.9)
-            for rank, record in enumerate((*images, *texts))
-        )
-        index.lexical_hits_override = ()
+        _rank_all((*texts, *images))
 
-        result = memory.ask("find evidence", limit=4)
+        result = memory.ask("find evidence", limit=10)
 
-    assert [hit.modality for hit in result.hits] == [
-        Modality.IMAGE,
-        Modality.TEXT,
-        Modality.IMAGE,
-        Modality.TEXT,
+    assert [hit.modality for hit in result.hits] == [Modality.TEXT] * 9 + [Modality.IMAGE]
+    assert [hit.id for hit in result.hits] == [
+        *(record.id for record in texts[:9]),
+        images[0].id,
     ]
+
+    with _memory(tmp_path / "text-only", _FakeModels()) as memory:
+        records = tuple(memory.add(f"only text {index}") for index in range(6))
+        _rank_all(records)
+
+        single = memory.ask("find evidence", limit=3)
+
+    assert [hit.id for hit in single.hits] == [record.id for record in records[:3]]
 
 
 def _rank_all(records: Sequence[MemoryRecord]) -> None:
