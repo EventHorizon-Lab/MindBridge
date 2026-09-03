@@ -89,7 +89,8 @@ demand better inferences, not a way to exclude observations; filter those by `me
   budget line -- which is roughly 150 characters plus the goal text;
 - a blank line and a two-character `##` heading, plus a space, for each non-empty section;
 - per included memory, the `- [id]` prefix and the `(confidence 0.00)` suffix, with their
-  separating spaces: 23 characters plus the id, plus a validity suffix when it carries one;
+  separating spaces: 23 characters plus the id, plus a validity suffix when it carries one, and
+  on an affect entry the provenance and hop marks [affect cues](#affect-cues) lists;
 - the optional `## Conflicts`, `## Unknowns`, and `Omitted:` blocks.
 
 A caller who ships `render()` should size against `len(bundle.render())`; the bundle does not
@@ -123,6 +124,9 @@ A typed `MemoryKind` decides the section first; an untyped or generic record fal
 | `procedures` | Type `procedural` |
 | `affect` | Kind `affect` |
 | `traits` | Kind `trait` |
+
+The `affect` section carries `AffectCue`, not a plain hit; [affect cues](#affect-cues) below is
+its contract. Every other section carries `SearchHit`.
 
 `actors`, `relationships`, `scene`, `affect`, and `traits` are keyed on `MemoryKind`. A stored
 record is kind `observation` unless a validated `FormationProposal` typed it, so all five sections
@@ -172,6 +176,45 @@ A provisional actor is not a hit. It never appears in `hits`, it takes no item s
 characters, and it is dropped when the evidence that observed the person did not make it into the
 bundle -- the bundle never reports somebody the reader cannot see the evidence for. `render()`
 prints one plainly labelled line per entry, after the ranked actors.
+
+## Affect cues
+
+An affect entry asserts how somebody felt, which is the one section where the difference between
+a model's guess and a person's own words changes what an agent may say. So `affect` carries
+`AffectCue`: every `SearchHit` field, plus two ID tuples, and `render()` prints the provenance on
+the line instead of leaving it in `context` for a caller who may never look.
+
+| On the line | Read from | Meaning |
+| --- | --- | --- |
+| `basis` | `context.basis` | `user_statement` when somebody said it, `model_inference` when a model concluded it |
+| `confidence` | `context.confidence` | The typed confidence, the same number `min_confidence` filters on |
+| `cue` | `context.cue_modality` | Which modality the cue was read from; formation must name a modality the source actually carries |
+| `valence` | `context.valence` | -1 through 1 |
+| `arousal` | `context.arousal` | 0 through 1 |
+| `from` | `AffectCue.source_ids` | The observations this cue cites, the same IDs as `context.evidence_ids` |
+| `co-occurring events` | `AffectCue.event_ids` | Events formed from at least one of those same observations |
+
+`cue`, `valence`, `arousal`, and either ID tuple are omitted from the line when the record does
+not carry them. Non-affect sections keep the plain `[id] content (confidence; validity)` line.
+
+```text
+## Affect
+- [i9j0] the user sounded tense about the deadline (confidence 0.72; basis model_inference; cue audio; valence -0.20; arousal 0.80; from [e5f6]; co-occurring events [k1l2])
+```
+
+**`event_ids` is co-occurrence, not cause.** An event is reported for a cue exactly when the two
+records share a `memory_evidence` source: both were derived from one thing that was observed.
+Nothing in the bundle claims the event caused the feeling, or even that the cue is about the
+event, and the compiler asserts no such edge across two different observations. That is why the
+field is named for what it is rather than `about` or `triggered_by`.
+
+The hop is one batched store read per `compile`, never one per cue, and it is subject to the same
+rules retrieval hydrated the hits under: a retired version, a hidden assertion, a forgotten
+record, and anything outside the requested `valid_at`/`known_at` window are all excluded, and
+`event_ids` is sorted so two compilations of one store render the same line. Only IDs are
+carried: the events are not fetched, they cost no characters and no item slot, and they are not
+added to `episodes`. A co-derived event that appears in `episodes` earned that slot from its own
+score. Read an event's text with `get()`.
 
 ## Conflicts
 

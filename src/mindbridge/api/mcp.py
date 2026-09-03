@@ -23,6 +23,7 @@ from mindbridge.api.messages import error_message
 from mindbridge.exceptions import MindBridgeError, ValidationError
 from mindbridge.types import (
     AbstentionReason,
+    AffectCue,
     AssetRef,
     ContextBudget,
     ContextBundle,
@@ -232,6 +233,17 @@ class SearchHitResult(MemoryResult):
     score: Annotated[float, Field(ge=0.0, le=1.0)]
 
 
+class AffectCueResult(SearchHitResult):
+    """One affect entry of a compiled bundle, with the evidence the cue hangs on.
+
+    `source_ids` are the observations the cue cites. `event_ids` are the events formed from
+    those same observations: co-occurrence inside one capture, never an attributed cause.
+    """
+
+    source_ids: tuple[str, ...] = ()
+    event_ids: tuple[str, ...] = ()
+
+
 class PageResult(BaseModel):
     items: tuple[MemoryResult, ...]
     next_cursor: str | None = None
@@ -338,7 +350,7 @@ class ContextBundleResult(BaseModel):
     episodes: tuple[SearchHitResult, ...]
     facts: tuple[SearchHitResult, ...]
     procedures: tuple[SearchHitResult, ...]
-    affect: tuple[SearchHitResult, ...]
+    affect: tuple[AffectCueResult, ...]
     traits: tuple[SearchHitResult, ...]
     conflicts: tuple[ContextConflictResult, ...]
     unknowns: tuple[ContextUnknownResult, ...]
@@ -990,6 +1002,16 @@ def _search_hit_result(hit: SearchHit) -> SearchHitResult:
     )
 
 
+def _affect_cue_result(cue: AffectCue) -> AffectCueResult:
+    # `dict(model)` is shallow, so the already-validated asset and context values are carried
+    # across rather than dumped and revalidated.
+    return AffectCueResult(
+        **dict(_search_hit_result(cue)),
+        source_ids=cue.source_ids,
+        event_ids=cue.event_ids,
+    )
+
+
 def _context_budget(budget: ContextBudgetInput | None) -> ContextBudget | None:
     """Translate the tool budget into the SDK value, which validates every bound."""
     if budget is None:
@@ -1019,7 +1041,7 @@ def _bundle_result(bundle: ContextBundle) -> ContextBundleResult:
         episodes=tuple(_search_hit_result(hit) for hit in bundle.episodes),
         facts=tuple(_search_hit_result(hit) for hit in bundle.facts),
         procedures=tuple(_search_hit_result(hit) for hit in bundle.procedures),
-        affect=tuple(_search_hit_result(hit) for hit in bundle.affect),
+        affect=tuple(_affect_cue_result(cue) for cue in bundle.affect),
         traits=tuple(_search_hit_result(hit) for hit in bundle.traits),
         conflicts=tuple(_conflict_result(conflict) for conflict in bundle.conflicts),
         unknowns=tuple(

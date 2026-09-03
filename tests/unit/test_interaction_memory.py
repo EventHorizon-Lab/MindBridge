@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
 
 from mindbridge import (
@@ -12,7 +13,11 @@ from mindbridge import (
     FormationInput,
     FormationProposal,
     Memory,
+    MemoryIntent,
     MemoryKind,
+    MemoryOperation,
+    MemoryRecord,
+    MemoryTrigger,
     Modality,
     ObservationContext,
     RetrievalScope,
@@ -75,6 +80,73 @@ class InteractionFormer:
 
     def close(self) -> None:
         pass
+
+
+class CueConsolidator:
+    """Proposes one model-inferred trait citing exactly the evidence it was shown."""
+
+    consolidation_model = "interaction-consolidator-test"
+    consolidation_recipe = "interaction-consolidator-test:v1"
+
+    def consolidate(
+        self,
+        evidence: Sequence[MemoryRecord],
+        *,
+        trigger: MemoryTrigger,
+    ) -> tuple[MemoryOperation, ...]:
+        del trigger
+        return (
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE,
+                evidence_ids=tuple(record.id for record in evidence),
+                proposal=FormationProposal(
+                    kind=MemoryKind.TRAIT,
+                    content="The user is anxious under stress",
+                    subject="user",
+                    predicate="disposition",
+                    value="anxious",
+                    confidence=0.6,
+                ),
+            ),
+        )
+
+    def close(self) -> None:
+        pass
+
+
+def _cue_memory(root: Path) -> Memory:
+    return Memory(
+        root,
+        embedder=TinyEmbedder(),
+        former=InteractionFormer(),
+        consolidator=CueConsolidator(),
+        minimum_relevance=0,
+    )
+
+
+def _affect_ids(memory: Memory) -> tuple[str, ...]:
+    return tuple(
+        record.id
+        for record in memory.list(limit=100).items
+        if record.context is not None and record.context.kind is MemoryKind.AFFECT
+    )
+
+
+def _observe_cues(memory: Memory, text: str, source_id: str) -> tuple[str, ...]:
+    """Record one audiovisual observation and return the affect cues formed from it."""
+    known = set(_affect_ids(memory))
+    memory.add(
+        (text, Blob(text.encode(), "audio/wav")),
+        context=ObservationContext(source_id=source_id),
+    )
+    return tuple(value for value in _affect_ids(memory) if value not in known)
+
+
+def _trait_over(memory: Memory, evidence_ids: Sequence[str]) -> MemoryRecord:
+    report = memory.consolidate(evidence_ids=tuple(evidence_ids))
+    assert report.rejected == ()
+    assert len(report.operations) == 1
+    return memory.get(report.operations[0].created_ids[0])
 
 
 def test_multimodal_affect_keeps_conflicting_cues_separate(tmp_path: Path) -> None:
@@ -258,3 +330,49 @@ def test_explicit_trait_can_evolve_back_to_an_earlier_value(tmp_path: Path) -> N
         }
 
     assert traits == {"concise"}
+
+
+def test_two_affect_cues_from_one_observation_are_one_independent_source(tmp_path: Path) -> None:
+    with _cue_memory(tmp_path) as memory:
+        cues = _observe_cues(memory, "I am fine", "session-1")
+        assert len(cues) == 2
+
+        derived = _trait_over(memory, cues)
+
+        assert derived.context is not None
+        # Both cues were formed from the same observation, so they inherit its evidence group:
+        # a single emotional event cannot corroborate itself into a trait.
+        assert derived.context.visible is False
+        assert derived.context.confidence == pytest.approx(0.6)
+        assert not any(hit.id == derived.id for hit in memory.search("anxious", limit=10))
+        assert memory.compile("anxious under stress").traits == ()
+
+
+def test_affect_cues_from_two_observations_support_a_trait(tmp_path: Path) -> None:
+    with _cue_memory(tmp_path) as memory:
+        first = _observe_cues(memory, "I am fine", "session-1")
+        second = _observe_cues(memory, "I am okay", "session-2")
+
+        derived = _trait_over(memory, (first[0], second[0]))
+
+        assert derived.context is not None
+        assert derived.context.visible is True
+        assert derived.context.confidence == pytest.approx(1 - 0.4 * 0.4)
+        assert any(hit.id == derived.id for hit in memory.search("anxious", limit=10))
+        assert [hit.id for hit in memory.compile("anxious under stress").traits] == [derived.id]
+
+
+def test_a_derived_cue_and_an_unrelated_observation_are_two_sources(tmp_path: Path) -> None:
+    with _cue_memory(tmp_path) as memory:
+        cues = _observe_cues(memory, "I am fine", "session-1")
+        raw = memory.add(
+            ("the user paused", Blob(b"pause", "audio/wav")),
+            context=ObservationContext(source_id="session-2"),
+        )
+
+        derived = _trait_over(memory, (cues[0], raw.id))
+
+        assert derived.context is not None
+        assert derived.context.visible is True
+        assert derived.context.confidence == pytest.approx(1 - 0.4 * 0.4)
+        assert any(hit.id == derived.id for hit in memory.search("anxious", limit=10))

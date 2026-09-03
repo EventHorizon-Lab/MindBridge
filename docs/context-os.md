@@ -184,7 +184,9 @@ The resulting bundle may contain:
 - current actors, relationships, and scene state, each in its own bundle section (identities
   still need the asset-keyed identity edge, which no read path traverses yet);
 - relevant episodic, semantic, and procedural memories;
-- affect cues separated from longer-horizon traits;
+- affect cues separated from longer-horizon traits, each cue carrying its basis, cue
+  modality, and confidence; see [affective memory](affective-memory.md) for why a cue is
+  never reconciled into a single current feeling;
 - temporal and spatial bounds, both metric frames and symbolic places;
 - conflicts, uncertainty, and explicit unknowns; and
 - provenance needed to inspect or correct the result.

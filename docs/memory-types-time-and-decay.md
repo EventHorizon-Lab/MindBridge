@@ -137,7 +137,10 @@ commits derived records. Two kinds carry extra visibility rules:
   model cannot claim an audio cue for a source that has no audio.
 - `MemoryKind.TRAIT` stays hidden from active retrieval until two independent sources support the
   same typed claim, combining their independent confidence with a noisy-OR projection. A trusted
-  `EvidenceBasis.USER_STATEMENT` trait is visible immediately.
+  `EvidenceBasis.USER_STATEMENT` trait is visible immediately. Independence is counted at the
+  observation level: a derived record inherits the evidence group of its own sources, so several
+  cues formed from one observation — a text and an audio `AFFECT`, say — count as one source and
+  can never corroborate each other into a visible trait.
 
 ### Naming a person is a typed assertion
 
@@ -304,7 +307,7 @@ first: `rollback()` returns `False` for an operation a standing later one has bu
 
 | Intent | Kernel semantics |
 | --- | --- |
-| `REINFORCE` | Link an independent source to an existing derived record. Confidence recombines by noisy-OR over independent sources, and a hidden inferred `TRAIT` can become visible. |
+| `REINFORCE` | Link an independent source to an existing derived record. Confidence recombines by noisy-OR over independent sources counted at the observation level, and a hidden inferred `TRAIT` can become visible. |
 | `CONSOLIDATE` | Derive one new record citing several sources. The sources stay as evidence, and stay in recall unless the same proposal names them in `target_ids`. |
 | `CORRECT` | Retire the current version of a bad derived inference. History is preserved, not overwritten. |
 | `FORGET` | Set `forgotten_at`. Recall skips the record; audit keeps it. |

@@ -35,6 +35,7 @@ from mindbridge.exceptions import (
 )
 from mindbridge.memory import declared_capabilities
 from mindbridge.types import (
+    AffectCue,
     AssetRef,
     Blob,
     ContextBudget,
@@ -417,6 +418,9 @@ def test_the_error_envelope_has_one_shape() -> None:
     [
         (MemoryRecord, rest.MemoryResponse, mcp_adapter.MemoryResult),
         (SearchHit, rest.SearchHitResponse, mcp_adapter.SearchHitResult),
+        # The compiled affect entry is a hit plus its evidence hop, so both transports have to
+        # carry the two extra fields instead of serializing it as a plain hit.
+        (AffectCue, rest.AffectCueResponse, mcp_adapter.AffectCueResult),
     ],
 )
 def test_result_records_expose_the_same_fields_on_both_transports(

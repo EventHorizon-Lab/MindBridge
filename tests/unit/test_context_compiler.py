@@ -13,6 +13,7 @@ from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
 from test_memory_control_plane import ScriptedConsolidator
 
 from mindbridge import (
+    AffectCue,
     AnswerResult,
     AssetRef,
     AsyncMemory,
@@ -53,6 +54,11 @@ def _hit(
     memory_type: MemoryType = MemoryType.SEMANTIC,
     kind: MemoryKind | None = None,
     confidence: float = 0.9,
+    basis: EvidenceBasis = EvidenceBasis.OBSERVATION,
+    cue_modality: Modality | None = None,
+    valence: float | None = None,
+    arousal: float | None = None,
+    evidence_ids: tuple[str, ...] = (),
     occurred_at: datetime | None = None,
     occurred_end: datetime | None = None,
     created_at: datetime = REFERENCE,
@@ -70,12 +76,16 @@ def _hit(
         if kind is None
         else MemoryContext(
             kind=kind,
-            basis=EvidenceBasis.OBSERVATION,
+            basis=basis,
             confidence=confidence,
             valid_from=valid_from,
             valid_until=valid_until,
             recorded_at=created_at,
             lineage_id=lineage_id,
+            evidence_ids=evidence_ids,
+            cue_modality=cue_modality,
+            valence=valence,
+            arousal=arousal,
             subject="ana" if value is not None else None,
             predicate="location" if value is not None else None,
             value=value,
@@ -998,3 +1008,227 @@ def test_rendering_labels_a_provisional_actor_plainly() -> None:
     )
     assert "1/24 items" in bundle.render()
     assert bundle.render() == bundle.render()
+
+
+# ---------------------------------------------------------------------------------------------
+# Affect cues
+
+
+def _affect_hit(identifier: str = "cue-1", **overrides: object) -> SearchHit:
+    fields: dict[str, object] = {
+        "kind": MemoryKind.AFFECT,
+        "memory_type": MemoryType.EPISODIC,
+        "confidence": 0.72,
+        "basis": EvidenceBasis.MODEL_INFERENCE,
+        "cue_modality": Modality.AUDIO,
+        "valence": -0.2,
+        "arousal": 0.8,
+        "evidence_ids": ("obs-1",),
+    }
+    fields.update(overrides)
+    return _hit(identifier, **fields)  # type: ignore[arg-type]
+
+
+def test_an_affect_entry_renders_its_provenance_and_its_evidence_hop() -> None:
+    """An agent reading the line can tell an inference from a statement without a second call."""
+    bundle = compile_context(
+        "how did that land",
+        (_affect_hit(),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        co_derived_events={"cue-1": ("event-1",)},
+    )
+
+    cue = bundle.affect[0]
+    assert (cue.source_ids, cue.event_ids) == (("obs-1",), ("event-1",))
+    assert bundle.render().splitlines()[-1] == (
+        "- [cue-1] evidence cue-1 (confidence 0.72; basis model_inference; cue audio;"
+        " valence -0.20; arousal 0.80; from [obs-1]; co-occurring events [event-1])"
+    )
+
+
+def test_an_affect_entry_names_the_basis_that_makes_it_a_statement() -> None:
+    bundle = compile_context(
+        "how did that land",
+        (_affect_hit(basis=EvidenceBasis.USER_STATEMENT, confidence=1.0),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+    )
+
+    assert "(confidence 1.00; basis user_statement; cue audio;" in bundle.render()
+    # No hop resolved is an empty hop, not an invented one.
+    assert bundle.affect[0].event_ids == ()
+
+
+def test_the_affect_hop_costs_no_item_slot_and_no_characters() -> None:
+    """Only IDs are carried, so the hop can never push evidence out of the bundle."""
+    hits = (_affect_hit(), _hit("fact-1"))
+    plain = compile_context(
+        "how did that land",
+        hits,
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+    )
+    hopped = compile_context(
+        "how did that land",
+        hits,
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        co_derived_events={"cue-1": ("event-1", "event-2")},
+    )
+
+    assert (hopped.chars, len(hopped.hits), hopped.omitted) == (plain.chars, 2, 0)
+    assert hopped.affect[0].event_ids == ("event-1", "event-2")
+    # The linked events were never fetched, so they are not smuggled into `episodes`.
+    assert [hit.id for hit in hopped.episodes] == []
+
+
+class _AffectFormer:
+    """One text observation forms one event and one affect cue, from the same evidence."""
+
+    formation_capabilities = ATOMIC_MODALITIES
+    formation_model = "affect-test"
+    formation_space = "affect-test:v1"
+
+    def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+        return tuple(
+            (
+                FormationProposal(
+                    kind=MemoryKind.EVENT,
+                    content=f"the review call happened: {item.content.text}",
+                ),
+                FormationProposal(
+                    kind=MemoryKind.AFFECT,
+                    content=f"the user sounded tense about it: {item.content.text}",
+                    subject="user",
+                    value="tense",
+                    confidence=0.72,
+                    cue_modality=Modality.TEXT,
+                    valence=-0.2,
+                    arousal=0.8,
+                ),
+            )
+            if "cue" in item.content.text
+            else ()
+            for item in inputs
+        )
+
+    def close(self) -> None:
+        return None
+
+
+def _affect_memory(data_dir: Path) -> Memory:
+    return Memory(
+        data_dir,
+        embedder=TinyEmbedder(),
+        former=_AffectFormer(),
+        minimum_relevance=0,
+    )
+
+
+def _cue(bundle: ContextBundle) -> AffectCue:
+    assert len(bundle.affect) == 1
+    return bundle.affect[0]
+
+
+def _event_ids(bundle: ContextBundle) -> list[str]:
+    return [
+        hit.id
+        for hit in bundle.episodes
+        if hit.context is not None and hit.context.kind is MemoryKind.EVENT
+    ]
+
+
+def test_an_affect_cue_carries_its_observation_and_the_event_it_co_occurred_with(
+    tmp_path: Path,
+) -> None:
+    with _affect_memory(tmp_path) as memory:
+        observation = memory.add("cue: the review call about the harbour")
+        bundle = memory.compile("the review call about the harbour", reference_at=REFERENCE)
+
+    assert _cue(bundle).source_ids == (observation.id,)
+    assert _cue(bundle).event_ids == tuple(_event_ids(bundle))
+    assert len(_event_ids(bundle)) == 1
+
+
+def test_two_observations_do_not_cross_link_their_cues_and_events(tmp_path: Path) -> None:
+    """The edge is shared evidence, so one capture's event never reaches another's cue."""
+    with _affect_memory(tmp_path) as memory:
+        first = memory.add("cue: the review call about the harbour")
+        second = memory.add("cue: the review call about the workshop")
+        bundle = memory.compile(
+            "the review call",
+            budget=ContextBudget(max_items=8),
+            reference_at=REFERENCE,
+        )
+
+    events = {
+        hit.id: hit.context.evidence_ids
+        for hit in bundle.episodes
+        if hit.context is not None and hit.context.kind is MemoryKind.EVENT
+    }
+    cues = {cue.source_ids: cue.event_ids for cue in bundle.affect}
+    assert len(events) == 2
+    assert cues == {
+        (first.id,): tuple(
+            event_id for event_id, sources in events.items() if sources == (first.id,)
+        ),
+        (second.id,): tuple(
+            event_id for event_id, sources in events.items() if sources == (second.id,)
+        ),
+    }
+    assert all(len(event_ids) == 1 for event_ids in cues.values())
+
+
+def test_a_forgotten_co_derived_event_leaves_the_hop_and_returns_on_rollback(
+    tmp_path: Path,
+) -> None:
+    with _affect_memory(tmp_path) as memory:
+        memory.add("cue: the review call about the harbour")
+        bundle = memory.compile("the review call about the harbour", reference_at=REFERENCE)
+        (event_id,) = _cue(bundle).event_ids
+
+        operation = memory.forget((event_id,))
+        assert operation is not None
+        forgotten = memory.compile("the review call about the harbour", reference_at=REFERENCE)
+        assert _cue(forgotten).event_ids == ()
+        # The event lost its own line too, so the bundle never names an ID it cannot show.
+        assert _event_ids(forgotten) == []
+
+        assert memory.rollback(operation.operation_id) is True
+        restored = memory.compile("the review call about the harbour", reference_at=REFERENCE)
+
+    assert _cue(restored).event_ids == (event_id,)
+
+
+def test_the_cli_command_serializes_the_affect_hop(tmp_path: Path) -> None:
+    with _affect_memory(tmp_path) as memory:
+        memory.add("cue: the review call about the harbour")
+        arguments = _parser().parse_args(
+            [
+                "compile",
+                "the review call about the harbour",
+                "--reference-at",
+                REFERENCE.isoformat(),
+            ]
+        )
+        document = _LOCAL["compile"](memory, arguments)
+
+    (cue,) = json.loads(json.dumps(document))["affect"]
+    assert cue["source_ids"] and cue["event_ids"]
+    assert "co-occurring events" in str(document["rendered"])
+
+
+def test_the_affect_hop_reads_the_transaction_time_the_scope_asked_for(tmp_path: Path) -> None:
+    """`known_at` reaches the hop, so it cannot report a version the hits were not hydrated at."""
+    later = datetime.now(timezone.utc) + timedelta(days=1)
+    with _affect_memory(tmp_path) as memory:
+        memory.add("cue: the review call about the harbour")
+        bundle = memory.compile(
+            "the review call about the harbour",
+            reference_at=REFERENCE,
+            scope=RetrievalScope(known_at=later, valid_at=later),
+        )
+
+    assert _cue(bundle).event_ids == tuple(_event_ids(bundle))
+    assert len(_event_ids(bundle)) == 1

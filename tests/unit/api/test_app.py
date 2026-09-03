@@ -22,6 +22,7 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.types import (
+    AffectCue,
     AnswerResult,
     AssetRef,
     Blob,
@@ -31,7 +32,10 @@ from mindbridge.types import (
     ContextConflict,
     ContextUnknown,
     ContextUnknownKind,
+    EvidenceBasis,
     MemoryCapabilities,
+    MemoryContext,
+    MemoryKind,
     MemoryRecord,
     MemoryType,
     Modality,
@@ -84,6 +88,18 @@ CAPABILITIES = MemoryCapabilities(
 
 
 PROVISIONAL = ProvisionalActor(identity_id="identity_2", memory_ids=("memory_2",))
+AFFECT_CONTEXT = MemoryContext(
+    kind=MemoryKind.AFFECT,
+    basis=EvidenceBasis.MODEL_INFERENCE,
+    confidence=0.72,
+    valid_from=None,
+    valid_until=None,
+    recorded_at=NOW,
+    evidence_ids=("memory_2",),
+    cue_modality=Modality.AUDIO,
+    valence=-0.2,
+    arousal=0.8,
+)
 CONFLICT = ContextConflict(
     lineage_id="lineage_1",
     subject="ana",
@@ -837,6 +853,12 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
     assert [hit["id"] for hit in bundle["episodes"]] == ["memory_2"]
     # A person the evidence observed whom nobody has named travels beside the ranked hits.
     assert bundle["actors"] == [{"identity_id": "identity_2", "memory_ids": ["memory_2"]}]
+    # An affect entry is a hit plus its evidence hop: the observations it cites and the events
+    # formed from those same observations.
+    assert [(cue["id"], cue["source_ids"], cue["event_ids"]) for cue in bundle["affect"]] == [
+        ("memory_3", ["memory_2"], ["memory_9"])
+    ]
+    assert bundle["affect"][0]["context"]["basis"] == "model_inference"
     assert bundle["conflicts"] == [
         {
             "lineage_id": "lineage_1",
@@ -1018,7 +1040,7 @@ def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
         episodes=(_media_hit(),),
         facts=(_hit(),),
         procedures=(),
-        affect=(),
+        affect=(_affect_cue(),),
         traits=(),
         conflicts=(CONFLICT,),
         unknowns=(UNKNOWN,),
@@ -1030,6 +1052,20 @@ def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
         chars=42,
         elapsed_ms=7,
         deadline_exceeded=False,
+    )
+
+
+def _affect_cue() -> AffectCue:
+    """One affect entry, whose evidence hop must reach the wire beside the hit fields."""
+    return AffectCue(
+        id="memory_3",
+        content="The user sounded tense.",
+        score=0.6,
+        memory_type=MemoryType.EPISODIC,
+        created_at=NOW,
+        context=AFFECT_CONTEXT,
+        source_ids=("memory_2",),
+        event_ids=("memory_9",),
     )
 
 

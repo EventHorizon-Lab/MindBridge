@@ -2995,6 +2995,89 @@ class LocalStore:
             for memory_id, identity_ids in sorted(provisional.items())
         }
 
+    def co_derived_events(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        valid_at: datetime | None = None,
+        known_at: datetime | None = None,
+        near: SpatialContext | None = None,
+        radius_m: float | None = None,
+        place_id: str | None = None,
+    ) -> dict[str, tuple[str, ...]]:
+        """Return, per memory, the active event records formed from the same observations.
+
+        The edge is shared evidence: an event is reported for a memory exactly when both cite
+        one `memory_evidence.source_memory_id`. That is co-occurrence inside one capture and
+        not a cause, and the memory itself is never its own co-derived event. The candidates
+        are then read through `read_memories(active_only=True)` under every scope axis a search
+        hydration applies, so a retired version, a hidden assertion, a forgotten record, and
+        anything outside the asked-for validity, pose, or place are all left out. Empty entries
+        are dropped, so a missing key means no event shares this memory's observations.
+        """
+        ids = tuple(dict.fromkeys(memory_ids))
+        for memory_id in ids:
+            _require_identifier(memory_id, "memory_id")
+        if not ids:
+            return {}
+        if known_at is not None:
+            _require_aware(known_at, "known_at")
+        # Both evidence sides are read as of the same transaction time the versions are, so a
+        # link retired after `known_at` still joins the pair it joined then.
+        current = "{alias}.retired_at IS NULL"
+        as_of = (
+            "{alias}.recorded_at <= ? AND ({alias}.retired_at IS NULL OR {alias}.retired_at > ?)"
+        )
+        clause = current if known_at is None else as_of
+        known_parameters: tuple[object, ...] = (
+            () if known_at is None else (_datetime_text(known_at), _datetime_text(known_at))
+        )
+        derived: dict[str, list[str]] = {}
+        # Half a batch: each statement binds the cue IDs once and the time bounds twice.
+        with self._read_transaction() as connection:
+            for offset in range(0, len(ids), _SQLITE_PARAMETER_BATCH // 2):
+                batch = ids[offset : offset + _SQLITE_PARAMETER_BATCH // 2]
+                placeholders = ", ".join("?" for _memory_id in batch)
+                for row in connection.execute(
+                    f"""
+                    SELECT DISTINCT cue.memory_id AS memory_id, ev.memory_id AS event_id
+                    FROM memory_evidence AS cue
+                    JOIN memory_evidence AS ev
+                        ON ev.source_memory_id = cue.source_memory_id
+                        AND ev.memory_id <> cue.memory_id
+                    JOIN memory_semantics AS s ON s.memory_id = ev.memory_id
+                    WHERE cue.memory_id IN ({placeholders}) AND s.kind = ?
+                      AND {clause.format(alias="cue")} AND {clause.format(alias="ev")}
+                    ORDER BY memory_id, event_id
+                    """,
+                    (*batch, MemoryKind.EVENT.value, *known_parameters, *known_parameters),
+                ).fetchall():
+                    derived.setdefault(_row_text(row, "memory_id"), []).append(
+                        _row_text(row, "event_id")
+                    )
+        if not derived:
+            return {}
+        candidates = tuple(
+            dict.fromkeys(event_id for events in derived.values() for event_id in events)
+        )
+        active = {
+            memory.memory_id
+            for memory in self.read_memories(
+                candidates,
+                valid_at=valid_at,
+                known_at=known_at,
+                near=near,
+                radius_m=radius_m,
+                place_id=place_id,
+                active_only=True,
+            )
+        }
+        return {
+            memory_id: standing
+            for memory_id, events in sorted(derived.items())
+            if (standing := tuple(sorted(event for event in events if event in active)))
+        }
+
     def identity_profile(self, identity_id: str) -> IdentityProfile | None:
         """Return one identity's profile, or None when it does not exist.
 
@@ -5224,9 +5307,24 @@ def _insert_memory_evidence(
         is not None
     ):
         return False
+    # Independence is counted at the observation level. A derived source (an affect cue, say)
+    # inherits the group its own evidence already resolves to, so several cues formed from one
+    # observation stay one group and cannot corroborate each other into a visible trait. A
+    # source resolving to several groups keeps its own identity: nothing that traces back to a
+    # single observation can then reach two groups. Only a record with no evidence of its own
+    # -- a raw observation -- falls back to its capture source.
     source = connection.execute(
         """
-        SELECT COALESCE(s.source_id, r.memory_id) AS source_group_id
+        SELECT COALESCE(
+            (
+                SELECT MIN(d.source_group_id)
+                FROM memory_evidence AS d
+                WHERE d.memory_id = r.memory_id AND d.retired_at IS NULL
+                HAVING COUNT(DISTINCT d.source_group_id) = 1
+            ),
+            s.source_id,
+            r.memory_id
+        ) AS source_group_id
         FROM memory_records AS r
         LEFT JOIN memory_semantics AS s
           ON s.memory_id = r.memory_id AND s.kind = 'observation'

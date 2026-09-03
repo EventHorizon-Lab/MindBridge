@@ -15,6 +15,7 @@ from types import MappingProxyType
 from typing import TypeAlias
 
 from mindbridge.types import (
+    AffectCue,
     ContextBudget,
     ContextBundle,
     ContextConflict,
@@ -106,6 +107,7 @@ def compile_context(
     unknowns: Sequence[ContextUnknown] = (),
     candidate_limit: int | None = None,
     provisional: Mapping[str, Sequence[str]] = MappingProxyType({}),
+    co_derived_events: Mapping[str, Sequence[str]] = MappingProxyType({}),
 ) -> ContextBundle:
     """Partition, filter, and budget ranked hits into one bundle.
 
@@ -119,6 +121,12 @@ def compile_context(
     assertion names. The kernel resolves that, deterministically, before calling; the compiler
     only keeps the entries whose evidence actually made it into the bundle, so the bundle never
     reports a person the reader cannot see the evidence for.
+
+    `co_derived_events` maps an affect memory ID to the event IDs formed from the same
+    observations, resolved by the store under the same visibility the hits were hydrated with.
+    The compiler attaches those to the selected affect entries and nothing else: the edge is
+    co-occurrence inside one capture, not causation, and the events themselves are neither
+    fetched nor charged.
     """
     started_at = perf_counter() if started_at is None else started_at
     excluded: dict[str, int] = {}
@@ -130,6 +138,13 @@ def compile_context(
         else:
             excluded[reason] = excluded.get(reason, 0) + 1
     sections = _select(candidates, budget)
+    # An affect entry becomes an `AffectCue`: the same hit, plus its own evidence and the events
+    # that evidence also formed. Substituted before anything reads the sections, so `hits`,
+    # `chars`, and the conflict pass all see one instance per included memory.
+    affect = tuple(
+        _affect_cue(hit, co_derived_events.get(hit.id, ())) for hit in sections["affect"]
+    )
+    sections["affect"] = affect
     # Rank order, not section order: `_lineage_conflict` pairs each value with the highest-ranked
     # memory asserting it, so a lineage whose claims land in different sections must still be read
     # by score. `ContextBundle.hits` sorts the same way.
@@ -166,7 +181,7 @@ def compile_context(
         episodes=sections["episodes"],
         facts=sections["facts"],
         procedures=sections["procedures"],
-        affect=sections["affect"],
+        affect=affect,
         traits=sections["traits"],
         conflicts=conflicts,
         unknowns=_unknowns(
@@ -247,6 +262,32 @@ def _select(
             taken.add(hit.id)
             used += cost
     return {name: tuple(section) for name, section in sections.items()}
+
+
+def _affect_cue(hit: SearchHit, event_ids: Sequence[str]) -> AffectCue:
+    """Return one affect hit as the evidence-first entry the bundle publishes.
+
+    `source_ids` is the cue's own evidence, which retrieval already hydrated, so the entry
+    cannot disagree with `context.evidence_ids`. `event_ids` is sorted, so two compilations of
+    the same store produce the same line.
+    """
+    return AffectCue(
+        id=hit.id,
+        content=hit.content,
+        score=hit.score,
+        created_at=hit.created_at,
+        occurred_at=hit.occurred_at,
+        occurred_end=hit.occurred_end,
+        metadata=hit.metadata,
+        assets=hit.assets,
+        modality=hit.modality,
+        memory_type=hit.memory_type,
+        context=hit.context,
+        place_id=hit.place_id,
+        forgotten_at=hit.forgotten_at,
+        source_ids=() if hit.context is None else hit.context.evidence_ids,
+        event_ids=tuple(sorted(set(event_ids))),
+    )
 
 
 def _section(hit: SearchHit) -> str:
