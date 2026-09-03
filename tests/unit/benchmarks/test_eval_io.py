@@ -345,11 +345,12 @@ def test_single_boundary_segmentation_avoids_the_segment_muxer(
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
     commands: list[tuple[str, ...]] = []
+    expected_segments = [1]
 
     def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
         commands.append(tuple(command))
         output = Path(command[-1])
-        for index in range(len(_boundaries)):
+        for index in range(expected_segments[0]):
             Path(str(output).replace("%05d", f"{index:05d}")).write_bytes(b"segment")
 
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._run_ffmpeg", run)
@@ -357,8 +358,7 @@ def test_single_boundary_segmentation_avoids_the_segment_muxer(
     # Asked for one whole clip, ffmpeg must write one named output. Handing this to the segment
     # muxer without `-segment_times` makes it split at every keyframe instead, which turned one
     # 30 s EgoLife clip into 13 + 17 frames and failed the write.
-    _boundaries: tuple[float, ...] = (30.0,)
-    prepared = _segment_video(source, _boundaries, tmp_path / "cache", None)
+    prepared = _segment_video(source, (30.0,), tmp_path / "cache", None)
 
     assert len(prepared) == 1
     assert prepared[0][:2] == (0.0, 30.0)
@@ -367,8 +367,8 @@ def test_single_boundary_segmentation_avoids_the_segment_muxer(
     assert commands[0][-1].endswith("segment-00000.mp4")
 
     # With real cuts the segment muxer is still the right tool, and it is told where to cut.
-    _boundaries = (10.0, 20.0)
-    _segment_video(source, _boundaries, tmp_path / "cache", None)
+    expected_segments[0] = 2
+    _segment_video(source, (10.0, 20.0), tmp_path / "cache", None)
 
     assert commands[1][commands[1].index("-f") + 1] == "segment"
     assert commands[1][commands[1].index("-segment_times") + 1] == "10.000"

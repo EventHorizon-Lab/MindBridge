@@ -561,6 +561,45 @@ def test_table_shows_the_control_values_when_they_are_present() -> None:
     assert eval_module._uninterpretable_tasks(results) == ()
 
 
+def test_table_prints_the_product_token_cost_when_the_judge_left_the_total_null() -> None:
+    results = {
+        "tasks": [
+            {
+                "task": "fixture",
+                "primary_metric": "accuracy",
+                "score": {"mean": 0.9, "confidence_interval_95": None},
+                "question_count": 2,
+                "error_count": 0,
+                "performance": {
+                    "duration_seconds": {"total": 2.5, "average": 1.25},
+                    "token_usage": {
+                        "total_tokens": None,
+                        "average_tokens": None,
+                        "product": {"total_tokens": 80, "average_tokens": 40.0},
+                    },
+                },
+                "ingest_failure_count": 0,
+                "controls": {
+                    "random_ranker": None,
+                    "recall_at_1": None,
+                    "recall_at_20": None,
+                    "blind": None,
+                    "is_blind_run": False,
+                    "missing": [],
+                    "interpretable": True,
+                    "reason": None,
+                },
+            }
+        ]
+    }
+
+    table = eval_module._table(results)
+
+    # The marker says these are the product modules' tokens, not the run total.
+    assert "80*" in table
+    assert "40.0*" in table
+
+
 # --- blind baseline provenance ---------------------------------------------------------------
 
 

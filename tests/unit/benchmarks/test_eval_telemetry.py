@@ -101,3 +101,49 @@ def test_evaluation_telemetry_does_not_turn_missing_usage_into_zero() -> None:
     assert usage["reported_total_tokens"] == 0
     assert usage["input_tokens"] == 5
     assert usage["input_by_modality"] == {"text": 5}
+
+
+def test_product_token_cost_survives_an_incomplete_judge() -> None:
+    """One judge request without usage must not hide a fully reported product cost."""
+    telemetry = EvaluationTelemetry()
+    try:
+        with telemetry.tracer.start_as_current_span(
+            BENCHMARK_TASK_SPAN,
+            attributes={BENCHMARK_TASK: "fixture", SPAN_KIND: "benchmark"},
+        ):
+            with telemetry.tracer.start_as_current_span(
+                "mindbridge.model.generation",
+                attributes={SPAN_KIND: "model", MODEL_MODULE: "generation"},
+            ):
+                mark_model_requests(1)
+                record_model_usage(
+                    input_tokens=70,
+                    output_tokens=10,
+                    total_tokens=80,
+                    expected_requests=1,
+                    reported_requests=1,
+                )
+            with telemetry.tracer.start_as_current_span(
+                "mindbridge.model.judge",
+                attributes={SPAN_KIND: "model", MODEL_MODULE: "judge"},
+            ):
+                mark_model_requests(1)
+                record_model_usage(
+                    input_tokens=None,
+                    output_tokens=None,
+                    total_tokens=None,
+                    expected_requests=1,
+                    reported_requests=0,
+                )
+        result = telemetry.result("fixture", question_count=2)
+    finally:
+        telemetry.close()
+
+    usage = cast(dict[str, object], result["token_usage"])
+    product = cast(dict[str, object], usage["product"])
+    assert usage["complete"] is False
+    assert usage["total_tokens"] is None
+    assert product["modules"] == ["generation"]
+    assert product["complete"] is True
+    assert product["total_tokens"] == 80
+    assert product["average_tokens"] == pytest.approx(40.0)

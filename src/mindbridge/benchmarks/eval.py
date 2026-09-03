@@ -3676,6 +3676,18 @@ def _table(results: Mapping[str, object]) -> str:
         average_duration = duration.get("average")
         total_tokens = usage.get("total_tokens")
         average_tokens = usage.get("average_tokens")
+        # When the judge's usage is incomplete the task total is honestly null, but the product's
+        # own spend is usually complete; print that with a marker rather than a dash.
+        token_marker = ""
+        product = usage.get("product")
+        if (
+            total_tokens is None
+            and isinstance(product, Mapping)
+            and product.get("total_tokens") is not None
+        ):
+            total_tokens = product.get("total_tokens")
+            average_tokens = product.get("average_tokens")
+            token_marker = "*"
         valid = task.get("score_valid") is not False
         rows.append(
             (
@@ -3715,13 +3727,13 @@ def _table(results: Mapping[str, object]) -> str:
                 (
                     "—"
                     if isinstance(total_tokens, bool) or not isinstance(total_tokens, int)
-                    else str(total_tokens)
+                    else f"{total_tokens}{token_marker}"
                 ),
                 (
                     "—"
                     if isinstance(average_tokens, bool)
                     or not isinstance(average_tokens, int | float)
-                    else f"{float(average_tokens):.1f}"
+                    else f"{float(average_tokens):.1f}{token_marker}"
                 ),
                 _control_cell(controls.get("recall_at_1")),
                 _control_cell(controls.get("recall_at_20")),
