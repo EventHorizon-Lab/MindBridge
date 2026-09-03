@@ -116,6 +116,20 @@ _FORMATION_FIELDS = frozenset(
     }
 )
 _MAX_FORMATION_PROPOSALS = 64
+# The caption is written into a memory's full-text document, so it is asked for as index terms:
+# concrete nouns a later question could plausibly use, and nothing about the request itself. A
+# prose preamble ("This image shows ...") spends the document's first words on terms no query
+# contains.
+_VISION_SYSTEM_PROMPT = """Describe each supplied visual so a keyword search can find it later.
+
+Write one or two plain sentences per visual naming only what is visible: the objects, people,
+readable text, actions, and setting. Do not interpret, guess at intent, estimate anything you
+cannot see, or refer to the image, the frames, or this request. A video arrives as ordered stills
+from one clip; describe it as one scene.
+
+Reply with JSON {"descriptions": ["...", "..."]} holding exactly one string per numbered visual,
+in the order supplied. Never leave a string empty; if a visual is unreadable, say what little is
+visible."""
 _TRUNCATED_ANSWER_ERROR = (
     "generation stopped at the output token limit; raise generation_max_tokens or lower the "
     "answer limit"
@@ -343,6 +357,17 @@ class OpenAIModels:
         return self._formation_space
 
     @property
+    def vision_capabilities(self) -> frozenset[Modality]:
+        # Description is a chat completion, so the visual modalities the endpoint accepts are the
+        # generation ones, exactly as formation reads them. `Memory` narrows this further: a
+        # describer declaring anything but image or video is rejected at construction.
+        return self._generation_capabilities
+
+    @property
+    def vision_model(self) -> str:
+        return self._generation_model
+
+    @property
     def transcription_capabilities(self) -> frozenset[Modality]:
         return self._transcription_capabilities
 
@@ -484,22 +509,7 @@ class OpenAIModels:
         assets = tuple(asset for value in batch for asset in value.content.assets)
         _require_consistent_assets(assets)
         _require_inline_size(assets)
-        request: dict[str, object] = {
-            "model": self._generation_model,
-            "messages": [
-                {"role": "system", "content": _FORMATION_SYSTEM_PROMPT},
-                {"role": "user", "content": _formation_content(batch)},
-            ],
-            "response_format": {"type": "json_object"},
-        }
-        if self._generation_seed is not None:
-            request["seed"] = self._generation_seed
-        if self._generation_temperature is not None:
-            request["temperature"] = self._generation_temperature
-        if self._generation_max_tokens is not None:
-            request["max_tokens"] = self._generation_max_tokens
-        if self._generation_extra_body is not None:
-            request["extra_body"] = dict(self._generation_extra_body)
+        request = self._json_request(_FORMATION_SYSTEM_PROMPT, _formation_content(batch))
         create_completion = cast(Any, self._client("generation").chat.completions.create)
         mark_model_requests(1)
         try:
@@ -517,7 +527,80 @@ class OpenAIModels:
             input_modalities=modalities,
             output_modalities=frozenset({Modality.TEXT}),
         )
-        return _formation_results(_formation_text(response), batch)
+        return _formation_results(
+            _json_completion_text(response, subject="formation", stage="form"),
+            batch,
+        )
+
+    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+        """Caption every supplied visual in one chat completion, for the text index.
+
+        The write path calls this so that an image-only memory has a full-text document at all.
+        What travels is pixels and an ordinal: no memory ID, file name, or path, because the
+        caption is stored beside the caller's own text and anything else in the prompt becomes
+        provenance leaked into a searchable document. A video is sent as the same four ordered
+        stills the generation path samples, never as the file -- one caption still describes the
+        whole clip.
+        """
+        mark_model_requests(0, token_usage_expected=0)
+        if isinstance(inputs, (str, bytes)):
+            raise ValidationError("inputs must contain ModelInput values")
+        batch = tuple(inputs)
+        if any(not isinstance(value, ModelInput) for value in batch):
+            raise ValidationError("inputs must contain ModelInput values")
+        if not batch:
+            return ()
+        modalities = frozenset(modality for value in batch for modality in value.modalities)
+        _require_capabilities("vision", modalities, self.vision_capabilities)
+        assets = tuple(asset for value in batch for asset in value.assets)
+        _require_consistent_assets(assets)
+        _require_inline_size(assets)
+        request = self._json_request(_VISION_SYSTEM_PROMPT, _vision_content(batch))
+        create_completion = cast(Any, self._client("generation").chat.completions.create)
+        mark_model_requests(1)
+        try:
+            response = create_completion(**request)
+        except ModelError:
+            raise
+        except Exception as error:
+            raise ModelError(
+                "vision description request failed",
+                reason=_provider_reason(error),
+                stage="describe",
+            ) from error
+        _record_openai_usage(
+            response,
+            input_modalities=modalities,
+            output_modalities=frozenset({Modality.TEXT}),
+        )
+        return _vision_captions(
+            _json_completion_text(response, subject="vision description", stage="describe"),
+            len(batch),
+        )
+
+    def _json_request(
+        self,
+        system_prompt: str,
+        content: str | list[dict[str, object]],
+    ) -> dict[str, object]:
+        """Build one JSON-object chat completion under the configured generation controls."""
+        request: dict[str, object] = {
+            "model": self._generation_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        if self._generation_seed is not None:
+            request["seed"] = self._generation_seed
+        if self._generation_temperature is not None:
+            request["temperature"] = self._generation_temperature
+        if self._generation_max_tokens is not None:
+            request["max_tokens"] = self._generation_max_tokens
+        if self._generation_extra_body is not None:
+            request["extra_body"] = dict(self._generation_extra_body)
+        return request
 
     def answer(
         self,
@@ -1378,26 +1461,27 @@ def _embedding_vectors(
     return tuple(vector for vector in ordered if vector is not None)
 
 
-def _formation_text(response: object) -> str:
+def _json_completion_text(response: object, *, subject: str, stage: str) -> str:
+    """Return the single JSON-object completion's text, or fail the way its caller reports."""
     choices = getattr(response, "choices", None)
     if (
         not isinstance(choices, list)
         or len(choices) != 1
         or getattr(choices[0], "index", None) != 0
     ):
-        raise _invalid_formation_response()
+        raise _invalid_json_response(subject, stage)
     finish_reason = getattr(choices[0], "finish_reason", None)
     _record_finish_reason(finish_reason)
     if finish_reason == "length":
         raise ModelOutputTruncatedError(
-            "formation stopped at the output token limit; raise generation_max_tokens",
-            stage="form",
+            f"{subject} stopped at the output token limit; raise generation_max_tokens",
+            stage=stage,
         )
     if finish_reason == "content_filter":
-        raise _invalid_formation_response()
+        raise _invalid_json_response(subject, stage)
     content = getattr(getattr(choices[0], "message", None), "content", None)
     if not isinstance(content, str) or not content.strip():
-        raise _invalid_formation_response()
+        raise _invalid_json_response(subject, stage)
     return content.strip()
 
 
@@ -1562,12 +1646,67 @@ def _formation_spatial(value: object) -> SpatialContext | None:
     )
 
 
-def _invalid_formation_response() -> ModelError:
+def _invalid_json_response(subject: str, stage: str) -> ModelError:
     return ModelError(
-        "formation response was invalid",
+        f"{subject} response was invalid",
         reason="response_invalid",
-        stage="form",
+        stage=stage,
     )
+
+
+def _invalid_formation_response() -> ModelError:
+    return _invalid_json_response("formation", "form")
+
+
+def _vision_content(inputs: Sequence[ModelInput]) -> list[dict[str, object]]:
+    """Number each visual and inline it, replacing every video with its ordered stills."""
+    parts: list[dict[str, object]] = []
+    cache: dict[str, str] = {}
+    for position, value in enumerate(inputs, start=1):
+        parts.append({"type": "text", "text": f"Visual {position}:"})
+        for asset in value.assets:
+            parts.extend(_vision_asset_parts(asset, cache))
+    return parts
+
+
+def _vision_asset_parts(
+    asset: AssetRef,
+    cache: dict[str, str],
+) -> tuple[dict[str, object], ...]:
+    if asset.modality is not Modality.VIDEO:
+        return (_generation_asset_part(asset, cache),)
+    frames = _video_frame_urls(asset)
+    if frames is None:
+        # Sending the file instead would be a silent policy change: a caption is derived text
+        # worth one small request, not worth uploading a whole clip to a generation endpoint.
+        # The decoder ships with this adapter's own extra, so reaching here means the file has
+        # no readable video stream or no readable duration.
+        raise ModelError(
+            "cannot decode video frames for description; the asset has no readable video "
+            "stream, or drop video from the vision modalities",
+            reason="asset_unavailable",
+            subject=asset.id,
+            stage="describe",
+        )
+    return tuple({"type": "image_url", "image_url": {"url": frame}} for frame in frames)
+
+
+def _vision_captions(content: str, count: int) -> tuple[str, ...]:
+    """Accept only one non-empty caption per visual, in order, and nothing else."""
+    try:
+        payload = json.loads(content)
+    except (json.JSONDecodeError, RecursionError):
+        raise _invalid_json_response("vision description", "describe") from None
+    values = payload.get("descriptions") if isinstance(payload, Mapping) else None
+    if (
+        not isinstance(values, list)
+        or len(values) != count
+        or any(not isinstance(value, str) or not value.strip() for value in values)
+    ):
+        raise _invalid_json_response("vision description", "describe")
+    # One line of index terms: a caption crosses a memory's text document, where an embedded
+    # newline would split a section marker away from what it labels.
+    return tuple(" ".join(cast(str, value).split()) for value in values)
 
 
 def _answer_text(response: object) -> str:

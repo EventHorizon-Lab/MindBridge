@@ -17,6 +17,17 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   composition had ever produced a typed memory, and therefore none had ever revised a belief,
   because the supersession rules fire only on the `STATE` and user-stated `TRAIT` kinds that only
   formation emits. Formation stays absent by default: it adds a model round-trip per write.
+- A `vision` slot on the declarative configuration surface, and `describe` on `OpenAIModels`, so a
+  `VisionDescriptionBackend` exists and is reachable from `Memory.from_config()`. The protocol was
+  declared, accepted by `MemoryPlugins`, and called by `Memory` on every write, but no class
+  implemented it and no key selected one, so the derived-text write path returned its input
+  unchanged everywhere: on one measured corpus 38.9 % of records were images or video stored with
+  a 28-character body, matchable by the dense route alone because a full-text document that is
+  empty cannot be matched and scores zero for the lexical re-ranking bonus. The caption is unioned
+  into that document, never substituted for the caller's text, and the asset is still embedded
+  natively. Video is described from four locally decoded stills rather than by uploading the file.
+  Description stays absent by default: it adds a model call per visual on the write path, reported
+  under its own model module so its tokens are separable from answer tokens.
 - `explain` on the search tool and the REST query, routing to `search_with_trace` and returning
   the per-candidate trace beside unchanged hits. An empty result over a transport was previously
   indistinguishable between nothing stored, everything below `minimum_relevance`, a `memory_type`

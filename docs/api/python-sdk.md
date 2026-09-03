@@ -87,8 +87,13 @@ the supported provider configuration fields live in [configuration](../configura
 A plain `TranscriptionBackend` transcribes supported audio/video during `add` regardless of
 `index_speech`; `SpeechBackend` analysis and identity resolution stay behind the explicit flag.
 
-`vision_describer` has no declarative provider and is reachable through direct construction or
-`MemoryPlugins`. `former` proposes typed memories only after the source observation commits;
+`vision_describer` captions a visual memory so it has a full-text document at all; without one an
+image-only memory is reachable by the dense route alone. It is selected by the declarative `vision`
+slot, which stays off unless it is configured, or supplied directly through `MemoryPlugins`; see
+[configuration](../configuration.md#visual-descriptions). The bundled `OpenAIModels.describe`
+captions one batch per chat completion, sends a video as four locally decoded stills rather than
+the file, and accepts only exactly one non-empty caption per input.
+`former` proposes typed memories only after the source observation commits;
 omitting it keeps ordinary add behavior and makes no formation model call. The bundled OpenAI
 former is selected by the declarative `formation` slot, which stays off unless it is configured;
 see [configuration](../configuration.md#automatic-memory-formation).

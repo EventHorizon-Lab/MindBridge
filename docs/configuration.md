@@ -82,6 +82,7 @@ and `max_retries`:
 | `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, `modalities=[text]` (at least one), `request_format=input`, plus connection fields |
 | `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `video_limit=8`, `min_video_seconds=None`, `extra_body=None`, plus connection fields |
 | `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
+| `vision: openai` | — | `model=gpt-5-mini`, `modalities=[image]` (image and/or video only), `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
 | `speech: funasr` | — | `device=auto` |
 | `speech: openai` | — | `model=whisper-1`, `space=None`, plus connection fields |
 | `face: opencv` | `detector_model`, `recognizer_model` | `score_threshold=0.9`, `nms_threshold=0.3`, `top_k=5000`, `frame_interval_ms=1000`, `max_video_frames=300` |
@@ -108,9 +109,12 @@ clips needs; it requires the model to accept images and is unset by default. `fo
 `video_limit` or `min_video_seconds` because
 it shapes an answer rather than a formation proposal; the slot otherwise takes the same fields as
 `generation`, since the adapter derives its formation model and space from exactly those values.
-`generation` and `formation` are separate slots and separate clients: setting one never enables the
-other. See [automatic formation over a local server](#automatic-formation-over-a-local-server) for
-what that slot costs and what a local endpoint has to implement.
+`vision` takes the same completion fields as `formation`, but its `modalities` accepts only
+`image` and `video`, because it is the visual capability set rather than a generation one.
+`generation`, `formation`, and `vision` are separate slots and separate clients: setting one never
+enables another. See [automatic formation over a local server](#automatic-formation-over-a-local-server)
+for what that slot costs and what a local endpoint has to implement, and
+[visual descriptions](#visual-descriptions) for the write-path cost of the vision slot.
 
 ## Automatic memory formation
 
@@ -150,6 +154,46 @@ absent because it caps answer evidence only. Formation is idempotent per source 
 formation recipe, so a model failure leaves the raw observation durable and the formation
 retryable. See [memory types, time, and decay](memory-types-time-and-decay.md) for the typed
 kinds and their visibility rules.
+
+## Visual descriptions
+
+The `vision` slot is omitted by default and, like `formation`, must stay omitted unless the
+deployment wants it. Configuring it adds one chat completion per write batch that carries a
+not-yet-described image or video, and buys the derived text that lets the lexical half of
+retrieval reach a visual memory at all.
+
+```python
+config = {
+    "embedding": {"provider": "jina-omni"},
+    "vision": {
+        "provider": "openai",
+        "model": "gpt-5-mini",
+        "modalities": ["image"],
+    },
+}
+```
+
+A memory whose content is one image has no words. Its full-text document is empty, so BM25 cannot
+match it, the lexical re-ranking bonus scores it zero, and the only route that reaches it is the
+dense one -- however capable the embedder is. Speech-bearing video escapes this through
+`index_speech`; nothing covers a silent image. The caption is unioned into that document beside
+whatever the caller wrote, each section carrying a `[visual description:<asset_id>]` marker so
+`get` shows which assets were described, and the asset is still embedded natively: the derived
+text is added to the record, never substituted for it.
+
+Three things bound what it costs and what it can do:
+
+- `modalities` is the visual capability set and accepts only `image` and `video`. An asset outside
+  it is left undescribed, silently and by design.
+- Video is described from four ordered stills decoded locally, never by uploading the file, so it
+  costs four image parts per memory; that is why the default is `[image]` and video is opted into.
+  A clip with no readable video stream fails the write rather than falling back to sending it.
+- The caption is derived text, so the request carries pixels and an ordinal only -- no memory ID,
+  file name, or store path -- and a reply that does not return exactly one non-empty caption per
+  visual is rejected whole rather than mislabelling a memory with another's contents.
+
+Description tokens are reported under their own model module, so a deployment that meters usage
+can separate what captioning costs from what answering costs.
 
 ## Embedding choices
 
@@ -395,12 +439,13 @@ Two capability slots behave differently from the declarative catalog:
   from the same recipe table as `--embedder` and `--answerer`. Configuring `generation` never
   enables automatic formation, because a former is a model call per observation on the write path.
   It stays opt-in on every path.
-- `vision_describer=` takes a `VisionDescriptionBackend` and is reachable only this way, or through
-  `MemoryPlugins`; no declarative provider selects it, because MindBridge bundles no
-  implementation of that protocol. `add` and `add_many` call it for every embedder whenever a
-  visual asset has no description yet. `AsyncVisionStream` additionally calls it at finality, when
-  the embedder lacks native image support and no external `VisionPartial` supplied a description,
-  so speculative retrieval has a query before finality.
+- `vision_describer=` takes a `VisionDescriptionBackend` directly, for a custom or non-bundled
+  adapter. The declarative `vision` slot above builds the bundled OpenAI adapter for the same
+  slot, and configuring `generation` never enables it, because a describer is a model call per
+  visual on the write path. `add` and `add_many` call it for every embedder whenever a visual
+  asset has no description yet. `AsyncVisionStream` additionally calls it at finality, when the
+  embedder lacks native image support and no external `VisionPartial` supplied a description, so
+  speculative retrieval has a query before finality.
 
 Use `MemoryPlugins` with `Memory.from_plugins()` when these constructed adapters should travel as
 one value. `resolve_memory_config()` is for hosts that need a `MemoryComposition` before opening
