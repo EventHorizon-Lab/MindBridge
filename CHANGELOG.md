@@ -23,7 +23,16 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - `Memory.capabilities()` and `MemoryCapabilities`, so an agent surface can advertise the
   modalities and memory capabilities one instance is configured for instead of discovering a
   missing backend by failing on first use.
-- `mindbridge compile` and `mindbridge capabilities` on the command line.
+- `mindbridge compile` and `mindbridge capabilities` on the command line, in local and `--url`
+  mode.
+- `POST /v1/context` (`compileContext`) and `GET /v1/capabilities` (`capabilities`) on REST, plus a
+  seventh MCP tool `compile_context`. Both transports return the whole `ContextBundle` — every
+  section, the conflicts, the temporal and spatial bounds, the budget it filled, and `rendered` —
+  and never serialize a local asset path. `build_mcp_server` now reads `memory.capabilities()` once
+  and publishes it as the MCP server instructions, so a connecting agent learns the configured
+  modalities and capabilities without a tool call; there is no capabilities tool. Compiling context
+  is a read-only view: identity naming, cognitive forgetting, and operation rollback still have no
+  REST route or MCP tool.
 
 - Face and speaker writes now record `mindbridge.identity.observations` and
   `mindbridge.identity.matched_existing` on their storage span, so a recognizer that cannot tell

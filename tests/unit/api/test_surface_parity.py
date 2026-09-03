@@ -18,7 +18,28 @@ from mindbridge.api import app as rest
 from mindbridge.api import mcp as mcp_adapter
 from mindbridge.api.errors import ErrorEnvelope, _public_error
 from mindbridge.exceptions import MindBridgeError
-from mindbridge.types import AssetRef, MemoryRecord, Page, SearchHit
+from mindbridge.types import (
+    AssetRef,
+    ContextBudget,
+    ContextBundle,
+    ContextConflict,
+    MemoryCapabilities,
+    MemoryRecord,
+    Modality,
+    Page,
+    SearchHit,
+)
+
+CAPABILITIES = MemoryCapabilities(
+    modalities=frozenset({Modality.TEXT, Modality.IMAGE}),
+    answer=True,
+    transcribe=False,
+    faces=False,
+    describe_vision=False,
+    form=True,
+    consolidate=False,
+    decay=True,
+)
 
 # The only hand-written mapping: which SDK operation each transport route and tool serves. Every
 # `/v1` route and every published tool must appear, so a new surface cannot skip this file.
@@ -27,6 +48,8 @@ SHARED_OPERATIONS: dict[str, tuple[str, str | None]] = {
     "add_many": ("createMemories", None),
     "search": ("searchMemories", "search_memories"),
     "ask": ("answer", "ask_memory"),
+    "compile": ("compileContext", "compile_context"),
+    "capabilities": ("capabilities", None),
     "get": ("getMemory", "get_memory"),
     "list": ("listMemories", "list_memories"),
     "delete": ("deleteMemory", "delete_memory"),
@@ -38,6 +61,7 @@ REST_REQUEST_MODELS: dict[str, type[BaseModel]] = {
     "createMemories": rest.MemoryBatchCreate,
     "searchMemories": rest.QueryRequest,
     "answer": rest.AnswerRequest,
+    "compileContext": rest.ContextRequest,
 }
 
 
@@ -103,7 +127,10 @@ def _mcp_defaults(tool: str) -> dict[str, object]:
 
 
 class _UnusedMemory:
-    """Adapter construction only reads shapes here; no operation is ever invoked."""
+    """Adapter construction reads shapes and the capability advertisement, nothing else."""
+
+    def capabilities(self) -> MemoryCapabilities:
+        return CAPABILITIES
 
 
 @pytest.mark.parametrize("operation", sorted(SHARED_OPERATIONS))
@@ -222,3 +249,56 @@ def test_page_results_expose_the_same_fields_on_both_transports() -> None:
 def test_delete_reports_the_same_state_on_both_transports() -> None:
     assert set(rest.DeleteResponse.model_fields) == set(mcp_adapter.DeleteResult.model_fields)
     assert get_type_hints(rest.DeleteResponse) == get_type_hints(mcp_adapter.DeleteResult)
+
+
+@pytest.mark.parametrize(
+    ("record", "rest_model", "mcp_model", "renamed"),
+    [
+        (ContextBundle, rest.ContextBundleResponse, mcp_adapter.ContextBundleResult, {}),
+        (ContextConflict, rest.ContextConflictResponse, mcp_adapter.ContextConflictResult, {}),
+        (
+            ContextBudget,
+            rest.ContextBudgetResponse,
+            mcp_adapter.ContextBudgetResult,
+            {"freshness": "freshness_seconds"},
+        ),
+    ],
+)
+def test_the_compiled_bundle_mirrors_the_sdk_value_on_both_transports(
+    record: type,
+    rest_model: type[BaseModel],
+    mcp_model: type[BaseModel],
+    renamed: dict[str, str],
+) -> None:
+    """A new `ContextBundle` field must reach both transports instead of being dropped."""
+    expected = {renamed.get(field.name, field.name) for field in dataclass_fields(record)}
+    # `rendered` is the transports' serialization of `ContextBundle.render()`, not a stored field.
+    if record is ContextBundle:
+        expected |= {"rendered"}
+
+    assert set(rest_model.model_fields) == expected
+    assert set(mcp_model.model_fields) == expected
+
+
+def test_the_context_budget_input_defaults_come_from_the_sdk_value() -> None:
+    budget = ContextBudget()
+    expected = {
+        "max_chars": budget.max_chars,
+        "max_items": budget.max_items,
+        "memory_types": budget.memory_types,
+        "min_confidence": budget.min_confidence,
+        "freshness_seconds": budget.freshness,
+    }
+
+    for model in (rest.ContextBudgetRequest, mcp_adapter.ContextBudgetInput):
+        assert {
+            name: field.get_default(call_default_factory=True)
+            for name, field in model.model_fields.items()
+        } == expected
+
+
+def test_capabilities_reports_the_same_flags_on_rest_and_in_the_mcp_instructions() -> None:
+    expected = {field.name for field in dataclass_fields(MemoryCapabilities)}
+
+    assert set(rest.CapabilitiesResponse.model_fields) == expected
+    assert set(mcp_adapter._CAPABILITY_FLAGS) == expected - {"modalities"}

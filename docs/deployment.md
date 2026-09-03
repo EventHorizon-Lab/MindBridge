@@ -133,8 +133,9 @@ with Memory.from_config(
     build_mcp_server(memory).run("stdio")
 ```
 
-`build_mcp_server()` does not close `memory`. A stdio server inherits the host user's filesystem,
-environment, and model credentials. If the host chooses SSE or streamable HTTP, it must add
+`build_mcp_server()` does not close `memory`. It reads `memory.capabilities()` once while building
+the server and publishes it as the server instructions, so build the server after the composition
+is final. A stdio server inherits the host user's filesystem, environment, and model credentials. If the host chooses SSE or streamable HTTP, it must add
 authentication, authorization, TLS, request limits, and rate limiting. MCP error subjects may
 contain owner-local paths.
 

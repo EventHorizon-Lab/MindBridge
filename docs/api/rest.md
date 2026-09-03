@@ -2,7 +2,7 @@
 
 ## Surface
 
-The optional FastAPI adapter exposes seven `Memory` operations under `/v1`. It validates transport
+The optional FastAPI adapter exposes nine `Memory` operations under `/v1`. It validates transport
 input, calls the injected synchronous memory, and serializes the public SDK values; it is not a
 separate storage or retrieval implementation.
 
@@ -62,8 +62,8 @@ request-rate policy. See [deployment](../deployment.md) for supported process sh
 
 ### Content input
 
-The `content`, `query`, and `question` fields accept either a trimmed, non-blank string or an
-ordered array of 1 through 16 strict content parts. Unknown fields are rejected.
+The `content`, `query`, `question`, and `goal` fields accept either a trimmed, non-blank string
+or an ordered array of 1 through 16 strict content parts. Unknown fields are rejected.
 
 | Part | Required fields | Source rule | Optional fields |
 | --- | --- | --- | --- |
@@ -106,6 +106,8 @@ SDK validator and error contract.
 | `GET /v1/memories/{memory_id}` | `getMemory` | non-empty path value | `200 MemoryResponse` |
 | `DELETE /v1/memories/{memory_id}` | `deleteMemory` | non-empty path value | `200 {"deleted":bool}` |
 | `POST /v1/answers` | `answer` | `AnswerRequest` | `200 AnswerResponse` |
+| `POST /v1/context` | `compileContext` | `ContextRequest` | `200 ContextBundleResponse` |
+| `GET /v1/capabilities` | `capabilities` | none | `200 CapabilitiesResponse` |
 
 Request fields and defaults are:
 
@@ -115,6 +117,8 @@ Request fields and defaults are:
 | `MemoryBatchCreate` | `contents` with 1–100 items; optional per-item arrays `occurred_at`, `occurred_end`, `metadata`, `context`; `memory_type="semantic"` for the complete batch |
 | `QueryRequest` | required `query`; `limit=10`; optional `memory_type`, `reference_at`, `occurred_from`, `occurred_until`, `scope` |
 | `AnswerRequest` | required `question`; `limit=5`; optional `memory_type`, `reference_at`, `scope` |
+| `ContextRequest` | required `goal`; optional `budget`, `reference_at`, `scope` |
+| `ContextBudgetRequest` | `max_chars=6000`; `max_items=24`; `min_confidence=0.0`; optional `memory_types` with at least one value; optional `freshness_seconds` |
 | List query | `limit=100`; optional opaque `cursor` |
 
 All timestamps must include a timezone. An event end requires a start and must be later than it.
@@ -166,9 +170,32 @@ Search-request scope:
 }
 ```
 
+Context-request budget:
+
+```json
+{
+  "goal": "What should I bring to the workshop?",
+  "budget": {
+    "max_chars": 2000,
+    "max_items": 8,
+    "memory_types": ["semantic", "episodic"],
+    "min_confidence": 0.5,
+    "freshness_seconds": 2592000
+  }
+}
+```
+
 Creation is content-addressed and idempotent. Batch results preserve input order. Deletion is also
 idempotent: `deleted` reports whether a record existed. `ask` requires an answerer configured in
 the injected memory.
+
+`compileContext` is a read-only view: it selects and structures existing evidence, reports
+conflicts without resolving them, calls no generation model, and writes nothing. Its request
+`budget` is the transport form of `ContextBudget`, with the `freshness` timedelta expressed as
+`freshness_seconds`. `max_chars` accepts 1 through 65,536 and `max_items` 1 through 100; the
+[compiler reference](../context-compilation.md) owns section, selection, and conflict semantics.
+`capabilities` reports the injected memory's configured composition and calls no model, so an
+agent can read what an instance supports instead of discovering a missing backend by failing.
 
 ### Response objects
 
@@ -178,6 +205,10 @@ the injected memory.
 | `MemoryResponse` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context`, `forgotten_at` |
 | `SearchHitResponse` | all memory fields plus `score` from 0 through 1 |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
+| `ContextBudgetResponse` | `max_chars`, `max_items`, `memory_types` sorted or `null`, `min_confidence`, `freshness_seconds` |
+| `ContextConflictResponse` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
+| `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `actors`, `episodes`, `facts`, `procedures`, `affect`, `traits`, plus `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`, `rendered` |
+| `CapabilitiesResponse` | `modalities` sorted, `answer`, `transcribe`, `faces`, `describe_vision`, `form`, `consolidate`, `decay` |
 | `PageResponse` | `items`, `next_cursor` |
 
 `modality` is `text`, `image`, `video`, `audio`, or `omni`. `memory_type` is `semantic`,
@@ -187,7 +218,9 @@ usable evidence, not that the model declined to answer in its own words. A respo
 the authoritative `MemoryContext`: typed kind and basis, confidence, valid and transaction time,
 visibility, lineage/source/evidence/supersession IDs, model recipe, optional
 subject/predicate/value, spatial pose, and affect cue fields. It is `null` on a raw record formed
-without typed context. Asset filesystem paths are never serialized.
+without typed context. Asset filesystem paths are never serialized, in bundle sections as
+elsewhere. Every bundle section is an array of `SearchHitResponse` values, and `rendered` is the
+deterministic text of `ContextBundle.render()`.
 
 ## Errors and limits
 
@@ -278,11 +311,12 @@ Use the [Python SDK](python-sdk.md) in the owning process for those operations.
 | Bound | REST value |
 | --- | --- |
 | Complete `/v1` request body | 8 MiB before JSON parsing |
+| Context `budget.max_chars` | 1 through 65,536 |
 | Content parts | 1 through 16 |
 | One URL source string | 8,192 characters |
 | Normalized text, including combined text parts | 65,536 characters |
 | Batch contents | 1 through 100 |
-| Search, answer, or page `limit` | 1 through 100 |
+| Search, answer, or page `limit`, and `budget.max_items` | 1 through 100 |
 | Serialized metadata for one memory | 262,144 UTF-8 bytes |
 | `file_id` or `filename` | 255 characters |
 

@@ -173,7 +173,9 @@ The resulting bundle may contain:
 
 The compiler selects and structures context; it does not choose the agent's final answer or action.
 `ask()` may remain a convenient grounded-generation surface, but it is not the operating-system
-boundary.
+boundary. `compile()` is implemented and exposed on all three interfaces; see
+[context compilation](context-compilation.md) for the contract and
+[REST](api/rest.md#endpoints) and [MCP](api/mcp.md#tools) for the transport forms.
 
 The first compiler should remain request-response and reuse the existing retrieval kernel. Push
 subscriptions, proactive interruption, and shared multi-agent working sets wait for a demonstrated
@@ -201,10 +203,17 @@ The Python SDK is the full developer and device integration surface. REST expose
 application operations. MCP exposes a small agent-appropriate capability view rather than mirroring
 every administrative method.
 
+The compiler is that view's centre. `POST /v1/context` and the `compile_context` MCP tool return a
+budgeted bundle with provenance, and `GET /v1/capabilities` and the MCP server instructions
+advertise the configured modalities and memory capabilities so an agent does not discover them
+through failure. Both are read-only: compiling context selects and structures existing evidence and
+resolves nothing. Answering stays available as a convenience rather than the operating-system
+boundary.
+
 High-rate sensor streams stay on the embedded SDK boundary. Agents operate on completed
-observations or stable asset identifiers. Identity naming, merge reversal, retention policy, and
-physical deletion remain opt-in trusted capabilities. A future agent surface should advertise its
-configured modalities and memory capabilities so an agent does not discover them through failure.
+observations or stable asset identifiers. Identity naming, merge reversal, cognitive forgetting,
+operation rollback, retention policy, and physical deletion remain opt-in trusted capabilities that
+no ordinary recall or compile call grants.
 
 All interfaces call one owner of one physical `data_dir`. Supporting several agents against that
 owner does not introduce logical account or request scope into the memory contract. A hosted
@@ -250,7 +259,9 @@ defaults or justify superiority claims.
 3. Generalize formation into one bounded memory-management loop with structured proposals,
    replay, rollback, and privacy tests.
 4. Add a context compiler whose output improves downstream tasks within declared budgets.
-5. Extend REST or MCP only after the Python contract and authority model are stable.
+5. Extend REST or MCP only after the Python contract and authority model are stable. The
+   compiler and the capability advertisement are the first operations to pass that gate; the
+   control-plane intents have not.
 
 MindBridge earns the Context OS label when fast capture is independent of slow reasoning, the
 agentic control plane can safely govern the memory lifecycle, and the compiler can produce

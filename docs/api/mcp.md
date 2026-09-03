@@ -2,9 +2,9 @@
 
 ## Surface
 
-The optional MCP adapter exposes exactly six typed tools over one injected synchronous `Memory`.
-It validates tool input, calls the matching SDK operation, and returns structured public values.
-It does not own storage, provider selection, or the injected memory. Finalized media arrives
+The optional MCP adapter exposes exactly seven typed tools over one injected synchronous
+`Memory`. It validates tool input, calls the matching SDK operation, and returns structured public
+values. It does not own storage, provider selection, or the injected memory. Finalized media arrives
 through ordinary content parts; live audio and vision packet ingestion, and `StreamEvent`
 reduction, stay Python-only because a tool call is a finite request.
 
@@ -34,6 +34,14 @@ with Memory.from_config(
 build_mcp_server(memory: Memory) -> MCPServer[None]
 ```
 
+`build_mcp_server` reads `memory.capabilities()` once at construction and publishes it as the
+server `instructions`, so a connecting agent learns the configured modalities and capabilities
+without spending a tool call. There is no capabilities tool. The text names the configured
+modalities, the available and unavailable capability flags, that `compile_context` is the preferred
+way to obtain context, and that identity naming, cognitive forgetting, consolidation, and
+operation rollback have no tool here. Because it is read at construction, a server built before a
+composition change keeps advertising the composition it was built with.
+
 ## Lifecycle and ownership
 
 `build_mcp_server` borrows `memory`; it neither opens nor closes it. The host must keep the owner
@@ -49,8 +57,8 @@ rate limits. MCP error `subject` is unredacted and may contain an owner-local pa
 
 ### Content input
 
-`content`, `query`, and `question` use the same strict `input_text`, `input_image`, and `input_file`
-union as [REST content input](rest.md#content-input): a non-blank string or 1 through 16 ordered
+`content`, `query`, `question`, and `goal` use the same strict `input_text`, `input_image`, and
+`input_file` union as [REST content input](rest.md#content-input): a non-blank string or 1 through 16 ordered
 parts. Source fields are mutually exclusive. Data URLs must contain base64 media; `file_data`
 requires a concrete image, video, or audio MIME type.
 
@@ -64,6 +72,7 @@ rejected. The MCP-specific media bounds are listed below.
 | `add_memory` | required `content`; `occurred_at=None`; `occurred_end=None`; `metadata=None`; `memory_type="semantic"`; `context=None` | `MemoryResult` | idempotent write |
 | `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None` | `{"hits":[SearchHitResult,...]}` | retrieval |
 | `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None` | `AnswerResponse` | retrieval |
+| `compile_context` | required `goal`; `budget=None`; `reference_at=None`; `scope=None` | `ContextBundleResult` | retrieval |
 | `get_memory` | required `memory_id` | `MemoryResult` | read-only |
 | `list_memories` | `limit=100`; `cursor=None` | `PageResult` | read-only |
 | `delete_memory` | required `memory_id` | `{"deleted":bool}` | destructive, idempotent |
@@ -79,11 +88,33 @@ version known then; `scope.near` and `scope.radius_m` must appear together, and 
 and observer/subject anchor must match the stored spatial context. SQLite reapplies both filters
 after candidate retrieval.
 
-`add_memory` is content-addressed. `delete_memory` reports whether a record existed. Search and
-answer are not marked read-only because their SDK path may persist lazy transcript caches; they are
-also not advertised as idempotent. Every tool has `open_world_hint=false`.
+`add_memory` is content-addressed. `delete_memory` reports whether a record existed. Search,
+answer, and compile are not marked read-only because their SDK path may persist lazy transcript
+caches; they are also not advertised as idempotent. Every tool has `open_world_hint=false`.
 `ask_memory` requires an answerer in the injected memory; without one it returns
 `model_error/backend_not_configured`.
+
+`compile_context` is the preferred way to get task-ready context: it returns a structured,
+budgeted bundle with provenance instead of one sentence, calls no generation model, and writes no
+memory. It reports lineage conflicts and never resolves them. `ask_memory` remains a convenience
+for one grounded answer. The optional `budget` object is the transport form of `ContextBudget`
+with the `freshness` timedelta expressed as `freshness_seconds`:
+
+```json
+{
+  "goal": "What should I bring to the workshop?",
+  "budget": {
+    "max_chars": 2000,
+    "max_items": 8,
+    "memory_types": ["semantic", "episodic"],
+    "min_confidence": 0.5,
+    "freshness_seconds": 2592000
+  }
+}
+```
+
+Omitting `budget` uses the [`ContextBudget` defaults](../context-compilation.md#budget); its
+section, selection, and conflict semantics live on the same page.
 
 ### Result objects
 
@@ -95,6 +126,9 @@ Successful calls populate MCP `structuredContent`:
 | `MemoryResult` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context`, `forgotten_at` |
 | `SearchHitResult` | all memory fields plus `score` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
+| `ContextBudgetResult` | `max_chars`, `max_items`, `memory_types` sorted or `null`, `min_confidence`, `freshness_seconds` |
+| `ContextConflictResult` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
+| `ContextBundleResult` | `goal`, `reference_at`, `budget`, the `SearchHitResult` arrays `actors`, `episodes`, `facts`, `procedures`, `affect`, `traits`, plus `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`, `rendered` |
 | `PageResult` | `items`, `next_cursor` |
 
 These fields have the same meanings as the [REST response objects](rest.md#response-objects).
@@ -105,8 +139,8 @@ described above.
 
 ### Validation and errors
 
-Only the six documented names and their exact top-level arguments are accepted. An unknown tool or
-top-level argument returns `validation_error/unknown_field`; schema and SDK input failures return
+Only the seven documented names and their exact top-level arguments are accepted. An unknown
+tool or top-level argument returns `validation_error/unknown_field`; schema and SDK input failures return
 `validation_error/input_invalid`. Unknown values are not echoed.
 
 Failed tool calls set `isError` and carry the same JSON envelope as
@@ -154,10 +188,11 @@ The following Python operations have no MCP tool:
 | `register_speaker`, `register_identity` | Owner-process identity naming |
 | `identity`, `unlink_identity` | Owner-process identity inspection and merge reversal |
 | `reinforce` | Owner-process feedback |
+| `capabilities` | Published as the server `instructions` instead of a tool |
 | `reindex`, `optimize` | Owner-process index maintenance |
 
-`list_memories` is part of the six-tool surface and supports the same default page size and opaque
-cursor contract as `Memory.list`.
+`list_memories` is part of the seven-tool surface and supports the same default page size and
+opaque cursor contract as `Memory.list`.
 
 ### Input limits
 
@@ -167,7 +202,8 @@ cursor contract as `Memory.list`.
 | One data-URL source string | 8,192 characters |
 | One decoded `file_data` value | 8 MiB |
 | Normalized text, including combined text parts | 65,536 characters |
-| Search, answer, or page `limit` | 1 through 100 |
+| Search, answer, or page `limit`, and `budget.max_items` | 1 through 100 |
+| Context `budget.max_chars` | 1 through 65,536 |
 | Serialized metadata | 262,144 UTF-8 bytes |
 | `file_id` or `filename` | 255 characters |
 

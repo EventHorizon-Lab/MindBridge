@@ -117,7 +117,9 @@ DOCTOR = "doctor"
 COMMANDS: tuple[str, ...] = (*(name.replace("_", "-") for name in OPERATIONS), DOCTOR)
 # Operations a running owner serves over `/v1`. Other operations have no route today; that is a
 # documented transport gap, reported honestly, not a CLI design choice.
-REMOTE_COMMANDS = frozenset({"add", "add-many", "search", "ask", "get", "list", "delete"})
+REMOTE_COMMANDS = frozenset(
+    {"add", "add-many", "search", "ask", "compile", "capabilities", "get", "list", "delete"}
+)
 _QUERY_METAVAR: Mapping[str, str] = {
     "add": "TEXT",
     "capture": "TEXT",
@@ -588,24 +590,28 @@ def _ask(memory: Memory, arguments: argparse.Namespace) -> _Document:
     }
 
 
+def _budget(arguments: argparse.Namespace) -> ContextBudget:
+    return ContextBudget(
+        max_chars=arguments.max_chars,
+        max_items=arguments.max_items,
+        memory_types=(
+            None
+            if arguments.memory_type is None
+            else frozenset(MemoryType(value) for value in arguments.memory_type)
+        ),
+        min_confidence=arguments.min_confidence,
+        freshness=(
+            None
+            if arguments.freshness_seconds is None
+            else timedelta(seconds=arguments.freshness_seconds)
+        ),
+    )
+
+
 def _compile(memory: Memory, arguments: argparse.Namespace) -> _Document:
     bundle = memory.compile(
         _content_input(arguments),
-        budget=ContextBudget(
-            max_chars=arguments.max_chars,
-            max_items=arguments.max_items,
-            memory_types=(
-                None
-                if arguments.memory_type is None
-                else frozenset(MemoryType(value) for value in arguments.memory_type)
-            ),
-            min_confidence=arguments.min_confidence,
-            freshness=(
-                None
-                if arguments.freshness_seconds is None
-                else timedelta(seconds=arguments.freshness_seconds)
-            ),
-        ),
+        budget=_budget(arguments),
         reference_at=_optional_time(arguments.reference_at, "reference_at"),
         scope=_retrieval_scope(_json_source(arguments.scope)),
     )
@@ -851,6 +857,24 @@ def _remote_query(field: str, arguments: argparse.Namespace) -> _Document:
     return body
 
 
+def _remote_compile(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    body: _Document = {
+        "goal": _content_value(arguments),
+        "budget": _budget_document(_budget(arguments)),
+    }
+    _put(body, "reference_at", _remote_time(arguments.reference_at, "reference_at"))
+    _put(
+        body,
+        "scope",
+        _retrieval_scope_document(_retrieval_scope(_json_source(arguments.scope))),
+    )
+    return "POST", "/v1/context", body
+
+
+def _remote_capabilities(_arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    return "GET", "/v1/capabilities", None
+
+
 def _remote_get(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
     return "GET", f"/v1/memories/{quote(arguments.memory_id, safe='')}", None
 
@@ -872,6 +896,8 @@ _REMOTE: Mapping[str, Callable[[argparse.Namespace], tuple[str, str, _Document |
     "add-many": _remote_add_many,
     "search": _remote_search,
     "ask": _remote_ask,
+    "compile": _remote_compile,
+    "capabilities": _remote_capabilities,
     "get": _remote_get,
     "list": _remote_list,
     "delete": _remote_delete,

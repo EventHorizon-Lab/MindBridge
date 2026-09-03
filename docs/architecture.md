@@ -150,9 +150,11 @@ store, and Zvec are internal components rather than public storage plugins.
 
 ## Public and trust boundaries
 
-Supported SDK values are imported from `mindbridge`. REST exposes add, batch add, search, ask, get,
-list, and delete under `/v1`. MCP exposes exactly six tools: add, search, ask, get, list, and
-delete. Transport adapters do not create another owner: `create_app(memory=...)` and
+Supported SDK values are imported from `mindbridge`. REST exposes add, batch add, search, ask,
+compile, capabilities, get, list, and delete under `/v1`. MCP exposes exactly seven tools: add,
+search, ask, compile, get, list, and delete, and advertises `capabilities()` in the server
+instructions instead of as a tool. Compiling context is a read-only view; identity naming,
+cognitive forgetting, operation rollback, and physical deletion stay in the owner process. Transport adapters do not create another owner: `create_app(memory=...)` and
 `build_mcp_server(memory)` use a caller-owned instance and never close it.
 
 MindBridge does not add authentication, authorization, TLS, rate limits, quotas, or audit policy.

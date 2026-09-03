@@ -7,6 +7,7 @@ import binascii
 import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
+from datetime import timedelta
 from functools import wraps
 from typing import Annotated, Any, Literal, ParamSpec, TypeAlias, TypeVar, cast
 from uuid import uuid4
@@ -41,6 +42,10 @@ from mindbridge.types import (
     AssetRef,
     Blob,
     ContentInput,
+    ContextBudget,
+    ContextBundle,
+    ContextConflict,
+    MemoryCapabilities,
     MemoryContext,
     MemoryRecord,
     MemoryType,
@@ -78,6 +83,20 @@ _Filename = Annotated[
     ),
 ]
 _Source = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8_192)]
+_Chars = Annotated[int, Field(strict=True, ge=1, le=65_536)]
+_Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
+_Seconds = Annotated[float, Field(gt=0.0)]
+# Tool defaults are read from the SDK value so the advertised budget cannot drift.
+_BUDGET = ContextBudget()
+_CAPABILITY_FLAGS: tuple[str, ...] = (
+    "answer",
+    "transcribe",
+    "faces",
+    "describe_vision",
+    "form",
+    "consolidate",
+    "decay",
+)
 _READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 _RETRIEVAL = ToolAnnotations(
     read_only_hint=False,
@@ -113,6 +132,7 @@ _TOOL_ARGUMENTS = {
         }
     ),
     "ask_memory": frozenset({"question", "limit", "memory_type", "reference_at", "scope"}),
+    "compile_context": frozenset({"goal", "budget", "reference_at", "scope"}),
     "get_memory": frozenset({"memory_id"}),
     "list_memories": frozenset({"limit", "cursor"}),
     "delete_memory": frozenset({"memory_id"}),
@@ -204,6 +224,14 @@ _Parts = Annotated[tuple[_InputPart, ...], Field(min_length=1, max_length=16)]
 _Content: TypeAlias = _Text | _Parts
 
 
+class ContextBudgetInput(_InputModel):
+    max_chars: _Chars = _BUDGET.max_chars
+    max_items: _Limit = _BUDGET.max_items
+    memory_types: Annotated[list[MemoryType], Field(min_length=1)] | None = None
+    min_confidence: _Confidence = _BUDGET.min_confidence
+    freshness_seconds: _Seconds | None = None
+
+
 class AssetResult(BaseModel):
     id: str
     modality: Modality
@@ -251,12 +279,50 @@ class DeleteResult(BaseModel):
     deleted: bool
 
 
+class ContextBudgetResult(BaseModel):
+    max_chars: int
+    max_items: int
+    memory_types: tuple[MemoryType, ...] | None
+    min_confidence: float
+    freshness_seconds: float | None
+
+
+class ContextConflictResult(BaseModel):
+    lineage_id: str
+    subject: str | None
+    predicate: str | None
+    values: tuple[str, ...]
+    memory_ids: tuple[str, ...]
+
+
+class ContextBundleResult(BaseModel):
+    goal: str
+    reference_at: AwareDatetime
+    budget: ContextBudgetResult
+    actors: tuple[SearchHitResult, ...]
+    episodes: tuple[SearchHitResult, ...]
+    facts: tuple[SearchHitResult, ...]
+    procedures: tuple[SearchHitResult, ...]
+    affect: tuple[SearchHitResult, ...]
+    traits: tuple[SearchHitResult, ...]
+    conflicts: tuple[ContextConflictResult, ...]
+    occurred_from: AwareDatetime | None
+    occurred_until: AwareDatetime | None
+    frames: tuple[str, ...]
+    omitted: int
+    chars: int
+    rendered: str
+
+
 def build_mcp_server(memory: Memory) -> MCPServer[None]:
-    """Expose six typed agent tools without taking ownership of ``memory``."""
+    """Expose seven typed agent tools without taking ownership of ``memory``."""
     server: MCPServer[None] = MCPServer(
         "mindbridge",
         title="MindBridge Memory",
         description="Fast local memory for agents.",
+        # Read once at construction: an agent learns the configured capability view at connect
+        # time instead of spending a tool call or discovering a missing backend by failing.
+        instructions=_instructions(memory.capabilities()),
         version="0.2.0",
         middleware=[cast(ServerMiddleware[Any], _strict_tool_arguments)],
     )
@@ -327,6 +393,30 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
             hits=tuple(_search_hit_result(hit) for hit in result.hits),
             abstained=result.abstained,
             abstention_reason=result.abstention_reason,
+        )
+
+    @server.tool(annotations=_RETRIEVAL)
+    @_stable_errors
+    def compile_context(
+        goal: _Content,
+        budget: ContextBudgetInput | None = None,
+        reference_at: AwareDatetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> ContextBundleResult:
+        """Compile bounded, task-ready context for a goal.
+
+        Prefer this tool when you need context to act on: it returns actors, facts, episodes,
+        procedures, affect cues, traits, unresolved conflicts, and provenance inside one declared
+        budget, plus a rendered text view. It selects and structures evidence and never resolves a
+        conflict or writes memory. `ask_memory` remains a convenience for one grounded sentence.
+        """
+        return _bundle_result(
+            memory.compile(
+                _content_input(goal),
+                budget=_context_budget(budget),
+                reference_at=reference_at,
+                scope=scope,
+            )
         )
 
     @server.tool(annotations=_READ_ONLY)
@@ -437,6 +527,85 @@ def _search_hit_result(hit: SearchHit) -> SearchHitResult:
         context=hit.context,
         forgotten_at=hit.forgotten_at,
     )
+
+
+def _context_budget(budget: ContextBudgetInput | None) -> ContextBudget | None:
+    if budget is None:
+        return None
+    return ContextBudget(
+        max_chars=budget.max_chars,
+        max_items=budget.max_items,
+        memory_types=None if budget.memory_types is None else frozenset(budget.memory_types),
+        min_confidence=budget.min_confidence,
+        freshness=(
+            None
+            if budget.freshness_seconds is None
+            else timedelta(seconds=budget.freshness_seconds)
+        ),
+    )
+
+
+def _bundle_result(bundle: ContextBundle) -> ContextBundleResult:
+    return ContextBundleResult(
+        goal=bundle.goal,
+        reference_at=bundle.reference_at,
+        budget=_budget_result(bundle.budget),
+        actors=tuple(_search_hit_result(hit) for hit in bundle.actors),
+        episodes=tuple(_search_hit_result(hit) for hit in bundle.episodes),
+        facts=tuple(_search_hit_result(hit) for hit in bundle.facts),
+        procedures=tuple(_search_hit_result(hit) for hit in bundle.procedures),
+        affect=tuple(_search_hit_result(hit) for hit in bundle.affect),
+        traits=tuple(_search_hit_result(hit) for hit in bundle.traits),
+        conflicts=tuple(_conflict_result(conflict) for conflict in bundle.conflicts),
+        occurred_from=bundle.occurred_from,
+        occurred_until=bundle.occurred_until,
+        frames=bundle.frames,
+        omitted=bundle.omitted,
+        chars=bundle.chars,
+        rendered=bundle.render(),
+    )
+
+
+def _budget_result(budget: ContextBudget) -> ContextBudgetResult:
+    return ContextBudgetResult(
+        max_chars=budget.max_chars,
+        max_items=budget.max_items,
+        memory_types=None if budget.memory_types is None else tuple(sorted(budget.memory_types)),
+        min_confidence=budget.min_confidence,
+        freshness_seconds=(None if budget.freshness is None else budget.freshness.total_seconds()),
+    )
+
+
+def _conflict_result(conflict: ContextConflict) -> ContextConflictResult:
+    return ContextConflictResult(
+        lineage_id=conflict.lineage_id,
+        subject=conflict.subject,
+        predicate=conflict.predicate,
+        values=conflict.values,
+        memory_ids=conflict.memory_ids,
+    )
+
+
+def _instructions(capabilities: MemoryCapabilities) -> str:
+    """Render the configured capability view an agent reads when it connects."""
+    available = [name for name in _CAPABILITY_FLAGS if getattr(capabilities, name)]
+    missing = [name for name in _CAPABILITY_FLAGS if not getattr(capabilities, name)]
+    return "\n".join(
+        (
+            "MindBridge is local multimodal memory for one physical data directory.",
+            f"Modalities: {_names([modality.value for modality in capabilities.modalities])}.",
+            f"Capabilities: {_names(available)}.",
+            f"Unavailable: {_names(missing)}.",
+            "Prefer compile_context for task-ready context; ask_memory remains a convenience for "
+            "one grounded sentence.",
+            "Identity naming, cognitive forgetting, consolidation, and operation rollback have no "
+            "tool here; they stay with the process that owns this memory.",
+        )
+    )
+
+
+def _names(values: Sequence[str]) -> str:
+    return ", ".join(sorted(values)) or "none"
 
 
 def _asset_result(asset: AssetRef) -> AssetResult:
