@@ -30,6 +30,7 @@ from contextvars import copy_context
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from functools import partial
+from itertools import zip_longest
 from pathlib import Path
 from threading import Condition, RLock
 from time import perf_counter
@@ -134,6 +135,7 @@ from mindbridge.types import (
     ContextBundle,
     ContextUnknown,
     ContextUnknownKind,
+    DeliberationReport,
     EvidenceBasis,
     FaceObservation,
     FormationProposal,
@@ -147,6 +149,7 @@ from mindbridge.types import (
     MemoryKind,
     MemoryOperation,
     MemoryOperationRecord,
+    MemoryOutcome,
     MemoryRecord,
     MemoryTrigger,
     MemoryType,
@@ -214,6 +217,16 @@ _OUTBOX_BATCH_SIZE = 256
 _REINDEX_PAGE_SIZE = 256
 _REEMBED_PAGE_SIZE = 32
 _RERANK_CANDIDATES = 100
+# One empty recall is a question nobody had asked before; two near-equal ones inside the
+# configured window is a gap. Not configurable: below two there is no repetition to speak of, and
+# a host that wants a stricter threshold narrows the window instead.
+_REPEATED_FAILURES = 2
+# Everything a recall query's normalization drops before two of them are called near-equal:
+# case, accents, punctuation, and whitespace runs. Deliberately lexical -- an embedding-based
+# near-duplicate check would make the trigger depend on the model, so "did the user ask this
+# again" would change meaning when the embedder was replaced.
+_QUERY_NOISE = re.compile(r"[^\w\s]+", re.UNICODE)
+_QUERY_SPACE = re.compile(r"\s+")
 _RANK_FLOOR = 0.3
 _RANK_CEILING = 1.5
 _DEFAULT_CONFIG = MemoryConfig()
@@ -544,6 +557,9 @@ class Memory:
         face_similarity: float = _DEFAULT_CONFIG.face_similarity,
         face_margin: float = _DEFAULT_CONFIG.face_margin,
         identity_link_min_assets: int = _DEFAULT_CONFIG.identity_link_min_assets,
+        memory_budget_records: int | None = _DEFAULT_CONFIG.memory_budget_records,
+        query_failure_window_seconds: float = _DEFAULT_CONFIG.query_failure_window_seconds,
+        query_failure_history: int = _DEFAULT_CONFIG.query_failure_history,
         tracer: Tracer | None = None,
     ) -> None:
         self.data_dir = Path(data_dir).expanduser().resolve()
@@ -580,6 +596,15 @@ class Memory:
         if not isinstance(reinforce_on_answer, bool):
             raise ValidationError("reinforce_on_answer must be a boolean")
         self._reinforce_on_answer = reinforce_on_answer
+        self._memory_budget_records = (
+            None
+            if memory_budget_records is None
+            else _positive_int(memory_budget_records, "memory_budget_records")
+        )
+        self._query_failure_window = _positive_seconds(
+            query_failure_window_seconds, "query_failure_window_seconds"
+        )
+        self._query_failure_history = _positive_int(query_failure_history, "query_failure_history")
 
         self._store = _open_store(self.data_dir)
         self._embedder = embedder
@@ -702,6 +727,9 @@ class Memory:
             face_similarity=config.face_similarity,
             face_margin=config.face_margin,
             identity_link_min_assets=config.identity_link_min_assets,
+            memory_budget_records=config.memory_budget_records,
+            query_failure_window_seconds=config.query_failure_window_seconds,
+            query_failure_history=config.query_failure_history,
             tracer=tracer,
         )
 
@@ -1250,6 +1278,7 @@ class Memory:
                 capture_trace=capture_trace,
             )
             self._persist_transcripts(assets)
+            self._note_query_failure(prepared.text, failed=not outcome.hits)
             return outcome
 
     def ask(
@@ -1345,6 +1374,10 @@ class Memory:
             used_ids = {hit.id for hit in result.hits}
             grounding = tuple(hit for hit in hits if hit.id in used_ids)
             self._reinforce_answered(grounding)
+            # An abstention is the answering plane reporting that the evidence did not support
+            # an answer, which is the same durable signal as an empty search: the memory the
+            # question needed is missing or unreachable.
+            self._note_query_failure(prepared.text, failed=result.abstained)
             return AnswerResult(
                 answer=result.answer,
                 hits=grounding,
@@ -1400,7 +1433,7 @@ class Memory:
             # The same transcript cache `search()` writes for a spoken query. It is a cache of
             # the query's own audio, not a memory: `compile()` stores nothing it retrieved.
             self._persist_transcripts(assets)
-            return compile_context(
+            bundle = compile_context(
                 prepared.text,
                 outcome.hits,
                 budget=budget,
@@ -1410,6 +1443,10 @@ class Memory:
                 candidate_limit=candidate_limit,
                 provisional=self._provisional_identities(outcome.hits),
             )
+            # QUERY_FAILURE hook: a bundle with no evidence in it is the compiler reporting that
+            # the goal found nothing, which is the same signal as an empty search.
+            self._note_query_failure(prepared.text, failed=not bundle.hits)
+            return bundle
 
     def _provisional_identities(self, hits: Sequence[SearchHit]) -> dict[str, tuple[str, ...]]:
         """Resolve which people the candidate evidence observed but nobody has named.
@@ -1986,28 +2023,161 @@ class Memory:
     # deletion is not an intent: it stays on `delete()` under host authority. None of these
     # methods is exposed on REST or MCP.
 
-    def consolidation_candidates(self, *, limit: int = 32) -> tuple[ConsolidationCandidate, ...]:
+    def consolidation_candidates(
+        self,
+        *,
+        limit: int = 32,
+        idle: bool = False,
+    ) -> tuple[ConsolidationCandidate, ...]:
         """Ask what needs deliberation, at most `limit` rows, interleaved across triggers.
 
         This is the durable trigger the slow loop runs on: every row is derived from state
-        already committed -- evidence links, lineage disagreement, recorded confirmations --
-        rather than from a clock. Hand a row's `memory_ids` straight to
-        `consolidate(evidence_ids=...)` with the row's `trigger`.
+        already committed -- evidence links, lineage disagreement, recorded confirmations,
+        recorded recall failures, the configured record budget -- rather than from a clock. Hand
+        a row's `memory_ids` straight to `consolidate(evidence_ids=...)` with the row's
+        `trigger`, or let `deliberate()` do it.
+
+        `idle` is the operator declaring an approved idle or charging window. The kernel does not
+        guess it from a clock: whether now is a good time to spend the device's battery on
+        reasoning is the host's knowledge.
         """
         with (
             self._trace("mindbridge.consolidation_candidates", kind="operation"),
-            self._operation(),
+            self._operation() as assets,
         ):
             _limit(limit, maximum=100)
+            if not isinstance(idle, bool):
+                raise ValidationError("idle must be a boolean")
             with _translate_storage_errors("list consolidation candidates"):
-                rows = self._store.read_consolidation_candidates(limit=limit)
-            return tuple(
+                rows = self._store.read_consolidation_candidates(
+                    limit=limit,
+                    idle=idle,
+                    record_budget=self._memory_budget_records,
+                )
+            derived = tuple(
                 ConsolidationCandidate(
                     trigger=MemoryTrigger(row.trigger),
                     memory_ids=row.memory_ids,
                     evidence_count=row.evidence_count,
                 )
                 for row in rows
+            )
+            failures = self._query_failure_candidates(limit=limit, assets=assets)
+            # Round robin rather than concatenation, so a store with many repeated failures
+            # cannot push every evidence and contradiction row out of the window.
+            return tuple(
+                candidate
+                for pair in zip_longest(derived, failures)
+                for candidate in pair
+                if candidate is not None
+            )[:limit]
+
+    def _query_failure_candidates(
+        self,
+        *,
+        limit: int,
+        assets: _OperationAssets,
+    ) -> tuple[ConsolidationCandidate, ...]:
+        """Turn repeated empty recalls into candidates naming what the store does hold.
+
+        A failed query has no evidence of its own -- that is what failing means -- so the
+        candidate names the nearest active records to it. Those are what a backend can act on:
+        the memory that should have matched and did not, or the gap it should record. Resolved
+        through the ordinary retrieval kernel, and bounded by `limit`.
+        """
+        reference = datetime.now(timezone.utc)
+        with _translate_storage_errors("list repeated query failures"):
+            failures = self._store.read_repeated_query_failures(
+                limit=limit,
+                since=reference - self._query_failure_window,
+                minimum=_REPEATED_FAILURES,
+            )
+        if not failures:
+            return ()
+        candidates: builtins.list[ConsolidationCandidate] = []
+        for failure in failures:
+            prepared = self._prepare_content(failure.query, assets)
+            outcome = self._search_prepared(
+                prepared,
+                limit=min(100, max(2, limit // 4)),
+                operation=assets,
+                memory_type=None,
+                reference_at=reference,
+                temporal_range=None,
+                occurred_from=None,
+                occurred_until=None,
+                scope=None,
+                require_unambiguous=False,
+                capture_trace=False,
+            )
+            memory_ids = tuple(hit.id for hit in outcome.hits)
+            if not memory_ids:
+                # Nothing to weigh: the store holds no evidence anywhere near this query, so
+                # there is no bounded evidence set a proposal could cite.
+                continue
+            with _translate_storage_errors("read deliberation marks"):
+                weighed = self._store.read_weighed_at(memory_ids)
+            if weighed and failure.failed_at <= max(weighed.values()):
+                continue
+            candidates.append(
+                ConsolidationCandidate(
+                    trigger=MemoryTrigger.QUERY_FAILURE,
+                    memory_ids=memory_ids,
+                    evidence_count=failure.failures,
+                )
+            )
+        return tuple(candidates)
+
+    def deliberate(
+        self,
+        *,
+        limit: int = 32,
+        max_rounds: int = 4,
+        idle: bool = False,
+    ) -> DeliberationReport:
+        """Run the memory-management loop to a fixed point, or to `max_rounds`.
+
+        One round asks `consolidation_candidates()` what is due and runs `consolidate()` over
+        each row with the row's own trigger. Applying operations can make further work due --
+        a derived record gains evidence, a corrected lineage stops disagreeing -- so the loop
+        repeats until nothing is due or the ceiling is reached.
+
+        It terminates on a backend that proposes nothing, because a pass records that it weighed
+        its evidence set whatever it yielded, and candidate derivation excludes a candidate
+        weighed since its own signal. The report then says so: rounds and `weighed` non-zero,
+        `applied` zero.
+        """
+        with self._trace("mindbridge.deliberate", kind="operation"):
+            _limit(limit, maximum=100)
+            _limit(max_rounds, maximum=100)
+            if not isinstance(idle, bool):
+                raise ValidationError("idle must be a boolean")
+            rounds = weighed = skipped = applied = rejected = calls = 0
+            for _round in range(max_rounds):
+                candidates = self.consolidation_candidates(limit=limit, idle=idle)
+                if not candidates:
+                    break
+                rounds += 1
+                for candidate in candidates:
+                    report = self.consolidate(
+                        evidence_ids=candidate.memory_ids,
+                        limit=limit,
+                        trigger=candidate.trigger,
+                    )
+                    if report.weighed:
+                        weighed += 1
+                        calls += 1
+                    else:
+                        skipped += 1
+                    applied += len(report.operations)
+                    rejected += len(report.rejected)
+            return DeliberationReport(
+                rounds=rounds,
+                weighed=weighed,
+                skipped=skipped,
+                applied=applied,
+                rejected=rejected,
+                model_calls=calls,
             )
 
     def consolidate(
@@ -2049,11 +2219,18 @@ class Memory:
             # reachable form of the staleness the kernel is required to reject.
             consumed: set[str] = set()
             retired: set[str] = set()
+            # Deliberately outside `_formation_lock`: the backend round trip is the slow part of
+            # this call, and holding the formation lock across it makes a consolidation over
+            # media evidence stall every concurrent `add()`. Scheduling between latency-sensitive
+            # work and slow reasoning is the point of the plane, so the lock covers the apply
+            # transactions only. Correctness does not rest on the lock: every proposal is
+            # re-checked inside its own apply transaction (`require_active` and
+            # `require_unretired`) and refused as stale if a target moved while the backend was
+            # thinking. A model call that raised weighed nothing, so no marker is recorded and
+            # the candidate stays due.
+            proposals = self._propose_operations(tuple(shown.values()), trigger=trigger)
             with self._formation_lock:
-                for operation in self._propose_operations(
-                    tuple(shown.values()),
-                    trigger=trigger,
-                ):
+                for operation in proposals:
                     targets = _retiring_targets(operation)
                     named = set(operation.evidence_ids) | set(operation.target_ids)
                     if targets & consumed or named & retired:
@@ -2076,7 +2253,151 @@ class Memory:
                     else:
                         consumed.update(set(operation.evidence_ids) - targets)
                         retired.update(targets)
-            return ConsolidationReport(operations=tuple(applied), rejected=tuple(rejected))
+            # Recorded whatever the pass yielded, including nothing. Without this a candidate the
+            # backend could not resolve -- or whose every proposal the kernel refused -- leaves no
+            # trace and is derived again, and paid for again, every round.
+            self._record_deliberation(
+                trigger,
+                tuple(shown),
+                proposed=len(proposals),
+                applied=len(applied),
+                rejected=len(rejected),
+            )
+            return ConsolidationReport(
+                operations=tuple(applied),
+                rejected=tuple(rejected),
+                weighed=len(shown),
+            )
+
+    def _record_deliberation(
+        self,
+        trigger: MemoryTrigger,
+        memory_ids: Sequence[str],
+        *,
+        proposed: int,
+        applied: int,
+        rejected: int,
+    ) -> None:
+        """Mark one evidence set weighed so candidate derivation stops re-listing it."""
+        with self._write_lock, _translate_storage_errors("record a deliberation"):
+            self._store.record_deliberation(
+                trigger.value,
+                memory_ids,
+                weighed_at=datetime.now(timezone.utc),
+                proposed=proposed,
+                applied=applied,
+                rejected=rejected,
+            )
+
+    def _note_query_failure(self, text: str, *, failed: bool) -> None:
+        """Record one empty recall, which is the whole of the QUERY_FAILURE signal.
+
+        The stored query is the owner's own words about their own memory, in their own memory
+        domain, and the table is capped on write so it stays a signal buffer rather than a
+        growing query log. A non-text query records nothing: there is nothing to compare two of
+        them by.
+        """
+        if not failed:
+            return
+        folded = unicodedata.normalize("NFKC", text).casefold()
+        normalized = _QUERY_SPACE.sub(" ", _QUERY_NOISE.sub(" ", folded)).strip()
+        if not normalized:
+            return
+        with self._write_lock, _translate_storage_errors("record a query failure"):
+            self._store.record_query_failure(
+                text,
+                normalized,
+                failed_at=datetime.now(timezone.utc),
+                keep=self._query_failure_history,
+            )
+
+    def apply(self, operation: MemoryOperation) -> MemoryOperationRecord:
+        """Apply one operation the host supplies, through the same kernel validation.
+
+        This is the public replay surface: a logged `MemoryOperation` re-applied against a fresh
+        store reproduces the derived state, without a `ConsolidationBackend` and without a model.
+        Nothing is trusted because the host supplied it. The window is the operation's own cited
+        evidence and named targets, eligibility is checked exactly as it is for a proposal, and
+        the apply transaction re-checks every target so one that moved meanwhile is refused as
+        stale rather than half-applied.
+
+        Raises `ValidationError` naming the kernel's own rejection reason when the operation is
+        refused, because a single operation the caller chose has nowhere else to report it.
+        """
+        with (
+            self._trace("mindbridge.apply", kind="operation"),
+            self._operation() as assets,
+        ):
+            if not isinstance(operation, MemoryOperation):
+                raise ValidationError("operation must be a MemoryOperation")
+            shown, _window = self._consolidation_evidence(
+                operation.evidence_ids,
+                None,
+                limit=100,
+                operation=assets,
+            )
+            try:
+                with self._formation_lock:
+                    return self._apply_memory_operation(
+                        operation,
+                        trigger=MemoryTrigger.MANUAL,
+                        # The configured consolidation recipe and model, not the caller's word
+                        # for them. A derived record's representation belongs to a recipe -- it
+                        # is part of its identity and of the operation key -- so replaying a
+                        # logged sequence reproduces the same derived IDs exactly when the
+                        # store is configured with the recipe that produced them, and mints
+                        # different ones when it is not. No backend is called either way.
+                        model_id=self._consolidation_model,
+                        recipe=self._consolidation_recipe,
+                        shown=shown,
+                        # The host names these IDs, the way it does for `forget()`, so the
+                        # not-shown rule that bounds a backend to the window the kernel gathered
+                        # does not apply. Every other rejection does.
+                        window=None,
+                        assets=assets,
+                    )
+            except _RejectedOperation as rejection:
+                raise ValidationError(
+                    f"memory operation refused: {rejection.reason}",
+                    reason=rejection.reason,
+                ) from None
+
+    def record_outcome(
+        self,
+        operation_id: int,
+        outcome: MemoryOutcome,
+        *,
+        note: str | None = None,
+    ) -> bool:
+        """Record what later evidence said about one applied operation.
+
+        Post-hoc and purely for measurement: the kernel never reads it back into a decision, and
+        recording `REFUTED` does not reverse anything -- `rollback()` does that. It exists so the
+        slow loop's quality is derivable from the log rather than only its rollback success:
+        consolidation precision and contradiction recovery are `CONFIRMED` rates over
+        `CONSOLIDATE` and `CORRECT` rows, and false retirement is the `REFUTED` rate over rows
+        that forgot something.
+
+        Reports `False` for an unknown `operation_id`. A later call replaces an earlier
+        judgement, because later evidence supersedes earlier evidence here as everywhere.
+        """
+        with self._trace("mindbridge.record_outcome", kind="operation"), self._operation():
+            if (
+                isinstance(operation_id, bool)
+                or not isinstance(operation_id, int)
+                or operation_id <= 0
+            ):
+                raise ValidationError("operation_id must be a positive integer")
+            if not isinstance(outcome, MemoryOutcome):
+                raise ValidationError("outcome must be a MemoryOutcome")
+            if note is not None and (not isinstance(note, str) or not note.strip()):
+                raise ValidationError("note must be a non-empty string or None")
+            with self._write_lock, _translate_storage_errors("record an operation outcome"):
+                return self._store.record_operation_outcome(
+                    operation_id,
+                    outcome=outcome.value,
+                    note=None if note is None else note.strip(),
+                )
 
     def forget(self, memory_ids: Sequence[str]) -> MemoryOperationRecord | None:
         """Cognitively forget memories: recall skips them, `get()` and `list()` keep them.
@@ -5644,6 +5965,9 @@ class AsyncMemory:
         face_similarity: float = _DEFAULT_CONFIG.face_similarity,
         face_margin: float = _DEFAULT_CONFIG.face_margin,
         identity_link_min_assets: int = _DEFAULT_CONFIG.identity_link_min_assets,
+        memory_budget_records: int | None = _DEFAULT_CONFIG.memory_budget_records,
+        query_failure_window_seconds: float = _DEFAULT_CONFIG.query_failure_window_seconds,
+        query_failure_history: int = _DEFAULT_CONFIG.query_failure_history,
         tracer: Tracer | None = None,
     ) -> None:
         self._memory = Memory(
@@ -5667,6 +5991,9 @@ class AsyncMemory:
             face_similarity=face_similarity,
             face_margin=face_margin,
             identity_link_min_assets=identity_link_min_assets,
+            memory_budget_records=memory_budget_records,
+            query_failure_window_seconds=query_failure_window_seconds,
+            query_failure_history=query_failure_history,
             tracer=tracer,
         )
 
@@ -5707,6 +6034,9 @@ class AsyncMemory:
             face_similarity=config.face_similarity,
             face_margin=config.face_margin,
             identity_link_min_assets=config.identity_link_min_assets,
+            memory_budget_records=config.memory_budget_records,
+            query_failure_window_seconds=config.query_failure_window_seconds,
+            query_failure_history=config.query_failure_history,
             tracer=tracer,
         )
 
@@ -6005,8 +6335,41 @@ class AsyncMemory:
         self,
         *,
         limit: int = 32,
+        idle: bool = False,
     ) -> tuple[ConsolidationCandidate, ...]:
-        return await asyncio.to_thread(partial(self._memory.consolidation_candidates, limit=limit))
+        return await asyncio.to_thread(
+            partial(self._memory.consolidation_candidates, limit=limit, idle=idle)
+        )
+
+    async def deliberate(
+        self,
+        *,
+        limit: int = 32,
+        max_rounds: int = 4,
+        idle: bool = False,
+    ) -> DeliberationReport:
+        return await asyncio.to_thread(
+            partial(
+                self._memory.deliberate,
+                limit=limit,
+                max_rounds=max_rounds,
+                idle=idle,
+            )
+        )
+
+    async def apply(self, operation: MemoryOperation) -> MemoryOperationRecord:
+        return await asyncio.to_thread(self._memory.apply, operation)
+
+    async def record_outcome(
+        self,
+        operation_id: int,
+        outcome: MemoryOutcome,
+        *,
+        note: str | None = None,
+    ) -> bool:
+        return await asyncio.to_thread(
+            partial(self._memory.record_outcome, operation_id, outcome, note=note)
+        )
 
     async def consolidate(
         self,
@@ -7021,7 +7384,16 @@ def _operation_record(logged: StoredOperation) -> MemoryOperationRecord:
         forgotten_ids=logged.forgotten_ids,
         superseded=logged.superseded,
         rolled_back_at=logged.rolled_back_at,
+        outcome=None if logged.outcome is None else _memory_outcome(logged.outcome),
+        outcome_note=logged.outcome_note,
     )
+
+
+def _memory_outcome(value: str) -> MemoryOutcome:
+    try:
+        return MemoryOutcome(value)
+    except ValueError:
+        raise StorageError("a logged memory operation has an unknown outcome") from None
 
 
 def _validate_formation_pairs(
@@ -7755,6 +8127,17 @@ def _positive_dimension(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValidationError(f"{name} must be a positive integer")
     return value
+
+
+def _positive_seconds(value: object, name: str) -> timedelta:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(float(value))
+        or value <= 0
+    ):
+        raise ValidationError(f"{name} must be a positive finite number")
+    return timedelta(seconds=float(value))
 
 
 def _positive_int(value: object, name: str) -> int:
