@@ -162,7 +162,7 @@ _BUDGET_DESCRIPTION = (
     " `freshness_seconds` keeps only memories anchored within that many seconds of the reference"
     " clock; `max_latency_ms` is a deadline after which optional work is skipped rather than a"
     " timeout that aborts, and the bundle reports `elapsed_ms` and `deadline_exceeded`. Null uses"
-    " the defaults, which are 6,000 characters and 24 items with no deadline."
+    " the defaults, which are 16,000 characters and 24 items with no deadline."
 )
 _MEMORY_ID_DESCRIPTION = (
     "The `id` a previous `add_memory`, `search_memories`, or `list_memories` result returned."
