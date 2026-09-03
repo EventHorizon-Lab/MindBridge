@@ -25,7 +25,6 @@ from functools import partial
 from pathlib import Path
 from threading import Condition, RLock
 from time import perf_counter
-from types import MappingProxyType
 from typing import Protocol, TypeVar, cast
 
 from opentelemetry import trace
@@ -53,6 +52,7 @@ from mindbridge._telemetry import (
     traced_span,
 )
 from mindbridge.configuration import MindBridgeConfig, resolve_memory_config
+from mindbridge.context import compile_context, evidence_cost
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -112,11 +112,14 @@ from mindbridge.types import (
     Blob,
     ContentAtom,
     ContentInput,
+    ContextBudget,
+    ContextBundle,
     EvidenceBasis,
     FaceObservation,
     FormationProposal,
     IdentityProfile,
     IndexQuantization,
+    MemoryCapabilities,
     MemoryContext,
     MemoryKind,
     MemoryRecord,
@@ -256,19 +259,6 @@ _TEXT_KEY_CONTEXT = 256
 _MAX_RETRIEVAL_KEYS = 128
 # The reason an embedding backend reports when media does not fit one inline request.
 _PAYLOAD_TOO_LARGE = "payload_too_large"
-# Text-equivalent cost of one grounded media part, at the usual four characters per token. The
-# modalities are an order of magnitude apart in what a model charges for them: an image part
-# measured near five hundred tokens against this stack where a ten-second video part measured
-# near three thousand, so one flat number would either starve text or overrun on video. These
-# are coarse by design; the budget is the caller's knob, not these constants.
-_ASSET_EVIDENCE_CHARS: Mapping[Modality, int] = MappingProxyType(
-    {
-        Modality.IMAGE: 2_000,
-        Modality.AUDIO: 4_000,
-        Modality.VIDEO: 12_000,
-    }
-)
-_DEFAULT_ASSET_EVIDENCE_CHARS = 4_000
 _MAX_QUERY_RETRIEVAL_KEYS = 7
 _MAX_INDEX_SEARCH_WORKERS = 4
 _TODAY_ISO_DATE = re.compile(r"\btoday\s+is\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
@@ -1031,6 +1021,69 @@ class Memory:
                 abstained=result.abstained,
                 abstention_reason=result.abstention_reason,
             )
+
+    def compile(
+        self,
+        goal: ContentInput,
+        *,
+        budget: ContextBudget | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> ContextBundle:
+        """Compile one bounded, structured context bundle for a goal."""
+        with self._trace("mindbridge.compile", kind="operation"), self._operation() as assets:
+            budget = ContextBudget() if budget is None else budget
+            if not isinstance(budget, ContextBudget):
+                raise ValidationError("budget must be a ContextBudget")
+            scope = _retrieval_scope(scope)
+            with self._trace("mindbridge.content.prepare", kind="stage"):
+                prepared = self._prepare_content(goal, assets)
+            explicit_reference = _reference_at(reference_at)
+            reference, temporal_text = _temporal_context(
+                prepared.text,
+                explicit_reference or datetime.now(timezone.utc),
+                infer_reference=explicit_reference is None,
+            )
+            outcome = self._search_prepared(
+                prepared,
+                # `_limit` bounds what a caller may ask a public search to return, not how deep
+                # the kernel ranks, so `_search_prepared` has no ceiling of its own and a bundle
+                # may rank past one hundred. Three candidates per slot is the same headroom
+                # `ask()` gives its modality round robin.
+                limit=max(_RERANK_CANDIDATES, budget.max_items * 3),
+                operation=assets,
+                # The budget filters memory types itself, because it selects a set rather than
+                # the one type the retrieval plane can push into the index.
+                memory_type=None,
+                reference_at=reference,
+                temporal_range=_temporal_range(temporal_text, reference),
+                occurred_from=None,
+                occurred_until=None,
+                scope=scope,
+                require_unambiguous=False,
+                capture_trace=False,
+            )
+            self._persist_transcripts(assets)
+            return compile_context(
+                prepared.text,
+                outcome.hits,
+                budget=budget,
+                reference_at=reference,
+            )
+
+    def capabilities(self) -> MemoryCapabilities:
+        """Report what this composition can do, so an agent need not discover it by failing."""
+        return MemoryCapabilities(
+            modalities=self._embedding_capabilities,
+            answer=self._answerer is not None,
+            transcribe=self._transcriber is not None,
+            faces=self._face_analyzer is not None,
+            describe_vision=self._vision_describer is not None,
+            form=self._former is not None,
+            # Consolidation has no backend slot yet; the control-plane flag replaces this.
+            consolidate=False,
+            decay=self._decay_half_life is not None,
+        )
 
     def get(self, memory_id: str) -> MemoryRecord:
         """Return one memory or raise `MemoryNotFoundError`."""
@@ -4026,6 +4079,25 @@ class AsyncMemory:
             scope=scope,
         )
 
+    async def compile(
+        self,
+        goal: ContentInput,
+        *,
+        budget: ContextBudget | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> ContextBundle:
+        return await asyncio.to_thread(
+            self._memory.compile,
+            goal,
+            budget=budget,
+            reference_at=reference_at,
+            scope=scope,
+        )
+
+    async def capabilities(self) -> MemoryCapabilities:
+        return await asyncio.to_thread(self._memory.capabilities)
+
     async def get(self, memory_id: str) -> MemoryRecord:
         return await asyncio.to_thread(self._memory.get, memory_id)
 
@@ -5758,29 +5830,17 @@ def _budgeted_hits(
     record's text; the provider adapter still enforces its own byte ceiling.
     """
     taken = {hit.id for hit in selected}
-    used = sum(_evidence_cost(hit) for hit in selected)
+    used = sum(evidence_cost(hit) for hit in selected)
     extra: list[SearchHit] = []
     for hit in hits:
         if hit.id in taken:
             continue
-        cost = _evidence_cost(hit)
+        cost = evidence_cost(hit)
         if used + cost > budget_chars:
             break
         used += cost
         extra.append(hit)
     return tuple(extra)
-
-
-def _evidence_cost(hit: SearchHit) -> int:
-    # `AssetRef.modality` is optional on the public type; an unresolved asset is charged the
-    # default rather than being treated as free.
-    charges = (
-        _DEFAULT_ASSET_EVIDENCE_CHARS
-        if asset.modality is None
-        else _ASSET_EVIDENCE_CHARS.get(asset.modality, _DEFAULT_ASSET_EVIDENCE_CHARS)
-        for asset in hit.assets
-    )
-    return len(hit.content) + sum(charges)
 
 
 def _merge_index_hits(*groups: Sequence[IndexHit]) -> tuple[IndexHit, ...]:

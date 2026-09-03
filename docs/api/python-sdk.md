@@ -247,6 +247,24 @@ metadata, media, vectors, paths, or model output. `ask` requires an answerer and
 retrieved hits the answerer actually used.
 
 ```text
+compile(
+    goal: ContentInput,
+    *,
+    budget: ContextBudget | None = None,
+    reference_at: datetime | None = None,
+    scope: RetrievalScope | None = None,
+) -> ContextBundle
+
+capabilities() -> MemoryCapabilities
+```
+
+`compile()` runs the same retrieval path once with a candidate limit of
+`max(100, 3 * budget.max_items)`, then partitions, filters, and budgets the result into a
+`ContextBundle`. It calls no generation model and never resolves a conflict; `ask()` is unchanged.
+`capabilities()` reports the configured composition so an agent surface can advertise it instead of
+failing on first use. [Context compilation](../context-compilation.md) owns both contracts.
+
+```text
 get(memory_id: str) -> MemoryRecord
 speech(memory_id: str) -> tuple[SpeakerSegment, ...]
 faces(memory_id: str) -> tuple[FaceObservation, ...]
@@ -382,7 +400,7 @@ These are the supported names exported by `mindbridge`:
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `FaceObservation`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `FaceObservation`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `MemoryCapabilities` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `SpatialAnchor`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
@@ -409,6 +427,10 @@ The principal immutable values are:
 | `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial` |
 | `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `spatial`, `cue_modality`, `valence`, `arousal` |
 | `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m` |
+| `ContextBudget` | `max_chars`, `max_items`, `memory_types`, `min_confidence`, `freshness` |
+| `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
+| `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`; `hits` property and `render()` |
+| `MemoryCapabilities` | `modalities`, `answer`, `transcribe`, `faces`, `describe_vision`, `form`, `consolidate`, `decay` |
 | `StreamEvent` | `phase`, `item`, `stream_id` |
 | `StreamCommit` | `record`, `prefetch`, `retrieval_error`, `stream_id` |
 | `PCMChunk` | `data`, `sample_rate_hz`, `channels`, `sample_width_bytes`, `stream_id`, `occurred_at` |

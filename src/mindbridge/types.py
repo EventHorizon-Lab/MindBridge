@@ -6,7 +6,7 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TypeAlias
@@ -898,6 +898,12 @@ def _unit_interval(value: object, name: str) -> float:
     return float(value)
 
 
+def _positive_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValidationError(f"{name} must be a positive integer")
+    return value
+
+
 def _bounded_optional(
     value: object | None,
     name: str,
@@ -1203,3 +1209,155 @@ class Page:
     def __post_init__(self) -> None:
         if self.next_cursor is not None:
             _text(self.next_cursor, "next_cursor")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ContextBudget:
+    """The size, type, confidence, and freshness bounds one context compilation may spend."""
+
+    max_chars: int = 6000
+    max_items: int = 24
+    memory_types: frozenset[MemoryType] | None = None
+    min_confidence: float = 0.0
+    freshness: timedelta | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "max_chars", _positive_int(self.max_chars, "budget max_chars"))
+        object.__setattr__(self, "max_items", _positive_int(self.max_items, "budget max_items"))
+        if self.memory_types is not None:
+            memory_types = frozenset(self.memory_types)
+            if not memory_types or any(not isinstance(value, MemoryType) for value in memory_types):
+                raise ValidationError("budget memory_types must name at least one MemoryType")
+            object.__setattr__(self, "memory_types", memory_types)
+        object.__setattr__(
+            self,
+            "min_confidence",
+            _unit_interval(self.min_confidence, "budget min_confidence"),
+        )
+        if self.freshness is not None and (
+            not isinstance(self.freshness, timedelta) or self.freshness <= timedelta(0)
+        ):
+            raise ValidationError("budget freshness must be a positive timedelta")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ContextConflict:
+    """Two or more included memories in one lineage that disagree on the same value.
+
+    The compiler reports a disagreement and never resolves it. `values` and `memory_ids` are
+    aligned: each value is paired with the highest-ranked included memory that asserts it.
+    """
+
+    lineage_id: str
+    subject: str | None
+    predicate: str | None
+    values: tuple[str, ...]
+    memory_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.values) < 2 or len(self.values) != len(self.memory_ids):
+            raise ValidationError("a conflict pairs at least two values with one memory each")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ContextBundle:
+    """One bounded, structured context view compiled for a goal."""
+
+    goal: str
+    reference_at: datetime
+    budget: ContextBudget
+    actors: tuple[SearchHit, ...]
+    episodes: tuple[SearchHit, ...]
+    facts: tuple[SearchHit, ...]
+    procedures: tuple[SearchHit, ...]
+    affect: tuple[SearchHit, ...]
+    traits: tuple[SearchHit, ...]
+    conflicts: tuple[ContextConflict, ...]
+    occurred_from: datetime | None
+    occurred_until: datetime | None
+    frames: tuple[str, ...]
+    omitted: int
+    chars: int
+
+    @property
+    def hits(self) -> tuple[SearchHit, ...]:
+        """Every included hit in rank order, without duplicates."""
+        merged = {hit.id: hit for _heading, section in self._sections() for hit in section}
+        return tuple(sorted(merged.values(), key=lambda hit: (-hit.score, hit.id)))
+
+    def render(self) -> str:
+        """Return the bundle as deterministic sectioned text carrying `[id]` provenance."""
+        included = len(self.hits)
+        lines = [
+            f"# Context: {self.goal}",
+            "Each line is one memory: [id] content (confidence; validity).",
+            f"Reference time: {self.reference_at.isoformat()}",
+            f"Budget: {self.chars}/{self.budget.max_chars} chars, "
+            f"{included}/{self.budget.max_items} items",
+        ]
+        for heading, section in self._sections():
+            if not section:
+                continue
+            lines.extend(("", f"## {heading}"))
+            lines.extend(_hit_line(hit) for hit in section)
+        if self.conflicts:
+            lines.extend(("", "## Conflicts"))
+            lines.extend(_conflict_line(conflict) for conflict in self.conflicts)
+        if self.omitted > 0:
+            lines.extend(("", f"Omitted: {self.omitted} lower-ranked candidates"))
+        return "\n".join(lines)
+
+    def _sections(self) -> tuple[tuple[str, tuple[SearchHit, ...]], ...]:
+        """Return the sections in their fixed rendering order."""
+        return (
+            ("Actors", self.actors),
+            ("Facts", self.facts),
+            ("Episodes", self.episodes),
+            ("Procedures", self.procedures),
+            ("Affect", self.affect),
+            ("Traits", self.traits),
+        )
+
+
+def _hit_line(hit: SearchHit) -> str:
+    confidence = 1.0 if hit.context is None else hit.context.confidence
+    marks = f"confidence {confidence:.2f}{_validity(hit)}"
+    # One hit is one line, so stored newlines collapse rather than break the section shape.
+    return f"- [{hit.id}] {' '.join(hit.content.split())} ({marks})"
+
+
+def _validity(hit: SearchHit) -> str:
+    """Render a typed memory's world-validity bounds inline, so a stale fact reads as stale.
+
+    `MemoryContext` refuses an end without a start, so the only open form is an open-ended one.
+    """
+    context = hit.context
+    if context is None or context.valid_from is None:
+        return ""
+    start = context.valid_from.isoformat()
+    if context.valid_until is None:
+        return f"; valid from {start}"
+    return f"; valid {start} → {context.valid_until.isoformat()}"
+
+
+def _conflict_line(conflict: ContextConflict) -> str:
+    label = " ".join(part for part in (conflict.subject, conflict.predicate) if part)
+    values = " vs ".join(
+        f'"{value}" [{memory_id}]'
+        for value, memory_id in zip(conflict.values, conflict.memory_ids, strict=True)
+    )
+    return f"- {label or conflict.lineage_id}: {values}"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MemoryCapabilities:
+    """What one configured instance can do, so an agent need not discover it by failing."""
+
+    modalities: frozenset[Modality]
+    answer: bool
+    transcribe: bool
+    faces: bool
+    describe_vision: bool
+    form: bool
+    consolidate: bool
+    decay: bool

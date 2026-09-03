@@ -93,6 +93,8 @@ concurrently, with at most four outer search workers.
 `search_with_trace()` exposes bounded ranking signals and terminal rejection reasons without
 copying memory content or metadata into the trace. `ask()` uses the same retrieval path, applies
 the evidence budget, and returns only evidence the generation backend actually used.
+`compile()` reuses that same retrieval path, so SQLite reapplies authoritative visibility and
+scope before any hit reaches a [context bundle](context-compilation.md).
 
 ## Ownership and concurrency
 

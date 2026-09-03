@@ -88,6 +88,8 @@ credential behavior live in [configuration](../configuration.md).
 | `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
 | `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | no |
 | `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope` | answer object | yes |
+| `compile` | content; `--max-chars`; `--max-items`; repeatable `--memory-type`; `--min-confidence`; `--freshness-seconds`; `--reference-at`; `--scope` | context bundle plus `rendered` | no |
+| `capabilities` | none | `{"modalities":[...],"answer":bool,...}` | no |
 | `get` | `MEMORY_ID` | memory object | yes |
 | `speech` | `MEMORY_ID` | `{"segments":[...]}` | no |
 | `faces` | `MEMORY_ID` | `{"observations":[...]}` | no |
@@ -107,12 +109,14 @@ Defaults match the SDK: `add`, `add-many`, and `add-stream` use `memory_type=sem
 unset. Timestamps must be timezone-aware ISO 8601 values. Cursors are opaque and passed through
 unchanged. `ask` requires the selected composition to supply an answerer. `speech` and `faces`
 return an empty result without a model call when the record has no corresponding media; otherwise
-they require the matching capability.
+they require the matching capability. `compile` mirrors the
+[`ContextBudget` defaults](../context-compilation.md#budget) and repeats `--memory-type` to keep
+more than one type.
 
 ### Content and JSONL input
 
-Content commands (`add`, `search`, `search-with-trace`, and `ask`) accept exactly one of these
-forms:
+Content commands (`add`, `search`, `search-with-trace`, `ask`, and `compile`) accept exactly
+one of these forms:
 
 - Positional atoms: bare values are text, `@PATH` is a local file, `@@TEXT` is text beginning with
   a literal `@`, and `-` reads stdin. Order is preserved.
