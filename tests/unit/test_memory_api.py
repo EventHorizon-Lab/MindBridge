@@ -2122,6 +2122,53 @@ def test_naming_is_auditable_and_rollback_restores_the_previous_name(tmp_path: P
         assert '"speaker_name":null' in memory.get(record.id).content
 
 
+def test_deleting_the_standing_assertion_does_not_resurrect_a_retracted_name(
+    tmp_path: Path,
+) -> None:
+    """The projection reads standing assertions only, so a retraction cannot come back.
+
+    Deleting the assertion a name currently projects must leave the person unnamed. Falling
+    back to an assertion that a rollback retired would let a retracted name return through the
+    delete path, which is the same audit-versus-registry contradiction the rollback ordering
+    guard exists to prevent.
+    """
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=1,
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+
+        memory.register_identity(identity_id, "Li")
+        memory.register_identity(identity_id, "Li Hua")
+        superseding = next(
+            entry
+            for entry in memory.operations()
+            if entry.operation.claim is not None and entry.operation.claim.name == "Li Hua"
+        )
+        assert memory.rollback(superseding.operation_id) is True
+
+        standing = next(
+            item.id
+            for item in memory.list().items
+            if item.context is not None
+            and item.context.kind is MemoryKind.ENTITY
+            and item.context.identity_id == identity_id
+            and item.context.subject == "Li"
+        )
+        assert memory.delete(standing) is True
+
+        profile = memory.identity(identity_id)
+        assert profile is not None and profile.name is None
+        content = memory.get(record.id).content
+        assert '"speaker_name":"Li"' not in content
+        assert '"speaker_name":"Li Hua"' not in content
+
+
 def test_naming_rollbacks_happen_newest_standing_first(tmp_path: Path) -> None:
     """A reversal that changes nothing must say so, and must not resurrect a retracted name.
 
