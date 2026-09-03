@@ -65,13 +65,21 @@ SHARED_OPERATIONS: dict[str, tuple[str | None, str | None]] = {
     "list": ("listMemories", "list_memories"),
     "delete": ("deleteMemory", "delete_memory"),
     "reinforce": ("reinforceMemories", "reinforce_memories"),
-    "speech": (None, "analyze_speech"),
-    "faces": (None, "analyze_faces"),
+    # The fast plane is an ordinary application operation on the caller's own records, so it is
+    # always on REST rather than gated; MCP still has no tool for it (a host owns the settle loop).
+    "capture": ("captureMemory", None),
+    "settle": ("settleCaptures", None),
+    "pending_captures": ("pendingCaptures", None),
+    # Embodied and identity operations are gated behind REST's `identity_operations` and
+    # `embodied_operations`, mirroring MCP's own switches; `_rest_route` below builds the app
+    # with both on so the shared checks below see every gated route.
+    "speech": ("analyzeSpeech", "analyze_speech"),
+    "faces": ("analyzeFaces", "analyze_faces"),
     "register_speaker": (None, "register_speaker"),
-    "register_identity": (None, "register_identity"),
-    "identity": (None, "get_identity"),
-    "unlink_identity": (None, "unlink_identity"),
-    "forget_identity": (None, "forget_identity"),
+    "register_identity": ("registerIdentity", "register_identity"),
+    "identity": ("getIdentity", "get_identity"),
+    "unlink_identity": ("unlinkIdentity", "unlink_identity"),
+    "forget_identity": ("forgetIdentity", "forget_identity"),
 }
 # Operations no transport exposes, each with the reason. `docs/design-principles.md` requires a
 # transport gap to be documented rather than silently left out, and the union of this and
@@ -82,11 +90,6 @@ UNEXPOSED_OPERATIONS: dict[str, str] = {
     "search_with_trace": "candidate-level retrieval diagnostics with no agent or client action",
     "reindex": "unbounded index maintenance an operator schedules, not a caller",
     "optimize": "index maintenance an operator schedules, not a caller",
-    # Fast capture is a two-call contract whose second half the host schedules; a transport
-    # caller cannot be handed the first half without also owning the settle loop.
-    "capture": "acknowledges before enrichment, so the host must own the matching settle loop",
-    "settle": "deferred-enrichment work an owner schedules, not a caller",
-    "pending_captures": "queue depth for the process that runs settle",
     # The control plane rewrites derived memory under policy. `docs/context-os.md` keeps that
     # authority with the host: an agent must not gain it by holding ordinary recall access.
     "consolidation_candidates": "the control plane's own due-work queue, read by the host loop",
@@ -136,6 +139,11 @@ REST_REQUEST_MODELS: dict[str, type[BaseModel]] = {
     "answer": rest.AnswerRequest,
     "reinforceMemories": rest.ReinforceRequest,
     "compileContext": rest.ContextRequest,
+    "captureMemory": rest.MemoryCreate,
+    "settleCaptures": rest.SettleRequest,
+    "analyzeSpeech": rest.AnalyzeRequest,
+    "analyzeFaces": rest.AnalyzeRequest,
+    "registerIdentity": rest.IdentityRegisterRequest,
 }
 
 
@@ -154,7 +162,11 @@ def _sdk_parameters(operation: str) -> set[str]:
 
 
 def _rest_route(operation_id: str) -> APIRoute:
-    app = rest.create_app(memory=cast(rest._Memory, _UnusedMemory()))
+    app = rest.create_app(
+        memory=cast(rest._Memory, _UnusedMemory()),
+        identity_operations=True,
+        embodied_operations=True,
+    )
     routes = [
         route
         for route in app.routes
@@ -237,7 +249,11 @@ def test_transport_fields_name_sdk_arguments(operation: str) -> None:
 
 
 def test_every_transport_operation_is_covered() -> None:
-    app = rest.create_app(memory=cast(rest._Memory, _UnusedMemory()))
+    app = rest.create_app(
+        memory=cast(rest._Memory, _UnusedMemory()),
+        identity_operations=True,
+        embodied_operations=True,
+    )
     routes = {
         route.operation_id
         for route in app.routes
