@@ -125,11 +125,11 @@ _VISION_SYSTEM_PROMPT = """Describe each supplied visual so a keyword search can
 Write one or two plain sentences per visual naming only what is visible: the objects, people,
 readable text, actions, and setting. Do not interpret, guess at intent, estimate anything you
 cannot see, or refer to the image, the frames, or this request. A video arrives as ordered stills
-from one clip; describe it as one scene.
+from one clip, under one visual number; describe it as one scene, in the order the stills run.
 
-Reply with JSON {"descriptions": ["...", "..."]} holding exactly one string per numbered visual,
-in the order supplied. Never leave a string empty; if a visual is unreadable, say what little is
-visible."""
+Reply with JSON {"descriptions": ["...", "..."]} holding exactly one string per numbered visual --
+one per visual, never one per still -- in the order supplied. Never leave a string empty; if a
+visual is unreadable, say what little is visible."""
 # Pinned so the sampler is not a source of caption drift. Not a reproducibility guarantee: a
 # measured endpoint returned four distinct completions for four identical requests at these
 # values, so a caller that needs identical documents across ingests caches by asset instead.
@@ -1693,13 +1693,26 @@ def _invalid_formation_response() -> ModelError:
 
 
 def _vision_content(inputs: Sequence[ModelInput]) -> list[dict[str, object]]:
-    """Number each visual and inline it, replacing every video with its ordered stills."""
+    """Number each visual and inline it, saying how many stills the visual arrived as.
+
+    A video is replaced by its ordered stills, so one visual can carry several image parts, and
+    the count has to be in the marker rather than left to the reader. Asked for "one description
+    per numbered visual" over a single clip's four unlabelled stills, a measured endpoint returned
+    four descriptions on every attempt, which the output contract rejected whole -- the request was
+    billed and the caption was lost. Naming the count is what makes one caption per clip the
+    obvious reading.
+    """
     parts: list[dict[str, object]] = []
     cache: dict[str, str] = {}
     for position, value in enumerate(inputs, start=1):
-        parts.append({"type": "text", "text": f"Visual {position}:"})
-        for asset in value.assets:
-            parts.extend(_vision_asset_parts(asset, cache))
+        visual = tuple(part for asset in value.assets for part in _vision_asset_parts(asset, cache))
+        marker = (
+            f"Visual {position}:"
+            if len(visual) <= 1
+            else f"Visual {position}, as {len(visual)} ordered stills:"
+        )
+        parts.append({"type": "text", "text": marker})
+        parts.extend(visual)
     return parts
 
 
