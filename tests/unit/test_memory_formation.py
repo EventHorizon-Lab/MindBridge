@@ -7,6 +7,9 @@ from pathlib import Path
 
 import pytest
 from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from mindbridge import (
     Blob,
@@ -21,6 +24,7 @@ from mindbridge import (
     RetrievalScope,
     SearchHit,
 )
+from mindbridge._telemetry import FORMATION_PROPOSALS_DROPPED
 
 
 class PreferenceFormer:
@@ -228,34 +232,94 @@ def test_unsupported_source_modality_is_kept_without_calling_the_former(tmp_path
         assert former.calls == 1
 
 
-def test_affect_proposal_must_name_a_modality_present_in_its_source(tmp_path: Path) -> None:
-    class InvalidAffectFormer(PreferenceFormer):
+def test_a_proposal_the_kernel_refuses_is_dropped_and_not_charged_to_the_write(
+    tmp_path: Path,
+) -> None:
+    """A per-proposal rule costs that proposal, never the observation it was derived from.
+
+    `add` commits the source before formation runs, so raising failed a write that had in fact
+    succeeded -- and the record stayed durable with its formation stuck in the queue, so every
+    retry re-ran the model and failed the same way. Text that merely mentions an image ("shared a
+    photo described as ...") is enough to make a model call it an image cue, which made this the
+    ordinary case rather than a rare one. The model adapter already drops and counts a malformed
+    proposal; the kernel's own rules now agree with that policy.
+    """
+
+    class MisgroundedAffectFormer(PreferenceFormer):
         def form(
             self, inputs: Sequence[FormationInput]
         ) -> tuple[tuple[FormationProposal, ...], ...]:
             return tuple(
                 (
                     FormationProposal(
+                        kind=MemoryKind.STATE,
+                        content="The user's preferred drink is tea",
+                        subject="user",
+                        predicate="preferred_drink",
+                        value="tea",
+                        confidence=0.9,
+                    ),
+                    # The source is text; no image was ever observed.
+                    FormationProposal(
                         kind=MemoryKind.AFFECT,
-                        content="The user sounded happy",
+                        content="The user looked happy",
                         subject="user",
                         value="happy",
-                        cue_modality=Modality.AUDIO,
+                        cue_modality=Modality.IMAGE,
                     ),
                 )
                 for _value in inputs
             )
 
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
     with Memory(
         tmp_path,
         embedder=TinyEmbedder(),
-        former=InvalidAffectFormer(),
+        former=MisgroundedAffectFormer(),
+        minimum_relevance=0,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        source = memory.add("I prefer tea, and I shared a photo described as a smile")
+
+        assert [item.id for item in memory.list().items] != []
+        kinds = {
+            hit.context.kind
+            for hit in memory.search("preferred drink happy", limit=10)
+            if hit.context is not None
+        }
+        assert MemoryKind.STATE in kinds
+        assert MemoryKind.AFFECT not in kinds
+        assert memory.pending_captures(memory_ids=(source.id,)) == ()
+
+    assert [
+        span.attributes[FORMATION_PROPOSALS_DROPPED]
+        for span in exporter.get_finished_spans()
+        if span.attributes is not None and FORMATION_PROPOSALS_DROPPED in span.attributes
+    ] == [1]
+
+
+def test_a_damaged_formation_envelope_still_fails_the_write(tmp_path: Path) -> None:
+    """Dropping one bad proposal must not swallow a backend that answered the wrong question."""
+
+    class ShortBatchFormer(PreferenceFormer):
+        def form(
+            self, inputs: Sequence[FormationInput]
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            assert inputs
+            return ()
+
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=ShortBatchFormer(),
         minimum_relevance=0,
     ) as memory:
-        with pytest.raises(ModelError, match="modality present"):
-            memory.add("I am happy")
+        with pytest.raises(ModelError) as failure:
+            memory.add("I prefer tea")
 
-        assert [item.content for item in memory.list().items] == ["I am happy"]
+        assert failure.value.reason == "response_invalid"
 
 
 def _formed(

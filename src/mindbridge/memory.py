@@ -44,6 +44,7 @@ from mindbridge._telemetry import (
     CAPTURE_SETTLED,
     CAPTURE_TIME_TO_SEARCHABLE,
     EMBEDDING_PARTS_ELIDED,
+    FORMATION_PROPOSALS_DROPPED,
     IDENTITY_CACHED,
     IDENTITY_CREATED,
     IDENTITY_EVIDENCE_ASSETS,
@@ -3282,10 +3283,23 @@ class Memory:
         pairs: builtins.list[tuple[_PreparedMemory, str, float]] = []
         inputs_by_id = {value.memory_id: value for value in inputs}
         formed_sources = tuple(source for source in pending if source.id in inputs_by_id)
+        dropped = 0
         for source in formed_sources:
             proposals = proposals_by_id.get(source.id, ())
             for proposal in proposals:
-                _validate_formation_proposal(proposal, inputs_by_id[source.id])
+                try:
+                    _validate_formation_proposal(proposal, inputs_by_id[source.id])
+                except ModelError:
+                    # One derived opinion the model grounded wrongly -- an affect cue naming a
+                    # modality the source never carried, a pose in another frame -- must not cost
+                    # the caller the observation it came from. `add` commits the source before
+                    # formation runs, so raising here fails a write that in fact succeeded, and
+                    # every retry re-runs formation and fails the same way. It is dropped and
+                    # counted instead, which is the policy the model adapter already applies to a
+                    # malformed one, and which consolidation already applies to this same rule.
+                    # Damage to the batch envelope still raises above: that is not one opinion.
+                    dropped += 1
+                    continue
                 prepared = _prepare_memory(
                     self._prepare_content(proposal.content, operation),
                     occurred_at=source.occurred_at,
@@ -3325,6 +3339,7 @@ class Memory:
                         proposal.confidence,
                     )
                 )
+        _record_dropped_proposals(dropped)
         _validate_formation_pairs(pairs)
         self._commit_formation(pairs, formed_sources, completed_at=now)
 
@@ -8073,6 +8088,17 @@ def _batch_values(
 def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _PreparedContent:
     note = f"Reference time for relative dates: {reference_at.isoformat(timespec='microseconds')}"
     return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
+
+
+def _record_dropped_proposals(count: int) -> None:
+    """Publish how many proposals kernel validation refused, so no loss is silent.
+
+    Recorded even at zero, because the absence of the attribute is otherwise indistinguishable
+    from formation never having run -- which is the state this signal exists to tell apart.
+    """
+    span = trace.get_current_span()
+    if span.is_recording():
+        span.set_attribute(FORMATION_PROPOSALS_DROPPED, count)
 
 
 def _record_elided_parts(count: int) -> None:

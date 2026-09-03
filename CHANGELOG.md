@@ -480,6 +480,17 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- One badly grounded formation proposal no longer fails the write that produced it. An `AFFECT`
+  proposal whose cue modality is absent from its source, or a pose in another coordinate frame,
+  raised `ModelError` out of `add`/`add_many`/`settle` although the observation was already
+  committed — so the record stayed durable with its formation stuck in the queue and every retry
+  re-ran the model and failed identically. Text that merely mentions a photo is enough to make a
+  model call it an image cue, so this was the ordinary case: a measured run failed 3 of 7 write
+  chunks, then spent 1.7x the successful path's tokens re-forming records one at a time, and
+  reported records as unwritten that were in fact stored and searchable. Such a proposal is now
+  dropped and counted on the `mindbridge.formation.dropped_proposals` span attribute while its
+  siblings commit, which is the policy the model adapter already applied to a malformed proposal
+  and consolidation already applied to this same rule. Damage to the batch envelope still raises.
 - A formed record no longer drops the symbolic place and the metadata of the observation it was
   formed from, and a `capture()` no longer drops the place it was captured in. `place_id` is a hard
   SQL filter, so a place-scoped `search()`, `ask()`, or `compile()` could previously return only

@@ -123,6 +123,14 @@ source modality and spatial binding, assigns IDs, links evidence, versions confl
 commits derived records. A formation failure leaves the source durable, and repeating the same add
 can complete the missing formation recipe.
 
+A proposal that fails one of the kernel's per-proposal rules — an `AFFECT` cue naming a modality
+the source never carried, a pose in another coordinate frame — is dropped, counted on the
+`mindbridge.formation.dropped_proposals` span attribute, and costs only itself: the observation's
+remaining proposals commit and the write succeeds. One badly grounded opinion must not fail a write
+whose source is already durable, because every retry would re-run the model and fail the same way.
+Only damage to the batch envelope — a backend returning the wrong number of results, or a shape
+that is not a batch of proposals — fails the write.
+
 Formation never rewrites the caller's source record. A derived record inherits its source's event
 time, valid interval, metric pose, symbolic `place_id`, and `metadata`, so a place-scoped or
 metadata-filtered recall reaches the knowledge formed in a room and not only the raw observation it
