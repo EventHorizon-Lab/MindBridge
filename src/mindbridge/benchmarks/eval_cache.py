@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -241,32 +242,39 @@ class DescriptionCache:
         self.hits = 0
         self.misses = 0
         self._closed = False
+        # Unlike `ResponseCache`, which every unit opens for itself, one description cache serves
+        # the whole run from the thread that built the backend pool while units ingest on worker
+        # threads. SQLite's per-thread binding is lifted and the calls are serialised here instead.
+        self._lock = threading.Lock()
         self._connection = _open_descriptions(self.path)
 
     def get(self, digest: str) -> str | None:
-        row = self._connection.execute(
-            "SELECT description FROM descriptions WHERE cache_key = ?",
-            (self._key(digest),),
-        ).fetchone()
-        if row is None:
-            self.misses += 1
-            return None
-        self.hits += 1
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT description FROM descriptions WHERE cache_key = ?",
+                (self._key(digest),),
+            ).fetchone()
+            if row is None:
+                self.misses += 1
+                return None
+            self.hits += 1
         return str(row[0])
 
     def put(self, digest: str, description: str) -> None:
         if not description.strip():
             raise ValueError("description must not be blank")
-        self._connection.execute(
-            "INSERT OR REPLACE INTO descriptions(cache_key, description) VALUES (?, ?)",
-            (self._key(digest), description),
-        )
+        with self._lock:
+            self._connection.execute(
+                "INSERT OR REPLACE INTO descriptions(cache_key, description) VALUES (?, ?)",
+                (self._key(digest), description),
+            )
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._connection.close()
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._connection.close()
+            self._closed = True
 
     def _key(self, digest: str) -> str:
         if not digest:
@@ -277,7 +285,7 @@ class DescriptionCache:
 
 def _open_descriptions(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=60, isolation_level=None)
+    connection = sqlite3.connect(path, timeout=60, isolation_level=None, check_same_thread=False)
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
     connection.execute(

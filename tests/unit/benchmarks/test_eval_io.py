@@ -7,6 +7,7 @@ import os
 import stat
 import zipfile
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -755,6 +756,30 @@ def test_a_cached_description_is_reused_instead_of_described_again(tmp_path: Pat
     assert backend.calls == 2
     assert backend.described == ["a" * 64, "b" * 64]
     assert (cache.hits, cache.misses) == (3, 2)
+
+
+def test_a_description_cache_is_shared_across_unit_worker_threads(tmp_path: Path) -> None:
+    """One cache serves every unit worker of a run, so it must accept calls from any thread.
+
+    `_BackendPool` opens the cache once, on the thread that builds the pool, and each unit then
+    ingests on a worker thread. A connection bound to its creating thread raised on every worker
+    call; the write path counts that as a failed description batch and fails open, so two whole
+    vision arms built caption-less libraries while every other counter read as healthy.
+    """
+    cache = DescriptionCache(tmp_path / "descriptions.db", "caption-model")
+    try:
+        digests = [format(index, "064x") for index in range(16)]
+
+        def round_trip(digest: str) -> str | None:
+            cache.put(digest, f"caption {digest[-1]}")
+            return cache.get(digest)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            seen = list(pool.map(round_trip, digests))
+        assert seen == [f"caption {digest[-1]}" for digest in digests]
+        assert cache.get(digests[0]) == "caption 0"
+    finally:
+        cache.close()
 
 
 def test_a_description_cache_survives_the_process_that_wrote_it(tmp_path: Path) -> None:

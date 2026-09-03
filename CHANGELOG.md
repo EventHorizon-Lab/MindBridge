@@ -403,6 +403,10 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- The benchmark description cache accepts calls from every unit worker thread. It is opened once
+  for a run while units ingest on worker threads, and SQLite's per-thread binding made every
+  worker-side describe fail; the write path counted each as a failed batch and fell open, so a
+  vision arm could build caption-less libraries while every other counter read as healthy.
 - Abstention is now detected structurally instead of by exact equality against one English
   sentence, so a refusal is still reported when the model re-punctuates it, wraps it in emphasis,
   appends an explanation, or answers in another language. The grounded prompt requests an opaque
