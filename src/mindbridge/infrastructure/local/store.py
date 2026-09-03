@@ -11,7 +11,7 @@ import struct
 import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, NoReturn
@@ -772,6 +772,49 @@ class StoredEmbedding:
             raise ValueError("normalized embedding must have unit length")
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StoredOperation:
+    """One append-only control-plane operation-log row.
+
+    The same value describes a pending write and a logged read: a caller supplies everything but
+    `operation_id`, and the store returns a copy carrying the assigned id and the effects it
+    actually applied.
+    """
+
+    operation_key: str
+    intent: str
+    trigger: str
+    operation_json: str
+    applied_at: datetime
+    model_id: str | None = None
+    recipe: str | None = None
+    operation_id: int = 0
+    created_ids: tuple[str, ...] = ()
+    changed_ids: tuple[str, ...] = ()
+    # Evidence rows this operation actually inserted. Rollback retires exactly these, so a link
+    # that predated the operation survives it.
+    linked: tuple[tuple[str, str], ...] = ()
+    rolled_back_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.operation_key, "operation_key")
+        _require_identifier(self.intent, "intent")
+        _require_identifier(self.trigger, "trigger")
+        if not self.operation_json.strip():
+            raise ValueError("operation_json must not be blank")
+        _require_aware(self.applied_at, "applied_at")
+        if self.rolled_back_at is not None:
+            _require_aware(self.rolled_back_at, "rolled_back_at")
+        if self.operation_id < 0:
+            raise ValueError("operation_id must not be negative")
+        for name in ("created_ids", "changed_ids"):
+            for memory_id in getattr(self, name):
+                _require_identifier(memory_id, name)
+        for memory_id, source_memory_id in self.linked:
+            _require_identifier(memory_id, "memory_id")
+            _require_identifier(source_memory_id, "source_memory_id")
+
+
 @dataclass(frozen=True, slots=True)
 class IndexOperation:
     """One durable mutation awaiting a successful search-index flush."""
@@ -1064,8 +1107,14 @@ class LocalStore:
         source_memory_ids: Sequence[str],
         recipe: str,
         completed_at: datetime,
+        operation: StoredOperation | None = None,
     ) -> bool:
-        """Commit derived records, evidence, and source completion in one transaction."""
+        """Commit derived records, evidence, and source completion in one transaction.
+
+        `operation` logs the control-plane operation that produced these records in the same
+        transaction. Consolidation passes no `source_memory_ids`, so no `formation_runs` marker
+        is written and the derived record stays open to further independent evidence.
+        """
         supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
             memories,
             embeddings,
@@ -1104,14 +1153,21 @@ class LocalStore:
                 transaction_memory_ids.add(memory.memory_id)
             for embedding in supplied_embeddings:
                 self._write_embedding(connection, embedding)
+            linked: list[tuple[str, str]] = []
             for memory_id, source_memory_id, confidence in evidence:
-                _add_memory_evidence(
+                if _add_memory_evidence(
                     connection,
                     memory_id,
                     source_memory_id,
                     confidence=confidence,
                     recorded_at=completed_at,
-                )
+                ):
+                    linked.append((memory_id, source_memory_id))
+            _refresh_multi_source_projections(
+                connection,
+                supplied_memories,
+                changed_at=completed_at,
+            )
             connection.executemany(
                 """
                 INSERT INTO formation_runs (source_memory_id, recipe, completed_at)
@@ -1122,6 +1178,8 @@ class LocalStore:
                     for source_memory_id in sources
                 ),
             )
+            if operation is not None:
+                _insert_operation(connection, replace(operation, linked=tuple(linked)))
         return True
 
     def replace_memory_embeddings(
@@ -1202,6 +1260,120 @@ class LocalStore:
                 confidence=float(confidence),
                 recorded_at=recorded_at,
             )
+
+    def apply_control_operation(
+        self,
+        operation: StoredOperation,
+        *,
+        reinforce: Sequence[tuple[str, str]] = (),
+        correct_ids: Sequence[str] = (),
+        forget_ids: Sequence[str] = (),
+    ) -> StoredOperation | None:
+        """Apply one already-validated operation and its log row in one transaction.
+
+        The caller owns policy; this only executes the supplied effects. It returns `None` when
+        the operation key is already applied and not rolled back.
+        """
+        for memory_id, source_memory_id in reinforce:
+            _require_identifier(memory_id, "memory_id")
+            _require_identifier(source_memory_id, "source_memory_id")
+        for memory_id in (*correct_ids, *forget_ids):
+            _require_identifier(memory_id, "memory_id")
+        with self._transaction() as connection:
+            if _active_operation_id(connection, operation.operation_key) is not None:
+                return None
+            changed: list[str] = []
+            linked: list[tuple[str, str]] = []
+            for memory_id, source_memory_id in reinforce:
+                if _add_memory_evidence(
+                    connection,
+                    memory_id,
+                    source_memory_id,
+                    confidence=_asserted_confidence(connection, memory_id),
+                    recorded_at=operation.applied_at,
+                ):
+                    changed.append(memory_id)
+                    linked.append((memory_id, source_memory_id))
+            changed.extend(
+                _retire_memory_versions(connection, correct_ids, retired_at=operation.applied_at)
+            )
+            changed.extend(
+                _set_forgotten(connection, forget_ids, forgotten_at=operation.applied_at)
+            )
+            applied = replace(
+                operation,
+                changed_ids=tuple(dict.fromkeys(changed)),
+                linked=tuple(linked),
+            )
+            return replace(applied, operation_id=_insert_operation(connection, applied))
+
+    def rollback_operation(
+        self,
+        operation_id: int,
+        *,
+        rolled_back_at: datetime,
+        retire_evidence: Sequence[tuple[str, str]] = (),
+        restore_versions: Sequence[str] = (),
+        clear_forgotten: Sequence[str] = (),
+    ) -> bool:
+        """Apply the caller's reversal and mark one operation rolled back, atomically.
+
+        Returns `False` when the operation is unknown or already rolled back, in which case no
+        reversal is applied.
+        """
+        _require_aware(rolled_back_at, "rolled_back_at")
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT applied_at FROM memory_operations
+                WHERE operation_id = ? AND rolled_back_at IS NULL
+                """,
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            reverted_at = max(rolled_back_at, _parse_datetime(_row_text(row, "applied_at")))
+            _retire_memory_evidence(connection, retire_evidence, retired_at=reverted_at)
+            _restore_memory_versions(connection, restore_versions, recorded_at=reverted_at)
+            _set_forgotten(connection, clear_forgotten, forgotten_at=None)
+            connection.execute(
+                "UPDATE memory_operations SET rolled_back_at = ? WHERE operation_id = ?",
+                (_datetime_text(reverted_at), operation_id),
+            )
+        return True
+
+    def read_operations(
+        self,
+        *,
+        limit: int = 100,
+        operation_id: int | None = None,
+        operation_key: str | None = None,
+    ) -> tuple[StoredOperation, ...]:
+        """Return logged operations newest first, or the one matching an id or active key."""
+        if not 1 <= limit <= 1_000:
+            raise ValueError("limit must be between 1 and 1000")
+        where = ""
+        parameters: tuple[object, ...] = ()
+        if operation_id is not None:
+            where = "WHERE operation_id = ?"
+            parameters = (operation_id,)
+        elif operation_key is not None:
+            _require_identifier(operation_key, "operation_key")
+            where = "WHERE operation_key = ? AND rolled_back_at IS NULL"
+            parameters = (operation_key,)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT operation_id, operation_key, intent, trigger, model_id, recipe,
+                       operation_json, effects_json, applied_at, rolled_back_at
+                FROM memory_operations
+                {where}
+                ORDER BY operation_id DESC
+                LIMIT ?
+                """,
+                (*parameters, limit),
+            ).fetchall()
+        return tuple(_operation_from_row(row) for row in rows)
 
     def read_memory(self, memory_id: str) -> StoredMemory | None:
         """Return one memory, or none when it does not exist."""
@@ -1439,24 +1611,8 @@ class LocalStore:
             _require_aware(forgotten_at, "forgotten_at")
         if not ids:
             return ()
-        changed: list[str] = []
         with self._transaction() as connection:
-            for memory_id in ids:
-                cursor = connection.execute(
-                    """
-                    UPDATE memory_records
-                    SET forgotten_at = ?
-                    WHERE memory_id = ? AND (forgotten_at IS NULL) != (? IS NULL)
-                    """,
-                    (
-                        None if forgotten_at is None else _datetime_text(forgotten_at),
-                        memory_id,
-                        None if forgotten_at is None else 1,
-                    ),
-                )
-                if cursor.rowcount:
-                    changed.append(memory_id)
-        return tuple(changed)
+            return _set_forgotten(connection, ids, forgotten_at=forgotten_at)
 
     def delete_memory(self, memory_id: str) -> bool:
         """Delete a memory; cascading embedding triggers enqueue index deletions."""
@@ -3945,6 +4101,201 @@ def _add_memory_evidence(
         return True
     _refresh_evidence_projection(connection, memory_id, tx_time)
     return True
+
+
+def _set_forgotten(
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+    *,
+    forgotten_at: datetime | None,
+) -> tuple[str, ...]:
+    changed: list[str] = []
+    for memory_id in dict.fromkeys(memory_ids):
+        cursor = connection.execute(
+            """
+            UPDATE memory_records
+            SET forgotten_at = ?
+            WHERE memory_id = ? AND (forgotten_at IS NULL) != (? IS NULL)
+            """,
+            (
+                None if forgotten_at is None else _datetime_text(forgotten_at),
+                memory_id,
+                None if forgotten_at is None else 1,
+            ),
+        )
+        if cursor.rowcount:
+            changed.append(memory_id)
+    return tuple(changed)
+
+
+def _refresh_multi_source_projections(
+    connection: sqlite3.Connection,
+    memories: Sequence[StoredMemory],
+    *,
+    changed_at: datetime,
+) -> None:
+    """Project confidence and visibility for records written with several sources at once.
+
+    A record inserted with all of its evidence rows already present never reaches the per-row
+    projection in `_add_memory_evidence`. Formation cites one source and needs nothing here;
+    consolidation needs it for the noisy-OR confidence and trait visibility.
+    """
+    for memory in memories:
+        context = memory.context
+        if context is not None and len(context.evidence_ids) > 1:
+            _refresh_evidence_projection(connection, memory.memory_id, changed_at)
+
+
+def _asserted_confidence(connection: sqlite3.Connection, memory_id: str) -> float:
+    """Return the confidence one source lends this assertion, not the noisy-OR projection.
+
+    Version 1 never changes, so reinforcing the same record twice combines equal independent
+    support instead of compounding whatever the last projection happened to be.
+    """
+    row = connection.execute(
+        "SELECT confidence FROM memory_versions WHERE memory_id = ? ORDER BY version LIMIT 1",
+        (memory_id,),
+    ).fetchone()
+    return 1.0 if row is None else float(row["confidence"])
+
+
+def _retire_memory_versions(
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+    *,
+    retired_at: datetime,
+) -> tuple[str, ...]:
+    changed: list[str] = []
+    for memory_id in dict.fromkeys(memory_ids):
+        tx_time = _next_semantic_transaction_time(connection, retired_at, (memory_id,))
+        cursor = connection.execute(
+            """
+            UPDATE memory_versions SET retired_at = ?
+            WHERE memory_id = ? AND retired_at IS NULL
+            """,
+            (_datetime_text(tx_time), memory_id),
+        )
+        if cursor.rowcount:
+            changed.append(memory_id)
+    return tuple(changed)
+
+
+def _restore_memory_versions(
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+    *,
+    recorded_at: datetime,
+) -> None:
+    for memory_id in dict.fromkeys(memory_ids):
+        row = connection.execute(
+            """
+            SELECT memory_id, version, confidence, valid_from, valid_until,
+                   recorded_at, visible, supersedes_id
+            FROM memory_versions WHERE memory_id = ?
+            ORDER BY version DESC LIMIT 1
+            """,
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        _carry_memory_version(
+            connection,
+            row,
+            valid_from=_optional_datetime_from_row(row, "valid_from"),
+            valid_until=_optional_datetime_from_row(row, "valid_until"),
+            recorded_at=_next_semantic_transaction_time(connection, recorded_at, (memory_id,)),
+        )
+
+
+def _retire_memory_evidence(
+    connection: sqlite3.Connection,
+    pairs: Sequence[tuple[str, str]],
+    *,
+    retired_at: datetime,
+) -> tuple[str, ...]:
+    changed: list[str] = []
+    for memory_id, source_memory_id in pairs:
+        tx_time = _next_semantic_transaction_time(connection, retired_at, (memory_id,))
+        cursor = connection.execute(
+            """
+            UPDATE memory_evidence SET retired_at = ?
+            WHERE memory_id = ? AND source_memory_id = ? AND retired_at IS NULL
+            """,
+            (_datetime_text(tx_time), memory_id, source_memory_id),
+        )
+        if cursor.rowcount:
+            changed.append(memory_id)
+    for memory_id in dict.fromkeys(changed):
+        _refresh_evidence_projection(
+            connection,
+            memory_id,
+            _next_semantic_transaction_time(connection, retired_at, (memory_id,)),
+        )
+    return tuple(dict.fromkeys(changed))
+
+
+def _active_operation_id(connection: sqlite3.Connection, operation_key: str) -> int | None:
+    row = connection.execute(
+        """
+        SELECT operation_id FROM memory_operations
+        WHERE operation_key = ? AND rolled_back_at IS NULL
+        """,
+        (operation_key,),
+    ).fetchone()
+    return None if row is None else int(row["operation_id"])
+
+
+def _insert_operation(connection: sqlite3.Connection, operation: StoredOperation) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO memory_operations (
+            operation_key, intent, trigger, model_id, recipe,
+            operation_json, effects_json, applied_at, rolled_back_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        """,
+        (
+            operation.operation_key,
+            operation.intent,
+            operation.trigger,
+            operation.model_id,
+            operation.recipe,
+            operation.operation_json,
+            json.dumps(
+                {
+                    "created_ids": list(operation.created_ids),
+                    "changed_ids": list(operation.changed_ids),
+                    "linked": [list(pair) for pair in operation.linked],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            _datetime_text(operation.applied_at),
+        ),
+    )
+    if cursor.lastrowid is None:
+        raise RuntimeError("failed to log a memory operation")
+    return int(cursor.lastrowid)
+
+
+def _operation_from_row(row: sqlite3.Row) -> StoredOperation:
+    effects = json.loads(_row_text(row, "effects_json"))
+    if not isinstance(effects, dict):
+        raise ValueError("logged operation effects must encode an object")
+    return StoredOperation(
+        operation_id=int(row["operation_id"]),
+        operation_key=_row_text(row, "operation_key"),
+        intent=_row_text(row, "intent"),
+        trigger=_row_text(row, "trigger"),
+        model_id=_optional_row_text(row, "model_id"),
+        recipe=_optional_row_text(row, "recipe"),
+        operation_json=_row_text(row, "operation_json"),
+        created_ids=tuple(effects.get("created_ids") or ()),
+        changed_ids=tuple(effects.get("changed_ids") or ()),
+        linked=tuple((pair[0], pair[1]) for pair in effects.get("linked") or ()),
+        applied_at=_parse_datetime(_row_text(row, "applied_at")),
+        rolled_back_at=_optional_datetime_from_row(row, "rolled_back_at"),
+    )
 
 
 def _evidence_summary(

@@ -461,6 +461,131 @@ class MemoryContext:
         object.__setattr__(self, "arousal", _bounded_optional(self.arousal, "arousal", 0, 1))
 
 
+class MemoryIntent(str, Enum):
+    """One memory-management operation the agentic control plane may propose."""
+
+    REINFORCE = "reinforce"
+    CONSOLIDATE = "consolidate"
+    CORRECT = "correct"
+    FORGET = "forget"
+
+
+class MemoryTrigger(str, Enum):
+    """Why one bounded memory-management deliberation ran."""
+
+    MANUAL = "manual"
+    EVIDENCE = "evidence"
+    FEEDBACK = "feedback"
+    CONTRADICTION = "contradiction"
+    QUERY_FAILURE = "query_failure"
+    PRESSURE = "pressure"
+    IDLE = "idle"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MemoryOperation:
+    """One proposed memory operation whose required fields follow from its intent."""
+
+    intent: MemoryIntent
+    evidence_ids: tuple[str, ...] = ()
+    target_ids: tuple[str, ...] = ()
+    proposal: FormationProposal | None = None
+    rationale: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, MemoryIntent):
+            try:
+                object.__setattr__(self, "intent", MemoryIntent(self.intent))
+            except (TypeError, ValueError):
+                raise ValidationError("memory operation intent is invalid") from None
+        object.__setattr__(self, "evidence_ids", _memory_ids(self.evidence_ids, "evidence_ids"))
+        object.__setattr__(self, "target_ids", _memory_ids(self.target_ids, "target_ids"))
+        object.__setattr__(
+            self,
+            "rationale",
+            _optional_text(self.rationale, "operation rationale"),
+        )
+        if self.proposal is not None and not isinstance(self.proposal, FormationProposal):
+            raise ValidationError("memory operation proposal is invalid")
+        if self.intent is MemoryIntent.CONSOLIDATE:
+            if self.proposal is None or not self.evidence_ids or self.target_ids:
+                raise ValidationError(
+                    "consolidate requires a proposal and cited evidence, and names no target"
+                )
+        elif self.proposal is not None:
+            raise ValidationError(f"{self.intent.value} must not carry a proposal")
+        elif self.intent is MemoryIntent.REINFORCE:
+            if len(self.target_ids) != 1 or not self.evidence_ids:
+                raise ValidationError("reinforce requires exactly one target and cited evidence")
+        elif not self.target_ids or self.evidence_ids:
+            raise ValidationError(
+                f"{self.intent.value} requires at least one target and cites no evidence"
+            )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MemoryOperationRecord:
+    """One applied control-plane operation as the append-only log holds it."""
+
+    operation_id: int
+    operation: MemoryOperation
+    trigger: MemoryTrigger
+    applied_at: datetime
+    model_id: str | None = None
+    recipe: str | None = None
+    created_ids: tuple[str, ...] = ()
+    changed_ids: tuple[str, ...] = ()
+    rolled_back_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.operation_id, bool)
+            or not isinstance(self.operation_id, int)
+            or self.operation_id <= 0
+        ):
+            raise ValidationError("operation_id must be a positive integer")
+        if not isinstance(self.operation, MemoryOperation):
+            raise ValidationError("operation must be a MemoryOperation")
+        if not isinstance(self.trigger, MemoryTrigger):
+            raise ValidationError("operation trigger is invalid")
+        _require_aware(self.applied_at, "applied_at")
+        _require_aware(self.rolled_back_at, "rolled_back_at")
+        for name in ("model_id", "recipe"):
+            object.__setattr__(
+                self,
+                name,
+                _optional_text(getattr(self, name), f"operation {name}"),
+            )
+        object.__setattr__(self, "created_ids", _memory_ids(self.created_ids, "created_ids"))
+        object.__setattr__(self, "changed_ids", _memory_ids(self.changed_ids, "changed_ids"))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ConsolidationReport:
+    """What one consolidation pass applied and which proposals the kernel refused."""
+
+    operations: tuple[MemoryOperationRecord, ...] = ()
+    rejected: tuple[tuple[MemoryOperation, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        operations = tuple(self.operations)
+        if any(not isinstance(value, MemoryOperationRecord) for value in operations):
+            raise ValidationError("consolidation operations are invalid")
+        try:
+            rejected = tuple((value, reason) for value, reason in self.rejected)
+        except (TypeError, ValueError):
+            raise ValidationError("consolidation rejections are invalid") from None
+        if any(
+            not isinstance(value, MemoryOperation)
+            or not isinstance(reason, str)
+            or not reason.strip()
+            for value, reason in rejected
+        ):
+            raise ValidationError("consolidation rejections are invalid")
+        object.__setattr__(self, "operations", operations)
+        object.__setattr__(self, "rejected", rejected)
+
+
 @dataclass(frozen=True, slots=True)
 class StreamInput:
     """One independently durable observation from an omni input stream."""
@@ -859,6 +984,14 @@ def _optional_media_type(value: object | None) -> str | None:
 def _require_matching_media_type(modality: Modality, media_type: str) -> None:
     if media_type.split("/", 1)[0] != modality.value:
         raise ValidationError("asset modality does not match media_type")
+
+
+def _memory_ids(values: object, name: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValidationError(f"{name} must be a sequence of memory IDs")
+    if any(not isinstance(value, str) or not value.strip() for value in values):
+        raise ValidationError(f"{name} must contain non-blank memory IDs")
+    return tuple(dict.fromkeys(values))
 
 
 def _require_aware(value: datetime | None, name: str) -> None:

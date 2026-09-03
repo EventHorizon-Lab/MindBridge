@@ -62,6 +62,7 @@ Memory(
     vision_describer: VisionDescriptionBackend | None = None,
     face_analyzer: FaceBackend | None = None,
     former: FormationBackend | None = None,
+    consolidator: ConsolidationBackend | None = None,
     index_speech: bool = False,
     index_quantization: IndexQuantization = IndexQuantization.NONE,
     minimum_relevance: float = 0.55,
@@ -86,9 +87,10 @@ the supported provider configuration fields live in [configuration](../configura
 A plain `TranscriptionBackend` transcribes supported audio/video during `add` regardless of
 `index_speech`; `SpeechBackend` analysis and identity resolution stay behind the explicit flag.
 
-`vision_describer` and `former` have no declarative provider and are reachable through direct
-construction or `MemoryPlugins`. `former` proposes typed memories only after the source observation
-commits. `identity_link_min_assets` is the number of distinct co-occurring assets required before a
+`vision_describer`, `former`, and `consolidator` have no declarative provider and are reachable
+through direct construction or `MemoryPlugins`. `former` proposes typed memories only after the
+source observation commits; `consolidator` proposes memory-management operations over records that
+already exist. `identity_link_min_assets` is the number of distinct co-occurring assets required before a
 face and voice are bound; its default is `2`.
 
 Use `index_speech=True` when transcripts and resolved speaker names should become retrieval text.
@@ -119,7 +121,7 @@ resolve_memory_config(
 ```
 
 `MemoryPlugins` contains `embedder` plus optional `answerer`, `transcriber`, `vision_describer`,
-`face_analyzer`, and `former`. `MemoryConfig` contains the value-only constructor settings;
+`face_analyzer`, `former`, and `consolidator`. `MemoryConfig` contains the value-only constructor settings;
 `MemorySettings` is its public alias. `MemoryComposition` contains `data_dir`, `plugins`, and
 `settings`; call `close()` unless its plugins have been transferred to a `Memory`.
 
@@ -328,6 +330,46 @@ records explicit positive feedback and returns the number of existing distinct m
 returns the number of memories rebuilt. `optimize` merges and flushes staged index vectors.
 Repeated `close()` calls are harmless.
 
+### Memory management operations
+
+```text
+consolidate(
+    *,
+    evidence_ids: Sequence[str] | None = None,
+    query: ContentInput | None = None,
+    limit: int = 32,
+    trigger: MemoryTrigger = MemoryTrigger.MANUAL,
+) -> ConsolidationReport
+
+forget(memory_ids: Sequence[str]) -> MemoryOperationRecord | None
+rollback(operation_id: int) -> bool
+operations(*, limit: int = 100) -> tuple[MemoryOperationRecord, ...]
+```
+
+`consolidate` requires a `consolidator` and gathers the evidence set from `evidence_ids`, else the
+active search result for `query`, else the newest `limit` active records. Forgotten and hidden
+records never reach the backend. The backend proposes `MemoryOperation` values; the kernel
+validates each one, applies only the effect its intent allows, and commits it with its own log
+row. Rejected proposals are returned with a reason instead of raising, so one bad proposal does
+not discard the pass. Every operation carries `operation_key = sha256(canonical operation JSON +
+recipe)`; a key already applied and not rolled back is rejected as `"duplicate"`.
+
+| Intent | Kernel checks | Effect | `rollback` |
+| --- | --- | --- | --- |
+| `REINFORCE` | One derived target; every evidence ID shown, existing, not the target, not already linked | Adds independent evidence; confidence and visibility recompute | Retires those evidence rows |
+| `CONSOLIDATE` | Valid proposal; at least one shown evidence ID; affect cue modality and spatial frame present in some source | New derived record citing every source | Deletes the created records |
+| `CORRECT` | Targets exist and are derived (`kind != OBSERVATION`) | Retires current versions at transaction time | Carries a new version with the same interval |
+| `FORGET` | Targets exist and are not already forgotten | Sets `forgotten_at` | Clears `forgotten_at` |
+
+`forget` is the host entry point for the FORGET intent and needs no backend. It is cognitive
+forgetting only: recall skips the record while `get()`, `list()`, and `MemoryRecord.forgotten_at`
+keep it for audit. Use `delete` to remove a record and its media. It returns `None` when nothing
+changed, so an unknown or already-forgotten ID is a no-op rather than an error.
+
+`rollback` reverses one applied operation and returns `False` for an unknown or already-reversed
+`operation_id`. `operations` lists the log newest first. Physical deletion is not an intent, and
+none of these four operations is exposed on REST or MCP.
+
 ### Cross-modal identity binding
 
 A face and a voice become one identity only after the same pair co-occurs in
@@ -429,10 +471,10 @@ These are the supported names exported by `mindbridge`:
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `FaceObservation`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `MemoryCapabilities` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `FaceObservation`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `MemoryCapabilities`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
-| Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `SpatialAnchor`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
-| Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
+| Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
+| Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
 | Bundled adapters | `JinaOmniEmbedder`, `SentenceTransformersEmbedder`, `OpenAIModels`, `OpenCVFaceAnalyzer`, `FunASRTranscriber`, `FunASRRecipe`, `DEFAULT_FUNASR_MODEL_ID`, `DEFAULT_FUNASR_RECIPE` |
 | Exceptions | `MindBridgeError`, `ValidationError`, `MemoryNotFoundError`, `SpeakerNotFoundError`, `IdentityNotFoundError`, `ModelError`, `ModelOutputTruncatedError`, `StorageError`, `IndexUnavailableError` |
 
@@ -460,6 +502,8 @@ The principal immutable values are:
 | `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`; `hits` property and `render()` |
 | `MemoryCapabilities` | `modalities`, `answer`, `transcribe`, `faces`, `describe_vision`, `form`, `consolidate`, `decay` |
+| `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `rolled_back_at` |
+| `ConsolidationReport` | `operations`, `rejected` as `(MemoryOperation, reason)` pairs |
 | `StreamEvent` | `phase`, `item`, `stream_id` |
 | `StreamCommit` | `record`, `prefetch`, `retrieval_error`, `stream_id` |
 | `PCMChunk` | `data`, `sample_rate_hz`, `channels`, `sample_width_bytes`, `stream_id`, `occurred_at` |
@@ -490,6 +534,8 @@ Enum values are:
 | `EmbedTask` | `retrieval.query`, `retrieval.document` |
 | `MemoryKind` | `observation`, `entity`, `event`, `state`, `relation`, `affect`, `trait`, `response_policy` |
 | `EvidenceBasis` | `observation`, `user_statement`, `model_inference`, `response_feedback` |
+| `MemoryIntent` | `reinforce`, `consolidate`, `correct`, `forget` |
+| `MemoryTrigger` | `manual`, `evidence`, `feedback`, `contradiction`, `query_failure`, `pressure`, `idle` |
 | `SpatialAnchor` | `observer`, `subject` |
 | `StreamPhase` | `update`, `final`, `cancel` |
 | `AudioBoundary` | `start`, `end`, `cancel` |
@@ -534,6 +580,12 @@ VisionDescriptionBackend.describe(
 FormationBackend.form(
     inputs: Sequence[FormationInput],
 ) -> tuple[tuple[FormationProposal, ...], ...]
+
+ConsolidationBackend.consolidate(
+    evidence: Sequence[MemoryRecord],
+    *,
+    trigger: MemoryTrigger,
+) -> tuple[MemoryOperation, ...]
 ```
 
 Required properties are `embedding_capabilities`, `embedding_model`, `embedding_space`, and
@@ -541,12 +593,17 @@ Required properties are `embedding_capabilities`, `embedding_model`, `embedding_
 `transcription_space` for transcription and speech; `face_capabilities`, `face_model`,
 `face_space`, and `face_analysis_space` for faces; `vision_capabilities` and `vision_model` for
 visual description; `formation_capabilities`, `formation_model`, and `formation_space` for
-formation; and `generation_capabilities` for generation. Every base protocol except the optional
+formation; `consolidation_model` and `consolidation_recipe` for consolidation; and
+`generation_capabilities` for generation. Every base protocol except the optional
 streaming extension implements `close()`.
 
 `form` receives one `FormationInput` per committed source and returns one proposal tuple per
 input, in the same order. A former never writes storage: the kernel validates each proposal
 against the source modality and spatial frame, assigns identity, links evidence, and commits.
+
+`consolidate` receives the bounded evidence set the kernel selected and may cite only IDs from
+it. It proposes; the kernel authorizes. `consolidation_recipe` identifies every control that
+changes what the backend proposes, so it is part of each operation's idempotency key.
 
 `ModelInput` contains normalized `text` and resolved `assets`. Speech adapters return
 `SpeechAnalysis(turns, speakers)` using `SpeechTurn` and `SpeakerEmbedding`; face adapters return
@@ -562,6 +619,7 @@ against the source modality and spatial frame, assigns identity, links evidence,
 | `FaceAnalysis` | `faces` |
 | `FormationInput` | `memory_id`, `content`, `context` |
 | `FormationProposal` | `kind`, `content`, `basis`, `subject`, `predicate`, `value`, `confidence`, `valid_from`, `valid_until`, `spatial`, `cue_modality`, `valence`, `arousal` |
+| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `rationale` |
 
 ### Bundled adapters
 

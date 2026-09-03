@@ -14,6 +14,7 @@ from mindbridge.infrastructure.local.store import (
     StoredAsset,
     StoredEmbedding,
     StoredMemory,
+    StoredOperation,
     UnsupportedSchemaError,
 )
 
@@ -29,5 +30,6 @@ __all__ = [
     "StoredAsset",
     "StoredEmbedding",
     "StoredMemory",
+    "StoredOperation",
     "UnsupportedSchemaError",
 ]

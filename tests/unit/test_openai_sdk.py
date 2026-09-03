@@ -32,6 +32,7 @@ from mindbridge._telemetry import (
 )
 from mindbridge.exceptions import ModelError, ModelOutputTruncatedError, ValidationError
 from mindbridge.models.base import (
+    ConsolidationBackend,
     EmbeddingBackend,
     EmbedTask,
     FormationBackend,
@@ -44,7 +45,12 @@ from mindbridge.models.openai_sdk import UNKNOWN_ANSWER, OpenAIModels
 from mindbridge.types import (
     AbstentionReason,
     AssetRef,
+    EvidenceBasis,
+    MemoryContext,
+    MemoryIntent,
     MemoryKind,
+    MemoryRecord,
+    MemoryTrigger,
     Modality,
     ObservationContext,
     SearchHit,
@@ -415,6 +421,162 @@ def test_formation_space_identifies_every_generation_control() -> None:
     assert baseline not in variants
     assert len(variants) == 5
     assert OpenAIModels(generation_seed=7).formation_space in variants
+
+
+def test_consolidation_numbers_evidence_and_resolves_cited_indices_to_ids() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["response_format"] == {"type": "json_object"}
+        assert "never write a memory identifier" in payload["messages"][0]["content"]
+        shown = json.loads(payload["messages"][1]["content"])
+        assert shown["trigger"] == "contradiction"
+        assert [item["index"] for item in shown["evidence"]] == [0, 1]
+        assert [item["memory_id"] for item in shown["evidence"]] == ["raw-1", "derived-1"]
+        assert shown["evidence"][1]["context"]["predicate"] == "disposition"
+        return _completion(
+            {
+                "operations": [
+                    {
+                        "intent": "reinforce",
+                        "targets": [1],
+                        "evidence": [0],
+                        "rationale": "an independent second sighting",
+                    },
+                    {
+                        "intent": "consolidate",
+                        "evidence": [0, 1],
+                        "proposal": {
+                            "kind": "state",
+                            "content": "The lamp is on.",
+                            "subject": "lamp",
+                            "predicate": "power",
+                            "value": "on",
+                            "confidence": 0.8,
+                        },
+                        "rationale": "both sources agree",
+                    },
+                    {"intent": "forget", "targets": [0], "rationale": "no longer useful"},
+                ]
+            }
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client))
+        assert isinstance(model, ConsolidationBackend)
+        assert model.consolidation_model == "answer-model"
+        operations = model.consolidate(
+            _consolidation_evidence(),
+            trigger=MemoryTrigger.CONTRADICTION,
+        )
+
+    reinforce, consolidate, forget = operations
+    assert reinforce.intent is MemoryIntent.REINFORCE
+    assert reinforce.target_ids == ("derived-1",)
+    assert reinforce.evidence_ids == ("raw-1",)
+    assert reinforce.rationale == "an independent second sighting"
+    assert consolidate.intent is MemoryIntent.CONSOLIDATE
+    assert consolidate.evidence_ids == ("raw-1", "derived-1")
+    assert consolidate.proposal is not None
+    assert consolidate.proposal.kind is MemoryKind.STATE
+    assert forget.intent is MemoryIntent.FORGET
+    assert forget.target_ids == ("raw-1",)
+
+
+@pytest.mark.parametrize(
+    "operations",
+    (
+        # An index outside the numbered evidence list fails the whole response.
+        [{"intent": "forget", "targets": [7]}],
+        [{"intent": "forget", "targets": [-1]}],
+        [{"intent": "forget", "targets": ["raw-1"]}],
+        # An intent whose shape the kernel could never apply.
+        [{"intent": "reinforce", "targets": [0, 1], "evidence": [0]}],
+        [{"intent": "consolidate", "evidence": [0]}],
+        [{"intent": "shred", "targets": [0]}],
+        # Fields outside the operation vocabulary.
+        [{"intent": "forget", "targets": [0], "confidence": 0.5}],
+        [{"targets": [0]}],
+    ),
+)
+def test_consolidation_refuses_an_ungrounded_or_malformed_operation(
+    operations: list[dict[str, object]],
+) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        return _completion({"operations": operations})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client))
+        with pytest.raises(ModelError) as failure:
+            model.consolidate(_consolidation_evidence(), trigger=MemoryTrigger.MANUAL)
+
+    assert failure.value.reason == "response_invalid"
+    assert failure.value.stage == "consolidate"
+
+
+def test_consolidation_recipe_identifies_every_generation_control() -> None:
+    baseline = OpenAIModels().consolidation_recipe
+    variants = {
+        OpenAIModels(generation_seed=7).consolidation_recipe,
+        OpenAIModels(generation_temperature=0.2).consolidation_recipe,
+        OpenAIModels(generation_max_tokens=128).consolidation_recipe,
+        OpenAIModels(generation_extra_body={"reasoning": {"effort": "low"}}).consolidation_recipe,
+    }
+
+    assert baseline not in variants
+    assert len(variants) == 4
+    # A consolidation recipe is never mistaken for a formation space on the same model.
+    assert baseline != OpenAIModels().formation_space
+
+
+def test_consolidation_without_evidence_calls_no_model() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request should be sent")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client))
+        assert model.consolidate((), trigger=MemoryTrigger.IDLE) == ()
+        with pytest.raises(ValidationError):
+            model.consolidate(_consolidation_evidence(), trigger="idle")  # type: ignore[arg-type]
+        with pytest.raises(ValidationError):
+            model.consolidate(["raw-1"], trigger=MemoryTrigger.IDLE)  # type: ignore[list-item]
+
+
+def _completion(payload: dict[str, object]) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"content": json.dumps(payload)},
+                    "finish_reason": "stop",
+                }
+            ]
+        },
+    )
+
+
+def _consolidation_evidence() -> tuple[MemoryRecord, ...]:
+    return (
+        MemoryRecord(id="raw-1", content="The lamp looks on.", created_at=NOW),
+        MemoryRecord(
+            id="derived-1",
+            content="Ana is patient",
+            created_at=NOW,
+            context=MemoryContext(
+                kind=MemoryKind.TRAIT,
+                basis=EvidenceBasis.MODEL_INFERENCE,
+                confidence=0.6,
+                valid_from=NOW,
+                valid_until=None,
+                recorded_at=NOW,
+                subject="Ana",
+                predicate="disposition",
+                value="patient",
+                evidence_ids=("raw-0",),
+            ),
+        ),
+    )
 
 
 def test_answer_marks_the_grounded_unknown_sentinel_as_insufficient_evidence() -> None:

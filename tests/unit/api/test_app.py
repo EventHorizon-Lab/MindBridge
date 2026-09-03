@@ -65,6 +65,7 @@ class FakeMemory:
         self.close_count = 0
         self.failure = failure
         self.deleted = True
+        self.forgotten_at: datetime | None = None
 
     def add(
         self,
@@ -168,12 +169,15 @@ class FakeMemory:
     def get(self, memory_id: str) -> MemoryRecord:
         self._fail()
         self.calls.append(("get", memory_id))
-        return _record(memory_id, "The toolbox is blue.")
+        return _record(memory_id, "The toolbox is blue.", forgotten_at=self.forgotten_at)
 
     def list(self, *, limit: int = 100, cursor: str | None = None) -> Page:
         self._fail()
         self.calls.append(("list", limit, cursor))
-        return Page(items=(_record("memory_1", "The toolbox is blue."),), next_cursor="next")
+        return Page(
+            items=(_record("memory_1", "The toolbox is blue.", forgotten_at=self.forgotten_at),),
+            next_cursor="next",
+        )
 
     def delete(self, memory_id: str) -> bool:
         self._fail()
@@ -669,6 +673,22 @@ def test_size_limit_runs_before_body_parsing() -> None:
     assert memory.calls == []
 
 
+def test_a_forgotten_record_serializes_its_cognitive_forgetting_state() -> None:
+    """Cognitive forgetting is auditable over the wire: `get` still returns the record."""
+    forgotten_at = datetime(2026, 9, 3, 9, 0, tzinfo=timezone.utc)
+    memory = FakeMemory()
+    memory.forgotten_at = forgotten_at
+    app = create_app(memory=memory)
+
+    with TestClient(app) as client:
+        found = client.get("/v1/memories/memory_1")
+        listed = client.get("/v1/memories")
+
+    expected = forgotten_at.isoformat().replace("+00:00", "Z")
+    assert found.json()["forgotten_at"] == expected
+    assert listed.json()["items"][0]["forgotten_at"] == expected
+
+
 def _record(
     memory_id: str,
     content: str,
@@ -679,6 +699,7 @@ def _record(
     assets: tuple[AssetRef, ...] = (),
     modality: Modality = Modality.TEXT,
     memory_type: MemoryType = MemoryType.SEMANTIC,
+    forgotten_at: datetime | None = None,
 ) -> MemoryRecord:
     return MemoryRecord(
         id=memory_id,
@@ -690,6 +711,7 @@ def _record(
         occurred_at=occurred_at,
         occurred_end=occurred_end,
         metadata=metadata or {},
+        forgotten_at=forgotten_at,
     )
 
 

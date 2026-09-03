@@ -176,7 +176,58 @@ does not infer coordinate transforms.
 still expose the latest retired or hidden context for audit, while ordinary search returns only
 active visible versions.
 
+## Memory management loop
+
+Formation reads one committed observation. The memory management loop reads a bounded set of
+records that already exist and proposes what should change about them. It is one loop with a
+stable vocabulary, not a swarm of specialized agents, and it needs a `consolidator`:
+
+```python
+report = memory.consolidate(query="what do we know about Ana?", trigger=MemoryTrigger.EVIDENCE)
+for record in report.operations:
+    print(record.operation_id, record.operation.intent, record.changed_ids)
+for operation, reason in report.rejected:
+    print(operation.intent, "refused:", reason)
+```
+
+The evidence set comes from explicit `evidence_ids`, else the active search result for `query`,
+else the newest `limit` active records. Forgotten and hidden records never reach the backend, and
+the backend may cite only IDs it was shown.
+
+| Intent | Kernel semantics |
+| --- | --- |
+| `REINFORCE` | Link an independent source to an existing derived record. Confidence recombines by noisy-OR over independent sources, and a hidden inferred `TRAIT` can become visible. |
+| `CONSOLIDATE` | Derive one new record citing several sources. The sources stay as evidence. |
+| `CORRECT` | Retire the current version of a bad derived inference. History is preserved, not overwritten. |
+| `FORGET` | Set `forgotten_at`. Recall skips the record; audit keeps it. |
+
+**Contract:** The backend proposes, never writes. Each proposal is validated against the shown
+evidence set and its intent's rules, then committed in its own transaction together with an
+append-only log row. A refused proposal is reported with a reason instead of raising, so one bad
+proposal does not discard the pass. Every operation is identified by
+`sha256(canonical operation JSON + recipe)`, so re-proposing the same operation is rejected as
+`"duplicate"` rather than applied twice. `rollback(operation_id)` reverses one operation and
+`operations()` lists the log newest first. Deletion is not an intent.
+
+**Guidance:** Trigger the loop on durable evidence: new independent support, explicit feedback, a
+contradiction, repeated query failure, memory pressure, or an approved idle window. A periodic
+timer alone is not evidence that the work is useful. See the
+[Python SDK reference](api/python-sdk.md#memory-management-operations) for signatures, effects,
+and rollback behavior.
+
 ## Decay and reinforcement
+
+MindBridge separates three forms of forgetting, and it never conflates them:
+
+| Form | Call | Effect |
+| --- | --- | --- |
+| Ranking decay | `decay_half_life_days` | Downranks stale records at query time. Nothing is removed or rewritten. |
+| Cognitive forgetting | `forget()` | Excludes a record from recall while `get()`, `list()`, and `MemoryRecord.forgotten_at` retain it. Reversible through `rollback()`. |
+| Physical deletion | `delete()` | Removes the record and any media no other record references. Not recoverable, and never something a model proposes. |
+
+`forget()` is cognitive only. It is the host entry point for the `FORGET` intent, so it takes the
+same log row and the same rollback path as a proposed operation. It returns `None` when nothing
+changed, which makes an unknown or already-forgotten ID a no-op rather than an error.
 
 Decay is disabled by default. Enable it with a positive `decay_half_life_days` setting. Decay
 changes query-time ranking only; it does not delete or rewrite records, assets, embeddings, or
@@ -197,6 +248,11 @@ if used and user_confirmed_helpful:
 `reinforce()` de-duplicates IDs, ignores missing records, and caps each record's confirmation count
 at 20. A confirmation later than the query's ranking reference is ignored for that query, which
 prevents future feedback from leaking into historical evaluation.
+
+`reinforce()` and the `REINFORCE` intent are different mechanisms with similar names. `reinforce()`
+records host feedback that slows ranking decay; it changes no evidence and no confidence. The
+`REINFORCE` intent links a second independent source to a derived record, which recomputes that
+record's confidence and visibility.
 
 **Guidance:** Reinforce only observed positive use or feedback. Use `search_with_trace()` when one
 query needs its temporal, reinforcement, retention, or rejection factors explained.

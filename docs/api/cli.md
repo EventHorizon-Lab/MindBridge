@@ -101,6 +101,10 @@ credential behavior live in [configuration](../configuration.md).
 | `identity` | `IDENTITY_ID` | `{"identity":{...}}` or `{"identity":null}` | no |
 | `unlink-identity` | `ALIAS_ID` | `{"restored_identity_id":...}` | no |
 | `reinforce` | one or more `MEMORY_ID` values | `{"reinforced":int}` | no |
+| `consolidate` | optional goal content; `--evidence-id`; `--limit`; `--trigger` | `{"operations":[...],"rejected":[...]}` | no |
+| `forget` | one or more `MEMORY_ID` values | `{"operation":{...}}` or `{"operation":null}` | no |
+| `rollback` | `OPERATION_ID` | `{"rolled_back":bool}` | no |
+| `operations` | `--limit` | `{"operations":[...]}` | no |
 | `list` | `--limit`; `--cursor` | `{"items":[...],"next_cursor":...}` | yes |
 | `delete` | `MEMORY_ID` | `{"deleted":bool}` | yes |
 | `reindex` | none | `{"memories":int}` | no |
@@ -108,7 +112,8 @@ credential behavior live in [configuration](../configuration.md).
 | `doctor` | none | composition and loader report | yes |
 
 Defaults match the SDK: `add`, `add-many`, `add-stream`, and `capture` use `memory_type=semantic`;
-search uses `limit=10`; ask uses `limit=5`; list and `settle` use `limit=100`; optional retrieval roles and timestamps are
+search uses `limit=10`; ask uses `limit=5`; list, `settle`, and `operations` use `limit=100`;
+`consolidate` uses `limit=32` with `trigger=manual`; optional retrieval roles and timestamps are
 unset. Timestamps must be timezone-aware ISO 8601 values. Cursors are opaque and passed through
 unchanged. `ask` requires the selected composition to supply an answerer. `speech` and `faces`
 return an empty result without a model call when the record has no corresponding media; otherwise

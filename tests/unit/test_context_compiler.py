@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
+from test_memory_control_plane import ScriptedConsolidator
 
 from mindbridge import (
     AnswerResult,
@@ -548,6 +549,7 @@ def test_async_compile_and_capabilities_mirror_the_sync_surface(tmp_path: Path) 
             tmp_path,
             embedder=TinyEmbedder(),
             former=_Former(),
+            consolidator=ScriptedConsolidator(),
             minimum_relevance=0,
         ) as memory:
             await memory.add("the spare key is in the blue toolbox")
@@ -568,7 +570,7 @@ def test_async_compile_and_capabilities_mirror_the_sync_surface(tmp_path: Path) 
         faces=False,
         describe_vision=False,
         form=True,
-        consolidate=False,
+        consolidate=True,
         decay=False,
     )
 
