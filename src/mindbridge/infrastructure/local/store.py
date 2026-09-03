@@ -1132,7 +1132,6 @@ class LocalStore:
             _reproject_named_identities(
                 connection,
                 tuple(memory.memory_id for memory in supplied_memories),
-                changed_at=datetime.now(timezone.utc),
             )
         return tuple(created_flags)
 
@@ -1437,7 +1436,6 @@ class LocalStore:
                 connection,
                 tuple(memory.memory_id for memory in supplied_memories)
                 + tuple(memory_id for memory_id, _source, _confidence in evidence),
-                changed_at=completed_at,
             )
             connection.executemany(
                 """
@@ -1542,7 +1540,7 @@ class LocalStore:
             )
             # Independent evidence is what makes an inferred naming assertion visible, so it is
             # also what can move the projection.
-            _reproject_named_identities(connection, (memory_id,), changed_at=recorded_at)
+            _reproject_named_identities(connection, (memory_id,))
             return added
 
     def apply_control_operation(
@@ -1600,11 +1598,7 @@ class LocalStore:
             forgotten = _set_forgotten(connection, forget_ids, forgotten_at=operation.applied_at)
             _require_every(forgotten, forget_ids, "forget")
             changed.extend(forgotten)
-            _reproject_named_identities(
-                connection,
-                (*changed, *correct_ids, *forget_ids),
-                changed_at=operation.applied_at,
-            )
+            _reproject_named_identities(connection, (*changed, *correct_ids, *forget_ids))
             applied = replace(
                 operation,
                 changed_ids=tuple(dict.fromkeys(changed)),
@@ -1676,7 +1670,6 @@ class LocalStore:
                     *(entry if isinstance(entry, str) else entry[0] for entry in restore_versions),
                     *clear_forgotten,
                 ),
-                changed_at=reverted_at,
             )
             connection.execute(
                 "UPDATE memory_operations SET rolled_back_at = ? WHERE operation_id = ?",
@@ -1970,11 +1963,7 @@ class LocalStore:
             return ()
         with self._transaction() as connection:
             changed = _set_forgotten(connection, ids, forgotten_at=forgotten_at)
-            _reproject_named_identities(
-                connection,
-                changed,
-                changed_at=forgotten_at or datetime.now(timezone.utc),
-            )
+            _reproject_named_identities(connection, changed)
             return changed
 
     def delete_memory(self, memory_id: str) -> bool:
@@ -2137,7 +2126,7 @@ class LocalStore:
                 kind,
                 changed_at=changed_at,
             )
-        _reproject_identities(connection, named_identities, changed_at=changed_at)
+        _reproject_identities(connection, named_identities)
         unreferenced = self._read_unreferenced_assets(
             connection,
             tuple(dict.fromkeys(linked_ids)),
@@ -3060,7 +3049,7 @@ class LocalStore:
             )
             connection.execute("DELETE FROM identities WHERE identity_id = ?", (source,))
             if _has_naming_assertion(connection, target):
-                _reproject_identities(connection, (target,), changed_at=_parse_datetime(now))
+                _reproject_identities(connection, (target,))
             self._replace_memory_embeddings(
                 connection,
                 supplied_memories,
@@ -3192,7 +3181,7 @@ class LocalStore:
                 modality=modality,
             )
             if _has_naming_assertion(connection, target):
-                _reproject_identities(connection, (target,), changed_at=_parse_datetime(now))
+                _reproject_identities(connection, (target,))
             self._replace_memory_embeddings(
                 connection,
                 supplied_memories,
@@ -5389,8 +5378,6 @@ def _naming_assertion_identities(
 def _reproject_identities(
     connection: sqlite3.Connection,
     identity_ids: Sequence[str],
-    *,
-    changed_at: datetime,
 ) -> tuple[str, ...]:
     """Recompute `identities.name` from each identity's current visible naming assertion.
 
@@ -5398,8 +5385,14 @@ def _reproject_identities(
     retired, hidden, re-pointed or deleted, the registry is recomputed in the same transaction,
     so `identities.name` is never a name no visible assertion supports. Returns the identities
     whose projection actually moved, which is what a caller has to repaint indexed text for.
+
+    `identities.updated_at` is transaction time and is taken here rather than from the caller.
+    Every path that moves the projection carries a semantic time of its own -- a record's
+    `recorded_at`, an operation's `applied_at`, a `forgotten_at` a host may deliberately backdate
+    -- and none of them says when this row changed. Stamping one of those could put `updated_at`
+    before the row's own `created_at`, which the schema refuses.
     """
-    now = _datetime_text(changed_at)
+    now = _datetime_text(datetime.now(timezone.utc))
     changed: list[str] = []
     for identity_id in dict.fromkeys(identity_ids):
         current = connection.execute(
@@ -5434,14 +5427,12 @@ def _reproject_identities(
 def _reproject_named_identities(
     connection: sqlite3.Connection,
     memory_ids: Sequence[str],
-    *,
-    changed_at: datetime,
 ) -> tuple[str, ...]:
     """Reproject every identity named by one of these records. The projection hook."""
     identity_ids = _naming_assertion_identities(connection, memory_ids)
     if not identity_ids:
         return ()
-    return _reproject_identities(connection, identity_ids, changed_at=changed_at)
+    return _reproject_identities(connection, identity_ids)
 
 
 def _rebind_unlinked_claims(
