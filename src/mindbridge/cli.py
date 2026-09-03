@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
-from typing import TextIO, TypeAlias, cast
+from typing import Any, TextIO, TypeAlias, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -45,7 +45,7 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
-from mindbridge.memory import Memory
+from mindbridge.memory import Memory, declared_capabilities
 from mindbridge.types import (
     AssetRef,
     Blob,
@@ -394,6 +394,10 @@ def _doctor(arguments: argparse.Namespace, composition: _Document) -> _Document:
     report: _Document = {"source": composition["source"]}
     data_dir: Path | None = None
     state = "owned by the application"
+    loaded: dict[str, object] = {}
+    # `--app` owns its own backends and doctor never calls the factory, so there is nothing to
+    # declare there; a local composition declares what its probed backends can do.
+    capabilities: _Document | None = None
     if arguments.app is not None:
         report["app"] = composition["app"]
         # Calling the factory would open the store, so the check stops at "the target resolves".
@@ -402,16 +406,49 @@ def _doctor(arguments: argparse.Namespace, composition: _Document) -> _Document:
     else:
         data_dir = _data_dir(arguments)
         state = _data_dir_state(data_dir)
-        for slot in _SLOTS:
-            name = getattr(arguments, slot)
-            report[slot] = None if name is None else _probe(name, slot)
+        try:
+            for slot in _SLOTS:
+                name = getattr(arguments, slot)
+                report[slot] = None if name is None else _probe(name, slot, loaded)
+            capabilities = _doctor_capabilities(loaded)
+        finally:
+            for backend in loaded.values():
+                close = getattr(backend, "close", None)
+                if callable(close):
+                    close()
     return {
         "version": _installed_version(),
         "python": ".".join(str(part) for part in sys.version_info[:3]),
         "data_dir": None if data_dir is None else str(data_dir),
         "data_dir_state": state,
+        # The same document `/healthz` serves and the MCP server greets an agent with, so the
+        # three surfaces cannot describe one composition differently.
+        "capabilities": capabilities,
         "composition": report,
     }
+
+
+def _doctor_capabilities(loaded: Mapping[str, object]) -> _Document | None:
+    """Declare what the probed backends can do, without opening the store `Memory` would.
+
+    Every capability is a backend declaration, so this needs no `data_dir` and stays true to
+    doctor's rule that diagnosing a busy or absent directory must not create or lock anything.
+    """
+    embedder = loaded.get("embedder")
+    if embedder is None:
+        return None
+    try:
+        capabilities = declared_capabilities(
+            embedder=cast(Any, embedder),
+            answerer=cast(Any, loaded.get("answerer")),
+            transcriber=cast(Any, loaded.get("transcriber")),
+            former=cast(Any, loaded.get("former")),
+        )
+    except MindBridgeError:
+        # A backend that declares an invalid contract is already reported per slot above; the
+        # capability document is a summary, not a second place to fail the command.
+        return None
+    return capabilities.document()
 
 
 def _application_target_exists(spec: str) -> None:
@@ -422,8 +459,8 @@ def _application_target_exists(spec: str) -> None:
         getattr(import_module(module_name), attribute)
 
 
-def _probe(name: str, slot: str) -> _Document:
-    """Construct one recipe with its loader exercised, then close what was constructed."""
+def _probe(name: str, slot: str, loaded: dict[str, object]) -> _Document:
+    """Construct one recipe with its loader exercised, keeping it for the capability summary."""
     document: _Document = dict(recipes.describe(name))
     document["probe"] = recipes.probe(name)
     build: Callable[..., object] = getattr(recipes, slot)
@@ -440,13 +477,9 @@ def _probe(name: str, slot: str) -> _Document:
             detail=" ".join(str(error).split()) or type(error).__name__,
         )
         return document
-    try:
-        document["loader"] = "ok"
-        document.update(_identity(backend))
-    finally:
-        close = getattr(backend, "close", None)
-        if callable(close):
-            close()
+    loaded[slot] = backend
+    document["loader"] = "ok"
+    document.update(_identity(backend))
     return document
 
 
@@ -619,6 +652,7 @@ def _budget(arguments: argparse.Namespace) -> ContextBudget:
             if arguments.freshness_seconds is None
             else timedelta(seconds=arguments.freshness_seconds)
         ),
+        max_latency_ms=arguments.max_latency_ms,
     )
 
 
@@ -634,14 +668,29 @@ def _compile(memory: Memory, arguments: argparse.Namespace) -> _Document:
         "reference_at": _encode_time(bundle.reference_at),
         "budget": _budget_document(bundle.budget),
         "conflicts": [asdict(conflict) for conflict in bundle.conflicts],
+        "unknowns": [
+            {"kind": unknown.kind.value, "detail": unknown.detail} for unknown in bundle.unknowns
+        ],
         "occurred_from": _encode_optional_time(bundle.occurred_from),
         "occurred_until": _encode_optional_time(bundle.occurred_until),
         "frames": list(bundle.frames),
+        "places": list(bundle.places),
         "omitted": bundle.omitted,
         "chars": bundle.chars,
+        "elapsed_ms": bundle.elapsed_ms,
+        "deadline_exceeded": bundle.deadline_exceeded,
         "rendered": bundle.render(),
     }
-    for name in ("actors", "episodes", "facts", "procedures", "affect", "traits"):
+    for name in (
+        "actors",
+        "relationships",
+        "scene",
+        "episodes",
+        "facts",
+        "procedures",
+        "affect",
+        "traits",
+    ):
         document[name] = [_memory_document(hit) for hit in getattr(bundle, name)]
     return document
 
@@ -659,6 +708,7 @@ def _budget_document(budget: ContextBudget) -> _Document:
         "freshness_seconds": (
             None if budget.freshness is None else budget.freshness.total_seconds()
         ),
+        "max_latency_ms": budget.max_latency_ms,
     }
 
 
@@ -1806,6 +1856,11 @@ def _compile_command(
         "--freshness-seconds",
         type=float,
         help="keep only memories anchored within this many seconds of the reference clock",
+    )
+    command.add_argument(
+        "--max-latency-ms",
+        type=int,
+        help="deadline after which optional compilation stages are skipped, in milliseconds",
     )
     command.add_argument("--reference-at", metavar="TIME", help="retrieval reference clock")
     command.add_argument("--scope", metavar="JSON", help="temporal/spatial scope, @PATH, or -")

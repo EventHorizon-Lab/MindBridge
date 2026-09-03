@@ -184,7 +184,8 @@ Context-request budget:
     "max_items": 8,
     "memory_types": ["semantic", "episodic"],
     "min_confidence": 0.5,
-    "freshness_seconds": 2592000
+    "freshness_seconds": 2592000,
+    "max_latency_ms": 250
   }
 }
 ```
@@ -196,11 +197,16 @@ Explicit reinforcement is not idempotent: every call raises `access_count` for t
 and moves the ranker's reinforcement factor, so a lost response must not be retried blindly.
 Unknown IDs are skipped, and `reinforced` counts the ones that existed.
 
-`compileContext` is a read-only view: it selects and structures existing evidence, reports
-conflicts without resolving them, calls no generation model, and writes nothing. Its request
-`budget` is the transport form of `ContextBudget`, with the `freshness` timedelta expressed as
-`freshness_seconds`. The [compiler reference](../context-compilation.md) owns section, selection,
-and conflict semantics.
+`compileContext` selects and structures existing evidence, reports conflicts without resolving
+them, calls no generation model, and stores no memory. It is not a pure read: it runs the same
+retrieval path `searchMemories` runs and can make the same one write, caching a transcript for
+spoken query media, which is a cache of the caller's own input rather than a new memory. Its
+request `budget` is the transport form of `ContextBudget`, with the `freshness` timedelta
+expressed as `freshness_seconds` and `max_latency_ms` a deadline the compiler checks between
+stages rather than a timeout that aborts. The bundle reports `elapsed_ms`, `deadline_exceeded`,
+and an `unknowns` array naming what the request implied and the bundle does not carry. The
+[compiler reference](../context-compilation.md) owns section, selection, unknown, and conflict
+semantics.
 
 ### Retrieval trace
 
@@ -235,7 +241,7 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 | `PageResponse` | `items`, `next_cursor` |
 | `ContextBudgetResponse` | `max_chars`, `max_items`, `memory_types` or `null`, `min_confidence`, `freshness_seconds` |
 | `ContextConflictResponse` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
-| `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `actors`, `episodes`, `facts`, `procedures`, `affect`, `traits`, plus `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`, `rendered` |
+| `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
 | `CapabilitiesResponse` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `consolidation_model`, `speaker_recognition`, `streaming_generation` |
 | `HealthResponse` | `status`, `capabilities` |
 
@@ -273,7 +279,8 @@ to send a probe write to learn what the deployment can do:
     "formation_model": null,
     "consolidation_model": null,
     "speaker_recognition": true,
-    "streaming_generation": false
+    "streaming_generation": false,
+    "operations": ["ask", "speech", "transcribe"]
   }
 }
 ```
@@ -283,8 +290,15 @@ list means the backend is absent, not that it supports nothing. A `null` model I
 `embedding_space` is the value that decides whether stored vectors and a new backend belong to the
 same space. `speaker_recognition` is not derivable from `transcription`: a transcription backend
 and a speech backend occupy one slot and declare the same modalities, but only the second resolves
-speakers, so this is the field that says whether `speech` will work. Values are captured when
-`Memory` is constructed, so the route performs no I/O and no model call.
+speakers, so this is the field that says whether `speech` will work. `operations` is derived from
+those backends rather than declared, and names which optional operations this composition can
+serve, so a caller does not have to know that `ask` needs generation or `consolidate` a
+consolidation backend. Values are captured when `Memory` is constructed, so the route performs no
+I/O and no model call.
+
+This is `MemoryCapabilities.document()` verbatim. The MCP server embeds the same document in its
+instructions and `mindbridge doctor` prints it under `capabilities`, so no surface can describe
+one composition differently.
 
 ## Errors and limits
 
@@ -394,6 +408,7 @@ names a tool. None of these is a REST limitation: the adapter runs in the proces
 | Search, answer, or page `limit` | 1 through 100 |
 | Context `budget.max_chars` | 1 through 65,536 |
 | Context `budget.max_items` | 1 through 100 |
+| Context `budget.max_latency_ms` | 1 or greater |
 | Serialized metadata for one memory | 262,144 UTF-8 bytes |
 | `file_id` or `filename` | 255 characters |
 

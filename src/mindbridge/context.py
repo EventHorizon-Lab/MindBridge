@@ -1,15 +1,16 @@
 """Pure context selection behind `Memory.compile`.
 
-The compiler selects and structures already-retrieved evidence. It calls no model, writes nothing,
-and never resolves a conflict: every value here is a deterministic function of the ranked hits, the
-budget, and the reference clock. Authoritative visibility and scope were applied by the retrieval
-path that produced the hits.
+The compiler selects and structures already-retrieved evidence. It calls no model, resolves no
+conflict, and writes nothing itself: every value here is a deterministic function of the ranked
+hits, the budget, the reference clock, and -- for the deadline alone -- the wall clock.
+Authoritative visibility and scope were applied by the retrieval path that produced the hits.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from time import perf_counter
 from types import MappingProxyType
 from typing import TypeAlias
 
@@ -17,6 +18,8 @@ from mindbridge.types import (
     ContextBudget,
     ContextBundle,
     ContextConflict,
+    ContextUnknown,
+    ContextUnknownKind,
     MemoryKind,
     MemoryType,
     Modality,
@@ -37,11 +40,22 @@ _ASSET_EVIDENCE_CHARS: Mapping[Modality, int] = MappingProxyType(
 )
 _DEFAULT_ASSET_EVIDENCE_CHARS = 4_000
 # Bundle sections, keyed by the `ContextBundle` field they fill.
-_SECTIONS: tuple[str, ...] = ("actors", "facts", "episodes", "procedures", "affect", "traits")
+_SECTIONS: tuple[str, ...] = (
+    "actors",
+    "relationships",
+    "scene",
+    "facts",
+    "episodes",
+    "procedures",
+    "affect",
+    "traits",
+)
 # A typed kind decides the section first; an untyped or generic record falls back to its type.
 _KIND_SECTIONS: Mapping[MemoryKind, str] = MappingProxyType(
     {
         MemoryKind.ENTITY: "actors",
+        MemoryKind.RELATION: "relationships",
+        MemoryKind.STATE: "scene",
         MemoryKind.AFFECT: "affect",
         MemoryKind.TRAIT: "traits",
     }
@@ -55,6 +69,15 @@ _TYPE_SECTIONS: Mapping[MemoryType, str] = MappingProxyType(
 )
 # Kinds that assert one value about one subject, so two of them in a lineage can disagree.
 _CONFLICT_KINDS = frozenset({MemoryKind.STATE, MemoryKind.RELATION, MemoryKind.TRAIT})
+# Why a candidate the retrieval kernel returned never became a bundle line. Reported as counts
+# under `unknowns` so a caller reading a thin bundle knows which bound produced it.
+_EXCLUSIONS: Mapping[str, str] = MappingProxyType(
+    {
+        "memory_types": "outside the requested memory types",
+        "min_confidence": "below the requested minimum confidence",
+        "freshness": "older than the requested freshness window",
+    }
+)
 # One asserted value: the value, the memory asserting it, and that memory's subject and predicate.
 _Claim: TypeAlias = tuple[str, str, str | None, str | None]
 
@@ -78,41 +101,81 @@ def compile_context(
     *,
     budget: ContextBudget,
     reference_at: datetime,
+    started_at: float | None = None,
+    unknowns: Sequence[ContextUnknown] = (),
 ) -> ContextBundle:
-    """Partition, filter, and budget ranked hits into one bundle."""
-    candidates = tuple(hit for hit in hits if _admits(hit, budget, reference_at))
+    """Partition, filter, and budget ranked hits into one bundle.
+
+    `started_at` is a `time.perf_counter()` reading taken before retrieval, so `budget
+    .max_latency_ms` bounds the whole compilation rather than this function. `unknowns` carries
+    what the caller already knows and the compiler cannot see, such as an empty spatial scope.
+    """
+    started_at = perf_counter() if started_at is None else started_at
+    excluded: dict[str, int] = {}
+    candidates: list[SearchHit] = []
+    for hit in hits:
+        reason = _rejection(hit, budget, reference_at)
+        if reason is None:
+            candidates.append(hit)
+        else:
+            excluded[reason] = excluded.get(reason, 0) + 1
     sections = _select(candidates, budget)
     included = tuple(hit for name in _SECTIONS for hit in sections[name])
+    omitted = len(candidates) - len(included)
+    # The deadline is checked here, between section assembly and the optional enrichment that
+    # follows it. Nothing already computed is discarded and no stage is cut in half, so a bundle
+    # under a deadline is a prefix of the one without it, never a different one.
+    skipped = _past_deadline(budget, started_at)
+    conflicts = () if skipped else _conflicts(included)
     occurred_from, occurred_until = _occurred_range(included)
+    elapsed_ms = _elapsed_ms(started_at)
     return ContextBundle(
         goal=goal,
         reference_at=reference_at,
         budget=budget,
         actors=sections["actors"],
+        relationships=sections["relationships"],
+        scene=sections["scene"],
         episodes=sections["episodes"],
         facts=sections["facts"],
         procedures=sections["procedures"],
         affect=sections["affect"],
         traits=sections["traits"],
-        conflicts=_conflicts(included),
+        conflicts=conflicts,
+        unknowns=_unknowns(unknowns, budget, included, excluded, omitted, skipped=skipped),
         occurred_from=occurred_from,
         occurred_until=occurred_until,
         frames=_frames(included),
-        omitted=len(candidates) - len(included),
+        places=tuple(sorted({hit.place_id for hit in included if hit.place_id})),
+        omitted=omitted,
         chars=sum(evidence_cost(hit) for hit in included),
+        elapsed_ms=elapsed_ms,
+        deadline_exceeded=(
+            budget.max_latency_ms is not None and elapsed_ms > budget.max_latency_ms
+        ),
     )
 
 
-def _admits(hit: SearchHit, budget: ContextBudget, reference_at: datetime) -> bool:
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, round((perf_counter() - started_at) * 1000))
+
+
+def _past_deadline(budget: ContextBudget, started_at: float) -> bool:
+    """Whether the declared deadline had already passed at this checkpoint."""
+    return budget.max_latency_ms is not None and _elapsed_ms(started_at) > budget.max_latency_ms
+
+
+def _rejection(hit: SearchHit, budget: ContextBudget, reference_at: datetime) -> str | None:
+    """Return which budget bound excludes this hit, or `None` when it is a candidate."""
     if budget.memory_types is not None and hit.memory_type not in budget.memory_types:
-        return False
+        return "memory_types"
     # A record with no typed context is evidence in its own right, not a low-confidence inference.
     confidence = 1.0 if hit.context is None else hit.context.confidence
     if confidence < budget.min_confidence:
-        return False
-    if budget.freshness is None:
-        return True
-    return reference_at - _anchor(hit) <= budget.freshness
+        return "min_confidence"
+    if budget.freshness is not None and reference_at - _anchor(hit) > budget.freshness:
+        return "freshness"
+    return None
 
 
 def _anchor(hit: SearchHit) -> datetime:
@@ -151,6 +214,58 @@ def _section(hit: SearchHit) -> str:
     if context is not None and context.kind in _KIND_SECTIONS:
         return _KIND_SECTIONS[context.kind]
     return _TYPE_SECTIONS[hit.memory_type]
+
+
+def _unknowns(
+    supplied: Sequence[ContextUnknown],
+    budget: ContextBudget,
+    included: Sequence[SearchHit],
+    excluded: Mapping[str, int],
+    omitted: int,
+    *,
+    skipped: bool,
+) -> tuple[ContextUnknown, ...]:
+    """Name what the request implied and this bundle does not carry, in one stable order."""
+    found = list(supplied)
+    found.extend(
+        ContextUnknown(
+            kind=ContextUnknownKind.BUDGET_EXCLUDED,
+            detail=f"{excluded[reason]} candidates {text}",
+        )
+        for reason, text in _EXCLUSIONS.items()
+        if excluded.get(reason)
+    )
+    if omitted:
+        found.append(
+            ContextUnknown(
+                kind=ContextUnknownKind.BUDGET_EXCLUDED,
+                detail=(
+                    f"{omitted} candidates did not fit {budget.max_items} items"
+                    f" and {budget.max_chars} chars"
+                ),
+            )
+        )
+    if budget.memory_types is not None:
+        present = {hit.memory_type for hit in included}
+        found.extend(
+            ContextUnknown(
+                kind=ContextUnknownKind.SECTION_EMPTY,
+                detail=f"no {memory_type.value} memory was included",
+            )
+            for memory_type in sorted(budget.memory_types)
+            if memory_type not in present
+        )
+    if skipped:
+        found.append(
+            ContextUnknown(
+                kind=ContextUnknownKind.STAGE_SKIPPED,
+                detail=(
+                    "conflict detection was skipped after the"
+                    f" {budget.max_latency_ms} ms deadline passed"
+                ),
+            )
+        )
+    return tuple(sorted(found, key=lambda item: (item.kind.value, item.detail)))
 
 
 def _conflicts(hits: Sequence[SearchHit]) -> tuple[ContextConflict, ...]:

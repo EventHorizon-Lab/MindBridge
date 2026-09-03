@@ -95,7 +95,7 @@ trust, license, model identity, and credential behavior live in
 | `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
 | `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | no |
 | `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope` | answer object | yes |
-| `compile` | content; `--max-chars`; `--max-items`; repeatable `--memory-type`; `--min-confidence`; `--freshness-seconds`; `--reference-at`; `--scope` | context bundle plus `rendered` | yes |
+| `compile` | content; `--max-chars`; `--max-items`; repeatable `--memory-type`; `--min-confidence`; `--freshness-seconds`; `--max-latency-ms`; `--reference-at`; `--scope` | context bundle plus `rendered` | yes |
 | `get` | `MEMORY_ID` | memory object | yes |
 | `speech` | `MEMORY_ID` | `{"segments":[...]}` | no |
 | `faces` | `MEMORY_ID` | `{"observations":[...]}` | no |
@@ -123,9 +123,11 @@ Cursors are opaque and passed through unchanged. `ask` requires the selected com
 return an empty result without a model call when the record has no corresponding media; otherwise
 they require the matching capability. `compile` mirrors the
 [`ContextBudget` defaults](../context-compilation.md#budget) and repeats `--memory-type` to keep
-more than one type. `forget` is cognitive forgetting, reversible with `rollback`; `delete` is
-erasure. With the default `reinforce_on_answer=True`, `ask` also reinforces the hits the answerer
-cites; use `--app` to construct a memory with that policy disabled.
+more than one type; `--max-latency-ms` is a deadline the compiler checks between stages, and the
+printed bundle carries `elapsed_ms`, `deadline_exceeded`, and `unknowns` alongside its sections.
+`forget` is cognitive forgetting, reversible with `rollback`; `delete` is erasure. With the
+default `reinforce_on_answer=True`, `ask` also reinforces the hits the answerer cites; use
+`--app` to construct a memory with that policy disabled.
 
 ### Content and JSONL input
 
@@ -199,9 +201,12 @@ still syntactically required.
 `doctor` returns the installed MindBridge and Python versions plus composition-specific checks:
 
 - `--embedder` constructs each configured recipe, exercises its published loader probe, closes it,
-  and reports the data-directory state without writing memory data.
+  and reports the data-directory state without writing memory data. The probed backends also fill
+  `capabilities`, which is `MemoryCapabilities.document()` -- the same document `GET /healthz`
+  serves and the MCP server greets an agent with, including the derived `operations` set. It is
+  declared by the backends, so producing it opens no store and creates no data directory.
 - `--app` imports and resolves the target but does not call a factory, because that could open the
-  store.
+  store, so `capabilities` is `null`: the application owns its own backends.
 - `--url` calls the owner's `GET /healthz` with the configured timeout.
 
 Loader failures are reported inside the successful doctor document so all configured slots can be

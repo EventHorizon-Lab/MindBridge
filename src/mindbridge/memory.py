@@ -127,6 +127,8 @@ from mindbridge.types import (
     ContentInput,
     ContextBudget,
     ContextBundle,
+    ContextUnknown,
+    ContextUnknownKind,
     EvidenceBasis,
     FaceObservation,
     FormationProposal,
@@ -1200,6 +1202,9 @@ class Memory:
     ) -> ContextBundle:
         """Compile one bounded, structured context bundle for a goal."""
         with self._trace("mindbridge.compile", kind="operation"), self._operation() as assets:
+            # Taken before anything else, so `budget.max_latency_ms` bounds the compilation a
+            # caller waits for rather than the selection pass alone.
+            started_at = perf_counter()
             budget = ContextBudget() if budget is None else budget
             if not isinstance(budget, ContextBudget):
                 raise ValidationError("budget must be a ContextBudget")
@@ -1231,13 +1236,47 @@ class Memory:
                 require_unambiguous=False,
                 capture_trace=False,
             )
+            # The same transcript cache `search()` writes for a spoken query. It is a cache of
+            # the query's own audio, not a memory: `compile()` stores nothing it retrieved.
             self._persist_transcripts(assets)
             return compile_context(
                 prepared.text,
                 outcome.hits,
                 budget=budget,
                 reference_at=reference,
+                started_at=started_at,
+                unknowns=self._request_unknowns(prepared, scope, outcome.hits),
             )
+
+    def _request_unknowns(
+        self,
+        prepared: _PreparedContent,
+        scope: RetrievalScope | None,
+        hits: Sequence[SearchHit],
+    ) -> tuple[ContextUnknown, ...]:
+        """Name what the request asked for that the compiler cannot see in the hits alone."""
+        unknowns: list[ContextUnknown] = []
+        unsupported = sorted(
+            {
+                asset.modality
+                for asset in prepared.assets
+                if Modality(asset.modality) not in self._embedding_capabilities
+            }
+        )
+        if unsupported:
+            unknowns.append(
+                ContextUnknown(
+                    kind=ContextUnknownKind.MODALITY_UNSUPPORTED,
+                    detail=(
+                        f"the goal's {', '.join(unsupported)} was not embedded natively;"
+                        f" embedding accepts {_modality_names(self._embedding_capabilities)},"
+                        " so only derived text could have matched"
+                    ),
+                )
+            )
+        if not hits and (described := _scope_description(scope)) is not None:
+            unknowns.append(ContextUnknown(kind=ContextUnknownKind.SCOPE_EMPTY, detail=described))
+        return tuple(unknowns)
 
     @property
     def capabilities(self) -> MemoryCapabilities:
@@ -1246,28 +1285,14 @@ class Memory:
         Published so a caller does not have to construct a probe write to find out, and so a
         transport can report the composition instead of a bare liveness flag.
         """
-        return MemoryCapabilities(
-            embedding=self._embedding_capabilities,
-            embedding_model=self._embedding_model,
-            embedding_space=self._space_id,
-            embedding_dimension=self._embedding_dimension,
-            generation=self._generation_capabilities,
-            transcription=self._transcription_capabilities,
-            vision=self._vision_capabilities,
-            face=self._face_capabilities,
-            formation=self._formation_capabilities,
-            # The contracts substitute a `"none"` sentinel for an absent backend because the
-            # space and recipe digests hash these strings. That sentinel is an implementation
-            # detail, so the published value is absent when the backend is, keyed on the backend
-            # itself rather than on the string -- a real model could be named "none".
-            generation_model=getattr(self._answerer, "generation_model", None),
-            transcription_space=(None if self._transcriber is None else self._transcription_space),
-            vision_model=None if self._vision_describer is None else self._vision_model,
-            face_model=None if self._face_analyzer is None else self._face_model,
-            formation_model=None if self._former is None else self._formation_model,
-            consolidation_model=(None if self._consolidator is None else self._consolidation_model),
-            speaker_recognition=isinstance(self._transcriber, SpeechBackend),
-            streaming_generation=isinstance(self._answerer, StreamingGenerationBackend),
+        return declared_capabilities(
+            embedder=self._embedder,
+            answerer=self._answerer,
+            transcriber=self._transcriber,
+            vision_describer=self._vision_describer,
+            face_analyzer=self._face_analyzer,
+            former=self._former,
+            consolidator=self._consolidator,
         )
 
     def _reinforce_answered(self, hits: Sequence[SearchHit]) -> None:
@@ -7018,6 +7043,75 @@ def _reference_at(value: datetime | None) -> datetime | None:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValidationError("reference_at must include a timezone")
     return value
+
+
+def _modality_names(modalities: Iterable[Modality]) -> str:
+    return ", ".join(sorted(modality.value for modality in modalities)) or "nothing"
+
+
+def _scope_description(scope: RetrievalScope | None) -> str | None:
+    """Describe a requested scope that matched nothing, or `None` when none was requested."""
+    if scope is None:
+        return None
+    bounds = []
+    if scope.place_id is not None:
+        bounds.append(f"place {scope.place_id}")
+    if scope.near is not None:
+        radius = "" if scope.radius_m is None else f" within {scope.radius_m} m"
+        bounds.append(f"frame {scope.near.frame_id}{radius}")
+    if scope.valid_at is not None:
+        bounds.append(f"valid at {scope.valid_at.isoformat()}")
+    if scope.known_at is not None:
+        bounds.append(f"known at {scope.known_at.isoformat()}")
+    if not bounds:
+        return None
+    return f"no memory matched the requested scope: {', '.join(bounds)}"
+
+
+def declared_capabilities(
+    *,
+    embedder: EmbeddingBackend,
+    answerer: GenerationBackend | None = None,
+    transcriber: SpeechBackend | TranscriptionBackend | None = None,
+    vision_describer: VisionDescriptionBackend | None = None,
+    face_analyzer: FaceBackend | None = None,
+    former: FormationBackend | None = None,
+    consolidator: ConsolidationBackend | None = None,
+) -> MemoryCapabilities:
+    """Declare what one set of backends can do, without opening a store.
+
+    `Memory.capabilities` reads it, and so does `mindbridge doctor`, which probes recipes without
+    owning a `data_dir`. Both therefore publish one document rather than two descriptions.
+    """
+    embedding, embedding_model, space_id, dimension = _embedding_contract(embedder)
+    transcription, transcription_space = _transcription_contract(transcriber)
+    vision, vision_model = _vision_contract(vision_describer)
+    face, face_model, _face_space, _face_analysis_space = _face_contract(face_analyzer)
+    formation, formation_model, _formation_space = _formation_contract(former)
+    consolidation_model, _consolidation_recipe = _consolidation_contract(consolidator)
+    return MemoryCapabilities(
+        embedding=embedding,
+        embedding_model=embedding_model,
+        embedding_space=space_id,
+        embedding_dimension=dimension,
+        generation=_generation_contract(answerer),
+        transcription=transcription,
+        vision=vision,
+        face=face,
+        formation=formation,
+        # The contracts substitute a `"none"` sentinel for an absent backend because the space
+        # and recipe digests hash these strings. That sentinel is an implementation detail, so
+        # the published value is absent when the backend is, keyed on the backend itself rather
+        # than on the string -- a real model could be named "none".
+        generation_model=getattr(answerer, "generation_model", None),
+        transcription_space=None if transcriber is None else transcription_space,
+        vision_model=None if vision_describer is None else vision_model,
+        face_model=None if face_analyzer is None else face_model,
+        formation_model=None if former is None else formation_model,
+        consolidation_model=None if consolidator is None else consolidation_model,
+        speaker_recognition=isinstance(transcriber, SpeechBackend),
+        streaming_generation=isinstance(answerer, StreamingGenerationBackend),
+    )
 
 
 def _retrieval_scope(value: RetrievalScope | None) -> RetrievalScope | None:

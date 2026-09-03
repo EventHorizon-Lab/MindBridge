@@ -3,8 +3,11 @@
 This page owns `compile()`: what a `ContextBudget` bounds, how hits become sections, how conflicts
 are reported, and what `render()` emits.
 
-`compile()` selects and structures evidence. It calls no generation model, writes nothing, and
-never resolves a conflict. `ask()` is unchanged and remains the grounded-generation surface; see
+`compile()` selects and structures evidence. It calls no generation model, stores no memory, and
+never resolves a conflict. It is not a pure read: it runs the same retrieval path `search()` runs
+and makes the same single write that path can make, caching a transcript for spoken query media.
+That cache is a cache of the caller's own input, never a new memory, and repeating the call adds
+nothing to the store. `ask()` is unchanged and remains the grounded-generation surface; see
 [the Python SDK reference](api/python-sdk.md#memory-operations).
 
 ## Contract
@@ -33,10 +36,24 @@ forgotten record and a hidden inferred trait never reach a bundle.
 | `memory_types` | `None` | Keep only these `MemoryType` values; `None` keeps every type |
 | `min_confidence` | `0.0` | Minimum typed confidence; a record with no typed context counts as `1.0` |
 | `freshness` | `None` | Keep only memories anchored within this `timedelta` of `reference_at` |
+| `max_latency_ms` | `None` | Deadline in milliseconds; optional stages are skipped once it passes |
 
 The freshness anchor is event end, then event start, then creation time. Every field is validated
-on construction: the two maxima are positive integers, `min_confidence` is in `[0, 1]`, and
-`freshness` is a positive `timedelta`.
+on construction: the two maxima and `max_latency_ms` are positive integers, `min_confidence` is in
+`[0, 1]`, and `freshness` is a positive `timedelta`.
+
+### The deadline
+
+`max_latency_ms` is a deadline, not a timeout. Nothing is cancelled, no thread is started, and no
+work already in flight is interrupted or discarded. The compiler reads the clock between stages --
+retrieval, hydration, section assembly, then optional enrichment -- and once the deadline has
+passed it stops adding optional stages instead of truncating one halfway. A bundle compiled under
+a deadline is therefore a prefix of the bundle without one, never a different bundle.
+
+Today the one optional stage is conflict detection. When it is skipped, `conflicts` is empty and
+`unknowns` carries a `stage_skipped` entry naming it, so an empty `conflicts` under a deadline is
+never mistaken for agreement. Every bundle reports `elapsed_ms`, measured from before retrieval,
+and `deadline_exceeded`, which is true when `elapsed_ms` passed the declared deadline.
 
 ## Sections
 
@@ -46,11 +63,24 @@ A typed `MemoryKind` decides the section first; an untyped or generic record fal
 | Section | Contents |
 | --- | --- |
 | `actors` | Kind `entity` |
-| `facts` | Type `semantic`, except `entity` and `trait` |
+| `relationships` | Kind `relation` |
+| `scene` | Kind `state` |
+| `facts` | Type `semantic`, except `entity`, `relation`, `state`, and `trait` |
 | `episodes` | Type `episodic`, except `affect` |
 | `procedures` | Type `procedural` |
 | `affect` | Kind `affect` |
 | `traits` | Kind `trait` |
+
+`actors`, `relationships`, `scene`, `affect`, and `traits` are keyed on `MemoryKind`. A stored
+record is kind `observation` unless a validated `FormationProposal` typed it, so all five sections
+stay empty in a composition with neither a `FormationBackend` nor a `ConsolidationBackend`.
+`episodes`, `facts`, and `procedures` are keyed on `MemoryType`, which every record carries, and
+populate without either.
+
+The bundle also carries no person link. Identity lives asset-keyed in the speech and face tables,
+reachable through `speech()` and `faces()`, and no `identity_id` exists on a memory, a hit, or a
+`MemoryContext`. Cross-modal person linkage in a bundle needs that edge; it is a known gap rather
+than a configuration mistake.
 
 Selection gives every non-empty section one slot in rank order before any section receives a
 second, so a small budget still describes the whole scene instead of spending everything on the
@@ -59,7 +89,22 @@ bundle: a cheaper lower-ranked candidate can still fit. `omitted` counts every c
 passed the filters but did not fit, and `chars` is what the included hits cost.
 
 `ContextBundle` also reports `occurred_from` and `occurred_until` over the included hits, `frames`
-(the distinct spatial frame IDs, sorted), and `hits` (every included hit in rank order).
+(the distinct metric spatial frame IDs, sorted), `places` (the distinct symbolic `place_id`s,
+sorted), and `hits` (every included hit in rank order).
+
+## Unknowns
+
+`unknowns` names, in one stable order, what the request implied that the bundle does not carry.
+Every entry is a deterministic statement about the compilation, produced without a model call, so
+a thin bundle explains itself instead of looking like an empty store.
+
+| `kind` | When it appears |
+| --- | --- |
+| `budget_excluded` | Counted candidates a bound removed, or that did not fit the budget |
+| `section_empty` | A `memory_types` value the request asked for that no included hit carries |
+| `scope_empty` | A `scope` was supplied and retrieval matched nothing; the entry names the bounds |
+| `modality_unsupported` | The goal carries media this composition's embedder cannot search |
+| `stage_skipped` | An optional stage the `max_latency_ms` deadline skipped |
 
 ## Conflicts
 
@@ -67,6 +112,10 @@ Included hits that share a `lineage_id`, carry kind `state`, `relation`, or `tra
 on `value` produce one `ContextConflict` each. Its `values` and `memory_ids` are aligned: each
 distinct value is paired with the highest-ranked included memory asserting it. The compiler reports
 the disagreement and leaves resolution to the caller or to a later correction.
+
+Only included hits are compared. A superseded version that bitemporal filtering already excluded
+never appears, so `conflicts` is a statement about this bundle and not a belief-revision history;
+read `memory_versions` through the control plane for that.
 
 ## Rendered text
 
@@ -125,9 +174,16 @@ A caller does not have to compile a bundle to learn what a composition supports.
 `Memory.capabilities` property returns a frozen `MemoryCapabilities` describing the declarations
 routing reads: the embedding modalities, model, space and dimension, the modality sets for
 generation, transcription, vision, face, and formation with their model identities,
-`consolidation_model` when a `ConsolidationBackend` is injected, and the `speaker_recognition` and
-`streaming_generation` flags. Its fields are listed in
+`consolidation_model` when a `ConsolidationBackend` is injected, the `speaker_recognition` and
+`streaming_generation` flags, and the derived `operations` set naming which optional operations
+those backends can serve (`ask`, `speech`, `transcribe`, `faces`, `describe_vision`, `formation`,
+`consolidate`). Its fields are listed in
 [the Python SDK reference](api/python-sdk.md#public-values).
+
+`MemoryCapabilities.document()` renders that value as one JSON-ready document, and it is the only
+renderer: `GET /healthz` serves it, the MCP server embeds it in its instructions, and
+`mindbridge doctor` prints it under `capabilities`. The three surfaces cannot describe one
+composition differently.
 
 ```python
 if memory.capabilities.generation:

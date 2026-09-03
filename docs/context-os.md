@@ -170,10 +170,11 @@ A context compilation request supplies a goal or query plus constraints such as 
 text or media budget, freshness, allowed sensitivity, spatial scope, and minimum evidence quality.
 The resulting bundle may contain:
 
-- current actors, identities, relationships, and scene state;
+- current actors, relationships, and scene state, each in its own bundle section (identities
+  still need the asset-keyed identity edge, which no read path traverses yet);
 - relevant episodic, semantic, and procedural memories;
 - affect cues separated from longer-horizon traits;
-- temporal and spatial bounds;
+- temporal and spatial bounds, both metric frames and symbolic places;
 - conflicts, uncertainty, and explicit unknowns; and
 - provenance needed to inspect or correct the result.
 
@@ -267,10 +268,15 @@ defaults or justify superiority claims.
    tests: `consolidate()`, `forget()`, `rollback()`, and `operations()`. Open: replay of a logged
    operation sequence against a fresh store, and companion-scenario privacy tests.
 4. Add a context compiler whose output improves downstream tasks within declared budgets. Done
-   for selection and budgeting: `compile()`. Open: a downstream-task measurement against the
-   no-memory, full-context, and retrieval-only baselines.
+   for selection, budgeting, the latency deadline, and the explicit unknowns a thin bundle
+   reports: `compile()`. Open: a downstream-task measurement against the no-memory,
+   full-context, and retrieval-only baselines, and the person link, which needs an identity edge
+   the bundle cannot reach today.
 5. Extend REST or MCP only after the Python contract and authority model are stable. Done for the
-   compiler and the capability advertisement; the control-plane intents stay off REST and MCP.
+   compiler and for one capability document rendered identically by `/healthz`, the MCP server
+   instructions, and `mindbridge doctor`; the control-plane intents stay off REST and MCP. Open:
+   a supported switch for withholding the embodied and identity tools from an MCP server, so a
+   host can expose recall and compile alone.
 
 Fast capture is now independent of slow reasoning, the control plane governs the lifecycle through
 validated, logged, reversible operations, and the compiler produces budgeted task-ready context.
