@@ -329,10 +329,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   standing operation has built on. Operations that touched one lineage reverse newest first;
   reversing an older one out of order would restore a superseded version beside the current one.
 
-- The local schema is version 10. Version 9 directories upgrade in place, adding
+- The local schema is version 12. Version 9 directories upgrade in place through three steps:
+  version 10 adds `memory_records.place_id` and its index; version 11 adds
   `memory_records.forgotten_at`, the `capture_queue` table that makes deferred enrichment durable
   across a crash, and the append-only `memory_operations` log that makes a control-plane operation
-  replayable and reversible.
+  replayable and reversible; version 12 adds `memory_semantics.identity_id` and rebuilds the
+  operation-intent constraint so `identify` is an allowed intent.
 
 - **Breaking:** `minimum_relevance` now gates evidence relevance — the cosine the dense route
   reports, or the demoted full-text contribution when only the lexical route matched, times the
