@@ -10,6 +10,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- `capture()`, `settle()`, and `pending_captures()` on `Memory` and `AsyncMemory`, plus the
+  matching `capture`, `settle`, and `pending-captures` CLI commands. `capture()` commits a record,
+  its media, its observation context, and one durable enrichment queue row in one SQLite
+  transaction and returns before any model call; `settle()` runs the deferred transcription,
+  embedding, indexing, and formation stages. `add()` and `add_many()` settle a queued record they
+  encounter, so their searchable-on-return contract is unchanged.
+
 - Face and speaker writes now record `mindbridge.identity.observations` and
   `mindbridge.identity.matched_existing` on their storage span, so a recognizer that cannot tell
   people apart is visible at the write instead of only as a weak answer much later. Both failure

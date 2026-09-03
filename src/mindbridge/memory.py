@@ -821,6 +821,91 @@ class Memory:
             self._form_sources(records, operation=assets)
             return records
 
+    def capture(
+        self,
+        content: ContentInput,
+        *,
+        occurred_at: datetime | None = None,
+        occurred_end: datetime | None = None,
+        metadata: Mapping[str, object] | None = None,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: ObservationContext | None = None,
+    ) -> MemoryRecord:
+        """Commit one memory without calling any model; `settle()` makes it searchable.
+
+        The returned record is the content-addressed record `add()` returns for the same input, so
+        capturing and then adding the same content is one memory. It is durable and readable
+        through `get()` and `list()` immediately and invisible to `search()` until settled.
+        """
+        with self._trace("mindbridge.capture", kind="operation"), self._operation() as assets:
+            if self._former is not None and context is None:
+                context = ObservationContext()
+            with self._trace("mindbridge.content.prepare", kind="stage"):
+                prepared_content = self._prepare_content(content, assets)
+            prepared = _prepare_memory(
+                prepared_content,
+                occurred_at=occurred_at,
+                occurred_end=occurred_end,
+                metadata=metadata,
+                memory_type=memory_type,
+                context=context,
+            )
+            now = datetime.now(timezone.utc)
+            # No index lock: a capture enqueues no vectors, so it has no outbox work to drain and
+            # never has to wait behind a Zvec flush.
+            with (
+                self._trace("mindbridge.storage.write", kind="stage"),
+                _translate_storage_errors("capture memory"),
+            ):
+                self._store.write_captures(
+                    (
+                        StoredMemory(
+                            memory_id=prepared.memory_id,
+                            content=prepared.content.text,
+                            modality=prepared.content.modality.value,
+                            memory_type=prepared.memory_type.value,
+                            assets=prepared.content.assets,
+                            metadata_json=prepared.metadata_json,
+                            occurred_at=prepared.occurred_at,
+                            occurred_end=prepared.occurred_end,
+                            created_at=now,
+                            updated_at=now,
+                            context=_stored_memory_context(prepared, recorded_at=now),
+                        ),
+                    ),
+                    enqueued_at=now,
+                )
+            with (
+                self._trace("mindbridge.storage.hydrate", kind="stage"),
+                _translate_storage_errors("hydrate captured memory"),
+            ):
+                authoritative = self._store.read_memories((prepared.memory_id,))
+            if not authoritative:
+                raise StorageError("captured memory could not be read from SQLite")
+            assets.persisted.update(asset.asset_id for asset in authoritative[0].assets)
+            return self._memory_record(authoritative[0])
+
+    def settle(self, *, limit: int = 100) -> int:
+        """Enrich, embed, index, and form up to `limit` captured records in enqueue order."""
+        with self._trace("mindbridge.settle", kind="operation"), self._operation() as assets:
+            _limit(limit, maximum=100)
+            with _translate_storage_errors("read the capture queue"):
+                queued = self._store.pending_captures(limit=limit)
+            if not queued:
+                return 0
+            with _translate_storage_errors("hydrate captured memories"):
+                rows = self._store.read_memories(queued)
+            return self._settle_stored(rows, operation=assets)
+
+    def pending_captures(self) -> int:
+        """Return how many captured records are still waiting for `settle()`."""
+        with (
+            self._trace("mindbridge.pending_captures", kind="operation"),
+            self._operation(),
+            _translate_storage_errors("count the capture queue"),
+        ):
+            return self._store.pending_capture_count()
+
     def add_stream(
         self,
         contents: Iterable[ContentInput | StreamInput],
@@ -1528,6 +1613,9 @@ class Memory:
             existing_rows = self._store.read_memories(ordered_ids)
         existing_ids = {row.memory_id for row in existing_rows}
         missing = [unique[memory_id] for memory_id in ordered_ids if memory_id not in existing_ids]
+        # Settled before this write takes its own speech-index guard: the two batches are
+        # independent, and nesting the guards would share one rollback list between them.
+        self._settle_queued(existing_rows, operation=operation)
         speech_indexed = self._index_speech and any(
             self._answer_speech_assets(memory.content.assets) for memory in missing
         )
@@ -1630,6 +1718,114 @@ class Memory:
         if rows_by_id.keys() != unique.keys():
             raise StorageError("written memories could not be read from SQLite")
         return tuple(self._memory_record(rows_by_id[memory.memory_id]) for memory in prepared)
+
+    def _settle_queued(
+        self,
+        existing: Sequence[StoredMemory],
+        *,
+        operation: _OperationAssets,
+    ) -> None:
+        """Settle rows `add()` found already stored but still queued from `capture()`.
+
+        Such a row is durable and has no vectors, so `add()` owes it the enrichment `capture()`
+        deferred instead of taking the "already exists" shortcut past every model.
+        """
+        if not existing:
+            return
+        with _translate_storage_errors("check the capture queue"):
+            queued = frozenset(
+                self._store.pending_captures(
+                    limit=len(existing),
+                    memory_ids=tuple(row.memory_id for row in existing),
+                )
+            )
+        self._settle_stored(
+            tuple(row for row in existing if row.memory_id in queued),
+            operation=operation,
+        )
+
+    def _settle_stored(
+        self,
+        rows: Sequence[StoredMemory],
+        *,
+        operation: _OperationAssets,
+    ) -> int:
+        """Run the model stages `capture()` deferred over already-committed rows.
+
+        `settle()` and the `add()` path share this routine, so a captured record reaches exactly
+        the state a blocking `add()` would have left it in. Each row commits on its own, so one
+        failing record keeps its queue row, its attempt count, and its reason while every earlier
+        record in the batch stays settled.
+        """
+        settled = 0
+        for row in rows:
+            try:
+                self._settle_row(row, operation=operation)
+            except MindBridgeError as error:
+                with _translate_storage_errors("record a failed settlement"):
+                    self._store.record_capture_failure(row.memory_id, str(error))
+                if error.subject is None:
+                    error.subject = row.memory_id
+                raise
+            settled += 1
+        return settled
+
+    def _settle_row(self, row: StoredMemory, *, operation: _OperationAssets) -> None:
+        memory = _prepared_from_stored(row)
+        speech_assets = self._answer_speech_assets(memory.content.assets)
+        speech_indexed = self._index_speech and bool(speech_assets)
+        with self._speech_index_guard(operation, enabled=speech_indexed):
+            if speech_indexed:
+                self._recognize_speech(speech_assets, operation, reversible=True)
+            if Modality.AUDIO not in self._embedding_capabilities:
+                _fallback_unsupported(memory.content, self._embedding_capabilities, "embedding")
+                if not memory.content.audio_transcript:
+                    self._cache_audio_transcripts(memory.content.assets, operation)
+            elif self._derives_transcripts(memory.content.assets):
+                self._cache_audio_transcripts(memory.content.assets, operation)
+            memory = self._prepare_for_embedding(memory, operation)
+            vectors, parts = self._embed_document_parts(
+                tuple(
+                    (memory, object_part, model_input)
+                    for object_part, model_input in enumerate(
+                        self._embedding_inputs(memory.content)
+                    )
+                )
+            )
+            now = datetime.now(timezone.utc)
+            enriched = replace(row, content=memory.content.text, updated_at=now)
+            with (
+                self._trace("mindbridge.storage.write", kind="stage"),
+                _translate_storage_errors("settle captured memory"),
+            ):
+                # The captured row already carries its assets and its observation context, so
+                # this commit replaces only the derived text and adds the queued vectors.
+                committed = self._store.settle_capture(
+                    replace(enriched, context=None),
+                    tuple(
+                        StoredEmbedding(
+                            embedding_id=_embedding_id(row.memory_id, object_part),
+                            memory_id=row.memory_id,
+                            values=vector,
+                            model_id=self._embedding_model,
+                            space_id=self._space_id,
+                            task=_DOCUMENT_TASK,
+                            created_at=now,
+                            object_part=object_part,
+                            normalized=True,
+                        )
+                        for (_memory, object_part, _model_input), vector in zip(
+                            parts, vectors, strict=True
+                        )
+                    ),
+                )
+            with self._write_lock:
+                self._drain_outbox()
+                operation.persisted.update(asset.asset_id for asset in row.assets)
+                if operation.speech_updates:
+                    self._persist_transcripts(operation)
+        if committed:
+            self._form_sources((self._memory_record(enriched),), operation=operation)
 
     def _form_sources(
         self,
@@ -3934,6 +4130,32 @@ class AsyncMemory:
             context=context,
         )
 
+    async def capture(
+        self,
+        content: ContentInput,
+        *,
+        occurred_at: datetime | None = None,
+        occurred_end: datetime | None = None,
+        metadata: Mapping[str, object] | None = None,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: ObservationContext | None = None,
+    ) -> MemoryRecord:
+        return await asyncio.to_thread(
+            self._memory.capture,
+            content,
+            occurred_at=occurred_at,
+            occurred_end=occurred_end,
+            metadata=metadata,
+            memory_type=memory_type,
+            context=context,
+        )
+
+    async def settle(self, *, limit: int = 100) -> int:
+        return await asyncio.to_thread(self._memory.settle, limit=limit)
+
+    async def pending_captures(self) -> int:
+        return await asyncio.to_thread(self._memory.pending_captures)
+
     async def add_stream(
         self,
         contents: AsyncIterable[ContentInput | StreamInput],
@@ -4780,6 +5002,25 @@ def _prepare_memory(
         occurred_end=normalized_occurred_end,
         memory_type=normalized_memory_type,
         context=context,
+    )
+
+
+def _prepared_from_stored(memory: StoredMemory) -> _PreparedMemory:
+    """Rebuild the prepared form of a captured row so one path enriches add and settle alike."""
+    return _PreparedMemory(
+        memory_id=memory.memory_id,
+        content=_PreparedContent(
+            text=memory.content,
+            assets=memory.assets,
+            modality=Modality(memory.modality),
+            canonical_parts=(("text", memory.content),) if memory.content else (),
+            audio_transcript=_has_stream_transcript(memory.content, memory.assets),
+            visual_description=_has_stream_description(memory.content, memory.assets),
+        ),
+        metadata_json=memory.metadata_json,
+        occurred_at=memory.occurred_at,
+        occurred_end=memory.occurred_end,
+        memory_type=MemoryType(memory.memory_type),
     )
 
 

@@ -85,6 +85,9 @@ credential behavior live in [configuration](../configuration.md).
 | `add` | content; `--occurred-at`; `--occurred-end`; `--metadata`; `--memory-type`; `--context` | memory object | yes |
 | `add-many` | optional JSONL source; `--memory-type` | `{"memories":[...]}` | yes |
 | `add-stream` | optional JSONL source; `--memory-type` | `{"memories":[...]}` | no |
+| `capture` | same operands and options as `add` | memory object | no |
+| `settle` | `--limit` | `{"settled":int}` | no |
+| `pending-captures` | none | `{"pending":int}` | no |
 | `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
 | `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | no |
 | `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope` | answer object | yes |
@@ -102,8 +105,8 @@ credential behavior live in [configuration](../configuration.md).
 | `optimize` | none | `{}` | no |
 | `doctor` | none | composition and loader report | yes |
 
-Defaults match the SDK: `add`, `add-many`, and `add-stream` use `memory_type=semantic`; search uses
-`limit=10`; ask uses `limit=5`; list uses `limit=100`; optional retrieval roles and timestamps are
+Defaults match the SDK: `add`, `add-many`, `add-stream`, and `capture` use `memory_type=semantic`;
+search uses `limit=10`; ask uses `limit=5`; list and `settle` use `limit=100`; optional retrieval roles and timestamps are
 unset. Timestamps must be timezone-aware ISO 8601 values. Cursors are opaque and passed through
 unchanged. `ask` requires the selected composition to supply an answerer. `speech` and `faces`
 return an empty result without a model call when the record has no corresponding media; otherwise
@@ -111,8 +114,8 @@ they require the matching capability.
 
 ### Content and JSONL input
 
-Content commands (`add`, `search`, `search-with-trace`, and `ask`) accept exactly one of these
-forms:
+Content commands (`add`, `capture`, `search`, `search-with-trace`, and `ask`) accept exactly one of
+these forms:
 
 - Positional atoms: bare values are text, `@PATH` is a local file, `@@TEXT` is text beginning with
   a literal `@`, and `-` reads stdin. Order is preserved.

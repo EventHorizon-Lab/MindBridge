@@ -91,6 +91,9 @@ OPERATIONS: tuple[str, ...] = (
     "add",
     "add_many",
     "add_stream",
+    "capture",
+    "settle",
+    "pending_captures",
     "search",
     "search_with_trace",
     "ask",
@@ -114,6 +117,7 @@ COMMANDS: tuple[str, ...] = (*(name.replace("_", "-") for name in OPERATIONS), D
 REMOTE_COMMANDS = frozenset({"add", "add-many", "search", "ask", "get", "list", "delete"})
 _QUERY_METAVAR: Mapping[str, str] = {
     "add": "TEXT",
+    "capture": "TEXT",
     "search": "QUERY",
     "search-with-trace": "QUERY",
     "ask": "QUESTION",
@@ -481,6 +485,19 @@ def _add(memory: Memory, arguments: argparse.Namespace) -> _Document:
     )
 
 
+def _capture(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return _memory_document(
+        memory.capture(
+            _content_input(arguments),
+            occurred_at=_optional_time(arguments.occurred_at, "occurred_at"),
+            occurred_end=_optional_time(arguments.occurred_end, "occurred_end"),
+            metadata=_metadata_value(_json_source(arguments.metadata)),
+            memory_type=MemoryType(arguments.memory_type),
+            context=_observation_context(_json_source(arguments.context)),
+        )
+    )
+
+
 def _add_many(memory: Memory, arguments: argparse.Namespace) -> _Document:
     items = _jsonl(arguments.source)
     return {
@@ -614,6 +631,14 @@ def _unlink_identity(memory: Memory, arguments: argparse.Namespace) -> _Document
     return {"restored_identity_id": memory.unlink_identity(arguments.alias_id)}
 
 
+def _settle(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {"settled": memory.settle(limit=arguments.limit)}
+
+
+def _pending_captures(memory: Memory, _arguments: argparse.Namespace) -> _Document:
+    return {"pending": memory.pending_captures()}
+
+
 def _reinforce(memory: Memory, arguments: argparse.Namespace) -> _Document:
     return {"reinforced": memory.reinforce(arguments.memory_ids)}
 
@@ -643,6 +668,9 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "add": _add,
     "add-many": _add_many,
     "add-stream": _add_stream,
+    "capture": _capture,
+    "settle": _settle,
+    "pending-captures": _pending_captures,
     "search": _search,
     "search-with-trace": _search_with_trace,
     "ask": _ask,
@@ -1448,12 +1476,24 @@ def _positive_seconds(value: str) -> float:
 
 
 def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    add = _content_command(commands, "add", "store one memory")
-    add.add_argument("--occurred-at", metavar="TIME", help="ISO 8601 event start")
-    add.add_argument("--occurred-end", metavar="TIME", help="ISO 8601 event end")
-    add.add_argument("--metadata", metavar="JSON", help="application metadata object, @PATH, or -")
-    add.add_argument("--context", metavar="JSON", help="typed observation context, @PATH, or -")
-    _memory_type_option(add, "add")
+    for name, help_text in (
+        ("add", "store one memory"),
+        ("capture", "store one memory without model work; settle makes it searchable"),
+    ):
+        observation = _content_command(commands, name, help_text)
+        observation.add_argument("--occurred-at", metavar="TIME", help="ISO 8601 event start")
+        observation.add_argument("--occurred-end", metavar="TIME", help="ISO 8601 event end")
+        observation.add_argument(
+            "--metadata",
+            metavar="JSON",
+            help="application metadata object, @PATH, or -",
+        )
+        observation.add_argument(
+            "--context",
+            metavar="JSON",
+            help="typed observation context, @PATH, or -",
+        )
+        _memory_type_option(observation, name)
     batch = commands.add_parser("add-many", help="store a JSONL batch in one transaction")
     batch.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
     _memory_type_option(batch, "add_many")
@@ -1504,7 +1544,15 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         help="page size (default: %(default)s)",
     )
     listing.add_argument("--cursor", help="opaque cursor from a previous page")
+    settle = commands.add_parser("settle", help="enrich and index captured memories")
+    settle.add_argument(
+        "--limit",
+        type=int,
+        default=_default("settle", "limit"),
+        help="maximum captured memories to settle (default: %(default)s)",
+    )
     for name, help_text in (
+        ("pending-captures", "count captured memories waiting to be settled"),
         ("reindex", "rebuild the search index from SQLite"),
         ("optimize", "merge staged index vectors"),
         (DOCTOR, "resolve the composition and exercise each loader"),

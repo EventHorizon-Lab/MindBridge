@@ -14,6 +14,7 @@ decoding, frame selection, and turn detection remain application or adapter work
 | Need | API |
 | --- | --- |
 | Lazily add completed independent observations | `Memory.add_stream()` or `AsyncMemory.add_stream()` |
+| Acknowledge final observations without waiting for models | `Memory.capture()` with `Memory.settle()` |
 | Search while one query snapshot is changing | `AsyncOmniPrefetch` |
 | Associate speculative snapshots with final commits | `AsyncCaptureStream` |
 | Normalize PCM, VAD, and ASR state | `AsyncAudioStream` |
@@ -58,6 +59,26 @@ backpressure and identify a failing item as zero-based `contents[index]` in the 
 
 **Contract:** Mutable ASR hypotheses, incomplete media, and changing file paths are not completed
 observations. Keep them out of durable `add_stream()` input.
+
+## Fast capture
+
+Use `capture()` instead of `add()` when the observation is final but the caller cannot wait for
+transcription, embedding, indexing, and formation — a device that must acknowledge a burst of
+finals, or a turn loop that would otherwise block on the slowest model. `capture()` returns after
+the SQLite commit; the record becomes searchable when the host calls `settle()`.
+
+```python
+for observation in burst:
+    memory.capture(observation)
+
+while memory.pending_captures():
+    memory.settle(limit=32)
+```
+
+Keep `add()` where a caller needs the record searchable on return, and keep the enrichment loop
+explicit: nothing else settles for you, so an application that never calls `settle()` accumulates
+durable memories that `search()` and `ask()` cannot see. See the
+[Python SDK reference](api/python-sdk.md#memory-operations) for the exact failure semantics.
 
 ## Prefetch a changing query
 

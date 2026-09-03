@@ -916,6 +916,145 @@ class LocalStore:
                 self._write_embedding(connection, embedding)
         return tuple(created_flags)
 
+    def write_captures(
+        self,
+        memories: Iterable[StoredMemory],
+        *,
+        enqueued_at: datetime,
+    ) -> tuple[str, ...]:
+        """Commit new captured records, their media, their context, and their queue rows.
+
+        Returns the IDs this call enqueued. A memory that already exists is left exactly as it is,
+        so capturing content that was already added or already queued neither rewrites derived
+        content nor re-enqueues work.
+        """
+        supplied_memories, _embeddings, supplied_by_memory = _prepare_write_batch(memories, ())
+        if not supplied_memories:
+            return ()
+        _require_aware(enqueued_at, "enqueued_at")
+        enqueued: list[str] = []
+        with self._transaction() as connection:
+            transaction_memory_ids: set[str] = set()
+            for memory in supplied_memories:
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM memory_records WHERE memory_id = ?",
+                        (memory.memory_id,),
+                    ).fetchone()
+                    is not None
+                ):
+                    continue
+                self._write_memory(
+                    connection,
+                    memory,
+                    supplied_embedding_ids=supplied_by_memory[memory.memory_id],
+                    transaction_memory_ids=transaction_memory_ids,
+                )
+                transaction_memory_ids.add(memory.memory_id)
+                connection.execute(
+                    "INSERT INTO capture_queue (memory_id, enqueued_at) VALUES (?, ?)",
+                    (memory.memory_id, _datetime_text(enqueued_at)),
+                )
+                enqueued.append(memory.memory_id)
+        return tuple(enqueued)
+
+    def settle_capture(
+        self,
+        memory: StoredMemory,
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> bool:
+        """Store one captured record's derived content and vectors and clear its queue row.
+
+        Returns false when the record was not queued, so a concurrent settlement cannot commit
+        the same enrichment twice.
+        """
+        supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
+            (memory,),
+            embeddings,
+        )
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "DELETE FROM capture_queue WHERE memory_id = ?",
+                (memory.memory_id,),
+            )
+            if not cursor.rowcount:
+                return False
+            self._write_memory(
+                connection,
+                supplied_memories[0],
+                supplied_embedding_ids=supplied_by_memory[memory.memory_id],
+            )
+            for embedding in supplied_embeddings:
+                self._write_embedding(connection, embedding)
+        return True
+
+    def record_capture_failure(self, memory_id: str, error: str) -> None:
+        """Count one failed settlement and store its reason, leaving the row queued."""
+        _require_identifier(memory_id, "memory_id")
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                UPDATE capture_queue
+                SET attempts = attempts + 1, last_error = ?
+                WHERE memory_id = ?
+                """,
+                (error.strip() or None, memory_id),
+            )
+
+    def pending_captures(
+        self,
+        *,
+        limit: int = 100,
+        memory_ids: Sequence[str] | None = None,
+    ) -> tuple[str, ...]:
+        """Return queued capture IDs in enqueue order, optionally restricted to given IDs."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        if memory_ids is not None:
+            if not memory_ids:
+                return ()
+            for memory_id in memory_ids:
+                _require_identifier(memory_id, "memory_id")
+        selected = None if memory_ids is None else tuple(dict.fromkeys(memory_ids))
+        batches: list[tuple[str, ...] | None] = (
+            [None]
+            if selected is None
+            else [
+                selected[offset : offset + _SQLITE_PARAMETER_BATCH]
+                for offset in range(0, len(selected), _SQLITE_PARAMETER_BATCH)
+            ]
+        )
+        queued: list[str] = []
+        with self._read_transaction() as connection:
+            for batch in batches:
+                restriction = (
+                    ""
+                    if batch is None
+                    else f"WHERE memory_id IN ({', '.join('?' for _value in batch)})"
+                )
+                queued.extend(
+                    _row_text(row, "memory_id")
+                    for row in connection.execute(
+                        f"""
+                        SELECT memory_id
+                        FROM capture_queue
+                        {restriction}
+                        ORDER BY enqueued_at, memory_id
+                        LIMIT ?
+                        """,
+                        (*(batch or ()), limit - len(queued)),
+                    ).fetchall()
+                )
+                if len(queued) >= limit:
+                    break
+        return tuple(queued[:limit])
+
+    def pending_capture_count(self) -> int:
+        """Return how many captured records are still waiting for enrichment."""
+        with self._connection() as connection:
+            row = connection.execute("SELECT COUNT(*) AS pending FROM capture_queue").fetchone()
+        return int(row["pending"])
+
     def apply_formation(
         self,
         memories: Iterable[StoredMemory],

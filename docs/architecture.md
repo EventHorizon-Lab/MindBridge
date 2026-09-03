@@ -72,6 +72,28 @@ Formation follows the same authority rule. A `FormationBackend` proposes typed s
 source observation commits; the kernel validates and identifies it. Derived records, evidence,
 versions, embeddings, the per-source completion marker, and outbox work commit together.
 
+### Deferred capture
+
+`capture()` takes the same path with the model stages removed. It validates content, materializes
+media, and commits the record, its assets, its observation context, and one `capture_queue` row in
+one transaction. Capture acknowledges after that commit and before any model call, which is the
+invariant that keeps slow work off the acknowledgement path.
+
+```mermaid
+flowchart LR
+    input["Validate and materialize content"] --> commit["Commit record, media, context, and queue row"]
+    commit --> ack["Acknowledge capture"]
+    ack -. later .-> settle["settle(): run the model stages"]
+    settle --> derived["Commit derived content, vectors, and queue-row deletion"]
+    derived --> zvec["Flush Zvec and acknowledge the outbox"]
+    settle -. failure .-> queued["Count the attempt, store the reason, keep the row queued"]
+```
+
+A captured record is durable and readable but has no vectors, so it enqueues no index work and
+`search()` cannot return it. `settle()` and the `add()` path share one enrichment routine over the
+committed row, so a settled record holds exactly the derived content, vectors, and formation a
+blocking `add()` would have produced. Retrieval and shutdown never settle.
+
 ## Retrieval consistency
 
 ```mermaid
