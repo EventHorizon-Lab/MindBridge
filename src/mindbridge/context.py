@@ -120,7 +120,15 @@ def compile_context(
         else:
             excluded[reason] = excluded.get(reason, 0) + 1
     sections = _select(candidates, budget)
-    included = tuple(hit for name in _SECTIONS for hit in sections[name])
+    # Rank order, not section order: `_lineage_conflict` pairs each value with the highest-ranked
+    # memory asserting it, so a lineage whose claims land in different sections must still be read
+    # by score. `ContextBundle.hits` sorts the same way.
+    included = tuple(
+        sorted(
+            (hit for name in _SECTIONS for hit in sections[name]),
+            key=lambda hit: (-hit.score, hit.id),
+        )
+    )
     omitted = len(candidates) - len(included)
     # The deadline is checked here, between section assembly and the optional enrichment that
     # follows it. Nothing already computed is discarded and no stage is cut in half, so a bundle

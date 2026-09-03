@@ -119,7 +119,7 @@ Request fields and defaults are:
 | `ReinforceRequest` | required `memory_ids` with 1–100 IDs |
 | `AnswerRequest` | required `question`; `limit=5`; optional `memory_type`, `reference_at`, `scope` |
 | `ContextRequest` | required `goal`; optional `budget`, `reference_at`, `scope` |
-| `ContextBudgetRequest` | `max_chars=6000`; `max_items=24`; `min_confidence=0.0`; optional `memory_types` with at least one value; optional `freshness_seconds` |
+| `ContextBudgetRequest` | `max_chars=6000`; `max_items=24`; `min_confidence=0.0`; optional `memory_types` with at least one value; optional `freshness_seconds`; optional `max_latency_ms` |
 | List query | `limit=100`; optional opaque `cursor` |
 
 All timestamps must include a timezone. An event end requires a start and must be later than it.
@@ -239,10 +239,11 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 | `ReinforceResponse` | `reinforced` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResponse` | `items`, `next_cursor` |
-| `ContextBudgetResponse` | `max_chars`, `max_items`, `memory_types` or `null`, `min_confidence`, `freshness_seconds` |
+| `ContextBudgetResponse` | `max_chars`, `max_items`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
 | `ContextConflictResponse` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
+| `ContextUnknownResponse` | `kind`, `detail` |
 | `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
-| `CapabilitiesResponse` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `consolidation_model`, `speaker_recognition`, `streaming_generation` |
+| `CapabilitiesResponse` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `consolidation_model`, `speaker_recognition`, `streaming_generation`, `operations` |
 | `HealthResponse` | `status`, `capabilities` |
 
 `modality` is `text`, `image`, `video`, `audio`, or `omni`. `memory_type` is `semantic`,

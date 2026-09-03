@@ -296,6 +296,23 @@ def test_capture_refuses_media_no_configured_model_will_ever_embed(tmp_path: Pat
         assert _queue_rows(tmp_path) == []
         assert memory.list().items == ()
 
+    # An embedder that takes audio reaches `add()`'s second rejection instead of its first, so
+    # the capture guard has to be the same unconditional check rather than an audio-only mirror.
+    with Memory(
+        tmp_path,
+        embedder=CountingEmbedder(capabilities=frozenset({Modality.TEXT, Modality.AUDIO})),
+        minimum_relevance=0,
+    ) as memory:
+        image = Blob(b"frame", "image/png", "frame.png")
+        with pytest.raises(ModelError) as refusal:
+            memory.add(image)
+        with pytest.raises(ModelError) as captured:
+            memory.capture(image)
+
+        assert captured.value.reason == refusal.value.reason == "unsupported_modality"
+        assert _queue_rows(tmp_path) == []
+        assert memory.list().items == ()
+
 
 def test_an_add_that_crashed_before_forming_is_completed_by_the_next_settle(
     tmp_path: Path,

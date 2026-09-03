@@ -117,8 +117,9 @@ trust, license, model identity, and credential behavior live in
 | `doctor` | none | composition and loader report | yes |
 
 Defaults match the SDK: `add`, `add-many`, `add-stream`, and `capture` use
-`memory_type=semantic`; search uses `limit=10`; ask uses `limit=5`; list, `settle`, and
-`operations` use `limit=100`; `consolidate` and `consolidation-candidates` use `limit=32`,
+`memory_type=semantic`; search uses `limit=10`; ask uses `limit=5`; list, `settle`,
+`pending-captures`, and `operations` use `limit=100`; `settle` also uses `max-attempts=3`;
+`consolidate` and `consolidation-candidates` use `limit=32`,
 and `consolidate` defaults to `trigger=manual`; optional
 retrieval roles and timestamps are unset. Timestamps must be timezone-aware ISO 8601 values.
 Cursors are opaque and passed through unchanged. `ask` requires the selected composition to supply an answerer. `speech` and `faces`
@@ -189,10 +190,12 @@ values as JSON strings and datetimes as ISO 8601.
 `forget-identity` returns `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`,
 `face_observations`, and `speech_segments`, matching the fields of `IdentityErasure`.
 
-`pending-captures` returns one object per queued record — `memory_id`, ISO 8601 `enqueued_at`,
-`attempts`, and `last_error` — oldest first, matching the fields of `PendingCapture`. Naming memory
-IDs restricts the report to them; an ID that is absent from the result is not pending, so it is
-either settled or unknown, and `get` tells the two apart.
+`pending-captures` returns one object per record whose deferred work is not finished — `memory_id`,
+ISO 8601 `enqueued_at`, `attempts`, and `last_error` — oldest first, matching the fields of
+`PendingCapture`. With a formation backend, `add` holds a row between its commit and formation, so
+a queued record may already be searchable and owe formation only. Naming memory IDs restricts the
+report to them; an ID that is absent from the result is not pending, so it is either settled or
+unknown, and `get` tells the two apart.
 
 Unless `--quiet` is set, commands write the resolved composition as one JSON document on stderr
 before executing. `--url` forwards successful owner response objects unchanged. Runtime
@@ -207,11 +210,13 @@ still syntactically required.
 
 `doctor` returns the installed MindBridge and Python versions plus composition-specific checks:
 
-- `--embedder` constructs each configured recipe, exercises its published loader probe, closes it,
-  and reports the data-directory state without writing memory data. The probed backends also fill
+- `--embedder` constructs each configured recipe, exercises its published loader probe, and
+  reports the data-directory state without writing memory data. The probed backends also fill
   `capabilities`, which is `MemoryCapabilities.document()` -- the same document `GET /healthz`
   serves and the MCP server greets an agent with, including the derived `operations` set. It is
-  declared by the backends, so producing it opens no store and creates no data directory.
+  declared by the backends, so producing it opens no store and creates no data directory. Every
+  probed backend stays loaded until the capability summary is built and is then closed, so a
+  doctor run holds the weights of all configured slots at once.
 - `--app` imports and resolves the target but does not call a factory, because that could open the
   store, so `capabilities` is `null`: the application owns its own backends.
 - `--url` calls the owner's `GET /healthz` with the configured timeout.

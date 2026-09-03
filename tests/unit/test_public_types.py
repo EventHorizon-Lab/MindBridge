@@ -30,6 +30,7 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     Page,
+    PendingCapture,
     RetrievalCandidateTrace,
     RetrievalRejection,
     RetrievalTrace,
@@ -314,6 +315,21 @@ def test_single_condition_errors_default_their_own_reason() -> None:
     assert ValidationError("bad").reason == "input_invalid"
     assert ModelOutputTruncatedError("cut off").reason == "output_truncated"
     assert ModelOutputTruncatedError("cut off").retryable is False
+
+
+def test_a_pending_capture_refuses_a_naive_clock_and_a_nonsense_attempt_count() -> None:
+    assert PendingCapture(memory_id="a", enqueued_at=NOW).attempts == 0
+    for enqueued_at in (None, NOW.replace(tzinfo=None)):
+        with pytest.raises(ValidationError, match="enqueued_at must include a timezone"):
+            PendingCapture(memory_id="a", enqueued_at=enqueued_at)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="attempts must not be negative"):
+        PendingCapture(memory_id="a", enqueued_at=NOW, attempts=-1)
+    # `bool` is an `int`, so a flag passed where a count belongs is rejected rather than counted.
+    for attempts in (True, 1.0):
+        with pytest.raises(ValidationError, match="attempts must be an integer"):
+            PendingCapture(memory_id="a", enqueued_at=NOW, attempts=attempts)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="last_error must be text"):
+        PendingCapture(memory_id="a", enqueued_at=NOW, last_error=7)  # type: ignore[arg-type]
 
 
 def _asset(

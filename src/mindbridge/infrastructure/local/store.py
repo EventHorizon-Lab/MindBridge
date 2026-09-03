@@ -4702,6 +4702,10 @@ def _consumed_at_by_memory(connection: sqlite3.Connection) -> dict[str, datetime
     The log stores IDs inside its two JSON documents rather than in columns, so this reads them
     back with `json_tree`. A rolled-back operation consumed nothing that still stands.
     """
+    # ponytail: one full scan of the standing operation log per call, JSON-parsed row by row,
+    # because both consumers need the map before they pick their candidate windows. Narrow it to
+    # `j.value IN (...)` over those windows -- which means computing them first -- once a store's
+    # log is long enough for the scan to show up next to the two window queries.
     return {
         _row_text(row, "memory_id"): _parse_datetime(_row_text(row, "consumed_at"))
         for row in connection.execute(
@@ -4754,12 +4758,18 @@ def _evidence_candidates(
         return []
     placeholders = ", ".join("?" for _memory_id in due)
     fresh: dict[str, list[str]] = {memory_id: [] for memory_id in due}
+    # A forgotten source is dropped here, not later: `consolidate()` reads the shown records with
+    # `active_only=True`, so naming one would inflate `evidence_count` with an ID the deliberation
+    # never sees. A candidate left with no remaining sources falls out of the `if sources` guard.
     for row in connection.execute(
         f"""
-        SELECT memory_id, source_memory_id, recorded_at
-        FROM memory_evidence
-        WHERE retired_at IS NULL AND memory_id IN ({placeholders})
-        ORDER BY memory_id, position
+        SELECT e.memory_id AS memory_id, e.source_memory_id AS source_memory_id,
+               e.recorded_at AS recorded_at
+        FROM memory_evidence AS e
+        JOIN memory_records AS s
+          ON s.memory_id = e.source_memory_id AND s.forgotten_at IS NULL
+        WHERE e.retired_at IS NULL AND e.memory_id IN ({placeholders})
+        ORDER BY e.memory_id, e.position
         """,
         tuple(due),
     ).fetchall():
@@ -4838,7 +4848,11 @@ def _feedback_candidates(
     consumed: Mapping[str, datetime],
     limit: int,
 ) -> list[StoredCandidate]:
-    """Records confirmed through `reinforce_memories` since a standing operation last saw them."""
+    """Records whose recall was confirmed since a standing operation last saw them.
+
+    `reinforce_memories` is one writer of `last_accessed_at`; under the default
+    `reinforce_on_answer`, an `ask()` answer citing a record is the other.
+    """
     rows = connection.execute(
         """
         SELECT memory_id, last_accessed_at, access_count

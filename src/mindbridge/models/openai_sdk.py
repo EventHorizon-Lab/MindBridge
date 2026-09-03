@@ -129,9 +129,10 @@ derives from and a proposal with the same fields a formation proposal uses; it m
 target indices, which must be among its own evidence indices, for detail the derived memory
 replaces in ordinary recall. correct names the
 target indices whose derived inference the evidence contradicts. forget names the target indices
-whose recall is no longer useful. Do not target an observation, cite one index as both target and
-evidence, invent evidence, restate an assertion that already holds, or propose an operation the
-shown evidence cannot ground. Return an empty list instead."""
+whose recall is no longer useful. Do not target an observation with reinforce or correct; do not
+cite one index as both target and evidence, except for the retirement targets consolidate names
+among its own evidence; do not invent evidence, restate an assertion that already holds, or propose
+an operation the shown evidence cannot ground. Return an empty list instead."""
 _CONSOLIDATION_FIELDS = frozenset({"intent", "evidence", "targets", "proposal", "rationale"})
 _MAX_CONSOLIDATION_OPERATIONS = 16
 _TRUNCATED_ANSWER_ERROR = (

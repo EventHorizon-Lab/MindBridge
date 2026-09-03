@@ -922,13 +922,15 @@ class Memory:
             # Reject here what `add()` would reject, before the commit. Committing media no
             # configured model can ever take would make the record durable and then fail every
             # `settle()` forever, which is a queue entry no retry ceiling should have to absorb.
-            if Modality.AUDIO not in self._embedding_capabilities:
-                _fallback_unsupported(
-                    prepared.content,
-                    self._embedding_capabilities,
-                    "embedding",
-                    rescuable=self._deferred_rescue(prepared.content.assets),
-                )
+            # Unconditional: `add()` rejects twice, once early and once inside
+            # `_embedding_content`, so guarding this on one capability would miss the second.
+            # With an embedder that takes everything it is a no-op.
+            _fallback_unsupported(
+                prepared.content,
+                self._embedding_capabilities,
+                "embedding",
+                rescuable=self._deferred_rescue(prepared.content.assets),
+            )
             now = datetime.now(timezone.utc)
             # No index lock: a capture enqueues no vectors, so it has no outbox work to drain and
             # never has to wait behind a Zvec flush.
@@ -1013,11 +1015,12 @@ class Memory:
         limit: int = 100,
         memory_ids: Sequence[str] | None = None,
     ) -> tuple[PendingCapture, ...]:
-        """Return up to `limit` records that are durable but not yet searchable, oldest first.
+        """Return up to `limit` records whose deferred work is not finished, oldest first.
 
-        Pass `memory_ids` to ask whether specific records are still waiting: one that is absent
-        from the result is not pending, which means it is settled or was never stored, and `get()`
-        tells the two apart.
+        With a formation backend, `add()` holds a row between its commit and formation, so a
+        queued record may already be searchable and owe formation only. Pass `memory_ids` to ask
+        whether specific records are still waiting: one that is absent from the result is not
+        pending, which means it is settled or was never stored, and `get()` tells the two apart.
         """
         with (
             self._trace("mindbridge.pending_captures", kind="operation"),

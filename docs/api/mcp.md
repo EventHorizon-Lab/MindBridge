@@ -190,9 +190,10 @@ Successful calls populate MCP `structuredContent`:
 | `ReinforceResult` | `reinforced` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResult` | `items`, `next_cursor` |
-| `ContextBudgetResult` | `max_chars`, `max_items`, `memory_types` or `null`, `min_confidence`, `freshness_seconds` |
+| `ContextBudgetResult` | `max_chars`, `max_items`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
 | `ContextConflictResult` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
-| `ContextBundleResult` | `goal`, `reference_at`, `budget`, the `SearchHitResult` arrays `actors`, `episodes`, `facts`, `procedures`, `affect`, `traits`, plus `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`, `rendered` |
+| `ContextUnknownResult` | `kind`, `detail` |
+| `ContextBundleResult` | `goal`, `reference_at`, `budget`, the `SearchHitResult` arrays `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
 | `FaceObservation` | `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
 | `IdentityProfile` | `identity_id`, `name`, `relationship` |

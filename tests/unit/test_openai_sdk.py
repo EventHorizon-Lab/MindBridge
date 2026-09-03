@@ -462,6 +462,9 @@ def test_consolidation_numbers_evidence_and_resolves_cited_indices_to_ids() -> N
                     {
                         "intent": "consolidate",
                         "evidence": [0, 1],
+                        # Consolidation forgetting: a retirement target the prompt allows only
+                        # among this operation's own evidence indices.
+                        "targets": [0],
                         "proposal": {
                             "kind": "state",
                             "content": "The lamp is on.",
@@ -493,6 +496,7 @@ def test_consolidation_numbers_evidence_and_resolves_cited_indices_to_ids() -> N
     assert reinforce.rationale == "an independent second sighting"
     assert consolidate.intent is MemoryIntent.CONSOLIDATE
     assert consolidate.evidence_ids == ("raw-1", "derived-1")
+    assert consolidate.target_ids == ("raw-1",)
     assert consolidate.proposal is not None
     assert consolidate.proposal.kind is MemoryKind.STATE
     assert forget.intent is MemoryIntent.FORGET

@@ -1236,12 +1236,13 @@ class SearchHit:
 
 @dataclass(frozen=True, slots=True)
 class PendingCapture:
-    """One record that is durable but not yet searchable, and why it is still waiting.
+    """One record whose deferred work is not finished, and why it is still waiting.
 
-    `Memory.pending_captures` returns these. A memory ID that is absent from the result is not
-    pending: it is either settled or unknown, and `get` distinguishes the two. `attempts` and
-    `last_error` are the failure state a poisoned record accumulates, so an operator can see the
-    reason without opening SQLite.
+    `Memory.pending_captures` returns these. With a formation backend, `add` holds a row between
+    its commit and formation, so a queued record may already be searchable and owe formation only.
+    A memory ID that is absent from the result is not pending: it is either settled or unknown,
+    and `get` distinguishes the two. `attempts` and `last_error` are the failure state a poisoned
+    record accumulates, so an operator can see the reason without opening SQLite.
     """
 
     memory_id: str

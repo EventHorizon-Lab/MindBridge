@@ -182,15 +182,15 @@ Each `add_stream()` item creates an ordinary `mindbridge.add` span. `search_with
 speculative prefetch use `mindbridge.search`. `AsyncMemory` preserves tracing context across its
 worker thread.
 
-Capture acknowledgement, settle duration, and time to searchable are three different numbers and
+Capture acknowledgement, settle duration, and time to settled are three different numbers and
 are measured separately. `mindbridge.capture` and `mindbridge.settle` are distinct operation
-spans, and the settle span carries the capture-to-searchable interval its batch closed:
+spans, and the settle span carries the capture-to-settled interval its batch closed:
 
 | Attribute | Meaning |
 | --- | --- |
 | `mindbridge.capture.records_settled` | Records this call made searchable. |
 | `mindbridge.capture.records_failed` | Records that failed and kept their queue row. |
-| `mindbridge.capture.max_time_to_searchable_ms` | Longest capture-to-searchable interval this call closed. Absent when nothing settled. |
+| `mindbridge.capture.max_time_to_searchable_ms` | Longest capture-to-settled interval this call closed, over every row settled including `add()` recoveries. Absent when nothing settled. |
 
 Model spans include request model, module, batch size, modalities, and
 `mindbridge.model.request_count`. Provider-reported usage is recorded without estimation:

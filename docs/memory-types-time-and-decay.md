@@ -280,7 +280,8 @@ for candidate in memory.consolidation_candidates():
 `EVIDENCE` rows are derived records that gained independent evidence no standing operation has
 weighed — what the formation path leaves behind. `CONTRADICTION` rows are lineages whose current
 visible claims disagree, and clear when a `CORRECT` retires one side. `FEEDBACK` rows are records
-confirmed through `reinforce()` since an operation last saw them. `QUERY_FAILURE`, `PRESSURE`, and
+confirmed through `reinforce()`, or cited by an `ask()` answer under the default
+`reinforce_on_answer`, since an operation last saw them. `QUERY_FAILURE`, `PRESSURE`, and
 `IDLE` stay labels a caller may pass: nothing durable records them today, and adding bookkeeping
 for a trigger no host asks for would be a scheduler by another name.
 

@@ -45,9 +45,9 @@ on construction: the two maxima and `max_latency_ms` are positive integers, `min
 ### The deadline
 
 `max_latency_ms` is a deadline, not a timeout. Nothing is cancelled, no thread is started, and no
-work already in flight is interrupted or discarded. The compiler reads the clock between stages --
-retrieval, hydration, section assembly, then optional enrichment -- and once the deadline has
-passed it stops adding optional stages instead of truncating one halfway. A bundle compiled under
+work already in flight is interrupted or discarded. The compiler reads the clock once, after
+section assembly and before the optional enrichment that follows it, and if the deadline has
+already passed it skips that enrichment instead of truncating it halfway. A bundle compiled under
 a deadline is therefore a prefix of the bundle without one, never a different bundle.
 
 Today the one optional stage is conflict detection. When it is skipped, `conflicts` is empty and
@@ -65,7 +65,7 @@ A typed `MemoryKind` decides the section first; an untyped or generic record fal
 | `actors` | Kind `entity` |
 | `relationships` | Kind `relation` |
 | `scene` | Kind `state` |
-| `facts` | Type `semantic`, except `entity`, `relation`, `state`, and `trait` |
+| `facts` | Type `semantic`, except `entity`, `relation`, `state`, `affect`, and `trait` |
 | `episodes` | Type `episodic`, except `affect` |
 | `procedures` | Type `procedural` |
 | `affect` | Kind `affect` |
@@ -121,8 +121,10 @@ read `memory_versions` through the control plane for that.
 
 `render()` is deterministic: the same bundle always produces the same string. It emits a goal
 heading, a one-line reading guide, the reference time, the budget it filled, one `##` heading per
-non-empty section in the fixed order above, one line per hit, a conflicts section, and an omitted
-trailer only when something was omitted.
+non-empty section in the fixed order above, one line per hit, a `## Conflicts` section when the
+bundle reports any, a `## Unknowns` section when it carries any, and an omitted trailer only when
+something was omitted. Anything omitted is itself a `budget_excluded` unknown, so the trailer never
+appears without the `## Unknowns` block above it.
 
 ```text
 # Context: what should I bring to the workshop?
@@ -139,6 +141,9 @@ Budget: 132/6000 chars, 3/24 items
 
 ## Conflicts
 - ana location: "berlin" [c3d4] vs "paris" [g7h8]
+
+## Unknowns
+- budget_excluded: 4 candidates did not fit 24 items and 6000 chars
 
 Omitted: 4 lower-ranked candidates
 ```

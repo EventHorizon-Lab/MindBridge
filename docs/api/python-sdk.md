@@ -244,10 +244,12 @@ so their searchable-on-return contract holds. `search`, `ask`, `compile`, `close
 store never settle: time to searchable is the host's choice, so call `settle` from an idle loop, a
 timer, or after a capture burst.
 
-`pending_captures` returns up to `limit` queued records oldest first as `PendingCapture` values
-(`memory_id`, `enqueued_at`, `attempts`, `last_error`). Pass `memory_ids` to ask whether specific
-records are searchable yet: one that is absent from the result is not pending, which means it is
-settled or was never stored, and `get` tells the two apart.
+`pending_captures` returns up to `limit` records whose deferred work is not finished, oldest first,
+as `PendingCapture` values (`memory_id`, `enqueued_at`, `attempts`, `last_error`). With a formation
+backend, `add` holds a row between its commit and formation, so a queued record may already be
+searchable and owe formation only. Pass `memory_ids` to ask whether specific records are still
+waiting: one that is absent from the result is not pending, which means it is settled or was never
+stored, and `get` tells the two apart.
 
 ```text
 search(
@@ -386,7 +388,7 @@ takes no lock, so a host loop may poll it cheaply.
 | --- | --- | --- |
 | `EVIDENCE` | A derived record gained independent evidence no standing operation has weighed. `memory_ids` is that record followed by the new sources. | New evidence links |
 | `CONTRADICTION` | One lineage carries two or more current visible claims with different values, the same disagreement `compile()` reports as a `ContextConflict`. It stays listed until a `CORRECT` retires one side. | Distinct conflicting values |
-| `FEEDBACK` | A record was confirmed through `reinforce()` since a standing operation last saw it. | Recorded confirmations |
+| `FEEDBACK` | A record was confirmed through `reinforce()`, or cited by an `ask()` answer under the default `reinforce_on_answer`, since a standing operation last saw it. | Recorded confirmations |
 
 `QUERY_FAILURE`, `PRESSURE`, and `IDLE` remain labels a caller may pass to `consolidate`: nothing
 in the store records a failed query, memory pressure, or an approved idle window, and inventing
@@ -581,9 +583,9 @@ These are the 103 supported names exported by `mindbridge`:
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `ContextUnknownKind`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
-| Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
+| Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
 | Bundled adapters | `JinaOmniEmbedder`, `SentenceTransformersEmbedder`, `OpenAIModels`, `OpenCVFaceAnalyzer`, `FunASRTranscriber`, `FunASRRecipe`, `DEFAULT_FUNASR_MODEL_ID`, `DEFAULT_FUNASR_RECIPE` |
 | Exceptions | `MindBridgeError`, `ValidationError`, `MemoryNotFoundError`, `SpeakerNotFoundError`, `IdentityNotFoundError`, `ModelError`, `ModelOutputTruncatedError`, `StorageError`, `IndexUnavailableError` |

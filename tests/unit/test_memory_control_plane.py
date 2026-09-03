@@ -875,6 +875,22 @@ def test_formed_evidence_no_operation_has_weighed_is_a_durable_candidate(tmp_pat
             memory.consolidation_candidates(limit=0)
 
 
+def test_a_forgotten_source_stops_supporting_the_candidate_it_formed(tmp_path: Path) -> None:
+    with _memory(tmp_path / "forgotten-source", former=DispositionFormer()) as memory:
+        (first,) = _observations(memory, "Ana waited calmly")
+        assert [row for row in memory.consolidation_candidates() if first.id in row.memory_ids]
+
+        memory.forget([first.id])
+
+        # `consolidate()` reads the shown records with `active_only=True`, so a candidate naming a
+        # forgotten source would ask the backend to weigh evidence it is never shown, and count it.
+        assert [
+            row
+            for row in memory.consolidation_candidates()
+            if row.trigger is MemoryTrigger.EVIDENCE and first.id in row.memory_ids
+        ] == []
+
+
 def test_a_deliberated_candidate_leaves_the_queue_until_new_evidence_arrives(
     tmp_path: Path,
 ) -> None:

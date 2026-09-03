@@ -20,7 +20,7 @@ import json
 import math
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from importlib import import_module
@@ -416,7 +416,10 @@ def _doctor(arguments: argparse.Namespace, composition: _Document) -> _Document:
             for backend in loaded.values():
                 close = getattr(backend, "close", None)
                 if callable(close):
-                    close()
+                    # One slot that fails to shut down must not strand the weights of the rest.
+                    # doctor already reports what each slot could load; a close is pure cleanup.
+                    with suppress(Exception):
+                        close()
     return {
         "version": _installed_version(),
         "python": ".".join(str(part) for part in sys.version_info[:3]),
