@@ -2,7 +2,7 @@
 
 ## Surface
 
-The optional FastAPI adapter exposes eight `Memory` operations under `/v1`. It validates transport
+The optional FastAPI adapter exposes nine `Memory` operations under `/v1`. It validates transport
 input, calls the injected synchronous memory, and serializes the public SDK values; it is not a
 separate storage or retrieval implementation.
 
@@ -104,11 +104,12 @@ SDK validator and error contract.
 | `POST /v1/memories` | `createMemory` | `MemoryCreate` | `201 MemoryResponse` |
 | `POST /v1/memories/batch` | `createMemories` | `MemoryBatchCreate` | `201 {"memories":[...]}` |
 | `GET /v1/memories` | `listMemories` | `limit`, `cursor` query parameters | `200 PageResponse` |
-| `POST /v1/memories/search` | `searchMemories` | `QueryRequest` | `200 {"hits":[...],"trace":null}` |
-| `POST /v1/memories/reinforce` | `reinforceMemories` | `ReinforceRequest` | `200 {"reinforced":int}` |
+| `POST /v1/memories/search` | `searchMemories` | `QueryRequest` | `200 SearchResponse` |
+| `POST /v1/memories/reinforce` | `reinforceMemories` | `ReinforceRequest` | `200 ReinforceResponse` |
 | `GET /v1/memories/{memory_id}` | `getMemory` | non-empty path value | `200 MemoryResponse` |
 | `DELETE /v1/memories/{memory_id}` | `deleteMemory` | non-empty path value | `200 {"deleted":bool}` |
 | `POST /v1/answers` | `answer` | `AnswerRequest` | `200 AnswerResponse` |
+| `POST /v1/context` | `compileContext` | `ContextRequest` | `200 ContextBundleResponse` |
 
 Request fields and defaults are:
 
@@ -119,6 +120,8 @@ Request fields and defaults are:
 | `QueryRequest` | required `query`; `limit=10`; `explain=false`; optional `memory_type`, `reference_at`, `occurred_from`, `occurred_until`, `scope` |
 | `ReinforceRequest` | required `memory_ids` with 1–100 IDs |
 | `AnswerRequest` | required `question`; `limit=5`; optional `memory_type`, `reference_at`, `scope` |
+| `ContextRequest` | required `goal`; optional `budget`, `reference_at`, `scope` |
+| `ContextBudgetRequest` | `max_chars=16000`; `max_items=24`; `min_confidence=0.0`; optional `memory_types` with at least one value; optional `freshness_seconds`; optional `max_latency_ms` |
 | List query | `limit=100`; optional opaque `cursor` |
 
 All timestamps must include a timezone. An event end requires a start and must be later than it.
@@ -128,11 +131,12 @@ records without `occurred_at` do not match. Pass `next_cursor` back unchanged to
 Time and role behavior is defined in
 [memory types, time, and decay](../memory-types-time-and-decay.md).
 
-An input `context` is an optional typed observation. `scope` is an optional retrieval filter:
-`valid_at` and `known_at` are timezone-aware world-time and transaction-time instants, while
-`near` and a non-negative `radius_m` must appear together and restrict results to the same
-coordinate frame and observer/subject anchor. SQLite authoritatively reapplies every scope filter
-after candidate retrieval.
+An input `context` is an optional typed observation. Its `place_id` is a trimmed symbolic place
+label independent of its metric `spatial` pose. `scope` is an optional retrieval filter:
+`valid_at` and `known_at` are timezone-aware world-time and transaction-time instants; `place_id`
+matches the stored label exactly; and `near` with a non-negative `radius_m` restricts results to
+the same coordinate frame and observer/subject anchor. SQLite authoritatively reapplies every
+scope filter after candidate retrieval.
 
 Create-request context:
 
@@ -144,6 +148,7 @@ Create-request context:
     "source_id": "camera-1:frame-42",
     "confidence": 0.94,
     "valid_from": "2026-08-27T09:00:00Z",
+    "place_id": "kitchen",
     "spatial": {
       "frame_id": "home/map",
       "anchor": "subject",
@@ -164,17 +169,46 @@ Search-request scope:
   "scope": {
     "valid_at": "2026-08-27T10:00:00Z",
     "known_at": "2026-08-27T12:00:00Z",
+    "place_id": "kitchen",
     "near": {"frame_id": "home/map", "anchor": "subject", "x": 2.0, "y": 1.0},
     "radius_m": 0.75
   }
 }
 ```
 
+Context-request budget:
+
+```json
+{
+  "goal": "What should I bring to the workshop?",
+  "budget": {
+    "max_chars": 2000,
+    "max_items": 8,
+    "memory_types": ["semantic", "episodic"],
+    "min_confidence": 0.5,
+    "freshness_seconds": 2592000,
+    "max_latency_ms": 250
+  }
+}
+```
+
 Creation is content-addressed and idempotent. Batch results preserve input order. Deletion is also
 idempotent: `deleted` reports whether a record existed. `ask` requires an answerer configured in
-the injected memory. Reinforcement is not idempotent: every call raises `access_count` for the named
-memories and moves the ranker's reinforcement factor, so a lost response must not be retried
-blindly. Unknown IDs are skipped, and `reinforced` counts the ones that existed.
+the injected memory and, with the default `reinforce_on_answer=True`, reinforces the hits it cites.
+Explicit reinforcement is not idempotent: every call raises `access_count` for the named memories
+and moves the ranker's reinforcement factor, so a lost response must not be retried blindly.
+Unknown IDs are skipped, and `reinforced` counts the ones that existed.
+
+`compileContext` selects and structures existing evidence, reports conflicts without resolving
+them, calls no generation model, and stores no memory. It is not a pure read: it runs the same
+retrieval path `searchMemories` runs and can make the same one write, caching a transcript for
+spoken query media, which is a cache of the caller's own input rather than a new memory. Its
+request `budget` is the transport form of `ContextBudget`, with the `freshness` timedelta
+expressed as `freshness_seconds` and `max_latency_ms` a deadline the compiler checks between
+stages rather than a timeout that aborts. The bundle reports `elapsed_ms`, `deadline_exceeded`,
+and an `unknowns` array naming what the request implied and the bundle does not carry. The
+[compiler reference](../context-compilation.md) owns section, selection, unknown, and conflict
+semantics.
 
 ### Retrieval trace
 
@@ -201,13 +235,18 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 | Object | Fields |
 | --- | --- |
 | `AssetResponse` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name` |
-| `MemoryResponse` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context` |
+| `MemoryResponse` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context`, `place_id`, `forgotten_at` |
 | `SearchHitResponse` | all memory fields plus `score` from 0 through 1 |
-| `SearchResponse` | `hits`, and `trace` when the request set `explain` |
+| `SearchResponse` | `hits`, `trace`; `trace` is `null` unless the request set `explain=true` |
 | `ReinforceResponse` | `reinforced` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResponse` | `items`, `next_cursor` |
-| `CapabilitiesResponse` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `speaker_recognition`, `streaming_generation` |
+| `ContextBudgetResponse` | `max_chars`, `max_items`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
+| `ContextConflictResponse` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
+| `ContextUnknownResponse` | `kind`, `detail` |
+| `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, the mixed `actors` array of hits and `ProvisionalActorResponse` objects, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
+| `ProvisionalActorResponse` | `identity_id`, `memory_ids`: one recognized person in the included evidence whom no visible naming assertion names |
+| `CapabilitiesResponse` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `consolidation_model`, `speaker_recognition`, `streaming_generation`, `operations` |
 | `HealthResponse` | `status`, `capabilities` |
 
 `modality` is `text`, `image`, `video`, `audio`, or `omni`. `memory_type` is `semantic`,
@@ -219,7 +258,9 @@ some other way is an ordinary answer. See
 the authoritative `MemoryContext`: typed kind and basis, confidence, valid and transaction time,
 visibility, lineage/source/evidence/supersession IDs, model recipe, optional
 subject/predicate/value, spatial pose, and affect cue fields. It is `null` on a raw record formed
-without typed context. Asset filesystem paths are never serialized.
+without typed context. `forgotten_at` is set on a cognitively forgotten record, which `get`
+still returns and retrieval skips. Asset filesystem paths are never serialized, in bundle sections
+as in hits, and `rendered` is the deterministic text of `ContextBundle.render()`.
 
 `/healthz` reports liveness and the composition behind the process, so an operator does not have
 to send a probe write to learn what the deployment can do:
@@ -242,8 +283,10 @@ to send a probe write to learn what the deployment can do:
     "vision_model": null,
     "face_model": null,
     "formation_model": null,
+    "consolidation_model": null,
     "speaker_recognition": true,
-    "streaming_generation": false
+    "streaming_generation": false,
+    "operations": ["ask", "speech", "transcribe"]
   }
 }
 ```
@@ -253,8 +296,15 @@ list means the backend is absent, not that it supports nothing. A `null` model I
 `embedding_space` is the value that decides whether stored vectors and a new backend belong to the
 same space. `speaker_recognition` is not derivable from `transcription`: a transcription backend
 and a speech backend occupy one slot and declare the same modalities, but only the second resolves
-speakers, so this is the field that says whether `speech` will work. Values are captured when
-`Memory` is constructed, so the route performs no I/O and no model call.
+speakers, so this is the field that says whether `speech` will work. `operations` is derived from
+those backends rather than declared, and names which optional operations this composition can
+serve, so a caller does not have to know that `ask` needs generation or `consolidate` a
+consolidation backend. Values are captured when `Memory` is constructed, so the route performs no
+I/O and no model call.
+
+This is `MemoryCapabilities.document()` verbatim. The MCP server embeds the same document in its
+instructions and `mindbridge doctor` prints it under `capabilities`, so no surface can describe
+one composition differently.
 
 ## Errors and limits
 
@@ -345,6 +395,8 @@ REST has no route for these Python operations:
 | `register_speaker`, `register_identity` | No route; both have an MCP tool |
 | `identity`, `unlink_identity`, `forget_identity` | No route; all three have an MCP tool |
 | `reindex`, `optimize` | Index maintenance an operator schedules |
+| `capture`, `settle`, `pending_captures` | No route; deferred enrichment is the owning process's loop |
+| `consolidation_candidates`, `consolidate`, `forget`, `rollback`, `operations` | No route and no MCP tool; the memory control plane stays under host authority |
 
 Use the [Python SDK](python-sdk.md) in the owning process, or the MCP adapter where the table
 names a tool. None of these is a REST limitation: the adapter runs in the process that owns
@@ -360,6 +412,9 @@ names a tool. None of these is a REST limitation: the adapter runs in the proces
 | Normalized text, including combined text parts | 65,536 characters |
 | Batch contents | 1 through 100 |
 | Search, answer, or page `limit` | 1 through 100 |
+| Context `budget.max_chars` | 1 through 65,536 |
+| Context `budget.max_items` | 1 through 100 |
+| Context `budget.max_latency_ms` | 1 or greater |
 | Serialized metadata for one memory | 262,144 UTF-8 bytes |
 | `file_id` or `filename` | 255 characters |
 

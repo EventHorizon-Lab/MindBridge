@@ -12,7 +12,7 @@ This page defines implementation invariants. See [core concepts](concepts.md) fo
 | Component | Responsibility |
 | --- | --- |
 | `Memory` | Coordinate public operations, model capabilities, storage, retrieval, and lifecycle. |
-| Model backends | Embed, generate, transcribe or analyze speech, analyze faces, describe images, or propose typed formations through narrow protocols. |
+| Model backends | Embed, generate, transcribe or analyze speech, analyze faces, describe images, propose typed formations, or propose memory-control-plane operations. |
 | `LocalStore` | Persist authoritative records, FP32 embeddings, analysis and identity state, compatibility metadata, and the index outbox in SQLite. |
 | `AssetStore` | Persist immutable image, video, and audio bytes by SHA-256. |
 | `ZvecIndex` | Maintain rebuildable dense, lexical, type, and event-time search projections. |
@@ -25,7 +25,7 @@ data, not an account, authorization, request, or isolation boundary.
 
 | Path | Authority | Recovery role |
 | --- | --- | --- |
-| `state.sqlite3` | Authoritative | Records, FP32 embeddings, model and index compatibility markers, cached analyses, identities, typed semantics with evidence, bitemporal versions, durable formation completion, and pending index operations. |
+| `state.sqlite3` | Authoritative | Records, FP32 embeddings, model and index compatibility markers, cached analyses, identities, typed semantics with evidence, bitemporal versions, durable formation completion, forgetting state, deferred capture work, the memory-operation log, and pending index operations. |
 | `assets/` | Authoritative | Original media bytes, stored by digest. SQLite cannot recreate a missing asset. |
 | `zvec/` | Derived | Disposable search projection. It may be deleted while stopped; startup rebuilds it from SQLite without re-embedding stored content. |
 | `.mindbridge.lock` | Coordination only | Operating-system lock target; the file normally remains after shutdown, so its presence says nothing about a live owner. |
@@ -69,6 +69,19 @@ The ordering determines failure behavior:
   still durable and the unacknowledged projection work is retryable.
 - Stale IDs left in Zvec cannot resurrect deleted data because final hydration uses SQLite.
 
+`delete()` is physical forgetting and runs the same ordering in reverse. One SQLite transaction
+removes the record and everything keyed on it -- semantics, versions, evidence, formation runs,
+the capture-queue row, and the embeddings, whose delete triggers enqueue the projection work the
+call then drains. Media is content-addressed and therefore shared: the transaction returns the
+assets no remaining memory references, and only those lose their blob, their descriptor, their
+cached transcript, and the speech and face rows keyed on them. Removing the last observation of an
+anonymous identity also removes that identity and its exemplar template, so no biometric vector
+outlives the media it was derived from; a named or merged person survives, because a name is an
+assertion a caller made and `forget_identity()` is what erases one. The single deliberate survivor
+is `memory_operations`: the operation log is append-only audit history over ids, proposals, and
+rationales, and rewriting it would make `rollback()` unsound. The Python SDK reference owns the
+row-by-row contract.
+
 A memory ID is the SHA-256 digest of canonical ordered content, media digests, metadata, event
 time, memory type, and optional typed observation context. Repeating the same add is idempotent.
 `add_many()` uses one model batch and one SQLite transaction. `add_stream()` commits each completed
@@ -79,14 +92,86 @@ pending. Only the projection is grouped, so the order and the failure behavior a
 a group the process never reaches leaves its rows pending for the next drain, and `search` drains
 before it reads, so a committed item is retrievable during the stream either way.
 
-Formation follows the same authority rule: a `FormationBackend` only proposes. After the source
-observation commits, the kernel assigns identity, validates source binding and source modality,
-and resolves validity and conflicts. Derived records, evidence edges, bitemporal versions,
-embeddings, the durable per-source completion marker, and outbox work then commit in one SQLite
-transaction. Formation is idempotent for a given source memory and formation recipe, so a model
-failure leaves the raw observation durable and the formation retryable. Retiring or losing a source
-recomputes derived confidence and visibility from the remaining independent evidence instead of
-destroying the observation.
+### Deferred capture
+
+`capture()` takes the same path with the model stages removed. It validates content, materializes
+media, and commits the record, its assets, its observation context, and one `capture_queue` row in
+one transaction. Capture acknowledges after that commit and before any model call, which is the
+invariant that keeps slow work off the acknowledgement path.
+
+```mermaid
+flowchart LR
+    input["Validate and materialize content"] --> commit["Commit record, media, context, and queue row"]
+    commit --> ack["Acknowledge capture"]
+    ack -. later .-> settle["settle(): run the model stages"]
+    settle --> derived["Commit derived content and vectors; the queue row survives"]
+    derived --> zvec["Flush Zvec, form, then delete the queue row"]
+    settle -. failure .-> queued["Count the attempt, store the reason, keep the row queued"]
+```
+
+A captured record is durable and readable but has no vectors, so it enqueues no index work and
+`search()` cannot return it. `settle()` and the `add()` path share one enrichment routine over the
+committed row, so a settled record holds exactly the derived content, vectors, and formation a
+blocking `add()` would have produced. Retrieval and shutdown never settle. That shared routine
+runs under one process-wide settlement lock, so a concurrent `settle()` or an `add()` of the same
+captured content waits instead of running the model stages twice.
+
+Enrichment appends. Derived text is added to `memory_records.content` behind a per-asset marker —
+`[transcript:<asset_id>]`, `[visual description:<asset_id>]`, or `[speech identities:<asset_id>]`
+— so the caller's own text stays byte-identical at the front of the record and model
+interpretation stays separable from evidence. Media bytes are never rewritten: they stay in
+`assets/` under their digest, and a transcript is also cached on the asset row.
+
+`settle()` attempts every record it read: a failing one keeps its queue row, its attempt count,
+and its reason while the records behind it still settle, and the first failure is raised once the
+batch is done. A record that has already failed `max_attempts` times is skipped rather than
+retried, so one poisoned capture cannot block the queue. `capture()` applies the same
+embedder-capability check `add()` applies, so media no configured model could ever take is
+refused before the commit instead of becoming a durable row that can never settle.
+
+### Formation and consolidation
+
+Formation follows the same authority rule. A `FormationBackend` proposes typed state after the
+source observation commits; the kernel validates source binding, modality, identity, validity, and
+conflicts. Derived records, evidence, versions, embeddings, the per-source recipe marker, and
+outbox work commit together. Retiring or losing a source recomputes derived confidence and
+visibility from the remaining independent evidence instead of destroying the observation.
+
+A failed formation leaves the source durable and retryable on both paths. `add()` enqueues each
+new record in `capture_queue` inside its own write transaction whenever a formation backend is
+configured, and deletes that row after formation returns; a crash in between leaves the row, and
+the next `settle()` finds a record that is already embedded and owes formation only, so it forms
+it without buying the same vectors twice. `capture()` keeps its queue row through the settle
+commit for the same reason. The per-source recipe marker makes the retry idempotent: a source
+that already formed is skipped.
+
+`memory_semantics.identity_id` binds a typed claim to a recognized person, and the kernel is the
+only writer of it. It is `ON DELETE SET NULL` on purpose: erasing a person drops the attribution
+and keeps the claim, which is the same promise as keeping the evening after forgetting who was in
+it. Naming a person travels this path too, as an `ENTITY` assertion carrying that binding, so it
+needs no formation backend and inherits versioning, visibility, and rollback rather than getting
+its own. `identities.name` and `identities.relationship` are then a projection of the current
+visible assertion, not an independently writable field, and every recompute replaces the affected
+indexed documents in the same transaction. Every write that can change a bound assertion's
+visibility recomputes the projection in its own transaction -- naming, evidence, correction,
+cognitive forgetting, rollback, a merge that re-points the assertion onto the survivor, an
+unlink, an erasure, and the ordinary deletion of the assertion record -- so no committed state
+exists in which `identities.name`, the stored text, and the currently visible assertion
+disagree.
+
+The binding is deterministic policy, never a model's choice: the kernel stamps it when a
+proposed claim's subject matches the canonical subject of a visible naming assertion under the
+same NFKC casefold the lineage key uses, and `_formation_lineage_id` then keys on the identity,
+so claims about one person converge however a turn spelled the name. A model's `ENTITY` proposal
+is never bound, because a bound `ENTITY` row is a naming assertion and naming stays with the
+host. Undoing a merge re-evaluates the claims bound to the survivor: one resting only on media
+that moved back is re-attributed to the restored person, one resting on both people's media is
+unbound, and none is left attributed to somebody it was never about.
+
+An identity with no visible naming assertion is provisional: derived state, not a stored flag.
+`IdentityProfile.confirmed` reports it, and a compiled bundle's `actors` carries one
+`ProvisionalActor` per unnamed person in its evidence, because an unrecognized person in the room
+must be distinguishable from one who is absent.
 
 ## Retrieval consistency
 
@@ -102,14 +187,14 @@ flowchart LR
 ```
 
 Zvec proposes candidates; SQLite decides whether they exist and whether hard event-time,
-bitemporal, spatial, and memory-type filters pass. Composite records use an aggregate embedding
-plus bounded, de-duplicated text and media keys, and long text contributes bounded overlapping
-contextual keys. A query uses its complete aggregate plus bounded keys focused on the first text
-atom and query media. Dense routes and the lexical route may run concurrently, with at most four
-outer search workers. Every route runs at a fixed candidate depth that does not depend on the
-requested `limit`, so a narrow request returns the prefix of a wider one and each hit reports the
-same score at both. A scope that leaves fewer survivors than the request asked for still widens the
-pool.
+bitemporal, symbolic-place, metric-spatial, and memory-type filters pass. Composite records use an
+aggregate embedding plus bounded, de-duplicated text and media keys, and long text contributes
+bounded overlapping contextual keys. A query uses its complete aggregate plus bounded keys focused
+on the first text atom and query media. Dense routes and the lexical route may run concurrently,
+with at most four outer search workers. Every route runs at a fixed candidate depth that does not
+depend on the requested `limit`, so a narrow request returns the prefix of a wider one and each hit
+reports the same score at both. A scope that leaves fewer survivors than the request asked for
+still widens the pool.
 
 Ranking combines the strongest dense evidence with bounded lexical, temporal, ambiguity, and
 optional decay signals. `RetrievalScope` filters apply as authoritative SQLite checks rather than
@@ -120,7 +205,9 @@ spatial frame and anchor, with no implicit frame transform.
 `search_with_trace()` exposes bounded ranking signals and terminal rejection reasons without
 copying memory content or metadata into the trace. `ask()` uses the same retrieval path, applies
 the evidence budget, routes the question and hits through the generation backend's declared
-capabilities, and returns only evidence the backend actually used.
+capabilities, and returns only evidence the backend actually used. `compile()` reuses that same
+retrieval path, so SQLite reapplies authoritative visibility, scope, and forgetting before any hit
+reaches a [context bundle](context-compilation.md).
 
 ## Ownership and concurrency
 
@@ -143,11 +230,22 @@ create a service or a second consistency model.
 ## Model boundary
 
 The extension contracts are `EmbeddingBackend`, `GenerationBackend`, `TranscriptionBackend`,
-`SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, and `FormationBackend`;
-`StreamingGenerationBackend` adds streamed generation. Routing follows declared atomic modalities,
-not provider or model names. Unsupported visual evidence fails; unsupported audio can fall back to
-transcript text only when a configured transcription backend declares the required capability.
-Provider output is validated before persistence or return.
+`SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, and
+`ConsolidationBackend`; `StreamingGenerationBackend` adds streamed generation. Routing follows
+declared atomic modalities, not provider or model names. Unsupported visual evidence fails;
+unsupported audio can fall back to transcript text only when a configured transcription backend
+declares the required capability. Provider output is validated before persistence or return.
+
+The two reasoning contracts differ only in horizon and authority scope. A `FormationBackend`
+proposes typed semantics from one committed observation. A `ConsolidationBackend` proposes
+reinforcement, consolidation, correction, or cognitive forgetting over a bounded set of records
+that already exist. Neither writes SQLite: the kernel validates every field, applies only the
+effect the declared intent allows, and commits each operation with an append-only
+`memory_operations` row that `Memory.rollback()` can reverse. A consolidation proposal may name
+targets only inside the evidence window the kernel gathered for it, must be eligible in every
+target it names or be refused whole, and has those preconditions re-checked inside the apply
+transaction, so a record that moved since validation is refused as stale rather than half
+applied. Physical deletion is not a proposable intent.
 
 Applications may inject backend objects directly or use `MemoryPlugins` and
 `Memory.from_plugins()`. `Memory.from_config()` validates a closed catalog of bundled providers and
@@ -156,22 +254,28 @@ backend swap during a `Memory` lifetime. SQLite, the asset store, and Zvec are i
 rather than public storage plugins: a model backend may perform inference but cannot bypass
 validation, stable identity, durability, or final SQLite hydration.
 
-Model code is part of the application's trust boundary. The bundled Jina adapter in particular
-executes upstream code with model and code revisions pinned; [configuration](configuration.md)
-owns the exact recipe and license constraints.
+Model code is part of the application's trust boundary. The bundled Jina adapter, for example,
+executes pinned upstream model code; [configuration](configuration.md) owns its exact recipe and
+license constraints. No backend can bypass validation, stable identity, durability, or final
+SQLite hydration.
+
+Typed lineage and evidence are a SQLite projection, not a graph database or traversal service. A
+future entity/relation search projection must remain derived and rebuildable and pass the evidence
+gate in the [benchmark protocol](benchmarking.md#mandatory-controls).
 
 ## Public and trust boundaries
 
-Supported SDK values are imported from `mindbridge`, and the SDK exposes the complete set of
-product operations. REST exposes add, batch add, search, reinforce, get, list, delete, and ask
-under `/v1`. MCP exposes fourteen tools: that subset without batch add, plus the embodied and
-identity operations. The local CLI can call the SDK operations; `--url` is limited to operations
-REST implements.
+Supported SDK values are imported from `mindbridge`. The `Memory` SDK exposes 28 product
+operations. REST exposes nine `/v1` routes: add, batch add, list, search, reinforce, get, delete,
+answer, and compile context. MCP exposes fifteen tools: the eight corresponding non-batch
+operations plus speech, face, and identity operations, or ten when the host builds it with
+`identity_operations=False`, because naming and erasing a person is host authority and the host
+decides whether it is on the wire at all. The local CLI exposes the 28 operations
+plus `doctor`; `--url` is limited to operations implemented by REST.
 
-Transport adapters do not create another owner: `create_app(memory=...)` and
-`build_mcp_server(memory)` use a caller-owned instance and never close it. They also do not add
-authentication, authorization, TLS, rate limits, quotas, or audit policy. See
-[deployment](deployment.md) for process and network setup.
+Compiling context is a read-only view. The memory control plane — `consolidation_candidates()`,
+`consolidate()`, `forget()`, `rollback()`, and `operations()` — and physical deletion stay in the
+owner process, which is also the process that can audit and reverse an operation through its log.
 
 Python callers may intentionally pass regular local `Path` values; MindBridge opens only regular
 files and avoids following the final symlink where the platform supports it. REST and MCP accept

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from datetime import datetime
-from typing import Annotated, Literal, Protocol
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timedelta
+from typing import Annotated, Any, Literal, Protocol
 
 from fastapi import APIRouter, FastAPI, Query, Response, status
 from fastapi import Path as PathParameter
@@ -19,7 +19,12 @@ from pydantic import (
 )
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from mindbridge.api.content import Content, StrictModel, content_input
+from mindbridge.api.content import (
+    MAX_TEXT_CHARACTERS,
+    Content,
+    StrictModel,
+    content_input,
+)
 from mindbridge.api.errors import (
     REASON_STATUS,
     error_response,
@@ -30,6 +35,9 @@ from mindbridge.types import (
     AbstentionReason,
     AnswerResult,
     ContentInput,
+    ContextBudget,
+    ContextBundle,
+    ContextUnknownKind,
     MemoryCapabilities,
     MemoryContext,
     MemoryRecord,
@@ -49,6 +57,13 @@ _MemoryId = Annotated[str, PathParameter(min_length=1)]
 # The same identifier inside a request body, where `PathParameter` does not apply. Constrained
 # here rather than only in the SDK so a malformed ID fails validation on every route alike.
 _BodyMemoryId = Annotated[str, StringConstraints(min_length=1, pattern=r"^\S(?:.*\S)?$")]
+_Chars = Annotated[int, Field(strict=True, ge=1, le=MAX_TEXT_CHARACTERS)]
+_Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
+_Seconds = Annotated[float, Field(gt=0.0)]
+_Milliseconds = Annotated[int, Field(strict=True, ge=1)]
+# Budget defaults are read from the SDK value, so the published transport default cannot drift
+# from `ContextBudget`.
+_BUDGET = ContextBudget()
 
 
 class MemoryCreate(StrictModel):
@@ -102,6 +117,23 @@ class AnswerRequest(StrictModel):
     scope: RetrievalScope | None = None
 
 
+class ContextBudgetRequest(StrictModel):
+    max_chars: _Chars = _BUDGET.max_chars
+    max_items: _Limit = _BUDGET.max_items
+    memory_types: Annotated[list[MemoryType], Field(min_length=1)] | None = None
+    min_confidence: _Confidence = _BUDGET.min_confidence
+    # `ContextBudget.freshness` is a timedelta; JSON carries the same bound as seconds.
+    freshness_seconds: _Seconds | None = None
+    max_latency_ms: _Milliseconds | None = None
+
+
+class ContextRequest(StrictModel):
+    goal: Content
+    budget: ContextBudgetRequest | None = None
+    reference_at: AwareDatetime | None = None
+    scope: RetrievalScope | None = None
+
+
 class _ResponseModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -127,6 +159,7 @@ class MemoryResponse(_ResponseModel):
     metadata: dict[str, JsonValue]
     context: MemoryContext | None = None
     place_id: str | None = None
+    forgotten_at: AwareDatetime | None = None
 
 
 class SearchHitResponse(MemoryResponse):
@@ -158,6 +191,61 @@ class ReinforceResponse(_ResponseModel):
     reinforced: int
 
 
+class ContextBudgetResponse(_ResponseModel):
+    max_chars: int
+    max_items: int
+    memory_types: tuple[MemoryType, ...] | None
+    min_confidence: float
+    freshness_seconds: float | None
+    max_latency_ms: int | None
+
+
+class ContextConflictResponse(_ResponseModel):
+    lineage_id: str
+    subject: str | None
+    predicate: str | None
+    values: tuple[str, ...]
+    memory_ids: tuple[str, ...]
+
+
+class ProvisionalActorResponse(_ResponseModel):
+    identity_id: str
+    memory_ids: tuple[str, ...]
+
+
+class ContextUnknownResponse(_ResponseModel):
+    kind: ContextUnknownKind
+    detail: str
+
+
+class ContextBundleResponse(_ResponseModel):
+    goal: str
+    reference_at: AwareDatetime
+    budget: ContextBudgetResponse
+    # A recognized person in the evidence whom no visible naming assertion names is reported
+    # here beside the ranked entity hits, labelled, rather than omitted.
+    actors: tuple[SearchHitResponse | ProvisionalActorResponse, ...]
+    relationships: tuple[SearchHitResponse, ...]
+    scene: tuple[SearchHitResponse, ...]
+    episodes: tuple[SearchHitResponse, ...]
+    facts: tuple[SearchHitResponse, ...]
+    procedures: tuple[SearchHitResponse, ...]
+    affect: tuple[SearchHitResponse, ...]
+    traits: tuple[SearchHitResponse, ...]
+    conflicts: tuple[ContextConflictResponse, ...]
+    unknowns: tuple[ContextUnknownResponse, ...]
+    occurred_from: AwareDatetime | None
+    occurred_until: AwareDatetime | None
+    frames: tuple[str, ...]
+    places: tuple[str, ...]
+    omitted: int
+    chars: int
+    elapsed_ms: int
+    deadline_exceeded: bool
+    # The deterministic text of `ContextBundle.render()`, so a caller need not re-derive it.
+    rendered: str
+
+
 class PageResponse(_ResponseModel):
     items: tuple[MemoryResponse, ...]
     next_cursor: str | None = None
@@ -180,8 +268,12 @@ class CapabilitiesResponse(_ResponseModel):
     vision_model: str | None
     face_model: str | None
     formation_model: str | None
+    consolidation_model: str | None
     speaker_recognition: bool
     streaming_generation: bool
+    # Derived from the backends above, not declared: which optional operations this composition
+    # can serve. `MemoryCapabilities.document()` is the one place that derivation happens.
+    operations: tuple[str, ...]
 
 
 class HealthResponse(BaseModel):
@@ -248,6 +340,15 @@ class _Memory(Protocol):
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
     ) -> AnswerResult: ...
+
+    def compile(
+        self,
+        goal: ContentInput,
+        *,
+        budget: ContextBudget | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> ContextBundle: ...
 
     def reinforce(self, memory_ids: Sequence[str]) -> int: ...
 
@@ -450,7 +551,95 @@ def _v1_router(memory: _Memory) -> APIRouter:
             )
         )
 
+    _add_context_route(router, current_service, responses=model_errors)
     return router
+
+
+def _add_context_route(
+    router: APIRouter,
+    current_service: Callable[[], _Memory],
+    *,
+    responses: dict[int | str, dict[str, Any]],
+) -> None:
+    """Register the compiler route, split out only to keep `_v1_router` readable."""
+
+    @router.post(
+        "/context",
+        response_model=ContextBundleResponse,
+        operation_id="compileContext",
+        responses=responses,
+    )
+    def compile_context(request: ContextRequest) -> ContextBundleResponse:
+        return _bundle_response(
+            current_service().compile(
+                content_input(request.goal),
+                budget=_context_budget(request.budget),
+                reference_at=request.reference_at,
+                scope=request.scope,
+            )
+        )
+
+
+def _context_budget(request: ContextBudgetRequest | None) -> ContextBudget | None:
+    """Translate the transport budget into the SDK value, which validates every bound."""
+    if request is None:
+        return None
+    return ContextBudget(
+        max_chars=request.max_chars,
+        max_items=request.max_items,
+        memory_types=None if request.memory_types is None else frozenset(request.memory_types),
+        min_confidence=request.min_confidence,
+        freshness=(
+            None
+            if request.freshness_seconds is None
+            else timedelta(seconds=request.freshness_seconds)
+        ),
+        max_latency_ms=request.max_latency_ms,
+    )
+
+
+def _bundle_response(bundle: ContextBundle) -> ContextBundleResponse:
+    return ContextBundleResponse.model_validate(
+        {
+            "goal": bundle.goal,
+            "reference_at": bundle.reference_at,
+            "budget": {
+                "max_chars": bundle.budget.max_chars,
+                "max_items": bundle.budget.max_items,
+                "memory_types": (
+                    None
+                    if bundle.budget.memory_types is None
+                    else tuple(sorted(bundle.budget.memory_types))
+                ),
+                "min_confidence": bundle.budget.min_confidence,
+                "freshness_seconds": (
+                    None
+                    if bundle.budget.freshness is None
+                    else bundle.budget.freshness.total_seconds()
+                ),
+                "max_latency_ms": bundle.budget.max_latency_ms,
+            },
+            "actors": bundle.actors,
+            "relationships": bundle.relationships,
+            "scene": bundle.scene,
+            "episodes": bundle.episodes,
+            "facts": bundle.facts,
+            "procedures": bundle.procedures,
+            "affect": bundle.affect,
+            "traits": bundle.traits,
+            "conflicts": bundle.conflicts,
+            "unknowns": bundle.unknowns,
+            "occurred_from": bundle.occurred_from,
+            "occurred_until": bundle.occurred_until,
+            "frames": bundle.frames,
+            "places": bundle.places,
+            "omitted": bundle.omitted,
+            "chars": bundle.chars,
+            "elapsed_ms": bundle.elapsed_ms,
+            "deadline_exceeded": bundle.deadline_exceeded,
+            "rendered": bundle.render(),
+        }
+    )
 
 
 def _search(service: _Memory, request: QueryRequest) -> SearchResponse:
@@ -480,16 +669,8 @@ def _search(service: _Memory, request: QueryRequest) -> SearchResponse:
 
 
 def _capabilities_response(capabilities: MemoryCapabilities) -> CapabilitiesResponse:
-    """Serialize declared capabilities, ordering modality sets so the document is stable."""
-    values: dict[str, object] = {}
-    for name in CapabilitiesResponse.model_fields:
-        value = getattr(capabilities, name)
-        values[name] = (
-            tuple(sorted(value, key=lambda modality: modality.value))
-            if isinstance(value, frozenset)
-            else value
-        )
-    return CapabilitiesResponse.model_validate(values)
+    """Serialize the one capability document MCP and the CLI publish too."""
+    return CapabilitiesResponse.model_validate(capabilities.document())
 
 
 def _headers(scope: Scope) -> list[tuple[bytes, bytes]]:

@@ -1,19 +1,21 @@
 # Product goals and design principles
 
-MindBridge's product direction is an **Agentic Native Embodied Memory System**: the memory layer
-for agents that perceive and act in the physical world. Its primary product context is a household
-robot for emotional companionship. The same memory contract should also serve desktop robots and
-personal work assistants without requiring a separate architecture.
+MindBridge's product direction is an **Agentic Native Embodied Omni-Modal Memory System**: a memory
+layer designed as a native part of intelligent systems that perceive, reason, and act. Its
+reference product is an emotional companion robot. The same memory contract should also serve
+desktop robots, personal work assistants, chatbots, and voice agents without requiring a separate
+architecture.
 
 MindBridge is the memory system, not the robot, agent framework, sensor stack, or foundation model.
 It turns ordered text, image, video, and audio observations into durable memory that an agent can
 search, question, and trace back to evidence.
 
 > This page defines product direction and the criteria for future design decisions. It is not a
-> claim that every target is implemented in the current release. See [architecture](architecture.md)
-> for the implemented system and [plugin architecture](plugin-architecture.md) for today's extension
-> boundary. Where this page and an owning reference disagree, the reference wins and this page is
-> the page to fix.
+> claim that every target is implemented in the current release. See
+> [product capabilities](product-capabilities.md) for what ships today,
+> [architecture](architecture.md) for its invariants, and
+> [plugin architecture](plugin-architecture.md) for today's extension boundary. Where this page and
+> an owning reference disagree, the reference wins and this page is the page to fix.
 
 ## What the direction means
 
@@ -21,12 +23,22 @@ search, question, and trace back to evidence.
 | --- | --- |
 | Agentic Native | Memory semantics are a first-class agent capability, not a thin wrapper over a vector database. |
 | Embodied | Time, source media, identity signals, and other evidence from the physical world remain meaningful throughout storage and retrieval. |
+| Omni-Modal | Every supported modality works independently or in an arbitrary ordered combination under one memory contract. |
 | Memory System | MindBridge owns memory semantics, retrieval orchestration, and durable local consistency while models and transports remain replaceable. |
 
 The household companion is the reference product because it exercises the hardest requirements:
 long-lived personal context, mixed sensory input, low perceived latency, intermittent connectivity,
 sensitive data, and heterogeneous hardware. Other product forms are supported by generalizing this
 same path, not by adding product-specific forks.
+
+MindBridge pursues four product outcomes:
+
+| Outcome | Commitment |
+| --- | --- |
+| Stronger | Target state-of-the-art memory quality independently across text-only, image-text, video, audio, and omni routes. |
+| Faster | Measure and reduce the complete ingestion, retrieval, and answer path experienced by the agent. |
+| Leaner | Reduce model, compute, memory, storage, energy, and operational cost without trading away quality or durability. |
+| Developer- and agent-friendly | Keep the API concise, typed, discoverable, structured, and consistent across every public surface. |
 
 ## Design goals
 
@@ -38,8 +50,9 @@ modalities and the configured backend capabilities.
 
 | Available input | Intended route |
 | --- | --- |
-| Text | Text embedding, retrieval, and generation |
-| Image or video, with optional text | Native visual-text route |
+| Text only | Text embedding, retrieval, and generation |
+| Image with text | Native image-text route |
+| Video, with optional text | Native video-text route |
 | Audio, with optional text | Native audio-text route, or explicit transcription fallback when required |
 | Multiple media families | Omni route that retains every supported evidence type |
 
@@ -48,9 +61,10 @@ deployment can run it. Omni-first does not mean always invoking the largest mode
 request should remain on the text path, and absent modalities must not add work. Unsupported media
 must never be discarded silently.
 
-The core contract stays intentionally small. User-defined capture formats, sensor records, or
-application objects should be normalized into canonical content at an adapter boundary instead of
-expanding the public API to accept unvalidated `Any` values.
+Input form belongs to the user: capture formats, sensor records, interaction events, and application
+objects may be defined freely outside MindBridge. They normalize into canonical content at an
+adapter boundary so the core API remains small, typed, and validatable instead of accepting
+unvalidated `Any` values.
 
 ### End-to-end memory and search speed
 
@@ -133,7 +147,13 @@ For developers:
   invoke a model and persist identity state, so they are separate operations rather than variants of
   `get`; batching (`add_many`), diagnostics (`search_with_trace`), identity naming, explicit
   feedback (`reinforce`), and index maintenance (`reindex`, `optimize`) are each their own verb for
-  the same reason. An operation that only reshapes an existing result is not one of them.
+  the same reason. So are the three operations that split acknowledgement from enrichment
+  (`capture`, `settle`, `pending_captures`) and the four that manage stored memory rather than add
+  to it (`consolidate`, `forget`, `rollback`, `operations`): each changes when work happens or what
+  authority applies it, not just the shape of a result. `compile` is the one that pays for itself
+  on the common path, because an agent assembling its own prompt otherwise re-derives structure and
+  budget from a flat hit list. An operation that only reshapes an existing result is not one of
+  them.
 - The SDK is the canonical capability inventory. MCP and the product CLI expose the same product
   operations unless a transport limitation is documented explicitly; a gap is implementation work,
   not permission to create different behavior.
@@ -291,15 +311,15 @@ an owning reference for detail. A cell that stops being true is a defect in this
 
 | Concern | Current release | Product direction |
 | --- | --- | --- |
-| Input | Ordered text, image, video, and audio through `ContentInput`; lazy completed observations through `StreamInput`/`add_stream`; async speculative omni recall | More capture formats normalize into the same canonical contract |
+| Input | Ordered text, image, video, and audio through `ContentInput`; lazy completed observations through `StreamInput`/`add_stream`; deferred enrichment through `capture`/`settle`; async speculative omni recall | More capture formats normalize into the same canonical contract |
 | Embedding | Caller explicitly supplies a backend; Jina v5 Omni is the bundled omni adapter | Omni-capable recommended composition with route-specific execution |
 | Generation | Optional caller-supplied backend with explicit capabilities | Omni-capable recommended composition where the deployment supports it |
 | Speech runtime | Built-in FunASR adapter uses `AutoModel` | Additional measured runtime adapters, selected explicitly or by observable policy |
-| Extensions | The explicit model protocols in [architecture](architecture.md#model-and-plugin-boundary), one of them optional; no registry. Declarative configuration builds a subset of the slots; the rest are object injection only | Optional domain capabilities after a real implementation establishes the contract |
+| Extensions | The explicit model protocols in [architecture](architecture.md#model-and-plugin-boundary), including `ConsolidationBackend` for the memory control plane, one of them optional; no registry. Declarative configuration builds a subset of the slots; the rest are object injection only | Optional domain capabilities after a real implementation establishes the contract |
 | Hardware | Runs where Python, dependencies, and the selected models are supported | Verified device-class matrix with published quality, latency, and resource evidence |
 | Developer interfaces | Typed Python API, OpenAPI-documented REST adapter, and a JSON-only product CLI over the same composition | Same small vocabulary and time-to-first-success across supported transports |
 | Execution plane | Python SDK, REST, MCP, and the `mindbridge` CLI all dispatch to one `Memory`; none of them implements its own routing, persistence, or defaults | Every surface reaches the operations the SDK publishes, with no transport gap left undocumented |
-| Agent interfaces | Fourteen typed MCP tools and a `mindbridge` CLI whose commands are the SDK operations kebab-cased plus `doctor`. The common path — `add_memory`, `search_memories`, `ask_memory`, `get_memory`, `list_memories`, `delete_memory` — plus the embodied and identity operations an agent driving a robot needs: `analyze_speech`, `analyze_faces`, `register_speaker`, `register_identity`, `get_identity`, `unlink_identity`, `forget_identity`, `reinforce_memories`. Erasure is exposed, so a privacy request reaches an agent surface. What MCP still does not expose is batching, streaming, diagnostics and index maintenance; each is listed with its reason in [the MCP reference](api/mcp.md#operations-without-a-tool) | SDK-derived MCP and CLI capability parity, machine-readable schemas, and lifecycle integrations |
+| Agent interfaces | Fifteen typed MCP tools and a `mindbridge` CLI whose commands are the SDK operations kebab-cased plus `doctor`. The common path — `add_memory`, `search_memories`, `ask_memory`, `compile_context`, `get_memory`, `list_memories`, `delete_memory` — plus the embodied and identity operations an agent driving a robot needs: `analyze_speech`, `analyze_faces`, `register_speaker`, `register_identity`, `get_identity`, `unlink_identity`, `forget_identity`, `reinforce_memories`. Erasure is exposed, so a privacy request reaches an agent surface, and the composition's capability view is the server instructions rather than a tool. What MCP still does not expose is batching, streaming, diagnostics, index maintenance, deferred capture, and the memory control plane; each is listed with its reason in [the MCP reference](api/mcp.md#operations-without-a-tool) | SDK-derived MCP and CLI capability parity, machine-readable schemas, and lifecycle integrations |
 
 This distinction is deliberate: goals guide what to build next, while current API and deployment
 documentation remain the source of truth for what users can run now.

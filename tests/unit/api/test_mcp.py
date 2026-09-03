@@ -3,7 +3,7 @@
 import base64
 import json
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 
@@ -29,14 +29,21 @@ from mindbridge.types import (
     AssetRef,
     Blob,
     ContentInput,
+    ContextBudget,
+    ContextBundle,
+    ContextConflict,
+    ContextUnknown,
+    ContextUnknownKind,
     FaceObservation,
     IdentityErasure,
     IdentityProfile,
+    MemoryCapabilities,
     MemoryRecord,
     MemoryType,
     Modality,
     ObservationContext,
     Page,
+    ProvisionalActor,
     RetrievalCandidateTrace,
     RetrievalRejection,
     RetrievalScope,
@@ -84,7 +91,13 @@ ERASURE = IdentityErasure(
     face_observations=7,
     speech_segments=11,
 )
-PROFILE = IdentityProfile(identity_id="identity_1", name="Ann", relationship="daughter")
+PROFILE = IdentityProfile(
+    identity_id="identity_1",
+    name="Ann",
+    relationship="daughter",
+    confirmed=True,
+    evidence_ids=("memory_1",),
+)
 ASSET = AssetRef(
     id="asset_image",
     modality=Modality.IMAGE,
@@ -93,6 +106,29 @@ ASSET = AssetRef(
     sha256="a" * 64,
     name="frame.png",
     path=Path("/private/mindbridge/assets/frame.png"),
+)
+
+
+CAPABILITIES = MemoryCapabilities(
+    embedding=frozenset({Modality.TEXT, Modality.IMAGE}),
+    embedding_model="jina-v5-omni",
+    embedding_space="space_1",
+    embedding_dimension=1024,
+    generation=frozenset({Modality.TEXT}),
+    generation_model="qwen3-omni",
+    speaker_recognition=True,
+)
+PROVISIONAL = ProvisionalActor(identity_id="identity_2", memory_ids=("memory_2",))
+CONFLICT = ContextConflict(
+    lineage_id="lineage_1",
+    subject="ana",
+    predicate="location",
+    values=("berlin", "paris"),
+    memory_ids=("memory_1", "memory_2"),
+)
+UNKNOWN = ContextUnknown(
+    kind=ContextUnknownKind.BUDGET_EXCLUDED,
+    detail="3 candidates did not fit 24 items and 16000 chars",
 )
 
 
@@ -176,6 +212,22 @@ class FakeMemory:
             )
         )
         return TracedSearchResult(hits=(), trace=_trace())
+
+    @property
+    def capabilities(self) -> MemoryCapabilities:
+        return CAPABILITIES
+
+    def compile(
+        self,
+        goal: ContentInput,
+        *,
+        budget: ContextBudget | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> ContextBundle:
+        self._fail()
+        self.calls.append(("compile", goal, budget, reference_at, scope))
+        return _bundle(budget or ContextBudget(), reference_at or NOW)
 
     def reinforce(self, memory_ids: Sequence[str]) -> int:
         self._fail()
@@ -273,6 +325,7 @@ async def test_mcp_publishes_only_the_flat_local_tools() -> None:
         "add_memory",
         "search_memories",
         "ask_memory",
+        "compile_context",
         "get_memory",
         "list_memories",
         "delete_memory",
@@ -305,6 +358,7 @@ async def test_mcp_publishes_only_the_flat_local_tools() -> None:
             "explain",
         },
         "ask_memory": {"question", "limit", "memory_type", "reference_at", "scope"},
+        "compile_context": {"goal", "budget", "reference_at", "scope"},
         "get_memory": {"memory_id"},
         "list_memories": {"limit", "cursor"},
         "delete_memory": {"memory_id"},
@@ -327,6 +381,9 @@ async def test_mcp_publishes_only_the_flat_local_tools() -> None:
     assert tools["ask_memory"].annotations.read_only_hint is False
     assert tools["delete_memory"].annotations is not None
     assert tools["delete_memory"].annotations.destructive_hint is True
+    # Compiling reads only, but may cache a transcript, so it cannot claim to be read-only.
+    assert tools["compile_context"].annotations is not None
+    assert tools["compile_context"].annotations.read_only_hint is False
     assert tools["get_identity"].annotations is not None
     assert tools["get_identity"].annotations.read_only_hint is True
     assert tools["register_speaker"].annotations is not None
@@ -396,6 +453,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
         "metadata": {"room": "workshop"},
         "context": None,
         "place_id": None,
+        "forgotten_at": None,
     }
     assert searched.structured_content is not None
     assert searched.structured_content["hits"][0]["score"] == 0.9
@@ -489,6 +547,8 @@ async def test_mcp_dispatches_the_embodied_and_identity_operations() -> None:
             "identity_id": "identity_1",
             "name": "Ann",
             "relationship": "daughter",
+            "confirmed": True,
+            "evidence_ids": ["memory_1"],
         }
     }
     assert unlinked.structured_content == {"restored_identity_id": "identity_3"}
@@ -902,6 +962,116 @@ async def test_reinforce_reaches_the_sdk_and_deduplicates_ids() -> None:
     assert _error_envelope(empty)["code"] == "validation_error"
 
 
+async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_paths() -> None:
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        compiled = await client.call_tool(
+            "compile_context",
+            {
+                "goal": "  What should I bring?  ",
+                "budget": {
+                    "max_chars": 2_000,
+                    "max_items": 8,
+                    "memory_types": ["episodic", "semantic"],
+                    "min_confidence": 0.5,
+                    "freshness_seconds": 3_600,
+                    "max_latency_ms": 250,
+                },
+                "reference_at": NOW.isoformat(),
+            },
+        )
+        defaulted = await client.call_tool("compile_context", {"goal": "What should I bring?"})
+
+    assert compiled.is_error is False
+    assert memory.calls == [
+        (
+            "compile",
+            "What should I bring?",
+            ContextBudget(
+                max_chars=2_000,
+                max_items=8,
+                memory_types=frozenset({MemoryType.EPISODIC, MemoryType.SEMANTIC}),
+                min_confidence=0.5,
+                freshness=timedelta(hours=1),
+                max_latency_ms=250,
+            ),
+            NOW,
+            None,
+        ),
+        ("compile", "What should I bring?", None, None, None),
+    ]
+    bundle = compiled.structured_content
+    assert bundle is not None
+    assert bundle["goal"] == "What should I bring?"
+    assert bundle["budget"] == {
+        "max_chars": 2_000,
+        "max_items": 8,
+        "memory_types": ["episodic", "semantic"],
+        "min_confidence": 0.5,
+        "freshness_seconds": 3_600.0,
+        "max_latency_ms": 250,
+    }
+    assert [hit["id"] for hit in bundle["facts"]] == ["memory_1"]
+    assert [hit["id"] for hit in bundle["episodes"]] == ["memory_2"]
+    assert bundle["actors"] == [{"identity_id": "identity_2", "memory_ids": ["memory_2"]}]
+    assert bundle["conflicts"] == [
+        {
+            "lineage_id": "lineage_1",
+            "subject": "ana",
+            "predicate": "location",
+            "values": ["berlin", "paris"],
+            "memory_ids": ["memory_1", "memory_2"],
+        }
+    ]
+    assert bundle["unknowns"] == [
+        {
+            "kind": "budget_excluded",
+            "detail": "3 candidates did not fit 24 items and 16000 chars",
+        }
+    ]
+    assert bundle["frames"] == ["home/map"]
+    assert bundle["places"] == ["kitchen"]
+    assert bundle["relationships"] == [] and bundle["scene"] == []
+    assert bundle["omitted"] == 3
+    assert bundle["chars"] == 42
+    assert (bundle["elapsed_ms"], bundle["deadline_exceeded"]) == (7, False)
+    assert bundle["rendered"].startswith("# Context: What should I bring?")
+    # The bundle serializes hits through the same asset model every other tool uses.
+    assert bundle["episodes"][0]["assets"] == [
+        {
+            "id": "asset_image",
+            "modality": "image",
+            "media_type": "image/png",
+            "size_bytes": 3,
+            "sha256": "a" * 64,
+            "name": "frame.png",
+        }
+    ]
+    assert "/private/mindbridge/assets" not in json.dumps(bundle)
+    assert defaulted.structured_content is not None
+    assert defaulted.structured_content["budget"] == {
+        "max_chars": 16_000,
+        "max_items": 24,
+        "memory_types": None,
+        "min_confidence": 0.0,
+        "freshness_seconds": None,
+        "max_latency_ms": None,
+    }
+
+
+async def test_the_server_greeting_advertises_the_configured_composition() -> None:
+    """An agent learns what this instance supports on connect, without spending a tool call."""
+    async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
+        instructions = client.instructions
+
+    assert instructions is not None
+    assert "Prefer compile_context for task-ready context" in instructions
+    # The greeting embeds the capability document verbatim, so an agent reads every model
+    # identity and every modality set, not the prose subset this used to publish.
+    assert json.loads(instructions[instructions.index("{") :]) == CAPABILITIES.document()
+
+
 def test_the_guard_only_trusts_codes_derived_from_the_exception_tree() -> None:
     """No client path reaches this today; the check is what keeps that true."""
     forged = dict.fromkeys(ENVELOPE_FIELDS)
@@ -932,6 +1102,44 @@ async def test_every_tool_and_argument_carries_usable_prose() -> None:
     assert "backend_not_configured" in cast(str, descriptions["ask_memory"])
 
 
+async def test_a_host_can_withhold_the_identity_tools_from_an_agent() -> None:
+    """Naming people is host authority, so the host decides whether it is on the wire."""
+    identity_tools = {
+        "register_speaker",
+        "register_identity",
+        "get_identity",
+        "unlink_identity",
+        "forget_identity",
+    }
+
+    async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
+        exposed = {tool.name for tool in (await client.list_tools()).tools}
+    server = build_mcp_server(cast(Memory, FakeMemory()), identity_operations=False)
+    async with Client(server) as client:
+        withheld = {tool.name for tool in (await client.list_tools()).tools}
+        refused = await client.call_tool(
+            "register_identity",
+            {"identity_id": "identity_1", "name": "Ann"},
+        )
+
+    assert refused.is_error is True
+    assert len(exposed) == 15
+    assert identity_tools <= exposed
+    assert withheld == exposed - identity_tools
+    assert "Identity operations are not exposed here" in cast(str, server.instructions)
+
+
+async def test_naming_tools_state_that_naming_is_host_authority() -> None:
+    async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+    for name in ("register_speaker", "register_identity"):
+        description = cast(str, tools[name].description)
+        assert "host authority" in description, name
+        assert "operation log" in description, name
+        assert "reversible" in description, name
+
+
 def _record(
     *,
     memory_id: str = "memory_1",
@@ -953,6 +1161,46 @@ def _record(
         occurred_at=occurred_at,
         occurred_end=occurred_end,
         metadata=metadata or {},
+    )
+
+
+def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
+    """Two populated sections, empty ones, one conflict, and one explicit unknown."""
+    return ContextBundle(
+        goal="What should I bring?",
+        reference_at=reference_at,
+        budget=budget,
+        actors=(PROVISIONAL,),
+        relationships=(),
+        scene=(),
+        episodes=(_media_hit(),),
+        facts=(_hit(),),
+        procedures=(),
+        affect=(),
+        traits=(),
+        conflicts=(CONFLICT,),
+        unknowns=(UNKNOWN,),
+        occurred_from=OCCURRED_FROM,
+        occurred_until=OCCURRED_UNTIL,
+        frames=("home/map",),
+        places=("kitchen",),
+        omitted=3,
+        chars=42,
+        elapsed_ms=7,
+        deadline_exceeded=False,
+    )
+
+
+def _media_hit() -> SearchHit:
+    """A hit carrying a stored asset, whose local path must never be serialized."""
+    return SearchHit(
+        id="memory_2",
+        content="The toolbox is blue.",
+        score=0.7,
+        modality=Modality.IMAGE,
+        memory_type=MemoryType.EPISODIC,
+        assets=(ASSET,),
+        created_at=NOW,
     )
 
 

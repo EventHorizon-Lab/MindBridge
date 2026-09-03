@@ -71,14 +71,18 @@ from mindbridge.types import (
     AnswerResult,
     AssetRef,
     Blob,
+    ContextBudget,
+    EvidenceBasis,
     FormationProposal,
     IdentityProfile,
     IndexQuantization,
     MemoryKind,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
     ObservationContext,
+    ProvisionalActor,
     RetrievalScope,
     SearchHit,
     SpatialAnchor,
@@ -1979,13 +1983,13 @@ def test_identity_registration_round_trips_a_relationship(tmp_path: Path) -> Non
 
         memory.register_identity(identity_id, "Alice", relationship="sister")
         assert memory.identity(identity_id) == IdentityProfile(
-            identity_id=identity_id, name="Alice", relationship="sister"
+            identity_id=identity_id, name="Alice", relationship="sister", confirmed=True
         )
 
         # Renaming without naming a relationship must not discard the recorded one.
         memory.register_identity(identity_id, "Alicia")
         assert memory.identity(identity_id) == IdentityProfile(
-            identity_id=identity_id, name="Alicia", relationship="sister"
+            identity_id=identity_id, name="Alicia", relationship="sister", confirmed=True
         )
 
         assert memory.identity("identity_missing") is None
@@ -2011,7 +2015,7 @@ def test_identity_resolves_a_merged_away_id_to_the_surviving_person(tmp_path: Pa
 
         memory.register_identity(survivor, "Alice", relationship="sister")
         assert memory.identity(merged_away) == IdentityProfile(
-            identity_id=survivor, name="Alice", relationship="sister"
+            identity_id=survivor, name="Alice", relationship="sister", confirmed=True
         )
 
 
@@ -2039,11 +2043,245 @@ def test_unlink_identity_reverses_a_corroborated_merge(tmp_path: Path) -> None:
         # half carries none, because the name was asserted about the merged person.
         assert memory.faces(first.id)[0].identity_id != memory.speech(first.id)[0].speaker_id
         assert memory.identity(survivor) == IdentityProfile(
-            identity_id=survivor, name="Alice", relationship="sister"
+            identity_id=survivor, name="Alice", relationship="sister", confirmed=True
         )
         assert memory.identity(merged_away) == IdentityProfile(identity_id=merged_away)
 
         assert memory.unlink_identity("identity_missing") is None
+
+
+def test_naming_a_person_records_a_typed_assertion_bound_to_the_identity(tmp_path: Path) -> None:
+    """A name is knowledge about a person, not a label on a row.
+
+    No former and no consolidator are configured here on purpose: naming rests on the host's
+    authority, so it must not require a reasoning backend to be reachable.
+    """
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=1,
+    ) as memory:
+        identity_id = _linked_identity(memory)
+        memory.register_identity(identity_id, "Alice", relationship="sister")
+
+        assertions = [
+            record
+            for record in memory.list().items
+            if record.context is not None and record.context.kind is MemoryKind.ENTITY
+        ]
+        assert len(assertions) == 1
+        context = assertions[0].context
+        assert context is not None
+        assert assertions[0].content == "Alice is a recognized person, sister."
+        assert context.identity_id == identity_id
+        assert context.basis is EvidenceBasis.USER_STATEMENT
+        assert context.subject == "Alice"
+        assert context.value == "sister"
+        assert context.visible is True
+        assert context.evidence_ids == ()
+
+        # Re-asserting the same claim is idempotent; a rename supersedes through one lineage.
+        memory.register_identity(identity_id, "Alice")
+        renamed_id = memory.list().items[0].id
+        memory.register_identity(identity_id, "Alicia")
+        contents = {hit.content for hit in memory.search("Alicia")}
+
+    assert renamed_id == assertions[0].id
+    assert "Alicia is a recognized person, sister." in contents
+    assert "Alice is a recognized person, sister." not in contents
+
+
+def test_naming_is_auditable_and_rollback_restores_the_previous_name(tmp_path: Path) -> None:
+    """Mishearing a name must be reversible in both directions, index included."""
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=1,
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+
+        memory.register_identity(identity_id, "Li", relationship="neighbour")
+        memory.register_identity(identity_id, "Li Hua")
+
+        logged = memory.operations()
+        assert [entry.trigger for entry in logged] == [MemoryTrigger.MANUAL, MemoryTrigger.MANUAL]
+        assert memory.identity(identity_id) == IdentityProfile(
+            identity_id=identity_id, name="Li Hua", relationship="neighbour", confirmed=True
+        )
+        assert '"speaker_name":"Li Hua"' in memory.get(record.id).content
+
+        assert memory.rollback(logged[0].operation_id) is True
+
+        # The retracted name is gone from the projection, the registry, and the indexed text.
+        assert memory.identity(identity_id) == IdentityProfile(
+            identity_id=identity_id, name="Li", relationship="neighbour", confirmed=True
+        )
+        assert '"speaker_name":"Li"' in memory.get(record.id).content
+        contents = {hit.content for hit in memory.search("Li")}
+        assert "Li is a recognized person, neighbour." in contents
+        assert "Li Hua is a recognized person, neighbour." not in contents
+
+        # Rolling the same operation back twice is a no-op, and erasure takes the name with it.
+        assert memory.rollback(logged[0].operation_id) is False
+        memory.forget_identity(identity_id)
+        assert all("recognized person" not in hit.content for hit in memory.search("Li"))
+        assert '"speaker_name":null' in memory.get(record.id).content
+
+
+def test_deleting_the_standing_assertion_does_not_resurrect_a_retracted_name(
+    tmp_path: Path,
+) -> None:
+    """The projection reads standing assertions only, so a retraction cannot come back.
+
+    Deleting the assertion a name currently projects must leave the person unnamed. Falling
+    back to an assertion that a rollback retired would let a retracted name return through the
+    delete path, which is the same audit-versus-registry contradiction the rollback ordering
+    guard exists to prevent.
+    """
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=1,
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+
+        memory.register_identity(identity_id, "Li")
+        memory.register_identity(identity_id, "Li Hua")
+        superseding = next(
+            entry
+            for entry in memory.operations()
+            if entry.operation.claim is not None and entry.operation.claim.name == "Li Hua"
+        )
+        assert memory.rollback(superseding.operation_id) is True
+
+        standing = next(
+            item.id
+            for item in memory.list().items
+            if item.context is not None
+            and item.context.kind is MemoryKind.ENTITY
+            and item.context.identity_id == identity_id
+            and item.context.subject == "Li"
+        )
+        assert memory.delete(standing) is True
+
+        profile = memory.identity(identity_id)
+        assert profile is not None and profile.name is None
+        content = memory.get(record.id).content
+        assert '"speaker_name":"Li"' not in content
+        assert '"speaker_name":"Li Hua"' not in content
+
+
+def test_naming_rollbacks_happen_newest_standing_first(tmp_path: Path) -> None:
+    """A reversal that changes nothing must say so, and must not resurrect a retracted name.
+
+    Reversing a naming operation that a later naming already displaced used to return True and
+    change nothing, after which reversing the standing one restored the middle name even though
+    its own operation was marked rolled back: the audit trail said the name was retracted while
+    the registry answered to it.
+    """
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=1,
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+
+        memory.register_identity(identity_id, "Li")
+        memory.register_identity(identity_id, "Li Hua")
+        memory.register_identity(identity_id, "Li Hua Ming")
+        by_name = {
+            entry.operation.claim.name: entry
+            for entry in memory.operations()
+            if entry.operation.claim is not None
+        }
+
+        # The middle assertion is not in force, so reversing it is refused rather than claimed.
+        assert memory.rollback(by_name["Li Hua"].operation_id) is False
+        assert memory.identity(identity_id).name == "Li Hua Ming"  # type: ignore[union-attr]
+        assert '"speaker_name":"Li Hua Ming"' in memory.get(record.id).content
+        standing = {
+            entry.operation_id for entry in memory.operations() if entry.rolled_back_at is not None
+        }
+        assert standing == set()
+
+        # Reversing the standing one restores its predecessor, name and index together.
+        assert memory.rollback(by_name["Li Hua Ming"].operation_id) is True
+        assert memory.identity(identity_id).name == "Li Hua"  # type: ignore[union-attr]
+        assert '"speaker_name":"Li Hua"' in memory.get(record.id).content
+
+        # Now the middle one is in force, so the same call that was refused above succeeds.
+        assert memory.rollback(by_name["Li Hua"].operation_id) is True
+        assert memory.identity(identity_id).name == "Li"  # type: ignore[union-attr]
+        assert '"speaker_name":"Li"' in memory.get(record.id).content
+        assert all(
+            "Li Hua" not in hit.content
+            for hit in memory.search("recognized person")
+            if hit.context is not None and hit.context.identity_id == identity_id
+        )
+
+
+def test_unlink_identity_stops_the_index_quoting_the_other_persons_name(tmp_path: Path) -> None:
+    """Reversing a merge must repaint the indexed text, not only the identity rows.
+
+    A merge writes the surviving person's name into every stored transcript projection of the
+    voice it absorbed. Restoring that voice as its own unnamed identity while leaving the name
+    burned into `memory_records.content` makes the reversal a lie: search still answers to the
+    retracted name, and the retrieved transcript still attributes the words to the wrong person.
+    """
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        index_speech=True,
+    ) as memory:
+        first = memory.add(Blob(b"first video", "video/mp4", "first.mp4"))
+        face_id = memory.faces(first.id)[0].identity_id
+        voice_id = memory.speech(first.id)[0].speaker_id
+        assert voice_id is not None
+
+        # Naming the face first makes it the merge target, so the voice is the half that is
+        # merged away and later restored -- the direction in which a name is burned in.
+        memory.register_identity(face_id, "Bob")
+        second = memory.add(Blob(b"second video", "video/mp4", "second.mp4"))
+        memory.faces(second.id)
+        assert memory.speech(first.id)[0].speaker_id == face_id
+        assert '"speaker_name":"Bob"' in memory.get(first.id).content
+
+        assert memory.unlink_identity(voice_id) == voice_id
+
+        assert memory.identity(voice_id) == IdentityProfile(identity_id=voice_id)
+        for record in (first, second):
+            content = memory.get(record.id).content
+            assert "Bob" not in content
+            assert f'"speaker_id":"{voice_id}"' in content
+        # Bob is still Bob, so his naming assertion stands; what must be gone is every document
+        # of the restored person's memories that answered to it.
+        index = _FakeIndex.instances[-1]
+        assert all(
+            "Bob" not in document.content
+            for document in index.documents.values()
+            if document.embedding.memory_id in {first.id, second.id}
+        )
+        assert {hit.id for hit in index.lexical_search("Bob")} == {
+            document.embedding.embedding_id
+            for document in index.documents.values()
+            if document.content == "Bob is a recognized person."
+        }
 
 
 @pytest.mark.parametrize("value", ["x" * 256, "bad\nline", ""])
@@ -2521,15 +2759,21 @@ def test_opt_in_speech_indexing_makes_registered_names_retrievable(
         assert '"speaker_name":"Alicia"' in memory.get(first.id).content
         assert '"speaker_name":"Alicia"' in memory.get(second.id).content
         assert '"speaker_name":"Alice"' in second.content
-        assert {document.embedding.object_part for document in index.documents.values()} == {
-            0,
-            1,
-            2,
-        }
+        speech_documents = tuple(
+            document
+            for document in index.documents.values()
+            if document.embedding.memory_id in {first.id, second.id}
+        )
+        assert {document.embedding.object_part for document in speech_documents} == {0, 1, 2}
         assert all(
             "Alicia" in document.content and speaker_id not in document.content
-            for document in index.documents.values()
+            for document in speech_documents
         )
+        # Naming is now its own retrievable claim, and the retracted name is superseded rather
+        # than left standing beside the current one.
+        contents = {hit.content for hit in memory.search("Alicia")}
+        assert "Alicia is a recognized person." in contents
+        assert "Alice is a recognized person." not in contents
 
 
 def test_retrieval_projection_is_stable_across_opaque_speaker_ids(tmp_path: Path) -> None:
@@ -2752,7 +2996,13 @@ def test_speaker_rename_refreshes_indexed_memory_after_reopen(tmp_path: Path) ->
 
         assert '"speaker_name":"Alicia"' in refreshed.content
         assert '"speaker_name":"Alice"' not in refreshed.content
-        assert [hit.id for hit in reopened.search("Alicia")] == [record.id]
+        # Naming also asserts the name as its own retrievable claim, and the retracted "Alice"
+        # assertion is superseded rather than left beside it.
+        hits = {hit.id: hit.content for hit in reopened.search("Alicia")}
+        assert record.id in hits
+        assert sorted(set(hits.values()) - {refreshed.content}) == [
+            "Alicia is a recognized person."
+        ]
 
 
 def test_speaker_registration_rolls_back_when_refresh_embedding_fails(tmp_path: Path) -> None:
@@ -3035,10 +3285,14 @@ def test_add_many_deduplicates_one_model_and_store_batch(
         store: LocalStore,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
+        *,
+        formation_pending_at: datetime | None = None,
     ) -> tuple[bool, ...]:
         batch = tuple(memories)
         store_batches.append(tuple(memory.memory_id for memory in batch))
-        result: tuple[bool, ...] = original(store, batch, embeddings)
+        result: tuple[bool, ...] = original(
+            store, batch, embeddings, formation_pending_at=formation_pending_at
+        )
         return result
 
     monkeypatch.setattr(LocalStore, "write_memories", counted_write)
@@ -3230,8 +3484,10 @@ def test_concurrent_adds_share_one_durable_index_flush(
         store: LocalStore,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
+        *,
+        formation_pending_at: datetime | None = None,
     ) -> tuple[bool, ...]:
-        result = original(store, memories, embeddings)
+        result = original(store, memories, embeddings, formation_pending_at=formation_pending_at)
         committed.wait(timeout=3)
         return result
 
@@ -3277,8 +3533,12 @@ def test_reindex_replays_an_add_committed_after_its_sqlite_scan(
         store: LocalStore,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
+        *,
+        formation_pending_at: datetime | None = None,
     ) -> tuple[bool, ...]:
-        result = original_write(store, memories, embeddings)
+        result = original_write(
+            store, memories, embeddings, formation_pending_at=formation_pending_at
+        )
         add_committed.set()
         return result
 
@@ -3672,6 +3932,69 @@ def test_path_media_uses_native_dense_search_and_cas_lifecycle(tmp_path: Path) -
 
         assert memory.delete(record.id) is True
         assert not record.assets[0].path.exists()
+
+
+def _table_counts(data_dir: Path) -> dict[str, int]:
+    with closing(sqlite3.connect(data_dir / "state.sqlite3")) as connection:
+        names = tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        )
+        return {
+            name: int(connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0])
+            for name in names
+        }
+
+
+def test_delete_leaves_no_trace_of_the_record_in_any_table_or_blob(tmp_path: Path) -> None:
+    """Deletion completeness: what a deleted record contributed is gone, everywhere.
+
+    Blobs are content-addressed and shared, so one is removed only once no memory references
+    it. The audit log is the deliberate exception and is asserted separately.
+    """
+    audio = Blob(b"spoken audio bytes", "audio/wav", "voice.wav")
+    image = Blob(b"portrait bytes", "image/png", "portrait.png")
+
+    with Memory(
+        tmp_path,
+        embedder=_FakeModels(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        index_speech=True,
+    ) as memory:
+        heard = memory.add(("red note one", audio))
+        echoed = memory.add(("red note two", audio))
+        seen = memory.add(("red portrait", image))
+        memory.speech(heard.id)
+        memory.faces(seen.id)
+        blobs = {path.name for path in (tmp_path / "assets").rglob("*") if path.is_file()}
+        assert len(blobs) == 2
+        populated = _table_counts(tmp_path)
+        assert populated["identity_exemplars"] > 0
+        assert populated["speech_segments"] > 0
+        assert populated["face_observations"] > 0
+        operations = populated["memory_operations"]
+
+        # The shared blob outlives the first of the two memories holding it.
+        assert memory.delete(heard.id) is True
+        assert {path.name for path in (tmp_path / "assets").rglob("*") if path.is_file()} == blobs
+        assert _table_counts(tmp_path)["media_assets"] == 2
+
+        assert memory.delete(echoed.id) is True
+        assert memory.delete(seen.id) is True
+
+        assert [path for path in (tmp_path / "assets").rglob("*") if path.is_file()] == []
+        # `memory_operations` is audit history that outlives the records it names; every other
+        # table holds record content, derived vectors, or a biometric template built from it.
+        remaining = _table_counts(tmp_path)
+        assert remaining["memory_operations"] == operations
+        assert {
+            name: count
+            for name, count in remaining.items()
+            if count and name not in {"memory_operations", "sqlite_sequence", "store_metadata"}
+        } == {}
 
 
 def test_persisted_media_reads_do_not_run_gc_ownership_queries(
@@ -5230,3 +5553,140 @@ def test_add_stream_source_failure_leaves_the_committed_prefix_searchable(
         recovered = memory.search("failing-stream clip", limit=10)
 
     assert {hit.id for hit in recovered} == {record.id for record in prefix}
+
+
+def test_deleting_a_naming_assertion_takes_the_name_out_of_the_registry_and_the_index(
+    tmp_path: Path,
+) -> None:
+    """A naming assertion is an ordinary record, so an ordinary delete must not orphan a name."""
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=1,
+        index_speech=True,
+        minimum_relevance=0,
+    ) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+        memory.register_identity(identity_id, "Li", relationship="neighbour")
+        assertion = next(
+            item.id
+            for item in memory.list().items
+            if item.context is not None and item.context.kind is MemoryKind.ENTITY
+        )
+        assert '"speaker_name":"Li"' in memory.get(record.id).content
+
+        assert memory.delete(assertion) is True
+
+        profile = memory.identity(identity_id)
+        assert profile is not None
+        assert (profile.name, profile.confirmed) == (None, False)
+        assert '"speaker_name":"Li"' not in memory.get(record.id).content
+        assert "Li" not in {hit.content for hit in memory.search("Li")}
+
+
+class _SubjectFormer:
+    """Proposes one STATE claim per source, with the subject spelled as the text asks."""
+
+    formation_capabilities = frozenset({Modality.TEXT})
+    formation_model = "formation-test"
+    formation_space = "formation-test:atomic-v1"
+
+    def form(
+        self,
+        inputs: Sequence[FormationInput],
+    ) -> tuple[tuple[FormationProposal, ...], ...]:
+        return tuple(
+            (
+                FormationProposal(
+                    kind=MemoryKind.STATE,
+                    content=f"{value.content.text} recorded",
+                    subject=value.content.text.split(" prefers ")[0],
+                    predicate="preferred_drink",
+                    value=value.content.text.split(" prefers ")[1],
+                    confidence=0.9,
+                ),
+            )
+            for value in inputs
+        )
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_claim_about_a_named_person_binds_to_them_and_converges_on_one_lineage(
+    tmp_path: Path,
+) -> None:
+    """Section C: the kernel stamps the binding, and the binding is what makes one subject.
+
+    The two proposals spell the person differently on purpose. Only the binding can make them
+    one lineage, so a supersede works across turns that disagree about capitalization.
+    """
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        former=_SubjectFormer(),
+        identity_link_min_assets=1,
+        minimum_relevance=0,
+    ) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+        memory.register_identity(identity_id, "Li")
+
+        memory.add("Li prefers tea")
+        memory.add("  LI  prefers coffee")
+
+        claims = [
+            item
+            for item in memory.list().items
+            if item.context is not None and item.context.kind is MemoryKind.STATE
+        ]
+        contexts = [item.context for item in claims]
+        assert claims and all(context is not None for context in contexts)
+        assert {context.identity_id for context in contexts if context} == {identity_id}
+        assert len({context.lineage_id for context in contexts if context}) == 1
+        # A claim about somebody nobody has named stays unbound.
+        memory.add("Mei prefers water")
+        unbound = [
+            item.context
+            for item in memory.list().items
+            if item.context is not None
+            and item.context.kind is MemoryKind.STATE
+            and item.context.subject == "Mei"
+        ]
+        assert unbound and unbound[0] is not None and unbound[0].identity_id is None
+
+
+def test_compiled_context_reports_a_person_who_is_present_but_unnamed(tmp_path: Path) -> None:
+    """Scenario step 2: a stranger in the room must not be silently missing from context."""
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        minimum_relevance=0,
+    ) as memory:
+        record = memory.add(Blob(b"red stranger video", "video/mp4", "stranger.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+        speaker_id = memory.speech(record.id)[0].speaker_id
+
+        budget = ContextBudget(max_chars=40_000)
+        bundle = memory.compile("red", budget=budget)
+
+        provisional = [entry for entry in bundle.actors if isinstance(entry, ProvisionalActor)]
+        assert {entry.identity_id for entry in provisional} == {identity_id, speaker_id}
+        assert all(entry.memory_ids == (record.id,) for entry in provisional)
+        # A provisional entry is not a hit and buys no item slot.
+        assert all(hit.id != identity_id for hit in bundle.hits)
+        assert f"[{identity_id}] unnamed person present (provisional identity" in bundle.render()
+
+        memory.register_identity(identity_id, "Li")
+        named = memory.compile("red", budget=budget)
+
+    assert [entry.identity_id for entry in named.actors if isinstance(entry, ProvisionalActor)] == [
+        speaker_id
+    ]

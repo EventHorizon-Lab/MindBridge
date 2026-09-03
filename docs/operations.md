@@ -25,14 +25,11 @@ The REST adapter exposes an unauthenticated liveness endpoint outside `/v1`:
 curl --fail http://127.0.0.1:8000/healthz
 ```
 
-```json
-{"status":"ok"}
-```
-
 `/healthz` does not call a model, inspect pending outbox rows, or run retrieval. It proves only that
-the current process can serve the request; initial store and index opening happened before the app
-was constructed. Run any end-to-end canary against a separate directory so production memory is
-not polluted.
+the current process can serve the request; its response also includes the injected `Memory`'s live
+embedding, generation, transcription, vision, face, formation, speaker-recognition, and streaming
+capabilities. Initial store and index opening happened before the app was constructed. Run any
+end-to-end canary against a separate directory so production memory is not polluted.
 
 ## Backup
 
@@ -101,6 +98,27 @@ If Zvec cannot open or appears corrupt:
 Never edit `search_index_queue`, replace `zvec/`, or move authoritative files while a `Memory` is
 live.
 
+`capture_queue` is deferred enrichment rather than index work, and no operation drains it
+implicitly. A host that uses `capture()` owns the loop that calls `settle()`, and
+`pending_captures()` is what to alarm on: it returns up to `limit` queued records oldest first,
+each with its `enqueued_at`, `attempts`, `last_error`, and `awaiting`, so a result that stays at
+the limit means the loop stopped and those records are unsearchable until it resumes. `awaiting`
+separates a row with no vectors (`"enrichment"`) from one that is already searchable and owes only
+formation (`"formation"`), so a backlog of the second kind is not a recall outage. Drain the queue
+before a planned shutdown, because a queued row survives restart.
+
+A record whose `attempts` reached the `settle(max_attempts=...)` ceiling — three by default — is
+skipped rather than retried, so it stops holding up the records behind it while staying queued and
+visible with the reason it failed. Fix the cause, then either raise the ceiling for one call or
+name the record with `settle(memory_ids=...)`, which ignores the ceiling for the records it names.
+With a formation backend configured, `add()` also holds a queue row for the moment between its
+commit and its formation, so a short-lived entry under a live writer is expected rather than a
+stalled loop.
+
+`memory_operations` is an append-only audit log of every applied control-plane operation.
+`operations()` reads it newest first and `rollback(operation_id)` reverses one; neither is
+scheduled maintenance, and neither is reachable over REST or MCP.
+
 Applications may set Zvec process-wide resources once, before constructing any `Memory`:
 
 ```python
@@ -166,6 +184,16 @@ Every span sets `mindbridge.span.kind` to `operation`, `stage`, or `model`.
 Each `add_stream()` item creates an ordinary `mindbridge.add` span. `search_with_trace()` and
 speculative prefetch use `mindbridge.search`. `AsyncMemory` preserves tracing context across its
 worker thread.
+
+Capture acknowledgement, settle duration, and time to settled are three different numbers and
+are measured separately. `mindbridge.capture` and `mindbridge.settle` are distinct operation
+spans, and the settle span carries the capture-to-settled interval its batch closed:
+
+| Attribute | Meaning |
+| --- | --- |
+| `mindbridge.capture.records_settled` | Records this call made searchable. |
+| `mindbridge.capture.records_failed` | Records that failed and kept their queue row. |
+| `mindbridge.capture.max_time_to_searchable_ms` | Longest capture-to-settled interval this call closed, over every row settled including `add()` recoveries. Absent when nothing settled. |
 
 Model spans include request model, module, batch size, modalities, and
 `mindbridge.model.request_count`. Provider-reported usage is recorded without estimation:

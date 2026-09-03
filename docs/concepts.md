@@ -2,8 +2,9 @@
 
 MindBridge is an embedded memory library. The host application supplies content and model
 capabilities; one local `Memory` owns persistence, retrieval, and grounded-answer orchestration.
-This page gives the mental model. [Architecture](architecture.md) owns implementation invariants,
-and the [Python SDK](api/python-sdk.md) owns exact signatures.
+This page gives the mental model. Start with [product capabilities](product-capabilities.md) for the
+implemented use-case map. [Architecture](architecture.md) owns implementation invariants, and the
+[Python SDK](api/python-sdk.md) owns exact signatures.
 
 ## From input to evidence
 
@@ -30,17 +31,26 @@ Python accepts one content atom or an ordered sequence of atoms:
 | `Blob` | In-memory media bytes with an explicit MIME type |
 | `AssetRef` | Media already stored in the same data directory |
 
-`add`, `search`, and `ask` share this `ContentInput` shape. A URL-shaped `str` remains text;
-MindBridge never downloads it. Fetch remote media in the application, then pass a `Blob` or local
-`Path`. REST and MCP accept neither remote URLs nor server filesystem paths.
+`add`, `search`, and `ask` share this `ContentInput` shape. `add_stream` also accepts `StreamInput`,
+so each completed observation can supply event time, metadata, memory type, transcript or visual
+description, and an `ObservationContext`. A URL-shaped `str` remains text; MindBridge never
+downloads it. Fetch remote media in the application, then pass a `Blob` or local `Path`. REST and
+MCP accept neither remote URLs nor server filesystem paths.
 
 Each record has one modality. Text without media is `text`; text plus one media family keeps that
 media modality; multiple media families produce `omni`.
 
-`Memory.add()` returns a `MemoryRecord`. Its stable ID covers ordered canonical content, media
+`ObservationContext` is caller input for provenance, confidence, world-time validity, metric pose,
+and symbolic `place_id`. The returned `MemoryRecord` exposes the authoritative stored
+`MemoryContext` and place separately. Its stable ID covers ordered canonical content, media
 digests, metadata, event time, memory type, and optional observation context. Repeating the same
 logical add returns the existing record without another model call. Media bytes are independently
 de-duplicated by SHA-256, so records can share one immutable asset.
+
+`delete()` removes the authoritative record and queues removal from the search projection. Shared
+media remains until no record or active lease references it. API deletion is not secure erasure
+from SQLite free pages, WAL files, snapshots, or backups; see the
+[security model](../SECURITY.md#storage-deletion-and-backups).
 
 **Contract:** Metadata is JSON application payload. MindBridge stores and returns it but does not
 interpret it as a retrieval filter, tenant identifier, authorization rule, or isolation boundary.
@@ -85,10 +95,14 @@ Every memory requires an `EmbeddingBackend`. Other capabilities are optional:
 Routing follows each backend's declared atomic modalities. Unsupported media fails explicitly
 instead of being discarded.
 
+Formation is opt-in. The declarative `formation: openai` provider or an injected
+`FormationBackend` may propose finer typed records only after the source observation commits; it
+never replaces the caller's raw record or its `MemoryType`.
+
 Use `Memory.from_config()` for bundled adapters, `Memory.from_plugins()` for an explicit capability
 bundle, or `Memory(...)` for direct injection. `Memory` closes backend objects it receives; an
 adapter may leave its caller-supplied SDK client open. [Configuration](configuration.md) explains
-the three paths and their ownership rules.
+the three paths, formation controls, and ownership rules.
 
 ## Retrieval can return no evidence
 

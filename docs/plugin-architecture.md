@@ -6,6 +6,10 @@ MindBridge uses a stable memory kernel with explicit, typed computation plugins.
 global registry, arbitrary pipeline hooks, automatic package installation, or a second execution
 plane.
 
+This keeps the product rich without making the API sprawling: applications define their own input
+and capture forms at the edge, while replaceable model plugins implement narrow capabilities behind
+the same memory operations.
+
 The kernel owns memory identity and semantics, capability routing, validation, SQLite and media-CAS
 durability, the index outbox, SQLite hydration, and final context construction. A plugin may perform
 inference, but it cannot own or bypass those rules.

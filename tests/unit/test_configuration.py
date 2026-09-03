@@ -31,9 +31,13 @@ from mindbridge import (
     FormationProposal,
     Memory,
     MemoryConfig,
+    MemoryIntent,
     MemoryKind,
+    MemoryOperation,
     MemoryPlugins,
+    MemoryRecord,
     MemorySettings,
+    MemoryTrigger,
     MindBridgeConfig,
     Modality,
     ObservationContext,
@@ -42,6 +46,7 @@ from mindbridge import (
 from mindbridge._telemetry import MODEL_MODULE, TOKEN_TOTAL, VISION_BATCHES_FAILED
 from mindbridge.configuration import resolve_memory_config
 from mindbridge.exceptions import ValidationError
+from mindbridge.memory import declared_capabilities
 from mindbridge.models.base import FormationBackend, GenerationBackend, ModelInput
 from mindbridge.types import IndexQuantization
 
@@ -661,6 +666,104 @@ def test_declarative_formation_stays_off_unless_it_is_configured(
         composition.close()
 
     assert backend.formed == []
+
+
+def test_declarative_consolidation_slot_reaches_the_control_plane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without this slot the control plane needed a Python app loader to be reachable at all."""
+    backend = _ConsolidatingEmbedder()
+    monkeypatch.setattr(recipes_module, "_owned_openai_models", lambda **_v: backend)
+
+    with Memory.from_config(
+        {
+            "data_dir": tmp_path,
+            "embedding": {"provider": "openai", "model": "tiny-test", "dimension": 4},
+            "consolidation": {"provider": "openai", "model": "gpt-5-mini"},
+        }
+    ) as memory:
+        assert "consolidate" in memory.capabilities.operations
+        assert memory.capabilities.document()["consolidation_model"] == "tiny-consolidator"
+        source = memory.add("Ada moved to Berlin in March.")
+        report = memory.consolidate(evidence_ids=(source.id,))
+
+    assert backend.shown == [(source.id,)]
+    assert [record.operation.intent for record in report.operations] == [MemoryIntent.FORGET]
+
+
+def test_declarative_consolidation_stays_off_and_reuses_an_identical_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    built: list[object] = []
+
+    def build(**_values: object) -> _ConsolidatingEmbedder:
+        built.append(_ConsolidatingEmbedder())
+        return cast(_ConsolidatingEmbedder, built[-1])
+
+    monkeypatch.setattr(recipes_module, "_owned_openai_models", build)
+    generation = {"provider": "openai", "model": "gpt-5-mini"}
+    base = {
+        "data_dir": tmp_path,
+        "embedding": {"provider": "openai", "model": "tiny-test", "dimension": 4},
+    }
+
+    off = resolve_memory_config({**base, "generation": generation})
+    try:
+        assert off.plugins.consolidator is None
+        assert "consolidate" not in declared_capabilities(embedder=off.plugins.embedder).operations
+    finally:
+        off.close()
+
+    built.clear()
+    shared = resolve_memory_config(
+        {**base, "generation": generation, "consolidation": dict(generation)}
+    )
+    try:
+        # One client, not two, when the two slots declare exactly the same completion values.
+        assert id(shared.plugins.consolidator) == id(shared.plugins.answerer)
+        assert len(built) == 2  # the embedder and the one shared completion adapter
+    finally:
+        shared.close()
+
+    built.clear()
+    separate = resolve_memory_config(
+        {
+            **base,
+            "generation": generation,
+            "consolidation": {**generation, "base_url": "http://localhost:11434/v1"},
+        }
+    )
+    try:
+        assert id(separate.plugins.consolidator) != id(separate.plugins.answerer)
+        assert len(built) == 3
+    finally:
+        separate.close()
+
+
+class _ConsolidatingEmbedder(TinyEmbedder):
+    """One bundled-adapter stand-in that also fills the consolidation slot."""
+
+    generation_capabilities = frozenset({Modality.TEXT})
+    consolidation_model = "tiny-consolidator"
+    consolidation_recipe = "tiny-consolidator:v1"
+
+    def __init__(self) -> None:
+        self.shown: list[tuple[str, ...]] = []
+
+    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        raise AssertionError("not called")
+
+    def consolidate(
+        self,
+        evidence: Sequence[MemoryRecord],
+        *,
+        trigger: MemoryTrigger,
+    ) -> tuple[MemoryOperation, ...]:
+        self.shown.append(tuple(record.id for record in evidence))
+        return tuple(
+            MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(record.id,))
+            for record in evidence
+        )
 
 
 def test_composition_closes_the_optional_former(tmp_path: Path) -> None:

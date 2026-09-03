@@ -1,20 +1,22 @@
 # Configuration
 
-Configuration has one job: compose model capabilities and local policy around one `Memory`.
-Storage and retrieval semantics stay the same whichever composition path you choose.
+Configuration composes model capabilities and local policy around one `Memory`. Storage and
+retrieval semantics stay the same whichever path you choose.
 
 | Path | Choose it when |
 | --- | --- |
-| `Memory.from_config()` | Bundled providers and SDK-side credentials are enough |
+| `Memory.from_config()` | Bundled providers and pure-data configuration are enough |
 | `Memory.from_plugins()` | The application already groups constructed backends and settings |
 | `Memory(...)` | The application injects individual backends or owns SDK clients directly |
 
-All three paths open the same embedded kernel. An `EmbeddingBackend` is required; generation,
-speech, face, vision-description, and formation capabilities are optional.
+**Contract:** All three paths open the same embedded kernel. `EmbeddingBackend` is required;
+generation, speech, face, vision-description, formation, and consolidation capabilities are
+optional.
 
 ## Install only the surfaces you use
 
-Optional extras add the heavy or protocol-specific runtimes:
+The base package contains local storage, public values, backend protocols, and Zvec. Extras add
+model runtimes and transports:
 
 | Extra | Adds |
 | --- | --- |
@@ -24,11 +26,10 @@ Optional extras add the heavy or protocol-specific runtimes:
 | `server` | FastAPI and Uvicorn REST serving |
 | `mcp` | MCP server transport |
 | `observability` | OpenTelemetry SDK export support |
-| `benchmarks` | Benchmark datasets, scorers, and telemetry |
-| `all` | Every optional surface |
+| `benchmarks` | Benchmark download, parsing, scoring, and telemetry dependencies; datasets are downloaded separately |
+| `all` | The exact union of every optional surface |
 
-The base package already contains local SQLite storage, the Zvec index, public values, and the
-backend protocols.
+For example:
 
 ```bash
 uv add "mindbridge[local,openai]"
@@ -66,16 +67,17 @@ with Memory.from_config(config) as memory:
 ```
 
 `AsyncMemory.from_config()` accepts the same shape. Use `MindBridgeConfig.model_validate()` when a
-host needs validation before opening storage. Unknown fields, unknown providers, and out-of-range
-values are rejected rather than ignored or coerced; numeric and Boolean values are strict.
-Declarative configuration owns every adapter it creates and closes it with the memory.
+host needs validation before opening storage.
+
+**Contract:** Unknown fields and providers are rejected. Numeric and Boolean values are strict;
+invalid values are not silently coerced. Declarative composition owns and closes every adapter it
+creates.
 
 ### Provider fields
 
-Bundled provider fields are, with "connection fields" meaning `base_url`, `api_key`, `timeout`,
-and `max_retries`:
+In this table, connection fields are `base_url`, `api_key`, `timeout`, and `max_retries`:
 
-| Slot and provider | Required fields | Optional fields and defaults |
+| Slot and provider | Required | Optional defaults |
 | --- | --- | --- |
 | `embedding: jina-omni` | — | `dimension=1024`, `device=None`, `batch_size=32` |
 | `embedding: sentence-transformers` | `model`, `revision` | `dimension=None`, `device=None`, `batch_size=32` |
@@ -83,77 +85,102 @@ and `max_retries`:
 | `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `video_limit=8`, `min_video_seconds=None`, `extra_body=None`, plus connection fields |
 | `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
 | `vision: openai` | — | `model=gpt-5-mini`, `modalities=[image]` (image and/or video only), `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
+| `consolidation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
 | `speech: funasr` | — | `device=auto` |
 | `speech: openai` | — | `model=whisper-1`, `space=None`, plus connection fields |
 | `face: opencv` | `detector_model`, `recognizer_model` | `score_threshold=0.9`, `nms_threshold=0.3`, `top_k=5000`, `frame_interval_ms=1000`, `max_video_frames=300` |
 
-Every OpenAI slot accepts `base_url=None`, `api_key=None`, `timeout=None`, and `max_retries=None`.
-The official SDK then applies its own defaults and, for an unset `api_key`, reads its standard
-credentials including `OPENAI_API_KEY`.
+If `api_key` is unset, the official SDK uses its standard credential lookup, including
+`OPENAI_API_KEY`. Each OpenAI slot builds a separate client and can instead receive its own
+`api_key`, endpoint, timeout, and retry policy. `api_key` is a Pydantic `SecretStr`, so dumps and
+representations mask it, but a configuration file still contains a secret. Prefer environment
+lookup or a caller-owned client when the file could be committed or shared.
 
-Each slot builds its own client, so each takes its own `api_key`. That is what lets one
-composition point `embedding` at a local server and `generation` at a hosted one: a single
-environment variable cannot describe two endpoints with different credentials. The field is a
-Pydantic `SecretStr`, so the value is masked in `model_dump()`, in `repr()`, and therefore in
-anything that serialises a configuration -- but it is still a secret in a file. Prefer the SDK's
-environment lookup, or an injected caller-owned client, wherever the file would be committed or
-shared. Atomic generation modalities are `text`, `image`, `video`, and `audio`.
+Atomic capability declarations contain only `text`, `image`, `video`, and `audio`. OpenAI
+embedding requires at least one modality. Jina dimensions are `32`, `64`, `128`, `256`, `512`, or
+`1024`. Positive fields must be greater than zero; retry counts are non-negative; temperature is
+from 0 through 2; seed is from 0 through `2**63 - 1`; face thresholds are from 0 through 1.
 
-Jina dimensions are `32`, `64`, `128`, `256`, `512`, or `1024`. Batch sizes and model token/video
-limits are positive; OpenAI timeouts are positive, retry counts are non-negative, temperature is
-from 0 through 2, and seed is from 0 through `2**63 - 1`. Face thresholds are from 0 through 1.
 `generation.video_limit` caps retrieved evidence videos in one answer request; question media has
-priority, and `None` disables that evidence-video count. `generation.min_video_seconds` answers a
-shorter video as four ordered stills instead, which is what an endpoint that rejects very short
-clips needs; it requires the model to accept images and is unset by default. `formation` has no
-`video_limit` or `min_video_seconds` because
-it shapes an answer rather than a formation proposal; the slot otherwise takes the same fields as
-`generation`, since the adapter derives its formation model and space from exactly those values.
-`vision` takes the same completion fields as `formation`, but its `modalities` accepts only
-`image` and `video`, because it is the visual capability set rather than a generation one.
-`generation`, `formation`, and `vision` are separate slots and separate clients: setting one never
-enables another. See [automatic formation over a local server](#automatic-formation-over-a-local-server)
-for what that slot costs and what a local endpoint has to implement, and
-[visual descriptions](#visual-descriptions) for the write-path cost of the vision slot.
+priority, and `None` disables that count. `generation.min_video_seconds` sends a shorter video as
+four ordered stills and requires image support. Formation and consolidation have neither field
+because they shape answer evidence, not proposals.
+
+`vision` takes the same completion fields as `formation`, but its `modalities` accepts only `image`
+and `video`, because it is the visual capability set rather than a generation one. `generation`,
+`formation`, `vision`, and `consolidation` are separate slots and separate clients: setting one
+never enables another. See [visual descriptions](#visual-descriptions) for the write-path cost of
+the vision slot.
+
+## Embedding choices
+
+The embedding model defines durable vector identity, so every memory requires one:
+
+- `jina-omni` is the pinned multimodal recipe used in project examples. Its weights are CC BY-NC
+  4.0. Loading executes pinned upstream code with `trust_remote_code=True`; review that code and
+  license as part of the application's trust boundary.
+- `sentence-transformers` loads an application-selected model at a required immutable 40-character
+  commit revision. The model declares its supported modalities.
+- `openai` defaults to text embedding. For an OpenAI-compatible multimodal server, declare its
+  `modalities` and use `request_format=input` for the embeddings array or
+  `request_format=messages` for chat-style media parts. The request format is part of the embedding
+  space.
+
+Audio has one fallback: a configured speech backend can transcribe it for a text-only embedder.
+Unsupported image or video input fails instead of being stored without visual evidence.
+
+**Contract:** Changing a model, revision, dimension, or input recipe changes the vector space.
+MindBridge refuses unrecognized store metadata mismatches instead of mixing spaces.
+
+**Guidance:** Start a new data directory when intentionally changing embedding space. Reuse an
+existing directory only for a supported bundled migration; see
+[store metadata mismatch](troubleshooting.md#store-metadata-mismatch).
 
 ## Automatic memory formation
 
-The `formation` slot is omitted by default and must stay omitted unless the deployment wants it.
-Configuring it adds one LLM round-trip to every write, after the raw observation has already
-committed. Derived memories are a union with their sources, never a replacement: the raw
-observation stays exactly as it was written and stays retrievable on its own.
+The optional `formation` slot builds the bundled OpenAI-compatible `FormationBackend`. It proposes
+entity, event, state, relation, affect, trait, and response-policy records after the source
+observation commits. Derived records are additive: the raw source stays durable and independently
+retrievable.
 
 ```python
-config = {
-    "embedding": {"provider": "jina-omni"},
-    "formation": {
-        "provider": "openai",
-        "model": "gpt-5-mini",
-        "modalities": ["text", "image"],
-        "max_tokens": 4096,
-    },
-}
+from mindbridge import Memory
+
+with Memory.from_config(
+    {
+        "data_dir": "./data/assistant",
+        "embedding": {"provider": "jina-omni"},
+        "formation": {
+            "provider": "openai",
+            "model": "qwen3-8b",
+            "base_url": "http://127.0.0.1:8080/v1",
+            "api_key": "unused-by-this-local-server",
+            "modalities": ["text"],
+            "temperature": 0.0,
+            "max_tokens": 2048,
+        },
+    }
+) as memory:
+    memory.add("Ada said she prefers tea, and she sounded relieved.")
 ```
 
-What that buys is the typed plane: entity, event, state, relation, affect, trait, and
-response-policy memories, each carrying a validity interval, optional metric spatial pose, and
-optional emotional valence and arousal, all linked back to the source memory as evidence.
+An OpenAI-compatible local server can fill this slot without another adapter. It must implement
+`POST <base_url>/chat/completions`, accept `response_format={"type": "json_object"}`, and return one
+standard choice with a non-empty `message.content`. A `finish_reason` of `length` raises
+`ModelOutputTruncatedError`; increase `max_tokens` instead of accepting partial proposals.
 
-Two fields decide whether it does anything at all:
+Formation stays off when the slot is omitted. Configuring `generation` does not enable it, and the
+two slots use separate clients so they may select different models, endpoints, and credentials.
+`modalities` controls which observations reach the former; unsupported observations are skipped.
+Formation is one completion per `add`, or one batched completion per `add_many`, on the write path.
+A failed call leaves the source observation committed, and retry tracking prevents duplicate
+proposals for sources already formed by the same recipe.
 
-- `modalities` is the formation capability set. An observation whose modalities are not covered is
-  skipped silently and by design, so a text-only declaration means image and video sources never
-  form anything. Declare what the endpoint actually accepts.
-- `max_tokens` bounds a JSON response. Formation treats a truncated response as an error rather
-  than parsing it partially, so too small a budget fails the whole batch.
-
-The bundled adapter answers and forms with the same completion controls, so this slot repeats
-them instead of borrowing the `generation` slot; formation usually wants its own model, token
-budget, or endpoint, and configuring `generation` alone never enables formation. `video_limit` is
-absent because it caps answer evidence only. Formation is idempotent per source memory and
-formation recipe, so a model failure leaves the raw observation durable and the formation
-retryable. See [memory types, time, and decay](memory-types-time-and-decay.md) for the typed
-kinds and their visibility rules.
+MindBridge validates the response envelope and every proposal. Invalid envelopes fail the call;
+invalid individual proposals are dropped and counted by
+`mindbridge.formation.dropped_proposals`. See
+[memory types, time, and decay](memory-types-time-and-decay.md) for the resulting typed records and
+visibility rules.
 
 ## Visual descriptions
 
@@ -205,125 +232,44 @@ Three things bound what it costs and what it can do:
 Description tokens are reported under their own model module, so a deployment that meters usage
 can separate what captioning costs from what answering costs.
 
-## Embedding choices
+## Agentic memory management
 
-The embedding model defines durable vector identity, so every memory requires one:
-
-- `jina-omni` is the pinned multimodal default used in the examples. Its weights are licensed
-  CC BY-NC 4.0 for non-commercial use. Loading it sets `trust_remote_code=True`, with both model
-  and code revisions pinned to the same immutable upstream commit recorded by MindBridge. Review
-  that upstream code as part of the application's dependency trust boundary.
-- `sentence-transformers` loads a model and immutable 40-character commit revision selected by the
-  application. Its supported modalities come from that model.
-- `openai` uses the official SDK and defaults to text embedding. An OpenAI-compatible server may
-  host a multimodal embedding model, so `modalities` declares which atomic modalities it accepts and
-  `request_format` selects how media is carried: `input` posts the standard array, `messages` posts
-  chat-style content parts. Routing reads that declaration, so it decides whether an image or video
-  memory is stored or rejected — left at the default, every non-text write fails with
-  `unsupported_modality`, correctly, because nothing would have embedded the pixels. Audio is the
-  one modality with a fallback: with a `speech` backend configured it is transcribed and the text is
-  embedded. `embedding_space` records the request format, so changing it forces a rebuild rather
-  than silently mixing two spaces.
-
-Changing model, revision, dimension, or input recipe changes the embedding space. Do not point the
-new configuration at an existing directory unless it is an explicitly supported bundled upgrade;
-see [metadata mismatch](troubleshooting.md#store-metadata-mismatch).
-
-## Automatic formation over a local server
-
-`formation` is the only supplier of MindBridge's model-derived semantics: bitemporal validity windows,
-affect, traits, entities, relations, and proposed spatial pose all arrive as `FormationProposal`
-values from this one slot. Its single bundled implementation is the OpenAI SDK adapter, and that
-adapter reads `base_url` like every other OpenAI slot — so **an OpenAI-compatible local server
-already fills the slot, with no additional adapter and no additional dependency.** `llama-server`
-from llama.cpp, vLLM's OpenAI server, and Ollama's compatible endpoint all qualify.
+The optional `consolidation` slot builds the bundled OpenAI-compatible `ConsolidationBackend`,
+which is what `consolidate()` needs. It reads the same completion knobs as `formation`:
 
 ```python
-import os
-
-from mindbridge import Memory
-
-# The official SDK performs its own credential lookup even for an endpoint that checks nothing.
-os.environ.setdefault("OPENAI_API_KEY", "unused-by-a-local-server")
-
 with Memory.from_config(
     {
         "data_dir": "./data/assistant",
         "embedding": {"provider": "jina-omni"},
-        "formation": {
+        "consolidation": {
             "provider": "openai",
-            "model": "qwen3-8b",
-            "base_url": "http://127.0.0.1:8080/v1",
-            "temperature": 0.0,
-            "max_tokens": 2048,
+            "model": "gpt-5-mini",
+            "modalities": ["text", "image", "audio"],
+            "max_tokens": 4096,
         },
     }
 ) as memory:
-    memory.add("Ada said she prefers tea, and she sounded relieved.")
+    for candidate in memory.consolidation_candidates():
+        memory.consolidate(evidence_ids=candidate.memory_ids, trigger=candidate.trigger)
 ```
 
-A local endpoint that authenticates nobody still needs a credential in the environment. The
-official SDK resolves its own key when the client is constructed, and declarative configuration has
-no credential field by design, so `resolve_memory_config()` and `Memory.from_config()` raise
-`openai.OpenAIError` when `OPENAI_API_KEY` is unset — before any request reaches the local server.
-Any non-empty placeholder satisfies it. Inject a caller-owned client instead when the placeholder is
-unacceptable.
+Consolidation stays off when the slot is omitted, and `consolidate()` then raises
+`ModelError(reason="backend_not_configured")` while every other operation is unchanged. Declaring
+it flips `consolidate` on in the capability document that `/healthz`, the MCP server
+instructions, and `mindbridge doctor` publish. Unlike formation it is not on the write path: it
+runs only when a host calls `consolidate()`.
 
-### What the local server must implement
+`modalities` becomes the media the backend attaches to its request. Evidence assets in a declared
+modality travel natively, so an image or audio memory with no derived description is readable by
+the loop rather than an empty `content` string it can only propose forgetting; assets in an
+undeclared modality are left out instead of failing the pass.
 
-- `POST <base_url>/chat/completions` with the standard request and response shape. Formation uses
-  chat completions only; it never calls embeddings, transcription, or streaming.
-- A reply with exactly one choice at `index` 0, carrying `finish_reason` and a non-empty
-  `message.content` string. Anything else is refused rather than partially stored.
-- `response_format={"type": "json_object"}`, which every formation request sends. A server that
-  ignores the field still works if the model returns one JSON object anyway, but nothing recovers a
-  prose reply.
-- Enough output budget for the whole batch. `finish_reason == "length"` raises
-  `ModelOutputTruncatedError` instead of storing a truncated set, so raise `max_tokens` rather than
-  retrying.
-- `seed`, `temperature`, `max_tokens`, and `extra_body` are forwarded only when configured, so a
-  server that rejects one of them stays usable as long as you leave it unset.
-
-MindBridge supplies the system prompt and the reply schema; the local model does not need to know
-them in advance, but it does have to obey them. Validation is strict per proposal: one unknown
-field, one unusable `kind`, or one out-of-range `confidence` discards that whole proposal and the
-count is published on `mindbridge.formation.dropped_proposals`, so the loss is visible rather than
-silent. Damage to the envelope itself -- unparseable JSON, a missing observation, an unexpected
-top-level field -- still fails the whole call, and a `finish_reason` of `length` raises rather than
-storing a truncated set. A small local model is where that bites, so pin `temperature` at `0.0` and
-check a handful of observations before trusting an unattended deployment.
-
-### `formation` is not `generation`
-
-They are separate slots over separate clients, which is deliberate rather than incidental:
-
-- Configuring one never enables the other, in either direction.
-- Each slot builds its own SDK client. Pointing `generation` and `formation` at the same URL therefore
-  opens two connection pools against one server. That costs one extra pool and changes nothing
-  about correctness — and it is what lets the two slots differ, which is the useful arrangement
-  here: a capable remote answerer on the read path, a local former on the write path, or the
-  reverse. Inject one caller-owned `OpenAI` client into `OpenAIModels` when a single pool matters
-  more than declarative configuration.
-- `formation` accepts no `video_limit` or `min_video_seconds`: both shape the media an answer
-  request carries, and a formation proposal is not an answer.
-
-### Reachable is not default
-
-`formation` defaults to `None`, and that default is not a placeholder for an unfinished feature.
-Formation is one chat completion per `add` — per batch for `add_many` — on the write path, and the
-call happens *after* the raw observation commits. A rejected reply therefore raises from `add` with
-the observation already durable and searchable; the store records which observations a formation
-space has already covered, so a retry re-forms only what is still missing rather than duplicating
-proposals.
-
-An internal controlled comparison of competing write paths measured *not* extracting on the write
-path ahead by 15.9 and 22.0 points on its two arms. The same comparison found that keeping the raw
-observation **and** the derived records loses nothing, while replacing the raw observation with
-extraction does lose. MindBridge's former is that additive shape, so the penalty is not what makes
-the slot opt-in — cost is, together with the deployment choice of which model sees every
-observation. Turn it on for the semantics it supplies, on evidence from your own corpus; see
-[benchmarking](benchmarking.md) for what a quality claim has to report. Leaving it off costs
-nothing: no model call, no optional dependency, and no change to any other operation.
+When `consolidation` declares exactly the same values as `generation` or `formation`, the
+composition reuses that adapter rather than opening a second client against the same endpoint.
+Any difference — a different model, endpoint, or credential — builds its own. See
+[the memory management loop](memory-types-time-and-decay.md#memory-management-loop) for what a
+consolidator may propose and what the kernel refuses.
 
 ## Local memory settings
 
@@ -334,16 +280,21 @@ alias):
 | --- | --- | --- |
 | `index_speech` | `True` | Persist configured speech analysis during `add` |
 | `index_quantization` | `none` | Zvec projection mode: `none`, `fp16`, `int8`, or `rabitq` |
-| `minimum_relevance` | `0.10` | Floor on evidence relevance: the cosine the dense route reports, or the demoted full-text contribution when only the lexical route matched, times the observation's own confidence |
+| `minimum_relevance` | `0.10` | Floor on query-relevant evidence before retention and reinforcement ranking |
 | `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1` |
 | `evidence_budget_chars` | `None` | Widen `ask` grounding while the evidence fits this budget; raises a floor, never a ceiling; `None` grounds on exactly `limit` |
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
-| `reinforce_on_answer` | `true` | Count the evidence `ask()` cited, so retrieval favours it later |
+| `reinforce_on_answer` | `True` | Count the evidence `ask()` cited, so retrieval favours it later |
 | `speaker_similarity` | `0.78` | Voice identity match threshold (uncalibrated; see below) |
 | `speaker_margin` | `0.05` | Voice identity ambiguity margin |
 | `face_similarity` | `0.363` | Face identity match threshold |
 | `face_margin` | `0.05` | Face identity ambiguity margin |
 | `identity_link_min_assets` | `2` | Distinct assets a voice-and-face pair must share before they merge |
+
+A memory declares its composition through `Memory.capabilities`, which reports the modalities,
+model identities, and configured backends the routing layer reads, including
+`consolidation_model` when a consolidator is injected. `GET /healthz` and the MCP server
+instructions publish that same view.
 
 Thresholds and margins accept values from `0` through `1`. Relevance is floored at `0`, so
 `minimum_relevance=0` admits every candidate and disables the weak-evidence floor; a zero ambiguity margin disables the corresponding tie rejection. A zero
@@ -415,8 +366,8 @@ deployment's cameras.
 
 ## Direct adapter injection
 
-Direct injection is the boundary for custom protocols, custom SDK clients, proxies, or credentials
-that do not belong in declarative data:
+Direct injection is the boundary for custom protocols, caller-owned SDK clients, proxies, and
+connection pooling:
 
 ```python
 from openai import OpenAI
@@ -433,34 +384,45 @@ with OpenAI(timeout=30.0, max_retries=3) as client:
         embedder=JinaOmniEmbedder(),
         answerer=models,
     ) as memory:
-        print(memory.ask("What should I remember?").answer)
+        memory.add("The spare key is in the blue toolbox.")
+        print(memory.ask("Where is the spare key?").answer)
 ```
 
-`Memory` closes the adapter objects passed to it. `OpenAIModels.close()` deliberately leaves a
-caller-supplied SDK client open, so the outer client context remains the application's
-responsibility. Credentials, retries, timeouts, proxies, and connection pooling also remain SDK
-configuration.
+`Memory` closes the adapter objects passed to it. `OpenAIModels.close()` leaves a caller-supplied
+OpenAI client open, so the outer client context remains the application's responsibility.
 
-Two capability slots behave differently from the declarative catalog:
+`former=` accepts a custom `FormationBackend` and `consolidator=` a `ConsolidationBackend`;
+declarative `formation: openai` and `consolidation: openai` supply the bundled adapter for those
+slots. `vision_describer=` accepts a `VisionDescriptionBackend`, for a custom or non-bundled adapter;
+declarative `vision: openai` supplies the bundled one. `add` and `add_many` call it for every
+embedder whenever a visual asset has no description yet, and `AsyncVisionStream` additionally calls
+it at finality when the embedder lacks native image support and no external `VisionPartial`
+supplied a description, so speculative retrieval has a query before finality.
 
-- `former=` takes a `FormationBackend` directly, for a custom or non-bundled adapter that proposes
-  typed memories after a raw observation commits. The declarative `formation` slot above builds the
-  bundled OpenAI adapter for the same slot, and the command line fills it with `--former NAME`
-  from the same recipe table as `--embedder` and `--answerer`. Configuring `generation` never
-  enables automatic formation, because a former is a model call per observation on the write path.
-  It stays opt-in on every path.
-- `vision_describer=` takes a `VisionDescriptionBackend` directly, for a custom or non-bundled
-  adapter. The declarative `vision` slot above builds the bundled OpenAI adapter for the same
-  slot, and configuring `generation` never enables it, because a describer is a model call per
-  visual on the write path. `add` and `add_many` call it for every embedder whenever a visual
-  asset has no description yet. `AsyncVisionStream` additionally calls it at finality, when the
-  embedder lacks native image support and no external `VisionPartial` supplied a description, so
-  speculative retrieval has a query before finality.
+`OpenAIModels` implements both reasoning protocols on its generation client, so one adapter can
+fill `answerer=`, `former=`, and `consolidator=`:
 
-Use `MemoryPlugins` with `Memory.from_plugins()` when these constructed adapters should travel as
-one value. `resolve_memory_config()` is for hosts that need a `MemoryComposition` before opening
-storage; close that composition unless its plugins are transferred to a `Memory`. Ordinary
-applications should prefer `Memory.from_config()`.
+```python
+models = OpenAIModels(generation_model="gpt-5-mini")
+memory = Memory(
+    "./data/assistant",
+    embedder=JinaOmniEmbedder(),
+    answerer=models,
+    former=models,
+    consolidator=models,
+)
+```
 
-For every constructor and protocol field, see the [Python SDK reference](api/python-sdk.md). For
-benchmark-only environment variables, see [benchmarking](benchmarking.md).
+`Memory` closes each distinct adapter once, so passing one object to several slots is safe.
+Omitting `consolidator=` leaves `consolidate()` unavailable and every other operation unchanged;
+see [the memory management loop](memory-types-time-and-decay.md#memory-management-loop) for what a
+consolidator is allowed to propose.
+
+Use `MemoryPlugins` with `Memory.from_plugins()` when constructed adapters should travel as one
+value. `resolve_memory_config()` is for hosts that need a `MemoryComposition` before opening
+storage; close it unless its plugins are transferred to a `Memory`. Ordinary applications should
+prefer `Memory.from_config()`.
+
+For exact constructor, protocol, and configuration types, use the
+[Python SDK reference](api/python-sdk.md). For benchmark-only environment variables, use
+[benchmarking](benchmarking.md).

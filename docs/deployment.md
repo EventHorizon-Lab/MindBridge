@@ -26,6 +26,9 @@ Before starting the owner, verify:
 - Python 3.10 through 3.14 and compatible 64-bit wheels exist for Zvec and every selected backend.
 - The data directory is on one local, durable filesystem with working SQLite WAL, file locking,
   atomic rename, and durable writes.
+- The Python build links SQLite 3.35 or newer with the JSON1 extension, which is compiled in by
+  default from 3.38. `consolidation_candidates` reads the operation log with `json_tree`, so a
+  build without it fails that one call.
 - The service account alone can read the directory, model credentials, and backups.
 - Disk capacity covers SQLite, original media, the derived index, and temporary rebuild or
   compaction space.
@@ -106,8 +109,9 @@ uvicorn my_application:app --host 127.0.0.1 --port 8000 --workers 1
 
 `create_app()` does not own or close either resource. It also adds no authentication,
 authorization, TLS, rate limiting, quota, or audit log. Bind to a trusted interface or put the app
-behind the deployment's existing gateway or middleware. Keep `/healthz` protected consistently
-even though it returns only liveness.
+behind the deployment's existing gateway or middleware. Keep `/healthz` protected consistently; it
+reports liveness and the live composition's capability declaration, not model or retrieval
+readiness. The app publishes nine product routes under `/v1`.
 
 Do not retry a timed-out request blindly. Adds are content-idempotent, but the SQLite commit can
 precede a transport timeout or index failure; preserve or recover the stable returned ID.
@@ -133,10 +137,12 @@ with Memory.from_config(
     build_mcp_server(memory).run("stdio")
 ```
 
-`build_mcp_server()` does not close `memory`. A stdio server inherits the host user's filesystem,
-environment, and model credentials. If the host chooses SSE or streamable HTTP, it must add
-authentication, authorization, TLS, request limits, and rate limiting. MCP error subjects may
-contain owner-local paths.
+`build_mcp_server()` does not close `memory`. It reads `memory.capabilities` once while building
+the server and publishes it as the server instructions, so build the server after the composition
+is final. A stdio server inherits the host user's filesystem, environment, and model credentials.
+If the host chooses SSE or streamable HTTP, it must add authentication, authorization, TLS, request
+limits, and rate limiting. The server publishes fifteen tools; MCP error subjects may contain
+owner-local paths.
 
 ## Media and model placement
 

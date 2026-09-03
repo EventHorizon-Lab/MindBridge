@@ -18,6 +18,7 @@ work: the application decides when an observation is complete and normalizes it 
 | Need | API |
 | --- | --- |
 | Lazily add completed independent observations | `Memory.add_stream()` or `AsyncMemory.add_stream()` |
+| Acknowledge completed observations without waiting for models | `Memory.capture()` with `Memory.settle()`, or any stream API with `capture=True` |
 | Search while one query snapshot is changing | `AsyncOmniPrefetch` |
 | Associate speculative snapshots with final commits | `AsyncCaptureStream` |
 | Normalize PCM, VAD, and ASR state | `AsyncAudioStream` |
@@ -64,6 +65,34 @@ backpressure and identify a failing item as zero-based `contents[index]` in the 
 
 Mutable ASR hypotheses, incomplete media, and repeatedly overwritten file paths are not completed
 observations. Keep them out of durable `add_stream()` input.
+
+## Fast capture
+
+Use `capture()` instead of `add()` when the observation is final but the caller cannot wait for
+transcription, embedding, indexing, and formation — a device that must acknowledge a burst of
+finals, or a turn loop that would otherwise block on the slowest model. `capture()` returns after
+the SQLite commit; the record becomes searchable when the host calls `settle()`.
+
+```python
+for observation in burst:
+    memory.capture(observation)
+
+while memory.settle(limit=32):
+    pass
+```
+
+Loop on what `settle()` returns rather than on `pending_captures()`: a record that reached the
+retry ceiling stays queued on purpose, so a loop that waits for the queue to empty never ends.
+`pending_captures()` is how you then see which record it is and why, and `awaiting` says whether
+a queued record has no vectors yet or is already searchable and owes only formation.
+`settle(memory_ids=...)` runs named records alone and ignores the ceiling for them, so a parked
+capture is retried by hand rather than by raising the ceiling for everything. One settlement runs
+at a time per `Memory`: a concurrent call waits instead of running the same models twice.
+
+**Contract:** keep `add()` where a caller needs the record searchable on return, and keep the
+enrichment loop explicit. Nothing else settles for you, so an application that never calls
+`settle()` accumulates durable memories that `search()`, `ask()`, and `compile()` cannot see. See
+the [Python SDK reference](api/python-sdk.md#memory-operations) for the exact failure semantics.
 
 ## Prefetch a changing query
 
@@ -132,10 +161,34 @@ ID; different IDs may search concurrently. A final or cancel boundary frees that
 reducers additionally accept `context=`, either a fixed `ObservationContext` or a callable read once
 per closed observation, because a capture stream outlives the observations it commits.
 
+`AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream`, and `add_stream()` all accept
+`capture=True`, which commits each final through `capture()` instead of `add()`. That is the
+complete path from continuous observation to acknowledgement: speculative `UPDATE` retrieval, a
+`FINAL` acknowledged after the SQLite commit, and enrichment deferred to `settle()`. Every
+`StreamCommit` then reports `pending_settlement=True`, and the record stays out of `search()`
+until the host settles it. A `StreamInput` transcript or description is folded in at capture time,
+so the deferred commit lands on the same content-addressed record the strong path would have
+written. The default is unchanged: without the flag, a final still commits through `add()` and is
+searchable when the commit yields.
+
+```python
+audio = AsyncAudioStream(async_memory, limit=8, capture=True)
+async for commit in audio.consume(audio_packets()):
+    assert commit.pending_settlement
+
+while await async_memory.settle(limit=32):
+    pass
+```
+
 If final retrieval fails, the observation still commits and `StreamCommit.retrieval_error` carries
 a stable public error code, or `retrieval_failed` for an unclassified exception. Cancellation before
 the final write starts stores nothing. Once that write starts, cancellation waits for the commit and
 then propagates, so no worker writes after a cancelled task has returned.
+
+`AsyncAudioStream` and `AsyncVisionStream` accept a `memory_type` and `context`. The context may be
+one fixed `ObservationContext` for a static sensor or a zero-argument sampler for a moving sensor;
+the sampler is read once when each observation closes, so its metric pose or symbolic `place_id`
+belongs to that durable observation. Speculative updates do not persist the sampled context.
 
 ## Native audio protocol
 
@@ -335,7 +388,7 @@ A spatial pose recorded on a stream observation is retrieved with `RetrievalScop
 [spatial scope](memory-types-time-and-decay.md#spatial-scope) for the same-frame rule and
 [valid time and transaction time](memory-types-time-and-decay.md#valid-time-and-transaction-time)
 for the historical axes. Formation introduces no graph database, and the gate a graph projection
-would have to pass is in the [competitive review](competitive-memory-systems.md).
+would have to pass is in the [benchmark protocol](benchmarking.md#mandatory-controls).
 
 ## Observability
 

@@ -82,7 +82,7 @@ stored content.
 ## Public contracts
 
 The supported Python imports come from `mindbridge`; the supported HTTP surface is under `/v1`,
-and the supported MCP surface is the fourteen tools in `mindbridge.api.mcp`. Changing a
+and the supported MCP surface is the fifteen tools in `mindbridge.api.mcp`. Changing a
 signature,
 response type, exception, endpoint, tool schema, error code, on-disk schema, or console entry point
 is a breaking change and needs tests and documentation in the same patch.

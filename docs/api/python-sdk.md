@@ -62,6 +62,7 @@ Memory(
     vision_describer: VisionDescriptionBackend | None = None,
     face_analyzer: FaceBackend | None = None,
     former: FormationBackend | None = None,
+    consolidator: ConsolidationBackend | None = None,
     index_speech: bool = True,
     index_quantization: IndexQuantization = IndexQuantization.NONE,
     minimum_relevance: float = 0.10,
@@ -78,11 +79,12 @@ Memory(
 ) -> None
 ```
 
-`embedder` is required. `index_speech=True` requires a speech-capable `SpeechBackend` and stores
-transcripts and resolved speaker names with new memories. `index_quantization` changes only the
-rebuildable vector index; supported values are `none`, `fp16`, `int8`, and `rabitq`. The similarity,
-margin, relevance, and decay settings are validated when the instance opens. Their behavior and
-the supported provider configuration fields live in [configuration](../configuration.md).
+`embedder` is required. With a speech-capable `SpeechBackend`, the default `index_speech=True`
+stores transcripts and resolved speaker names with new memories; setting it to `False` defers that
+analysis until `speech()` is called. `index_quantization` changes only the rebuildable vector
+index; supported values are `none`, `fp16`, `int8`, and `rabitq`. The similarity, margin,
+relevance, and decay settings are validated when the instance opens. Their behavior and the
+supported provider configuration fields live in [configuration](../configuration.md).
 
 A plain `TranscriptionBackend` transcribes supported audio/video during `add` regardless of
 `index_speech`; `SpeechBackend` analysis and identity resolution stay behind the explicit flag.
@@ -95,12 +97,15 @@ captions one batch per chat completion, sends a video as four locally decoded st
 the file, accepts only exactly one non-empty caption per input, and retries one malformed reply
 once. A describer failure never fails the write: the memory is stored without a caption and the
 batch is counted on the vision span as `mindbridge.vision.failed_batches`.
-`former` proposes typed memories only after the source observation commits;
-omitting it keeps ordinary add behavior and makes no formation model call. The bundled OpenAI
-former is selected by the declarative `formation` slot, which stays off unless it is configured;
-see [configuration](../configuration.md#automatic-memory-formation).
-`identity_link_min_assets` is the number of distinct co-occurring assets required before a face
-and voice are bound; its default is `2`.
+
+`former` proposes typed memories after a source observation commits; omitting it keeps ordinary
+add behavior and makes no formation model call. The bundled OpenAI former is selected by the
+declarative `formation` slot, which stays off unless it is configured; see
+[configuration](../configuration.md#automatic-memory-formation). `consolidator` proposes the
+control-plane operations `consolidate()` applies; the bundled OpenAI backend is selected by the
+declarative `consolidation` slot, which stays off unless it is configured, and omitting it leaves
+`consolidate()` unavailable and every other operation unchanged. See
+[configuration](../configuration.md#agentic-memory-management).
 
 `index_speech` is on by default and is a no-op unless `transcriber` is a `SpeechBackend`, whose
 analysis has already run by the time `add` reaches the index. Set it to `False` to keep transcripts
@@ -116,6 +121,9 @@ those hits and then admits more ranked evidence while its text-equivalent cost f
 rather than imposing a ceiling, so bound a prompt by lowering `limit` and leaving the budget unset.
 The per-setting semantics and calibration notes live in
 [configuration](../configuration.md#local-memory-settings).
+
+`reinforce_on_answer=True` records positive feedback for the hits an answerer actually cites.
+Set it to `False` for evaluations that require one question not to change later rankings.
 
 The two other construction boundaries are:
 
@@ -140,8 +148,8 @@ resolve_memory_config(
 ```
 
 `MemoryPlugins` contains `embedder` plus optional `answerer`, `transcriber`, `vision_describer`,
-`face_analyzer`, and `former`. `MemoryConfig` contains the value-only constructor settings;
-`MemorySettings` is its public alias. `MemoryComposition` contains `data_dir`, `plugins`, and
+`face_analyzer`, `former`, and `consolidator`. `MemoryConfig` contains the value-only constructor
+settings; `MemorySettings` is its public alias. `MemoryComposition` contains `data_dir`, `plugins`, and
 `settings`; call `close()` unless its plugins have been transferred to a `Memory`.
 
 ### Content contract
@@ -209,6 +217,8 @@ add_many(
 
 add_stream(
     contents: Iterable[ContentInput | StreamInput],
+    *,
+    capture: bool = False,
 ) -> Iterator[MemoryRecord]
 ```
 
@@ -216,7 +226,68 @@ add_stream(
 transaction; each optional per-item sequence must have the same length as `contents`. An empty
 batch returns `()`. `add_stream` requests one item at a time and makes each yielded record durable
 and searchable before requesting the next. If a later item fails, earlier records remain and the
-error `subject` identifies `contents[N]`.
+error `subject` identifies `contents[N]`. With `capture=True`, `add_stream` commits each item
+through `capture` instead of `add`: every yielded record is durable and readable but has no
+vectors, and the host owes the matching `settle` before any of them is searchable.
+
+```text
+capture(
+    content: ContentInput,
+    *,
+    occurred_at: datetime | None = None,
+    occurred_end: datetime | None = None,
+    metadata: Mapping[str, object] | None = None,
+    memory_type: MemoryType = MemoryType.SEMANTIC,
+    context: ObservationContext | None = None,
+) -> MemoryRecord
+
+settle(
+    *,
+    limit: int = 100,
+    max_attempts: int = 3,
+    memory_ids: Sequence[str] | None = None,
+) -> int
+pending_captures(
+    *,
+    limit: int = 100,
+    memory_ids: Sequence[str] | None = None,
+) -> tuple[PendingCapture, ...]
+```
+
+`capture` returns after the SQLite commit and before any model call. It returns the same
+content-addressed record `add` returns for the same input, so capturing and then adding the same
+content is one memory. A captured record is durable and readable through `get` and `list`
+immediately, and invisible to `search`, `ask`, and `compile` until it is settled. It applies the
+same embedder-capability check `add` applies, so content `add` would reject raises here instead of
+becoming a durable record no `settle` could ever finish. Settling appends the text the models
+derive to `content` and never rewrites what the caller supplied; see
+[public values](#public-values) for how derived sections are marked.
+
+`settle` runs the deferred stages — speech identity, transcription, embedding, the SQLite embedding
+commit, the index flush, and formation — over up to `limit` captured records in enqueue order, and
+returns how many it settled. Every record it read is attempted: a model or storage failure on one
+leaves it queued with its attempt count and reason while the rest still settle, and the first
+failure is raised once the batch is done with `subject` set to that memory ID. A record whose
+attempt count has reached `max_attempts` is skipped rather than retried, so one record that can
+never settle does not block the queue; it stays queued and visible, and raising `max_attempts`
+retries it. `add` and `add_many` settle a queued record they encounter whatever its attempt count,
+so their searchable-on-return contract holds. `search`, `ask`, `compile`, `close`, and opening a
+store never settle: time to searchable is the host's choice, so call `settle` from an idle loop, a
+timer, or after a capture burst.
+
+Pass `memory_ids` to settle only those records. Naming a record is the host asking for it by hand,
+so `max_attempts` is ignored for that call: that is how a record parked at the ceiling is retried,
+how one is quarantined by never naming it, and how one is settled ahead of the queue. IDs that are
+not queued are skipped. One settlement runs at a time per `Memory`; a concurrent `settle` waits
+rather than running the same models twice, and then usually finds the queue already drained.
+
+`pending_captures` returns up to `limit` records whose deferred work is not finished, oldest first,
+as `PendingCapture` values (`memory_id`, `enqueued_at`, `attempts`, `last_error`, `awaiting`).
+`awaiting` is the stage the record is stopped at: `"enrichment"` has no vectors and cannot be
+returned by `search`, while `"formation"` is already embedded, indexed, and searchable and owes
+only the formation `add` holds a row for between its commit and its model call. Pass `memory_ids`
+to ask whether specific records are still waiting: one that is absent from the result is not
+pending, which means it is settled or was never stored, and `get` tells the two apart.
 
 ```text
 search(
@@ -268,6 +339,25 @@ metadata, media, vectors, paths, or model output. `ask` requires an answerer and
 retrieved hits the answerer actually used.
 
 ```text
+compile(
+    goal: ContentInput,
+    *,
+    budget: ContextBudget | None = None,
+    reference_at: datetime | None = None,
+    scope: RetrievalScope | None = None,
+) -> ContextBundle
+```
+
+`compile` runs the same retrieval path once with a candidate limit of
+`max(100, 3 * budget.max_items)`, then partitions, filters, and budgets the result into a
+`ContextBundle`. It calls no generation model, stores no memory, and never resolves a conflict;
+like `search`, and through the same helper, it may cache a transcript for spoken query media.
+`budget.max_latency_ms` is a deadline checked between stages, never a cancellation, and the bundle
+reports `elapsed_ms`, `deadline_exceeded`, and the `unknowns` the request implied but the bundle
+does not carry. `ask` is unchanged. [Context compilation](../context-compilation.md) owns the
+contract.
+
+```text
 capabilities -> MemoryCapabilities  # property
 get(memory_id: str) -> MemoryRecord
 speech(memory_id: str) -> tuple[SpeakerSegment, ...]
@@ -293,25 +383,169 @@ enrollment call that creates a person from a photograph or a voice sample. Regis
 the recognizers have already observed instead: add the media, read `faces()` or `speech()` for its
 `identity_id`, then name it. Omitting `relationship` on a later call leaves any recorded
 relationship intact, so renaming never silently discards it, and there is deliberately no way to
-clear one. `identity` resolves an ID through any merge alias and returns what has been registered,
+clear one. Registration writes a typed naming assertion and projects the profile from it, so it
+also adds a searchable memory record, appears in `operations()`, and is reversible with
+`rollback()`; see
+[typed assertions](../memory-types-time-and-decay.md#naming-a-person-is-a-typed-assertion).
+`identity` resolves an ID through any merge alias and returns what has been registered,
 so an observation captured before a merge still reaches the surviving person. `unlink_identity`
 reverses one face-and-voice merge, returning the restored ID or `None` when the merge is not
 reversible; it resets the pair's accumulated evidence rather than suppressing the pair, so a voice
-and face that keep co-occurring are corroborated and merged again. `reinforce`
+and face that keep co-occurring are corroborated and merged again. Restoring a voice also rewrites
+the indexed transcript projection in the same commit, so search stops answering to the name the
+reversed merge had attributed to it. `reinforce`
 records explicit positive feedback and returns the number of existing distinct memories updated.
-`list` uses an opaque keyset cursor. `delete` is idempotent and reports whether the record existed.
-`reindex` rebuilds Zvec from authoritative SQLite embeddings without calling the embedder and
-returns the number of memories rebuilt. `optimize` merges and flushes staged index vectors.
-Repeated `close()` calls are harmless.
+`list` uses an opaque keyset cursor. `delete` is idempotent and reports whether the record existed;
+what it removes is spelled out below. `reindex` rebuilds Zvec from authoritative SQLite embeddings
+without calling the embedder and returns the number of memories rebuilt. `optimize` merges and
+flushes staged index vectors. Repeated `close()` calls are harmless.
+
+#### What `delete` removes
+
+`delete` is physical forgetting, the third and strongest of
+[the three forms](../context-os.md#forgetting-is-three-operations). It is not a visibility change:
+after it returns, the record's content is not recoverable from MindBridge. Media is
+content-addressed and shared, so a blob and its descriptor go only once no remaining memory
+references them; deleting one of two memories holding the same file keeps the file.
+
+| Removed with the record | Left behind, and why |
+| --- | --- |
+| The `memory_records` row, and with it every typed row keyed on it: `memory_semantics`, `memory_versions`, `memory_evidence` for it, `formation_runs`, and its `capture_queue` row | -- |
+| Every `embeddings` row, and the matching Zvec vectors, through the durable index outbox `delete` drains before returning | -- |
+| Its `memory_assets` links, and then any `media_assets` descriptor and content-addressed blob no other memory still references | A blob a second memory still references, until that memory is deleted too |
+| Everything keyed on a removed asset: `speech_analyses`, `speech_segments`, `face_analyses`, `face_observations`, and the cached transcript on the descriptor | -- |
+| An `identities` row and its `identity_exemplars` biometric template, once the removed observations were its last and it carries no registered name, relationship, alias, or cross-modal evidence | A *named* or merged person, who is an assertion a caller made rather than a by-product of one recording. `forget_identity` erases a person |
+| Derived memories whose last active evidence was this record | A derived memory with other evidence, whose link to this record is retired rather than deleted, keeping its lineage auditable. Its own text may still paraphrase what the record said; that is consolidation, and `delete` on the derived memory removes it |
+| -- | `memory_operations` rows naming the id. The operation log is append-only audit history: it records that an operation happened, over which ids, with which proposal and rationale. Rewriting it to hide a deleted id would make `rollback` unsound and the log unable to answer what a deletion followed. It holds ids, a proposal, and a rationale -- never the deleted record's content or its media |
+
+`capabilities` reports what the composition's backends declare rather than what a provider name
+suggests, so an agent surface can advertise the instance instead of discovering a missing backend
+by failing on first use. `consolidation_model` is set only when a `ConsolidationBackend` is
+injected. `GET /healthz` and the MCP server instructions publish the same view.
+
+### Memory management operations
+
+```text
+consolidation_candidates(*, limit: int = 32) -> tuple[ConsolidationCandidate, ...]
+
+consolidate(
+    *,
+    evidence_ids: Sequence[str] | None = None,
+    query: ContentInput | None = None,
+    limit: int = 32,
+    trigger: MemoryTrigger = MemoryTrigger.MANUAL,
+) -> ConsolidationReport
+
+forget(memory_ids: Sequence[str]) -> MemoryOperationRecord | None
+rollback(operation_id: int) -> bool
+operations(*, limit: int = 100) -> tuple[MemoryOperationRecord, ...]
+```
+
+`consolidation_candidates` is the durable trigger: it answers "what needs deliberation?" from
+state the store already committed, with no queue, timer, or scheduler behind it. Hand a row's
+`memory_ids` straight to `consolidate(evidence_ids=..., trigger=...)`. It needs no backend and
+takes no lock, so a host loop may poll it cheaply.
+
+| `trigger` | Row means | `evidence_count` |
+| --- | --- | --- |
+| `EVIDENCE` | A derived record gained independent evidence no standing operation has weighed. `memory_ids` is that record followed by the new sources. | New evidence links |
+| `CONTRADICTION` | One lineage carries two or more current visible claims with different values, the same disagreement `compile()` reports as a `ContextConflict`. It stays listed until a `CORRECT` retires one side. | Distinct conflicting values |
+| `FEEDBACK` | A record was confirmed through `reinforce()`, or cited by an `ask()` answer under the default `reinforce_on_answer`, since a standing operation last saw it. | Recorded confirmations |
+
+`QUERY_FAILURE`, `PRESSURE`, and `IDLE` remain labels a caller may pass to `consolidate`: nothing
+in the store records a failed query, memory pressure, or an approved idle window, and inventing
+bookkeeping for a trigger no host asks for would be a scheduler by another name. A rolled-back
+operation weighed nothing, so its evidence becomes due again.
+
+`consolidate` requires a `consolidator` and gathers the evidence set from `evidence_ids`, else the
+active search result for `query`, else the newest `limit` active records. Forgotten and hidden
+records never reach the backend. The backend proposes `MemoryOperation` values; the kernel
+validates each one, applies only the effect its intent allows, and commits it in its own
+transaction with its own log row. A pass is therefore not atomic: `ConsolidationReport.operations`
+lists exactly what committed and `.rejected` exactly what the kernel refused, and a proposal
+refused after an earlier one committed does not undo it. Rejected proposals are returned with a
+reason instead of raising, so one bad proposal does not discard the pass. Every operation carries
+`operation_key = sha256(canonical operation JSON + recipe)`; a key already applied and not rolled
+back is rejected as `"duplicate"`.
+
+| Intent | Kernel checks | Effect | `rollback` |
+| --- | --- | --- | --- |
+| `REINFORCE` | One derived target in the window whose current version is not retired; every evidence ID shown, existing, not the target, not already linked | Adds independent evidence; confidence and visibility recompute | Retires those evidence rows |
+| `CONSOLIDATE` | Valid proposal; at least one shown evidence ID, each still standing; every `target_ids` entry among this proposal's own evidence; affect cue modality and spatial frame present in some source | New derived record citing every source, `forgotten_at` set on any named target, and the lineage supersession the kernel's own rule implies | Deletes the created records, un-forgets the targets, and restores the `superseded` versions |
+| `CORRECT` | Every target in the window, existing, and derived (`kind != OBSERVATION`) | Retires current versions at transaction time | Carries a new version with the same interval |
+| `FORGET` | Every target in the window, existing, and not already forgotten | Sets `forgotten_at` | Clears `forgotten_at` |
+| `IDENTIFY` | Identity exists; every evidence ID shown and existing, each still standing; at least one cited memory contains that identity through a speech or face observation | Commits the `ENTITY` naming assertion the kernel builds from `claim`, recomputes `identities.name` and the indexed speech text | Retracts the assertion, restores the `superseded` version, and repaints both |
+
+`REINFORCE`, `CORRECT`, and `FORGET` refuse a bound naming assertion with `"naming_assertion"`.
+A name is not an inference to be corrected: reverse it with `rollback` of the `IDENTIFY` that
+asserted it, which is what recomputes the projection. `IDENTIFY` adds `"unknown_identity"` and
+`"identity_not_in_evidence"` to the rejection vocabulary. An `IDENTIFY` proposed by a backend
+carries basis `MODEL_INFERENCE`, so it stays hidden, and out of `identities.name`, until two
+independent evidence groups support it, exactly like an inferred `TRAIT`. `register_identity` and
+`register_speaker` are the host entry points for the same intent: they assert the name on the
+host's authority with basis `USER_STATEMENT`, cite no evidence, and are visible immediately.
+
+Named targets and cited evidence are bounded by the window the kernel gathered: a proposal naming
+a target outside it is rejected as `"target_not_shown"` before any write. The window is the shown
+set plus, when the host supplied `evidence_ids`, the IDs it named -- a hidden derived record is
+exactly what `REINFORCE` and `CORRECT` exist for and can never appear in the shown set, so naming
+it stays the host's decision. A `query` or the default window never widens it.
+
+Lineage supersession is the one effect that reaches outside the window, and it is the kernel's
+own deterministic rule rather than a backend choice: a new `STATE` or user-stated `TRAIT` retires
+the current version of every other record in the same lineage whose validity it overlaps,
+including records nobody showed the backend. The log row names those `(memory_id, version)` pairs
+in `MemoryOperationRecord.superseded` and `rollback()` restores exactly them.
+
+Multi-target operations are all or nothing. A proposal whose targets are not all eligible is
+rejected whole -- `"unknown_target"`, `"not_derived"`, or `"already_forgotten"` -- so an applied
+row's `target_ids` are always the IDs the operation actually acted on. The apply transaction
+re-checks the preconditions validation read: a target or cited source that was forgotten,
+corrected, deleted, or linked in between makes the proposal `"stale"` with nothing written. There
+is no expected-revision token to supply; the in-transaction re-check is the whole guarantee.
+
+`target_ids` on a `CONSOLIDATE` is **consolidation forgetting**: sources the new derived record
+replaces in ordinary recall. They are retired in the same transaction that creates the derived
+record, stay linked to it as evidence so lineage survives, and are named in the log row's
+`forgotten_ids` so the operation reads as one reversible act. It is deliberately not a FORGET
+intent, not two unrelated operations, and not `delete()`; the operation log distinguishes the
+three by intent, by `forgotten_ids`, and by not appearing at all. One pass may not contradict
+itself either: an operation that would retire evidence an earlier accepted operation in the same
+pass built on, or that builds on evidence an earlier one retired, is rejected as
+`"inconsistent_batch"`.
+
+`forget` is the host entry point for the FORGET intent and needs no backend. The host names the
+IDs and is the authority, so no window bounds it. It is cognitive forgetting only: recall skips
+the record while `get()`, `list()`, and `MemoryRecord.forgotten_at` keep it for audit. Use
+`delete` to remove a record and its media. It is all or nothing like a proposal: an unknown ID
+raises `MemoryNotFoundError` the way `get` and `delete` do, and an empty sequence or a set in
+which any record is already forgotten returns `None` having changed nothing.
+
+`rollback` reverses one applied operation and returns `False` for an unknown or already-reversed
+`operation_id`, and for one a later standing operation has built on. Operations that touched one
+lineage reverse newest first: while a second consolidation's derived record supersedes the first
+one's, rolling the first one back would leave two current versions in the lineage, so it is
+refused and its log row stays standing until the newer one is reversed. The same rule orders a
+sequence of namings: reversing a naming a later one displaced is refused rather than reported
+as success. `operations` lists the log newest first. Physical deletion is not an intent, and
+none of these five operations is exposed on REST or MCP.
+
+The log is sufficient to replay a sequence against a fresh store holding the same sources:
+`operation_key` is a pure function of the operation and its recipe, derived record IDs are
+content-addressed, and both are reproduced exactly on replay. Two values are not reproduced and
+are not meant to be: `applied_at` is re-stamped at replay, and any ID derived from event time
+reproduces only if the fresh store's sources carry the same `occurred_at`. There is no public
+`apply(operation)`; replay means driving a `ConsolidationBackend` that returns the logged
+proposals, which is what `tests/unit/test_memory_control_plane.py` does.
 
 ### Cross-modal identity binding
 
 A face and a voice become one identity only after the same pair co-occurs in
-`identity_link_min_assets` distinct assets. The default `2` avoids binding on a single ambiguous
-co-occurrence: one asset cannot separate "this face spoke" from "this face was listening to someone
-off camera", which is the ordinary case in egocentric capture, where the wearer talks while
-somebody else fills the frame. Set `identity_link_min_assets=1` only when first-observation binding
-is intended.
+`identity_link_min_assets` distinct assets (default `2`). A single asset cannot separate "this
+face spoke" from "this face was listening to someone off camera", which is the ordinary case in
+egocentric capture: the wearer talks while somebody else fills the frame. Binding on one asset
+therefore attaches the wearer's voice to whoever happened to be visible. Set
+`identity_link_min_assets=1` to bind on first co-occurrence.
 
 Counting assets raises the price of that mistake without preventing it: a wearer talks to the same
 person across many clips, so the wrong pair accumulates as fast as a genuine speaker's. Binding is
@@ -355,8 +589,9 @@ recognition and streaming generation are available. It is a field read: it canno
 ### AsyncMemory
 
 `AsyncMemory` has the same constructor, class methods, keyword parameters, defaults, and result
-values as `Memory`, and the same operations except `forget_identity`, which is synchronous only.
-Finite operations are awaited; `close()` is asynchronous. Its stream boundary is:
+values as `Memory`. Finite operations are awaited and `close()` is asynchronous. It mirrors every
+listed operation except `forget_identity`; identity erasure currently requires synchronous
+`Memory`. Its stream boundary is:
 
 ```text
 add_stream(
@@ -378,7 +613,7 @@ AsyncOmniPrefetch(
     reference_at: datetime | None = None,
     occurred_from: datetime | None = None,
     occurred_until: datetime | None = None,
-)
+) -> None
 
 latest: PrefetchResult | None
 submit(query: ContentInput) -> int
@@ -392,8 +627,7 @@ exact final revision and closes the helper. Snapshots reject mutable `Path` atom
 
 ### Async capture streams
 
-The three capture helpers share `limit`, `memory_type`, `reference_at`, and `max_streams`. The two
-packet reducers add `context`, because a capture stream outlives the observations it commits:
+The capture helpers use these signatures:
 
 ```text
 AsyncCaptureStream(
@@ -403,24 +637,27 @@ AsyncCaptureStream(
     memory_type: MemoryType | None = None,
     reference_at: datetime | None = None,
     max_streams: int = 32,
+    capture: bool = False,
 ) -> None
 AsyncAudioStream(
     memory: AsyncMemory,
     *,
     limit: int = 10,
     memory_type: MemoryType | None = None,
-    context: ObservationContext | Callable[[], ObservationContext | None] | None = None,
+    context: StreamContext = None,
     reference_at: datetime | None = None,
     max_streams: int = 32,
+    capture: bool = False,
 ) -> None
 AsyncVisionStream(
     memory: AsyncMemory,
     *,
     limit: int = 10,
     memory_type: MemoryType | None = None,
-    context: ObservationContext | Callable[[], ObservationContext | None] | None = None,
+    context: StreamContext = None,
     reference_at: datetime | None = None,
     max_streams: int = 32,
+    capture: bool = False,
 ) -> None
 
 AsyncCaptureStream.consume(
@@ -437,28 +674,39 @@ AsyncVisionStream.consume(
 `AsyncCaptureStream` treats `update` as speculative retrieval, `final` as the durable write, and
 `cancel` as discard. `AsyncAudioStream` reduces `PCMChunk`, `VADPacket`, `ASRPartial`, and
 `AcousticBoundary`; `AsyncVisionStream` reduces `VisionFrame`, `VisionPartial`, and
-`SceneBoundary`. A `context` callable is read once per closed observation, which is the only moment
-the adapter knows which interval a pose belongs to; a fixed `ObservationContext` is accepted for a
-static sensor. Up to `max_streams` independent `stream_id` values may be active. See
+`SceneBoundary`. `StreamContext` is an `ObservationContext`, a callable sampled once per completed
+observation, or `None`. Up to `max_streams` independent `stream_id` values may be active.
+`capture=True` commits each final through `capture` instead of `add`, so acknowledgement leaves
+the model path and every `StreamCommit` reports `pending_settlement=True`; the host then owes
+`settle` before those records are searchable. The default stays the strong `add`. See
 [omni streaming and interaction memory](../omni-streaming-and-interaction-memory.md) for event
 semantics and complete examples.
 
 ### Root import inventory
 
-These are the supported names exported by `mindbridge`. Anything not listed here is internal.
+These are the 105 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `MemoryCapabilities`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityErasure`, `FaceObservation`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `ProvisionalActor`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
-| Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `SpatialAnchor`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
-| Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
+| Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
+| Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
 | Bundled adapters | `JinaOmniEmbedder`, `SentenceTransformersEmbedder`, `OpenAIModels`, `OpenCVFaceAnalyzer`, `FunASRTranscriber`, `FunASRRecipe`, `DEFAULT_FUNASR_MODEL_ID`, `DEFAULT_FUNASR_RECIPE` |
 | Exceptions | `MindBridgeError`, `ValidationError`, `MemoryNotFoundError`, `SpeakerNotFoundError`, `IdentityNotFoundError`, `ModelError`, `ModelOutputTruncatedError`, `StorageError`, `IndexUnavailableError` |
 
 ### Public values
+
+`MemoryRecord.content` is the caller's text followed by any text the configured models derived
+from the media. Derived sections are appended, never substituted: what the caller supplied stays
+byte-identical at the front, and each derived section is introduced by its own marker line --
+`[transcript:<asset_id>]`, `[visual description:<asset_id>]`, or
+`[speech identities:<asset_id>]` -- so a reader can separate interpretation from evidence and see
+which asset it came from. `add` derives before its first write and `settle` derives after
+`capture` already committed, so both paths leave the same record; the raw media is never rewritten
+and stays in `assets` under its content address.
 
 The principal immutable values are:
 
@@ -467,19 +715,32 @@ The principal immutable values are:
 | `Blob` | `data`, `media_type`, `name` |
 | `AssetRef` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name`, `path`; `is_resolved` property |
 | `StreamInput` | `content`, `occurred_at`, `occurred_end`, `metadata`, `memory_type`, `context`, `transcript`, `description` |
-| `MemoryRecord` | `id`, `content`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `assets`, `modality`, `memory_type`, `context` |
+| `MemoryRecord` | `id`, `content`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `assets`, `modality`, `memory_type`, `context`, `place_id`, `forgotten_at` |
+| `PendingCapture` | `memory_id`, `enqueued_at`, `attempts`, `last_error`, `awaiting` |
 | `SearchHit` | all visible memory fields plus `score` |
 | `AnswerResult` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `Page` | `items`, `next_cursor` |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
-| `IdentityProfile` | `identity_id`, `name`, `relationship` |
+| `IdentityProfile` | `identity_id`, `name`, `relationship`, `confirmed`, `evidence_ids`; the last two are derived from the current visible naming assertion, never stored |
+| `ProvisionalActor` | `identity_id`, `memory_ids`: a recognized person in a compiled bundle's `actors` whom no visible naming assertion names |
+| `IdentityErasure` | `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`, `face_observations`, `speech_segments` |
 | `FaceObservation` | `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
 | `SpatialContext` | `frame_id`, `anchor`, `x`, `y`, `z`, `orientation_xyzw`, `position_uncertainty_m` |
-| `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial` |
-| `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `spatial`, `cue_modality`, `valence`, `arousal` |
-| `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m` |
+| `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial`, `place_id` |
+| `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `identity_id`, `spatial`, `cue_modality`, `valence`, `arousal` |
+| `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m`, `place_id` |
+| `ContextBudget` | `max_chars`, `max_items`, `memory_types`, `min_confidence`, `freshness`, `max_latency_ms` |
+| `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
+| `ContextUnknown` | `kind` (a `ContextUnknownKind`), `detail` |
+| `ProvisionalActor` | `identity_id`, `memory_ids` |
+| `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`; `hits` property and `render()` |
+| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `rationale` |
+| `IdentityClaim` | `identity_id`, `name`, `relationship` |
+| `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `superseded`, `rolled_back_at` |
+| `ConsolidationCandidate` | `trigger`, `memory_ids`, `evidence_count` |
+| `ConsolidationReport` | `operations`, `rejected` as `(MemoryOperation, reason)` pairs |
 | `StreamEvent` | `phase`, `item`, `stream_id` |
-| `StreamCommit` | `record`, `prefetch`, `retrieval_error`, `stream_id` |
+| `StreamCommit` | `record`, `prefetch`, `retrieval_error`, `stream_id`, `pending_settlement` |
 | `PCMChunk` | `data`, `sample_rate_hz`, `channels`, `sample_width_bytes`, `stream_id`, `occurred_at` |
 | `VADPacket` | `active`, `stream_id`, `occurred_at` |
 | `ASRPartial` | `text`, `stream_id`, `occurred_at` |
@@ -487,10 +748,12 @@ The principal immutable values are:
 | `VisionFrame` | `image`, `stream_id`, `occurred_at` |
 | `VisionPartial` | `text`, `stream_id`, `occurred_at` |
 | `SceneBoundary` | `boundary`, `stream_id`, `occurred_at` |
+| `PendingCapture` | `memory_id`, `enqueued_at`, `attempts`, `last_error` |
 | `PrefetchResult` | positive `revision`, `hits` |
 | `TracedSearchResult` | `hits`, `trace` |
 | `RetrievalTrace` | `candidates`, `candidate_limit`, `exhaustive`, `ambiguous` |
 | `RetrievalCandidateTrace` | `memory_id`, `index_ids`, `dense_relevance`, `dense_confidence`, `lexical_relevance`, `lexical_rerank_bonus`, `lexical_match`, `gate_relevance`, `base_relevance`, `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`, `rejected_by` |
+| `MemoryCapabilities` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `consolidation_model`, `speaker_recognition`, `streaming_generation`; `operations` property and `document()` |
 
 `abstained` is a protocol signal, not a refusal rate. The bundled grounded prompt asks for the
 opaque token `[insufficient_evidence]`, and the adapter reports `abstained` when that bracketed
@@ -512,6 +775,8 @@ Enum values are:
 | `RetrievalRejection` | `stale_index`, `occurrence_range`, `missing_memory`, `memory_type`, `minimum_relevance`, `ambiguity`, `limit` |
 | `EmbedTask` | `retrieval.query`, `retrieval.document` |
 | `MemoryKind` | `observation`, `entity`, `event`, `state`, `relation`, `affect`, `trait`, `response_policy` |
+| `MemoryIntent` | `reinforce`, `consolidate`, `correct`, `forget`, `identify` |
+| `MemoryTrigger` | `manual`, `evidence`, `feedback`, `contradiction`, `query_failure`, `pressure`, `idle` |
 | `EvidenceBasis` | `observation`, `user_statement`, `model_inference`, `response_feedback` |
 | `SpatialAnchor` | `observer`, `subject` |
 | `StreamPhase` | `update`, `final`, `cancel` |
@@ -557,6 +822,12 @@ VisionDescriptionBackend.describe(
 FormationBackend.form(
     inputs: Sequence[FormationInput],
 ) -> tuple[tuple[FormationProposal, ...], ...]
+
+ConsolidationBackend.consolidate(
+    evidence: Sequence[MemoryRecord],
+    *,
+    trigger: MemoryTrigger,
+) -> tuple[MemoryOperation, ...]
 ```
 
 Required properties are `embedding_capabilities`, `embedding_model`, `embedding_space`, and
@@ -564,12 +835,17 @@ Required properties are `embedding_capabilities`, `embedding_model`, `embedding_
 `transcription_space` for transcription and speech; `face_capabilities`, `face_model`,
 `face_space`, and `face_analysis_space` for faces; `vision_capabilities` and `vision_model` for
 visual description; `formation_capabilities`, `formation_model`, and `formation_space` for
-formation; and `generation_capabilities` for generation. Every base protocol except the optional
+formation; `consolidation_model` and `consolidation_recipe` for consolidation; and
+`generation_capabilities` for generation. Every base protocol except the optional
 streaming extension implements `close()`.
 
 `form` receives one `FormationInput` per committed source and returns one proposal tuple per
 input, in the same order. A former never writes storage: the kernel validates each proposal
 against the source modality and spatial frame, assigns identity, links evidence, and commits.
+`consolidate` receives the bounded evidence set the kernel chose and may cite only IDs from it;
+like a former it proposes and never writes storage. An `IDENTIFY` proposal carries an
+`IdentityClaim` rather than a `FormationProposal`: the backend names the identity and cites the
+evidence, and the kernel builds the typed assertion.
 
 `ModelInput` contains normalized `text` and resolved `assets`. Speech adapters return
 `SpeechAnalysis(turns, speakers)` using `SpeechTurn` and `SpeakerEmbedding`; face adapters return
@@ -723,10 +999,11 @@ answer text is capped at 4 MiB. Answer fitting reserves media capacity for the q
 highest-ranked evidence that fits, and leaves overflow evidence as text when possible; use a
 provider-specific upload adapter for larger media.
 
-Named recipes are also available as a small, closed construction API:
+Named recipes are available through the supported `mindbridge.recipes` submodule, not as a root
+re-export:
 
 ```text
-from mindbridge import recipes
+import mindbridge.recipes as recipes
 
 recipes.names() -> tuple[str, ...]
 recipes.slots(name: str) -> tuple[str, ...]
@@ -735,6 +1012,7 @@ recipes.probe(name: str) -> str
 recipes.describe(name: str) -> dict[str, object]
 recipes.embedder(name: str, *, load: bool = False) -> EmbeddingBackend
 recipes.answerer(name: str, *, load: bool = False) -> GenerationBackend
+recipes.former(name: str, *, load: bool = False) -> FormationBackend
 recipes.transcriber(
     name: str,
     *,

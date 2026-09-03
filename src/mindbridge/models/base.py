@@ -13,6 +13,9 @@ from mindbridge.types import (
     AnswerResult,
     AssetRef,
     FormationProposal,
+    MemoryOperation,
+    MemoryRecord,
+    MemoryTrigger,
     Modality,
     ObservationContext,
     SearchHit,
@@ -139,6 +142,26 @@ class FormationBackend(Protocol):
         self,
         inputs: Sequence[FormationInput],
     ) -> tuple[tuple[FormationProposal, ...], ...]: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class ConsolidationBackend(Protocol):
+    """One thread-safe model that proposes memory operations over a bounded evidence set."""
+
+    @property
+    def consolidation_model(self) -> str: ...
+
+    @property
+    def consolidation_recipe(self) -> str: ...
+
+    def consolidate(
+        self,
+        evidence: Sequence[MemoryRecord],
+        *,
+        trigger: MemoryTrigger,
+    ) -> tuple[MemoryOperation, ...]: ...
 
     def close(self) -> None: ...
 

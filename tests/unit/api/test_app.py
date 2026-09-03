@@ -4,7 +4,7 @@ import base64
 import inspect
 import json
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -26,12 +26,18 @@ from mindbridge.types import (
     AssetRef,
     Blob,
     ContentInput,
+    ContextBudget,
+    ContextBundle,
+    ContextConflict,
+    ContextUnknown,
+    ContextUnknownKind,
     MemoryCapabilities,
     MemoryRecord,
     MemoryType,
     Modality,
     ObservationContext,
     Page,
+    ProvisionalActor,
     RetrievalCandidateTrace,
     RetrievalRejection,
     RetrievalScope,
@@ -74,6 +80,20 @@ CAPABILITIES = MemoryCapabilities(
     generation=frozenset({Modality.TEXT}),
     generation_model="qwen3-omni",
     speaker_recognition=True,
+)
+
+
+PROVISIONAL = ProvisionalActor(identity_id="identity_2", memory_ids=("memory_2",))
+CONFLICT = ContextConflict(
+    lineage_id="lineage_1",
+    subject="ana",
+    predicate="location",
+    values=("berlin", "paris"),
+    memory_ids=("memory_1", "memory_2"),
+)
+UNKNOWN = ContextUnknown(
+    kind=ContextUnknownKind.BUDGET_EXCLUDED,
+    detail="3 candidates did not fit 24 items and 16000 chars",
 )
 
 
@@ -199,6 +219,18 @@ class FakeMemory:
             )
         )
         return TracedSearchResult(hits=(), trace=_trace())
+
+    def compile(
+        self,
+        goal: ContentInput,
+        *,
+        budget: ContextBudget | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> ContextBundle:
+        self._fail()
+        self.calls.append(("compile", goal, budget, reference_at, scope))
+        return _bundle(budget or ContextBudget(), reference_at or NOW)
 
     def reinforce(self, memory_ids: Sequence[str]) -> int:
         self._fail()
@@ -652,8 +684,12 @@ def test_health_reports_the_live_composition() -> None:
         "vision_model": None,
         "face_model": None,
         "formation_model": None,
+        "consolidation_model": None,
         "speaker_recognition": True,
         "streaming_generation": False,
+        # Derived from the backends above: an agent reads which operations it may call instead
+        # of inferring the mapping from a modality set.
+        "operations": ["ask"],
     }
 
 
@@ -749,6 +785,111 @@ def test_batch_creation_carries_every_value_the_memory_identity_uses() -> None:
     ]
     assert response.json()["memories"][0]["occurred_at"] == "2026-08-27T12:00:00Z"
     assert response.json()["memories"][0]["metadata"] == {"room": "workshop"}
+
+
+def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() -> None:
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory)) as client:
+        response = client.post(
+            "/v1/context",
+            json={
+                "goal": "  What should I bring?  ",
+                "budget": {
+                    "max_chars": 2_000,
+                    "max_items": 8,
+                    "memory_types": ["episodic", "semantic"],
+                    "min_confidence": 0.5,
+                    "freshness_seconds": 3_600,
+                    "max_latency_ms": 250,
+                },
+                "reference_at": NOW.isoformat(),
+            },
+        )
+
+    assert response.status_code == 200
+    assert memory.calls == [
+        (
+            "compile",
+            "What should I bring?",
+            ContextBudget(
+                max_chars=2_000,
+                max_items=8,
+                memory_types=frozenset({MemoryType.EPISODIC, MemoryType.SEMANTIC}),
+                min_confidence=0.5,
+                freshness=timedelta(hours=1),
+                max_latency_ms=250,
+            ),
+            NOW,
+            None,
+        )
+    ]
+    bundle = response.json()
+    assert bundle["goal"] == "What should I bring?"
+    assert bundle["budget"] == {
+        "max_chars": 2_000,
+        "max_items": 8,
+        "memory_types": ["episodic", "semantic"],
+        "min_confidence": 0.5,
+        "freshness_seconds": 3_600.0,
+        "max_latency_ms": 250,
+    }
+    assert [hit["id"] for hit in bundle["facts"]] == ["memory_1"]
+    assert [hit["id"] for hit in bundle["episodes"]] == ["memory_2"]
+    # A person the evidence observed whom nobody has named travels beside the ranked hits.
+    assert bundle["actors"] == [{"identity_id": "identity_2", "memory_ids": ["memory_2"]}]
+    assert bundle["conflicts"] == [
+        {
+            "lineage_id": "lineage_1",
+            "subject": "ana",
+            "predicate": "location",
+            "values": ["berlin", "paris"],
+            "memory_ids": ["memory_1", "memory_2"],
+        }
+    ]
+    assert bundle["unknowns"] == [
+        {
+            "kind": "budget_excluded",
+            "detail": "3 candidates did not fit 24 items and 16000 chars",
+        }
+    ]
+    assert bundle["occurred_from"] == "2026-08-27T00:00:00Z"
+    assert bundle["occurred_until"] == "2026-08-28T00:00:00Z"
+    assert bundle["frames"] == ["home/map"]
+    assert bundle["places"] == ["kitchen"]
+    assert bundle["relationships"] == [] and bundle["scene"] == []
+    assert bundle["omitted"] == 3
+    assert bundle["chars"] == 42
+    assert (bundle["elapsed_ms"], bundle["deadline_exceeded"]) == (7, False)
+    assert bundle["rendered"].startswith("# Context: What should I bring?")
+    # The bundle serializes hits through the same asset model every other route uses.
+    assert bundle["episodes"][0]["assets"] == [
+        {
+            "id": "asset_image",
+            "modality": "image",
+            "media_type": "image/png",
+            "size_bytes": 3,
+            "sha256": "a" * 64,
+            "name": "frame.png",
+        }
+    ]
+    assert "/private/mindbridge/assets" not in response.text
+
+
+def test_the_context_route_defaults_to_the_sdk_budget() -> None:
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory)) as client:
+        response = client.post("/v1/context", json={"goal": "What should I bring?"})
+
+    assert response.status_code == 200
+    assert memory.calls == [("compile", "What should I bring?", None, None, None)]
+    assert response.json()["budget"] == {
+        "max_chars": 16_000,
+        "max_items": 24,
+        "memory_types": None,
+        "min_confidence": 0.0,
+        "freshness_seconds": None,
+        "max_latency_ms": None,
+    }
 
 
 def test_unexpected_and_framework_errors_keep_the_flat_envelope() -> None:
@@ -862,6 +1003,46 @@ def _record(
         occurred_at=occurred_at,
         occurred_end=occurred_end,
         metadata=metadata or {},
+    )
+
+
+def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
+    """Two populated sections, empty ones, one conflict, and one explicit unknown."""
+    return ContextBundle(
+        goal="What should I bring?",
+        reference_at=reference_at,
+        budget=budget,
+        actors=(PROVISIONAL,),
+        relationships=(),
+        scene=(),
+        episodes=(_media_hit(),),
+        facts=(_hit(),),
+        procedures=(),
+        affect=(),
+        traits=(),
+        conflicts=(CONFLICT,),
+        unknowns=(UNKNOWN,),
+        occurred_from=OCCURRED_FROM,
+        occurred_until=OCCURRED_UNTIL,
+        frames=("home/map",),
+        places=("kitchen",),
+        omitted=3,
+        chars=42,
+        elapsed_ms=7,
+        deadline_exceeded=False,
+    )
+
+
+def _media_hit() -> SearchHit:
+    """A hit carrying a stored asset, whose local path must never be serialized."""
+    return SearchHit(
+        id="memory_2",
+        content="The toolbox is blue.",
+        score=0.7,
+        modality=Modality.IMAGE,
+        memory_type=MemoryType.EPISODIC,
+        assets=(ASSET,),
+        created_at=NOW,
     )
 
 

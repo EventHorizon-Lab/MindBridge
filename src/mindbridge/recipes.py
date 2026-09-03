@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import (
+    ConsolidationBackend,
     EmbeddingBackend,
     FormationBackend,
     GenerationBackend,
@@ -48,7 +49,7 @@ from mindbridge.types import Modality
 if TYPE_CHECKING:
     from openai import OpenAI
 
-Slot = Literal["embedder", "answerer", "former", "transcriber"]
+Slot = Literal["embedder", "answerer", "former", "consolidator", "transcriber"]
 
 JINA_OMNI = "jina-omni"
 FUNASR = "funasr"
@@ -59,7 +60,7 @@ OPENAI = "openai"
 _SLOTS: Mapping[str, frozenset[str]] = {
     FUNASR: frozenset({"transcriber"}),
     JINA_OMNI: frozenset({"embedder"}),
-    OPENAI: frozenset({"embedder", "answerer", "former", "transcriber"}),
+    OPENAI: frozenset({"embedder", "answerer", "former", "consolidator", "transcriber"}),
 }
 _PARAMETERIZED = frozenset({OPENAI})
 _PROBES: Mapping[str, str] = {JINA_OMNI: "weights", FUNASR: "import", OPENAI: "client"}
@@ -68,6 +69,8 @@ _OPENAI_MODELS: Mapping[str, str] = {
     "answerer": DEFAULT_GENERATION_MODEL,
     # Formation proposes typed memories with the generation model, so it pins the same constant.
     "former": DEFAULT_GENERATION_MODEL,
+    # So does the memory-management loop; both reason with the same completion controls.
+    "consolidator": DEFAULT_GENERATION_MODEL,
     "transcriber": DEFAULT_TRANSCRIPTION_MODEL,
 }
 # MindBridge never reads a credential. The official SDK performs its own documented lookup, so the
@@ -151,6 +154,11 @@ def answerer(name: str, *, load: bool = False) -> GenerationBackend:
 def former(name: str, *, load: bool = False) -> FormationBackend:
     """Return the formation backend one recipe names; the caller owns and closes it."""
     return cast(FormationBackend, _build(name, slot="former", load=load))
+
+
+def consolidator(name: str, *, load: bool = False) -> ConsolidationBackend:
+    """Return the consolidation backend one recipe names; the caller owns and closes it."""
+    return cast(ConsolidationBackend, _build(name, slot="consolidator", load=load))
 
 
 def transcriber(name: str, *, load: bool = False) -> SpeechBackend | TranscriptionBackend:
@@ -293,8 +301,9 @@ def _build(name: str, *, slot: Slot, load: bool) -> object:
     client = _openai_client()
     if slot == "embedder":
         return _OwnedClientModels(client, embedding_model=selected)
-    if slot in ("answerer", "former"):
-        # One adapter serves both: `formation_model` is the generation model it was given.
+    if slot in ("answerer", "former", "consolidator"):
+        # One adapter serves all three: `formation_model` and `consolidation_model` are the
+        # generation model it was given.
         return _OwnedClientModels(client, generation_model=selected)
     return _OwnedClientModels(client, transcription_model=selected)
 

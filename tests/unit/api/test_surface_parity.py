@@ -6,10 +6,11 @@ derived from the code so a drifting default, field, or error code fails instead 
 """
 
 import inspect
+import json
 import re
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
-from typing import cast, get_type_hints
+from typing import Any, cast, get_type_hints
 
 import pytest
 from fastapi import status
@@ -17,7 +18,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel
 
 import mindbridge
-from mindbridge import Memory
+from mindbridge import Memory, cli
 from mindbridge.api import app as rest
 from mindbridge.api import content, errors
 from mindbridge.api import mcp as mcp_adapter
@@ -32,15 +33,22 @@ from mindbridge.exceptions import (
     StorageError,
     ValidationError,
 )
+from mindbridge.memory import declared_capabilities
 from mindbridge.types import (
     AssetRef,
     Blob,
+    ContextBudget,
+    ContextBundle,
+    ContextConflict,
+    ContextUnknown,
     FaceObservation,
     IdentityErasure,
     IdentityProfile,
     MemoryCapabilities,
     MemoryRecord,
+    Modality,
     Page,
+    ProvisionalActor,
     SearchHit,
     SpeakerSegment,
 )
@@ -52,6 +60,7 @@ SHARED_OPERATIONS: dict[str, tuple[str | None, str | None]] = {
     "add_many": ("createMemories", None),
     "search": ("searchMemories", "search_memories"),
     "ask": ("answer", "ask_memory"),
+    "compile": ("compileContext", "compile_context"),
     "get": ("getMemory", "get_memory"),
     "list": ("listMemories", "list_memories"),
     "delete": ("deleteMemory", "delete_memory"),
@@ -73,6 +82,18 @@ UNEXPOSED_OPERATIONS: dict[str, str] = {
     "search_with_trace": "candidate-level retrieval diagnostics with no agent or client action",
     "reindex": "unbounded index maintenance an operator schedules, not a caller",
     "optimize": "index maintenance an operator schedules, not a caller",
+    # Fast capture is a two-call contract whose second half the host schedules; a transport
+    # caller cannot be handed the first half without also owning the settle loop.
+    "capture": "acknowledges before enrichment, so the host must own the matching settle loop",
+    "settle": "deferred-enrichment work an owner schedules, not a caller",
+    "pending_captures": "queue depth for the process that runs settle",
+    # The control plane rewrites derived memory under policy. `docs/context-os.md` keeps that
+    # authority with the host: an agent must not gain it by holding ordinary recall access.
+    "consolidation_candidates": "the control plane's own due-work queue, read by the host loop",
+    "consolidate": "derives and retires memory under host authority, not agent authority",
+    "forget": "cognitive forgetting is a policy decision the host owns",
+    "rollback": "reverses a committed operation, so it stays with the host that authorized it",
+    "operations": "the control-plane audit log, read by an operator rather than a caller",
 }
 # Not operations: construction, lifecycle, and the capability declaration REST reports in
 # `/healthz`.
@@ -80,12 +101,31 @@ NON_OPERATIONS = frozenset({"capabilities", "close", "from_config", "from_plugin
 # Transport fields that select between two SDK operations instead of naming an argument to one.
 # `explain` routes the same search to `search_with_trace`, which takes no extra argument itself.
 ROUTING_FIELDS: dict[str, frozenset[str]] = {"search": frozenset({"explain"})}
+# Prose in `docs/api/mcp.md` spells the count out, so the check has to spell it out too.
+_COUNT_WORDS = {
+    10: "Ten",
+    11: "Eleven",
+    12: "Twelve",
+    13: "Thirteen",
+    14: "Fourteen",
+}
 # `search_with_trace` has no route or tool of its own; the search surfaces reach it through
 # `explain`, so the adapter protocol must still declare it exactly as the SDK does. The MCP-only
 # operations are absent from the REST protocol by design, so they are not part of it.
 PROTOCOL_OPERATIONS = (
     *(operation for operation, (route, _tool) in SHARED_OPERATIONS.items() if route is not None),
     "search_with_trace",
+)
+# One declared composition, so the capability view an MCP server publishes at construction is
+# built from a real value rather than a stub.
+CAPABILITIES = MemoryCapabilities(
+    embedding=frozenset({Modality.TEXT, Modality.IMAGE}),
+    embedding_model="jina-v5-omni",
+    embedding_space="space_1",
+    embedding_dimension=1024,
+    generation=frozenset({Modality.TEXT}),
+    generation_model="qwen3-omni",
+    speaker_recognition=True,
 )
 # Body models are matched to their route by `operation_id`; a route without one takes its arguments
 # from query or path parameters instead.
@@ -95,6 +135,7 @@ REST_REQUEST_MODELS: dict[str, type[BaseModel]] = {
     "searchMemories": rest.QueryRequest,
     "answer": rest.AnswerRequest,
     "reinforceMemories": rest.ReinforceRequest,
+    "compileContext": rest.ContextRequest,
 }
 
 
@@ -160,7 +201,15 @@ def _mcp_defaults(tool: str) -> dict[str, object]:
 
 
 class _UnusedMemory:
-    """Adapter construction only reads shapes here; no operation is ever invoked."""
+    """Adapter construction reads shapes and the capability declaration, nothing else.
+
+    MCP fixes `instructions` at construction, so building a server reads `capabilities`; every
+    other member is only inspected.
+    """
+
+    @property
+    def capabilities(self) -> MemoryCapabilities:
+        return CAPABILITIES
 
 
 @pytest.mark.parametrize("operation", sorted(SHARED_OPERATIONS))
@@ -417,9 +466,120 @@ def test_embodied_tool_results_publish_every_public_field(
 
 def test_health_reports_every_declared_capability() -> None:
     """`/healthz` says what the composition can do, so a new capability cannot go unreported."""
-    assert set(rest.CapabilitiesResponse.model_fields) == {
+    assert set(rest.CapabilitiesResponse.model_fields) == set(CAPABILITIES.document())
+    assert set(CAPABILITIES.document()) == {
         field.name for field in dataclass_fields(MemoryCapabilities)
+    } | {"operations"}
+
+
+class _TinyEmbedder:
+    """The smallest thing `declared_capabilities` accepts, so the CLI path needs no store."""
+
+    embedding_capabilities = frozenset({Modality.TEXT, Modality.IMAGE})
+    embedding_model = "jina-v5-omni"
+    embedding_space = "space_1"
+    embedding_dimension = 1024
+
+
+def test_every_surface_publishes_one_capability_document() -> None:
+    """REST, MCP, and the CLI must render `MemoryCapabilities.document()`, not three views."""
+    served = rest._capabilities_response(CAPABILITIES).model_dump(mode="json")
+    instructions = mcp_adapter.build_mcp_server(_UnusedMemory()).instructions  # type: ignore[arg-type]
+    assert instructions is not None
+    greeted = json.loads(instructions[instructions.index("{") :])
+    probed = cli._doctor_capabilities({"embedder": _TinyEmbedder()})
+
+    assert served == CAPABILITIES.document()
+    assert greeted == CAPABILITIES.document()
+    assert probed == declared_capabilities(embedder=cast(Any, _TinyEmbedder())).document()
+    # The one composition the three surfaces share here differs only in its declared backends.
+    assert set(probed or {}) == set(CAPABILITIES.document())
+
+
+def test_the_capability_document_names_the_backend_each_operation_needs() -> None:
+    """`operations` is derived, so an agent never has to know that `ask` means generation."""
+    assert CAPABILITIES.operations == frozenset({"ask"})
+    assert MemoryCapabilities(
+        embedding=frozenset({Modality.TEXT}),
+        embedding_model="m",
+        embedding_space="s",
+        embedding_dimension=8,
+        transcription=frozenset({Modality.AUDIO}),
+        face=frozenset({Modality.IMAGE}),
+        formation=frozenset({Modality.TEXT}),
+        consolidation_model="c",
+        speaker_recognition=True,
+    ).operations == frozenset({"speech", "transcribe", "faces", "formation", "consolidate"})
+
+
+def test_the_compiled_bundle_mirrors_the_sdk_value_on_both_transports() -> None:
+    """A field added to `ContextBundle` must reach both transports instead of being dropped."""
+    for record, rest_model, mcp_model, renamed in (
+        (ContextBundle, rest.ContextBundleResponse, mcp_adapter.ContextBundleResult, {}),
+        (ContextConflict, rest.ContextConflictResponse, mcp_adapter.ContextConflictResult, {}),
+        (ContextUnknown, rest.ContextUnknownResponse, mcp_adapter.ContextUnknownResult, {}),
+        (
+            ProvisionalActor,
+            rest.ProvisionalActorResponse,
+            mcp_adapter.ProvisionalActorResult,
+            {},
+        ),
+        (
+            ContextBudget,
+            rest.ContextBudgetResponse,
+            mcp_adapter.ContextBudgetResult,
+            {"freshness": "freshness_seconds"},
+        ),
+    ):
+        expected = {renamed.get(field.name, field.name) for field in dataclass_fields(record)}
+        # `rendered` is the transports' serialization of `render()`, not a stored field.
+        if record is ContextBundle:
+            expected |= {"rendered"}
+        assert set(rest_model.model_fields) == expected, record.__name__
+        assert set(mcp_model.model_fields) == expected, record.__name__
+
+
+def test_the_context_budget_transport_defaults_come_from_the_sdk_value() -> None:
+    """`ContextBudget()` is the one source of the published default, on both surfaces."""
+    budget = ContextBudget()
+    expected = {
+        "max_chars": budget.max_chars,
+        "max_items": budget.max_items,
+        "memory_types": budget.memory_types,
+        "min_confidence": budget.min_confidence,
+        "freshness_seconds": budget.freshness,
+        "max_latency_ms": budget.max_latency_ms,
     }
+
+    for model in (rest.ContextBudgetRequest, mcp_adapter.ContextBudgetInput):
+        assert {
+            name: field.get_default(call_default_factory=True)
+            for name, field in model.model_fields.items()
+        } == expected, model.__name__
+
+
+def test_the_mcp_instructions_publish_the_declared_capability_view() -> None:
+    """MCP has no capability tool: the declaration REST serves at `/healthz` is the greeting."""
+    server = mcp_adapter.build_mcp_server(_UnusedMemory())  # type: ignore[arg-type]
+    instructions = server.instructions
+
+    assert instructions is not None
+    assert instructions.startswith("MindBridge is local multimodal memory")
+    assert "Prefer compile_context for task-ready context" in instructions
+    # The whole document, so a new capability cannot go unmentioned in the greeting.
+    assert json.loads(instructions[instructions.index("{") :]) == CAPABILITIES.document()
+
+
+def test_the_documented_count_of_operations_without_a_tool_is_the_real_one() -> None:
+    """`docs/api/mcp.md` states a count in prose; the prose must not drift from the tables."""
+    without_a_tool = len(UNEXPOSED_OPERATIONS) + sum(
+        1 for _route, tool in SHARED_OPERATIONS.values() if tool is None
+    )
+    page = (Path(mindbridge.__file__).parents[2] / "docs" / "api" / "mcp.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert f"{_COUNT_WORDS[without_a_tool]} Python operations have no MCP tool." in page
 
 
 def test_both_transports_decode_content_parts_with_one_implementation() -> None:
