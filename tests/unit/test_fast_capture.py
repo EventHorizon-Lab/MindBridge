@@ -523,6 +523,39 @@ def test_settling_describes_an_image_a_text_only_embedder_cannot_take(tmp_path: 
         assert {hit.id for hit in memory.search("red toolbox")} == {record.id}
 
 
+def test_a_caption_derived_while_settling_is_reused_by_a_later_add(tmp_path: Path) -> None:
+    """Settlement must cache what it paid for, or the next write over the same bytes pays again.
+
+    Captions are derived before the asset rows exist and staged on the operation, so the settle
+    path has to persist them the way the `add` path does. `_CountingDescriber` never repeats a
+    caption, which is what makes a reused one distinguishable from a second call.
+    """
+    from test_memory_search_index import _CountingDescriber
+
+    describer = _CountingDescriber()
+    picture = Blob(b"one picture, two memories", "image/png")
+    with Memory(
+        tmp_path,
+        embedder=CountingEmbedder(capabilities=frozenset({Modality.TEXT})),
+        vision_describer=describer,
+        minimum_relevance=0,
+    ) as memory:
+        captured = memory.capture(("the red toolbox", picture))
+        assert describer.calls == 0
+
+        assert memory.settle() == 1
+        settled = memory.get(captured.id)
+        # A distinct memory over the same bytes: the text differs, so `add` dedup cannot be what
+        # keeps the describer at one call.
+        added = memory.add(("the same toolbox, photographed again", picture))
+
+    assert describer.calls == 1
+    caption = describer.captions[0]
+    assert caption in settled.content
+    assert caption in added.content
+    assert added.id != captured.id
+
+
 def test_settling_appends_derived_text_and_leaves_the_captured_evidence_intact(
     tmp_path: Path,
 ) -> None:
