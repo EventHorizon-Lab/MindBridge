@@ -31,7 +31,7 @@ from mindbridge.types import (
     SpeakerSegment,
 )
 
-_SCHEMA_VERSION = 11
+_SCHEMA_VERSION = 12
 _SQLITE_PARAMETER_BATCH = 900
 _FACE_EXEMPLAR_LIMIT = 10
 _VOICE_EXEMPLAR_LIMIT = 20
@@ -279,6 +279,7 @@ CREATE TABLE memory_semantics (
     value TEXT,
     model_id TEXT,
     recipe TEXT,
+    identity_id TEXT REFERENCES identities (identity_id) ON DELETE SET NULL,
     cue_modality TEXT CHECK (
         cue_modality IS NULL OR cue_modality IN ('text', 'image', 'video', 'audio')
     ),
@@ -311,6 +312,8 @@ CREATE INDEX memory_semantics_lineage_idx
     ON memory_semantics (lineage_id, memory_id);
 CREATE INDEX memory_semantics_spatial_idx
     ON memory_semantics (spatial_frame_id, spatial_anchor, memory_id);
+CREATE INDEX memory_semantics_identity_idx
+    ON memory_semantics (identity_id, memory_id);
 
 CREATE TABLE memory_versions (
     memory_id TEXT NOT NULL REFERENCES memory_semantics (memory_id) ON DELETE CASCADE,
@@ -382,6 +385,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS memory_operations_active_key_idx
     WHERE rolled_back_at IS NULL;
 """
 
+# SQLite cannot add a REFERENCES column to a populated table with ALTER TABLE unless the value
+# defaults to NULL, which is exactly the shape wanted here: an existing claim is about nobody in
+# particular until something binds it.
+_SEMANTIC_IDENTITY_COLUMN_DDL = """
+ALTER TABLE memory_semantics
+ADD COLUMN identity_id TEXT REFERENCES identities (identity_id) ON DELETE SET NULL
+"""
+
+_SEMANTIC_IDENTITY_INDEX_DDL = """
+CREATE INDEX memory_semantics_identity_idx
+    ON memory_semantics (identity_id, memory_id)
+"""
+
 _PLACE_COLUMN_DDL = """
 ALTER TABLE memory_records
 ADD COLUMN place_id TEXT CHECK (
@@ -402,7 +418,7 @@ CREATE INDEX memory_records_place_idx
     WHERE place_id IS NOT NULL
 """
 
-_SCHEMA_V10 = f"""
+_SCHEMA_V12 = f"""
 BEGIN IMMEDIATE;
 
 CREATE TABLE memory_records (
@@ -469,7 +485,7 @@ CREATE INDEX search_index_queue_order_idx
 
 {_INDEX_TRIGGERS}
 
-PRAGMA user_version = 11;
+PRAGMA user_version = 12;
 COMMIT;
 """
 
@@ -3228,6 +3244,9 @@ class LocalStore:
             if version == 10:
                 _migrate_v10(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 11:
+                _migrate_v11(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
                 raise UnsupportedSchemaError(
@@ -3883,7 +3902,7 @@ def _create_schema(
     if existing_tables:
         raise UnsupportedSchemaError("local data directory contains an unversioned SQLite schema")
     try:
-        connection.executescript(_SCHEMA_V10)
+        connection.executescript(_SCHEMA_V12)
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -4099,6 +4118,34 @@ def _migrate_v10(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_v11(connection: sqlite3.Connection) -> None:
+    """Bind typed claims to the recognized person they are about.
+
+    `ON DELETE SET NULL` is the erasure promise in the schema: forgetting a person drops the
+    attribution and keeps the claim, the same way forgetting a person keeps the evening.
+    """
+    try:
+        semantic_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(memory_semantics)")
+        }
+        indexes = {
+            str(row[1])
+            for row in connection.execute("PRAGMA index_list(memory_semantics)")
+            if row[1] is not None
+        }
+        connection.execute("BEGIN IMMEDIATE")
+        if "identity_id" not in semantic_columns:
+            connection.execute(_SEMANTIC_IDENTITY_COLUMN_DDL)
+        if "memory_semantics_identity_idx" not in indexes:
+            connection.execute(_SEMANTIC_IDENTITY_INDEX_DDL)
+        connection.execute("PRAGMA user_version = 12")
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
 def _write_memory_context(
     connection: sqlite3.Connection,
     memory_id: str,
@@ -4137,12 +4184,12 @@ def _write_memory_context(
         """
         INSERT INTO memory_semantics (
             memory_id, lineage_id, kind, basis, source_id,
-            subject, predicate, value, model_id, recipe,
+            subject, predicate, value, model_id, recipe, identity_id,
             cue_modality, valence, arousal,
             spatial_frame_id, spatial_anchor, spatial_x, spatial_y, spatial_z,
             spatial_qx, spatial_qy, spatial_qz, spatial_qw, spatial_uncertainty_m
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         """,
         (
@@ -4156,6 +4203,7 @@ def _write_memory_context(
             context.value,
             context.model_id,
             context.recipe,
+            context.identity_id,
             None if context.cue_modality is None else context.cue_modality.value,
             context.valence,
             context.arousal,
@@ -4181,8 +4229,13 @@ def _write_memory_context(
         )
 
     supersedes_id = context.supersedes_id
-    reconcile_lineage = context.kind is MemoryKind.STATE or (
-        context.kind is MemoryKind.TRAIT and context.basis is EvidenceBasis.USER_STATEMENT
+    # A state changes, an asserted trait replaces the last one, and naming a person supersedes
+    # whatever they were called before -- so the retracted name stops answering to active reads
+    # instead of sitting beside the current one. Everything else accumulates evidence instead.
+    reconcile_lineage = (
+        context.kind is MemoryKind.STATE
+        or (context.kind is MemoryKind.TRAIT and context.basis is EvidenceBasis.USER_STATEMENT)
+        or (context.kind is MemoryKind.ENTITY and context.identity_id is not None)
     )
     if reconcile_lineage:
         old_rows = connection.execute(
@@ -4973,7 +5026,7 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
                     s.memory_id AS semantic_memory_id,
                     s.lineage_id, s.kind, s.basis, s.source_id,
                     s.subject, s.predicate, s.value, s.model_id, s.recipe,
-                    s.cue_modality, s.valence, s.arousal,
+                    s.identity_id, s.cue_modality, s.valence, s.arousal,
                     s.spatial_frame_id, s.spatial_anchor,
                     s.spatial_x, s.spatial_y, s.spatial_z,
                     s.spatial_qx, s.spatial_qy, s.spatial_qz, s.spatial_qw,
@@ -5092,6 +5145,7 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
             supersedes_id=_optional_row_text(row, "supersedes_id"),
             model_id=_optional_row_text(row, "model_id"),
             recipe=_optional_row_text(row, "recipe"),
+            identity_id=_optional_row_text(row, "identity_id"),
             spatial=spatial,
             cue_modality=(
                 None if row["cue_modality"] is None else Modality(_row_text(row, "cue_modality"))

@@ -129,6 +129,22 @@ sources support the same normalized claim; a trusted `USER_STATEMENT` can be vis
 Deleting evidence recomputes derived confidence and visibility, and removes a derived record when
 no support remains. Source observations are deleted only by an explicit caller action.
 
+### Naming a person is a typed assertion
+
+`register_speaker` and `register_identity` write an `ENTITY` assertion whose
+`MemoryContext.identity_id` binds it to the recognized person, whose `subject` is the name, and
+whose `value` is the recorded relationship. Its basis is `USER_STATEMENT`, so it is visible at
+once, and it needs no former: naming rests on the host's authority, not on a model.
+
+Every naming assertion about one identity shares a lineage keyed on that identity rather than on
+the spelling of the name, so renaming the person supersedes the previous assertion, exactly as a
+new `STATE` supersedes the one it overlaps. The retracted name stops reaching active retrieval;
+the retired version stays in the log.
+
+The consequence is deliberate and visible: naming a person creates a searchable memory record, and
+it appears in `list()` and `search()` results. That is what makes a name retrievable knowledge
+rather than a label on a registry row.
+
 **Guidance:** Keep raw observations even when an interpretation changes. Correct typed state with
 new evidence or remove the incorrect derived record; do not present a derived rewrite as the
 original observation.

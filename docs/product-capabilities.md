@@ -205,6 +205,13 @@ projection in the same commit, so no stored text keeps attributing the words to 
 Applications can attach a name and relationship with `register_speaker` or `register_identity` and
 resolve either current IDs or aliases with `identity`.
 
+Naming a person records an `ENTITY` assertion bound to that identity, so a name is retrievable
+knowledge and not a label on a registry row. It needs no formation backend, it is visible at once
+because the host asserted it, and renaming supersedes the previous assertion so the retracted name
+stops reaching retrieval. The visible consequence is that naming a person adds a searchable memory
+record, which appears in `list()` and `search()` results. See
+[typed assertions](memory-types-time-and-decay.md#naming-a-person-is-a-typed-assertion).
+
 `forget_identity` removes the person's biometric exemplars, aliases, and indexed name while
 retaining the surrounding memories, media, and transcript words. It is intentionally different from
 deleting an event. A later encounter can create a new unnamed identity because recognizing a

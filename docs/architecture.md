@@ -97,6 +97,13 @@ source observation commits; the kernel validates source binding, modality, ident
 conflicts. Derived records, evidence, versions, embeddings, the per-source recipe marker, and
 outbox work commit together. A failed formation leaves the source durable and retryable.
 
+`memory_semantics.identity_id` binds a typed claim to a recognized person, and the kernel is the
+only writer of it. It is `ON DELETE SET NULL` on purpose: erasing a person drops the attribution
+and keeps the claim, which is the same promise as keeping the evening after forgetting who was in
+it. Naming a person travels this path too, as an `ENTITY` assertion carrying that binding, so it
+needs no formation backend and inherits versioning, visibility, and rollback rather than getting
+its own.
+
 ## Retrieval consistency
 
 ```mermaid

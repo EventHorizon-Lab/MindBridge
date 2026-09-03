@@ -167,6 +167,11 @@ from mindbridge.types import (
 )
 
 _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
+# Naming a person is a claim the host asserts, so its recipe names the kernel rule that produced
+# it rather than a model space. That is what lets `register_identity` work with no former and no
+# consolidator configured.
+_NAMING_RECIPE = "mindbridge-identity-naming-v1"
+_NAMING_PREDICATE = "identity"
 _INDEX_RECIPE_PREFIX = (
     "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:context-keys-v10"
 )
@@ -1549,6 +1554,85 @@ class Memory:
                     raise SpeakerNotFoundError(f"speaker does not exist: {requested_id}")
                 raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
             self._drain_outbox()
+            self._assert_identity_name(
+                normalized_id,
+                normalized_name,
+                relationship=(
+                    normalized_relationship
+                    if normalized_relationship is not None
+                    else self._recorded_relationship(normalized_id)
+                ),
+                operation=operation,
+            )
+
+    def _recorded_relationship(self, identity_id: str) -> str | None:
+        with _translate_storage_errors("read identity profile"):
+            profile = self._store.identity_profile(identity_id)
+        return None if profile is None else profile.relationship
+
+    def _assert_identity_name(
+        self,
+        identity_id: str,
+        name: str,
+        *,
+        relationship: str | None,
+        operation: _OperationAssets,
+    ) -> str:
+        """Record naming one person as a typed ENTITY claim bound to that identity.
+
+        This is what makes a name retrievable knowledge instead of a label on a row, and it is
+        the versioned thing `identities.name` projects. It rests on the host's authority rather
+        than on a model, so it needs neither a former nor a consolidator to be configured, and
+        it carries no evidence: nothing was observed, somebody said so.
+
+        Re-asserting the same name and relationship is idempotent, because the derived memory ID
+        is a function of the claim; a different name supersedes through the shared lineage.
+        """
+        proposal = FormationProposal(
+            kind=MemoryKind.ENTITY,
+            content=(
+                f"{name} is a recognized person."
+                if relationship is None
+                else f"{name} is a recognized person, {relationship}."
+            ),
+            basis=EvidenceBasis.USER_STATEMENT,
+            subject=name,
+            predicate=_NAMING_PREDICATE,
+            value=relationship,
+            confidence=1.0,
+        )
+        now = datetime.now(timezone.utc)
+        context = _formation_context(
+            None,
+            proposal,
+            model_id=None,
+            recipe=_NAMING_RECIPE,
+            recorded_at=now,
+            identity_id=identity_id,
+        )
+        prepared = replace(
+            _prepare_memory(
+                self._prepare_content(proposal.content, operation),
+                occurred_at=None,
+                occurred_end=None,
+                metadata=None,
+                memory_type=_formation_memory_type(proposal.kind),
+            ),
+            memory_id=_formation_memory_id(
+                identity_id,
+                proposal,
+                recipe=_NAMING_RECIPE,
+                context=context,
+            ),
+            context=context,
+        )
+        self._commit_formation(
+            ((prepared, None, proposal.confidence),),
+            (),
+            completed_at=now,
+            recipe=_NAMING_RECIPE,
+        )
+        return prepared.memory_id
 
     def forget_identity(self, identity_id: str) -> IdentityErasure:
         """Erase a person: their biometric template, their aliases, and their indexed name.
@@ -2643,16 +2727,20 @@ class Memory:
 
     def _commit_formation(
         self,
-        pairs: Sequence[tuple[_PreparedMemory, str, float]],
+        pairs: Sequence[tuple[_PreparedMemory, str | None, float]],
         sources: Sequence[MemoryRecord],
         *,
         completed_at: datetime,
         recipe: str | None = None,
         operation: StoredOperation | None = None,
     ) -> StoredOperation | None:
-        """Embed and commit derived records; return the log row when one was requested."""
+        """Embed and commit derived records; return the log row when one was requested.
+
+        A `None` source ID states that the record rests on no other memory, which is what an
+        asserted claim such as a naming assertion is: it cites nothing and needs no evidence row.
+        """
         recipe = self._formation_space if recipe is None else recipe
-        ordered_pairs = tuple(sorted(pairs, key=lambda value: (value[0].memory_id, value[1])))
+        ordered_pairs = tuple(sorted(pairs, key=lambda value: (value[0].memory_id, value[1] or "")))
         unique = tuple(
             {
                 prepared.memory_id: prepared
@@ -2724,6 +2812,7 @@ class Memory:
                     evidence=tuple(
                         (prepared.memory_id, source_id, confidence)
                         for prepared, source_id, confidence in ordered_pairs
+                        if source_id is not None
                     ),
                     source_memory_ids=tuple(source.id for source in sources),
                     recipe=recipe,
@@ -6214,10 +6303,10 @@ def _operation_record(logged: StoredOperation) -> MemoryOperationRecord:
 
 
 def _validate_formation_pairs(
-    pairs: Sequence[tuple[_PreparedMemory, str, float]],
+    pairs: Sequence[tuple[_PreparedMemory, str | None, float]],
 ) -> None:
-    seen: dict[tuple[str, str], _PreparedMemory] = {}
-    states: dict[tuple[str, str], builtins.list[MemoryContext]] = {}
+    seen: dict[tuple[str, str | None], _PreparedMemory] = {}
+    states: dict[tuple[str | None, str], builtins.list[MemoryContext]] = {}
     for prepared, source_id, _confidence in pairs:
         key = (prepared.memory_id, source_id)
         prior = seen.setdefault(key, prepared)
@@ -6264,19 +6353,29 @@ def _valid_intervals_overlap(
 
 
 def _formation_context(
-    source: MemoryRecord,
+    source: MemoryRecord | None,
     proposal: FormationProposal,
     *,
-    model_id: str,
+    model_id: str | None,
     recipe: str,
     recorded_at: datetime,
+    identity_id: str | None = None,
 ) -> MemoryContext:
-    source_context = _observation_from_record(source)
-    valid_from = proposal.valid_from or source_context.valid_from or source.occurred_at
+    """Build the typed context for one proposal, optionally derived from a source memory.
+
+    A naming assertion has no source memory and no model behind it: the household owner said
+    so. It passes `source=None` and carries the identity binding instead.
+    """
+    source_context = None if source is None else _observation_from_record(source)
+    valid_from = proposal.valid_from
+    valid_until = proposal.valid_until
+    spatial = proposal.spatial
+    if source is not None and source_context is not None:
+        valid_from = valid_from or source_context.valid_from or source.occurred_at
+        valid_until = valid_until or source_context.valid_until
+        spatial = spatial or source_context.spatial
     if valid_from is None and proposal.kind in {MemoryKind.STATE, MemoryKind.TRAIT}:
         valid_from = recorded_at
-    valid_until = proposal.valid_until or source_context.valid_until
-    spatial = proposal.spatial or source_context.spatial
     return MemoryContext(
         kind=proposal.kind,
         basis=proposal.basis,
@@ -6284,14 +6383,15 @@ def _formation_context(
         valid_from=valid_from,
         valid_until=valid_until,
         recorded_at=recorded_at,
-        lineage_id=_formation_lineage_id(proposal, spatial=spatial),
-        source_id=source_context.source_id,
+        lineage_id=_formation_lineage_id(proposal, spatial=spatial, identity_id=identity_id),
+        source_id=None if source_context is None else source_context.source_id,
         subject=proposal.subject,
         predicate=proposal.predicate,
         value=proposal.value,
-        evidence_ids=(source.id,),
+        evidence_ids=() if source is None else (source.id,),
         model_id=model_id,
         recipe=recipe,
+        identity_id=identity_id,
         spatial=spatial,
         cue_modality=proposal.cue_modality,
         valence=proposal.valence,
@@ -6303,16 +6403,26 @@ def _formation_lineage_id(
     proposal: FormationProposal,
     *,
     spatial: object = None,
+    identity_id: str | None = None,
 ) -> str:
     frame_id = getattr(spatial, "frame_id", None)
     anchor = getattr(getattr(spatial, "anchor", None), "value", None)
+    # A bound claim keys on the person, not on how the subject happened to be spelled, so every
+    # naming assertion about one identity lands in one lineage and a rename supersedes rather
+    # than forks. An unbound claim keeps the original payload byte for byte, so lineage IDs
+    # already on disk stay valid.
+    binding: dict[str, object] = (
+        {"subject": _semantic_text(proposal.subject)}
+        if identity_id is None
+        else {"subject": None, "identity_id": identity_id}
+    )
     payload = json.dumps(
         {
             "kind": proposal.kind.value,
-            "subject": _semantic_text(proposal.subject),
             "predicate": _semantic_text(proposal.predicate),
             "frame_id": frame_id,
             "anchor": anchor,
+            **binding,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -6343,6 +6453,9 @@ def _formation_memory_id(
         {
             "recipe": recipe,
             "kind": proposal.kind.value,
+            # Only present once something is bound, so two identities that share a name stay two
+            # records while every ID minted before the binding existed keeps its value.
+            **({} if context.identity_id is None else {"identity_id": context.identity_id}),
             "subject": _semantic_text(proposal.subject),
             "predicate": _semantic_text(proposal.predicate),
             "value": _semantic_text(proposal.value),

@@ -1651,6 +1651,35 @@ def test_schema_v10_adds_forgetting_and_control_plane_state(tmp_path: Path) -> N
     assert version == _SCHEMA_VERSION
 
 
+def test_schema_v11_adds_the_identity_binding_on_typed_claims(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory(),), (_embedding(),))
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.executescript(
+            """
+            DROP INDEX memory_semantics_identity_idx;
+            ALTER TABLE memory_semantics DROP COLUMN identity_id;
+            PRAGMA user_version = 11;
+            """
+        )
+
+    with LocalStore(tmp_path) as store:
+        memory = store.read_memory("memory-1")
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(memory_semantics)")
+            }
+            indexes = {
+                str(row[1]) for row in connection.execute("PRAGMA index_list(memory_semantics)")
+            }
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert memory is not None
+    assert "identity_id" in columns
+    assert "memory_semantics_identity_idx" in indexes
+    assert version == _SCHEMA_VERSION
+
+
 def test_forgotten_memories_leave_active_reads_but_stay_auditable(tmp_path: Path) -> None:
     forgotten_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
     with LocalStore(tmp_path) as store:

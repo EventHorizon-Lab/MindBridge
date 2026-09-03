@@ -433,6 +433,7 @@ class MemoryContext:
     supersedes_id: str | None = None
     model_id: str | None = None
     recipe: str | None = None
+    identity_id: str | None = None
     spatial: SpatialContext | None = None
     cue_modality: Modality | None = None
     valence: float | None = None
@@ -467,6 +468,7 @@ class MemoryContext:
             "supersedes_id",
             "model_id",
             "recipe",
+            "identity_id",
         ):
             object.__setattr__(
                 self,

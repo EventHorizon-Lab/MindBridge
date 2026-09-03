@@ -71,6 +71,7 @@ from mindbridge.types import (
     AnswerResult,
     AssetRef,
     Blob,
+    EvidenceBasis,
     FormationProposal,
     IdentityProfile,
     IndexQuantization,
@@ -2034,6 +2035,49 @@ def test_unlink_identity_reverses_a_corroborated_merge(tmp_path: Path) -> None:
         assert memory.unlink_identity("identity_missing") is None
 
 
+def test_naming_a_person_records_a_typed_assertion_bound_to_the_identity(tmp_path: Path) -> None:
+    """A name is knowledge about a person, not a label on a row.
+
+    No former and no consolidator are configured here on purpose: naming rests on the host's
+    authority, so it must not require a reasoning backend to be reachable.
+    """
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=1,
+    ) as memory:
+        identity_id = _linked_identity(memory)
+        memory.register_identity(identity_id, "Alice", relationship="sister")
+
+        assertions = [
+            record
+            for record in memory.list().items
+            if record.context is not None and record.context.kind is MemoryKind.ENTITY
+        ]
+        assert len(assertions) == 1
+        context = assertions[0].context
+        assert context is not None
+        assert assertions[0].content == "Alice is a recognized person, sister."
+        assert context.identity_id == identity_id
+        assert context.basis is EvidenceBasis.USER_STATEMENT
+        assert context.subject == "Alice"
+        assert context.value == "sister"
+        assert context.visible is True
+        assert context.evidence_ids == ()
+
+        # Re-asserting the same claim is idempotent; a rename supersedes through one lineage.
+        memory.register_identity(identity_id, "Alice")
+        renamed_id = memory.list().items[0].id
+        memory.register_identity(identity_id, "Alicia")
+        contents = {hit.content for hit in memory.search("Alicia")}
+
+    assert renamed_id == assertions[0].id
+    assert "Alicia is a recognized person, sister." in contents
+    assert "Alice is a recognized person, sister." not in contents
+
+
 def test_unlink_identity_stops_the_index_quoting_the_other_persons_name(tmp_path: Path) -> None:
     """Reversing a merge must repaint the indexed text, not only the identity rows.
 
@@ -2069,9 +2113,19 @@ def test_unlink_identity_stops_the_index_quoting_the_other_persons_name(tmp_path
             content = memory.get(record.id).content
             assert "Bob" not in content
             assert f'"speaker_id":"{voice_id}"' in content
+        # Bob is still Bob, so his naming assertion stands; what must be gone is every document
+        # of the restored person's memories that answered to it.
         index = _FakeIndex.instances[-1]
-        assert all("Bob" not in document.content for document in index.documents.values())
-        assert index.lexical_search("Bob") == ()
+        assert all(
+            "Bob" not in document.content
+            for document in index.documents.values()
+            if document.embedding.memory_id in {first.id, second.id}
+        )
+        assert {hit.id for hit in index.lexical_search("Bob")} == {
+            document.embedding.embedding_id
+            for document in index.documents.values()
+            if document.content == "Bob is a recognized person."
+        }
 
 
 @pytest.mark.parametrize("value", ["x" * 256, "bad\nline", ""])
@@ -2549,15 +2603,21 @@ def test_opt_in_speech_indexing_makes_registered_names_retrievable(
         assert '"speaker_name":"Alicia"' in memory.get(first.id).content
         assert '"speaker_name":"Alicia"' in memory.get(second.id).content
         assert '"speaker_name":"Alice"' in second.content
-        assert {document.embedding.object_part for document in index.documents.values()} == {
-            0,
-            1,
-            2,
-        }
+        speech_documents = tuple(
+            document
+            for document in index.documents.values()
+            if document.embedding.memory_id in {first.id, second.id}
+        )
+        assert {document.embedding.object_part for document in speech_documents} == {0, 1, 2}
         assert all(
             "Alicia" in document.content and speaker_id not in document.content
-            for document in index.documents.values()
+            for document in speech_documents
         )
+        # Naming is now its own retrievable claim, and the retracted name is superseded rather
+        # than left standing beside the current one.
+        contents = {hit.content for hit in memory.search("Alicia")}
+        assert "Alicia is a recognized person." in contents
+        assert "Alice is a recognized person." not in contents
 
 
 def test_retrieval_projection_is_stable_across_opaque_speaker_ids(tmp_path: Path) -> None:
@@ -2780,7 +2840,13 @@ def test_speaker_rename_refreshes_indexed_memory_after_reopen(tmp_path: Path) ->
 
         assert '"speaker_name":"Alicia"' in refreshed.content
         assert '"speaker_name":"Alice"' not in refreshed.content
-        assert [hit.id for hit in reopened.search("Alicia")] == [record.id]
+        # Naming also asserts the name as its own retrievable claim, and the retracted "Alice"
+        # assertion is superseded rather than left beside it.
+        hits = {hit.id: hit.content for hit in reopened.search("Alicia")}
+        assert record.id in hits
+        assert sorted(set(hits.values()) - {refreshed.content}) == [
+            "Alicia is a recognized person."
+        ]
 
 
 def test_speaker_registration_rolls_back_when_refresh_embedding_fails(tmp_path: Path) -> None:
