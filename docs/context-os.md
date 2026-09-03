@@ -264,7 +264,8 @@ defaults or justify superiority claims.
    current `add()` semantics. Done: `capture()`, `settle()`, and `pending_captures()`.
 3. Generalize formation into one bounded memory-management loop with structured proposals,
    replay, rollback, and privacy tests. Done for the operation log, rollback, and authority
-   tests: `consolidate()`, `forget()`, `rollback()`, and `operations()`. Open: replay of a logged
+   tests: `consolidate()`, `forget()`, `rollback()`, `operations()`, and the `identify` intent
+   that makes naming a person an evidence-bearing, reversible claim. Open: replay of a logged
    operation sequence against a fresh store, and companion-scenario privacy tests.
 4. Add a context compiler whose output improves downstream tasks within declared budgets. Done
    for selection and budgeting: `compile()`. Open: a downstream-task measurement against the
