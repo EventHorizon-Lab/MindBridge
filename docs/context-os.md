@@ -270,7 +270,11 @@ defaults or justify superiority claims.
 1. Measure the current strong `add`, streaming prefetch, search, and formation paths on target
    hardware before setting latency objectives. Open: no named-hardware measurement exists yet.
 2. Add an explicit fast-capture path and SQLite-backed durable enrichment work without changing
-   current `add()` semantics. Done: `capture()`, `settle()`, and `pending_captures()`.
+   current `add()` semantics. Done: `capture()`, `settle()`, and `pending_captures()`;
+   `settle()` honours a retry ceiling so one poisoned capture cannot block the queue,
+   `pending_captures()` answers per-record readiness with attempts and last error, and a record
+   whose formation was interrupted after `add()` committed is completed by the next `settle()`
+   through the same queue. Open: routing streaming `FINAL` events through the capture path.
 3. Generalize formation into one bounded memory-management loop with structured proposals,
    replay, rollback, and privacy tests. Done: the operation log and authority tests
    (`consolidate()`, `forget()`, `rollback()`, `operations()`), the durable trigger
@@ -292,5 +296,6 @@ defaults or justify superiority claims.
 
 Fast capture is now independent of slow reasoning, the control plane governs the lifecycle through
 validated, logged, reversible operations, and the compiler produces budgeted task-ready context.
-The remaining gates are measurements, not mechanisms: named-hardware latency, downstream task
-utility, and slow-loop quality on companion scenarios decide whether the defaults are right.
+Apart from the open items named above, the remaining gates are measurements, not mechanisms:
+named-hardware latency, downstream task utility, and slow-loop quality on companion scenarios
+decide whether the defaults are right.
