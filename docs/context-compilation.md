@@ -27,6 +27,16 @@ compile(
 behave exactly as they do for `search()`, and SQLite reapplies authoritative visibility: a
 forgotten record and a hidden inferred trait never reach a bundle.
 
+`memory_types` is pushed into that retrieval rather than applied to its result. The index filter
+takes one type, so a set of them opens one route per type and each gets the full candidate depth:
+a `memory_types={procedural}` request finds procedural records however many episodes outrank them,
+instead of coming back empty because the common types filled a shared window. A request naming
+every type is the unfiltered request written out and opens one route, not three.
+
+`min_confidence` and `freshness` the index cannot answer, so they are still applied to the window
+after it comes back -- and the window is tripled when either is set, so that what they will remove
+was ranked rather than crowded out.
+
 There is one retrieval round and no second one. Everything the bundle counts -- `omitted`, and
 each `budget_excluded` tally -- is therefore a statement about that window, not about the store:
 `omitted == 0` means nothing inside the window was dropped, not that nothing else exists. When the
@@ -40,7 +50,7 @@ window came back full and the bundle still lost evidence, `unknowns` carries a
 | `max_chars` | `16000` | Rendered-evidence character ceiling: the header, each section heading, each memory's whole rendered line, and a per-modality text equivalent for each media asset. One image part is charged 2000, one audio part 4000, and one video part 12000, so a ceiling below 12000 omits every video record it ranks |
 | `max_items` | `24` | Maximum included memories |
 | `max_media_items` | `None` | Maximum grounded media parts; `0` compiles a text-only bundle and `None` lets `max_chars` alone decide |
-| `memory_types` | `None` | Keep only these `MemoryType` values; `None` keeps every type |
+| `memory_types` | `None` | Keep only these `MemoryType` values, pushed into the index as one route per type; `None` keeps every type |
 | `min_confidence` | `0.0` | Minimum typed confidence; a record with no typed context counts as `1.0` |
 | `freshness` | `None` | Keep only memories anchored within this `timedelta` of `reference_at` |
 | `max_latency_ms` | `None` | Deadline in milliseconds; optional stages are skipped once it passes |

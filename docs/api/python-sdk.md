@@ -331,8 +331,9 @@ compile(
 ```
 
 `compile` runs the same retrieval path once with a candidate limit of
-`max(100, 3 * budget.max_items)`, then partitions, filters, and budgets the result into a
-`ContextBundle`. It calls no generation model, stores no memory, and never resolves a conflict;
+`max(100, 3 * budget.max_items)` -- tripled when `budget.min_confidence` or `budget.freshness` is
+set, because only the compiler can apply those -- pushing `budget.memory_types` into the index as
+one route per type, then partitions, filters, and budgets the result into a `ContextBundle`. It calls no generation model, stores no memory, and never resolves a conflict;
 like `search`, and through the same helper, it may cache a transcript for spoken query media.
 `budget.max_latency_ms` is a deadline checked between stages, never a cancellation, and the bundle
 reports `elapsed_ms`, `deadline_exceeded`, and the `unknowns` the request implied but the bundle

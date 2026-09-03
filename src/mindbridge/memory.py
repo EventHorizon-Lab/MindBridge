@@ -334,6 +334,11 @@ _MAX_RETRIEVAL_KEYS = 128
 _PAYLOAD_TOO_LARGE = "payload_too_large"
 _MAX_QUERY_RETRIEVAL_KEYS = 7
 _MAX_INDEX_SEARCH_WORKERS = 4
+# How much deeper `compile()` ranks when the budget carries a bound only the compiler can
+# apply -- `min_confidence` or `freshness`. Those remove candidates after retrieval, so the
+# window has to hold what they will remove for `candidates_exhausted` to mean the store ran
+# out rather than the window did.
+_POST_FILTER_WINDOW = 3
 _TODAY_ISO_DATE = re.compile(r"\btoday\s+is\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
 _MONTH_NAME = (
     r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
@@ -1241,7 +1246,7 @@ class Memory:
                 prepared,
                 limit=limit,
                 operation=assets,
-                memory_type=_optional_memory_type(memory_type),
+                memory_types=_pushed_memory_types(_optional_memory_type(memory_type)),
                 reference_at=reference,
                 temporal_range=_temporal_range(temporal_text, reference),
                 occurred_from=occurred_from,
@@ -1291,7 +1296,7 @@ class Memory:
                     _RERANK_CANDIDATES if self._evidence_budget is not None else min(100, limit * 3)
                 ),
                 operation=assets,
-                memory_type=_optional_memory_type(memory_type),
+                memory_types=_pushed_memory_types(_optional_memory_type(memory_type)),
                 reference_at=reference,
                 temporal_range=temporal_range,
                 occurred_from=None,
@@ -1381,15 +1386,22 @@ class Memory:
             # `_limit` bounds what a caller may ask a public search to return, not how deep the
             # kernel ranks, so `_search_prepared` has no ceiling of its own and a bundle may rank
             # past one hundred. Three candidates per slot is the same headroom `ask()` gives its
-            # modality round robin.
-            candidate_limit = max(_RERANK_CANDIDATES, budget.max_items * 3)
+            # modality round robin -- widened when the budget carries a bound the index cannot
+            # answer, because those are applied to the window after it comes back and a window
+            # sized for the bundle alone would report exhaustion the store does not have.
+            candidate_limit = max(_RERANK_CANDIDATES, budget.max_items * 3) * (
+                _POST_FILTER_WINDOW
+                if budget.min_confidence > 0.0 or budget.freshness is not None
+                else 1
+            )
             outcome = self._search_prepared(
                 prepared,
                 limit=candidate_limit,
                 operation=assets,
-                # The budget filters memory types itself, because it selects a set rather than
-                # the one type the retrieval plane can push into the index.
-                memory_type=None,
+                # `memory_types` is index-pushable one type at a time, so the kernel opens one
+                # route per type. Without that a request for a rare type competes for the same
+                # window as every common one and comes back empty while the store holds records.
+                memory_types=_pushed_memory_types(budget.memory_types),
                 reference_at=reference,
                 temporal_range=_temporal_range(temporal_text, reference),
                 occurred_from=None,
@@ -2252,7 +2264,7 @@ class Memory:
                 prepared,
                 limit=limit,
                 operation=operation,
-                memory_type=None,
+                memory_types=None,
                 reference_at=reference,
                 temporal_range=None,
                 occurred_from=None,
@@ -3682,7 +3694,7 @@ class Memory:
         *,
         limit: int,
         operation: _OperationAssets,
-        memory_type: MemoryType | None,
+        memory_types: frozenset[MemoryType] | None,
         reference_at: datetime,
         temporal_range: tuple[datetime, datetime] | None,
         occurred_from: datetime | None,
@@ -3730,7 +3742,7 @@ class Memory:
                         vectors,
                         lexical_query=lexical_query,
                         limit=candidate_limit,
-                        memory_type=memory_type,
+                        memory_types=memory_types,
                         occurred_from=occurred_from,
                         occurred_until=occurred_until,
                     )
@@ -3749,7 +3761,7 @@ class Memory:
                             vectors,
                             lexical_query="",
                             limit=candidate_limit,
-                            memory_type=memory_type,
+                            memory_types=memory_types,
                             occurred_from=preferred_range[0],
                             occurred_until=preferred_range[1],
                         )
@@ -3758,7 +3770,7 @@ class Memory:
                         vectors,
                         lexical_query=lexical_query,
                         limit=candidate_limit,
-                        memory_type=memory_type,
+                        memory_types=memory_types,
                         occurred_from=occurred_from,
                         occurred_until=occurred_until,
                     )
@@ -3788,7 +3800,7 @@ class Memory:
                     hydrated_documents,
                     lexical_query=lexical_query,
                     temporal_range=temporal_range,
-                    memory_type=memory_type,
+                    memory_types=memory_types,
                     route_limit=candidate_limit,
                     result_limit=limit,
                 )
@@ -3890,20 +3902,19 @@ class Memory:
                     lexical_relevance_by_rank,
                     lexical_matches,
                 )
-                if memory_type is not None:
+                if memory_types is not None:
+                    kept = frozenset(memory_type.value for memory_type in memory_types)
                     _extend_memory_type_traces(
                         trace_candidates,
                         memories,
-                        memory_type,
+                        kept,
                         index_ids_by_memory,
                         dense_relevance,
                         dense_confidence,
                         lexical_relevance_by_rank,
                         lexical_matches,
                     )
-                    memories = tuple(
-                        memory for memory in memories if memory.memory_type == memory_type.value
-                    )
+                    memories = tuple(memory for memory in memories if memory.memory_type in kept)
                 lexical_relevance = _lexical_relevance(lexical_query, memories)
                 ranked = []
                 ranked_traces: dict[str, RetrievalCandidateTrace] | None = (
@@ -4044,7 +4055,7 @@ class Memory:
         *,
         lexical_query: str,
         temporal_range: tuple[datetime, datetime] | None,
-        memory_type: MemoryType | None,
+        memory_types: frozenset[MemoryType] | None,
         route_limit: int,
         result_limit: int,
     ) -> tuple[_IndexCandidates, tuple[IndexCandidate, ...]]:
@@ -4081,7 +4092,14 @@ class Memory:
                 *temporal_range,
                 space_id=self._space_id,
                 task=_DOCUMENT_TASK,
-                memory_type=None if memory_type is None else memory_type.value,
+                # The whitelist only narrows what the deepening loop will consider, and the
+                # ranking stage applies the full set afterwards, so one pushed type is a
+                # sharpening and several are correctly left to it.
+                memory_type=(
+                    next(iter(memory_types)).value
+                    if memory_types is not None and len(memory_types) == 1
+                    else None
+                ),
             )
         if not in_range:
             return candidates, documents
@@ -4100,7 +4118,7 @@ class Memory:
                 (),
                 lexical_query=lexical_query,
                 limit=search_limit,
-                memory_type=memory_type,
+                memory_types=memory_types,
             ).lexical
             qualified = tuple(
                 hit
@@ -4130,11 +4148,18 @@ class Memory:
         *,
         lexical_query: str,
         limit: int,
-        memory_type: MemoryType | None,
+        memory_types: frozenset[MemoryType] | None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
     ) -> _IndexCandidates:
-        memory_type_value = None if memory_type is None else memory_type.value
+        # The index filter takes one type, so a set becomes one route per type rather than a
+        # post-filter over a shared window. Each type then gets the full `limit` of depth, which
+        # is what lets a request for a rare type reach records a common type outranks.
+        type_values: tuple[str | None, ...] = (
+            (None,)
+            if memory_types is None
+            else tuple(sorted(memory_type.value for memory_type in memory_types))
+        )
         dense_calls = tuple(
             partial(
                 self._index.search,
@@ -4142,23 +4167,31 @@ class Memory:
                 limit=limit,
                 space_id=self._space_id,
                 task=_DOCUMENT_TASK,
-                memory_type=memory_type_value,
+                memory_type=value,
                 occurred_from=occurred_from,
                 occurred_until=occurred_until,
             )
+            for value in type_values
             for vector in vectors
         )
-        lexical_call = partial(
-            self._index.lexical_search,
-            lexical_query,
-            limit=limit,
-            space_id=self._space_id,
-            task=_DOCUMENT_TASK,
-            memory_type=memory_type_value,
-            occurred_from=occurred_from,
-            occurred_until=occurred_until,
+        lexical_calls = (
+            tuple(
+                partial(
+                    self._index.lexical_search,
+                    lexical_query,
+                    limit=limit,
+                    space_id=self._space_id,
+                    task=_DOCUMENT_TASK,
+                    memory_type=value,
+                    occurred_from=occurred_from,
+                    occurred_until=occurred_until,
+                )
+                for value in type_values
+            )
+            if lexical_query
+            else ()
         )
-        calls = (*dense_calls, lexical_call) if lexical_query else dense_calls
+        calls = (*dense_calls, *lexical_calls)
         routes: tuple[tuple[IndexHit, ...], ...]
         with self._trace("mindbridge.index.search", kind="stage") as span:
             span.set_attribute("mindbridge.index.route_count", len(calls))
@@ -4171,10 +4204,13 @@ class Memory:
                     futures = tuple(executor.submit(copy_context().run, call) for call in calls)
                     routes = tuple(future.result() for future in futures)
         dense_routes = routes[: len(dense_calls)]
-        lexical = routes[-1] if lexical_query else ()
+        lexical_routes = routes[len(dense_calls) :]
         return _IndexCandidates(
             dense=_merge_index_hits(*dense_routes),
-            lexical=lexical,
+            # One route keeps the index's own order, which `lexical_relevance_by_rank` reads as a
+            # reciprocal rank. Several have to be re-ordered by relevance or that rank would
+            # record the interleaving of the routes instead of the ranking of the candidates.
+            lexical=_merge_lexical_routes(lexical_routes),
             exhausted=all(len(route) < limit for route in routes),
         )
 
@@ -7991,6 +8027,20 @@ def _optional_memory_type(value: object) -> MemoryType | None:
     return None if value is None else _memory_type(value)
 
 
+def _pushed_memory_types(
+    requested: MemoryType | frozenset[MemoryType] | None,
+) -> frozenset[MemoryType] | None:
+    """Return the type filter to push into the index, or `None` when it would filter nothing.
+
+    A request naming every type is the unfiltered request written out, and pushing it would buy
+    one index route per type for a filter that removes nothing.
+    """
+    if requested is None:
+        return None
+    pushed = frozenset({requested}) if isinstance(requested, MemoryType) else requested
+    return None if pushed >= frozenset(MemoryType) else pushed
+
+
 def _index_quantization(value: object) -> IndexQuantization:
     if not isinstance(value, IndexQuantization):
         raise ValidationError("index_quantization must be an IndexQuantization value")
@@ -8104,6 +8154,14 @@ def _budgeted_hits(
         used += cost
         extra.append(hit)
     return tuple(extra)
+
+
+def _merge_lexical_routes(routes: Sequence[Sequence[IndexHit]]) -> tuple[IndexHit, ...]:
+    if not routes:
+        return ()
+    if len(routes) == 1:
+        return tuple(routes[0])
+    return tuple(sorted(_merge_index_hits(*routes), key=lambda hit: -hit.relevance))
 
 
 def _merge_index_hits(*groups: Sequence[IndexHit]) -> tuple[IndexHit, ...]:
@@ -8278,7 +8336,7 @@ def _extend_missing_memory_traces(
 def _extend_memory_type_traces(
     target: builtins.list[RetrievalCandidateTrace] | None,
     memories: Sequence[StoredMemory],
-    memory_type: MemoryType,
+    kept: frozenset[str],
     index_ids_by_memory: Mapping[str, tuple[str, ...]],
     dense_relevance: Mapping[str, float],
     dense_confidence: Mapping[str, float],
@@ -8288,7 +8346,7 @@ def _extend_memory_type_traces(
     if target is None:
         return
     for memory in memories:
-        if memory.memory_type != memory_type.value:
+        if memory.memory_type not in kept:
             target.append(
                 _early_candidate_trace(
                     memory.memory_id,

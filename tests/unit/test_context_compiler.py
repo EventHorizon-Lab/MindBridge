@@ -961,6 +961,40 @@ def test_compile_reuses_the_retrieval_path_and_structures_what_it_returns(tmp_pa
         assert note.id in bundle.render()
 
 
+def test_a_type_only_budget_reaches_past_the_window_the_common_types_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`memory_types` is pushed into the index, so a rare type gets its own candidate depth.
+
+    Filtering after retrieval let sixty episodes crowd the one procedural record out of the
+    window, and the bundle came back empty with only a `candidates_exhausted` unknown to explain
+    it. The narrowed rerank window here is what a real store reaches with more records.
+    """
+    monkeypatch.setattr("mindbridge.memory._RERANK_CANDIDATES", 4)
+    with _memory(tmp_path) as memory:
+        memory.add_many(
+            [f"we walked to the harbour on day {index}" for index in range(60)],
+            memory_type=MemoryType.EPISODIC,
+        )
+        recipe = memory.add(
+            "to open the toolbox, turn the blue latch twice",
+            memory_type=MemoryType.PROCEDURAL,
+        )
+
+        # The record is nowhere near the top of the unfiltered ranking for this goal.
+        ranked = memory.search("we walked to the harbour", limit=4)
+        assert recipe.id not in {hit.id for hit in ranked}
+
+        bundle = memory.compile(
+            "we walked to the harbour",
+            budget=ContextBudget(max_items=1, memory_types=frozenset({MemoryType.PROCEDURAL})),
+            reference_at=REFERENCE,
+        )
+
+        assert [hit.id for hit in bundle.procedures] == [recipe.id]
+
+
 def test_compile_rejects_a_budget_that_is_not_one(tmp_path: Path) -> None:
     with _memory(tmp_path) as memory, pytest.raises(ValidationError, match="ContextBudget"):
         memory.compile("anything", budget="6000")  # type: ignore[arg-type]
