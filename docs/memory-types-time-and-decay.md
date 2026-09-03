@@ -127,7 +127,9 @@ Formation never rewrites the caller's source record. A derived record inherits i
 time, valid interval, metric pose, symbolic `place_id`, and `metadata`, so a place-scoped or
 metadata-filtered recall reaches the knowledge formed in a room and not only the raw observation it
 came from. It carries no media assets of its own: a formed record is text, and its evidence link
-points at the observation that holds the media. `AFFECT` must name a cue modality present in
+points at the observation that holds the media. A consolidation rests on several sources, so it
+inherits the place and the metadata only when every cited source agrees; disagreeing evidence
+inherits neither rather than one picked arbitrarily. `AFFECT` must name a cue modality present in
 that source. A model-inferred `TRAIT` remains hidden from active retrieval until two independent
 sources support the same normalized claim; a trusted `USER_STATEMENT` can be visible immediately.
 Deleting evidence recomputes derived confidence and visibility, and removes a derived record when
@@ -214,9 +216,10 @@ does not infer coordinate transforms.
 
 `ObservationContext(place_id="kitchen")` stores a trimmed symbolic label when metric localization is
 not available. `RetrievalScope(place_id="kitchen")` applies indexed equality in SQLite and excludes
-unlabelled records. Records formed from a labelled observation carry that label too, so the scope
-reaches derived entities, states, and relations as well as the observations. Symbolic and metric
-scopes are independent and both must match when combined.
+unlabelled records. Records formed from a labelled observation carry that label too, and a
+consolidated record carries it when all of its evidence agrees on one place, so the scope reaches
+derived entities, states, and relations as well as the observations. Symbolic and metric scopes are
+independent and both must match when combined.
 
 `get` and `list` expose the latest typed context even when it is retired or hidden, while default
 search uses only active visible versions. Forgetting is evidence-aware: deleting evidence

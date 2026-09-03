@@ -485,8 +485,10 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   SQL filter, so a place-scoped `search()`, `ask()`, or `compile()` could previously return only
   raw observations and never the entities, states, or relations formed from them — the household
   question the symbolic axis exists for. A captured record lost its place permanently, because
-  `settle()` leaves the committed row alone. Derived records still carry no media assets of their
-  own: their evidence link points at the observation that holds them.
+  `settle()` leaves the committed row alone. A consolidation rests on several sources, so it
+  inherits the place and the metadata only when every cited source agrees, and inherits neither
+  when they disagree: a hard retrieval filter must not be guessed. Derived records still carry no
+  media assets of their own: their evidence link points at the observation that holds them.
 - A control-plane operation that lost the idempotency race on the consolidation write path raised
   `StorageError` from a unique-index violation instead of being rejected as `"duplicate"`. The
   formation transaction now makes the same in-transaction key check the other write path already

@@ -2496,12 +2496,13 @@ class Memory:
             ),
             evidence_ids=tuple(sorted(source.id for source in sources)),
         )
+        place_id, metadata = _agreed_inheritance(sources)
         prepared = replace(
             _prepare_memory(
                 self._prepare_content(proposal.content, assets),
                 occurred_at=primary.occurred_at,
                 occurred_end=primary.occurred_end,
-                metadata=None,
+                metadata=metadata,
                 memory_type=_formation_memory_type(proposal.kind),
             ),
             memory_id=_formation_memory_id(
@@ -2511,6 +2512,7 @@ class Memory:
                 context=context,
             ),
             context=context,
+            place_id=place_id,
         )
         logged = self._commit_formation(
             tuple((prepared, source.id, proposal.confidence) for source in sources),
@@ -2587,12 +2589,13 @@ class Memory:
             ),
             evidence_ids=tuple(sorted(source.id for source in sources)),
         )
+        place_id, metadata = _agreed_inheritance(sources)
         prepared = replace(
             _prepare_memory(
                 self._prepare_content(proposal.content, assets),
                 occurred_at=None,
                 occurred_end=None,
-                metadata=None,
+                metadata=metadata,
                 memory_type=_formation_memory_type(proposal.kind),
             ),
             memory_id=_formation_memory_id(
@@ -2602,6 +2605,7 @@ class Memory:
                 context=context,
             ),
             context=context,
+            place_id=place_id,
         )
         logged = self._commit_formation(
             tuple((prepared, source.id, proposal.confidence) for source in sources),
@@ -7079,6 +7083,26 @@ def _valid_intervals_overlap(
     return not (
         (left_until is not None and right_from is not None and left_until <= right_from)
         or (right_until is not None and left_from is not None and right_until <= left_from)
+    )
+
+
+def _agreed_inheritance(
+    sources: Sequence[MemoryRecord],
+) -> tuple[str | None, Mapping[str, object] | None]:
+    """The place and the metadata every cited source agrees on, or nothing.
+
+    Formation derives from one observation and inherits its record columns outright. A
+    consolidation rests on several, so it inherits only what they all say: a place is a hard
+    retrieval filter, and picking one source's room or one source's tag arbitrarily would file the
+    knowledge somewhere it was not observed. Disagreement inherits nothing rather than a majority.
+    """
+    if not sources:
+        return (None, None)
+    places = {source.place_id for source in sources}
+    tags = {_metadata_json(source.metadata) for source in sources}
+    return (
+        sources[0].place_id if len(places) == 1 else None,
+        sources[0].metadata if len(tags) == 1 else None,
     )
 
 
