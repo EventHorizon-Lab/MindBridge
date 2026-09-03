@@ -1004,18 +1004,28 @@ def _segment_video(
         ]
         if cuts:
             times = ",".join(f"{value:.3f}" for value in cuts)
-            command.extend(("-force_key_frames", times, "-segment_times", times))
-        command.extend(
-            (
-                "-f",
-                "segment",
-                "-segment_format",
-                "mp4",
-                "-reset_timestamps",
-                "1",
-                str(output),
+            command.extend(
+                (
+                    "-force_key_frames",
+                    times,
+                    "-segment_times",
+                    times,
+                    "-f",
+                    "segment",
+                    "-segment_format",
+                    "mp4",
+                    "-reset_timestamps",
+                    "1",
+                    str(output),
+                )
             )
-        )
+        else:
+            # With nothing to cut, the segment muxer is not just unnecessary but wrong: given no
+            # `-segment_times` it splits at every keyframe it happens to see, and `-tune
+            # zerolatency` emits them often. One 30 s EgoLife clip came back as 13 + 17 frames.
+            # A single boundary means one output file, which is what any source at or below one
+            # segment length asks for.
+            command.append(str(working / "segment-00000.mp4"))
         _run_ffmpeg(command, source)
         produced = tuple(sorted(working.glob("segment-*.mp4")))
         if len(produced) != len(expected) or any(not path.stat().st_size for path in produced):

@@ -336,6 +336,45 @@ def test_lifelong_preparation_builds_one_ordered_segment_timeline(
     assert [part["end_seconds"] for part in parts] == [12.0, 24.0]
 
 
+def test_single_boundary_segmentation_avoids_the_segment_muxer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
+    commands: list[tuple[str, ...]] = []
+
+    def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
+        commands.append(tuple(command))
+        output = Path(command[-1])
+        for index in range(len(_boundaries)):
+            Path(str(output).replace("%05d", f"{index:05d}")).write_bytes(b"segment")
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._run_ffmpeg", run)
+
+    # Asked for one whole clip, ffmpeg must write one named output. Handing this to the segment
+    # muxer without `-segment_times` makes it split at every keyframe instead, which turned one
+    # 30 s EgoLife clip into 13 + 17 frames and failed the write.
+    _boundaries: tuple[float, ...] = (30.0,)
+    prepared = _segment_video(source, _boundaries, tmp_path / "cache", None)
+
+    assert len(prepared) == 1
+    assert prepared[0][:2] == (0.0, 30.0)
+    assert "segment" not in commands[0]
+    assert "-segment_times" not in commands[0]
+    assert commands[0][-1].endswith("segment-00000.mp4")
+
+    # With real cuts the segment muxer is still the right tool, and it is told where to cut.
+    _boundaries = (10.0, 20.0)
+    _segment_video(source, _boundaries, tmp_path / "cache", None)
+
+    assert commands[1][commands[1].index("-f") + 1] == "segment"
+    assert commands[1][commands[1].index("-segment_times") + 1] == "10.000"
+    assert commands[1][-1].endswith("segment-%05d.mp4")
+
+
 def test_video_segment_cache_repairs_an_interrupted_entry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
