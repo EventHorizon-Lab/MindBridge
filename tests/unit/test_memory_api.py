@@ -3672,6 +3672,69 @@ def test_path_media_uses_native_dense_search_and_cas_lifecycle(tmp_path: Path) -
         assert not record.assets[0].path.exists()
 
 
+def _table_counts(data_dir: Path) -> dict[str, int]:
+    with closing(sqlite3.connect(data_dir / "state.sqlite3")) as connection:
+        names = tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        )
+        return {
+            name: int(connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0])
+            for name in names
+        }
+
+
+def test_delete_leaves_no_trace_of_the_record_in_any_table_or_blob(tmp_path: Path) -> None:
+    """Deletion completeness: what a deleted record contributed is gone, everywhere.
+
+    Blobs are content-addressed and shared, so one is removed only once no memory references
+    it. The audit log is the deliberate exception and is asserted separately.
+    """
+    audio = Blob(b"spoken audio bytes", "audio/wav", "voice.wav")
+    image = Blob(b"portrait bytes", "image/png", "portrait.png")
+
+    with Memory(
+        tmp_path,
+        embedder=_FakeModels(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        index_speech=True,
+    ) as memory:
+        heard = memory.add(("red note one", audio))
+        echoed = memory.add(("red note two", audio))
+        seen = memory.add(("red portrait", image))
+        memory.speech(heard.id)
+        memory.faces(seen.id)
+        blobs = {path.name for path in (tmp_path / "assets").rglob("*") if path.is_file()}
+        assert len(blobs) == 2
+        populated = _table_counts(tmp_path)
+        assert populated["identity_exemplars"] > 0
+        assert populated["speech_segments"] > 0
+        assert populated["face_observations"] > 0
+        operations = populated["memory_operations"]
+
+        # The shared blob outlives the first of the two memories holding it.
+        assert memory.delete(heard.id) is True
+        assert {path.name for path in (tmp_path / "assets").rglob("*") if path.is_file()} == blobs
+        assert _table_counts(tmp_path)["media_assets"] == 2
+
+        assert memory.delete(echoed.id) is True
+        assert memory.delete(seen.id) is True
+
+        assert [path for path in (tmp_path / "assets").rglob("*") if path.is_file()] == []
+        # `memory_operations` is audit history that outlives the records it names; every other
+        # table holds record content, derived vectors, or a biometric template built from it.
+        remaining = _table_counts(tmp_path)
+        assert remaining["memory_operations"] == operations
+        assert {
+            name: count
+            for name, count in remaining.items()
+            if count and name not in {"memory_operations", "sqlite_sequence", "store_metadata"}
+        } == {}
+
+
 def test_persisted_media_reads_do_not_run_gc_ownership_queries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -136,7 +136,7 @@ def test_a_budget_that_cannot_bound_anything_is_rejected(invalid: dict[str, obje
 
 def test_budget_defaults_are_the_documented_ones() -> None:
     budget = ContextBudget()
-    assert (budget.max_chars, budget.max_items) == (6000, 24)
+    assert (budget.max_chars, budget.max_items) == (16000, 24)
     assert (budget.memory_types, budget.min_confidence, budget.freshness) == (None, 0.0, None)
     assert budget.max_latency_ms is None
 
@@ -240,6 +240,10 @@ def test_a_media_hit_is_charged_far_above_its_record_text() -> None:
     bundle = _compile((video, text), max_chars=100)
     assert [hit.id for hit in bundle.hits] == ["note"]
     assert bundle.omitted == 1
+    # ... but the default budget must be able to buy the most expensive single grounded part,
+    # or no default compilation could ever reach a video memory.
+    assert evidence_cost(video) < ContextBudget().max_chars
+    assert [hit.id for hit in _compile((video, text)).hits] == ["clip", "note"]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -264,8 +268,16 @@ def test_memory_types_and_min_confidence_filter_candidates() -> None:
         ),
         min_confidence=0.5,
     )
-    # A record with no typed context counts as fully confident rather than as an unknown.
+    # A record with no typed context counts as fully confident rather than as an unknown: it is
+    # an observation, which carries no inference to discount. It therefore survives the
+    # strictest possible bound, and renders at the same 1.00 the filter used.
     assert {hit.id for hit in weak.hits} == {"strong", "untyped"}
+    certain = _compile(
+        (_hit("untyped"), _hit("inferred", kind=MemoryKind.STATE, confidence=0.99)),
+        min_confidence=1.0,
+    )
+    assert [hit.id for hit in certain.hits] == ["untyped"]
+    assert "- [untyped] evidence untyped (confidence 1.00)" in certain.render()
 
 
 def test_freshness_anchors_on_event_end_then_event_start_then_creation() -> None:
@@ -309,6 +321,60 @@ def test_disagreeing_states_in_one_lineage_produce_one_conflict() -> None:
     assert (conflict.subject, conflict.predicate) == ("ana", "location")
     assert conflict.values == ("berlin", "paris")
     assert conflict.memory_ids == ("first", "second")
+
+
+def test_a_conflict_survives_the_budget_dropping_one_side() -> None:
+    bundle = _compile(
+        (
+            _hit(
+                "berlin", score=0.9, kind=MemoryKind.STATE, lineage_id="lineage-1", value="berlin"
+            ),
+            _hit("paris", score=0.5, kind=MemoryKind.STATE, lineage_id="lineage-1", value="paris"),
+        ),
+        max_items=1,
+    )
+
+    assert [hit.id for hit in bundle.hits] == ["berlin"]
+    assert bundle.conflicts[0].memory_ids == ("berlin", "paris")
+    # The dropped side has no line of its own, so the conflict line says where it is not.
+    assert '- ana location: "berlin" [berlin] vs "paris" [paris, not included]' in bundle.render()
+
+
+def test_a_conflict_no_included_memory_asserts_is_not_this_bundles_disagreement() -> None:
+    bundle = _compile(
+        (
+            _hit("kept", score=0.9),
+            _hit(
+                "berlin", score=0.5, kind=MemoryKind.STATE, lineage_id="lineage-1", value="berlin"
+            ),
+            _hit("paris", score=0.4, kind=MemoryKind.STATE, lineage_id="lineage-1", value="paris"),
+        ),
+        max_items=1,
+    )
+
+    assert [hit.id for hit in bundle.hits] == ["kept"]
+    assert bundle.conflicts == ()
+
+
+def test_a_filtered_out_side_of_a_conflict_stays_filtered_out() -> None:
+    bundle = _compile(
+        (
+            _hit(
+                "berlin", score=0.9, kind=MemoryKind.STATE, lineage_id="lineage-1", value="berlin"
+            ),
+            _hit(
+                "paris",
+                score=0.5,
+                kind=MemoryKind.STATE,
+                confidence=0.1,
+                lineage_id="lineage-1",
+                value="paris",
+            ),
+        ),
+        min_confidence=0.5,
+    )
+
+    assert bundle.conflicts == ()
 
 
 def test_bounds_and_frames_summarize_only_included_hits() -> None:
@@ -388,7 +454,7 @@ def test_every_budget_bound_that_removed_evidence_is_named_with_its_count() -> N
 
     assert [(item.kind.value, item.detail) for item in bundle.unknowns] == [
         ("budget_excluded", "1 candidates below the requested minimum confidence"),
-        ("budget_excluded", "1 candidates did not fit 1 items and 6000 chars"),
+        ("budget_excluded", "1 candidates did not fit 1 items and 16000 chars"),
         ("budget_excluded", "1 candidates older than the requested freshness window"),
         ("budget_excluded", "1 candidates outside the requested memory types"),
         ("section_empty", "no procedural memory was included"),
@@ -412,6 +478,32 @@ def test_every_budget_bound_that_removed_evidence_is_named_with_its_count() -> N
     )
 
 
+def test_a_full_candidate_window_is_named_beside_what_the_bundle_lost() -> None:
+    hits = tuple(_hit(f"hit-{index}", score=0.9 - index / 100) for index in range(4))
+
+    def _window(limit: int | None, **budget: object) -> tuple[str, ...]:
+        bundle = compile_context(
+            "what is going on",
+            hits,
+            budget=ContextBudget(**budget),  # type: ignore[arg-type]
+            reference_at=REFERENCE,
+            candidate_limit=limit,
+        )
+        return tuple(item.detail for item in bundle.unknowns if item.kind.value == exhausted)
+
+    exhausted = "candidates_exhausted"
+    assert _window(4, max_items=2) == (
+        "retrieval filled its 4 candidate window, so the counts above bound what this window"
+        " held and not what the store holds",
+    )
+    # Room left in the window means the ranking really did end where the bundle says it did.
+    assert _window(8, max_items=2) == ()
+    # A full window that cost the bundle nothing is not an unknown.
+    assert _window(4) == ()
+    # A caller compiling hits it retrieved itself declares no window and is told about none.
+    assert _window(None, max_items=2) == ()
+
+
 def test_a_bundle_that_lost_nothing_reports_no_unknowns() -> None:
     bundle = _compile((_hit("kept", kind=MemoryKind.STATE),))
 
@@ -425,7 +517,7 @@ def test_the_renderer_names_every_unknown() -> None:
     rendered = bundle.render()
 
     assert "## Unknowns" in rendered
-    assert "- budget_excluded: 1 candidates did not fit 1 items and 6000 chars" in rendered
+    assert "- budget_excluded: 1 candidates did not fit 1 items and 16000 chars" in rendered
 
 
 def test_the_deadline_skips_optional_enrichment_and_says_so(
@@ -586,7 +678,7 @@ def test_render_is_deterministic_and_names_every_included_id() -> None:
         "# Context: what is going on",
         "Each line is one memory: [id] content (confidence; validity).",
         f"Reference time: {REFERENCE.isoformat()}",
-        f"Budget: {bundle.chars}/6000 chars, 4/4 items",
+        f"Budget: {bundle.chars}/16000 chars, 4/4 items",
     ]
     assert "## Actors" in rendered and "## Scene" in rendered
     assert "- [actor-1] evidence actor-1 (confidence 0.90)" in rendered
@@ -806,7 +898,7 @@ def test_the_cli_command_serializes_the_bundle(tmp_path: Path) -> None:
         document = _LOCAL["compile"](memory, arguments)
 
     assert json.loads(json.dumps(document))["budget"] == {
-        "max_chars": 6000,
+        "max_chars": 16000,
         "max_items": 1,
         "memory_types": ["semantic"],
         "min_confidence": 0.0,

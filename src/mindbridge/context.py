@@ -103,12 +103,15 @@ def compile_context(
     reference_at: datetime,
     started_at: float | None = None,
     unknowns: Sequence[ContextUnknown] = (),
+    candidate_limit: int | None = None,
 ) -> ContextBundle:
     """Partition, filter, and budget ranked hits into one bundle.
 
     `started_at` is a `time.perf_counter()` reading taken before retrieval, so `budget
     .max_latency_ms` bounds the whole compilation rather than this function. `unknowns` carries
     what the caller already knows and the compiler cannot see, such as an empty spatial scope.
+    `candidate_limit` is the depth retrieval was asked to rank, so a bundle that lost evidence
+    and filled that window can say the ranking may continue past it.
     """
     started_at = perf_counter() if started_at is None else started_at
     excluded: dict[str, int] = {}
@@ -134,7 +137,16 @@ def compile_context(
     # follows it. Nothing already computed is discarded and no stage is cut in half, so a bundle
     # under a deadline is a prefix of the one without it, never a different one.
     skipped = _past_deadline(budget, started_at)
-    conflicts = () if skipped else _conflicts(included)
+    # Conflict detection reads every candidate the filters kept, not only what the budget bought,
+    # so dropping one side of a disagreement for want of a slot cannot make it disappear.
+    conflicts = (
+        ()
+        if skipped
+        else _conflicts(
+            sorted(candidates, key=lambda hit: (-hit.score, hit.id)),
+            frozenset(hit.id for hit in included),
+        )
+    )
     occurred_from, occurred_until = _occurred_range(included)
     elapsed_ms = _elapsed_ms(started_at)
     return ContextBundle(
@@ -150,7 +162,20 @@ def compile_context(
         affect=sections["affect"],
         traits=sections["traits"],
         conflicts=conflicts,
-        unknowns=_unknowns(unknowns, budget, included, excluded, omitted, skipped=skipped),
+        unknowns=_unknowns(
+            unknowns,
+            budget,
+            included,
+            excluded,
+            omitted,
+            skipped=skipped,
+            exhausted=(
+                candidate_limit is not None
+                and len(hits) >= candidate_limit
+                and bool(excluded or omitted)
+            ),
+            candidate_limit=candidate_limit,
+        ),
         occurred_from=occurred_from,
         occurred_until=occurred_until,
         frames=_frames(included),
@@ -232,6 +257,8 @@ def _unknowns(
     omitted: int,
     *,
     skipped: bool,
+    exhausted: bool = False,
+    candidate_limit: int | None = None,
 ) -> tuple[ContextUnknown, ...]:
     """Name what the request implied and this bundle does not carry, in one stable order."""
     found = list(supplied)
@@ -250,6 +277,16 @@ def _unknowns(
                 detail=(
                     f"{omitted} candidates did not fit {budget.max_items} items"
                     f" and {budget.max_chars} chars"
+                ),
+            )
+        )
+    if exhausted:
+        found.append(
+            ContextUnknown(
+                kind=ContextUnknownKind.CANDIDATES_EXHAUSTED,
+                detail=(
+                    f"retrieval filled its {candidate_limit} candidate window, so the counts"
+                    " above bound what this window held and not what the store holds"
                 ),
             )
         )
@@ -276,7 +313,10 @@ def _unknowns(
     return tuple(sorted(found, key=lambda item: (item.kind.value, item.detail)))
 
 
-def _conflicts(hits: Sequence[SearchHit]) -> tuple[ContextConflict, ...]:
+def _conflicts(
+    hits: Sequence[SearchHit],
+    included_ids: frozenset[str],
+) -> tuple[ContextConflict, ...]:
     lineages: dict[str, list[_Claim]] = {}
     for hit in hits:
         context = hit.context
@@ -288,10 +328,12 @@ def _conflicts(hits: Sequence[SearchHit]) -> tuple[ContextConflict, ...]:
         lineages.setdefault(lineage_id, []).append(
             (value, hit.id, context.subject, context.predicate)
         )
+    # A lineage no included memory takes part in is not this bundle's disagreement to report.
     return tuple(
         conflict
         for lineage_id, claims in lineages.items()
-        if (conflict := _lineage_conflict(lineage_id, claims)) is not None
+        if any(memory_id in included_ids for _value, memory_id, _subject, _predicate in claims)
+        and (conflict := _lineage_conflict(lineage_id, claims)) is not None
     )
 
 

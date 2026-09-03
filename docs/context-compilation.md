@@ -27,11 +27,17 @@ compile(
 behave exactly as they do for `search()`, and SQLite reapplies authoritative visibility: a
 forgotten record and a hidden inferred trait never reach a bundle.
 
+There is one retrieval round and no second one. Everything the bundle counts -- `omitted`, and
+each `budget_excluded` tally -- is therefore a statement about that window, not about the store:
+`omitted == 0` means nothing inside the window was dropped, not that nothing else exists. When the
+window came back full and the bundle still lost evidence, `unknowns` carries a
+`candidates_exhausted` entry saying so, so the difference is visible rather than inferred.
+
 ## Budget
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `max_chars` | `6000` | Evidence character ceiling, charged with the same cost function `ask()` uses: record text plus a per-modality text equivalent for each media asset |
+| `max_chars` | `16000` | Evidence character ceiling, charged with the same cost function `ask()` uses: record text plus a per-modality text equivalent for each media asset |
 | `max_items` | `24` | Maximum included memories |
 | `memory_types` | `None` | Keep only these `MemoryType` values; `None` keeps every type |
 | `min_confidence` | `0.0` | Minimum typed confidence; a record with no typed context counts as `1.0` |
@@ -41,6 +47,53 @@ forgotten record and a hidden inferred trait never reach a bundle.
 The freshness anchor is event end, then event start, then creation time. Every field is validated
 on construction: the two maxima and `max_latency_ms` are positive integers, `min_confidence` is in
 `[0, 1]`, and `freshness` is a positive `timedelta`.
+
+### What a character costs
+
+There is one budget, not a text budget and a media budget. `max_chars` prices both against the
+same scale, because what a bundle spends is what the downstream model is charged for, and one
+grounded media part costs far more than the record text beside it. The prices are fixed:
+
+| Charged | Characters |
+| --- | --- |
+| Record text | `len(hit.content)` |
+| One `image` asset | 2000 |
+| One `audio` asset | 4000 |
+| One `video` asset | 12000 |
+| One asset whose modality did not resolve | 4000 |
+
+They are measured, not derived: against this stack an image part came out near five hundred model
+tokens and a ten-second video part near three thousand, at the usual four characters per token.
+They are coarse on purpose -- the budget is the caller's knob, not these constants.
+
+The default `max_chars` follows from the largest of them. A video memory costs at least 12000, so
+a default below that could never buy one, and every video memory would be reported as omitted no
+matter how well it ranked. The default is set above the most expensive single part with room for
+its record text and a cheaper second part.
+
+### What `min_confidence` compares
+
+`min_confidence` filters a *typed* confidence: the confidence a `FormationBackend` or
+`ConsolidationBackend` attached when it inferred something. A record with no typed context has no
+inference to discount -- it is a raw observation, evidence in its own right -- so it counts as
+`1.0` and passes every bound, including `min_confidence=1.0`. `render()` prints the same `1.00`,
+so the filter and the rendered line never disagree. Raising `min_confidence` is therefore a way to
+demand better inferences, not a way to exclude observations; filter those by `memory_types`.
+
+### What `max_chars` does not bound
+
+`max_chars` bounds evidence, the quantity `ContextBundle.chars` reports. It does not bound
+`len(bundle.render())`, which adds a bounded frame around that evidence:
+
+- a four-line header -- the goal, a 61-character reading guide, the reference time, and the
+  budget line -- which is roughly 150 characters plus the goal text;
+- a blank line and a two-character `##` heading, plus a space, for each non-empty section;
+- per included memory, the `- [id]` prefix and the `(confidence 0.00)` suffix, with their
+  separating spaces: 23 characters plus the id, plus a validity suffix when it carries one;
+- the optional `## Conflicts`, `## Unknowns`, and `Omitted:` blocks.
+
+A caller who ships `render()` should size against `len(bundle.render())`; the bundle does not
+publish a second number for it.
 
 ### The deadline
 
@@ -105,17 +158,25 @@ a thin bundle explains itself instead of looking like an empty store.
 | `scope_empty` | A `scope` was supplied and retrieval matched nothing; the entry names the bounds |
 | `modality_unsupported` | The goal carries media this composition's embedder cannot search |
 | `stage_skipped` | An optional stage the `max_latency_ms` deadline skipped |
+| `candidates_exhausted` | Retrieval filled its candidate window and the bundle still lost evidence, so the counts bound the window and not the store |
 
 ## Conflicts
 
-Included hits that share a `lineage_id`, carry kind `state`, `relation`, or `trait`, and disagree
-on `value` produce one `ContextConflict` each. Its `values` and `memory_ids` are aligned: each
-distinct value is paired with the highest-ranked included memory asserting it. The compiler reports
-the disagreement and leaves resolution to the caller or to a later correction.
+Candidates that share a `lineage_id`, carry kind `state`, `relation`, or `trait`, and disagree on
+`value` produce one `ContextConflict` each. Its `values` and `memory_ids` are aligned: each
+distinct value is paired with the highest-ranked candidate asserting it. The compiler reports the
+disagreement and leaves resolution to the caller or to a later correction.
 
-Only included hits are compared. A superseded version that bitemporal filtering already excluded
-never appears, so `conflicts` is a statement about this bundle and not a belief-revision history;
-read `memory_versions` through the control plane for that.
+Detection reads every candidate the filters kept, not only the ones the budget bought, so running
+out of slots cannot make a disagreement disappear. A `memory_id` in a conflict may therefore name
+a memory that is not in `hits`; `render()` marks it `not included`, because that memory has no
+line of its own anywhere in the text. At least one included memory must take part, so a lineage
+the bundle says nothing about is not reported as its disagreement.
+
+A candidate a *filter* removed -- `memory_types`, `min_confidence`, or `freshness` -- is not
+compared, and neither is a superseded version bitemporal filtering already excluded. `conflicts`
+is a statement about what this request admitted, not a belief-revision history; read
+`memory_versions` through the control plane for that.
 
 ## Rendered text
 
@@ -130,7 +191,7 @@ appears without the `## Unknowns` block above it.
 # Context: what should I bring to the workshop?
 Each line is one memory: [id] content (confidence; validity).
 Reference time: 2026-09-03T12:00:00+00:00
-Budget: 132/6000 chars, 3/24 items
+Budget: 132/16000 chars, 3/24 items
 
 ## Facts
 - [a1b2] the spare key is in the blue toolbox (confidence 1.00)
@@ -140,10 +201,10 @@ Budget: 132/6000 chars, 3/24 items
 - [e5f6] we walked to the harbour (confidence 1.00)
 
 ## Conflicts
-- ana location: "berlin" [c3d4] vs "paris" [g7h8]
+- ana location: "berlin" [c3d4] vs "paris" [g7h8, not included]
 
 ## Unknowns
-- budget_excluded: 4 candidates did not fit 24 items and 6000 chars
+- budget_excluded: 4 candidates did not fit 24 items and 16000 chars
 
 Omitted: 4 lower-ranked candidates
 ```

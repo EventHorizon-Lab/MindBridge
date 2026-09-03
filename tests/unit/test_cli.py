@@ -885,7 +885,7 @@ def test_remote_mode_compiles_over_v1(
             {
                 "goal": "what should I bring",
                 "budget": {
-                    "max_chars": 6000,
+                    "max_chars": 16000,
                     "max_items": 8,
                     "memory_types": ["episodic"],
                     "min_confidence": 0.0,

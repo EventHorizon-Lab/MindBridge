@@ -1279,13 +1279,14 @@ class Memory:
                 explicit_reference or datetime.now(timezone.utc),
                 infer_reference=explicit_reference is None,
             )
+            # `_limit` bounds what a caller may ask a public search to return, not how deep the
+            # kernel ranks, so `_search_prepared` has no ceiling of its own and a bundle may rank
+            # past one hundred. Three candidates per slot is the same headroom `ask()` gives its
+            # modality round robin.
+            candidate_limit = max(_RERANK_CANDIDATES, budget.max_items * 3)
             outcome = self._search_prepared(
                 prepared,
-                # `_limit` bounds what a caller may ask a public search to return, not how deep
-                # the kernel ranks, so `_search_prepared` has no ceiling of its own and a bundle
-                # may rank past one hundred. Three candidates per slot is the same headroom
-                # `ask()` gives its modality round robin.
-                limit=max(_RERANK_CANDIDATES, budget.max_items * 3),
+                limit=candidate_limit,
                 operation=assets,
                 # The budget filters memory types itself, because it selects a set rather than
                 # the one type the retrieval plane can push into the index.
@@ -1308,6 +1309,7 @@ class Memory:
                 reference_at=reference,
                 started_at=started_at,
                 unknowns=self._request_unknowns(prepared, scope, outcome.hits),
+                candidate_limit=candidate_limit,
             )
 
     def _request_unknowns(

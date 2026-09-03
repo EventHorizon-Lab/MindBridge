@@ -880,7 +880,7 @@ def test_the_context_route_defaults_to_the_sdk_budget() -> None:
     assert response.status_code == 200
     assert memory.calls == [("compile", "What should I bring?", None, None, None)]
     assert response.json()["budget"] == {
-        "max_chars": 6_000,
+        "max_chars": 16_000,
         "max_items": 24,
         "memory_types": None,
         "min_confidence": 0.0,

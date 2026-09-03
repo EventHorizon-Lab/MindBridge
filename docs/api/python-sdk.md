@@ -351,10 +351,28 @@ reverses one face-and-voice merge, returning the restored ID or `None` when the 
 reversible; it resets the pair's accumulated evidence rather than suppressing the pair, so a voice
 and face that keep co-occurring are corroborated and merged again. `reinforce`
 records explicit positive feedback and returns the number of existing distinct memories updated.
-`list` uses an opaque keyset cursor. `delete` is idempotent and reports whether the record existed.
-`reindex` rebuilds Zvec from authoritative SQLite embeddings without calling the embedder and
-returns the number of memories rebuilt. `optimize` merges and flushes staged index vectors.
-Repeated `close()` calls are harmless.
+`list` uses an opaque keyset cursor. `delete` is idempotent and reports whether the record existed;
+what it removes is spelled out below. `reindex` rebuilds Zvec from authoritative SQLite embeddings
+without calling the embedder and returns the number of memories rebuilt. `optimize` merges and
+flushes staged index vectors. Repeated `close()` calls are harmless.
+
+#### What `delete` removes
+
+`delete` is physical forgetting, the third and strongest of
+[the three forms](../context-os.md#forgetting-is-three-operations). It is not a visibility change:
+after it returns, the record's content is not recoverable from MindBridge. Media is
+content-addressed and shared, so a blob and its descriptor go only once no remaining memory
+references them; deleting one of two memories holding the same file keeps the file.
+
+| Removed with the record | Left behind, and why |
+| --- | --- |
+| The `memory_records` row, and with it every typed row keyed on it: `memory_semantics`, `memory_versions`, `memory_evidence` for it, `formation_runs`, and its `capture_queue` row | -- |
+| Every `embeddings` row, and the matching Zvec vectors, through the durable index outbox `delete` drains before returning | -- |
+| Its `memory_assets` links, and then any `media_assets` descriptor and content-addressed blob no other memory still references | A blob a second memory still references, until that memory is deleted too |
+| Everything keyed on a removed asset: `speech_analyses`, `speech_segments`, `face_analyses`, `face_observations`, and the cached transcript on the descriptor | -- |
+| An `identities` row and its `identity_exemplars` biometric template, once the removed observations were its last and it carries no registered name, relationship, alias, or cross-modal evidence | A *named* or merged person, who is an assertion a caller made rather than a by-product of one recording. `forget_identity` erases a person |
+| Derived memories whose last active evidence was this record | A derived memory with other evidence, whose link to this record is retired rather than deleted, keeping its lineage auditable. Its own text may still paraphrase what the record said; that is consolidation, and `delete` on the derived memory removes it |
+| -- | `memory_operations` rows naming the id. The operation log is append-only audit history: it records that an operation happened, over which ids, with which proposal and rationale. Rewriting it to hide a deleted id would make `rollback` unsound and the log unable to answer what a deletion followed. It holds ids, a proposal, and a rationale -- never the deleted record's content or its media |
 
 `capabilities` reports what the composition's backends declare rather than what a provider name
 suggests, so an agent surface can advertise the instance instead of discovering a missing backend
