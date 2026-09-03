@@ -104,9 +104,26 @@ it. Naming a person travels this path too, as an `ENTITY` assertion carrying tha
 needs no formation backend and inherits versioning, visibility, and rollback rather than getting
 its own. `identities.name` and `identities.relationship` are then a projection of the current
 visible assertion, not an independently writable field, and every recompute replaces the affected
-indexed documents in the same transaction. Naming, unlinking, and erasure all route through that
-one recompute, so no committed state exists in which the stored text and the projected name
+indexed documents in the same transaction. Every write that can change a bound assertion's
+visibility recomputes the projection in its own transaction -- naming, evidence, correction,
+cognitive forgetting, rollback, a merge that re-points the assertion onto the survivor, an
+unlink, an erasure, and the ordinary deletion of the assertion record -- so no committed state
+exists in which `identities.name`, the stored text, and the currently visible assertion
 disagree.
+
+The binding is deterministic policy, never a model's choice: the kernel stamps it when a
+proposed claim's subject matches the canonical subject of a visible naming assertion under the
+same NFKC casefold the lineage key uses, and `_formation_lineage_id` then keys on the identity,
+so claims about one person converge however a turn spelled the name. A model's `ENTITY` proposal
+is never bound, because a bound `ENTITY` row is a naming assertion and naming stays with the
+host. Undoing a merge re-evaluates the claims bound to the survivor: one resting only on media
+that moved back is re-attributed to the restored person, one resting on both people's media is
+unbound, and none is left attributed to somebody it was never about.
+
+An identity with no visible naming assertion is provisional: derived state, not a stored flag.
+`IdentityProfile.confirmed` reports it, and a compiled bundle's `actors` carries one
+`ProvisionalActor` per unnamed person in its evidence, because an unrecognized person in the room
+must be distinguishable from one who is absent.
 
 ## Retrieval consistency
 
@@ -185,7 +202,9 @@ gate in the [benchmark protocol](benchmarking.md#mandatory-controls).
 Supported SDK values are imported from `mindbridge`. The `Memory` SDK exposes 27 product
 operations. REST exposes nine `/v1` routes: add, batch add, list, search, reinforce, get, delete,
 answer, and compile context. MCP exposes fifteen tools: the eight corresponding non-batch
-operations plus speech, face, and identity operations. The local CLI exposes the 27 operations
+operations plus speech, face, and identity operations, or ten when the host builds it with
+`identity_operations=False`, because naming and erasing a person is host authority and the host
+decides whether it is on the wire at all. The local CLI exposes the 27 operations
 plus `doctor`; `--url` is limited to operations implemented by REST.
 
 Compiling context is a read-only view. The memory control plane — `consolidate()`, `forget()`,

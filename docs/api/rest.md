@@ -235,7 +235,8 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 | `PageResponse` | `items`, `next_cursor` |
 | `ContextBudgetResponse` | `max_chars`, `max_items`, `memory_types` or `null`, `min_confidence`, `freshness_seconds` |
 | `ContextConflictResponse` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
-| `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `actors`, `episodes`, `facts`, `procedures`, `affect`, `traits`, plus `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`, `rendered` |
+| `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `episodes`, `facts`, `procedures`, `affect`, `traits`, the mixed `actors` array of hits and `ProvisionalActorResponse` objects, plus `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`, `rendered` |
+| `ProvisionalActorResponse` | `identity_id`, `memory_ids`: one recognized person in the included evidence whom no visible naming assertion names |
 | `CapabilitiesResponse` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `consolidation_model`, `speaker_recognition`, `streaming_generation` |
 | `HealthResponse` | `status`, `capabilities` |
 

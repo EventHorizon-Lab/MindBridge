@@ -35,6 +35,7 @@ from mindbridge.types import (
     Modality,
     ObservationContext,
     Page,
+    ProvisionalActor,
     RetrievalCandidateTrace,
     RetrievalRejection,
     RetrievalScope,
@@ -80,6 +81,7 @@ CAPABILITIES = MemoryCapabilities(
 )
 
 
+PROVISIONAL = ProvisionalActor(identity_id="identity_2", memory_ids=("memory_2",))
 CONFLICT = ContextConflict(
     lineage_id="lineage_1",
     subject="ana",
@@ -821,7 +823,8 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
     }
     assert [hit["id"] for hit in bundle["facts"]] == ["memory_1"]
     assert [hit["id"] for hit in bundle["episodes"]] == ["memory_2"]
-    assert bundle["actors"] == []
+    # A person the evidence observed whom nobody has named travels beside the ranked hits.
+    assert bundle["actors"] == [{"identity_id": "identity_2", "memory_ids": ["memory_2"]}]
     assert bundle["conflicts"] == [
         {
             "lineage_id": "lineage_1",
@@ -987,7 +990,7 @@ def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
         goal="What should I bring?",
         reference_at=reference_at,
         budget=budget,
-        actors=(),
+        actors=(PROVISIONAL,),
         episodes=(_media_hit(),),
         facts=(_hit(),),
         procedures=(),

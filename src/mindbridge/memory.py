@@ -1242,7 +1242,19 @@ class Memory:
                 outcome.hits,
                 budget=budget,
                 reference_at=reference,
+                provisional=self._provisional_identities(outcome.hits),
             )
+
+    def _provisional_identities(self, hits: Sequence[SearchHit]) -> dict[str, tuple[str, ...]]:
+        """Resolve which people the candidate evidence observed but nobody has named.
+
+        Deterministic kernel policy, like every other identity decision: a person is
+        provisional exactly while no visible naming assertion names them.
+        """
+        if not hits:
+            return {}
+        with _translate_storage_errors("read provisional identities"):
+            return self._store.provisional_identities(tuple(hit.id for hit in hits))
 
     @property
     def capabilities(self) -> MemoryCapabilities:
@@ -1483,6 +1495,32 @@ class Memory:
             previous_speaker_id=target_id,
         )
 
+    def _deleted_naming_index(
+        self,
+        memory_id: str,
+        operation: _OperationAssets,
+    ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
+        """Rebuild indexed speech text for the projection a pending delete will leave behind.
+
+        Deleting the record that names somebody is the ordinary delete path applied to an
+        extraordinary record. The name it projected has to stop answering to search in the same
+        commit that removes the assertion, so the text is rebuilt from the assertion that will
+        still be visible afterwards -- usually none, which reindexes the speaker as nameless.
+        """
+        with _translate_storage_errors("read identity naming assertion"):
+            identity_id = self._store.naming_assertion_identity(memory_id)
+            if identity_id is None:
+                return (), ()
+            projected, _relationship = self._store.projected_identity_name(
+                identity_id,
+                excluding=(memory_id,),
+            )
+        return self._reindex_identity_speech(
+            identity_id,
+            speaker_name=projected,
+            operation=operation,
+        )
+
     def _projected_identity(self, identity_id: str) -> tuple[str | None, str | None]:
         with _translate_storage_errors("read identity naming assertion"):
             return self._store.projected_identity_name(identity_id)
@@ -1585,6 +1623,23 @@ class Memory:
                     raise SpeakerNotFoundError(f"speaker does not exist: {requested_id}")
                 raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
             self._drain_outbox()
+
+    def _bound_identity(self, proposal: FormationProposal) -> str | None:
+        """Resolve which recognized person a proposed claim is about, or None.
+
+        Deterministic and never the model's decision: the proposal's subject has to match the
+        canonical subject of one currently visible naming assertion, compared with the same
+        NFKC casefold the lineage key uses. `_formation_lineage_id` then keys on the identity,
+        so claims about one person converge however the model spelled the name that turn.
+
+        An ENTITY proposal is deliberately never bound. A bound ENTITY row *is* a naming
+        assertion, so binding one here would let a model's proposal rename a person; naming
+        stays with the host and with the identify path.
+        """
+        if proposal.kind is MemoryKind.ENTITY or proposal.subject is None:
+            return None
+        with _translate_storage_errors("resolve a claim's subject"):
+            return self._store.identity_for_subject(proposal.subject)
 
     def _recorded_relationship(self, identity_id: str) -> str | None:
         _name, relationship = self._projected_identity(identity_id)
@@ -2137,6 +2192,7 @@ class Memory:
                 model_id=self._consolidation_model,
                 recipe=self._consolidation_recipe,
                 recorded_at=now,
+                identity_id=self._bound_identity(proposal),
             ),
             evidence_ids=tuple(sorted(source.id for source in sources)),
         )
@@ -2198,15 +2254,25 @@ class Memory:
             )
 
     def delete(self, memory_id: str) -> bool:
-        """Delete one memory and garbage-collect media no memory still references."""
+        """Delete one memory and garbage-collect media no memory still references.
+
+        A naming assertion is an ordinary record, so deleting one is allowed and moves the
+        projection it fed. The registry and the indexed text that quoted the name are rebuilt
+        in the same commit, because a name nothing asserts must not stay searchable.
+        """
         with (
             self._trace("mindbridge.delete", kind="operation"),
-            self._operation(),
+            self._operation() as operation,
             self._write_lock,
         ):
             normalized_id = _identifier(memory_id, "memory_id")
+            memories, embeddings = self._deleted_naming_index(normalized_id, operation)
             with _translate_storage_errors("delete memory"):
-                deleted, orphaned = self._store.delete_memory_with_assets(normalized_id)
+                deleted, orphaned = self._store.delete_memory_with_assets(
+                    normalized_id,
+                    memories=memories,
+                    embeddings=embeddings,
+                )
             self._queue_asset_cleanup(orphaned)
             self._drain_outbox()
             return deleted
@@ -2766,6 +2832,7 @@ class Memory:
                     model_id=self._formation_model,
                     recipe=self._formation_space,
                     recorded_at=now,
+                    identity_id=self._bound_identity(proposal),
                 )
                 pairs.append(
                     (

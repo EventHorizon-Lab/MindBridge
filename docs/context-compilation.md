@@ -45,7 +45,7 @@ A typed `MemoryKind` decides the section first; an untyped or generic record fal
 
 | Section | Contents |
 | --- | --- |
-| `actors` | Kind `entity` |
+| `actors` | Kind `entity`, plus one `ProvisionalActor` per unnamed person in the included evidence |
 | `facts` | Type `semantic`, except `entity` and `trait` |
 | `episodes` | Type `episodic`, except `affect` |
 | `procedures` | Type `procedural` |
@@ -60,6 +60,19 @@ passed the filters but did not fit, and `chars` is what the included hits cost.
 
 `ContextBundle` also reports `occurred_from` and `occurred_until` over the included hits, `frames`
 (the distinct spatial frame IDs, sorted), and `hits` (every included hit in rank order).
+
+## Provisional actors
+
+A recognized person whom no visible naming assertion names is reported in `actors` as a
+`ProvisionalActor` carrying `identity_id` and the `memory_ids` of the included evidence that
+observed them, sorted by identity. An unnamed person present in the room is not a person missing
+from context: what an agent may say depends on knowing they are there and that nobody has named
+them.
+
+A provisional actor is not a hit. It never appears in `hits`, it takes no item slot, it costs no
+characters, and it is dropped when the evidence that observed the person did not make it into the
+bundle -- the bundle never reports somebody the reader cannot see the evidence for. `render()`
+prints one plainly labelled line per entry, after the ranked actors.
 
 ## Conflicts
 

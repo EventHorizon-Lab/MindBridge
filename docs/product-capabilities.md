@@ -213,6 +213,21 @@ indexed transcript text in the same commit. The visible consequence is that nami
 a searchable memory record, which appears in `list()` and `search()` results. See
 [typed assertions](memory-types-time-and-decay.md#naming-a-person-is-a-typed-assertion).
 
+The projection is recomputed by every path that can change what a bound assertion says,
+including deleting the assertion record like any other memory, so the registry and the indexed
+text never keep a name nothing asserts. Typed claims about a named person are bound to them:
+the kernel resolves the binding from the assertion's canonical subject, deterministically and
+never from a model's choice, so claims about one person converge on one subject even when a
+turn spells the name differently, and undoing a wrong merge re-attributes or unbinds the claims
+made while two people were one instead of leaving them on the wrong person.
+
+A recognized person with no visible naming assertion is *provisional*. `IdentityProfile` reports
+it as `confirmed=False` with the naming evidence in `evidence_ids`, and a compiled context bundle
+lists them in `actors` as a labelled `ProvisionalActor`, so an agent can say that somebody it does
+not recognize is present rather than omitting them. Naming stays host authority: the MCP adapter
+says so in the tool descriptions and can withhold the identity tools entirely with
+`build_mcp_server(memory, identity_operations=False)`.
+
 `forget_identity` removes the person's biometric exemplars, aliases, naming assertions, and
 indexed name while retaining the surrounding memories, media, and transcript words. It is intentionally different from
 deleting an event. A later encounter can create a new unnamed identity because recognizing a
