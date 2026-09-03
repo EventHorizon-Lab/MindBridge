@@ -2405,6 +2405,29 @@ def test_the_projection_follows_every_visibility_change_of_a_naming_assertion(
     assert speech is not None and speech[0].speaker_name is None
 
 
+def test_a_backdated_forget_does_not_break_the_identity_projection(tmp_path: Path) -> None:
+    """`identities.updated_at` is transaction time, not the caller's semantic time.
+
+    A host may forget or retract a record with a timestamp in the past -- backfilling something it
+    learned late. The name projection is rewritten in that same transaction, so stamping the
+    caller's time would put the identity row's `updated_at` before its own `created_at` and the
+    CHECK constraint would surface as an `IntegrityError` out of a public store method.
+    """
+    long_ago = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        voice_id = _voice_identity(store, clip, (1.0, 0.0))
+        store.write_memories(
+            (_naming_assertion("naming-1", voice_id, "Li", recorded_at=long_ago),),
+            (_embedding("e-naming-1", "naming-1"),),
+        )
+        assert store.projected_identity_name(voice_id) == ("Li", None)
+
+        assert store.set_forgotten(("naming-1",), forgotten_at=long_ago) == ("naming-1",)
+
+        assert store.projected_identity_name(voice_id) == (None, None)
+
+
 def test_merging_identities_repoints_the_naming_assertion_onto_the_survivor(
     tmp_path: Path,
 ) -> None:

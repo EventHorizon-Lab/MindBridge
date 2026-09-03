@@ -537,6 +537,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   for a run while units ingest on worker threads, and SQLite's per-thread binding made every
   worker-side describe fail; the write path counted each as a failed batch and fell open, so a
   vision arm could build caption-less libraries while every other counter read as healthy.
+- Forgetting, retracting, or correcting a naming assertion with a timestamp older than the identity
+  row raised `sqlite3.IntegrityError` (`CHECK constraint failed: updated_at >= created_at`) out of
+  the store instead of applying. The name projection is rewritten in the same transaction and was
+  stamping `identities.updated_at` with the caller's semantic time — a record's `recorded_at`, an
+  operation's `applied_at`, a deliberately backdated `forgotten_at` — none of which says when the
+  row changed. It now stamps transaction time, like every other write to that row, and the
+  projection helpers no longer take a timestamp at all.
 - A control-plane operation that lost the idempotency race on the consolidation write path raised
   `StorageError` from a unique-index violation instead of being rejected as `"duplicate"`. The
   formation transaction now makes the same in-transaction key check the other write path already
