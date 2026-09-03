@@ -287,8 +287,10 @@ defaults or justify superiority claims.
    (`consolidate()`, `forget()`, `rollback()`, `operations()`), the durable trigger
    (`consolidation_candidates()`), consolidation forgetting as one reversible operation, the
    declarative `consolidation` slot that makes the loop reachable without a Python app loader,
-   and replay of a logged sequence against a fresh store, covered as a test rather than as an
-   `apply(operation)` surface. Open: companion-scenario privacy tests; a post-hoc outcome field,
+   kernel rejection of proposals that name records the backend was not shown, of partial
+   multi-target operations, and of proposals whose targets moved before the commit, native media
+   in the bundled consolidation backend's input, and replay of a logged sequence against a fresh
+   store, covered as a test rather than as an `apply(operation)` surface. Open: companion-scenario privacy tests; a post-hoc outcome field,
    without which only rollback success of the slow-loop measurements is derivable; and identity
    merge and split, which stay outside the operation log until the identity-governance round.
 4. Add a context compiler whose output improves downstream tasks within declared budgets. Done
