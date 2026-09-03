@@ -33,6 +33,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from mindbridge import recipes
+from mindbridge.control import load_operation
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -55,7 +56,9 @@ from mindbridge.types import (
     EvidenceBasis,
     FaceObservation,
     MemoryContext,
+    MemoryOperation,
     MemoryOperationRecord,
+    MemoryOutcome,
     MemoryRecord,
     MemoryTrigger,
     MemoryType,
@@ -112,6 +115,9 @@ OPERATIONS: tuple[str, ...] = (
     "reinforce",
     "consolidation_candidates",
     "consolidate",
+    "deliberate",
+    "apply",
+    "record_outcome",
     "forget",
     "rollback",
     "operations",
@@ -852,6 +858,42 @@ def _consolidate(memory: Memory, arguments: argparse.Namespace) -> _Document:
             {"intent": operation.intent.value, "reason": reason}
             for operation, reason in report.rejected
         ],
+        "weighed": report.weighed,
+    }
+
+
+def _deliberate(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    report = memory.deliberate(
+        limit=arguments.limit,
+        max_rounds=arguments.max_rounds,
+        idle=arguments.idle,
+    )
+    return {
+        "rounds": report.rounds,
+        "weighed": report.weighed,
+        "skipped": report.skipped,
+        "applied": report.applied,
+        "rejected": report.rejected,
+        "model_calls": report.model_calls,
+    }
+
+
+def _apply(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {"operation": _operation_document(memory.apply(_operation_input(arguments.operation)))}
+
+
+def _operation_input(source: str) -> MemoryOperation:
+    """Read one operation from the same JSON the log stores, so a log row replays verbatim."""
+    return load_operation(_read_source(source))
+
+
+def _record_outcome(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {
+        "recorded": memory.record_outcome(
+            arguments.operation_id,
+            MemoryOutcome(arguments.outcome),
+            note=arguments.note,
+        )
     }
 
 
@@ -890,6 +932,8 @@ def _operation_document(record: MemoryOperationRecord) -> _Document:
         "rolled_back_at": (
             None if record.rolled_back_at is None else record.rolled_back_at.isoformat()
         ),
+        "outcome": None if record.outcome is None else record.outcome.value,
+        "outcome_note": record.outcome_note,
     }
 
 
@@ -936,6 +980,9 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "reinforce": _reinforce,
     "consolidation-candidates": _consolidation_candidates,
     "consolidate": _consolidate,
+    "deliberate": _deliberate,
+    "apply": _apply,
+    "record-outcome": _record_outcome,
     "forget": _forget,
     "rollback": _rollback,
     "operations": _operations,
@@ -1842,6 +1889,11 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         default=_default("consolidation_candidates", "limit"),
         help="candidate rows (default: %(default)s)",
     )
+    candidates.add_argument(
+        "--idle",
+        action="store_true",
+        help="declare an approved idle window, admitting never-weighed lineages",
+    )
     consolidate = _content_command(
         commands, "consolidate", "deliberate over evidence and apply memory operations"
     )
@@ -1859,6 +1911,44 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         choices=[item.value for item in MemoryTrigger],
         default=MemoryTrigger(_default("consolidate", "trigger")).value,
     )
+    deliberate = commands.add_parser(
+        "deliberate",
+        help="run the memory-management loop over due candidates until nothing is due",
+    )
+    deliberate.add_argument(
+        "--limit",
+        type=int,
+        default=_default("deliberate", "limit"),
+        help="candidate rows and evidence set size per round (default: %(default)s)",
+    )
+    deliberate.add_argument(
+        "--max-rounds",
+        type=int,
+        default=_default("deliberate", "max_rounds"),
+        help="candidate passes ceiling (default: %(default)s)",
+    )
+    deliberate.add_argument(
+        "--idle",
+        action="store_true",
+        help="declare an approved idle window, admitting never-weighed lineages",
+    )
+    applying = commands.add_parser(
+        "apply",
+        help="apply one host-supplied memory operation through the kernel, as replay does",
+    )
+    applying.add_argument(
+        "--operation",
+        required=True,
+        metavar="JSON",
+        help="one operation object as `operations` logs it, @PATH, or -",
+    )
+    outcome = commands.add_parser(
+        "record-outcome",
+        help="record what later evidence said about one logged operation",
+    )
+    outcome.add_argument("operation_id", type=int, metavar="OPERATION_ID")
+    outcome.add_argument("outcome", choices=[item.value for item in MemoryOutcome])
+    outcome.add_argument("--note", help="why later evidence confirmed or refuted it")
     forget = commands.add_parser("forget", help="cognitively forget memories without deleting")
     forget.add_argument("memory_ids", nargs="+", metavar="MEMORY_ID")
     rollback = commands.add_parser("rollback", help="reverse one logged memory operation")

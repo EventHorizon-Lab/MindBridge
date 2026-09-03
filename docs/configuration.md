@@ -193,9 +193,12 @@ with Memory.from_config(
         },
     }
 ) as memory:
-    for candidate in memory.consolidation_candidates():
-        memory.consolidate(evidence_ids=candidate.memory_ids, trigger=candidate.trigger)
+    report = memory.deliberate()
 ```
+
+`deliberate()` is that loop: it asks `consolidation_candidates()` what the store's own state says
+is due, consolidates each row under the row's trigger, and repeats until nothing is due. The
+primitives stay available for a host that wants to schedule the two halves itself.
 
 Consolidation stays off when the slot is omitted, and `consolidate()` then raises
 `ModelError(reason="backend_not_configured")` while every other operation is unchanged. Declaring
@@ -233,6 +236,9 @@ used by `Memory.from_plugins()`.
 | `face_similarity` | `0.363` | Face identity match threshold |
 | `face_margin` | `0.05` | Face identity ambiguity margin |
 | `identity_link_min_assets` | `2` | Distinct assets required before voice and face identities merge |
+| `memory_budget_records` | `None` | Active records this instance is meant to hold; the whole definition of the `PRESSURE` trigger, which derives nothing without it |
+| `query_failure_window_seconds` | `3600.0` | How far back the `QUERY_FAILURE` trigger counts near-equal empty recalls |
+| `query_failure_history` | `512` | How many empty recalls the store keeps at all; the oldest fall out |
 
 A memory declares its composition through `Memory.capabilities`, which reports the modalities,
 model identities, and configured backends the routing layer reads, including

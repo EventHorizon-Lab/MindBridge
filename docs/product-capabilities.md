@@ -271,6 +271,9 @@ arguments, schemas, limits, and errors.
 | Reinforce | `reinforce` | `POST /v1/memories/reinforce` | `reinforce_memories` | `reinforce` |
 | List due deliberation | `consolidation_candidates` | — | — | `consolidation-candidates` |
 | Deliberate over evidence | `consolidate` | — | — | `consolidate` |
+| Run the management loop | `deliberate` | — | — | `deliberate` |
+| Apply one operation | `apply` | — | — | `apply` |
+| Judge one operation | `record_outcome` | — | — | `record-outcome` |
 | Cognitively forget | `forget` | — | — | `forget` |
 | Undo one operation | `rollback` | — | — | `rollback` |
 | Read the operation log | `operations` | — | — | `operations` |
@@ -286,9 +289,9 @@ arguments, schemas, limits, and errors.
 | Declare capabilities | `capabilities` property | `GET /healthz` | — | `--explain` resolves composition |
 | Validate loaders | — | — | — | `doctor` |
 
-The synchronous SDK therefore exposes 28 product operations, plus construction, capability
+The synchronous SDK therefore exposes 31 product operations, plus construction, capability
 inspection, and lifecycle. REST exposes nine `/v1` product routes plus `/healthz`; MCP exposes
-fifteen tools; the product CLI exposes all 28 operations plus `doctor`. `AsyncMemory` mirrors the
+fifteen tools; the product CLI exposes all 31 operations plus `doctor`. `AsyncMemory` mirrors the
 finite SDK operations except `forget_identity`, which currently requires synchronous `Memory`, and
 adds async stream consumption.
 

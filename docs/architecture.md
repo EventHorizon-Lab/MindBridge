@@ -243,12 +243,13 @@ operations. REST exposes nine `/v1` routes: add, batch add, list, search, reinfo
 answer, and compile context. MCP exposes fifteen tools: the eight corresponding non-batch
 operations plus speech, face, and identity operations, or ten when the host builds it with
 `identity_operations=False`, because naming and erasing a person is host authority and the host
-decides whether it is on the wire at all. The local CLI exposes the 28 operations
+decides whether it is on the wire at all. The local CLI exposes the 31 operations
 plus `doctor`; `--url` is limited to operations implemented by REST.
 
 Compiling context is a read-only view. The memory control plane — `consolidation_candidates()`,
-`consolidate()`, `forget()`, `rollback()`, and `operations()` — and physical deletion stay in the
-owner process, which is also the process that can audit and reverse an operation through its log.
+`consolidate()`, `deliberate()`, `apply()`, `record_outcome()`, `forget()`, `rollback()`, and
+`operations()` — and physical deletion stay in the owner process, which is also the process that
+can audit and reverse an operation through its log.
 
 `create_app(memory=...)` and `build_mcp_server(memory)` use a caller-owned instance and do not
 close it. They also do not add authentication, authorization, TLS, rate limits, quotas, or audit

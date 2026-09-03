@@ -408,7 +408,11 @@ injected. `GET /healthz` and the MCP server instructions publish the same view.
 ### Memory management operations
 
 ```text
-consolidation_candidates(*, limit: int = 32) -> tuple[ConsolidationCandidate, ...]
+consolidation_candidates(
+    *,
+    limit: int = 32,
+    idle: bool = False,
+) -> tuple[ConsolidationCandidate, ...]
 
 consolidate(
     *,
@@ -418,6 +422,11 @@ consolidate(
     trigger: MemoryTrigger = MemoryTrigger.MANUAL,
 ) -> ConsolidationReport
 
+deliberate(*, limit: int = 32, max_rounds: int = 4, idle: bool = False) -> DeliberationReport
+
+apply(operation: MemoryOperation) -> MemoryOperationRecord
+record_outcome(operation_id: int, outcome: MemoryOutcome, *, note: str | None = None) -> bool
+
 forget(memory_ids: Sequence[str]) -> MemoryOperationRecord | None
 rollback(operation_id: int) -> bool
 operations(*, limit: int = 100) -> tuple[MemoryOperationRecord, ...]
@@ -425,27 +434,62 @@ operations(*, limit: int = 100) -> tuple[MemoryOperationRecord, ...]
 
 `consolidation_candidates` is the durable trigger: it answers "what needs deliberation?" from
 state the store already committed, with no queue, timer, or scheduler behind it. Hand a row's
-`memory_ids` straight to `consolidate(evidence_ids=..., trigger=...)`. It needs no backend and
-takes no lock, so a host loop may poll it cheaply.
+`memory_ids` straight to `consolidate(evidence_ids=..., trigger=...)`, or let `deliberate` do it.
+Rows are interleaved across triggers so a busy trigger cannot starve the others out of the
+window. It needs no consolidation backend and holds no lock, but it is not free: a `QUERY_FAILURE`
+row costs one query embedding and one ranking pass to name the records nearest the failed query,
+so a host that polls this in a tight loop should say so with `memory_budget_records` and
+`query_failure_window_seconds` rather than with the poll interval.
 
 | `trigger` | Row means | `evidence_count` |
 | --- | --- | --- |
-| `EVIDENCE` | A derived record gained independent evidence no standing operation has weighed. `memory_ids` is that record followed by the new sources. | New evidence links |
-| `CONTRADICTION` | One lineage carries two or more current visible claims with different values, the same disagreement `compile()` reports as a `ContextConflict`. It stays listed until a `CORRECT` retires one side. | Distinct conflicting values |
-| `FEEDBACK` | A record was confirmed through `reinforce()`, or cited by an `ask()` answer under the default `reinforce_on_answer`, since a standing operation last saw it. | Recorded confirmations |
+| `EVIDENCE` | A derived record gained independent evidence nothing has weighed yet. `memory_ids` is that record followed by the new sources. | New evidence links |
+| `CONTRADICTION` | One lineage carries two or more current visible claims with different values, the same disagreement `compile()` reports as a `ContextConflict`. | Distinct conflicting values |
+| `FEEDBACK` | A record was confirmed through `reinforce()`, or cited by an `ask()` answer under the default `reinforce_on_answer`, since anything last weighed it. | Recorded confirmations |
+| `QUERY_FAILURE` | Two or more near-equal recalls returned nothing inside `query_failure_window_seconds`. A failed query cites no evidence of its own, so `memory_ids` is the nearest active records to it, resolved through the ordinary retrieval kernel. | Recorded failures |
+| `PRESSURE` | The store holds more active records than `memory_budget_records`, so the least recently useful of them are offered for `CONSOLIDATE` or `FORGET`. Without a configured budget this derives nothing: growth alone is not evidence that forgetting is useful. | Records over budget |
+| `IDLE` | Only with `idle=True`: a derived lineage nothing has ever weighed, oldest first. The operator declares the window; the kernel never infers idleness from a clock, because whether now is a good time to spend the device's battery is the host's knowledge. | Always `1` |
 
-`QUERY_FAILURE`, `PRESSURE`, and `IDLE` remain labels a caller may pass to `consolidate`: nothing
-in the store records a failed query, memory pressure, or an approved idle window, and inventing
-bookkeeping for a trigger no host asks for would be a scheduler by another name. A rolled-back
-operation weighed nothing, so its evidence becomes due again.
+An empty recall is recorded by `search`, by an abstaining `ask`, and by a `compile` whose bundle
+holds no evidence. The stored query is the owner's own words in their own memory domain, capped
+at `query_failure_history` rows so the table stays a signal buffer rather than a growing query
+log, and compared after case, accent, punctuation, and whitespace normalization -- deliberately
+lexical, so "did the user ask this again" does not change meaning when the embedder is replaced.
+
+Every persistent-signal trigger honours an already-weighed marker: `consolidate` records that it
+weighed its evidence set whatever the pass yielded, and a candidate weighed since its own newest
+signal is not derived again. A zero-yield pass -- the backend proposed nothing, or the kernel
+refused everything -- therefore stops the candidate coming back, and new evidence, a further
+confirmation, a further failure, or a further claim in the lineage makes it due again. Without
+that marker a candidate the model could not resolve would be re-listed and re-paid for every
+round, which is the same disease as a periodic timer. `PRESSURE` and `IDLE` have no signal time
+of their own -- a level and an operator's declaration are not events -- so for those the marker
+means weighed at all. A rolled-back operation weighed nothing, so its evidence becomes due again.
+
+`deliberate` is the memory-management loop itself: one round asks `consolidation_candidates` what
+is due and runs `consolidate` over each row with the row's own trigger, and the loop repeats
+because applying operations can make further work due. It ends when nothing is due or after
+`max_rounds`; `DeliberationReport.rounds` says which, and `weighed`, `skipped`, `applied`,
+`rejected`, and `model_calls` say what the run cost and yielded. A backend that proposes nothing
+terminates the loop rather than spinning, and reports `rounds` and `weighed` non-zero with
+`applied` zero. With work due and no `consolidator` configured it raises the same
+`ModelError(reason="backend_not_configured")` `consolidate` does; with nothing due it is a no-op
+that reaches no backend. `mindbridge deliberate` is the same loop from the CLI.
 
 `consolidate` requires a `consolidator` and gathers the evidence set from `evidence_ids`, else the
 active search result for `query`, else the newest `limit` active records. Forgotten and hidden
-records never reach the backend. The backend proposes `MemoryOperation` values; the kernel
+records never reach the backend. The evidence gather and the applies hold the formation lock; the
+backend round trip deliberately does not, so slow reasoning over media evidence does not stall a
+concurrent `add()`. Correctness does not rest on that lock: every proposal is re-checked inside
+its own apply transaction and refused as `"stale"` if a target moved while the backend was
+thinking. The backend proposes `MemoryOperation` values; the kernel
 validates each one, applies only the effect its intent allows, and commits it in its own
 transaction with its own log row. A pass is therefore not atomic: `ConsolidationReport.operations`
 lists exactly what committed and `.rejected` exactly what the kernel refused, and a proposal
-refused after an earlier one committed does not undo it. Rejected proposals are returned with a
+refused after an earlier one committed does not undo it. `.weighed` is how many evidence records
+the backend was shown, so a zero there means the pass reached no backend at all -- every named
+record had become inactive -- which is a different thing from a backend that saw evidence and
+proposed nothing. Rejected proposals are returned with a
 reason instead of raising, so one bad proposal does not discard the pass. Every operation carries
 `operation_key = sha256(canonical operation JSON + recipe)`; a key already applied and not rolled
 back is rejected as `"duplicate"`.
@@ -510,15 +554,38 @@ one's, rolling the first one back would leave two current versions in the lineag
 refused and its log row stays standing until the newer one is reversed. The same rule orders a
 sequence of namings: reversing a naming a later one displaced is refused rather than reported
 as success. `operations` lists the log newest first. Physical deletion is not an intent, and
-none of these five operations is exposed on REST or MCP.
+none of these operations is exposed on REST or MCP.
 
-The log is sufficient to replay a sequence against a fresh store holding the same sources:
-`operation_key` is a pure function of the operation and its recipe, derived record IDs are
-content-addressed, and both are reproduced exactly on replay. Two values are not reproduced and
-are not meant to be: `applied_at` is re-stamped at replay, and any ID derived from event time
-reproduces only if the fresh store's sources carry the same `occurred_at`. There is no public
-`apply(operation)`; replay means driving a `ConsolidationBackend` that returns the logged
-proposals, which is what `tests/unit/test_memory_control_plane.py` does.
+`apply` applies one operation the host supplies, through the same kernel validation a proposal
+gets: the same eligibility checks, the same all-or-nothing rule for multiple targets, and the
+same in-transaction re-check that refuses a target which moved as `"stale"`. It needs no backend
+and calls none. The window is the operation's own cited evidence and named targets, because the
+host names them and is the authority here as it is for `forget`; every other rejection applies,
+including `"duplicate"`. A refusal raises `ValidationError` whose `reason` is the kernel's own
+rejection reason, because one operation the caller chose has nowhere else to report it.
+
+`apply` is what makes replay a public path. The log is sufficient to replay a sequence against a
+fresh store holding the same sources: `operation_key` is a pure function of the operation and its
+recipe, derived record IDs are content-addressed, and both are reproduced exactly on replay onto
+a store configured with the recipe that produced them -- a derived representation belongs to a
+recipe, so a store configured with a different one mints different IDs by design. Two values are
+not reproduced and are not meant to be: `applied_at` is re-stamped at replay, and any ID derived
+from event time reproduces only if the fresh store's sources carry the same `occurred_at`.
+
+`record_outcome` records what later evidence said about one applied operation, as
+`MemoryOperationRecord.outcome` and `.outcome_note`. It is post-hoc and purely for measurement:
+the kernel never reads it back into a decision, recording `REFUTED` reverses nothing --
+`rollback` does that -- and `None` means nobody has judged the operation yet, which is not the
+same as unrefuted. A later call replaces an earlier judgement. It reports `False` for an unknown
+`operation_id`. Its purpose is the slow-loop measurements
+[Context OS](../context-os.md#product-measurements) names: consolidation precision and
+contradiction recovery are `CONFIRMED` rates over `CONSOLIDATE` and `CORRECT` rows, and false
+retirement is the `REFUTED` rate over rows that forgot something.
+
+| `MemoryOutcome` | Means |
+| --- | --- |
+| `CONFIRMED` | Later evidence bore the operation out |
+| `REFUTED` | Later evidence contradicted it |
 
 ### Cross-modal identity binding
 

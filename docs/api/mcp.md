@@ -115,15 +115,17 @@ retrieval.
 
 `add_memory` is content-addressed. `delete_memory` reports whether a record existed. Search,
 answer, compile, and the two analysis tools are not marked read-only because their SDK path
-persists lazy transcript caches and identity evidence; they are also not advertised as
-idempotent. Every tool has `open_world_hint=false`. `ask_memory` requires an answerer in the
+persists lazy transcript caches, identity evidence, and -- when a recall comes back with nothing,
+an answer abstains, or a bundle carries no evidence -- the bounded recall-failure signal the
+control plane's `QUERY_FAILURE` trigger reads; they are also not advertised as idempotent. Every tool has `open_world_hint=false`. `ask_memory` requires an answerer in the
 injected memory; without one it returns `model_error/backend_not_configured`. With the default
 `reinforce_on_answer=True`, it also reinforces the hits the answerer cites.
 
 `compile_context` is the preferred way to get task-ready context: it returns a structured,
 budgeted bundle with provenance instead of one sentence, calls no generation model, and stores no
-memory. It shares the retrieval path with `search_memories`, including the one write both can
-make: a cached transcript for spoken query media, which is why neither is annotated read-only. It
+memory. It shares the retrieval path with `search_memories`, including the two writes both can
+make -- a cached transcript for spoken query media, and a recorded recall failure when the bundle
+holds no evidence -- which is why neither is annotated read-only. It
 reports lineage conflicts and never resolves them, and names in `unknowns` what the request
 implied that the bundle does not carry. `ask_memory` remains a convenience for one grounded
 answer. The optional `budget` object is the transport form of `ContextBudget` with the
@@ -263,7 +265,7 @@ details are still never serialized.
 
 ### Operations without a tool
 
-Thirteen Python operations have no MCP tool. One is a transport limitation and the rest are
+Sixteen Python operations have no MCP tool. One is a transport limitation and the rest are
 decisions; none is withheld because it touches owner-process state, since every tool already
 does.
 
@@ -275,7 +277,7 @@ does.
 | `reindex` | Rebuilds the whole search projection from SQLite. The duration grows with the store and has no upper bound, so it does not belong behind a client that expects one timely response. It is also an operator decision, not a caller's. |
 | `optimize` | Merges staged vectors into the index. An agent has no basis for deciding when that is worth doing, and the operator scheduling it has the CLI. |
 | `capture`, `settle`, `pending_captures` | Deferred enrichment is the owning process's scheduling decision: how long a record may stay unsearchable is a property of that host's loop, not of a caller's request. Use `add_memory`, which returns searchable. |
-| `consolidation_candidates`, `consolidate`, `forget`, `rollback`, `operations` | The memory control plane rewrites and retires derived memory and is deliberately not reachable from a client. It stays with the process that owns the `Memory`, which is also the process that can audit and reverse it through the operation log. |
+| `consolidation_candidates`, `consolidate`, `deliberate`, `apply`, `record_outcome`, `forget`, `rollback`, `operations` | The memory control plane rewrites and retires derived memory and is deliberately not reachable from a client. It stays with the process that owns the `Memory`, which is also the process that can audit and reverse it through the operation log. `deliberate` additionally spends that owner's model budget on its own schedule, and `apply` applies an operation with no proposal behind it, which is host authority itself. |
 
 `Memory.capabilities` has no tool either: it is a property rather than an operation, published
 here as the server `instructions` and by REST in [`GET /healthz`](rest.md#endpoints). The tools

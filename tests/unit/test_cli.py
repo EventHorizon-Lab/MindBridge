@@ -935,6 +935,9 @@ def test_remote_mode_passes_the_cursor_through_unparsed(
         ("register-identity", ("identity-1", "Ana")),
         ("reinforce", ("memory-1",)),
         ("consolidate", ("why",)),
+        ("deliberate", ()),
+        ("apply", ("--operation", '{"intent": "forget", "target_ids": ["memory-1"]}')),
+        ("record-outcome", ("1", "confirmed")),
         ("forget", ("memory-1",)),
         ("rollback", ("1",)),
         ("operations", ()),
@@ -1113,3 +1116,68 @@ def test_remote_timeout_must_be_positive_and_finite(
         main(("--url", "http://owner:8000", "--timeout", value, "list"))
     assert raised.value.code == 2
     assert "--timeout" in capsys.readouterr().err
+
+
+def test_the_control_plane_loop_commands_only_translate(
+    app: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`deliberate`, `apply`, and `record-outcome` add no policy of their own."""
+    status, added, _ = _run(capsys, "--app", app, "-q", "add", "a red wrench on the bench")
+    assert status == 0
+    memory_id = cast(str, cast(dict[str, object], added)["id"])
+
+    # No consolidator is composed here, so nothing is ever due and the loop is a no-op.
+    status, report, _ = _run(capsys, "--app", app, "-q", "deliberate", "--max-rounds", "2")
+    assert status == 0
+    assert report == {
+        "rounds": 0,
+        "weighed": 0,
+        "skipped": 0,
+        "applied": 0,
+        "rejected": 0,
+        "model_calls": 0,
+    }
+
+    # `apply` reads the same operation JSON the log stores, so a log row replays verbatim.
+    operation = json.dumps({"intent": "forget", "target_ids": [memory_id]})
+    status, applied, _ = _run(capsys, "--app", app, "-q", "apply", "--operation", operation)
+    assert status == 0
+    record = cast(dict[str, object], cast(dict[str, object], applied)["operation"])
+    assert record["intent"] == "forget"
+    assert record["forgotten_ids"] == [memory_id]
+    assert record["outcome"] is None and record["outcome_note"] is None
+
+    operation_id = cast(int, record["operation_id"])
+    status, recorded, _ = _run(
+        capsys,
+        "--app",
+        app,
+        "-q",
+        "record-outcome",
+        str(operation_id),
+        "refuted",
+        "--note",
+        "the wrench was still there",
+    )
+    assert status == 0
+    assert recorded == {"recorded": True}
+
+    status, listed, _ = _run(capsys, "--app", app, "-q", "operations")
+    assert status == 0
+    logged = cast(list[dict[str, object]], cast(dict[str, object], listed)["operations"])
+    assert logged[0]["outcome"] == "refuted"
+    assert logged[0]["outcome_note"] == "the wrench was still there"
+
+    # A refused operation reports the kernel's own reason as a validation error, exit 3.
+    status, stdout, stderr = _run(
+        capsys,
+        "--app",
+        app,
+        "-q",
+        "apply",
+        "--operation",
+        json.dumps({"intent": "correct", "target_ids": [memory_id]}),
+    )
+    assert status == EXIT_CODES["validation_error"] == 3
+    assert stdout is None
+    assert cast(dict[str, object], stderr[0])["reason"] == "not_derived"

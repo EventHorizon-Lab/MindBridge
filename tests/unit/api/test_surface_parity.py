@@ -91,6 +91,9 @@ UNEXPOSED_OPERATIONS: dict[str, str] = {
     # authority with the host: an agent must not gain it by holding ordinary recall access.
     "consolidation_candidates": "the control plane's own due-work queue, read by the host loop",
     "consolidate": "derives and retires memory under host authority, not agent authority",
+    "deliberate": "schedules the loop itself, so it spends the owner's model budget",
+    "apply": "applies an operation with no proposal behind it, which is host authority itself",
+    "record_outcome": "annotates the audit log for measurement, written by the owner",
     "forget": "cognitive forgetting is a policy decision the host owns",
     "rollback": "reverses a committed operation, so it stays with the host that authorized it",
     "operations": "the control-plane audit log, read by an operator rather than a caller",
@@ -108,6 +111,8 @@ _COUNT_WORDS = {
     12: "Twelve",
     13: "Thirteen",
     14: "Fourteen",
+    15: "Fifteen",
+    16: "Sixteen",
 }
 # `search_with_trace` has no route or tool of its own; the search surfaces reach it through
 # `explain`, so the adapter protocol must still declare it exactly as the SDK does. The MCP-only

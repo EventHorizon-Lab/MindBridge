@@ -149,9 +149,15 @@ observation while the kernel validates and persists it. `ConsolidationBackend` i
 values with the four intents reinforce, consolidate, correct, and forget, and the kernel validates
 each one, commits it with its log row, and can `rollback()` it. `consolidation_candidates()` is the
 durable trigger in front of that loop: it derives due work -- new independent evidence, a lineage
-that contradicts itself, a record confirmed since it was last weighed -- from committed state, so a
-host schedules deliberation on evidence rather than on a clock. The Python SDK reference owns the
-exact contract; the reasoning backend can change without changing that vocabulary.
+that contradicts itself, a record confirmed since it was last weighed, a question recall answered
+with nothing, a store over its declared budget, an operator-approved idle window -- from committed
+state, so deliberation is scheduled on evidence rather than on a clock. `deliberate()` is the loop
+itself, running those two halves to a fixed point and reporting what the run cost and yielded, and
+`apply(operation)` is the same kernel validation for an operation a host supplies, which makes
+replay of a logged sequence a public path. Neither a clock nor a candidate that always comes back
+is evidence that work is useful, so each pass records that it weighed its evidence set even when
+it yielded nothing. The Python SDK reference owns the exact contract; the reasoning backend can
+change without changing that vocabulary.
 
 ## Forgetting is three operations
 
@@ -224,7 +230,9 @@ every administrative method.
 The compiler is that view's centre. `POST /v1/context` and the `compile_context` MCP tool return a
 budgeted bundle with provenance, and `GET /healthz` and the MCP server instructions advertise the
 configured modalities and backends so an agent does not discover them through failure. Both are
-read-only: compiling context selects and structures existing evidence and resolves nothing.
+read-only in the sense that matters: compiling context selects and structures existing evidence
+and resolves nothing. A compilation that finds nothing does record that, as the bounded signal
+the control plane's `QUERY_FAILURE` trigger reads, which changes no evidence and no memory.
 Answering stays available as a convenience rather than the operating-system boundary.
 
 High-rate sensor streams stay on the embedded SDK boundary. Agents operate on completed
@@ -285,16 +293,23 @@ defaults or justify superiority claims.
 3. Generalize formation into one bounded memory-management loop with structured proposals,
    replay, rollback, and privacy tests. Done: the operation log and authority tests
    (`consolidate()`, `forget()`, `rollback()`, `operations()`), the `identify` intent that
-   makes naming a person an evidence-bearing, reversible claim, the durable trigger
-   (`consolidation_candidates()`), consolidation forgetting as one reversible operation, the
-   declarative `consolidation` slot that makes the loop reachable without a Python app loader,
-   kernel rejection of proposals that name records the backend was not shown, of partial
-   multi-target operations, and of proposals whose targets moved before the commit, native media
-   in the bundled consolidation backend's input, and replay of a logged sequence against a fresh
-   store, covered as a test rather than as an `apply(operation)` surface. Open: companion-scenario
-   privacy tests; a post-hoc outcome field, without which only rollback success of the slow-loop
-   measurements is derivable; and identity merge and split, which stay outside the operation
-   log until the identity-governance round.
+   makes naming a person an evidence-bearing, reversible claim, consolidation forgetting as one
+   reversible operation, the declarative `consolidation` slot that makes the loop reachable
+   without a Python app loader, kernel rejection of proposals that name records the backend was
+   not shown, of partial multi-target operations, and of proposals whose targets moved before the
+   commit, and native media in the bundled consolidation backend's input. The loop is now an
+   entity rather than two primitives a host joins: `deliberate()` and `mindbridge deliberate`
+   run candidates through consolidation to a fixed point, all six triggers are produced from
+   committed state rather than named in an enum -- `QUERY_FAILURE` from recorded empty recalls,
+   `PRESSURE` from a declared record budget, `IDLE` from an operator-declared window -- and every
+   pass records that it weighed its evidence set whatever it yielded, so a candidate the model
+   could not resolve stops coming back until its own signal moves instead of being paid for every
+   round. `consolidate()` holds no lock across the backend round trip, so slow reasoning does not
+   stall a concurrent `add()`; the in-transaction re-check remains the correctness guarantee.
+   Replay is a public, tested path through `apply(operation)`, and `record_outcome()` writes the
+   post-hoc outcome the slow-loop measurements need. Open: companion-scenario privacy tests, and
+   identity merge and split, which stay outside the operation log until the identity-governance
+   round.
 4. Add a context compiler whose output improves downstream tasks within declared budgets. Done
    for selection, budgeting, the latency deadline, and the explicit unknowns a thin bundle
    reports: `compile()`. Open: a downstream-task measurement against the no-memory,
