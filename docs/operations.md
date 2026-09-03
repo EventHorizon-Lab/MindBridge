@@ -101,13 +101,16 @@ live.
 `capture_queue` is deferred enrichment rather than index work, and no operation drains it
 implicitly. A host that uses `capture()` owns the loop that calls `settle()`, and
 `pending_captures()` is what to alarm on: it returns up to `limit` queued records oldest first,
-each with its `enqueued_at`, `attempts`, and `last_error`, so a result that stays at the limit
-means the loop stopped and those records are unsearchable until it resumes. Drain it before a
-planned shutdown, because a queued row survives restart.
+each with its `enqueued_at`, `attempts`, `last_error`, and `awaiting`, so a result that stays at
+the limit means the loop stopped and those records are unsearchable until it resumes. `awaiting`
+separates a row with no vectors (`"enrichment"`) from one that is already searchable and owes only
+formation (`"formation"`), so a backlog of the second kind is not a recall outage. Drain the queue
+before a planned shutdown, because a queued row survives restart.
 
 A record whose `attempts` reached the `settle(max_attempts=...)` ceiling — three by default — is
 skipped rather than retried, so it stops holding up the records behind it while staying queued and
-visible with the reason it failed. Fix the cause and raise the ceiling for one call to retry it.
+visible with the reason it failed. Fix the cause, then either raise the ceiling for one call or
+name the record with `settle(memory_ids=...)`, which ignores the ceiling for the records it names.
 With a formation backend configured, `add()` also holds a queue row for the moment between its
 commit and its formation, so a short-lived entry under a live writer is expected rather than a
 stalled loop.

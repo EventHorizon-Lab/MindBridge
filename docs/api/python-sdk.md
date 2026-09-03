@@ -197,6 +197,8 @@ add_many(
 
 add_stream(
     contents: Iterable[ContentInput | StreamInput],
+    *,
+    capture: bool = False,
 ) -> Iterator[MemoryRecord]
 ```
 
@@ -204,7 +206,9 @@ add_stream(
 transaction; each optional per-item sequence must have the same length as `contents`. An empty
 batch returns `()`. `add_stream` requests one item at a time and makes each yielded record durable
 and searchable before requesting the next. If a later item fails, earlier records remain and the
-error `subject` identifies `contents[N]`.
+error `subject` identifies `contents[N]`. With `capture=True`, `add_stream` commits each item
+through `capture` instead of `add`: every yielded record is durable and readable but has no
+vectors, and the host owes the matching `settle` before any of them is searchable.
 
 ```text
 capture(
@@ -217,7 +221,12 @@ capture(
     context: ObservationContext | None = None,
 ) -> MemoryRecord
 
-settle(*, limit: int = 100, max_attempts: int = 3) -> int
+settle(
+    *,
+    limit: int = 100,
+    max_attempts: int = 3,
+    memory_ids: Sequence[str] | None = None,
+) -> int
 pending_captures(
     *,
     limit: int = 100,
@@ -230,7 +239,9 @@ content-addressed record `add` returns for the same input, so capturing and then
 content is one memory. A captured record is durable and readable through `get` and `list`
 immediately, and invisible to `search`, `ask`, and `compile` until it is settled. It applies the
 same embedder-capability check `add` applies, so content `add` would reject raises here instead of
-becoming a durable record no `settle` could ever finish.
+becoming a durable record no `settle` could ever finish. Settling appends the text the models
+derive to `content` and never rewrites what the caller supplied; see
+[public values](#public-values) for how derived sections are marked.
 
 `settle` runs the deferred stages — speech identity, transcription, embedding, the SQLite embedding
 commit, the index flush, and formation — over up to `limit` captured records in enqueue order, and
@@ -244,12 +255,19 @@ so their searchable-on-return contract holds. `search`, `ask`, `compile`, `close
 store never settle: time to searchable is the host's choice, so call `settle` from an idle loop, a
 timer, or after a capture burst.
 
+Pass `memory_ids` to settle only those records. Naming a record is the host asking for it by hand,
+so `max_attempts` is ignored for that call: that is how a record parked at the ceiling is retried,
+how one is quarantined by never naming it, and how one is settled ahead of the queue. IDs that are
+not queued are skipped. One settlement runs at a time per `Memory`; a concurrent `settle` waits
+rather than running the same models twice, and then usually finds the queue already drained.
+
 `pending_captures` returns up to `limit` records whose deferred work is not finished, oldest first,
-as `PendingCapture` values (`memory_id`, `enqueued_at`, `attempts`, `last_error`). With a formation
-backend, `add` holds a row between its commit and formation, so a queued record may already be
-searchable and owe formation only. Pass `memory_ids` to ask whether specific records are still
-waiting: one that is absent from the result is not pending, which means it is settled or was never
-stored, and `get` tells the two apart.
+as `PendingCapture` values (`memory_id`, `enqueued_at`, `attempts`, `last_error`, `awaiting`).
+`awaiting` is the stage the record is stopped at: `"enrichment"` has no vectors and cannot be
+returned by `search`, while `"formation"` is already embedded, indexed, and searchable and owes
+only the formation `add` holds a row for between its commit and its model call. Pass `memory_ids`
+to ask whether specific records are still waiting: one that is absent from the result is not
+pending, which means it is settled or was never stored, and `get` tells the two apart.
 
 ```text
 search(
@@ -536,6 +554,7 @@ AsyncCaptureStream(
     memory_type: MemoryType | None = None,
     reference_at: datetime | None = None,
     max_streams: int = 32,
+    capture: bool = False,
 ) -> None
 AsyncAudioStream(
     memory: AsyncMemory,
@@ -545,6 +564,7 @@ AsyncAudioStream(
     context: StreamContext = None,
     reference_at: datetime | None = None,
     max_streams: int = 32,
+    capture: bool = False,
 ) -> None
 AsyncVisionStream(
     memory: AsyncMemory,
@@ -554,6 +574,7 @@ AsyncVisionStream(
     context: StreamContext = None,
     reference_at: datetime | None = None,
     max_streams: int = 32,
+    capture: bool = False,
 ) -> None
 
 AsyncCaptureStream.consume(
@@ -571,7 +592,10 @@ AsyncVisionStream.consume(
 `cancel` as discard. `AsyncAudioStream` reduces `PCMChunk`, `VADPacket`, `ASRPartial`, and
 `AcousticBoundary`; `AsyncVisionStream` reduces `VisionFrame`, `VisionPartial`, and
 `SceneBoundary`. `StreamContext` is an `ObservationContext`, a callable sampled once per completed
-observation, or `None`. Up to `max_streams` independent `stream_id` values may be active. See
+observation, or `None`. Up to `max_streams` independent `stream_id` values may be active.
+`capture=True` commits each final through `capture` instead of `add`, so acknowledgement leaves
+the model path and every `StreamCommit` reports `pending_settlement=True`; the host then owes
+`settle` before those records are searchable. The default stays the strong `add`. See
 [omni streaming and interaction memory](../omni-streaming-and-interaction-memory.md) for event
 semantics and complete examples.
 
@@ -592,6 +616,15 @@ These are the 103 supported names exported by `mindbridge`:
 
 ### Public values
 
+`MemoryRecord.content` is the caller's text followed by any text the configured models derived
+from the media. Derived sections are appended, never substituted: what the caller supplied stays
+byte-identical at the front, and each derived section is introduced by its own marker line --
+`[transcript:<asset_id>]`, `[visual description:<asset_id>]`, or
+`[speech identities:<asset_id>]` -- so a reader can separate interpretation from evidence and see
+which asset it came from. `add` derives before its first write and `settle` derives after
+`capture` already committed, so both paths leave the same record; the raw media is never rewritten
+and stays in `assets` under its content address.
+
 The principal immutable values are:
 
 | Value | Fields |
@@ -600,6 +633,7 @@ The principal immutable values are:
 | `AssetRef` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name`, `path`; `is_resolved` property |
 | `StreamInput` | `content`, `occurred_at`, `occurred_end`, `metadata`, `memory_type`, `context`, `transcript`, `description` |
 | `MemoryRecord` | `id`, `content`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `assets`, `modality`, `memory_type`, `context`, `place_id`, `forgotten_at` |
+| `PendingCapture` | `memory_id`, `enqueued_at`, `attempts`, `last_error`, `awaiting` |
 | `SearchHit` | all visible memory fields plus `score` |
 | `AnswerResult` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `Page` | `items`, `next_cursor` |
@@ -620,7 +654,7 @@ The principal immutable values are:
 | `ConsolidationCandidate` | `trigger`, `memory_ids`, `evidence_count` |
 | `ConsolidationReport` | `operations`, `rejected` as `(MemoryOperation, reason)` pairs |
 | `StreamEvent` | `phase`, `item`, `stream_id` |
-| `StreamCommit` | `record`, `prefetch`, `retrieval_error`, `stream_id` |
+| `StreamCommit` | `record`, `prefetch`, `retrieval_error`, `stream_id`, `pending_settlement` |
 | `PCMChunk` | `data`, `sample_rate_hz`, `channels`, `sample_width_bytes`, `stream_id`, `occurred_at` |
 | `VADPacket` | `active`, `stream_id`, `occurred_at` |
 | `ASRPartial` | `text`, `stream_id`, `occurred_at` |

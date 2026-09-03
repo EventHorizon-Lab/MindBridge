@@ -272,9 +272,13 @@ defaults or justify superiority claims.
 2. Add an explicit fast-capture path and SQLite-backed durable enrichment work without changing
    current `add()` semantics. Done: `capture()`, `settle()`, and `pending_captures()`;
    `settle()` honours a retry ceiling so one poisoned capture cannot block the queue,
-   `pending_captures()` answers per-record readiness with attempts and last error, and a record
-   whose formation was interrupted after `add()` committed is completed by the next `settle()`
-   through the same queue. Open: routing streaming `FINAL` events through the capture path.
+   `pending_captures()` answers per-record readiness with attempts, last error, and the stage the
+   record is stopped at, `settle(memory_ids=...)` runs named records past that ceiling, one
+   settlement runs at a time per `Memory`, and a record whose formation was interrupted after
+   `add()` committed is completed by the next `settle()` through the same queue. `capture=True`
+   on `add_stream()` and the three async reducers routes streaming `FINAL` events through the
+   capture path, so continuous observation reaches durable acknowledgement without waiting for a
+   model.
 3. Generalize formation into one bounded memory-management loop with structured proposals,
    replay, rollback, and privacy tests. Done: the operation log and authority tests
    (`consolidate()`, `forget()`, `rollback()`, `operations()`), the durable trigger

@@ -330,6 +330,13 @@ def test_a_pending_capture_refuses_a_naive_clock_and_a_nonsense_attempt_count() 
             PendingCapture(memory_id="a", enqueued_at=NOW, attempts=attempts)  # type: ignore[arg-type]
     with pytest.raises(ValidationError, match="last_error must be text"):
         PendingCapture(memory_id="a", enqueued_at=NOW, last_error=7)  # type: ignore[arg-type]
+    # The stage is the difference between "not searchable yet" and "searchable, owes formation",
+    # so an unknown value is refused rather than reported as either.
+    assert PendingCapture(memory_id="a", enqueued_at=NOW).awaiting == "enrichment"
+    embedded = PendingCapture(memory_id="a", enqueued_at=NOW, awaiting="formation")
+    assert embedded.awaiting == "formation"
+    with pytest.raises(ValidationError, match="awaiting must be enrichment or formation"):
+        PendingCapture(memory_id="a", enqueued_at=NOW, awaiting="indexing")  # type: ignore[arg-type]
 
 
 def _asset(

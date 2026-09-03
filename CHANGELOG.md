@@ -20,14 +20,28 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   record they encounter, so their searchable-on-return contract is unchanged, and `search()`,
   `ask()`, and `compile()` never settle: time to searchable stays under host control.
   `pending_captures()` returns `PendingCapture` values — `memory_id`, `enqueued_at`, `attempts`,
-  and `last_error` — and takes an optional `memory_ids` filter, so a caller can ask whether one
-  record is searchable yet and an operator can see why one is not. `settle()` attempts every
-  record it read rather than stopping at the first failure, and its `max_attempts` ceiling
-  (default 3) skips a record that has already failed that often, so one poisoned capture cannot
-  block the queue; `capture()` applies the embedder-capability check `add()` applies, so such a
-  record is refused before it becomes durable. With a formation backend configured, `add()` holds
-  a queue row from its write transaction until formation returns, so a crash in between leaves
-  work the next `settle()` completes without re-embedding.
+  `last_error`, and `awaiting` — and takes an optional `memory_ids` filter, so a caller can ask
+  whether one record is searchable yet and an operator can see why one is not. `awaiting`
+  separates a record with no vectors (`"enrichment"`) from one that is already searchable and owes
+  only formation (`"formation"`). `settle()` attempts every record it read rather than stopping at
+  the first failure, and its `max_attempts` ceiling (default 3) skips a record that has already
+  failed that often, so one poisoned capture cannot block the queue; `settle(memory_ids=...)` and
+  `mindbridge settle MEMORY_ID...` run named records alone and ignore that ceiling for them, which
+  is how a parked capture is retried by hand. One settlement runs at a time per `Memory`, so a
+  concurrent `settle()` or an `add()` of the same captured content waits instead of running the
+  model stages twice. `capture()` applies the embedder-capability check `add()` applies, so an
+  unsettleable record is refused before it becomes durable. With a formation backend configured,
+  `add()` holds a queue row from its write transaction until formation returns, so a crash in
+  between leaves work the next `settle()` completes without re-embedding.
+- `capture=True` on `Memory.add_stream()`, `AsyncMemory.add_stream()`, `AsyncCaptureStream`,
+  `AsyncAudioStream`, and `AsyncVisionStream`, plus `mindbridge add-stream --capture`. A streaming
+  `FINAL` then commits through `capture()` instead of `add()`, which completes the path from
+  continuous observation through speculative working context to low-latency durable
+  acknowledgement and deferred enrichment; every `StreamCommit` carries the new
+  `pending_settlement` field so the caller knows the record owes a `settle()`. A `StreamInput`
+  transcript or description is folded in at capture time, so the deferred commit lands on the same
+  content-addressed record the strong path would have written. The default is unchanged: without
+  the flag a final still commits through `add()` and is searchable when the commit yields.
 - `Memory.compile()` and `AsyncMemory.compile()`, a context compiler that runs the existing
   retrieval kernel once and returns a `ContextBundle`: actors, episodes, facts, procedures, affect
   cues, and traits selected within a `ContextBudget`, plus the lineage conflicts it reports without

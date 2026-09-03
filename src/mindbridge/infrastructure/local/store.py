@@ -1171,6 +1171,10 @@ class LocalStore:
 
         `max_attempts` excludes rows that already failed that many times. They stay queued and
         stay visible, so one poisoned record cannot block every record enqueued after it.
+
+        `awaiting` is read from the vectors themselves: a row whose part-0 embedding exists is
+        already searchable and owes formation only, which is the same test settlement applies
+        before deciding whether to re-run the model stages.
         """
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit must be a positive integer")
@@ -1209,10 +1213,16 @@ class LocalStore:
                         enqueued_at=_parse_datetime(_row_text(row, "enqueued_at")),
                         attempts=int(row["attempts"]),
                         last_error=row["last_error"],
+                        awaiting="formation" if row["embedded"] else "enrichment",
                     )
                     for row in connection.execute(
                         f"""
-                        SELECT memory_id, enqueued_at, attempts, last_error
+                        SELECT memory_id, enqueued_at, attempts, last_error,
+                               EXISTS (
+                                   SELECT 1 FROM embeddings
+                                   WHERE embeddings.memory_id = capture_queue.memory_id
+                                     AND embeddings.object_part = 0
+                               ) AS embedded
                         FROM capture_queue
                         {restriction}
                         ORDER BY enqueued_at, memory_id
