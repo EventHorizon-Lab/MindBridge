@@ -44,6 +44,7 @@ from mindbridge._telemetry import (
     CAPTURE_SETTLED,
     CAPTURE_TIME_TO_SEARCHABLE,
     EMBEDDING_PARTS_ELIDED,
+    FORMATION_PROPOSALS_DROPPED,
     IDENTITY_CACHED,
     IDENTITY_CREATED,
     IDENTITY_EVIDENCE_ASSETS,
@@ -511,6 +512,10 @@ class _PreparedMemory:
     occurred_end: datetime | None
     memory_type: MemoryType
     context: ObservationContext | MemoryContext | None = None
+    # The record column, carried separately from `context` because both write paths need it and
+    # only an `ObservationContext` has one: a formed record's `MemoryContext` deliberately has no
+    # place, so formation sets this from the observation it was formed from.
+    place_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -1047,6 +1052,7 @@ class Memory:
                             occurred_end=prepared.occurred_end,
                             created_at=now,
                             updated_at=now,
+                            place_id=prepared.place_id,
                             context=_stored_memory_context(prepared, recorded_at=now),
                         ),
                     ),
@@ -2560,12 +2566,13 @@ class Memory:
             ),
             evidence_ids=tuple(sorted(source.id for source in sources)),
         )
+        place_id, metadata = _agreed_inheritance(sources)
         prepared = replace(
             _prepare_memory(
                 self._prepare_content(proposal.content, assets),
                 occurred_at=primary.occurred_at,
                 occurred_end=primary.occurred_end,
-                metadata=None,
+                metadata=metadata,
                 memory_type=_formation_memory_type(proposal.kind),
             ),
             memory_id=_formation_memory_id(
@@ -2575,6 +2582,7 @@ class Memory:
                 context=context,
             ),
             context=context,
+            place_id=place_id,
         )
         logged = self._commit_formation(
             tuple((prepared, source.id, proposal.confidence) for source in sources),
@@ -2651,12 +2659,13 @@ class Memory:
             ),
             evidence_ids=tuple(sorted(source.id for source in sources)),
         )
+        place_id, metadata = _agreed_inheritance(sources)
         prepared = replace(
             _prepare_memory(
                 self._prepare_content(proposal.content, assets),
                 occurred_at=None,
                 occurred_end=None,
-                metadata=None,
+                metadata=metadata,
                 memory_type=_formation_memory_type(proposal.kind),
             ),
             memory_id=_formation_memory_id(
@@ -2666,6 +2675,7 @@ class Memory:
                 context=context,
             ),
             context=context,
+            place_id=place_id,
         )
         logged = self._commit_formation(
             tuple((prepared, source.id, proposal.confidence) for source in sources),
@@ -3035,14 +3045,7 @@ class Memory:
                         occurred_end=memory.occurred_end,
                         created_at=now,
                         updated_at=now,
-                        # Only an `ObservationContext` carries a place: it is what the caller
-                        # supplies at capture time. `MemoryContext` is the formed-semantics shape
-                        # and deliberately has none.
-                        place_id=(
-                            memory.context.place_id
-                            if isinstance(memory.context, ObservationContext)
-                            else None
-                        ),
+                        place_id=memory.place_id,
                         context=_stored_memory_context(memory, recorded_at=now),
                     )
                     for memory in missing
@@ -3352,15 +3355,31 @@ class Memory:
         pairs: builtins.list[tuple[_PreparedMemory, str, float]] = []
         inputs_by_id = {value.memory_id: value for value in inputs}
         formed_sources = tuple(source for source in pending if source.id in inputs_by_id)
+        dropped = 0
         for source in formed_sources:
             proposals = proposals_by_id.get(source.id, ())
             for proposal in proposals:
-                _validate_formation_proposal(proposal, inputs_by_id[source.id])
+                try:
+                    _validate_formation_proposal(proposal, inputs_by_id[source.id])
+                except ModelError:
+                    # One derived opinion the model grounded wrongly -- an affect cue naming a
+                    # modality the source never carried, a pose in another frame -- must not cost
+                    # the caller the observation it came from. `add` commits the source before
+                    # formation runs, so raising here fails a write that in fact succeeded, and
+                    # every retry re-runs formation and fails the same way. It is dropped and
+                    # counted instead, which is the policy the model adapter already applies to a
+                    # malformed one, and which consolidation already applies to this same rule.
+                    # Damage to the batch envelope still raises above: that is not one opinion.
+                    dropped += 1
+                    continue
                 prepared = _prepare_memory(
                     self._prepare_content(proposal.content, operation),
                     occurred_at=source.occurred_at,
                     occurred_end=source.occurred_end,
-                    metadata=None,
+                    # Application data travels with the knowledge formed from it: a host that
+                    # filters recall by metadata expects the tag on the observation to hold for
+                    # what was learned from it.
+                    metadata=source.metadata,
                     memory_type=_formation_memory_type(proposal.kind),
                 )
                 context = _formation_context(
@@ -3382,11 +3401,17 @@ class Memory:
                                 context=context,
                             ),
                             context=context,
+                            # `place_id` is a hard filter on the record, so knowledge formed
+                            # from an observation in a room has to stand in that room too --
+                            # otherwise a place-scoped question sees the raw observation and
+                            # none of the entities, states, or relations formed from it.
+                            place_id=source.place_id,
                         ),
                         source.id,
                         proposal.confidence,
                     )
                 )
+        _record_dropped_proposals(dropped)
         _validate_formation_pairs(pairs)
         self._commit_formation(pairs, formed_sources, completed_at=now)
 
@@ -3441,6 +3466,7 @@ class Memory:
                 occurred_end=memory.occurred_end,
                 created_at=completed_at,
                 updated_at=completed_at,
+                place_id=memory.place_id,
                 context=cast(MemoryContext, memory.context),
             )
             for memory in missing
@@ -6946,6 +6972,7 @@ def _prepare_memory(
         occurred_end=normalized_occurred_end,
         memory_type=normalized_memory_type,
         context=context,
+        place_id=None if context is None else context.place_id,
     )
 
 
@@ -7220,6 +7247,26 @@ def _valid_intervals_overlap(
     return not (
         (left_until is not None and right_from is not None and left_until <= right_from)
         or (right_until is not None and left_from is not None and right_until <= left_from)
+    )
+
+
+def _agreed_inheritance(
+    sources: Sequence[MemoryRecord],
+) -> tuple[str | None, Mapping[str, object] | None]:
+    """The place and the metadata every cited source agrees on, or nothing.
+
+    Formation derives from one observation and inherits its record columns outright. A
+    consolidation rests on several, so it inherits only what they all say: a place is a hard
+    retrieval filter, and picking one source's room or one source's tag arbitrarily would file the
+    knowledge somewhere it was not observed. Disagreement inherits nothing rather than a majority.
+    """
+    if not sources:
+        return (None, None)
+    places = {source.place_id for source in sources}
+    tags = {_metadata_json(source.metadata) for source in sources}
+    return (
+        sources[0].place_id if len(places) == 1 else None,
+        sources[0].metadata if len(tags) == 1 else None,
     )
 
 
@@ -8211,6 +8258,17 @@ def _validated_descriptions(
             "vision description exceeded the supported text length", reason="payload_too_large"
         )
     return normalized
+
+
+def _record_dropped_proposals(count: int) -> None:
+    """Publish how many proposals kernel validation refused, so no loss is silent.
+
+    Recorded even at zero, because the absence of the attribute is otherwise indistinguishable
+    from formation never having run -- which is the state this signal exists to tell apart.
+    """
+    span = trace.get_current_span()
+    if span.is_recording():
+        span.set_attribute(FORMATION_PROPOSALS_DROPPED, count)
 
 
 def _record_elided_parts(count: int) -> None:

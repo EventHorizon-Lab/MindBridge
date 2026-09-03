@@ -41,6 +41,7 @@ from mindbridge import (
     Modality,
     ModelError,
     ObservationContext,
+    RetrievalScope,
     SpeakerEmbedding,
     SpeechAnalysis,
     SpeechTurn,
@@ -1832,3 +1833,71 @@ def test_a_query_gathered_window_is_never_widened(tmp_path: Path) -> None:
         assert [reason for _operation, reason in report.rejected] == ["target_not_shown"]
         assert memory.get(outside).forgotten_at is None
         assert memory.operations() == ()
+
+
+def _consolidate_trait(
+    memory: Memory,
+    consolidator: ScriptedConsolidator,
+    *sources: tuple[str | None, str],
+) -> MemoryRecord:
+    """Consolidate one trait out of one observation per `(place_id, household tag)` pair."""
+    observed = tuple(
+        memory.add(
+            f"Ana waited calmly, time {index}",
+            occurred_at=OCCURRED + timedelta(minutes=index),
+            context=ObservationContext(
+                basis=EvidenceBasis.OBSERVATION,
+                source_id=f"cam-{index}",
+                place_id=place_id,
+            ),
+            metadata={"household": household},
+        )
+        for index, (place_id, household) in enumerate(sources)
+    )
+    evidence_ids = tuple(record.id for record in observed)
+    consolidator._scripts.append(
+        (
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE,
+                evidence_ids=evidence_ids,
+                proposal=_trait("Ana", "patient"),
+            ),
+        )
+    )
+    report = memory.consolidate(evidence_ids=evidence_ids)
+    assert report.rejected == ()
+    return memory.get(report.operations[0].created_ids[0])
+
+
+def test_a_consolidation_inherits_what_all_of_its_evidence_agrees_on(tmp_path: Path) -> None:
+    """A derived record stands where its evidence stands -- when the evidence says one thing.
+
+    Formation derives from one observation and inherits its place and metadata outright. A
+    consolidation rests on several, so agreement is the condition: two sightings in the kitchen
+    make kitchen knowledge, and a sighting in the kitchen plus one in the garage makes knowledge
+    that belongs to neither room. `place_id` is a hard retrieval filter, so guessing would file
+    the knowledge somewhere it was never observed.
+    """
+    agreeing = ScriptedConsolidator()
+    with _memory(tmp_path / "agree", agreeing) as memory:
+        derived = _consolidate_trait(memory, agreeing, ("kitchen", "flat-2"), ("kitchen", "flat-2"))
+
+        assert derived.place_id == "kitchen"
+        assert derived.metadata == {"household": "flat-2"}
+        assert derived.id in {
+            hit.id
+            for hit in memory.search("patient", limit=10, scope=RetrievalScope(place_id="kitchen"))
+        }
+
+    disagreeing = ScriptedConsolidator()
+    with _memory(tmp_path / "disagree", disagreeing) as memory:
+        derived = _consolidate_trait(
+            memory, disagreeing, ("kitchen", "flat-2"), ("garage", "flat-9")
+        )
+
+        assert derived.place_id is None
+        assert derived.metadata == {}
+        assert derived.id not in {
+            hit.id
+            for hit in memory.search("patient", limit=10, scope=RetrievalScope(place_id="kitchen"))
+        }

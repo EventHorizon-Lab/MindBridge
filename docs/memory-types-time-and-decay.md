@@ -142,6 +142,24 @@ commits derived records. Two kinds carry extra visibility rules:
   same typed claim, combining their independent confidence with a noisy-OR projection. A trusted
   `EvidenceBasis.USER_STATEMENT` trait is visible immediately.
 
+A proposal that fails one of those per-proposal rules — an `AFFECT` cue naming a modality the
+source never carried, a pose in another coordinate frame — is dropped, counted on the
+`mindbridge.formation.dropped_proposals` span attribute, and costs only itself: the observation's
+remaining proposals commit and the write succeeds. One badly grounded opinion must not fail a write
+whose source is already durable, because every retry would re-run the model and fail the same way.
+Only damage to the batch envelope — a backend returning the wrong number of results, or a shape
+that is not a batch of proposals — fails the write.
+
+Formation never rewrites the caller's source record. A derived record inherits its source's event
+time, valid interval, metric pose, symbolic `place_id`, and `metadata`, so a place-scoped or
+metadata-filtered recall reaches the knowledge formed in a room and not only the raw observation it
+came from. It carries no media assets of its own: a formed record is text, and its evidence link
+points at the observation that holds the media. A consolidation rests on several sources, so it
+inherits the place and the metadata only when every cited source agrees; disagreeing evidence
+inherits neither rather than one picked arbitrarily. Deleting evidence recomputes derived
+confidence and visibility, and removes a derived record when no support remains. Source
+observations are deleted only by an explicit caller action.
+
 ### Naming a person is a typed assertion
 
 `register_speaker` and `register_identity` write an `ENTITY` assertion whose
@@ -238,7 +256,10 @@ does not infer coordinate transforms.
 
 `ObservationContext(place_id="kitchen")` stores a trimmed symbolic label when metric localization is
 not available. `RetrievalScope(place_id="kitchen")` applies indexed equality in SQLite and excludes
-unlabelled records. Symbolic and metric scopes are independent and both must match when combined.
+unlabelled records. Records formed from a labelled observation carry that label too, and a
+consolidated record carries it when all of its evidence agrees on one place, so the scope reaches
+derived entities, states, and relations as well as the observations. Symbolic and metric scopes are
+independent and both must match when combined.
 
 `get` and `list` expose the latest typed context even when it is retired or hidden, while default
 search uses only active visible versions. Forgetting is evidence-aware: deleting evidence
