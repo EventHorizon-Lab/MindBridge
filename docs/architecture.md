@@ -238,7 +238,7 @@ gate in the [benchmark protocol](benchmarking.md#mandatory-controls).
 
 ## Public and trust boundaries
 
-Supported SDK values are imported from `mindbridge`. The `Memory` SDK exposes 27 product
+Supported SDK values are imported from `mindbridge`. The `Memory` SDK exposes 28 product
 operations. REST exposes nine `/v1` routes: add, batch add, list, search, reinforce, get, delete,
 answer, and compile context. MCP exposes fifteen tools: the eight corresponding non-batch
 operations plus speech, face, and identity operations, or ten when the host builds it with
