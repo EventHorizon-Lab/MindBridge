@@ -5014,3 +5014,63 @@ def test_a_wearer_voice_binding_one_face_does_not_cascade_to_everybody(tmp_path:
     assert faces["b"] != faces["a"]
     assert voices["a"] != faces["a"]
     assert len(set(voices.values()) | set(faces.values())) == 3
+
+
+def test_scoped_survivor_count_returns_the_hits_the_discarded_hydration_did(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """`count_memories` stands in for a hydration whose only use was `len()`.
+
+    The candidate loop widens on that number, so the arm below re-runs the same searches with
+    the discarded hydration restored and compares whole `SearchHit` values, not just IDs.
+    """
+    near = SpatialContext(frame_id="home-map", anchor=SpatialAnchor.SUBJECT, x=1, y=1)
+    wrong = SpatialContext(frame_id="wrong-map", anchor=SpatialAnchor.SUBJECT, x=1, y=1)
+    searches: tuple[tuple[str, int, RetrievalScope | None], ...] = (
+        ("scoped target", 1, RetrievalScope(near=near, radius_m=0.1)),
+        ("scoped target", 5, RetrievalScope(near=near, radius_m=0.1)),
+        ("distractor 7", 10, None),
+        ("scoped target", 3, RetrievalScope(place_id="home")),
+        ("scoped target", 3, RetrievalScope(valid_at=datetime(2020, 1, 1, tzinfo=timezone.utc))),
+    )
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        distractors = tuple(
+            memory.add(f"distractor {index}", context=ObservationContext(spatial=wrong))
+            for index in range(140)
+        )
+        target = memory.add(
+            "scoped target",
+            context=ObservationContext(spatial=near, place_id="home"),
+        )
+        index = _FakeIndex.instances[-1]
+        aggregate_ids = {
+            document.embedding.memory_id: document.embedding.embedding_id
+            for document in index.documents.values()
+            if document.embedding.object_part == 0
+        }
+        index.dense_hits_override = tuple(
+            IndexHit(id=aggregate_ids[record.id], relevance=0.99)
+            for record in (*distractors[:120], target, *distractors[120:])
+        )
+        index.lexical_hits_override = ()
+
+        counted = tuple(
+            memory.search(query, limit=limit, scope=scope) for query, limit, scope in searches
+        )
+        store = memory._store
+        monkeypatch.setattr(
+            store,
+            "count_memories",
+            lambda memory_ids, **scope: len(store.read_memories(memory_ids, **scope)),
+        )
+        hydrated = tuple(
+            memory.search(query, limit=limit, scope=scope) for query, limit, scope in searches
+        )
+
+    # Non-degenerate: the scoped searches find the one in-frame record among 140 distractors,
+    # and the unscoped one fills its window.
+    assert [hit.id for hit in counted[0]] == [target.id]
+    assert len(counted[2]) == 10
+    assert counted == hydrated

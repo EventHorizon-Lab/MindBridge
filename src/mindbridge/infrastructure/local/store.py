@@ -9,7 +9,7 @@ import re
 import sqlite3
 import struct
 import uuid
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -1164,20 +1164,80 @@ class LocalStore:
                 context=contexts.get(_row_text(row, "memory_id")),
             )
             for row in rows
-            if not active_only
-            or (
-                # A record with no `memory_semantics` row declares no validity interval, so it is
-                # valid at every `valid_at` exactly like a version row whose `valid_from` and
-                # `valid_until` are NULL; only recorded time can exclude it, and there `created_at`
-                # is the honest bound. `near` is separate and spatial: a record with no pose is not
-                # at any location, so it drops just as a semantic row without a pose does above.
-                near is None
-                and _row_text(row, "memory_id") not in semantic_ids
-                and (known_at is None or _parse_datetime(_row_text(row, "created_at")) <= known_at)
+            if _memory_in_scope(
+                row,
+                active_only=active_only,
+                known_at=known_at,
+                near=near,
+                semantic_ids=semantic_ids,
+                scoped_ids=contexts.keys(),
             )
-            or _row_text(row, "memory_id") in contexts
         }
         return tuple(by_id[memory_id] for memory_id in memory_ids if memory_id in by_id)
+
+    def count_memories(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        valid_at: datetime | None = None,
+        known_at: datetime | None = None,
+        near: SpatialContext | None = None,
+        radius_m: float | None = None,
+        place_id: str | None = None,
+        active_only: bool = False,
+    ) -> int:
+        """Count what `read_memories` would return for the same arguments.
+
+        Applies every scope predicate through the same selection pass, and reads neither
+        content, media assets, nor typed context rows: a caller that only needs the number of
+        surviving memories must not pay for the records.
+        """
+        if not memory_ids:
+            return 0
+        for memory_id in memory_ids:
+            _require_identifier(memory_id, "memory_id")
+        _require_optional_identifier(place_id, "place_id")
+        place_clause = "" if place_id is None else "AND place_id = ?"
+        place_parameters: tuple[object, ...] = () if place_id is None else (place_id,)
+        by_id: dict[str, sqlite3.Row] = {}
+        with self._read_transaction() as connection:
+            for offset in range(0, len(memory_ids), _SQLITE_PARAMETER_BATCH):
+                batch = memory_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+                placeholders = ", ".join("?" for _memory_id in batch)
+                for row in connection.execute(
+                    f"""
+                    SELECT memory_id, created_at
+                    FROM memory_records
+                    WHERE memory_id IN ({placeholders})
+                    {place_clause}
+                    """,
+                    (*batch, *place_parameters),
+                ).fetchall():
+                    by_id[_row_text(row, "memory_id")] = row
+            scoped, semantic_ids = _select_memory_contexts(
+                connection,
+                tuple(memory_ids),
+                valid_at=valid_at,
+                known_at=known_at,
+                near=near,
+                radius_m=radius_m,
+                active_only=active_only,
+            )
+        surviving = {
+            memory_id
+            for memory_id, row in by_id.items()
+            if _memory_in_scope(
+                row,
+                active_only=active_only,
+                known_at=known_at,
+                near=near,
+                semantic_ids=semantic_ids,
+                scoped_ids=scoped.keys(),
+            )
+        }
+        # Counted per requested ID, not per distinct row, because `read_memories` repeats a
+        # memory that its caller asked for twice.
+        return sum(1 for memory_id in memory_ids if memory_id in surviving)
 
     def embedding_ids_in_range(
         self,
@@ -4297,7 +4357,38 @@ def _memory_from_row(
     )
 
 
-def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydration pass
+def _memory_in_scope(
+    row: sqlite3.Row,
+    *,
+    active_only: bool,
+    known_at: datetime | None,
+    near: SpatialContext | None,
+    semantic_ids: frozenset[str],
+    scoped_ids: Collection[str],
+) -> bool:
+    """Decide whether one `memory_records` row survives the requested scope.
+
+    `row` needs only `memory_id` and `created_at`, so both the scoped hydration and the scoped
+    count reach this one predicate.
+    """
+    if not active_only:
+        return True
+    memory_id = _row_text(row, "memory_id")
+    if memory_id in scoped_ids:
+        return True
+    # A record with no `memory_semantics` row declares no validity interval, so it is valid at
+    # every `valid_at` exactly like a version row whose `valid_from` and `valid_until` are NULL;
+    # only recorded time can exclude it, and there `created_at` is the honest bound. `near` is
+    # separate and spatial: a record with no pose is not at any location, so it drops just as a
+    # semantic row without a pose does in the selection pass.
+    return (
+        near is None
+        and memory_id not in semantic_ids
+        and (known_at is None or _parse_datetime(_row_text(row, "created_at")) <= known_at)
+    )
+
+
+def _select_memory_contexts(  # noqa: C901 - one authoritative bitemporal selection pass
     connection: sqlite3.Connection,
     memory_ids: Sequence[str],
     *,
@@ -4306,7 +4397,12 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
     near: SpatialContext | None = None,
     radius_m: float | None = None,
     active_only: bool = False,
-) -> tuple[dict[str, MemoryContext], frozenset[str]]:
+) -> tuple[dict[str, tuple[sqlite3.Row, SpatialContext | None]], frozenset[str]]:
+    """Choose the one current version row per memory and apply every scope predicate.
+
+    Shared by `read_memories` and `count_memories` so a scoped count cannot drift from the
+    scoped hydration it predicts.
+    """
     if not memory_ids:
         return {}, frozenset()
     if (near is None) != (radius_m is None):
@@ -4328,7 +4424,6 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
     query_known_at = known_at or datetime.now(timezone.utc)
 
     rows: list[sqlite3.Row] = []
-    evidence: dict[str, list[str]] = {}
     for offset in range(0, len(memory_ids), _SQLITE_PARAMETER_BATCH):
         batch = memory_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
         placeholders = ", ".join("?" for _memory_id in batch)
@@ -4354,27 +4449,6 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
                 tuple(batch),
             ).fetchall()
         )
-        evidence_time = (
-            "retired_at IS NULL"
-            if known_at is None
-            else "recorded_at <= ? AND (retired_at IS NULL OR retired_at > ?)"
-        )
-        evidence_parameters: tuple[object, ...] = tuple(batch)
-        if known_at is not None:
-            known_text = _datetime_text(known_at)
-            evidence_parameters += (known_text, known_text)
-        for row in connection.execute(
-            f"""
-            SELECT memory_id, source_memory_id
-            FROM memory_evidence
-            WHERE memory_id IN ({placeholders}) AND {evidence_time}
-            ORDER BY memory_id, position
-            """,
-            evidence_parameters,
-        ).fetchall():
-            evidence.setdefault(_row_text(row, "memory_id"), []).append(
-                _row_text(row, "source_memory_id")
-            )
 
     semantic_ids = frozenset(_row_text(row, "semantic_memory_id") for row in rows)
     selected: dict[str, sqlite3.Row] = {}
@@ -4396,7 +4470,7 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
             continue
         selected[memory_id] = row
 
-    contexts: dict[str, MemoryContext] = {}
+    scoped: dict[str, tuple[sqlite3.Row, SpatialContext | None]] = {}
     for memory_id, row in selected.items():
         spatial: SpatialContext | None = None
         if row["spatial_frame_id"] is not None:
@@ -4437,6 +4511,32 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
             tolerance += near.position_uncertainty_m or 0.0
             if distance > tolerance:
                 continue
+        scoped[memory_id] = (row, spatial)
+    return scoped, semantic_ids
+
+
+def _read_memory_contexts(
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+    *,
+    valid_at: datetime | None = None,
+    known_at: datetime | None = None,
+    near: SpatialContext | None = None,
+    radius_m: float | None = None,
+    active_only: bool = False,
+) -> tuple[dict[str, MemoryContext], frozenset[str]]:
+    scoped, semantic_ids = _select_memory_contexts(
+        connection,
+        memory_ids,
+        valid_at=valid_at,
+        known_at=known_at,
+        near=near,
+        radius_m=radius_m,
+        active_only=active_only,
+    )
+    evidence = _read_memory_evidence(connection, tuple(scoped), known_at=known_at)
+    contexts: dict[str, MemoryContext] = {}
+    for memory_id, (row, spatial) in scoped.items():
         retired_at = _optional_datetime_from_row(row, "retired_at")
         if known_at is not None and retired_at is not None and known_at < retired_at:
             retired_at = None
@@ -4466,6 +4566,40 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
             arousal=None if row["arousal"] is None else float(row["arousal"]),
         )
     return contexts, semantic_ids
+
+
+def _read_memory_evidence(
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+    *,
+    known_at: datetime | None,
+) -> dict[str, list[str]]:
+    evidence: dict[str, list[str]] = {}
+    evidence_time = (
+        "retired_at IS NULL"
+        if known_at is None
+        else "recorded_at <= ? AND (retired_at IS NULL OR retired_at > ?)"
+    )
+    for offset in range(0, len(memory_ids), _SQLITE_PARAMETER_BATCH):
+        batch = memory_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+        placeholders = ", ".join("?" for _memory_id in batch)
+        parameters: tuple[object, ...] = tuple(batch)
+        if known_at is not None:
+            known_text = _datetime_text(known_at)
+            parameters += (known_text, known_text)
+        for row in connection.execute(
+            f"""
+            SELECT memory_id, source_memory_id
+            FROM memory_evidence
+            WHERE memory_id IN ({placeholders}) AND {evidence_time}
+            ORDER BY memory_id, position
+            """,
+            parameters,
+        ).fetchall():
+            evidence.setdefault(_row_text(row, "memory_id"), []).append(
+                _row_text(row, "source_memory_id")
+            )
+    return evidence
 
 
 def _access_count(value: object) -> int:

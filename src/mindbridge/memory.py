@@ -2422,23 +2422,24 @@ class Memory:
                 dict.fromkeys(document.memory_id for document in documents)
             )
             with _translate_storage_errors("apply search scope"):
-                active_count = len(
-                    self._store.read_memories(
-                        candidate_parent_ids,
-                        valid_at=None if scope is None else scope.valid_at,
-                        known_at=None if scope is None else scope.known_at,
-                        near=None if scope is None else scope.near,
-                        radius_m=None if scope is None else scope.radius_m,
-                        # Passed here for consistency with every other scope axis, which all
-                        # reach both reads. This one is the survivor count that drives candidate
-                        # widening; no constructed corpus (30 or 120 memories) could make its
-                        # absence change a result, so it is unproven rather than proven needed.
-                        # Kept because omitting one axis at one of two sites is the anomaly a
-                        # reader would have to explain, and because narrowing a count can only
-                        # widen the search. The hydration site below is mutation-covered.
-                        place_id=None if scope is None else scope.place_id,
-                        active_only=True,
-                    )
+                # Only the number of survivors decides whether to widen, so count them under
+                # the same predicates instead of hydrating content, media assets and typed
+                # context rows and calling `len()` on the records.
+                active_count = self._store.count_memories(
+                    candidate_parent_ids,
+                    valid_at=None if scope is None else scope.valid_at,
+                    known_at=None if scope is None else scope.known_at,
+                    near=None if scope is None else scope.near,
+                    radius_m=None if scope is None else scope.radius_m,
+                    # Passed here for consistency with every other scope axis, which all
+                    # reach both reads. This one is the survivor count that drives candidate
+                    # widening; no constructed corpus (30 or 120 memories) could make its
+                    # absence change a result, so it is unproven rather than proven needed.
+                    # Kept because omitting one axis at one of two sites is the anomaly a
+                    # reader would have to explain, and because narrowing a count can only
+                    # widen the search. The hydration site below is mutation-covered.
+                    place_id=None if scope is None else scope.place_id,
+                    active_only=True,
                 )
             if (
                 active_count >= limit
