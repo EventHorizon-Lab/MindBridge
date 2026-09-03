@@ -1027,6 +1027,36 @@ def test_relative_time_prefers_event_time_and_routes_the_reference(tmp_path: Pat
     )
 
 
+def test_duration_question_routes_the_reference_without_a_parsable_phrase(
+    tmp_path: Path,
+) -> None:
+    # "How long ago" carries no parsable date, so nothing narrows retrieval and no caller supplied
+    # a reference. The reader still cannot subtract without knowing when it is being asked.
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory:
+        memory.add(
+            "grandpa visited",
+            occurred_at=datetime(2026, 8, 20, 9, tzinfo=timezone.utc),
+            memory_type=MemoryType.EPISODIC,
+        )
+        before = datetime.now(timezone.utc)
+        memory.ask("How long ago did grandpa visit?", limit=1)
+        after = datetime.now(timezone.utc)
+        memory.search("How long ago did grandpa visit?", limit=1)
+        embedded = tuple(zip(models.embed_tasks, models.embed_batches, strict=True))
+
+    prefix = "Reference time for relative dates: "
+    routed = models.answer_calls[-1][0].text
+    assert prefix in routed
+    reference = datetime.fromisoformat(routed.rsplit(prefix, 1)[1].strip())
+    assert before <= reference <= after
+    # The note is for the reader, not the index: it must never reach an embedding, or the query
+    # vector would drift with the clock and `search()` would answer differently every minute.
+    assert [text for task, batch in embedded for text in batch if task is EmbedTask.QUERY] == [
+        "How long ago did grandpa visit?"
+    ] * 2
+
+
 def test_named_month_and_calendar_year_prefer_event_time(tmp_path: Path) -> None:
     reference = datetime(2026, 8, 30, 12, tzinfo=timezone.utc)
     relative = memory_module._parse_temporal_range("2024 days ago", reference)

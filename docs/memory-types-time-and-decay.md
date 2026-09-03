@@ -85,7 +85,10 @@ bounded parser recognizes:
 
 `reference_at` supplies the timezone-aware clock for relative phrases. Without it, the current UTC
 time is used. When no explicit reference is passed, `Today is <date>` may anchor the query. `ask()`
-includes the resolved reference in generation input when relative time is involved.
+appends the resolved reference to the generation input of every question that has text, whether or
+not the parser recognized a phrase in it: "how long ago did grandpa visit" narrows no retrieval
+window yet still needs the answering clock. A question made only of media carries no text part to
+append to and is routed unchanged.
 
 For a detected range, retrieval considers both in-range and global candidates. In-range events are
 boosted; events outside the range and records without event time keep the score their relevance

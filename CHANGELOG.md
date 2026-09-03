@@ -343,6 +343,17 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - `search` counts the candidates that survive its scope predicates instead of hydrating their
   records to count them, removing one of the two record reads per search (about 15 % of search
   latency at depth 100). Results are identical.
+- `ask()` appends the resolved reference time to the generation input of every question that has
+  text, and the bundled OpenAI answer prompt now tells the reader to resolve relative time
+  expressions against that reference and each hit's `occurred_at` and to state the resolved date
+  or duration explicitly. Previously the reference was appended only when a caller passed
+  `reference_at` or the bounded parser recognized a phrase, so "how long ago did grandpa visit" —
+  which narrows no retrieval window and names no date — reached the answerer with the event times
+  of its evidence but no time of asking, making the subtraction it asks for unanswerable in
+  principle. Nothing told the reader to do that arithmetic either, so a relative phrase in a
+  memory could be returned verbatim. No protocol changed: `GenerationBackend.answer` still takes
+  `(question, hits)` and the reference travels in `question.text`, as it already did. A question
+  made only of media has no text part to append to and is routed unchanged.
 - **Breaking for existing stores:** the bundled OpenAI consolidation recipe is
   `mindbridge-consolidation-v2`. Its system prompt now describes the media parts attached to each
   evidence item, and the recipe is a digest of that prompt. The recipe salts `operation_key` and

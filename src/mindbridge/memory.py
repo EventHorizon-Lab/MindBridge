@@ -1399,14 +1399,13 @@ class Memory:
                     self._recognize_speech(speech_assets, assets)
                 hits = search().hits
             hits = _grounding_hits(hits, limit, budget_chars=self._evidence_budget)
+            # Every textual question gets the reference time, not just the ones whose phrasing a
+            # parser recognized. "How long ago did grandpa visit?" narrows no retrieval window and
+            # names no date, yet it is exactly the question the reader cannot answer without
+            # knowing when it is being asked. Gated on text only because a media-only question has
+            # no text part to carry the note without changing which modalities the answer routes.
             routed_question = self._route_generation(
-                (
-                    _with_reference_time(prepared, reference)
-                    if explicit_reference is not None
-                    or temporal_text != prepared.text
-                    or temporal_range is not None
-                    else prepared
-                ),
+                _with_reference_time(prepared, reference) if prepared.text else prepared,
                 assets,
             )
             routed_hits = self._route_generation_hits(hits, assets) if hits else ()
