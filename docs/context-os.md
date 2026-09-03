@@ -223,8 +223,9 @@ every administrative method.
 
 The compiler is that view's centre. `POST /v1/context` and the `compile_context` MCP tool return a
 budgeted bundle with provenance, and `GET /healthz` and the MCP server instructions advertise the
-configured modalities and backends so an agent does not discover them through failure. Both are
-read-only: compiling context selects and structures existing evidence and resolves nothing.
+configured modalities and backends so an agent does not discover them through failure. Both
+resolve nothing and write no memory; a query that arrives as audio may be transcribed and that
+transcript cached, exactly as for search, which is why neither is annotated read-only.
 Answering stays available as a convenience rather than the operating-system boundary.
 
 High-rate sensor streams stay on the embedded SDK boundary. Agents operate on completed
