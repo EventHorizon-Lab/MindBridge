@@ -870,6 +870,56 @@ def test_async_memory_mirrors_the_control_plane(tmp_path: Path) -> None:
 # Naming as a proposal
 
 
+def test_deleting_every_cited_source_takes_the_agent_asserted_name_with_it(
+    tmp_path: Path,
+) -> None:
+    """Losing evidence un-projects an inferred name; losing all of it removes the assertion.
+
+    An agent's IDENTIFY links its assertion to the memories it cited, so deleting one source
+    drops the name below the two-group threshold and deleting the last one cascade-deletes the
+    assertion itself. Reprojecting only the record the caller named left the registry and the
+    search index answering to a name no assertion supported any more, which is the
+    audit-versus-registry contradiction this round exists to remove.
+    """
+    consolidator = ScriptedConsolidator()
+    with _identity_memory(tmp_path / "cascade", consolidator) as memory:
+        first = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        second = memory.add(Blob(b"stranger speaks again", "video/mp4", "two.mp4"))
+        identity_id = memory.faces(first.id)[0].identity_id
+
+        def identify(*evidence: str) -> MemoryOperation:
+            return MemoryOperation(
+                intent=MemoryIntent.IDENTIFY,
+                claim=IdentityClaim(identity_id=identity_id, name="Li"),
+                evidence_ids=evidence,
+                rationale="the stranger said so",
+            )
+
+        for cited in (first.id, second.id):
+            consolidator._scripts.append((identify(cited),))
+            assert not memory.consolidate(evidence_ids=(first.id, second.id)).rejected
+        profile = memory.identity(identity_id)
+        assert profile is not None and profile.name == "Li"
+
+        # Losing one source drops an inferred name below the two-group threshold, so it stops
+        # being projected while the assertion itself survives on its remaining evidence.
+        assert memory.delete(first.id) is True
+        assert _asserted_name(memory, identity_id) is None
+        profile = memory.identity(identity_id)
+        assert profile is not None and profile.name is None
+
+        # The second delete removes the assertion's last evidence, so the assertion goes too.
+        assert memory.delete(second.id) is True
+        assert not [
+            item
+            for item in memory.list().items
+            if item.context is not None and item.context.identity_id == identity_id
+        ]
+        profile = memory.identity(identity_id)
+        assert profile is not None and profile.name is None
+        assert profile.confirmed is False
+
+
 def test_an_agent_names_a_person_only_from_evidence_that_contains_them(tmp_path: Path) -> None:
     """Scenario step 3: the stranger introduces themselves and the agent proposes the name.
 

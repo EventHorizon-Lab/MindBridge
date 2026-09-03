@@ -2027,9 +2027,6 @@ class LocalStore:
         memory_id: str,
     ) -> tuple[bool, tuple[StoredAsset, ...]]:
         """Delete one memory inside the caller's transaction; see `delete_memory_with_assets`."""
-        # Read before the delete: once the record is gone nothing can say whom it named, and the
-        # projection it fed has to be recomputed from whatever assertion is left standing.
-        named_identities = _naming_assertion_identities(connection, (memory_id,))
         linked_ids = [
             _row_text(row, "asset_id")
             for row in connection.execute(
@@ -2080,6 +2077,12 @@ class LocalStore:
                     )
                 )
         affected_ids = [_row_text(row, "memory_id") for row in dependent_rows]
+        # Read before the delete, and over the dependents too: a derived record whose last
+        # evidence this delete removes is cascade-deleted with it, and an agent's naming
+        # assertion is exactly such a record, because IDENTIFY links it to the memories it
+        # cited. Reading only the target would leave the registry answering to a name whose
+        # assertion no longer exists.
+        named_identities = _naming_assertion_identities(connection, (memory_id, *affected_ids))
         for lineage_id, kind in reconciled:
             affected_ids.extend(
                 _row_text(row, "memory_id")
