@@ -96,8 +96,9 @@ use it rather than inferring the threshold from hits that were returned.
 Before changing thresholds, rule out a record that was captured but never settled:
 `pending_captures()` lists records that are durable and returned by `get()` and `list()` but hold
 no vectors, and nothing settles them on its own; pass `memory_ids=` to ask about one record, and
-read its `attempts` and `last_error` if it keeps failing. Call `settle()` — or add the same
-content, which settles it — and search again. A record whose `forgotten_at` is set is excluded
+read its `awaiting`, `attempts`, and `last_error` if it keeps failing. Call `settle()` —
+`settle(memory_ids=...)` for that record alone, past its retry ceiling — or add the same content,
+which settles it, and search again. A record whose `forgotten_at` is set is excluded
 from recall by policy; `rollback()` on the logged operation restores it.
 
 Then:

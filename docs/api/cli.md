@@ -88,9 +88,9 @@ trust, license, model identity, and credential behavior live in
 | --- | --- | --- | --- |
 | `add` | content; `--occurred-at`; `--occurred-end`; `--metadata`; `--memory-type`; `--context` | memory object | yes |
 | `add-many` | optional JSONL source; `--memory-type` | `{"memories":[...]}` | yes |
-| `add-stream` | optional JSONL source; `--memory-type` | `{"memories":[...]}` | no |
+| `add-stream` | optional JSONL source; `--memory-type`; `--capture` | `{"memories":[...]}` | no |
 | `capture` | same operands and options as `add` | memory object | no |
-| `settle` | `--limit`; `--max-attempts` | `{"settled":int}` | no |
+| `settle` | optional `MEMORY_ID...`; `--limit`; `--max-attempts` | `{"settled":int}` | no |
 | `pending-captures` | optional `MEMORY_ID...`; `--limit` | `{"pending":[...]}` | no |
 | `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
 | `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | no |
@@ -191,11 +191,16 @@ values as JSON strings and datetimes as ISO 8601.
 `face_observations`, and `speech_segments`, matching the fields of `IdentityErasure`.
 
 `pending-captures` returns one object per record whose deferred work is not finished — `memory_id`,
-ISO 8601 `enqueued_at`, `attempts`, and `last_error` — oldest first, matching the fields of
-`PendingCapture`. With a formation backend, `add` holds a row between its commit and formation, so
-a queued record may already be searchable and owe formation only. Naming memory IDs restricts the
-report to them; an ID that is absent from the result is not pending, so it is either settled or
-unknown, and `get` tells the two apart.
+ISO 8601 `enqueued_at`, `attempts`, `last_error`, and `awaiting` — oldest first, matching the
+fields of `PendingCapture`. `awaiting` is `"enrichment"` for a record that has no vectors yet and
+`"formation"` for one that is already searchable and owes only formation. Naming memory IDs
+restricts the report to them; an ID that is absent from the result is not pending, so it is either
+settled or unknown, and `get` tells the two apart.
+
+`settle` accepts the same memory IDs. Naming records settles only those and ignores
+`--max-attempts` for them, which is how a capture parked at the retry ceiling is retried by hand.
+`add-stream --capture` commits each item through `capture` rather than `add`, so the items are
+durable but unsearchable until `settle` runs.
 
 Unless `--quiet` is set, commands write the resolved composition as one JSON document on stderr
 before executing. `--url` forwards successful owner response objects unchanged. Runtime

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import TypeAlias
+from typing import Literal, TypeAlias
 
 from mindbridge.exceptions import ValidationError
 
@@ -1155,7 +1155,17 @@ def _assets(value: Sequence[AssetRef], modality: Modality) -> tuple[AssetRef, ..
 
 @dataclass(frozen=True, slots=True)
 class MemoryRecord:
-    """One stored memory."""
+    """One stored memory.
+
+    `content` is the caller's text followed by any text the configured models derived from the
+    media. Derived sections are appended, never substituted: what the caller supplied stays
+    byte-identical at the front, and each derived section is introduced by its own marker line --
+    `[transcript:<asset_id>]`, `[visual description:<asset_id>]`, or
+    `[speech identities:<asset_id>]` -- so a reader can tell interpretation from evidence and
+    which asset it came from. `add` derives before its first write and `settle` derives after
+    `capture` already committed, so the same record shape results either way; the raw media is
+    never rewritten and stays in `assets` under its content address.
+    """
 
     id: str
     content: str
@@ -1238,23 +1248,28 @@ class SearchHit:
 class PendingCapture:
     """One record whose deferred work is not finished, and why it is still waiting.
 
-    `Memory.pending_captures` returns these. With a formation backend, `add` holds a row between
-    its commit and formation, so a queued record may already be searchable and owe formation only.
-    A memory ID that is absent from the result is not pending: it is either settled or unknown,
-    and `get` distinguishes the two. `attempts` and `last_error` are the failure state a poisoned
-    record accumulates, so an operator can see the reason without opening SQLite.
+    `Memory.pending_captures` returns these. `awaiting` is the stage the record is stopped at:
+    `"enrichment"` has no vectors and is invisible to `search`, while `"formation"` is already
+    embedded, indexed, and searchable and owes only the formation `add` holds a row for between
+    its commit and its model call. A memory ID that is absent from the result is not pending: it
+    is either settled or unknown, and `get` distinguishes the two. `attempts` and `last_error` are
+    the failure state a poisoned record accumulates, so an operator can see the reason without
+    opening SQLite.
     """
 
     memory_id: str
     enqueued_at: datetime
     attempts: int = 0
     last_error: str | None = None
+    awaiting: Literal["enrichment", "formation"] = "enrichment"
 
     def __post_init__(self) -> None:
         _text(self.memory_id, "memory_id")
         _require_aware(self.enqueued_at, "enqueued_at")
         if self.enqueued_at is None:
             raise ValidationError("enqueued_at must include a timezone")
+        if self.awaiting not in {"enrichment", "formation"}:
+            raise ValidationError("awaiting must be enrichment or formation")
         if isinstance(self.attempts, bool) or not isinstance(self.attempts, int):
             raise ValidationError("attempts must be an integer")
         if self.attempts < 0:
@@ -1285,16 +1300,24 @@ class PrefetchResult:
 
 @dataclass(frozen=True, slots=True)
 class StreamCommit:
-    """One durable final observation plus retrieval success or a visible retrieval failure."""
+    """One durable final observation plus retrieval success or a visible retrieval failure.
+
+    `pending_settlement` is true when the reducer committed through `capture` rather than `add`:
+    the record is durable and readable but has no vectors yet, so it stays invisible to `search`
+    until the host calls `settle`.
+    """
 
     record: MemoryRecord
     prefetch: PrefetchResult | None
     retrieval_error: str | None = None
     stream_id: str = "default"
+    pending_settlement: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.record, MemoryRecord):
             raise ValidationError("stream commit values are invalid")
+        if not isinstance(self.pending_settlement, bool):
+            raise ValidationError("stream commit pending_settlement must be a boolean")
         if self.prefetch is not None and not isinstance(self.prefetch, PrefetchResult):
             raise ValidationError("stream prefetch result is invalid")
         error = _optional_text(self.retrieval_error, "stream retrieval_error")

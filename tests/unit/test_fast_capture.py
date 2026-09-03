@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
+import time
 from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
@@ -432,10 +434,31 @@ def test_the_capture_operations_reach_the_command_line(tmp_path: Path) -> None:
                 "enqueued_at": reported["pending"][0]["enqueued_at"],  # type: ignore[index]
                 "attempts": 0,
                 "last_error": None,
+                "awaiting": "enrichment",
             }
         ]
     }
     assert settled == {"settled": 1}
+
+
+def test_settle_names_records_on_the_command_line(tmp_path: Path) -> None:
+    from mindbridge import cli
+
+    parser = cli._parser()
+    embedder = CountingEmbedder()
+    embedder.poison = "unreachable"
+    with Memory(tmp_path, embedder=embedder, minimum_relevance=0) as memory:
+        poisoned = memory.capture("an unreachable observation")
+        for _attempt in range(3):
+            with pytest.raises(ModelError):
+                memory.settle()
+        later = memory.capture("the ladder is in the garage")
+
+        # Naming the healthy record settles it alone; the poisoned one keeps its ceiling.
+        assert cli._LOCAL["settle"](memory, parser.parse_args(["settle", later.id])) == {
+            "settled": 1
+        }
+        assert [row.memory_id for row in memory.pending_captures()] == [poisoned.id]
 
 
 class FlakyFormer(CountingFormer):
@@ -497,3 +520,133 @@ def test_settling_describes_an_image_a_text_only_embedder_cannot_take(tmp_path: 
         assert "[visual description:" in settled.content
         assert "automatically described red toolbox" in settled.content
         assert {hit.id for hit in memory.search("red toolbox")} == {record.id}
+
+
+def test_settling_appends_derived_text_and_leaves_the_captured_evidence_intact(
+    tmp_path: Path,
+) -> None:
+    note = "the tenant said this on the phone"
+    audio = Blob(b"captured speech bytes", "audio/wav", "speech.wav")
+    with Memory(
+        tmp_path,
+        embedder=CountingEmbedder(capabilities=frozenset({Modality.TEXT})),
+        transcriber=CountingTranscriber(),
+        minimum_relevance=0,
+    ) as memory:
+        captured = memory.capture((note, audio))
+        assert captured.content == note
+        assets = captured.assets
+
+        assert memory.settle() == 1
+        settled = memory.get(captured.id)
+
+        # Settlement appends; it never rewrites the observation. The caller's text is still the
+        # byte-identical front of `content`, the transcript sits behind its own asset-keyed
+        # marker, and the raw media is the same content-addressed object.
+        marker = f"[transcript:{assets[0].id}]"
+        assert settled.content == f"{note}\n\n{marker}\nthe spare key is in the blue toolbox"
+        assert settled.content.encode()[: len(note.encode())] == note.encode()
+        assert [(asset.id, asset.sha256) for asset in settled.assets] == [
+            (asset.id, asset.sha256) for asset in assets
+        ]
+
+
+def test_pending_captures_name_the_stage_a_record_is_stopped_at(tmp_path: Path) -> None:
+    former = FlakyFormer()
+    with Memory(
+        tmp_path,
+        embedder=CountingEmbedder(),
+        former=former,
+        minimum_relevance=0,
+    ) as memory:
+        record = memory.capture("the spare key is in the blue toolbox")
+        (pending,) = memory.pending_captures()
+        assert pending.awaiting == "enrichment"
+        assert memory.search("spare key") == ()
+
+        with pytest.raises(ModelError):
+            memory.settle()
+
+        # Embedded, indexed, and searchable already; only formation is still owed, which the
+        # attempt count and the error text alone could not tell an operator.
+        (pending,) = memory.pending_captures()
+        assert pending.awaiting == "formation"
+        assert {hit.id for hit in memory.search("spare key")} == {record.id}
+
+        assert memory.settle() == 1
+        assert memory.pending_captures() == ()
+
+
+def test_settle_can_name_the_records_it_runs_and_ignores_the_ceiling_for_them(
+    tmp_path: Path,
+) -> None:
+    embedder = CountingEmbedder()
+    with Memory(tmp_path, embedder=embedder, minimum_relevance=0) as memory:
+        first = memory.capture("the ladder is in the garage")
+        second = memory.capture("the fuse box is behind the coats")
+
+        # Only the named record settles, whatever the enqueue order says.
+        assert memory.settle(memory_ids=(second.id,)) == 1
+        assert [row.memory_id for row in memory.pending_captures()] == [first.id]
+        assert {hit.id for hit in memory.search("fuse box")} == {second.id}
+
+        # A settled or unknown ID is skipped rather than raised.
+        assert memory.settle(memory_ids=(second.id, "0" * 64)) == 0
+
+        embedder.poison = "unreachable"
+        poisoned = memory.capture("an unreachable observation")
+        for _attempt in range(3):
+            with pytest.raises(ModelError):
+                memory.settle(memory_ids=(poisoned.id,))
+
+        # The ordinary queue now skips it and settles the record behind it instead.
+        assert memory.settle() == 1
+        assert [row.memory_id for row in memory.pending_captures()] == [poisoned.id]
+
+        # Naming it is the host asking by hand, so the ceiling does not apply.
+        with pytest.raises(ModelError):
+            memory.settle(memory_ids=(poisoned.id,))
+        assert memory.pending_captures()[0].attempts == 4
+        embedder.poison = None
+        assert memory.settle(memory_ids=(poisoned.id,)) == 1
+        assert memory.pending_captures() == ()
+
+
+class SlowEmbedder(CountingEmbedder):
+    """`CountingEmbedder` slow enough that a second thread reaches the queue mid-embedding."""
+
+    def embed(
+        self,
+        inputs: Sequence[ModelInput],
+        task: EmbedTask = EmbedTask.DOCUMENT,
+    ) -> tuple[tuple[float, ...], ...]:
+        time.sleep(0.2)
+        return super().embed(inputs, task)
+
+
+def test_two_concurrent_settles_never_run_the_models_over_one_record_twice(
+    tmp_path: Path,
+) -> None:
+    embedder = SlowEmbedder()
+    with Memory(tmp_path, embedder=embedder, minimum_relevance=0) as memory:
+        record = memory.capture("the spare key is in the blue toolbox")
+
+        started = threading.Barrier(2)
+        settled: list[int] = []
+
+        def worker() -> None:
+            started.wait()
+            settled.append(memory.settle())
+
+        threads = [threading.Thread(target=worker) for _index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        # One settlement at a time: the loser waits and then finds the queue already drained,
+        # rather than paying for the same embedding and discovering the race at the commit.
+        assert sorted(settled) == [0, 1]
+        assert embedder.calls == 1
+        assert memory.pending_captures() == ()
+        assert {hit.id for hit in memory.search("spare key")} == {record.id}

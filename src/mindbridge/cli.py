@@ -591,7 +591,12 @@ def _add_stream(memory: Memory, arguments: argparse.Namespace) -> _Document:
     )
     # ponytail: preserve the CLI's one-JSON-document contract by collecting result records; add
     # streaming output only if finite CLI imports outgrow memory. The SDK input path stays lazy.
-    return {"memories": [_memory_document(record) for record in memory.add_stream(inputs)]}
+    return {
+        "memories": [
+            _memory_document(record)
+            for record in memory.add_stream(inputs, capture=arguments.capture)
+        ]
+    }
 
 
 def _search(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -777,7 +782,13 @@ def _unlink_identity(memory: Memory, arguments: argparse.Namespace) -> _Document
 
 
 def _settle(memory: Memory, arguments: argparse.Namespace) -> _Document:
-    return {"settled": memory.settle(limit=arguments.limit, max_attempts=arguments.max_attempts)}
+    return {
+        "settled": memory.settle(
+            limit=arguments.limit,
+            max_attempts=arguments.max_attempts,
+            memory_ids=tuple(arguments.memory_ids) or None,
+        )
+    }
 
 
 def _pending_captures(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -788,6 +799,7 @@ def _pending_captures(memory: Memory, arguments: argparse.Namespace) -> _Documen
                 "enqueued_at": pending.enqueued_at.isoformat(),
                 "attempts": pending.attempts,
                 "last_error": pending.last_error,
+                "awaiting": pending.awaiting,
             }
             for pending in memory.pending_captures(
                 limit=arguments.limit,
@@ -1759,6 +1771,11 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     _memory_type_option(batch, "add_many")
     stream = commands.add_parser("add-stream", help="store completed JSONL items incrementally")
     stream.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
+    stream.add_argument(
+        "--capture",
+        action="store_true",
+        help="commit each item through capture; settle makes them searchable",
+    )
     _memory_type_option(stream, "add")
     for operation in ("search", "search_with_trace", "ask"):
         name = operation.replace("_", "-")
@@ -1860,6 +1877,12 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         type=int,
         default=_default("settle", "max_attempts"),
         help="skip captures that already failed this often (default: %(default)s)",
+    )
+    settle.add_argument(
+        "memory_ids",
+        nargs="*",
+        metavar="MEMORY_ID",
+        help="settle only these memories, ignoring --max-attempts",
     )
     pending = commands.add_parser(
         "pending-captures",

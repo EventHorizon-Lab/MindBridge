@@ -88,7 +88,15 @@ flowchart LR
 A captured record is durable and readable but has no vectors, so it enqueues no index work and
 `search()` cannot return it. `settle()` and the `add()` path share one enrichment routine over the
 committed row, so a settled record holds exactly the derived content, vectors, and formation a
-blocking `add()` would have produced. Retrieval and shutdown never settle.
+blocking `add()` would have produced. Retrieval and shutdown never settle. That shared routine
+runs under one process-wide settlement lock, so a concurrent `settle()` or an `add()` of the same
+captured content waits instead of running the model stages twice.
+
+Enrichment appends. Derived text is added to `memory_records.content` behind a per-asset marker —
+`[transcript:<asset_id>]`, `[visual description:<asset_id>]`, or `[speech identities:<asset_id>]`
+— so the caller's own text stays byte-identical at the front of the record and model
+interpretation stays separable from evidence. Media bytes are never rewritten: they stay in
+`assets/` under their digest, and a transcript is also cached on the asset row.
 
 `settle()` attempts every record it read: a failing one keeps its queue row, its attempt count,
 and its reason while the records behind it still settle, and the first failure is raised once the

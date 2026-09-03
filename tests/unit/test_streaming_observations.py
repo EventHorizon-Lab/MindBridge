@@ -24,6 +24,7 @@ from mindbridge import (
     Blob,
     EmbedTask,
     EvidenceBasis,
+    MemoryRecord,
     MemoryType,
     Modality,
     ModelError,
@@ -661,3 +662,118 @@ async def test_streamed_observations_carry_the_pose_sampled_at_each_boundary(
         assert (spoken.context.spatial.x, spoken.context.spatial.y) == (4.0, 5.0)
     finally:
         await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_a_captured_final_acknowledges_before_the_models_and_settles_later(
+    tmp_path: Path,
+) -> None:
+    memory = AsyncMemory(tmp_path, embedder=TinyEmbedder(), minimum_relevance=0)
+    try:
+        commits = [
+            value
+            async for value in AsyncCaptureStream(memory, capture=True).consume(
+                _events(
+                    StreamEvent(StreamPhase.UPDATE, "find"),
+                    StreamEvent(StreamPhase.FINAL, StreamInput("find the red toolbox")),
+                )
+            )
+        ]
+
+        (commit,) = commits
+        assert commit.pending_settlement is True
+        assert [row.memory_id for row in await memory.pending_captures()] == [commit.record.id]
+        assert await memory.search("red toolbox") == ()
+
+        assert await memory.settle() == 1
+        assert await memory.pending_captures() == ()
+        assert [hit.id for hit in await memory.search("red toolbox")] == [commit.record.id]
+    finally:
+        await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_a_captured_audio_final_settles_into_the_record_add_would_have_written(
+    tmp_path: Path,
+) -> None:
+    pcm = b"\x00\x00\x01\x00" * 80
+    started_at = datetime(2026, 9, 1, 10, tzinfo=timezone.utc)
+    ended_at = started_at + timedelta(milliseconds=20)
+
+    async def commit_one(directory: Path, *, capture: bool) -> MemoryRecord:
+        memory = AsyncMemory(
+            directory,
+            embedder=RecordingEmbedder(frozenset({Modality.TEXT})),
+            minimum_relevance=0,
+        )
+        try:
+            commits = [
+                value
+                async for value in AsyncAudioStream(memory, capture=capture).consume(
+                    _audio_packets(
+                        VADPacket(True, stream_id="headset", occurred_at=started_at),
+                        PCMChunk(pcm, stream_id="headset"),
+                        ASRPartial("red toolbox", stream_id="headset"),
+                        VADPacket(False, stream_id="headset", occurred_at=ended_at),
+                    )
+                )
+            ]
+            (commit,) = commits
+            assert commit.pending_settlement is capture
+            if capture:
+                assert await memory.settle() == 1
+            return await memory.get(commit.record.id)
+        finally:
+            await memory.close()
+
+    captured = await commit_one(tmp_path / "captured", capture=True)
+    added = await commit_one(tmp_path / "added", capture=False)
+
+    # The ASR hypothesis the reducer already holds is folded in at capture time, so the deferred
+    # path lands on the same content-addressed record as the strong one.
+    assert captured.id == added.id
+    assert captured.content == added.content
+    assert "red toolbox" in captured.content
+
+
+@pytest.mark.asyncio
+async def test_a_captured_vision_final_reports_its_pending_settlement(tmp_path: Path) -> None:
+    memory = AsyncMemory(tmp_path, embedder=TinyEmbedder(), minimum_relevance=0)
+    try:
+        commits = [
+            value
+            async for value in AsyncVisionStream(memory, capture=True).consume(
+                _vision_packets(
+                    VisionFrame(Blob(b"frame", "image/png"), stream_id="camera"),
+                    VisionPartial("a red toolbox beside the door", stream_id="camera"),
+                    SceneBoundary(VisionBoundary.END, stream_id="camera"),
+                )
+            )
+        ]
+
+        (commit,) = commits
+        assert commit.pending_settlement is True
+        assert [row.memory_id for row in await memory.pending_captures()] == [commit.record.id]
+        assert await memory.settle() == 1
+        assert [hit.id for hit in await memory.search("red toolbox")] == [commit.record.id]
+    finally:
+        await memory.close()
+
+
+def test_add_stream_can_capture_instead_of_adding(tmp_path: Path) -> None:
+    from mindbridge import Memory
+
+    with Memory(tmp_path, embedder=TinyEmbedder(), minimum_relevance=0) as memory:
+        records = list(
+            memory.add_stream(
+                (StreamInput("the ladder is in the garage"), "the fuse box is behind the coats"),
+                capture=True,
+            )
+        )
+
+        assert [row.memory_id for row in memory.pending_captures()] == [
+            record.id for record in records
+        ]
+        assert memory.search("ladder") == ()
+        assert memory.settle() == 2
+        assert records[0].id in {hit.id for hit in memory.search("ladder")}

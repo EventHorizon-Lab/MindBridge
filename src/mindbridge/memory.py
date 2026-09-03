@@ -544,6 +544,11 @@ class Memory:
         self._owner_pid = os.getpid()
         self._write_lock = RLock()
         self._formation_lock = RLock()
+        # Settlement is the one path that runs the expensive model stages over rows another
+        # caller can already see queued, so two threads would otherwise embed the same record
+        # twice and discover it only at the commit. Blocking, like the other two: a second
+        # `settle()` waits and then finds the queue already drained.
+        self._settle_lock = RLock()
         self._lifecycle = Condition()
         self._active_operations = 0
         self._closing = False
@@ -827,6 +832,32 @@ class Memory:
             description=item.description,
         )
 
+    def _stream_record(
+        self,
+        content: ContentInput | StreamInput,
+        *,
+        capture: bool,
+    ) -> MemoryRecord:
+        if isinstance(content, StreamInput):
+            if capture:
+                return self._capture_stream_input(content)
+            return self._add_stream_input(content)
+        if capture:
+            return self.capture(content)
+        return self.add(content)
+
+    def _capture_stream_input(self, item: StreamInput) -> MemoryRecord:
+        return self._capture_one(
+            item.content,
+            occurred_at=item.occurred_at,
+            occurred_end=item.occurred_end,
+            metadata=item.metadata,
+            memory_type=item.memory_type,
+            context=item.context,
+            transcript=item.transcript,
+            description=item.description,
+        )
+
     def add_many(
         self,
         contents: Sequence[ContentInput],
@@ -905,12 +936,44 @@ class Memory:
         The returned record is the content-addressed record `add()` returns for the same input, so
         capturing and then adding the same content is one memory. It is durable and readable
         through `get()` and `list()` immediately and invisible to `search()` until settled.
+
+        `settle()` appends the text its models derive to `content`; it never rewrites what the
+        caller supplied. See `MemoryRecord` for how derived sections are marked and where the raw
+        evidence lives.
         """
+        return self._capture_one(
+            content,
+            occurred_at=occurred_at,
+            occurred_end=occurred_end,
+            metadata=metadata,
+            memory_type=memory_type,
+            context=context,
+        )
+
+    def _capture_one(
+        self,
+        content: ContentInput,
+        *,
+        occurred_at: datetime | None,
+        occurred_end: datetime | None,
+        metadata: Mapping[str, object] | None,
+        memory_type: MemoryType,
+        context: ObservationContext | None,
+        transcript: str | None = None,
+        description: str | None = None,
+    ) -> MemoryRecord:
         with self._trace("mindbridge.capture", kind="operation"), self._operation() as assets:
             if self._former is not None and context is None:
                 context = ObservationContext()
             with self._trace("mindbridge.content.prepare", kind="stage"):
                 prepared_content = self._prepare_content(content, assets)
+                # Folded in here, exactly as `_add_one` folds them, so a streaming FINAL that
+                # already carries ASR or caption text keeps the same content-addressed ID on
+                # either commit path and `settle()` sees the marker instead of paying again.
+                if transcript is not None:
+                    prepared_content = _with_stream_transcript(prepared_content, transcript)
+                if description is not None:
+                    prepared_content = _with_stream_description(prepared_content, description)
             prepared = _prepare_memory(
                 prepared_content,
                 occurred_at=occurred_at,
@@ -966,7 +1029,13 @@ class Memory:
             assets.persisted.update(asset.asset_id for asset in authoritative[0].assets)
             return self._memory_record(authoritative[0])
 
-    def settle(self, *, limit: int = 100, max_attempts: int = 3) -> int:
+    def settle(
+        self,
+        *,
+        limit: int = 100,
+        max_attempts: int = 3,
+        memory_ids: Sequence[str] | None = None,
+    ) -> int:
         """Enrich, embed, index, and form up to `limit` captured records in enqueue order.
 
         Every readable record is attempted: a failing one keeps its queue row, its attempt count,
@@ -975,6 +1044,14 @@ class Memory:
         `pending_captures()`. A record that has already failed `max_attempts` times is skipped
         rather than retried, so one poisoned capture cannot block the queue forever. It stays
         queued and visible, and lowering the ceiling is what retries it.
+
+        Pass `memory_ids` to settle only those records. Naming a record is the host asking for it
+        by hand, so the retry ceiling does not apply and `max_attempts` is ignored: that is how a
+        record parked at the ceiling is retried, quarantined by simply never being named, or
+        settled ahead of the queue. IDs that are not queued are skipped.
+
+        One settlement runs at a time per `Memory`. A concurrent call waits rather than paying
+        for the same model work twice, and usually then finds the queue already drained.
         """
         with (
             self._trace("mindbridge.settle", kind="operation") as span,
@@ -987,17 +1064,24 @@ class Memory:
                 or max_attempts < 1
             ):
                 raise ValidationError("max_attempts must be a positive integer")
-            with _translate_storage_errors("read the capture queue"):
-                queued = self._store.pending_captures(limit=limit, max_attempts=max_attempts)
-            span.set_attribute(CAPTURE_SETTLED, 0)
-            span.set_attribute(CAPTURE_FAILED, 0)
-            if not queued:
-                return 0
-            with _translate_storage_errors("hydrate captured memories"):
-                rows = self._store.read_memories(tuple(row.memory_id for row in queued))
-            settled, failures = self._settle_stored(rows, operation=assets)
-            span.set_attribute(CAPTURE_SETTLED, len(settled))
-            span.set_attribute(CAPTURE_FAILED, len(failures))
+            with self._settle_lock:
+                with _translate_storage_errors("read the capture queue"):
+                    # Same filter `pending_captures()` publishes, so naming records reuses the
+                    # queue read rather than adding a second way to select them.
+                    queued = self._store.pending_captures(
+                        limit=limit,
+                        memory_ids=memory_ids,
+                        max_attempts=None if memory_ids is not None else max_attempts,
+                    )
+                span.set_attribute(CAPTURE_SETTLED, 0)
+                span.set_attribute(CAPTURE_FAILED, 0)
+                if not queued:
+                    return 0
+                with _translate_storage_errors("hydrate captured memories"):
+                    rows = self._store.read_memories(tuple(row.memory_id for row in queued))
+                settled, failures = self._settle_stored(rows, operation=assets)
+                span.set_attribute(CAPTURE_SETTLED, len(settled))
+                span.set_attribute(CAPTURE_FAILED, len(failures))
             enqueued_at = {row.memory_id: row.enqueued_at for row in queued}
             now = datetime.now(timezone.utc)
             waits = tuple(
@@ -1033,8 +1117,15 @@ class Memory:
     def add_stream(
         self,
         contents: Iterable[ContentInput | StreamInput],
+        *,
+        capture: bool = False,
     ) -> Iterator[MemoryRecord]:
-        """Add a lazy omni stream one durable, searchable observation at a time."""
+        """Add a lazy omni stream one durable, searchable observation at a time.
+
+        With `capture=True` each item commits through `capture()` instead: every yielded record is
+        durable and readable but has no vectors, so the stream keeps its acknowledgement off the
+        model path and the host owes the matching `settle()` before anything is searchable.
+        """
         if isinstance(contents, (str, bytes, Path, Blob, AssetRef, Mapping)):
             raise ValidationError("contents must be an iterable of memory inputs")
         try:
@@ -1052,10 +1143,7 @@ class Memory:
                     error.subject = f"contents[{index}]"
                 raise
             try:
-                if isinstance(content, StreamInput):
-                    record = self._add_stream_input(content)
-                else:
-                    record = self.add(content)
+                record = self._stream_record(content, capture=capture)
             except MindBridgeError as error:
                 if error.subject is None:
                     error.subject = f"contents[{index}]"
@@ -2589,12 +2677,18 @@ class Memory:
         failing one is collected rather than raised, so it keeps its queue row, its attempt count,
         and its reason while every other record in the batch still settles. Returns the IDs that
         settled and the failures, and the caller decides which of them to raise.
+
+        Held under `_settle_lock`, which is the whole cross-thread guard: a `settle()` and an
+        `add()` of the same captured content would otherwise both find the row unembedded and
+        run every model stage over it. Serialized, the second caller reaches `_settle_row`'s
+        vector check after the first committed and owes formation only.
         """
         settled: list[str] = []
         failures: list[MindBridgeError] = []
         for row in rows:
             try:
-                self._settle_row(row, operation=operation)
+                with self._settle_lock:
+                    self._settle_row(row, operation=operation)
             except MindBridgeError as error:
                 with _translate_storage_errors("record a failed settlement"):
                     self._store.record_capture_failure(row.memory_id, str(error))
@@ -5254,6 +5348,9 @@ class AsyncMemory:
     async def _add_stream_input(self, item: StreamInput) -> MemoryRecord:
         return await asyncio.to_thread(self._memory._add_stream_input, item)
 
+    async def _capture_stream_input(self, item: StreamInput) -> MemoryRecord:
+        return await asyncio.to_thread(self._memory._capture_stream_input, item)
+
     async def add_many(
         self,
         contents: Sequence[ContentInput],
@@ -5294,8 +5391,19 @@ class AsyncMemory:
             context=context,
         )
 
-    async def settle(self, *, limit: int = 100, max_attempts: int = 3) -> int:
-        return await asyncio.to_thread(self._memory.settle, limit=limit, max_attempts=max_attempts)
+    async def settle(
+        self,
+        *,
+        limit: int = 100,
+        max_attempts: int = 3,
+        memory_ids: Sequence[str] | None = None,
+    ) -> int:
+        return await asyncio.to_thread(
+            self._memory.settle,
+            limit=limit,
+            max_attempts=max_attempts,
+            memory_ids=memory_ids,
+        )
 
     async def pending_captures(
         self,
@@ -5310,8 +5418,13 @@ class AsyncMemory:
     async def add_stream(
         self,
         contents: AsyncIterable[ContentInput | StreamInput],
+        *,
+        capture: bool = False,
     ) -> AsyncIterator[MemoryRecord]:
-        """Add an async omni stream one durable, searchable observation at a time."""
+        """Add an async omni stream one durable, searchable observation at a time.
+
+        With `capture=True` each item commits through `capture()` and owes a later `settle()`.
+        """
         if not isinstance(contents, AsyncIterable):
             raise ValidationError("contents must be an async iterable of memory inputs")
         iterator = aiter(contents)
@@ -5327,7 +5440,13 @@ class AsyncMemory:
                 raise
             try:
                 if isinstance(content, StreamInput):
-                    record = await self._add_stream_input(content)
+                    record = (
+                        await self._capture_stream_input(content)
+                        if capture
+                        else await self._add_stream_input(content)
+                    )
+                elif capture:
+                    record = await self.capture(content)
                 else:
                     record = await self.add(content)
             except MindBridgeError as error:
@@ -5627,7 +5746,12 @@ class AsyncOmniPrefetch:
 
 
 class AsyncCaptureStream:
-    """Reduce associated capture streams into retrieval and durable memories."""
+    """Reduce associated capture streams into retrieval and durable memories.
+
+    `capture=True` commits each `FINAL` through `Memory.capture()` instead of `Memory.add()`, so
+    the acknowledgement leaves the model path and every `StreamCommit` reports
+    `pending_settlement`. The host then owes `settle()`; the default stays the strong `add()`.
+    """
 
     def __init__(
         self,
@@ -5637,15 +5761,19 @@ class AsyncCaptureStream:
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
         max_streams: int = 32,
+        capture: bool = False,
     ) -> None:
         if not isinstance(memory, AsyncMemory):
             raise ValidationError("memory must be an AsyncMemory")
         _limit(limit, maximum=100)
+        if not isinstance(capture, bool):
+            raise ValidationError("capture must be a boolean")
         self._memory = memory
         self._limit = limit
         self._memory_type = _optional_memory_type(memory_type)
         self._reference_at = _reference_at(reference_at)
         self._max_streams = _positive_dimension(max_streams, "max_streams")
+        self._capture = capture
 
     async def consume(  # noqa: C901 - the three-state reducer is intentionally inline
         self,
@@ -5717,6 +5845,7 @@ class AsyncCaptureStream:
                             else "retrieval_failed"
                         ),
                         stream_id=stream_id,
+                        pending_settlement=self._capture,
                     )
                 else:
                     assert retrieval is not None
@@ -5724,6 +5853,7 @@ class AsyncCaptureStream:
                         record=record,
                         prefetch=retrieval,
                         stream_id=stream_id,
+                        pending_settlement=self._capture,
                     )
         finally:
             for prefetch in tuple(prefetches.values()):
@@ -5781,7 +5911,11 @@ class AsyncCaptureStream:
 
     async def _add_final(self, item: ContentInput | StreamInput) -> MemoryRecord:
         if isinstance(item, StreamInput):
+            if self._capture:
+                return await self._memory._capture_stream_input(item)
             return await self._memory._add_stream_input(item)
+        if self._capture:
+            return await self._memory.capture(item)
         return await self._memory.add(item)
 
 
@@ -5818,6 +5952,7 @@ class AsyncAudioStream:
         context: StreamContext = None,
         reference_at: datetime | None = None,
         max_streams: int = 32,
+        capture: bool = False,
     ) -> None:
         if not isinstance(memory, AsyncMemory):
             raise ValidationError("memory must be an AsyncMemory")
@@ -5835,6 +5970,7 @@ class AsyncAudioStream:
             memory_type=memory_type,
             reference_at=reference_at,
             max_streams=max_streams,
+            capture=capture,
         )
 
     async def consume(
@@ -5981,6 +6117,7 @@ class AsyncVisionStream:
         context: StreamContext = None,
         reference_at: datetime | None = None,
         max_streams: int = 32,
+        capture: bool = False,
     ) -> None:
         if not isinstance(memory, AsyncMemory):
             raise ValidationError("memory must be an AsyncMemory")
@@ -5997,6 +6134,7 @@ class AsyncVisionStream:
             memory_type=memory_type,
             reference_at=reference_at,
             max_streams=max_streams,
+            capture=capture,
         )
 
     async def consume(
