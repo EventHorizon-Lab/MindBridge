@@ -370,7 +370,10 @@ also adds a searchable memory record, appears in `operations()`, and is reversib
 `rollback()`; see
 [typed assertions](../memory-types-time-and-decay.md#naming-a-person-is-a-typed-assertion).
 `identity` resolves an ID through any merge alias and returns what has been registered,
-so an observation captured before a merge still reaches the surviving person. `unlink_identity`
+so an observation captured before a merge still reaches the surviving person. The merge itself is
+`faces()`'s side effect and is logged: a corroborated cross-modal bind commits a `MERGE` row whose
+`model_id` is the face recognizer and whose `recipe` is the corroboration rule, so `operations()`
+shows what fused two people and `rollback()` splits them apart again. `unlink_identity`
 reverses one face-and-voice merge, returning the restored ID or `None` when the merge is not
 reversible; it resets the pair's accumulated evidence rather than suppressing the pair, so a voice
 and face that keep co-occurring are corroborated and merged again. Restoring a voice also rewrites
@@ -457,6 +460,24 @@ back is rejected as `"duplicate"`.
 | `CORRECT` | Every target in the window, existing, and derived (`kind != OBSERVATION`) | Retires current versions at transaction time | Carries a new version with the same interval |
 | `FORGET` | Every target in the window, existing, and not already forgotten | Sets `forgotten_at` | Clears `forgotten_at` |
 | `IDENTIFY` | Identity exists; every evidence ID shown and existing, each still standing; at least one cited memory contains that identity through a speech or face observation | Commits the `ENTITY` naming assertion the kernel builds from `claim`, recomputes `identities.name` and the indexed speech text | Retracts the assertion, restores the `superseded` version, and repaints both |
+| `MERGE` | Never accepted from a backend: rejected as `"unauthorized"` | Kernel-initiated only. `faces()` commits one under the corroboration rule below | Splits the absorbed identity back out and repaints both projections |
+
+`MERGE` is the one intent the kernel initiates and never accepts: a cross-modal identity merge
+is committed from corroboration evidence the kernel counted itself, so a proposed `MERGE` is
+rejected as `"unauthorized"` before anything is read. `MemoryOperation.identity` is an
+`IdentityChange` naming the identity that stands after the operation and the identities it
+moved, because identity IDs are not memory IDs and must not travel in `target_ids`. Three
+operations carry one: a `MERGE`, the `CORRECT` that `unlink_identity` logs, and the `FORGET` that
+`forget_identity` logs. Each names either memories or one identity, never both.
+
+`unlink_identity` is the split half of "correct or split": it logs a `CORRECT` over the pair, and
+`rollback()` of that row re-merges them under the identity that survived. `forget_identity` is
+physical forgetting of a person: it logs a `FORGET` over the identity, carrying the identity, its
+aliases, and the naming assertions the erasure deleted in `changed_ids` -- IDs and counts only,
+never the name or the template -- and `rollback()` returns `False` for it, because nothing it
+destroyed can be restored. Which of the two a `FORGET` row names is the marker that separates
+cognitive forgetting from erasing a person: a row with `target_ids` is reversible, a row with an
+`identity` is not.
 
 `REINFORCE`, `CORRECT`, and `FORGET` refuse a bound naming assertion with `"naming_assertion"`.
 A name is not an inference to be corrected: reverse it with `rollback` of the `IDENTIFY` that
@@ -504,7 +525,7 @@ raises `MemoryNotFoundError` the way `get` and `delete` do, and an empty sequenc
 which any record is already forgotten returns `None` having changed nothing.
 
 `rollback` reverses one applied operation and returns `False` for an unknown or already-reversed
-`operation_id`, and for one a later standing operation has built on. Operations that touched one
+`operation_id`, for the erasure of a person, and for one a later standing operation has built on. Operations that touched one
 lineage reverse newest first: while a second consolidation's derived record supersedes the first
 one's, rolling the first one back would leave two current versions in the lineage, so it is
 refused and its log row stays standing until the newer one is reversed. The same rule orders a
@@ -672,7 +693,7 @@ These are the 105 supported names exported by `mindbridge`:
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `ProvisionalActor`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `ProvisionalActor`, `IdentityChange`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
@@ -716,8 +737,9 @@ The principal immutable values are:
 | `ContextUnknown` | `kind` (a `ContextUnknownKind`), `detail` |
 | `ProvisionalActor` | `identity_id`, `memory_ids` |
 | `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`; `hits` property and `render()` |
-| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `rationale` |
+| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `identity`, `rationale` |
 | `IdentityClaim` | `identity_id`, `name`, `relationship` |
+| `IdentityChange` | `identity_id`, `moved_ids` |
 | `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `superseded`, `rolled_back_at` |
 | `ConsolidationCandidate` | `trigger`, `memory_ids`, `evidence_count` |
 | `ConsolidationReport` | `operations`, `rejected` as `(MemoryOperation, reason)` pairs |
@@ -752,7 +774,7 @@ Enum values are:
 | `RetrievalRejection` | `stale_index`, `occurrence_range`, `missing_memory`, `memory_type`, `minimum_relevance`, `ambiguity`, `limit` |
 | `EmbedTask` | `retrieval.query`, `retrieval.document` |
 | `MemoryKind` | `observation`, `entity`, `event`, `state`, `relation`, `affect`, `trait`, `response_policy` |
-| `MemoryIntent` | `reinforce`, `consolidate`, `correct`, `forget`, `identify` |
+| `MemoryIntent` | `reinforce`, `consolidate`, `correct`, `forget`, `identify`, `merge` |
 | `MemoryTrigger` | `manual`, `evidence`, `feedback`, `contradiction`, `query_failure`, `pressure`, `idle` |
 | `EvidenceBasis` | `observation`, `user_statement`, `model_inference`, `response_feedback` |
 | `SpatialAnchor` | `observer`, `subject` |

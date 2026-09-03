@@ -131,7 +131,7 @@ The reasoning backend may change, but the proposal vocabulary and kernel validat
 | --- | --- |
 | Reinforce | Record independent supporting evidence or observed utility; retrieval alone is not reinforcement, though a hit an answerer cited is observed utility. |
 | Consolidate | Create a higher-level derived memory with explicit evidence links; preserve source observations. |
-| Merge | Unify compatible derived identity or meaning while retaining reversible lineage. |
+| Merge | Unify compatible derived identity or meaning while retaining reversible lineage. Kernel-initiated from corroborated cross-modal evidence, not backend vocabulary: a proposed merge is refused. |
 | Update | Add a new valid and transaction-time version that supersedes prior state; do not overwrite history. Realized as consolidate into an existing lineage. |
 | Correct or split | Reverse a bad inference, identity merge, or consolidation without manufacturing new source evidence. |
 | Forget | Change retrieval visibility or retention state under policy; do not equate it with physical deletion. |
@@ -147,7 +147,10 @@ forgotten, corrected, or deleted since validation is refused as stale rather tha
 observation while the kernel validates and persists it. `ConsolidationBackend` is the plane itself:
 `consolidate()` gathers a bounded, active evidence set, the backend proposes `MemoryOperation`
 values with the four intents reinforce, consolidate, correct, and forget, and the kernel validates
-each one, commits it with its log row, and can `rollback()` it. `consolidation_candidates()` is the
+each one, commits it with its log row, and can `rollback()` it. Merge is the one intent no backend
+may propose: a cross-modal identity merge is committed by the kernel from co-occurrence evidence it
+counted itself, with its own reversible log row, and a proposed `MERGE` is rejected as
+`unauthorized`. `consolidation_candidates()` is the
 durable trigger in front of that loop: it derives due work -- new independent evidence, a lineage
 that contradicts itself, a record confirmed since it was last weighed -- from committed state, so a
 host schedules deliberation on evidence rather than on a clock. The Python SDK reference owns the
@@ -166,11 +169,16 @@ recall, stays readable through `get()` and `list()` with its `forgotten_at`, and
 `rollback()`. Consolidation forgetting is a control-plane proposal over evidence lineage: a
 `CONSOLIDATE` may name sources of its own to retire, they leave recall in the same transaction that
 creates the derived record, the evidence links stay, and the log row carries them as
-`forgotten_ids` so the two halves reverse together. Physical forgetting remains `delete()` under
-host authority and is not a proposal intent. Retention work must keep these meanings separate in
-APIs, telemetry, and user-facing controls, and the operation log already does: `delete()` leaves no
-row, cognitive forgetting is a `FORGET` row, and consolidation forgetting is a `CONSOLIDATE` row
-carrying `forgotten_ids`.
+`forgotten_ids` so the two halves reverse together. Physical forgetting remains `delete()` and
+`forget_identity()` under host authority and is not a proposal intent. Retention work must keep
+these meanings separate in APIs, telemetry, and user-facing controls, and the operation log already
+does: `delete()` leaves no row, cognitive forgetting is a `FORGET` row over `target_ids`, and
+consolidation forgetting is a `CONSOLIDATE` row carrying `forgotten_ids`. Erasing a *person* is the
+one physical forgetting that does leave a row, because a data subject's request has to be
+auditable: it is a `FORGET` row over an `IdentityChange` rather than over memory IDs, it carries
+only the identity, its aliases, and the naming assertions it deleted, and `rollback()` refuses it.
+Which of the two a `FORGET` row names is the discriminator: a row over records is reversible, a row
+over a person is not.
 
 ## Context compiler
 
@@ -290,11 +298,13 @@ defaults or justify superiority claims.
    declarative `consolidation` slot that makes the loop reachable without a Python app loader,
    kernel rejection of proposals that name records the backend was not shown, of partial
    multi-target operations, and of proposals whose targets moved before the commit, native media
-   in the bundled consolidation backend's input, and replay of a logged sequence against a fresh
-   store, covered as a test rather than as an `apply(operation)` surface. Open: companion-scenario
-   privacy tests; a post-hoc outcome field, without which only rollback success of the slow-loop
-   measurements is derivable; and identity merge and split, which stay outside the operation
-   log until the identity-governance round.
+   in the bundled consolidation backend's input, replay of a logged sequence against a fresh
+   store, covered as a test rather than as an `apply(operation)` surface, and the identity
+   lifecycle: the corroborated cross-modal `MERGE` the kernel commits and `rollback()` re-splits,
+   the `CORRECT` that `unlink_identity` logs and `rollback()` re-links, and the irreversible
+   `FORGET` row an identity erasure leaves so the request is auditable without being
+   recoverable. Open: companion-scenario privacy tests, and a post-hoc outcome field, without
+   which only rollback success of the slow-loop measurements is derivable.
 4. Add a context compiler whose output improves downstream tasks within declared budgets. Done
    for selection, budgeting, the latency deadline, and the explicit unknowns a thin bundle
    reports: `compile()`. Open: a downstream-task measurement against the no-memory,

@@ -137,6 +137,7 @@ from mindbridge.types import (
     EvidenceBasis,
     FaceObservation,
     FormationProposal,
+    IdentityChange,
     IdentityClaim,
     IdentityErasure,
     IdentityProfile,
@@ -181,6 +182,11 @@ _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
 # consolidator configured.
 _NAMING_RECIPE = "mindbridge-identity-naming-v1"
 _NAMING_PREDICATE = "identity"
+# Binding one voice to one face is the kernel's own corroboration rule over co-occurrence
+# evidence it counted, not a model's proposal, so the recipe names that rule. It is what makes
+# the MERGE row's lineage honest: the recognizer models produced the templates, this rule
+# decided the bind, and `rollback()` reverses it.
+_IDENTITY_LINK_RECIPE = "mindbridge-identity-link-v1"
 _INDEX_RECIPE_PREFIX = (
     "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:context-keys-v10"
 )
@@ -1631,6 +1637,10 @@ class Memory:
 
         This resets the pair's accumulated evidence; it does not suppress the pair. If the same
         voice and face keep co-occurring, they will be corroborated and merged again.
+
+        A split is the `CORRECT` half of the control plane's "correct or split" intent, so it
+        commits with its own log row: it shows up in `operations()` and `rollback()` of that row
+        re-merges the pair under the identity that survived.
         """
         with (
             self._trace("mindbridge.unlink_identity", kind="operation"),
@@ -1644,9 +1654,34 @@ class Memory:
                     requested_id,
                     memories=memories,
                     embeddings=embeddings,
+                    operation=self._identity_split_operation(requested_id),
                 )
             self._drain_outbox()
             return restored
+
+    def _identity_split_operation(self, alias_id: str) -> StoredOperation | None:
+        """Build the CORRECT log row one split commits with, or None when there is no merge.
+
+        An ID that is not a merge alias resolves to itself, and the store refuses the split
+        anyway, so there is nothing to log and no row is built.
+        """
+        with _translate_storage_errors("read identity alias"):
+            survivor = self._store.resolve_identity_id(alias_id)
+        if survivor is None or survivor == alias_id:
+            return None
+        proposed = MemoryOperation(
+            intent=MemoryIntent.CORRECT,
+            identity=IdentityChange(identity_id=survivor, moved_ids=(alias_id,)),
+            rationale="the host split this face-and-voice merge",
+        )
+        return StoredOperation(
+            operation_key=operation_key(proposed, recipe=_IDENTITY_LINK_RECIPE),
+            intent=proposed.intent.value,
+            trigger=MemoryTrigger.MANUAL.value,
+            recipe=_IDENTITY_LINK_RECIPE,
+            operation_json=dump_operation(proposed),
+            applied_at=datetime.now(timezone.utc),
+        )
 
     def _unlinked_speaker_index(
         self,
@@ -1950,11 +1985,39 @@ class Memory:
                     normalized_id,
                     memories=memories,
                     embeddings=embeddings,
+                    operation=self._identity_erasure_operation(normalized_id),
                 )
             if erasure is None:
                 raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
             self._drain_outbox()
             return erasure
+
+    def _identity_erasure_operation(self, identity_id: str) -> StoredOperation:
+        """Build the irreversible log row one identity erasure commits with.
+
+        Erasure is physical forgetting of a person, so the row is audit history and nothing
+        else: it carries the identity, its aliases, and the naming assertions the erasure
+        deleted -- ids and counts, never content -- and `rollback()` refuses it. That is the
+        marker that separates this from the cognitive `FORGET` a row with `target_ids` records.
+        """
+        with _translate_storage_errors("read identity aliases"):
+            members = self._store.identity_equivalence_class(identity_id)
+        proposed = MemoryOperation(
+            intent=MemoryIntent.FORGET,
+            identity=IdentityChange(
+                identity_id=identity_id,
+                moved_ids=() if members is None else members[1:],
+            ),
+            rationale="the data subject asked to be erased",
+        )
+        return StoredOperation(
+            operation_key=operation_key(proposed, recipe=_IDENTITY_LINK_RECIPE),
+            intent=proposed.intent.value,
+            trigger=MemoryTrigger.MANUAL.value,
+            recipe=_IDENTITY_LINK_RECIPE,
+            operation_json=dump_operation(proposed),
+            applied_at=datetime.now(timezone.utc),
+        )
 
     def reinforce(self, memory_ids: Sequence[str]) -> int:
         """Record explicit positive feedback for existing memories."""
@@ -2126,6 +2189,11 @@ class Memory:
         standing operation has built on: when a second consolidation superseded the record this
         one put in force, reversing this one first would leave two current versions in the
         lineage, so the newer operation must be rolled back first.
+
+        Also reports `False`, without reversing anything, for the one operation that is not
+        reversible: the erasure of a person. A `FORGET` row carrying an identity is physical
+        forgetting, and its log row is the audit trail that it happened rather than a copy of
+        what it destroyed.
         """
         with (
             self._trace("mindbridge.rollback", kind="operation"),
@@ -2144,6 +2212,8 @@ class Memory:
                 return False
             row = logged[0]
             operation = load_operation(row.operation_json)
+            if operation.identity is not None:
+                return self._rollback_identity(row, operation, operation.identity)
             # A naming assertion is retracted, not deleted: the version it superseded has to
             # come back, and the record itself stays in the log so the audit trail shows both
             # names. That reversal rides the general `superseded` mechanism below.
@@ -2188,6 +2258,39 @@ class Memory:
                 assert operation.claim is not None
                 self._reproject_identity(operation.claim.identity_id)
             return reverted
+
+    def _rollback_identity(
+        self,
+        row: StoredOperation,
+        operation: MemoryOperation,
+        change: IdentityChange,
+    ) -> bool:
+        """Reverse one identity-lifecycle operation: split a merge, or re-merge a split.
+
+        The store refuses a reversal the identity graph no longer admits, which is what orders
+        identity operations on one person newest first: a later split already removed the alias
+        a merge would restore, and an erasure removed the person entirely.
+        """
+        if operation.intent is MemoryIntent.FORGET:
+            # Physical forgetting. Nothing here can be restored, and reporting success would
+            # claim a recovery that did not happen.
+            return False
+        absorbed = change.moved_ids[0]
+        merging = operation.intent is MemoryIntent.CORRECT
+        with _translate_storage_errors("roll back an identity operation"):
+            reverted, _orphaned = self._store.rollback_operation(
+                row.operation_id,
+                rolled_back_at=datetime.now(timezone.utc),
+                split_identity=None if merging else absorbed,
+                merge_identities=(change.identity_id, absorbed) if merging else None,
+            )
+        if reverted:
+            # Repaint from the assertions that stand now, exactly as reversing a naming does.
+            # A restored identity holds no assertion, so it projects as a nameless speaker.
+            self._reproject_identity(change.identity_id)
+            if not merging:
+                self._reproject_identity(absorbed)
+        return reverted
 
     def _reproject_identity(self, identity_id: str) -> None:
         """Repaint one identity's name and its indexed text from the assertion now current."""
@@ -2325,6 +2428,12 @@ class Memory:
         window: frozenset[str] | None,
         assets: _OperationAssets,
     ) -> MemoryOperationRecord:
+        if operation.intent is MemoryIntent.MERGE:
+            # A cross-modal merge is committed by the kernel from corroboration evidence it
+            # counted itself, never from a proposal: an agent-facing model must not be able to
+            # fuse two people by asking. Refused here rather than in the value type, so a
+            # backend that proposes one is reported instead of raising through the pass.
+            raise _RejectedOperation("unauthorized")
         key = operation_key(operation, recipe=recipe)
         with _translate_storage_errors("check a memory operation"):
             # Raise the rejection outside this block: `_RejectedOperation` is not a
@@ -4529,6 +4638,31 @@ class Memory:
             operation=operation,
         )
 
+    def _identity_link_operation(self, plan: IdentityLink) -> StoredOperation:
+        """Build the MERGE log row one corroborated cross-modal bind commits with."""
+        proposed = MemoryOperation(
+            intent=MemoryIntent.MERGE,
+            identity=IdentityChange(
+                identity_id=plan.target_id,
+                moved_ids=(plan.source_id,),
+            ),
+            rationale=(
+                f"one voice and one face co-occurred in at least "
+                f"{self._identity_link_min_assets} assets"
+            ),
+        )
+        return StoredOperation(
+            operation_key=operation_key(proposed, recipe=_IDENTITY_LINK_RECIPE),
+            intent=proposed.intent.value,
+            # Independent evidence accumulated until it corroborated the pair, which is exactly
+            # what this trigger names -- no clock and no host request is involved.
+            trigger=MemoryTrigger.EVIDENCE.value,
+            model_id=self._face_model,
+            recipe=_IDENTITY_LINK_RECIPE,
+            operation_json=dump_operation(proposed),
+            applied_at=datetime.now(timezone.utc),
+        )
+
     def _link_asset_identity(self, asset_id: str, operation: _OperationAssets) -> None:
         speaker_ids = {
             segment.speaker_id
@@ -4568,6 +4702,12 @@ class Memory:
                 expected=plan,
                 memories=memories,
                 embeddings=embeddings,
+                # Model reasoning proposes; the kernel authorizes and commits. The recognizers
+                # produced the templates and the corroboration rule above authorized the bind,
+                # so the bind commits with its own log row in the same transaction: it is
+                # visible through `operations()` and reversible through `rollback()`, which
+                # splits the two identities apart again.
+                operation=self._identity_link_operation(plan),
             )
             is None
         ):

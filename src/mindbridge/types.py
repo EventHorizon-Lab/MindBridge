@@ -521,6 +521,29 @@ class IdentityClaim:
             object.__setattr__(self, label, text)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class IdentityChange:
+    """Which recognized people one identity-lifecycle operation moved.
+
+    `identity_id` is the person who stands after the operation: the survivor of a cross-modal
+    merge, the identity a split was taken back out of, the person an erasure destroyed.
+    `moved_ids` are the other identities the operation names -- the absorbed identity of a
+    `MERGE`, the identity a `CORRECT` split restored, the aliases an erasure destroyed with the
+    person. An identity ID is not a memory ID, which is why it travels here rather than in
+    `target_ids`.
+    """
+
+    identity_id: str
+    moved_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        moved = _memory_ids(self.moved_ids, "moved_ids")
+        if self.identity_id in moved:
+            raise ValidationError("an identity change must not move the identity it keeps")
+        object.__setattr__(self, "moved_ids", moved)
+
+
 class MemoryIntent(str, Enum):
     """One memory-management operation the agentic control plane may propose."""
 
@@ -529,6 +552,15 @@ class MemoryIntent(str, Enum):
     CORRECT = "correct"
     FORGET = "forget"
     IDENTIFY = "identify"
+    # Kernel-initiated only. A cross-modal identity merge is committed from corroborated
+    # co-occurrence evidence the kernel counted, not from a backend's vocabulary: the kernel
+    # rejects a proposed MERGE as `"unauthorized"`.
+    MERGE = "merge"
+
+
+_IDENTITY_INTENTS = frozenset(
+    {MemoryIntent.MERGE, MemoryIntent.CORRECT, MemoryIntent.FORGET},
+)
 
 
 class MemoryTrigger(str, Enum):
@@ -552,6 +584,9 @@ class MemoryOperation:
     target_ids: tuple[str, ...] = ()
     proposal: FormationProposal | None = None
     claim: IdentityClaim | None = None
+    # Set exactly by the three identity-lifecycle intents: a `MERGE`, and a `CORRECT` or
+    # `FORGET` that names a person instead of memories.
+    identity: IdentityChange | None = None
     rationale: str | None = None
 
     def __post_init__(self) -> None:  # noqa: C901 - intent-specific boundary validation
@@ -571,6 +606,25 @@ class MemoryOperation:
             raise ValidationError("memory operation proposal is invalid")
         if self.claim is not None and not isinstance(self.claim, IdentityClaim):
             raise ValidationError("memory operation claim is invalid")
+        if self.identity is not None:
+            if not isinstance(self.identity, IdentityChange):
+                raise ValidationError("memory operation identity is invalid")
+            if self.intent not in _IDENTITY_INTENTS:
+                raise ValidationError(f"{self.intent.value} must not carry an identity")
+        if self.intent is MemoryIntent.MERGE:
+            # One absorbed identity, no memory: which naming assertions and exemplars moved is
+            # an effect the log row records, not something a proposal states.
+            if (
+                self.identity is None
+                or len(self.identity.moved_ids) != 1
+                or self.target_ids
+                or self.evidence_ids
+                or self.proposal is not None
+            ):
+                raise ValidationError(
+                    "merge names one surviving and one absorbed identity, and no memory"
+                )
+            return
         if self.intent is MemoryIntent.IDENTIFY:
             # A host naming somebody cites nothing, so an empty evidence set is well formed here
             # and it is the kernel that requires cited evidence of an agent's proposal.
@@ -593,6 +647,13 @@ class MemoryOperation:
         elif self.intent is MemoryIntent.REINFORCE:
             if len(self.target_ids) != 1 or not self.evidence_ids:
                 raise ValidationError("reinforce requires exactly one target and cited evidence")
+        elif self.identity is not None:
+            # A split or an erasure names the person, not a record. Naming both would leave the
+            # log row claiming two unrelated effects for one operation.
+            if self.target_ids or self.evidence_ids:
+                raise ValidationError(
+                    f"{self.intent.value} names either memories or one identity, not both"
+                )
         elif not self.target_ids or self.evidence_ids:
             raise ValidationError(
                 f"{self.intent.value} requires at least one target and cites no evidence"

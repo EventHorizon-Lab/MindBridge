@@ -2080,7 +2080,10 @@ def test_the_projection_follows_every_visibility_change_of_a_naming_assertion(
     leave a name standing that nothing asserts -- including the paths that know nothing about
     identities, which is every one of them but naming.
     """
-    recorded_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    # Relative to now, not a literal: the identity rows this writes carry the wall clock, and
+    # `updated_at >= created_at` makes a fixed past timestamp a time bomb that fires once the
+    # day it names has started.
+    recorded_at = datetime.now(timezone.utc) + timedelta(hours=1)
     with LocalStore(tmp_path) as store:
         clip = _video_asset(store, "clip")
         voice_id = _voice_identity(store, clip, (1.0, 0.0))
