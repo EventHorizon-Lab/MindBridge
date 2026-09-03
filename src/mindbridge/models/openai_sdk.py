@@ -130,6 +130,10 @@ from one clip; describe it as one scene.
 Reply with JSON {"descriptions": ["...", "..."]} holding exactly one string per numbered visual,
 in the order supplied. Never leave a string empty; if a visual is unreadable, say what little is
 visible."""
+# Pinned so the sampler is not a source of caption drift. Not a reproducibility guarantee: a
+# measured endpoint returned four distinct completions for four identical requests at these
+# values, so a caller that needs identical documents across ingests caches by asset instead.
+_VISION_SEED = 0
 _TRUNCATED_ANSWER_ERROR = (
     "generation stopped at the output token limit; raise generation_max_tokens or lower the "
     "answer limit"
@@ -541,6 +545,16 @@ class OpenAIModels:
         provenance leaked into a searchable document. A video is sent as the same four ordered
         stills the generation path samples, never as the file -- one caption still describes the
         whole clip.
+
+        The request asks for `temperature` 0 and a fixed `seed` unless the composition set its
+        own, which removes the sampler as a cause of drift. It does **not** make captions
+        reproducible: a measured endpoint returned four distinct completions for four identical
+        requests at temperature 0 and seed 0, so a caller that needs two ingests of one corpus
+        to build the same documents must cache descriptions by asset, not rely on these values.
+
+        One malformed reply is retried once. An HTTP 200 carrying invalid JSON is outside what
+        the SDK's `max_retries` covers and is transient in practice; a truncation or any other
+        failure is not retried, because an identical second request cannot clear it.
         """
         mark_model_requests(0, token_usage_expected=0)
         if isinstance(inputs, (str, bytes)):
@@ -556,27 +570,47 @@ class OpenAIModels:
         _require_consistent_assets(assets)
         _require_inline_size(assets)
         request = self._json_request(_VISION_SYSTEM_PROMPT, _vision_content(batch))
+        request.setdefault("temperature", 0.0)
+        request.setdefault("seed", _VISION_SEED)
         create_completion = cast(Any, self._client("generation").chat.completions.create)
-        mark_model_requests(1)
+        usages: list[_ModelUsage | None] = []
+
+        def attempt() -> tuple[str, ...]:
+            mark_model_requests(len(usages) + 1)
+            try:
+                response = create_completion(**request)
+            except ModelError:
+                raise
+            except Exception as error:
+                raise ModelError(
+                    "vision description request failed",
+                    reason=_provider_reason(error),
+                    stage="describe",
+                ) from error
+            usages.append(
+                _model_usage(
+                    response,
+                    input_modalities=modalities,
+                    output_modalities=frozenset({Modality.TEXT}),
+                )
+            )
+            return _vision_captions(
+                _json_completion_text(response, subject="vision description", stage="describe"),
+                len(batch),
+            )
+
+        # Both attempts are metered, even when the second one also fails: the first request was
+        # billed whether or not its reply parsed, so the usage is summed in `finally` rather than
+        # recorded per attempt, which would report only the last one.
         try:
-            response = create_completion(**request)
-        except ModelError:
-            raise
-        except Exception as error:
-            raise ModelError(
-                "vision description request failed",
-                reason=_provider_reason(error),
-                stage="describe",
-            ) from error
-        _record_openai_usage(
-            response,
-            input_modalities=modalities,
-            output_modalities=frozenset({Modality.TEXT}),
-        )
-        return _vision_captions(
-            _json_completion_text(response, subject="vision description", stage="describe"),
-            len(batch),
-        )
+            try:
+                return attempt()
+            except ModelError as error:
+                if error.reason != "response_invalid":
+                    raise
+            return attempt()
+        finally:
+            _record_usage_batch(usages, request_count=max(len(usages), 1))
 
     def _json_request(
         self,

@@ -27,7 +27,15 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   into that document, never substituted for the caller's text, and the asset is still embedded
   natively. Video is described from four locally decoded stills rather than by uploading the file.
   Description stays absent by default: it adds a model call per visual on the write path, reported
-  under its own model module so its tokens are separable from answer tokens.
+  under its own model module so its tokens are separable from answer tokens. A malformed reply is
+  retried once -- an endpoint can answer `200 OK` with invalid JSON, which an SDK retry policy
+  never sees -- and a describer failure leaves the memory stored without a caption instead of
+  failing the write, counted on the vision span as `mindbridge.vision.failed_batches`.
+- A description cache in the benchmark harness, keyed by asset SHA-256 and describer model, so two
+  ingests of one corpus build identical full-text documents and a repeat run spends no description
+  tokens. The measured generation endpoint returns a different caption for the same image on every
+  call even at temperature 0 with a fixed seed, which would otherwise make an arm incomparable
+  with itself. Opened only when the `vision` slot is configured.
 - `explain` on the search tool and the REST query, routing to `search_with_trace` and returning
   the per-candidate trace beside unchanged hits. An empty result over a transport was previously
   indistinguishable between nothing stored, everything below `minimum_relevance`, a `memory_type`

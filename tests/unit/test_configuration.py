@@ -39,7 +39,7 @@ from mindbridge import (
     ObservationContext,
     SearchHit,
 )
-from mindbridge._telemetry import MODEL_MODULE, TOKEN_TOTAL
+from mindbridge._telemetry import MODEL_MODULE, TOKEN_TOTAL, VISION_BATCHES_FAILED
 from mindbridge.configuration import resolve_memory_config
 from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import FormationBackend, GenerationBackend, ModelInput
@@ -867,3 +867,64 @@ def test_the_vision_slot_accepts_only_visual_modalities(tmp_path: Path) -> None:
     assert MindBridgeConfig.model_validate(
         {**base, "vision": {"provider": "openai"}}
     ).vision.modalities == frozenset({Modality.IMAGE})  # type: ignore[union-attr]
+
+
+def test_a_failing_describer_never_fails_the_write_it_was_decorating(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The caller handed us an observation to store; losing the caption must not lose the memory.
+
+    Both `describe` attempts return HTTP 200 with malformed JSON, which is what the round's
+    endpoint did on 3 of 24 single-image calls. Before the fail-open this raised out of `add`,
+    and an ingesting harness reported the whole batch as unwritten memories -- a far larger loss
+    than the empty document a missing caption leaves behind.
+    """
+    sent: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": '{"descriptions": ['},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http_client:
+        _openai_slot_stub(monkeypatch, http_client)
+        with Memory.from_config(
+            {
+                "data_dir": tmp_path,
+                "embedding": {"provider": "openai", "model": "tiny-test", "dimension": 4},
+                "vision": {"provider": "openai", "model": "caption-model"},
+            },
+            tracer=provider.get_tracer("test"),
+        ) as memory:
+            picture = memory.add(Blob(b"bicycle-frame", "image/png"))
+            stored = memory.get(picture.id)
+    provider.shutdown()
+
+    assert stored.content == ""
+    assert stored.assets[0].modality is Modality.IMAGE
+    assert len(sent) == 2
+
+    # Not silent: the harness reads counters off model spans, so this is where a run can see how
+    # much derived text it did not get.
+    vision_spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if (span.attributes or {}).get(MODEL_MODULE) == "vision"
+    ]
+    assert len(vision_spans) == 1
+    attributes = vision_spans[0].attributes
+    assert attributes is not None
+    assert attributes[VISION_BATCHES_FAILED] == 1

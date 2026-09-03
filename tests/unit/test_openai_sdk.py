@@ -617,6 +617,147 @@ def _unreachable(request: httpx.Request) -> httpx.Response:
     raise AssertionError(f"no request should be sent, got {request.url}")
 
 
+def _malformed_reply() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "choices": [
+                {"index": 0, "message": {"content": '{"descriptions": ['}, "finish_reason": "stop"}
+            ],
+            "usage": {"prompt_tokens": 900, "completion_tokens": 5, "total_tokens": 905},
+        },
+    )
+
+
+def test_one_malformed_description_reply_is_retried_once(tmp_path: Path) -> None:
+    # Measured against the round's endpoint: 3 of 24 single-image calls returned HTTP 200 with
+    # truncated JSON, and the same image failed twice then succeeded four times running. The SDK's
+    # `max_retries` never sees this, because the transport call succeeded.
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    replies = [_malformed_reply(), _caption_reply("a red bicycle")]
+    sent: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return replies[len(sent) - 1]
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        captions = model.describe((ModelInput(assets=(picture,)),))
+
+    assert captions == ("a red bicycle",)
+    assert len(sent) == 2
+    # The retry repeats the identical request rather than reshaping it.
+    assert sent[0] == sent[1]
+
+
+def test_a_second_malformed_reply_is_not_retried_again(tmp_path: Path) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    sent: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return _malformed_reply()
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        with (
+            operation_span(tracer, "operation", attributes={}),
+            model_span(tracer, "model", attributes={}),
+            pytest.raises(ModelError) as failure,
+        ):
+            model.describe((ModelInput(assets=(picture,)),))
+    provider.shutdown()
+
+    assert failure.value.reason == "response_invalid"
+    assert len(sent) == 2
+    # Both attempts were billed, so both are metered: recording per attempt would report the
+    # last one only, and recording on success only would drop the wasted request entirely.
+    attributes = {span.name: span.attributes for span in exporter.get_finished_spans()}["model"]
+    assert attributes is not None
+    assert attributes[TOKEN_TOTAL] == 1_810
+    assert attributes[MODEL_REQUEST_COUNT] == 2
+
+
+def test_a_truncated_description_is_not_retried(tmp_path: Path) -> None:
+    # An identical second request cannot clear an output-token limit, so paying for one is waste.
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    sent: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": '{"descriptions": ["a red bic'},
+                        "finish_reason": "length",
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        with pytest.raises(ModelOutputTruncatedError):
+            model.describe((ModelInput(assets=(picture,)),))
+
+    assert len(sent) == 1
+
+
+def test_description_asks_the_endpoint_for_a_deterministic_sample(tmp_path: Path) -> None:
+    # Pinned so the sampler is not a cause of drift. This is not a reproducibility guarantee --
+    # the measured endpoint returns a different completion for identical requests anyway -- which
+    # is why the benchmark harness caches descriptions by asset digest instead.
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    sent: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return _caption_reply("a red bicycle")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        first = model.describe((ModelInput(assets=(picture,)),))
+        second = model.describe((ModelInput(assets=(picture,)),))
+
+    assert first == second
+    assert sent[0]["temperature"] == 0.0
+    assert sent[0]["seed"] == 0
+    # Byte-identical requests: a caption that reaches a text index must not depend on anything
+    # that varies between two calls with the same input.
+    assert sent[0] == sent[1]
+
+
+def test_a_configured_sampler_still_wins_over_the_pinned_default(tmp_path: Path) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    sent: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return _caption_reply("a red bicycle")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(
+            _sdk_client(client),
+            generation_model="caption-model",
+            generation_capabilities=frozenset({Modality.IMAGE}),
+            generation_temperature=0.7,
+            generation_seed=99,
+            embedding_dimension=2,
+        )
+        model.describe((ModelInput(assets=(picture,)),))
+
+    assert sent[0]["temperature"] == 0.7
+    assert sent[0]["seed"] == 99
+
+
 def test_formation_space_identifies_every_generation_control() -> None:
     baseline = OpenAIModels().formation_space
     variants = {

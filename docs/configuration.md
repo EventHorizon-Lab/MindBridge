@@ -190,7 +190,17 @@ Three things bound what it costs and what it can do:
   A clip with no readable video stream fails the write rather than falling back to sending it.
 - The caption is derived text, so the request carries pixels and an ordinal only -- no memory ID,
   file name, or store path -- and a reply that does not return exactly one non-empty caption per
-  visual is rejected whole rather than mislabelling a memory with another's contents.
+  visual is rejected whole rather than mislabelling a memory with another's contents. One
+  malformed reply is retried once, because an endpoint can answer `200 OK` with invalid JSON and
+  an SDK retry policy never sees that; a second failure, or any other failure, leaves the memory
+  stored **without** a caption rather than failing the write. Losing derived text must never lose
+  an observation the caller handed over. Those batches are counted on the vision span as
+  `mindbridge.vision.failed_batches`, so the loss is measurable rather than silent.
+- Captions are not reproducible. The request pins `temperature` 0 and a fixed `seed` unless the
+  slot sets its own, but a measured endpoint returned four different completions for four
+  identical requests at those values. A caption becomes indexed text, so anything that needs two
+  ingests of one corpus to build the same documents has to cache descriptions by asset digest;
+  the benchmark harness does exactly that.
 
 Description tokens are reported under their own model module, so a deployment that meters usage
 can separate what captioning costs from what answering costs.
