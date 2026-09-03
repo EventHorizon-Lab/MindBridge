@@ -370,7 +370,9 @@ CREATE TABLE IF NOT EXISTS capture_queue (
 CREATE TABLE IF NOT EXISTS memory_operations (
     operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
     operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
-    intent TEXT NOT NULL CHECK (intent IN ('reinforce', 'consolidate', 'correct', 'forget')),
+    intent TEXT NOT NULL CHECK (
+        intent IN ('reinforce', 'consolidate', 'correct', 'forget', 'identify')
+    ),
     trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
     model_id TEXT,
     recipe TEXT,
@@ -397,6 +399,45 @@ _SEMANTIC_IDENTITY_INDEX_DDL = """
 CREATE INDEX memory_semantics_identity_idx
     ON memory_semantics (identity_id, memory_id)
 """
+
+# Naming a person is its own logged intent, so the log's intent whitelist has to admit it. A
+# CHECK cannot be altered in place, so widening it is the usual copy-and-swap; the rows carry
+# over unchanged because no existing intent name changed.
+_OPERATION_INTENT_REBUILD_DDL = (
+    "ALTER TABLE memory_operations RENAME TO memory_operations_v11",
+    """
+    CREATE TABLE memory_operations (
+        operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
+        intent TEXT NOT NULL CHECK (
+            intent IN ('reinforce', 'consolidate', 'correct', 'forget', 'identify')
+        ),
+        trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
+        model_id TEXT,
+        recipe TEXT,
+        operation_json TEXT NOT NULL,
+        effects_json TEXT NOT NULL,
+        applied_at TEXT NOT NULL,
+        rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at)
+    )
+    """,
+    """
+    INSERT INTO memory_operations (
+        operation_id, operation_key, intent, trigger, model_id, recipe,
+        operation_json, effects_json, applied_at, rolled_back_at
+    )
+    SELECT
+        operation_id, operation_key, intent, trigger, model_id, recipe,
+        operation_json, effects_json, applied_at, rolled_back_at
+    FROM memory_operations_v11
+    """,
+    "DROP TABLE memory_operations_v11",
+    """
+    CREATE UNIQUE INDEX memory_operations_active_key_idx
+        ON memory_operations (operation_key)
+        WHERE rolled_back_at IS NULL
+    """,
+)
 
 _PLACE_COLUMN_DDL = """
 ALTER TABLE memory_records
@@ -3937,6 +3978,45 @@ class LocalStore:
         if self._closed:
             raise LocalStoreClosedError("local store is closed")
 
+    def identity_evidence_memory_ids(
+        self,
+        identity_id: str,
+        memory_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Return which of `memory_ids` carry a face or voice occurrence of one identity.
+
+        The control plane asks this before it lets a proposal name a person: a name may only be
+        pinned on somebody the cited evidence actually contains. Unknown identities and unknown
+        memory IDs simply do not match, so the caller reads an empty result as "not involved".
+        """
+        _require_identifier(identity_id, "identity_id")
+        candidates = tuple(dict.fromkeys(memory_ids))
+        if not candidates:
+            return ()
+        placeholders = ", ".join("?" for _memory_id in candidates)
+        with self._connection() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            if resolved_id is None:
+                return ()
+            rows = connection.execute(
+                f"""
+                SELECT DISTINCT ma.memory_id
+                FROM memory_assets AS ma
+                WHERE ma.memory_id IN ({placeholders}) AND (
+                    EXISTS (
+                        SELECT 1 FROM speech_segments AS s
+                        WHERE s.asset_id = ma.asset_id AND s.speaker_id = ?
+                    ) OR EXISTS (
+                        SELECT 1 FROM face_observations AS f
+                        WHERE f.asset_id = ma.asset_id AND f.identity_id = ?
+                    )
+                )
+                ORDER BY ma.memory_id
+                """,
+                (*candidates, resolved_id, resolved_id),
+            ).fetchall()
+        return tuple(_row_text(row, "memory_id") for row in rows)
+
 
 def _table_names(connection: sqlite3.Connection) -> frozenset[str]:
     rows = connection.execute(
@@ -4200,7 +4280,7 @@ def _migrate_v10(connection: sqlite3.Connection) -> None:
 
 
 def _migrate_v11(connection: sqlite3.Connection) -> None:
-    """Bind typed claims to the recognized person they are about.
+    """Bind typed claims to the recognized person they are about, and admit `identify`.
 
     `ON DELETE SET NULL` is the erasure promise in the schema: forgetting a person drops the
     attribution and keeps the claim, the same way forgetting a person keeps the evening.
@@ -4219,6 +4299,8 @@ def _migrate_v11(connection: sqlite3.Connection) -> None:
             connection.execute(_SEMANTIC_IDENTITY_COLUMN_DDL)
         if "memory_semantics_identity_idx" not in indexes:
             connection.execute(_SEMANTIC_IDENTITY_INDEX_DDL)
+        for statement in _OPERATION_INTENT_REBUILD_DDL:
+            connection.execute(statement)
         connection.execute("PRAGMA user_version = 12")
         connection.commit()
     except BaseException:
@@ -4387,6 +4469,7 @@ def _write_memory_context(
         lineage_id=lineage_id,
         kind=context.kind.value,
         basis=context.basis.value,
+        identity_id=context.identity_id,
         evidence_count=evidence_count,
         valid_from=valid_from,
         valid_until=valid_until,
@@ -4857,12 +4940,20 @@ def _semantic_visibility(
     lineage_id: str,
     kind: str,
     basis: str,
+    identity_id: str | None,
     evidence_count: int,
     valid_from: datetime | None,
     valid_until: datetime | None,
     explicit_intervals: Sequence[tuple[datetime | None, datetime | None]] | None = None,
 ) -> bool:
-    if kind != MemoryKind.TRAIT.value or basis == EvidenceBasis.USER_STATEMENT.value:
+    if basis == EvidenceBasis.USER_STATEMENT.value:
+        return True
+    # A naming assertion bound to an identity is corroborated like an inferred trait: what an
+    # agent claims somebody is called stays hidden, and so stays out of the projected
+    # `identities.name`, until two independent evidence groups support it.
+    if kind != MemoryKind.TRAIT.value and not (
+        kind == MemoryKind.ENTITY.value and identity_id is not None
+    ):
         return True
     if evidence_count < 2:
         return False
@@ -4903,7 +4994,7 @@ def _refresh_evidence_projection(
     evidence_count, confidence = _evidence_summary(connection, memory_id)
     rows = connection.execute(
         """
-        SELECT v.*, s.lineage_id, s.kind, s.basis
+        SELECT v.*, s.lineage_id, s.kind, s.basis, s.identity_id
         FROM memory_versions AS v
         JOIN memory_semantics AS s ON s.memory_id = v.memory_id
         WHERE v.memory_id = ? AND v.retired_at IS NULL
@@ -4927,6 +5018,7 @@ def _refresh_evidence_projection(
             lineage_id=_row_text(row, "lineage_id"),
             kind=_row_text(row, "kind"),
             basis=_row_text(row, "basis"),
+            identity_id=_optional_row_text(row, "identity_id"),
             evidence_count=evidence_count,
             valid_from=_optional_datetime_from_row(row, "valid_from"),
             valid_until=_optional_datetime_from_row(row, "valid_until"),
@@ -4964,7 +5056,7 @@ def _rebuild_reconciled_lineage(  # noqa: C901 - replay order is the state contr
 ) -> None:
     assertions = connection.execute(
         """
-        SELECT v.*, s.kind, s.basis
+        SELECT v.*, s.kind, s.basis, s.identity_id
         FROM memory_semantics AS s
         JOIN memory_versions AS v ON v.memory_id = s.memory_id AND v.version = 1
         WHERE s.lineage_id = ? AND s.kind = ?
@@ -5060,6 +5152,7 @@ def _rebuild_reconciled_lineage(  # noqa: C901 - replay order is the state contr
             lineage_id=lineage_id,
             kind=kind,
             basis=_row_text(row, "basis"),
+            identity_id=_optional_row_text(row, "identity_id"),
             evidence_count=evidence_count,
             valid_from=valid_from,
             valid_until=valid_until,

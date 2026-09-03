@@ -271,6 +271,17 @@ the backend may cite only IDs it was shown.
 | `CONSOLIDATE` | Derive one new record citing several sources. The sources stay as evidence. |
 | `CORRECT` | Retire the current version of a bad derived inference. History is preserved, not overwritten. |
 | `FORGET` | Set `forgotten_at`. Recall skips the record; audit keeps it. |
+| `IDENTIFY` | Name a recognized person. The kernel turns the `IdentityClaim` into an `ENTITY` assertion bound to that identity, and `identities.name` is a projection of the assertion currently visible. |
+
+`IDENTIFY` is checked hardest, because a name is the one claim that changes what an agent will
+say out loud about somebody: the identity must exist and at least one cited memory must actually
+contain that person through a speech or face observation, so a name cannot be pinned on someone
+from evidence that never contained them. A proposed name also carries basis `MODEL_INFERENCE`,
+so it stays hidden until two independent evidence groups support it, and `identities.name` keeps
+projecting whatever is visible instead. `register_identity` names somebody on the host's
+authority and is visible at once. `REINFORCE`, `CORRECT`, and `FORGET` refuse a naming assertion
+outright; the way to retract a name is `rollback()` of the `IDENTIFY` that asserted it, which
+recomputes both the projected name and the indexed speech text.
 
 The backend proposes and never writes. Each proposal is validated against the shown evidence set
 and its intent's rules, then committed in its own transaction together with an append-only log

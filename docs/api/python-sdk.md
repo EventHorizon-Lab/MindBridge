@@ -377,6 +377,16 @@ recipe)`; a key already applied and not rolled back is rejected as `"duplicate"`
 | `CONSOLIDATE` | Valid proposal; at least one shown evidence ID; affect cue modality and spatial frame present in some source | New derived record citing every source | Deletes the created records |
 | `CORRECT` | Targets exist and are derived (`kind != OBSERVATION`) | Retires current versions at transaction time | Carries a new version with the same interval |
 | `FORGET` | Targets exist and are not already forgotten | Sets `forgotten_at` | Clears `forgotten_at` |
+| `IDENTIFY` | Identity exists; every evidence ID shown and existing; at least one cited memory contains that identity through a speech or face observation | Commits the `ENTITY` naming assertion the kernel builds from `claim`, recomputes `identities.name` and the indexed speech text | Retracts the assertion and repaints both |
+
+`REINFORCE`, `CORRECT`, and `FORGET` refuse a bound naming assertion with `"naming_assertion"`.
+A name is not an inference to be corrected: reverse it with `rollback` of the `IDENTIFY` that
+asserted it, which is what recomputes the projection. `IDENTIFY` adds `"unknown_identity"` and
+`"identity_not_in_evidence"` to the rejection vocabulary. An `IDENTIFY` proposed by a backend
+carries basis `MODEL_INFERENCE`, so it stays hidden, and out of `identities.name`, until two
+independent evidence groups support it, exactly like an inferred `TRAIT`. `register_identity` and
+`register_speaker` are the host entry points for the same intent: they assert the name on the
+host's authority with basis `USER_STATEMENT`, cite no evidence, and are visible immediately.
 
 `forget` is the host entry point for the FORGET intent and needs no backend. It is cognitive
 forgetting only: recall skips the record while `get()`, `list()`, and `MemoryRecord.forgotten_at`
@@ -385,7 +395,7 @@ changed, so an unknown or already-forgotten ID is a no-op rather than an error.
 
 `rollback` reverses one applied operation and returns `False` for an unknown or already-reversed
 `operation_id`. `operations` lists the log newest first. Physical deletion is not an intent, and
-none of these four operations is exposed on REST or MCP.
+none of these five operations is exposed on REST or MCP.
 
 ### Cross-modal identity binding
 
@@ -533,7 +543,7 @@ These are the 99 supported names exported by `mindbridge`:
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
@@ -564,7 +574,8 @@ The principal immutable values are:
 | `ContextBudget` | `max_chars`, `max_items`, `memory_types`, `min_confidence`, `freshness` |
 | `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`; `hits` property and `render()` |
-| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `rationale` |
+| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `rationale` |
+| `IdentityClaim` | `identity_id`, `name`, `relationship` |
 | `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `rolled_back_at` |
 | `ConsolidationReport` | `operations`, `rejected` as `(MemoryOperation, reason)` pairs |
 | `StreamEvent` | `phase`, `item`, `stream_id` |
@@ -597,7 +608,7 @@ Enum values are:
 | `RetrievalRejection` | `stale_index`, `occurrence_range`, `missing_memory`, `memory_type`, `minimum_relevance`, `ambiguity`, `limit` |
 | `EmbedTask` | `retrieval.query`, `retrieval.document` |
 | `MemoryKind` | `observation`, `entity`, `event`, `state`, `relation`, `affect`, `trait`, `response_policy` |
-| `MemoryIntent` | `reinforce`, `consolidate`, `correct`, `forget` |
+| `MemoryIntent` | `reinforce`, `consolidate`, `correct`, `forget`, `identify` |
 | `MemoryTrigger` | `manual`, `evidence`, `feedback`, `contradiction`, `query_failure`, `pressure`, `idle` |
 | `EvidenceBasis` | `observation`, `user_statement`, `model_inference`, `response_feedback` |
 | `SpatialAnchor` | `observer`, `subject` |
@@ -665,7 +676,9 @@ streaming extension implements `close()`.
 input, in the same order. A former never writes storage: the kernel validates each proposal
 against the source modality and spatial frame, assigns identity, links evidence, and commits.
 `consolidate` receives the bounded evidence set the kernel chose and may cite only IDs from it;
-like a former it proposes and never writes storage.
+like a former it proposes and never writes storage. An `IDENTIFY` proposal carries an
+`IdentityClaim` rather than a `FormationProposal`: the backend names the identity and cites the
+evidence, and the kernel builds the typed assertion.
 
 `ModelInput` contains normalized `text` and resolved `assets`. Speech adapters return
 `SpeechAnalysis(turns, speakers)` using `SpeechTurn` and `SpeakerEmbedding`; face adapters return

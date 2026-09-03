@@ -487,6 +487,29 @@ class MemoryContext:
         object.__setattr__(self, "arousal", _bounded_optional(self.arousal, "arousal", 0, 1))
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class IdentityClaim:
+    """Who one recognized person is, as an `IDENTIFY` operation claims it.
+
+    The kernel, not the backend, turns this into the typed ENTITY assertion `identities.name`
+    projects, so a proposal only has to name the identity and cite its evidence.
+    """
+
+    identity_id: str
+    name: str
+    relationship: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        for label, value in (("name", self.name), ("relationship", self.relationship)):
+            if value is None and label == "relationship":
+                continue
+            text = _text(value, f"identity {label}")
+            if len(text) > 255 or not text.isprintable():
+                raise ValidationError(f"identity {label} must be at most 255 printable characters")
+            object.__setattr__(self, label, text)
+
+
 class MemoryIntent(str, Enum):
     """One memory-management operation the agentic control plane may propose."""
 
@@ -494,6 +517,7 @@ class MemoryIntent(str, Enum):
     CONSOLIDATE = "consolidate"
     CORRECT = "correct"
     FORGET = "forget"
+    IDENTIFY = "identify"
 
 
 class MemoryTrigger(str, Enum):
@@ -516,9 +540,10 @@ class MemoryOperation:
     evidence_ids: tuple[str, ...] = ()
     target_ids: tuple[str, ...] = ()
     proposal: FormationProposal | None = None
+    claim: IdentityClaim | None = None
     rationale: str | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901 - intent-specific boundary validation
         if not isinstance(self.intent, MemoryIntent):
             try:
                 object.__setattr__(self, "intent", MemoryIntent(self.intent))
@@ -533,6 +558,18 @@ class MemoryOperation:
         )
         if self.proposal is not None and not isinstance(self.proposal, FormationProposal):
             raise ValidationError("memory operation proposal is invalid")
+        if self.claim is not None and not isinstance(self.claim, IdentityClaim):
+            raise ValidationError("memory operation claim is invalid")
+        if self.intent is MemoryIntent.IDENTIFY:
+            # A host naming somebody cites nothing, so an empty evidence set is well formed here
+            # and it is the kernel that requires cited evidence of an agent's proposal.
+            if self.claim is None or self.target_ids or self.proposal is not None:
+                raise ValidationError(
+                    "identify requires a claim and cites evidence, and names no target"
+                )
+            return
+        if self.claim is not None:
+            raise ValidationError(f"{self.intent.value} must not carry a claim")
         if self.intent is MemoryIntent.CONSOLIDATE:
             if self.proposal is None or not self.evidence_ids or self.target_ids:
                 raise ValidationError(

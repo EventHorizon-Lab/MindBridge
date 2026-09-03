@@ -130,6 +130,7 @@ from mindbridge.types import (
     EvidenceBasis,
     FaceObservation,
     FormationProposal,
+    IdentityClaim,
     IdentityErasure,
     IdentityProfile,
     IndexQuantization,
@@ -1606,26 +1607,15 @@ class Memory:
         it carries no evidence: nothing was observed, somebody said so.
 
         It is logged like any other control-plane operation, so naming is auditable through
-        `operations()` and reversible through `rollback()`. There is no naming intent yet, so
-        it is logged with consolidation semantics -- a proposal committed as a derived record --
-        and the cited "evidence" is the identity the claim is about rather than a memory.
+        `operations()` and reversible through `rollback()`. The logged intent is `IDENTIFY` and
+        the claim travels on the operation itself, so `operations()` never has to pass an
+        identity ID off as a memory ID in `evidence_ids`. A host cites nothing: nothing was
+        observed, somebody said so, so the evidence set is empty.
 
         Re-asserting the same name and relationship is idempotent, because the derived memory ID
         is a function of the claim; a different name supersedes through the shared lineage.
         """
-        proposal = FormationProposal(
-            kind=MemoryKind.ENTITY,
-            content=(
-                f"{name} is a recognized person."
-                if relationship is None
-                else f"{name} is a recognized person, {relationship}."
-            ),
-            basis=EvidenceBasis.USER_STATEMENT,
-            subject=name,
-            predicate=_NAMING_PREDICATE,
-            value=relationship,
-            confidence=1.0,
-        )
+        proposal = _naming_proposal(name, relationship, basis=EvidenceBasis.USER_STATEMENT)
         now = datetime.now(timezone.utc)
         context = _formation_context(
             None,
@@ -1652,9 +1642,8 @@ class Memory:
             context=context,
         )
         proposed = MemoryOperation(
-            intent=MemoryIntent.CONSOLIDATE,
-            evidence_ids=(identity_id,),
-            proposal=proposal,
+            intent=MemoryIntent.IDENTIFY,
+            claim=IdentityClaim(identity_id=identity_id, name=name, relationship=relationship),
             rationale="the host registered this name",
         )
         key = operation_key(proposed, recipe=_NAMING_RECIPE)
@@ -1864,8 +1853,8 @@ class Memory:
             operation = load_operation(row.operation_json)
             # A naming assertion is retracted, not deleted: the version it superseded has to come
             # back, and the record itself stays in the log so the audit trail shows both names.
-            naming = row.recipe == _NAMING_RECIPE
-            if operation.intent is MemoryIntent.CONSOLIDATE and not naming:
+            naming = operation.intent is MemoryIntent.IDENTIFY
+            if operation.intent is MemoryIntent.CONSOLIDATE:
                 # Deleting first keeps a lost race idempotent: a second rollback finds nothing to
                 # delete and the log claim below is what decides the return value.
                 for created in row.created_ids:
@@ -1889,7 +1878,8 @@ class Memory:
                 )
             self._drain_outbox()
             if reverted and naming:
-                self._reproject_identity(operation.evidence_ids[0])
+                assert operation.claim is not None
+                self._reproject_identity(operation.claim.identity_id)
             return reverted
 
     def _reproject_identity(self, identity_id: str) -> None:
@@ -2036,6 +2026,10 @@ class Memory:
             return _operation_record(
                 self._apply_consolidation(operation, pending, shown=shown, assets=assets)
             )
+        if operation.intent is MemoryIntent.IDENTIFY:
+            return _operation_record(
+                self._apply_identification(operation, pending, shown=shown, assets=assets)
+            )
         return _operation_record(self._apply_operation_effects(operation, pending, shown=shown))
 
     def _apply_operation_effects(
@@ -2049,6 +2043,12 @@ class Memory:
         targets = self._control_records(operation.target_ids)
         if not targets:
             raise _RejectedOperation("unknown_target")
+        # A name is not an inference to be corrected, reinforced, or quietly forgotten: the
+        # registry and the indexed speech text both project it, and only `rollback()` of the
+        # operation that asserted it recomputes those. Retiring the assertion behind their back
+        # leaves `identity()` and the stored transcripts answering to a name nothing asserts.
+        if any(_is_bound_naming_assertion(targets, target) for target in operation.target_ids):
+            raise _RejectedOperation("naming_assertion")
         reinforce: tuple[tuple[str, str], ...] = ()
         correct_ids: tuple[str, ...] = ()
         forget_ids: tuple[str, ...] = ()
@@ -2165,6 +2165,90 @@ class Memory:
         )
         if logged is None:
             raise _RejectedOperation("duplicate")
+        return logged
+
+    def _apply_identification(
+        self,
+        operation: MemoryOperation,
+        pending: StoredOperation,
+        *,
+        shown: Mapping[str, MemoryRecord] | None,
+        assets: _OperationAssets,
+    ) -> StoredOperation:
+        """Validate one agent-proposed naming and commit it as a bound ENTITY assertion.
+
+        The kernel builds the proposal from the claim, so a backend only names the identity and
+        cites its evidence. `MODEL_INFERENCE` basis keeps the assertion, and with it the
+        projected name, hidden until two independent evidence groups support it, exactly as an
+        inferred trait is. Committing it recomputes the projection, so the registry and the
+        indexed speech text never disagree with what is currently asserted.
+        """
+        claim = operation.claim
+        assert claim is not None
+        if shown is None or not set(operation.evidence_ids) <= set(shown):
+            raise _RejectedOperation("evidence_not_shown")
+        with _translate_storage_errors("read identity memories"):
+            identity_id = self._store.resolve_identity_id(claim.identity_id)
+            if identity_id is not None and self._store.identity_memory_ids(identity_id) is None:
+                identity_id = None
+        if identity_id is None:
+            raise _RejectedOperation("unknown_identity")
+        if set(self._control_records(operation.evidence_ids)) != set(operation.evidence_ids):
+            raise _RejectedOperation("unknown_evidence")
+        with _translate_storage_errors("read identity evidence"):
+            involved = self._store.identity_evidence_memory_ids(
+                identity_id,
+                operation.evidence_ids,
+            )
+        # A name may only be pinned on somebody the cited evidence actually contains, so an
+        # agent cannot rename a person from a clip that person was never in. An empty citation
+        # fails here too: nothing it cites involves them.
+        if not involved:
+            raise _RejectedOperation("identity_not_in_evidence")
+        proposal = _naming_proposal(
+            claim.name,
+            claim.relationship,
+            basis=EvidenceBasis.MODEL_INFERENCE,
+        )
+        sources = tuple(shown[memory_id] for memory_id in operation.evidence_ids)
+        now = datetime.now(timezone.utc)
+        context = replace(
+            _formation_context(
+                None,
+                proposal,
+                model_id=self._consolidation_model,
+                recipe=self._consolidation_recipe,
+                recorded_at=now,
+                identity_id=identity_id,
+            ),
+            evidence_ids=tuple(sorted(source.id for source in sources)),
+        )
+        prepared = replace(
+            _prepare_memory(
+                self._prepare_content(proposal.content, assets),
+                occurred_at=None,
+                occurred_end=None,
+                metadata=None,
+                memory_type=_formation_memory_type(proposal.kind),
+            ),
+            memory_id=_formation_memory_id(
+                identity_id,
+                proposal,
+                recipe=self._consolidation_recipe,
+                context=context,
+            ),
+            context=context,
+        )
+        logged = self._commit_formation(
+            tuple((prepared, source.id, proposal.confidence) for source in sources),
+            (),
+            completed_at=now,
+            recipe=self._consolidation_recipe,
+            operation=pending,
+        )
+        if logged is None:
+            raise _RejectedOperation("duplicate")
+        self._reproject_identity(identity_id)
         return logged
 
     def _control_records(self, memory_ids: Sequence[str]) -> dict[str, StoredMemory]:
@@ -6303,6 +6387,41 @@ class _RejectedOperation(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+def _naming_proposal(
+    name: str,
+    relationship: str | None,
+    *,
+    basis: EvidenceBasis,
+) -> FormationProposal:
+    """Build the ENTITY proposal one naming claim asserts, whoever claimed it."""
+    return FormationProposal(
+        kind=MemoryKind.ENTITY,
+        content=(
+            f"{name} is a recognized person."
+            if relationship is None
+            else f"{name} is a recognized person, {relationship}."
+        ),
+        basis=basis,
+        subject=name,
+        predicate=_NAMING_PREDICATE,
+        value=relationship,
+        confidence=1.0,
+    )
+
+
+def _is_bound_naming_assertion(
+    memories: Mapping[str, StoredMemory],
+    memory_id: str,
+) -> bool:
+    memory = memories.get(memory_id)
+    context = None if memory is None else memory.context
+    return (
+        context is not None
+        and context.kind is MemoryKind.ENTITY
+        and context.identity_id is not None
+    )
 
 
 def _is_derived(memories: Mapping[str, StoredMemory], memory_id: str) -> bool:
