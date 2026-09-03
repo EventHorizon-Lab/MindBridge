@@ -217,23 +217,37 @@ capture(
     context: ObservationContext | None = None,
 ) -> MemoryRecord
 
-settle(*, limit: int = 100) -> int
-pending_captures() -> int
+settle(*, limit: int = 100, max_attempts: int = 3) -> int
+pending_captures(
+    *,
+    limit: int = 100,
+    memory_ids: Sequence[str] | None = None,
+) -> tuple[PendingCapture, ...]
 ```
 
 `capture` returns after the SQLite commit and before any model call. It returns the same
 content-addressed record `add` returns for the same input, so capturing and then adding the same
 content is one memory. A captured record is durable and readable through `get` and `list`
-immediately, and invisible to `search`, `ask`, and `compile` until it is settled.
+immediately, and invisible to `search`, `ask`, and `compile` until it is settled. It applies the
+same embedder-capability check `add` applies, so content `add` would reject raises here instead of
+becoming a durable record no `settle` could ever finish.
 
 `settle` runs the deferred stages — speech identity, transcription, embedding, the SQLite embedding
 commit, the index flush, and formation — over up to `limit` captured records in enqueue order, and
-returns how many it settled. A model or storage failure on one record raises with `subject` set to
-that memory ID and leaves it queued with its attempt count and reason; records settled earlier in
-the same call stay settled. `add` and `add_many` settle a queued record they encounter, so their
-searchable-on-return contract holds. `search`, `ask`, `compile`, `close`, and opening a store never
-settle: time to searchable is the host's choice, so call `settle` from an idle loop, a timer, or
-after a capture burst. `pending_captures` returns how many records are still waiting.
+returns how many it settled. Every record it read is attempted: a model or storage failure on one
+leaves it queued with its attempt count and reason while the rest still settle, and the first
+failure is raised once the batch is done with `subject` set to that memory ID. A record whose
+attempt count has reached `max_attempts` is skipped rather than retried, so one record that can
+never settle does not block the queue; it stays queued and visible, and raising `max_attempts`
+retries it. `add` and `add_many` settle a queued record they encounter whatever its attempt count,
+so their searchable-on-return contract holds. `search`, `ask`, `compile`, `close`, and opening a
+store never settle: time to searchable is the host's choice, so call `settle` from an idle loop, a
+timer, or after a capture burst.
+
+`pending_captures` returns up to `limit` queued records oldest first as `PendingCapture` values
+(`memory_id`, `enqueued_at`, `attempts`, `last_error`). Pass `memory_ids` to ask whether specific
+records are searchable yet: one that is absent from the result is not pending, which means it is
+settled or was never stored, and `get` tells the two apart.
 
 ```text
 search(
@@ -521,13 +535,13 @@ semantics and complete examples.
 
 ### Root import inventory
 
-These are the 99 supported names exported by `mindbridge`:
+These are the 100 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
@@ -570,6 +584,7 @@ The principal immutable values are:
 | `VisionFrame` | `image`, `stream_id`, `occurred_at` |
 | `VisionPartial` | `text`, `stream_id`, `occurred_at` |
 | `SceneBoundary` | `boundary`, `stream_id`, `occurred_at` |
+| `PendingCapture` | `memory_id`, `enqueued_at`, `attempts`, `last_error` |
 | `PrefetchResult` | positive `revision`, `hits` |
 | `TracedSearchResult` | `hits`, `trace` |
 | `RetrievalTrace` | `candidates`, `candidate_limit`, `exhaustive`, `ambiguous` |

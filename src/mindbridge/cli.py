@@ -723,11 +723,24 @@ def _unlink_identity(memory: Memory, arguments: argparse.Namespace) -> _Document
 
 
 def _settle(memory: Memory, arguments: argparse.Namespace) -> _Document:
-    return {"settled": memory.settle(limit=arguments.limit)}
+    return {"settled": memory.settle(limit=arguments.limit, max_attempts=arguments.max_attempts)}
 
 
-def _pending_captures(memory: Memory, _arguments: argparse.Namespace) -> _Document:
-    return {"pending": memory.pending_captures()}
+def _pending_captures(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {
+        "pending": [
+            {
+                "memory_id": pending.memory_id,
+                "enqueued_at": pending.enqueued_at.isoformat(),
+                "attempts": pending.attempts,
+                "last_error": pending.last_error,
+            }
+            for pending in memory.pending_captures(
+                limit=arguments.limit,
+                memory_ids=tuple(arguments.memory_ids) or None,
+            )
+        ]
+    }
 
 
 def _reinforce(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -1763,8 +1776,29 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         default=_default("settle", "limit"),
         help="maximum captured memories to settle (default: %(default)s)",
     )
+    settle.add_argument(
+        "--max-attempts",
+        type=int,
+        default=_default("settle", "max_attempts"),
+        help="skip captures that already failed this often (default: %(default)s)",
+    )
+    pending = commands.add_parser(
+        "pending-captures",
+        help="list captured memories waiting to be settled",
+    )
+    pending.add_argument(
+        "--limit",
+        type=int,
+        default=_default("pending_captures", "limit"),
+        help="maximum queued captures to report (default: %(default)s)",
+    )
+    pending.add_argument(
+        "memory_ids",
+        nargs="*",
+        metavar="MEMORY_ID",
+        help="report only these memories; absent from the result means not pending",
+    )
     for name, help_text in (
-        ("pending-captures", "count captured memories waiting to be settled"),
         ("reindex", "rebuild the search index from SQLite"),
         ("optimize", "merge staged index vectors"),
         (DOCTOR, "resolve the composition and exercise each loader"),

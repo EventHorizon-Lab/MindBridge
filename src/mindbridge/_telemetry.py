@@ -24,6 +24,12 @@ TOKEN_AUDIO_SECONDS = "mindbridge.token_usage.audio_seconds"
 MODEL_TTFT = "mindbridge.model.time_to_first_token"
 GEN_AI_TTFC = "gen_ai.response.time_to_first_chunk"
 GEN_AI_FINISH_REASONS = "gen_ai.response.finish_reasons"
+CAPTURE_SETTLED = "mindbridge.capture.records_settled"
+CAPTURE_FAILED = "mindbridge.capture.records_failed"
+# The capture-to-searchable interval `docs/context-os.md` requires measured separately from the
+# capture acknowledgement and from settle duration. Reported as the batch maximum: one span
+# attribute answers "how stale was the oldest record this pass made searchable".
+CAPTURE_TIME_TO_SEARCHABLE = "mindbridge.capture.max_time_to_searchable_ms"
 EMBEDDING_PARTS_ELIDED = "mindbridge.embedding.elided_parts"
 EMBEDDING_VIDEO_SAMPLED = "mindbridge.embedding.video_sampled_inputs"
 GROUNDING_MEDIA_ELIDED = "mindbridge.grounding.media_elided_hits"

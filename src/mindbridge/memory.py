@@ -40,6 +40,9 @@ from opentelemetry.trace import Span, Tracer
 from opentelemetry.util.types import AttributeValue
 
 from mindbridge._telemetry import (
+    CAPTURE_FAILED,
+    CAPTURE_SETTLED,
+    CAPTURE_TIME_TO_SEARCHABLE,
     EMBEDDING_PARTS_ELIDED,
     IDENTITY_CACHED,
     IDENTITY_CREATED,
@@ -146,6 +149,7 @@ from mindbridge.types import (
     ObservationContext,
     Page,
     PCMChunk,
+    PendingCapture,
     PrefetchResult,
     RetrievalCandidateTrace,
     RetrievalRejection,
@@ -805,6 +809,7 @@ class Memory:
             )
             record = self._add_prepared((prepared,), operation=assets)[0]
             self._form_sources((record,), operation=assets)
+            self._complete_formation((record,))
             return record
 
     def _add_stream_input(self, item: StreamInput) -> MemoryRecord:
@@ -879,6 +884,7 @@ class Memory:
                 return ()
             records = self._add_prepared(prepared, operation=assets)
             self._form_sources(records, operation=assets)
+            self._complete_formation(records)
             return records
 
     def capture(
@@ -910,6 +916,16 @@ class Memory:
                 memory_type=memory_type,
                 context=context,
             )
+            # Reject here what `add()` would reject, before the commit. Committing media no
+            # configured model can ever take would make the record durable and then fail every
+            # `settle()` forever, which is a queue entry no retry ceiling should have to absorb.
+            if Modality.AUDIO not in self._embedding_capabilities:
+                _fallback_unsupported(
+                    prepared.content,
+                    self._embedding_capabilities,
+                    "embedding",
+                    rescuable=self._deferred_rescue(prepared.content.assets),
+                )
             now = datetime.now(timezone.utc)
             # No index lock: a capture enqueues no vectors, so it has no outbox work to drain and
             # never has to wait behind a Zvec flush.
@@ -945,26 +961,68 @@ class Memory:
             assets.persisted.update(asset.asset_id for asset in authoritative[0].assets)
             return self._memory_record(authoritative[0])
 
-    def settle(self, *, limit: int = 100) -> int:
-        """Enrich, embed, index, and form up to `limit` captured records in enqueue order."""
-        with self._trace("mindbridge.settle", kind="operation"), self._operation() as assets:
+    def settle(self, *, limit: int = 100, max_attempts: int = 3) -> int:
+        """Enrich, embed, index, and form up to `limit` captured records in enqueue order.
+
+        Every readable record is attempted: a failing one keeps its queue row, its attempt count,
+        and its reason, and the records behind it still settle. The first failure is raised once
+        the batch is done, with `subject` naming its record; the rest are readable through
+        `pending_captures()`. A record that has already failed `max_attempts` times is skipped
+        rather than retried, so one poisoned capture cannot block the queue forever. It stays
+        queued and visible, and lowering the ceiling is what retries it.
+        """
+        with (
+            self._trace("mindbridge.settle", kind="operation") as span,
+            self._operation() as assets,
+        ):
             _limit(limit, maximum=100)
+            if (
+                isinstance(max_attempts, bool)
+                or not isinstance(max_attempts, int)
+                or max_attempts < 1
+            ):
+                raise ValidationError("max_attempts must be a positive integer")
             with _translate_storage_errors("read the capture queue"):
-                queued = self._store.pending_captures(limit=limit)
+                queued = self._store.pending_captures(limit=limit, max_attempts=max_attempts)
+            span.set_attribute(CAPTURE_SETTLED, 0)
+            span.set_attribute(CAPTURE_FAILED, 0)
             if not queued:
                 return 0
             with _translate_storage_errors("hydrate captured memories"):
-                rows = self._store.read_memories(queued)
-            return self._settle_stored(rows, operation=assets)
+                rows = self._store.read_memories(tuple(row.memory_id for row in queued))
+            settled, failures = self._settle_stored(rows, operation=assets)
+            span.set_attribute(CAPTURE_SETTLED, len(settled))
+            span.set_attribute(CAPTURE_FAILED, len(failures))
+            enqueued_at = {row.memory_id: row.enqueued_at for row in queued}
+            now = datetime.now(timezone.utc)
+            waits = tuple(
+                (now - enqueued_at[memory_id]).total_seconds() * 1000.0 for memory_id in settled
+            )
+            if waits:
+                span.set_attribute(CAPTURE_TIME_TO_SEARCHABLE, max(waits))
+            if failures:
+                raise failures[0]
+            return len(settled)
 
-    def pending_captures(self) -> int:
-        """Return how many captured records are still waiting for `settle()`."""
+    def pending_captures(
+        self,
+        *,
+        limit: int = 100,
+        memory_ids: Sequence[str] | None = None,
+    ) -> tuple[PendingCapture, ...]:
+        """Return up to `limit` records that are durable but not yet searchable, oldest first.
+
+        Pass `memory_ids` to ask whether specific records are still waiting: one that is absent
+        from the result is not pending, which means it is settled or was never stored, and `get()`
+        tells the two apart.
+        """
         with (
             self._trace("mindbridge.pending_captures", kind="operation"),
             self._operation(),
-            _translate_storage_errors("count the capture queue"),
         ):
-            return self._store.pending_capture_count()
+            _limit(limit, maximum=100)
+            with _translate_storage_errors("read the capture queue"):
+                return self._store.pending_captures(limit=limit, memory_ids=memory_ids)
 
     def add_stream(
         self,
@@ -2301,7 +2359,7 @@ class Memory:
                             memory.content,
                             self._embedding_capabilities,
                             "embedding",
-                            transcribable=self._transcript_fallback(memory.content.assets),
+                            rescuable=self._transcript_fallback(memory.content.assets),
                         )
                 if fallback:
                     self._cache_audio_transcripts(
@@ -2372,7 +2430,17 @@ class Memory:
                     self._trace("mindbridge.storage.write", kind="stage"),
                     _translate_storage_errors("write memories"),
                 ):
-                    self._store.write_memories(stored_memories, stored_embeddings)
+                    # With a former configured, the same transaction enqueues the formation this
+                    # call still owes. `add()` deletes the row once it returns, so the row only
+                    # outlives the commit when the process did not: the next `settle()` then
+                    # finds an embedded record that owes formation and finishes it.
+                    self._store.write_memories(
+                        stored_memories,
+                        stored_embeddings,
+                        formation_pending_at=(
+                            stored_memories[0].created_at if self._former is not None else None
+                        ),
+                    )
             with self._write_lock:
                 self._drain_outbox()
                 with (
@@ -2390,6 +2458,17 @@ class Memory:
             raise StorageError("written memories could not be read from SQLite", reason="io_failed")
         return tuple(self._memory_record(rows_by_id[memory.memory_id]) for memory in prepared)
 
+    def _complete_formation(self, records: Sequence[MemoryRecord]) -> None:
+        """Clear the queue rows `_add_prepared` wrote once formation has actually run.
+
+        A no-op without a former, and harmless for a record that was never enqueued or whose row
+        `_settle_queued` already removed: the delete simply matches nothing.
+        """
+        if self._former is None or not records:
+            return
+        with _translate_storage_errors("complete formation"):
+            self._store.complete_captures(tuple(record.id for record in records))
+
     def _settle_queued(
         self,
         existing: Sequence[StoredMemory],
@@ -2405,30 +2484,37 @@ class Memory:
             return
         with _translate_storage_errors("check the capture queue"):
             queued = frozenset(
-                self._store.pending_captures(
+                pending.memory_id
+                for pending in self._store.pending_captures(
                     limit=len(existing),
                     memory_ids=tuple(row.memory_id for row in existing),
                 )
             )
-        self._settle_stored(
+        # No attempt ceiling here: `add()` promises a searchable return, so a record it is being
+        # asked for has to be settled however many times it has already failed.
+        _settled, failures = self._settle_stored(
             tuple(row for row in existing if row.memory_id in queued),
             operation=operation,
         )
+        if failures:
+            raise failures[0]
 
     def _settle_stored(
         self,
         rows: Sequence[StoredMemory],
         *,
         operation: _OperationAssets,
-    ) -> int:
-        """Run the model stages `capture()` deferred over already-committed rows.
+    ) -> tuple[tuple[str, ...], tuple[MindBridgeError, ...]]:
+        """Run the stages `capture()` deferred over already-committed rows, and report both sides.
 
         `settle()` and the `add()` path share this routine, so a captured record reaches exactly
-        the state a blocking `add()` would have left it in. Each row commits on its own, so one
-        failing record keeps its queue row, its attempt count, and its reason while every earlier
-        record in the batch stays settled.
+        the state a blocking `add()` would have left it in. Each row commits on its own and a
+        failing one is collected rather than raised, so it keeps its queue row, its attempt count,
+        and its reason while every other record in the batch still settles. Returns the IDs that
+        settled and the failures, and the caller decides which of them to raise.
         """
-        settled = 0
+        settled: list[str] = []
+        failures: list[MindBridgeError] = []
         for row in rows:
             try:
                 self._settle_row(row, operation=operation)
@@ -2437,11 +2523,35 @@ class Memory:
                     self._store.record_capture_failure(row.memory_id, str(error))
                 if error.subject is None:
                     error.subject = row.memory_id
-                raise
-            settled += 1
-        return settled
+                failures.append(error)
+                continue
+            settled.append(row.memory_id)
+        return tuple(settled), tuple(failures)
 
     def _settle_row(self, row: StoredMemory, *, operation: _OperationAssets) -> None:
+        # An `add()` that crashed between its commit and formation leaves a queue row over a
+        # record that is already enriched, embedded, and indexed. Its vectors are final, so
+        # settling it owes formation only; re-running the model stages would buy the same
+        # vectors twice.
+        with _translate_storage_errors("check a captured memory's vectors"):
+            embedded = self._store.read_embedding(_embedding_id(row.memory_id, 0)) is not None
+        settled = row
+        if not embedded:
+            enriched = self._enrich_row(row, operation=operation)
+            if enriched is None:
+                return
+            settled = enriched
+        self._form_sources((self._memory_record(settled),), operation=operation)
+        with _translate_storage_errors("complete captured memory"):
+            self._store.complete_captures((row.memory_id,))
+
+    def _enrich_row(
+        self,
+        row: StoredMemory,
+        *,
+        operation: _OperationAssets,
+    ) -> StoredMemory | None:
+        """Derive, embed, and commit one captured row, or return `None` if it lost the race."""
         memory = _prepared_from_stored(row)
         speech_assets = self._answer_speech_assets(memory.content.assets)
         speech_indexed = self._index_speech and bool(speech_assets)
@@ -2456,7 +2566,14 @@ class Memory:
                 content=self._with_visual_descriptions(memory.content, described),
             )
             if Modality.AUDIO not in self._embedding_capabilities:
-                _fallback_unsupported(memory.content, self._embedding_capabilities, "embedding")
+                # Same rescue set `_add_prepared` allows, so a composition `add()` accepts is not
+                # one `settle()` refuses after the record is already durable.
+                _fallback_unsupported(
+                    memory.content,
+                    self._embedding_capabilities,
+                    "embedding",
+                    rescuable=self._transcript_fallback(memory.content.assets),
+                )
                 if not memory.content.audio_transcript:
                     self._cache_audio_transcripts(memory.content.assets, operation)
             elif self._derives_transcripts(memory.content.assets):
@@ -2504,10 +2621,7 @@ class Memory:
                 operation.persisted.update(asset.asset_id for asset in row.assets)
                 if operation.speech_updates:
                     self._persist_transcripts(operation)
-        if committed:
-            self._form_sources((self._memory_record(enriched),), operation=operation)
-            with _translate_storage_errors("complete captured memory"):
-                self._store.complete_capture(row.memory_id)
+        return enriched if committed else None
 
     def _form_sources(
         self,
@@ -3526,7 +3640,7 @@ class Memory:
             prepared,
             self._embedding_capabilities,
             "embedding",
-            transcribable=rescues,
+            rescuable=rescues,
         )
         if Modality.AUDIO in unsupported:
             if prepared.audio_transcript:
@@ -3952,6 +4066,18 @@ class Memory:
         if not self._derives_transcripts(assets):
             return frozenset()
         return self._transcription_capabilities & {Modality.AUDIO, Modality.VIDEO}
+
+    def _deferred_rescue(self, assets: Sequence[StoredAsset]) -> frozenset[Modality]:
+        """Modalities `settle()` can still rescue for an embedder that cannot take them.
+
+        `capture()` commits before any model runs, so it cannot see the transcript or the visual
+        description that will exist by the time the record is embedded -- only which of them the
+        configured composition will derive.
+        """
+        rescued = self._transcript_fallback(assets)
+        if self._vision_describer is not None:
+            rescued |= self._vision_capabilities
+        return rescued
 
     def _derives_transcripts(self, assets: Sequence[StoredAsset]) -> bool:
         # A SpeechBackend indexes the same text through the explicit `index_speech` opt-in, so its
@@ -5085,11 +5211,18 @@ class AsyncMemory:
             context=context,
         )
 
-    async def settle(self, *, limit: int = 100) -> int:
-        return await asyncio.to_thread(self._memory.settle, limit=limit)
+    async def settle(self, *, limit: int = 100, max_attempts: int = 3) -> int:
+        return await asyncio.to_thread(self._memory.settle, limit=limit, max_attempts=max_attempts)
 
-    async def pending_captures(self) -> int:
-        return await asyncio.to_thread(self._memory.pending_captures)
+    async def pending_captures(
+        self,
+        *,
+        limit: int = 100,
+        memory_ids: Sequence[str] | None = None,
+    ) -> tuple[PendingCapture, ...]:
+        return await asyncio.to_thread(
+            self._memory.pending_captures, limit=limit, memory_ids=memory_ids
+        )
 
     async def add_stream(
         self,
@@ -6455,17 +6588,17 @@ def _fallback_unsupported(
     supported: frozenset[Modality],
     operation: str,
     *,
-    transcribable: frozenset[Modality] = frozenset(),
+    rescuable: frozenset[Modality] = frozenset(),
 ) -> frozenset[Modality]:
     unsupported = _prepared_modalities(prepared) - supported
     fallback = {Modality.AUDIO}
     if prepared.visual_description:
         fallback.update((Modality.IMAGE, Modality.VIDEO))
-    # This runs before any transcript exists, so a derived one cannot be seen yet -- only its
-    # possibility. `transcribable` is the modality set a transcript could still rescue, which is
-    # why a video reaching a video-less embedder is no longer fatal when the transcriber can read
-    # it. Empty by default, so a caller that does not pass it keeps the previous behaviour.
-    fallback.update(transcribable & {Modality.AUDIO, Modality.VIDEO})
+    # This runs before any derived text exists, so it cannot be seen yet -- only its possibility.
+    # `rescuable` is the modality set a transcript or a visual description could still rescue,
+    # which is why a video reaching a video-less embedder is no longer fatal when the transcriber
+    # can read it. Empty by default, so a caller that does not pass it keeps the strict behaviour.
+    fallback.update(rescuable)
     fatal = set(unsupported - fallback)
     if Modality.TEXT not in supported:
         fatal.update(unsupported & fallback)

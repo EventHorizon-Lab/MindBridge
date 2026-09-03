@@ -80,8 +80,8 @@ flowchart LR
     input["Validate and materialize content"] --> commit["Commit record, media, context, and queue row"]
     commit --> ack["Acknowledge capture"]
     ack -. later .-> settle["settle(): run the model stages"]
-    settle --> derived["Commit derived content, vectors, and queue-row deletion"]
-    derived --> zvec["Flush Zvec and acknowledge the outbox"]
+    settle --> derived["Commit derived content and vectors; the queue row survives"]
+    derived --> zvec["Flush Zvec, form, then delete the queue row"]
     settle -. failure .-> queued["Count the attempt, store the reason, keep the row queued"]
 ```
 
@@ -90,12 +90,27 @@ A captured record is durable and readable but has no vectors, so it enqueues no 
 committed row, so a settled record holds exactly the derived content, vectors, and formation a
 blocking `add()` would have produced. Retrieval and shutdown never settle.
 
+`settle()` attempts every record it read: a failing one keeps its queue row, its attempt count,
+and its reason while the records behind it still settle, and the first failure is raised once the
+batch is done. A record that has already failed `max_attempts` times is skipped rather than
+retried, so one poisoned capture cannot block the queue. `capture()` applies the same
+embedder-capability check `add()` applies, so media no configured model could ever take is
+refused before the commit instead of becoming a durable row that can never settle.
+
 ### Formation and consolidation
 
 Formation follows the same authority rule. A `FormationBackend` proposes typed state after the
 source observation commits; the kernel validates source binding, modality, identity, validity, and
 conflicts. Derived records, evidence, versions, embeddings, the per-source recipe marker, and
-outbox work commit together. A failed formation leaves the source durable and retryable.
+outbox work commit together.
+
+A failed formation leaves the source durable and retryable on both paths. `add()` enqueues each
+new record in `capture_queue` inside its own write transaction whenever a formation backend is
+configured, and deletes that row after formation returns; a crash in between leaves the row, and
+the next `settle()` finds a record that is already embedded and owes formation only, so it forms
+it without buying the same vectors twice. `capture()` keeps its queue row through the settle
+commit for the same reason. The per-source recipe marker makes the retry idempotent: a source
+that already formed is skipped.
 
 ## Retrieval consistency
 

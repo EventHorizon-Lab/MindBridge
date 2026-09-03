@@ -90,8 +90,8 @@ trust, license, model identity, and credential behavior live in
 | `add-many` | optional JSONL source; `--memory-type` | `{"memories":[...]}` | yes |
 | `add-stream` | optional JSONL source; `--memory-type` | `{"memories":[...]}` | no |
 | `capture` | same operands and options as `add` | memory object | no |
-| `settle` | `--limit` | `{"settled":int}` | no |
-| `pending-captures` | none | `{"pending":int}` | no |
+| `settle` | `--limit`; `--max-attempts` | `{"settled":int}` | no |
+| `pending-captures` | optional `MEMORY_ID...`; `--limit` | `{"pending":[...]}` | no |
 | `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
 | `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | no |
 | `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope` | answer object | yes |
@@ -184,6 +184,11 @@ values as JSON strings and datetimes as ISO 8601.
 
 `forget-identity` returns `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`,
 `face_observations`, and `speech_segments`, matching the fields of `IdentityErasure`.
+
+`pending-captures` returns one object per queued record — `memory_id`, ISO 8601 `enqueued_at`,
+`attempts`, and `last_error` — oldest first, matching the fields of `PendingCapture`. Naming memory
+IDs restricts the report to them; an ID that is absent from the result is not pending, so it is
+either settled or unknown, and `get` tells the two apart.
 
 Unless `--quiet` is set, commands write the resolved composition as one JSON document on stderr
 before executing. `--url` forwards successful owner response objects unchanged. Runtime

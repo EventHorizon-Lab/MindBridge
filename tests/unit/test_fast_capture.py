@@ -7,9 +7,13 @@ import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
+from typing import cast
 
 import pytest
 from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from mindbridge import (
     AssetRef,
@@ -23,6 +27,7 @@ from mindbridge import (
     ModelError,
     ModelInput,
 )
+from mindbridge._telemetry import CAPTURE_FAILED, CAPTURE_SETTLED, CAPTURE_TIME_TO_SEARCHABLE
 from mindbridge.memory import AsyncMemory
 
 
@@ -120,13 +125,13 @@ def test_a_capture_is_durable_and_listable_but_only_searchable_once_settled(
 
         assert embedder.calls == 0
         assert former.calls == 0
-        assert memory.pending_captures() == 1
+        assert len(memory.pending_captures()) == 1
         assert memory.get(record.id) == record
         assert [item.id for item in memory.list().items] == [record.id]
         assert memory.search("spare key") == ()
 
         assert memory.settle() == 1
-        assert memory.pending_captures() == 0
+        assert memory.pending_captures() == ()
         assert record.id in {hit.id for hit in memory.search("spare key")}
         assert former.calls == 1
 
@@ -143,12 +148,12 @@ def test_repeating_a_capture_is_idempotent_and_still_calls_no_model(tmp_path: Pa
 
         assert second == first
         assert embedder.calls == 0
-        assert memory.pending_captures() == 1
+        assert len(memory.pending_captures()) == 1
 
         assert memory.settle() == 1
         # Capturing settled content neither re-enqueues work nor rewrites the derived record.
         assert memory.capture("red screwdriver in drawer two") == memory.get(first.id)
-        assert memory.pending_captures() == 0
+        assert memory.pending_captures() == ()
         assert [hit.id for hit in memory.search("red screwdriver")] == [first.id]
 
 
@@ -165,14 +170,14 @@ def test_adding_captured_content_settles_it_under_the_same_id(tmp_path: Path) ->
         added = memory.add("the blue toolbox sits on the workbench")
 
         assert added.id == captured.id
-        assert memory.pending_captures() == 0
+        assert memory.pending_captures() == ()
         assert former.calls == 1
         assert captured.id in {hit.id for hit in memory.search("blue toolbox")}
 
         # `add_many` shares the same enrichment path.
         queued = memory.capture("the yellow hammer hangs by the door")
         assert memory.add_many(("the yellow hammer hangs by the door",))[0].id == queued.id
-        assert memory.pending_captures() == 0
+        assert memory.pending_captures() == ()
         assert queued.id in {hit.id for hit in memory.search("yellow hammer")}
 
 
@@ -218,10 +223,9 @@ def test_a_model_failure_keeps_its_record_queued_and_names_it(tmp_path: Path) ->
         with pytest.raises(ModelError) as failure:
             memory.settle()
 
-        # The queue is processed in enqueue order, so the healthy record settled before the
-        # failing one aborted the batch.
+        # Every readable record is attempted; the failure is raised once the batch is done.
         assert failure.value.subject == failing.id
-        assert memory.pending_captures() == 1
+        assert len(memory.pending_captures()) == 1
         assert {hit.id for hit in memory.search("observation")} == {healthy.id}
 
         queued = _queue_rows(tmp_path)
@@ -238,6 +242,128 @@ def test_a_model_failure_keeps_its_record_queued_and_names_it(tmp_path: Path) ->
         assert _queue_rows(tmp_path) == []
 
 
+def test_a_poisoned_capture_neither_blocks_nor_hides_the_records_behind_it(
+    tmp_path: Path,
+) -> None:
+    embedder = CountingEmbedder()
+    embedder.poison = "unreachable"
+    with Memory(tmp_path, embedder=embedder, minimum_relevance=0) as memory:
+        poisoned = memory.capture("an unreachable observation")
+
+        for _attempt in range(3):
+            with pytest.raises(ModelError):
+                memory.settle()
+
+        # Captured after the poisoned record, so enqueue order would starve it forever.
+        later = memory.capture("the ladder is in the garage")
+
+        # The ceiling retires the poisoned row from the work set. It stays queued and visible
+        # with its reason, and the record behind it settles.
+        assert memory.settle() == 1
+        assert {hit.id for hit in memory.search("ladder")} == {later.id}
+        (pending,) = memory.pending_captures()
+        assert pending.memory_id == poisoned.id
+        assert pending.attempts == 3
+        assert pending.last_error
+
+        # Asking about specific records answers "is this one searchable yet".
+        assert memory.pending_captures(memory_ids=(later.id,)) == ()
+        assert [row.memory_id for row in memory.pending_captures(memory_ids=(poisoned.id,))] == [
+            poisoned.id
+        ]
+
+        # Raising the ceiling is what retries it.
+        with pytest.raises(ModelError):
+            memory.settle(max_attempts=4)
+        assert memory.pending_captures()[0].attempts == 4
+
+
+def test_capture_refuses_media_no_configured_model_will_ever_embed(tmp_path: Path) -> None:
+    with Memory(
+        tmp_path,
+        embedder=CountingEmbedder(capabilities=frozenset({Modality.TEXT})),
+        minimum_relevance=0,
+    ) as memory:
+        image = Blob(b"frame", "image/png", "frame.png")
+        with pytest.raises(ModelError) as refusal:
+            memory.add(image)
+        with pytest.raises(ModelError) as captured:
+            memory.capture(image)
+
+        # Committing it would have made an unsettleable row durable, so capture rejects exactly
+        # what add rejects, before the write.
+        assert captured.value.reason == refusal.value.reason == "unsupported_modality"
+        assert _queue_rows(tmp_path) == []
+        assert memory.list().items == ()
+
+
+def test_an_add_that_crashed_before_forming_is_completed_by_the_next_settle(
+    tmp_path: Path,
+) -> None:
+    def crash(*_arguments: object, **_keywords: object) -> None:
+        raise RuntimeError("simulated crash after the add commit")
+
+    former = CountingFormer()
+    embedder = CountingEmbedder()
+    with Memory(tmp_path, embedder=embedder, former=former, minimum_relevance=0) as memory:
+        memory._form_sources = crash  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError):
+            memory.add("the fuse box is behind the coats")
+
+    # The record is committed and searchable but unformed, and the queue row is the only thing
+    # that says so.
+    (queued,) = _queue_rows(tmp_path)
+    embedded = embedder.calls
+    with Memory(tmp_path, embedder=embedder, former=former, minimum_relevance=0) as memory:
+        assert [row.memory_id for row in memory.pending_captures()] == [queued[0]]
+        # Settling an already-embedded row owes formation only; re-running the model stages would
+        # buy the same vectors twice.
+        memory._enrich_row = crash  # type: ignore[method-assign]
+        assert memory.settle() == 1
+
+        # Formation ran exactly once. The single extra embed is the record it proposed.
+        assert former.calls == 1
+        assert embedder.calls == embedded + 1
+        assert memory.pending_captures() == ()
+        derived = [
+            item
+            for item in memory.list().items
+            if item.context is not None and item.context.kind is MemoryKind.ENTITY
+        ]
+        assert len(derived) == 1
+
+        # A second pass has nothing left to do.
+        assert memory.settle() == 0
+        assert former.calls == 1
+
+
+def test_the_settle_span_reports_time_to_searchable_separately(tmp_path: Path) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    embedder = CountingEmbedder()
+    embedder.poison = "unreachable"
+    with Memory(
+        tmp_path,
+        embedder=embedder,
+        minimum_relevance=0,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        memory.capture("a healthy observation")
+        memory.capture("an unreachable observation")
+        with pytest.raises(ModelError):
+            memory.settle()
+    provider.shutdown()
+
+    (settle,) = [span for span in exporter.get_finished_spans() if span.name == "mindbridge.settle"]
+    assert settle.attributes is not None
+    assert settle.attributes[CAPTURE_SETTLED] == 1
+    assert settle.attributes[CAPTURE_FAILED] == 1
+    # The capture-to-searchable interval, which neither the capture span nor the settle span's own
+    # duration reports.
+    assert cast(float, settle.attributes[CAPTURE_TIME_TO_SEARCHABLE]) >= 0.0
+
+
 def test_a_capture_that_survived_a_crash_settles_under_a_new_owner(tmp_path: Path) -> None:
     with Memory(tmp_path, embedder=CountingEmbedder(), minimum_relevance=0) as memory:
         record = memory.capture("the fuse box is behind the coats")
@@ -245,7 +371,7 @@ def test_a_capture_that_survived_a_crash_settles_under_a_new_owner(tmp_path: Pat
     assert [row[0] for row in _queue_rows(tmp_path)] == [record.id]
 
     with Memory(tmp_path, embedder=CountingEmbedder(), minimum_relevance=0) as memory:
-        assert memory.pending_captures() == 1
+        assert len(memory.pending_captures()) == 1
         assert memory.settle() == 1
         assert [hit.id for hit in memory.search("fuse box")] == [record.id]
     assert _queue_rows(tmp_path) == []
@@ -260,21 +386,39 @@ def test_async_capture_settle_and_pending_mirror_the_synchronous_surface(tmp_pat
         ) as memory:
             record = await memory.capture("the ladder is in the garage")
 
-            assert await memory.pending_captures() == 1
+            assert len(await memory.pending_captures()) == 1
             assert await memory.search("ladder") == ()
             assert await memory.settle() == 1
-            assert await memory.pending_captures() == 0
+            assert await memory.pending_captures() == ()
             assert [hit.id for hit in await memory.search("ladder")] == [record.id]
 
     asyncio.run(scenario())
 
 
-def test_the_capture_operations_reach_the_command_line() -> None:
+def test_the_capture_operations_reach_the_command_line(tmp_path: Path) -> None:
     from mindbridge import cli
 
     assert {"capture", "settle", "pending_captures"} <= set(cli.OPERATIONS)
     assert {"capture", "settle", "pending-captures"} <= set(cli.COMMANDS)
     assert {"capture", "settle", "pending-captures"} <= set(cli._LOCAL)
+
+    parser = cli._parser()
+    with Memory(tmp_path, embedder=CountingEmbedder(), minimum_relevance=0) as memory:
+        record = memory.capture("the ladder is in the garage")
+        reported = cli._LOCAL["pending-captures"](memory, parser.parse_args(["pending-captures"]))
+        settled = cli._LOCAL["settle"](memory, parser.parse_args(["settle", "--max-attempts", "2"]))
+
+    assert reported == {
+        "pending": [
+            {
+                "memory_id": record.id,
+                "enqueued_at": reported["pending"][0]["enqueued_at"],  # type: ignore[index]
+                "attempts": 0,
+                "last_error": None,
+            }
+        ]
+    }
+    assert settled == {"settled": 1}
 
 
 class FlakyFormer(CountingFormer):
@@ -301,11 +445,11 @@ def test_a_formation_failure_keeps_the_capture_queued_until_it_forms(tmp_path: P
         # survives with the failure recorded instead of the source staying silently unformed.
         assert failure.value.subject == record.id
         assert {hit.id for hit in memory.search("spare key")} == {record.id}
-        assert memory.pending_captures() == 1
+        assert len(memory.pending_captures()) == 1
         assert _queue_rows(tmp_path)[0][1] == 1
 
         assert memory.settle() == 1
-        assert memory.pending_captures() == 0
+        assert memory.pending_captures() == ()
         assert former.calls == 2
         derived = [
             item
