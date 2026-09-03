@@ -195,6 +195,18 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- `add_stream` now indexes its committed items in bounded groups (32 items or 250 ms) instead of
+  flushing the search index after every observation. Each item still commits to SQLite on its own
+  and the committed prefix survives a mid-stream failure; a group the process never reaches leaves
+  its outbox rows pending for the next drain, and a `search` on any thread closes the open group
+  before it reads. Measured on 300 observations: 25× faster, 10 flushes instead of 300.
+- A temporal phrase in a query now only boosts memories that overlap the asked range; memories
+  outside it and records without an event time keep the score their relevance earned instead of
+  being decayed toward the rank floor. Replayed on 810 paired validation questions the penalty
+  recovered no gold memory and only reordered; the boost alone won or tied on every one but one.
+- `search` counts the candidates that survive its scope predicates instead of hydrating their
+  records to count them, removing one of the two record reads per search (about 15 % of search
+  latency at depth 100). Results are identical.
 - **Breaking:** `minimum_relevance` now gates evidence relevance — the cosine the dense route
   reports, or the demoted full-text contribution when only the lexical route matched, times the
   observation's own confidence — and its default moves from `0.55` to `0.10`. It previously gated
