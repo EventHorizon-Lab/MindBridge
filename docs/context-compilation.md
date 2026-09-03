@@ -28,7 +28,7 @@ forgotten record and a hidden inferred trait never reach a bundle.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `max_chars` | `6000` | Evidence character ceiling, charged with the same cost function `ask()` uses: record text plus a per-modality text equivalent for each media asset |
+| `max_chars` | `24000` | Evidence character ceiling, charged with the same cost function `ask()` uses: record text plus a per-modality text equivalent for each media asset. One image part is charged 2000, one audio part 4000, and one video part 12000, so a ceiling below 12000 omits every video record it ranks |
 | `max_items` | `24` | Maximum included memories |
 | `memory_types` | `None` | Keep only these `MemoryType` values; `None` keeps every type |
 | `min_confidence` | `0.0` | Minimum typed confidence; a record with no typed context counts as `1.0` |
@@ -45,7 +45,7 @@ A typed `MemoryKind` decides the section first; an untyped or generic record fal
 
 | Section | Contents |
 | --- | --- |
-| `actors` | Kind `entity` |
+| `actors` | Kind `entity`, plus one `ProvisionalActor` per unnamed person in the included evidence |
 | `facts` | Type `semantic`, except `entity` and `trait` |
 | `episodes` | Type `episodic`, except `affect` |
 | `procedures` | Type `procedural` |
@@ -60,6 +60,19 @@ passed the filters but did not fit, and `chars` is what the included hits cost.
 
 `ContextBundle` also reports `occurred_from` and `occurred_until` over the included hits, `frames`
 (the distinct spatial frame IDs, sorted), and `hits` (every included hit in rank order).
+
+## Provisional actors
+
+A recognized person whom no visible naming assertion names is reported in `actors` as a
+`ProvisionalActor` carrying `identity_id` and the `memory_ids` of the included evidence that
+observed them, sorted by identity. An unnamed person present in the room is not a person missing
+from context: what an agent may say depends on knowing they are there and that nobody has named
+them.
+
+A provisional actor is not a hit. It never appears in `hits`, it takes no item slot, it costs no
+characters, and it is dropped when the evidence that observed the person did not make it into the
+bundle -- the bundle never reports somebody the reader cannot see the evidence for. `render()`
+prints one plainly labelled line per entry, after the ranked actors.
 
 ## Conflicts
 
@@ -79,7 +92,7 @@ trailer only when something was omitted.
 # Context: what should I bring to the workshop?
 Each line is one memory: [id] content (confidence; validity).
 Reference time: 2026-09-03T12:00:00+00:00
-Budget: 132/6000 chars, 3/24 items
+Budget: 132/24000 chars, 3/24 items
 
 ## Facts
 - [a1b2] the spare key is in the blue toolbox (confidence 1.00)

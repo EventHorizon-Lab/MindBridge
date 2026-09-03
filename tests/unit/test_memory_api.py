@@ -71,6 +71,7 @@ from mindbridge.types import (
     AnswerResult,
     AssetRef,
     Blob,
+    ContextBudget,
     EvidenceBasis,
     FormationProposal,
     IdentityProfile,
@@ -81,6 +82,7 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     ObservationContext,
+    ProvisionalActor,
     RetrievalScope,
     SearchHit,
     SpatialAnchor,
@@ -1969,13 +1971,13 @@ def test_identity_registration_round_trips_a_relationship(tmp_path: Path) -> Non
 
         memory.register_identity(identity_id, "Alice", relationship="sister")
         assert memory.identity(identity_id) == IdentityProfile(
-            identity_id=identity_id, name="Alice", relationship="sister"
+            identity_id=identity_id, name="Alice", relationship="sister", confirmed=True
         )
 
         # Renaming without naming a relationship must not discard the recorded one.
         memory.register_identity(identity_id, "Alicia")
         assert memory.identity(identity_id) == IdentityProfile(
-            identity_id=identity_id, name="Alicia", relationship="sister"
+            identity_id=identity_id, name="Alicia", relationship="sister", confirmed=True
         )
 
         assert memory.identity("identity_missing") is None
@@ -2001,7 +2003,7 @@ def test_identity_resolves_a_merged_away_id_to_the_surviving_person(tmp_path: Pa
 
         memory.register_identity(survivor, "Alice", relationship="sister")
         assert memory.identity(merged_away) == IdentityProfile(
-            identity_id=survivor, name="Alice", relationship="sister"
+            identity_id=survivor, name="Alice", relationship="sister", confirmed=True
         )
 
 
@@ -2029,7 +2031,7 @@ def test_unlink_identity_reverses_a_corroborated_merge(tmp_path: Path) -> None:
         # half carries none, because the name was asserted about the merged person.
         assert memory.faces(first.id)[0].identity_id != memory.speech(first.id)[0].speaker_id
         assert memory.identity(survivor) == IdentityProfile(
-            identity_id=survivor, name="Alice", relationship="sister"
+            identity_id=survivor, name="Alice", relationship="sister", confirmed=True
         )
         assert memory.identity(merged_away) == IdentityProfile(identity_id=merged_away)
 
@@ -2098,7 +2100,7 @@ def test_naming_is_auditable_and_rollback_restores_the_previous_name(tmp_path: P
         logged = memory.operations()
         assert [entry.trigger for entry in logged] == [MemoryTrigger.MANUAL, MemoryTrigger.MANUAL]
         assert memory.identity(identity_id) == IdentityProfile(
-            identity_id=identity_id, name="Li Hua", relationship="neighbour"
+            identity_id=identity_id, name="Li Hua", relationship="neighbour", confirmed=True
         )
         assert '"speaker_name":"Li Hua"' in memory.get(record.id).content
 
@@ -2106,7 +2108,7 @@ def test_naming_is_auditable_and_rollback_restores_the_previous_name(tmp_path: P
 
         # The retracted name is gone from the projection, the registry, and the indexed text.
         assert memory.identity(identity_id) == IdentityProfile(
-            identity_id=identity_id, name="Li", relationship="neighbour"
+            identity_id=identity_id, name="Li", relationship="neighbour", confirmed=True
         )
         assert '"speaker_name":"Li"' in memory.get(record.id).content
         contents = {hit.content for hit in memory.search("Li")}
@@ -5162,3 +5164,140 @@ def test_a_wearer_voice_binding_one_face_does_not_cascade_to_everybody(tmp_path:
     assert faces["b"] != faces["a"]
     assert voices["a"] != faces["a"]
     assert len(set(voices.values()) | set(faces.values())) == 3
+
+
+def test_deleting_a_naming_assertion_takes_the_name_out_of_the_registry_and_the_index(
+    tmp_path: Path,
+) -> None:
+    """A naming assertion is an ordinary record, so an ordinary delete must not orphan a name."""
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=1,
+        index_speech=True,
+        minimum_relevance=0,
+    ) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+        memory.register_identity(identity_id, "Li", relationship="neighbour")
+        assertion = next(
+            item.id
+            for item in memory.list().items
+            if item.context is not None and item.context.kind is MemoryKind.ENTITY
+        )
+        assert '"speaker_name":"Li"' in memory.get(record.id).content
+
+        assert memory.delete(assertion) is True
+
+        profile = memory.identity(identity_id)
+        assert profile is not None
+        assert (profile.name, profile.confirmed) == (None, False)
+        assert '"speaker_name":"Li"' not in memory.get(record.id).content
+        assert "Li" not in {hit.content for hit in memory.search("Li")}
+
+
+class _SubjectFormer:
+    """Proposes one STATE claim per source, with the subject spelled as the text asks."""
+
+    formation_capabilities = frozenset({Modality.TEXT})
+    formation_model = "formation-test"
+    formation_space = "formation-test:atomic-v1"
+
+    def form(
+        self,
+        inputs: Sequence[FormationInput],
+    ) -> tuple[tuple[FormationProposal, ...], ...]:
+        return tuple(
+            (
+                FormationProposal(
+                    kind=MemoryKind.STATE,
+                    content=f"{value.content.text} recorded",
+                    subject=value.content.text.split(" prefers ")[0],
+                    predicate="preferred_drink",
+                    value=value.content.text.split(" prefers ")[1],
+                    confidence=0.9,
+                ),
+            )
+            for value in inputs
+        )
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_claim_about_a_named_person_binds_to_them_and_converges_on_one_lineage(
+    tmp_path: Path,
+) -> None:
+    """Section C: the kernel stamps the binding, and the binding is what makes one subject.
+
+    The two proposals spell the person differently on purpose. Only the binding can make them
+    one lineage, so a supersede works across turns that disagree about capitalization.
+    """
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        former=_SubjectFormer(),
+        identity_link_min_assets=1,
+        minimum_relevance=0,
+    ) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+        memory.register_identity(identity_id, "Li")
+
+        memory.add("Li prefers tea")
+        memory.add("  LI  prefers coffee")
+
+        claims = [
+            item
+            for item in memory.list().items
+            if item.context is not None and item.context.kind is MemoryKind.STATE
+        ]
+        contexts = [item.context for item in claims]
+        assert claims and all(context is not None for context in contexts)
+        assert {context.identity_id for context in contexts if context} == {identity_id}
+        assert len({context.lineage_id for context in contexts if context}) == 1
+        # A claim about somebody nobody has named stays unbound.
+        memory.add("Mei prefers water")
+        unbound = [
+            item.context
+            for item in memory.list().items
+            if item.context is not None
+            and item.context.kind is MemoryKind.STATE
+            and item.context.subject == "Mei"
+        ]
+        assert unbound and unbound[0] is not None and unbound[0].identity_id is None
+
+
+def test_compiled_context_reports_a_person_who_is_present_but_unnamed(tmp_path: Path) -> None:
+    """Scenario step 2: a stranger in the room must not be silently missing from context."""
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        minimum_relevance=0,
+    ) as memory:
+        record = memory.add(Blob(b"red stranger video", "video/mp4", "stranger.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+        speaker_id = memory.speech(record.id)[0].speaker_id
+
+        budget = ContextBudget(max_chars=40_000)
+        bundle = memory.compile("red", budget=budget)
+
+        provisional = [entry for entry in bundle.actors if isinstance(entry, ProvisionalActor)]
+        assert {entry.identity_id for entry in provisional} == {identity_id, speaker_id}
+        assert all(entry.memory_ids == (record.id,) for entry in provisional)
+        # A provisional entry is not a hit and buys no item slot.
+        assert all(hit.id != identity_id for hit in bundle.hits)
+        assert f"[{identity_id}] unnamed person present (provisional identity" in bundle.render()
+
+        memory.register_identity(identity_id, "Li")
+        named = memory.compile("red", budget=budget)
+
+    assert [entry.identity_id for entry in named.actors if isinstance(entry, ProvisionalActor)] == [
+        speaker_id
+    ]

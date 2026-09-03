@@ -925,14 +925,28 @@ class SpeakerSegment:
 
 @dataclass(frozen=True, slots=True)
 class IdentityProfile:
-    """What a caller has registered about one recognized person."""
+    """What a caller has registered about one recognized person.
+
+    `confirmed` and `evidence_ids` are derived, never stored: a person is confirmed exactly
+    while a visible naming assertion names them, and the evidence is what that assertion
+    cites. An unconfirmed person is provisional -- present, recognized, not yet named -- which
+    is a different thing from an unknown ID, and the difference decides what an agent may say.
+    """
 
     identity_id: str
     name: str | None = None
     relationship: str | None = None
+    confirmed: bool = False
+    evidence_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        object.__setattr__(self, "confirmed", bool(self.confirmed))
+        object.__setattr__(
+            self,
+            "evidence_ids",
+            tuple(_text(value, "evidence id") for value in self.evidence_ids),
+        )
         for label in ("name", "relationship"):
             value = getattr(self, label)
             if value is None:
@@ -1489,7 +1503,11 @@ class Page:
 class ContextBudget:
     """The size, type, confidence, and freshness bounds one context compilation may spend."""
 
-    max_chars: int = 6000
+    # Wide enough to admit one video memory. A video part is charged twelve thousand characters
+    # of text equivalent, so a smaller ceiling silently omits every video record it ranks: the
+    # selector skips a hit that cannot fit rather than truncating it, and reports it as omitted.
+    # An embodied deployment's primary modality must fit the default, not require tuning first.
+    max_chars: int = 24_000
     max_items: int = 24
     memory_types: frozenset[MemoryType] | None = None
     min_confidence: float = 0.0
@@ -1534,13 +1552,36 @@ class ContextConflict:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ProvisionalActor:
+    """One recognized person in the compiled evidence whom no visible assertion names.
+
+    A stranger in the room is not a stranger missing from context. This carries the identity
+    and the included memories that observed them, and nothing else: there is no name to carry,
+    which is the whole point. It is not a hit, so it costs no budget and occupies no item slot.
+    """
+
+    identity_id: str
+    memory_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        if not self.memory_ids:
+            raise ValidationError("a provisional actor names at least one observing memory")
+        object.__setattr__(
+            self,
+            "memory_ids",
+            tuple(_text(value, "memory id") for value in self.memory_ids),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ContextBundle:
     """One bounded, structured context view compiled for a goal."""
 
     goal: str
     reference_at: datetime
     budget: ContextBudget
-    actors: tuple[SearchHit, ...]
+    actors: tuple[SearchHit | ProvisionalActor, ...]
     episodes: tuple[SearchHit, ...]
     facts: tuple[SearchHit, ...]
     procedures: tuple[SearchHit, ...]
@@ -1555,8 +1596,16 @@ class ContextBundle:
 
     @property
     def hits(self) -> tuple[SearchHit, ...]:
-        """Every included hit in rank order, without duplicates."""
-        merged = {hit.id: hit for _heading, section in self._sections() for hit in section}
+        """Every included hit in rank order, without duplicates.
+
+        A provisional actor is not a hit: it is a person the evidence observed, not evidence.
+        """
+        merged = {
+            entry.id: entry
+            for _heading, section in self._sections()
+            for entry in section
+            if isinstance(entry, SearchHit)
+        }
         return tuple(sorted(merged.values(), key=lambda hit: (-hit.score, hit.id)))
 
     def render(self) -> str:
@@ -1573,7 +1622,7 @@ class ContextBundle:
             if not section:
                 continue
             lines.extend(("", f"## {heading}"))
-            lines.extend(_hit_line(hit) for hit in section)
+            lines.extend(_section_line(entry) for entry in section)
         if self.conflicts:
             lines.extend(("", "## Conflicts"))
             lines.extend(_conflict_line(conflict) for conflict in self.conflicts)
@@ -1581,7 +1630,7 @@ class ContextBundle:
             lines.extend(("", f"Omitted: {self.omitted} lower-ranked candidates"))
         return "\n".join(lines)
 
-    def _sections(self) -> tuple[tuple[str, tuple[SearchHit, ...]], ...]:
+    def _sections(self) -> tuple[tuple[str, tuple[SearchHit | ProvisionalActor, ...]], ...]:
         """Return the sections in their fixed rendering order."""
         return (
             ("Actors", self.actors),
@@ -1591,6 +1640,13 @@ class ContextBundle:
             ("Affect", self.affect),
             ("Traits", self.traits),
         )
+
+
+def _section_line(entry: SearchHit | ProvisionalActor) -> str:
+    if isinstance(entry, SearchHit):
+        return _hit_line(entry)
+    seen = ", ".join(f"[{memory_id}]" for memory_id in entry.memory_ids)
+    return f"- [{entry.identity_id}] unnamed person present (provisional identity; seen in {seen})"
 
 
 def _hit_line(hit: SearchHit) -> str:

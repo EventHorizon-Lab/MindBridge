@@ -20,6 +20,7 @@ from mindbridge.types import (
     MemoryKind,
     MemoryType,
     Modality,
+    ProvisionalActor,
     SearchHit,
 )
 
@@ -78,8 +79,15 @@ def compile_context(
     *,
     budget: ContextBudget,
     reference_at: datetime,
+    provisional: Mapping[str, Sequence[str]] = MappingProxyType({}),
 ) -> ContextBundle:
-    """Partition, filter, and budget ranked hits into one bundle."""
+    """Partition, filter, and budget ranked hits into one bundle.
+
+    `provisional` maps a memory ID to the recognized people it observed whom no visible naming
+    assertion names. The kernel resolves that, deterministically, before calling; the compiler
+    only keeps the entries whose evidence actually made it into the bundle, so the bundle never
+    reports a person the reader cannot see the evidence for.
+    """
     candidates = tuple(hit for hit in hits if _admits(hit, budget, reference_at))
     sections = _select(candidates, budget)
     included = tuple(hit for name in _SECTIONS for hit in sections[name])
@@ -88,7 +96,7 @@ def compile_context(
         goal=goal,
         reference_at=reference_at,
         budget=budget,
-        actors=sections["actors"],
+        actors=(*sections["actors"], *_provisional_actors(included, provisional)),
         episodes=sections["episodes"],
         facts=sections["facts"],
         procedures=sections["procedures"],
@@ -208,4 +216,28 @@ def _frames(hits: Sequence[SearchHit]) -> tuple[str, ...]:
                 if hit.context is not None and hit.context.spatial is not None
             }
         )
+    )
+
+
+def _provisional_actors(
+    hits: Sequence[SearchHit],
+    provisional: Mapping[str, Sequence[str]],
+) -> tuple[ProvisionalActor, ...]:
+    """Name every unnamed person the included evidence observed, in identity order.
+
+    These are appended to the ranked actors rather than competing with them: an unnamed person
+    earned no hit slot and costs no budget, and dropping them would leave an agent unable to
+    say that somebody it does not recognize is in the room.
+    """
+    if not provisional:
+        return ()
+    observed: dict[str, list[str]] = {}
+    for hit in hits:
+        for identity_id in provisional.get(hit.id, ()):
+            memory_ids = observed.setdefault(identity_id, [])
+            if hit.id not in memory_ids:
+                memory_ids.append(hit.id)
+    return tuple(
+        ProvisionalActor(identity_id=identity_id, memory_ids=tuple(memory_ids))
+        for identity_id, memory_ids in sorted(observed.items())
     )

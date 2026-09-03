@@ -2,8 +2,8 @@
 
 ## Surface
 
-The optional MCP adapter exposes exactly fifteen typed tools over one injected synchronous
-`Memory`.
+The optional MCP adapter exposes fifteen typed tools over one injected synchronous `Memory`, or
+ten when the host builds it with `identity_operations=False`.
 It validates tool input, calls the matching SDK operation, and returns structured public values.
 It does not own storage, provider selection, or the injected memory. Finalized media arrives
 through ordinary content parts; live audio and vision packet ingestion, and `StreamEvent`
@@ -15,6 +15,14 @@ its next turn, ask who spoke and who was seen, name them, reverse a wrong face-a
 erase a person on request, and record which memories were useful. `build_mcp_server` runs
 inside the process that holds the `Memory` it is given and every tool is one call on it, so an
 embodied operation is no less reachable here than `add_memory` is.
+
+Naming a person is host authority. `register_speaker` and `register_identity` assert a name on
+the host's behalf: the assertion is a versioned memory record, it is written to the operation
+log, and it is reversible, and the tool descriptions say so. A host that does not want an agent
+holding that authority builds the server with `identity_operations=False`; then
+`register_speaker`, `register_identity`, `get_identity`, `unlink_identity` and `forget_identity`
+are never registered, calling one fails as an unknown tool, and the server instructions say the
+identity operations stay with the process that owns the memory.
 
 ## Start the adapter
 
@@ -188,10 +196,11 @@ Successful calls populate MCP `structuredContent`:
 | `PageResult` | `items`, `next_cursor` |
 | `ContextBudgetResult` | `max_chars`, `max_items`, `memory_types` or `null`, `min_confidence`, `freshness_seconds` |
 | `ContextConflictResult` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
-| `ContextBundleResult` | `goal`, `reference_at`, `budget`, the `SearchHitResult` arrays `actors`, `episodes`, `facts`, `procedures`, `affect`, `traits`, plus `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`, `rendered` |
+| `ContextBundleResult` | `goal`, `reference_at`, `budget`, the `SearchHitResult` arrays `episodes`, `facts`, `procedures`, `affect`, `traits`, the mixed `actors` array of `SearchHitResult` and `ProvisionalActorResult`, plus `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`, `rendered` |
+| `ProvisionalActorResult` | `identity_id`, `memory_ids` |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
 | `FaceObservation` | `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
-| `IdentityProfile` | `identity_id`, `name`, `relationship` |
+| `IdentityProfile` | `identity_id`, `name`, `relationship`, `confirmed`, `evidence_ids` |
 | `IdentityErasure` | `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`, `face_observations`, `speech_segments` |
 
 The last four are the SDK dataclasses `Memory.speech`, `Memory.faces`, `Memory.identity`, and
@@ -210,7 +219,7 @@ described above.
 
 ### Validation and errors
 
-Only the fifteen documented names and their exact top-level arguments are accepted. An unknown
+Only the documented names and their exact top-level arguments are accepted. An unknown
 tool or top-level argument returns `validation_error/unknown_field`; schema and SDK input failures return
 `validation_error/input_invalid`. Unknown values are not echoed.
 
