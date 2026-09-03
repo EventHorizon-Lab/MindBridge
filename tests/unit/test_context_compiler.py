@@ -29,6 +29,7 @@ from mindbridge import (
     Modality,
     ModelInput,
     ObservationContext,
+    ProvisionalActor,
     RetrievalScope,
     SearchHit,
     SpatialAnchor,
@@ -141,6 +142,37 @@ def test_budget_defaults_are_the_documented_ones() -> None:
     assert budget.max_latency_ms is None
 
 
+def test_the_default_budget_admits_one_video_memory() -> None:
+    """An omni-modal product whose default budget cannot hold its primary modality is broken.
+
+    The selector skips a hit that does not fit rather than truncating it, so a ceiling below one
+    video part's charge does not shrink video evidence, it removes all of it and reports the
+    records as omitted. A caller would have to discover that by tuning.
+    """
+    video = _hit(
+        "video_1",
+        content="the neighbour is at the door",
+        modality=Modality.VIDEO,
+        assets=(
+            AssetRef(
+                id="asset-video",
+                modality=Modality.VIDEO,
+                media_type="video/mp4",
+                size_bytes=1,
+                sha256="a" * 64,
+                path=Path("door.mp4"),
+            ),
+        ),
+    )
+    assert evidence_cost(video) <= ContextBudget().max_chars
+
+    bundle = compile_context(
+        "who is at the door", (video,), budget=ContextBudget(), reference_at=REFERENCE
+    )
+    assert [hit.id for hit in bundle.hits] == ["video_1"]
+    assert bundle.omitted == 0
+
+
 # ---------------------------------------------------------------------------------------------
 # Partitioning and selection
 
@@ -159,7 +191,7 @@ def test_hits_partition_by_memory_type_and_kind() -> None:
         )
     )
 
-    assert [hit.id for hit in bundle.actors] == ["actor"]
+    assert [hit.id for hit in bundle.actors if isinstance(hit, SearchHit)] == ["actor"]
     # Relationships and scene state are the doc's own words and now their own sections; `facts`
     # keeps only what is neither, so the two are no longer indistinguishable inside it.
     assert [hit.id for hit in bundle.relationships] == ["relation"]
@@ -907,3 +939,62 @@ def test_the_cli_command_serializes_the_bundle(tmp_path: Path) -> None:
     }
     assert len(document["facts"]) == 1  # type: ignore[arg-type]
     assert "Budget: " in str(document["rendered"])
+
+
+# ---------------------------------------------------------------------------------------------
+# Provisional actors
+
+
+def test_a_provisional_actor_joins_the_actors_without_taking_a_hit_slot() -> None:
+    """An unnamed person is reported beside the ranked actors, and costs nothing."""
+    bundle = compile_context(
+        "who is in the room",
+        (
+            _hit("actor", kind=MemoryKind.ENTITY),
+            _hit("episode", kind=MemoryKind.EVENT, memory_type=MemoryType.EPISODIC),
+        ),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        provisional={"episode": ("identity_2", "identity_1"), "omitted": ("identity_3",)},
+    )
+
+    assert [entry.id for entry in bundle.actors if isinstance(entry, SearchHit)] == ["actor"]
+    assert [
+        (entry.identity_id, entry.memory_ids)
+        for entry in bundle.actors
+        if isinstance(entry, ProvisionalActor)
+    ] == [("identity_1", ("episode",)), ("identity_2", ("episode",))]
+    # Not a hit, not a budgeted item, and not the reason anything was omitted.
+    assert [hit.id for hit in bundle.hits] == ["actor", "episode"]
+    assert (bundle.omitted, bundle.chars) == (0, sum(evidence_cost(hit) for hit in bundle.hits))
+
+
+def test_a_provisional_actor_of_omitted_evidence_is_not_reported() -> None:
+    """The bundle never claims a person the reader cannot see the evidence for."""
+    bundle = compile_context(
+        "who is in the room",
+        (_hit("expensive", content="x" * 500),),
+        budget=ContextBudget(max_chars=10),
+        reference_at=REFERENCE,
+        provisional={"expensive": ("identity_1",)},
+    )
+
+    assert bundle.actors == ()
+    assert bundle.omitted == 1
+
+
+def test_rendering_labels_a_provisional_actor_plainly() -> None:
+    bundle = compile_context(
+        "who is in the room",
+        (_hit("clip", kind=MemoryKind.ENTITY),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        provisional={"clip": ("identity_1",)},
+    )
+    rendered = bundle.render().splitlines()
+
+    assert rendered[-1] == (
+        "- [identity_1] unnamed person present (provisional identity; seen in [clip])"
+    )
+    assert "1/24 items" in bundle.render()
+    assert bundle.render() == bundle.render()

@@ -208,6 +208,11 @@ class ContextConflictResponse(_ResponseModel):
     memory_ids: tuple[str, ...]
 
 
+class ProvisionalActorResponse(_ResponseModel):
+    identity_id: str
+    memory_ids: tuple[str, ...]
+
+
 class ContextUnknownResponse(_ResponseModel):
     kind: ContextUnknownKind
     detail: str
@@ -217,7 +222,9 @@ class ContextBundleResponse(_ResponseModel):
     goal: str
     reference_at: AwareDatetime
     budget: ContextBudgetResponse
-    actors: tuple[SearchHitResponse, ...]
+    # A recognized person in the evidence whom no visible naming assertion names is reported
+    # here beside the ranked entity hits, labelled, rather than omitted.
+    actors: tuple[SearchHitResponse | ProvisionalActorResponse, ...]
     relationships: tuple[SearchHitResponse, ...]
     scene: tuple[SearchHitResponse, ...]
     episodes: tuple[SearchHitResponse, ...]

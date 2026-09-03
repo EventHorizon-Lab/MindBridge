@@ -284,15 +284,17 @@ defaults or justify superiority claims.
    model.
 3. Generalize formation into one bounded memory-management loop with structured proposals,
    replay, rollback, and privacy tests. Done: the operation log and authority tests
-   (`consolidate()`, `forget()`, `rollback()`, `operations()`), the durable trigger
+   (`consolidate()`, `forget()`, `rollback()`, `operations()`), the `identify` intent that
+   makes naming a person an evidence-bearing, reversible claim, the durable trigger
    (`consolidation_candidates()`), consolidation forgetting as one reversible operation, the
    declarative `consolidation` slot that makes the loop reachable without a Python app loader,
    kernel rejection of proposals that name records the backend was not shown, of partial
    multi-target operations, and of proposals whose targets moved before the commit, native media
    in the bundled consolidation backend's input, and replay of a logged sequence against a fresh
-   store, covered as a test rather than as an `apply(operation)` surface. Open: companion-scenario privacy tests; a post-hoc outcome field,
-   without which only rollback success of the slow-loop measurements is derivable; and identity
-   merge and split, which stay outside the operation log until the identity-governance round.
+   store, covered as a test rather than as an `apply(operation)` surface. Open: companion-scenario
+   privacy tests; a post-hoc outcome field, without which only rollback success of the slow-loop
+   measurements is derivable; and identity merge and split, which stay outside the operation
+   log until the identity-governance round.
 4. Add a context compiler whose output improves downstream tasks within declared budgets. Done
    for selection, budgeting, the latency deadline, and the explicit unknowns a thin bundle
    reports: `compile()`. Open: a downstream-task measurement against the no-memory,

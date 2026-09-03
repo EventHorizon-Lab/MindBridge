@@ -444,6 +444,7 @@ class MemoryContext:
     supersedes_id: str | None = None
     model_id: str | None = None
     recipe: str | None = None
+    identity_id: str | None = None
     spatial: SpatialContext | None = None
     cue_modality: Modality | None = None
     valence: float | None = None
@@ -478,6 +479,7 @@ class MemoryContext:
             "supersedes_id",
             "model_id",
             "recipe",
+            "identity_id",
         ):
             object.__setattr__(
                 self,
@@ -496,6 +498,29 @@ class MemoryContext:
         object.__setattr__(self, "arousal", _bounded_optional(self.arousal, "arousal", 0, 1))
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class IdentityClaim:
+    """Who one recognized person is, as an `IDENTIFY` operation claims it.
+
+    The kernel, not the backend, turns this into the typed ENTITY assertion `identities.name`
+    projects, so a proposal only has to name the identity and cite its evidence.
+    """
+
+    identity_id: str
+    name: str
+    relationship: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        for label, value in (("name", self.name), ("relationship", self.relationship)):
+            if value is None and label == "relationship":
+                continue
+            text = _text(value, f"identity {label}")
+            if len(text) > 255 or not text.isprintable():
+                raise ValidationError(f"identity {label} must be at most 255 printable characters")
+            object.__setattr__(self, label, text)
+
+
 class MemoryIntent(str, Enum):
     """One memory-management operation the agentic control plane may propose."""
 
@@ -503,6 +528,7 @@ class MemoryIntent(str, Enum):
     CONSOLIDATE = "consolidate"
     CORRECT = "correct"
     FORGET = "forget"
+    IDENTIFY = "identify"
 
 
 class MemoryTrigger(str, Enum):
@@ -525,9 +551,10 @@ class MemoryOperation:
     evidence_ids: tuple[str, ...] = ()
     target_ids: tuple[str, ...] = ()
     proposal: FormationProposal | None = None
+    claim: IdentityClaim | None = None
     rationale: str | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901 - intent-specific boundary validation
         if not isinstance(self.intent, MemoryIntent):
             try:
                 object.__setattr__(self, "intent", MemoryIntent(self.intent))
@@ -542,6 +569,18 @@ class MemoryOperation:
         )
         if self.proposal is not None and not isinstance(self.proposal, FormationProposal):
             raise ValidationError("memory operation proposal is invalid")
+        if self.claim is not None and not isinstance(self.claim, IdentityClaim):
+            raise ValidationError("memory operation claim is invalid")
+        if self.intent is MemoryIntent.IDENTIFY:
+            # A host naming somebody cites nothing, so an empty evidence set is well formed here
+            # and it is the kernel that requires cited evidence of an agent's proposal.
+            if self.claim is None or self.target_ids or self.proposal is not None:
+                raise ValidationError(
+                    "identify requires a claim and cites evidence, and names no target"
+                )
+            return
+        if self.claim is not None:
+            raise ValidationError(f"{self.intent.value} must not carry a claim")
         if self.intent is MemoryIntent.CONSOLIDATE:
             # `target_ids` on a consolidation is consolidation forgetting: the sources to retire
             # from ordinary recall once the derived record exists. The kernel enforces the
@@ -941,14 +980,28 @@ class SpeakerSegment:
 
 @dataclass(frozen=True, slots=True)
 class IdentityProfile:
-    """What a caller has registered about one recognized person."""
+    """What a caller has registered about one recognized person.
+
+    `confirmed` and `evidence_ids` are derived, never stored: a person is confirmed exactly
+    while a visible naming assertion names them, and the evidence is what that assertion
+    cites. An unconfirmed person is provisional -- present, recognized, not yet named -- which
+    is a different thing from an unknown ID, and the difference decides what an agent may say.
+    """
 
     identity_id: str
     name: str | None = None
     relationship: str | None = None
+    confirmed: bool = False
+    evidence_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        object.__setattr__(self, "confirmed", bool(self.confirmed))
+        object.__setattr__(
+            self,
+            "evidence_ids",
+            tuple(_text(value, "evidence id") for value in self.evidence_ids),
+        )
         for label in ("name", "relationship"):
             value = getattr(self, label)
             if value is None:
@@ -1663,6 +1716,29 @@ class ContextConflict:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ProvisionalActor:
+    """One recognized person in the compiled evidence whom no visible assertion names.
+
+    A stranger in the room is not a stranger missing from context. This carries the identity
+    and the included memories that observed them, and nothing else: there is no name to carry,
+    which is the whole point. It is not a hit, so it costs no budget and occupies no item slot.
+    """
+
+    identity_id: str
+    memory_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        if not self.memory_ids:
+            raise ValidationError("a provisional actor names at least one observing memory")
+        object.__setattr__(
+            self,
+            "memory_ids",
+            tuple(_text(value, "memory id") for value in self.memory_ids),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ContextUnknown:
     """One thing the request implied a bundle might contain that this bundle does not.
 
@@ -1688,7 +1764,7 @@ class ContextBundle:
     goal: str
     reference_at: datetime
     budget: ContextBudget
-    actors: tuple[SearchHit, ...]
+    actors: tuple[SearchHit | ProvisionalActor, ...]
     relationships: tuple[SearchHit, ...]
     scene: tuple[SearchHit, ...]
     episodes: tuple[SearchHit, ...]
@@ -1709,8 +1785,16 @@ class ContextBundle:
 
     @property
     def hits(self) -> tuple[SearchHit, ...]:
-        """Every included hit in rank order, without duplicates."""
-        merged = {hit.id: hit for _heading, section in self._sections() for hit in section}
+        """Every included hit in rank order, without duplicates.
+
+        A provisional actor is not a hit: it is a person the evidence observed, not evidence.
+        """
+        merged = {
+            entry.id: entry
+            for _heading, section in self._sections()
+            for entry in section
+            if isinstance(entry, SearchHit)
+        }
         return tuple(sorted(merged.values(), key=lambda hit: (-hit.score, hit.id)))
 
     def render(self) -> str:
@@ -1727,7 +1811,7 @@ class ContextBundle:
             if not section:
                 continue
             lines.extend(("", f"## {heading}"))
-            lines.extend(_hit_line(hit) for hit in section)
+            lines.extend(_section_line(entry) for entry in section)
         if self.conflicts:
             lines.extend(("", "## Conflicts"))
             included_ids = {hit.id for hit in self.hits}
@@ -1739,7 +1823,7 @@ class ContextBundle:
             lines.extend(("", f"Omitted: {self.omitted} lower-ranked candidates"))
         return "\n".join(lines)
 
-    def _sections(self) -> tuple[tuple[str, tuple[SearchHit, ...]], ...]:
+    def _sections(self) -> tuple[tuple[str, tuple[SearchHit | ProvisionalActor, ...]], ...]:
         """Return the sections in their fixed rendering order."""
         return (
             ("Actors", self.actors),
@@ -1751,6 +1835,13 @@ class ContextBundle:
             ("Affect", self.affect),
             ("Traits", self.traits),
         )
+
+
+def _section_line(entry: SearchHit | ProvisionalActor) -> str:
+    if isinstance(entry, SearchHit):
+        return _hit_line(entry)
+    seen = ", ".join(f"[{memory_id}]" for memory_id in entry.memory_ids)
+    return f"- [{entry.identity_id}] unnamed person present (provisional identity; seen in {seen})"
 
 
 def _hit_line(hit: SearchHit) -> str:

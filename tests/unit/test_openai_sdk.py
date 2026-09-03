@@ -54,6 +54,7 @@ from mindbridge.types import (
     AssetRef,
     EvidenceBasis,
     FormationProposal,
+    IdentityClaim,
     MemoryContext,
     MemoryIntent,
     MemoryKind,
@@ -532,6 +533,118 @@ def test_consolidation_refuses_an_ungrounded_or_malformed_operation(
 
     assert failure.value.reason == "response_invalid"
     assert failure.value.stage == "consolidate"
+
+
+def test_consolidation_renders_identities_and_resolves_a_naming_claim() -> None:
+    """A claim names the person by an identity ID the evidence rendering actually showed.
+
+    Evidence stays cited by index, so no memory identifier is ever written. The identity ID is
+    the one identifier the model copies, and it can only copy one it was shown.
+    """
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert "identify names who a recognized person is" in payload["messages"][0]["content"]
+        shown = json.loads(payload["messages"][1]["content"])
+        assert shown["evidence"][0]["speaker_ids"] == ["identity_7"]
+        assert shown["evidence"][0]["face_identity_ids"] == ["identity_7"]
+        assert shown["evidence"][1]["speaker_ids"] == []
+        return _completion(
+            {
+                "operations": [
+                    {
+                        "intent": "identify",
+                        "claim": {
+                            "identity_id": "identity_7",
+                            "name": "Li",
+                            "relationship": "the neighbour",
+                        },
+                        "evidence": [0],
+                        "rationale": "the stranger introduced themselves",
+                    }
+                ]
+            }
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client))
+        (identify,) = model.consolidate(_identity_evidence(), trigger=MemoryTrigger.EVIDENCE)
+
+    assert identify.intent is MemoryIntent.IDENTIFY
+    assert identify.evidence_ids == ("clip-1",)
+    assert identify.target_ids == ()
+    assert identify.claim == IdentityClaim(
+        identity_id="identity_7",
+        name="Li",
+        relationship="the neighbour",
+    )
+
+
+@pytest.mark.parametrize(
+    "claim",
+    (
+        # An identity nobody in the shown evidence has is the same miscount as a bad index.
+        {"identity_id": "identity_9", "name": "Li"},
+        {"identity_id": 7, "name": "Li"},
+        {"name": "Li"},
+        {"identity_id": "identity_7"},
+        {"identity_id": "identity_7", "name": "Li", "confidence": 0.5},
+        {"identity_id": "identity_7", "name": "bad\nname"},
+    ),
+)
+def test_consolidation_refuses_a_naming_claim_the_evidence_cannot_ground(
+    claim: dict[str, object],
+) -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return _completion(
+            {"operations": [{"intent": "identify", "claim": claim, "evidence": [0]}]}
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client))
+        with pytest.raises(ModelError) as failure:
+            model.consolidate(_identity_evidence(), trigger=MemoryTrigger.MANUAL)
+
+    assert failure.value.reason == "response_invalid"
+    assert failure.value.stage == "consolidate"
+
+
+def _identity_evidence() -> tuple[MemoryRecord, ...]:
+    speech = json.dumps(
+        {
+            "asset_id": "a" * 64,
+            "segments": [
+                {
+                    "start_ms": 0,
+                    "end_ms": 900,
+                    "text": "I am Li, I live next door",
+                    "speaker_id": "identity_7",
+                    "speaker_name": None,
+                    "identity_score": 0.8,
+                }
+            ],
+        },
+        separators=(",", ":"),
+    )
+    faces = json.dumps(
+        {
+            "asset_id": "a" * 64,
+            "identities": [{"identity_id": "identity_7", "identity_name": None}],
+        },
+        separators=(",", ":"),
+    )
+    return (
+        MemoryRecord(
+            id="clip-1",
+            content=(
+                "a stranger at the door\n\n"
+                f"[speech identities:{'a' * 64}]\n{speech}\n\n"
+                f"[face identities:{'a' * 64}]\n{faces}"
+            ),
+            created_at=NOW,
+        ),
+        MemoryRecord(id="parcel-1", content="the courier left a parcel", created_at=NOW),
+    )
 
 
 def test_consolidation_carries_declared_evidence_media_as_native_parts(tmp_path: Path) -> None:

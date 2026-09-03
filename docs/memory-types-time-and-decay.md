@@ -129,6 +129,32 @@ sources support the same normalized claim; a trusted `USER_STATEMENT` can be vis
 Deleting evidence recomputes derived confidence and visibility, and removes a derived record when
 no support remains. Source observations are deleted only by an explicit caller action.
 
+### Naming a person is a typed assertion
+
+`register_speaker` and `register_identity` write an `ENTITY` assertion whose
+`MemoryContext.identity_id` binds it to the recognized person, whose `subject` is the name, and
+whose `value` is the recorded relationship. Its basis is `USER_STATEMENT`, so it is visible at
+once, and it needs no former: naming rests on the host's authority, not on a model.
+
+Every naming assertion about one identity shares a lineage keyed on that identity rather than on
+the spelling of the name, so renaming the person supersedes the previous assertion, exactly as a
+new `STATE` supersedes the one it overlaps. The retracted name stops reaching active retrieval;
+the retired version stays in the log.
+
+`identities.name` and `identities.relationship` are a projection of the current visible naming
+assertion, recomputed the way evidence recomputes confidence and visibility. Every recompute
+rewrites the indexed transcript text in the same commit, so what search matches and what
+`identity()` reports are always the same assertion.
+
+Naming is logged like any other control-plane operation with `MemoryTrigger.MANUAL`, so
+`operations()` shows it and `rollback(operation_id)` retracts the assertion, restores the one it
+superseded, and repaints both the projection and the index. Registering a name that already
+stands changes nothing and logs nothing.
+
+The consequence is deliberate and visible: naming a person creates a searchable memory record, and
+it appears in `list()` and `search()` results. That is what makes a name retrievable knowledge
+rather than a label on a registry row.
+
 **Guidance:** Keep raw observations even when an interpretation changes. Correct typed state with
 new evidence or remove the incorrect derived record; do not present a derived rewrite as the
 original observation.
@@ -257,6 +283,17 @@ first: `rollback()` returns `False` for an operation a standing later one has bu
 | `CONSOLIDATE` | Derive one new record citing several sources. The sources stay as evidence, and stay in recall unless the same proposal names them in `target_ids`. |
 | `CORRECT` | Retire the current version of a bad derived inference. History is preserved, not overwritten. |
 | `FORGET` | Set `forgotten_at`. Recall skips the record; audit keeps it. |
+| `IDENTIFY` | Name a recognized person. The kernel turns the `IdentityClaim` into an `ENTITY` assertion bound to that identity, and `identities.name` is a projection of the assertion currently visible. |
+
+`IDENTIFY` is checked hardest, because a name is the one claim that changes what an agent will
+say out loud about somebody: the identity must exist and at least one cited memory must actually
+contain that person through a speech or face observation, so a name cannot be pinned on someone
+from evidence that never contained them. A proposed name also carries basis `MODEL_INFERENCE`,
+so it stays hidden until two independent evidence groups support it, and `identities.name` keeps
+projecting whatever is visible instead. `register_identity` names somebody on the host's
+authority and is visible at once. `REINFORCE`, `CORRECT`, and `FORGET` refuse a naming assertion
+outright; the way to retract a name is `rollback()` of the `IDENTIFY` that asserted it, which
+recomputes both the projected name and the indexed speech text.
 
 The backend proposes and never writes. Each proposal is validated against the shown evidence set
 and its intent's rules, then committed in its own transaction together with an append-only log

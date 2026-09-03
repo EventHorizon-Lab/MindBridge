@@ -200,11 +200,36 @@ boxes and local identity IDs. Results are cached under stable model-space recipe
 When one asset contains exactly one eligible voice and one eligible face, MindBridge records
 co-occurrence evidence. A face/voice merge requires corroboration across distinct assets (two by
 default), preserves the merged-away ID as an alias, and can be reversed with `unlink_identity`.
+Reversing a merge restores the alias as an unnamed identity and repaints the indexed transcript
+projection in the same commit, so no stored text keeps attributing the words to the other person.
 Applications can attach a name and relationship with `register_speaker` or `register_identity` and
 resolve either current IDs or aliases with `identity`.
 
-`forget_identity` removes the person's biometric exemplars, aliases, and indexed name while
-retaining the surrounding memories, media, and transcript words. It is intentionally different from
+Naming a person records an `ENTITY` assertion bound to that identity, and the recorded name and
+relationship are a projection of it. A name is therefore retrievable knowledge and not a label on
+a registry row: it needs no formation backend, it is visible at once because the host asserted it,
+it is listed by `operations()` and reversed by `rollback()`, and every recompute rewrites the
+indexed transcript text in the same commit. The visible consequence is that naming a person adds
+a searchable memory record, which appears in `list()` and `search()` results. See
+[typed assertions](memory-types-time-and-decay.md#naming-a-person-is-a-typed-assertion).
+
+The projection is recomputed by every path that can change what a bound assertion says,
+including deleting the assertion record like any other memory, so the registry and the indexed
+text never keep a name nothing asserts. Typed claims about a named person are bound to them:
+the kernel resolves the binding from the assertion's canonical subject, deterministically and
+never from a model's choice, so claims about one person converge on one subject even when a
+turn spells the name differently, and undoing a wrong merge re-attributes or unbinds the claims
+made while two people were one instead of leaving them on the wrong person.
+
+A recognized person with no visible naming assertion is *provisional*. `IdentityProfile` reports
+it as `confirmed=False` with the naming evidence in `evidence_ids`, and a compiled context bundle
+lists them in `actors` as a labelled `ProvisionalActor`, so an agent can say that somebody it does
+not recognize is present rather than omitting them. Naming stays host authority: the MCP adapter
+says so in the tool descriptions and can withhold the identity tools entirely with
+`build_mcp_server(memory, identity_operations=False)`.
+
+`forget_identity` removes the person's biometric exemplars, aliases, naming assertions, and
+indexed name while retaining the surrounding memories, media, and transcript words. It is intentionally different from
 deleting an event. A later encounter can create a new unnamed identity because recognizing a
 forgotten person would require retaining the template that erasure destroys.
 

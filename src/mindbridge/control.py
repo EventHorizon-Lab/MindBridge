@@ -18,6 +18,7 @@ from typing import Any, cast
 from mindbridge.exceptions import StorageError
 from mindbridge.types import (
     FormationProposal,
+    IdentityClaim,
     MemoryOperation,
     SpatialContext,
 )
@@ -35,11 +36,13 @@ def load_operation(payload: str) -> MemoryOperation:
         if not isinstance(value, dict):
             raise ValueError
         proposal = value.get("proposal")
+        claim = value.get("claim")
         return MemoryOperation(
             intent=cast(Any, value["intent"]),
             evidence_ids=tuple(value.get("evidence_ids") or ()),
             target_ids=tuple(value.get("target_ids") or ()),
             proposal=None if proposal is None else _proposal(proposal),
+            claim=None if claim is None else _claim(claim),
             rationale=cast(Any, value.get("rationale")),
         )
     except Exception as error:
@@ -54,12 +57,34 @@ def operation_key(operation: MemoryOperation, *, recipe: str | None) -> str:
 
 def _identity(operation: MemoryOperation) -> dict[str, object]:
     proposal = operation.proposal
+    claim = operation.claim
     return {
         "intent": operation.intent.value,
         "evidence_ids": sorted(operation.evidence_ids),
         "target_ids": sorted(operation.target_ids),
         "proposal": None if proposal is None else _proposal_payload(proposal),
+        # Part of the idempotency identity: renaming the same person supersedes rather than
+        # replays, so two claims that differ only in the name must be two operations.
+        "claim": None if claim is None else _claim_payload(claim),
     }
+
+
+def _claim_payload(claim: IdentityClaim) -> dict[str, object]:
+    return {
+        "identity_id": claim.identity_id,
+        "name": claim.name,
+        "relationship": claim.relationship,
+    }
+
+
+def _claim(value: object) -> IdentityClaim:
+    if not isinstance(value, dict):
+        raise ValueError
+    return IdentityClaim(
+        identity_id=cast(Any, value["identity_id"]),
+        name=cast(Any, value["name"]),
+        relationship=cast(Any, value.get("relationship")),
+    )
 
 
 def _proposal_payload(proposal: FormationProposal) -> dict[str, object]:

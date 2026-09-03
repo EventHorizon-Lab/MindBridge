@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import struct
+import unicodedata
 import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -33,7 +34,7 @@ from mindbridge.types import (
     SpeakerSegment,
 )
 
-_SCHEMA_VERSION = 11
+_SCHEMA_VERSION = 12
 _SQLITE_PARAMETER_BATCH = 900
 # Kinds whose claims can contradict inside one lineage. This must stay the set the context
 # compiler reports conflicts for; `tests/unit/test_memory_control_plane.py` asserts they agree,
@@ -286,6 +287,7 @@ CREATE TABLE memory_semantics (
     value TEXT,
     model_id TEXT,
     recipe TEXT,
+    identity_id TEXT REFERENCES identities (identity_id) ON DELETE SET NULL,
     cue_modality TEXT CHECK (
         cue_modality IS NULL OR cue_modality IN ('text', 'image', 'video', 'audio')
     ),
@@ -318,6 +320,8 @@ CREATE INDEX memory_semantics_lineage_idx
     ON memory_semantics (lineage_id, memory_id);
 CREATE INDEX memory_semantics_spatial_idx
     ON memory_semantics (spatial_frame_id, spatial_anchor, memory_id);
+CREATE INDEX memory_semantics_identity_idx
+    ON memory_semantics (identity_id, memory_id);
 
 CREATE TABLE memory_versions (
     memory_id TEXT NOT NULL REFERENCES memory_semantics (memory_id) ON DELETE CASCADE,
@@ -374,7 +378,9 @@ CREATE TABLE IF NOT EXISTS capture_queue (
 CREATE TABLE IF NOT EXISTS memory_operations (
     operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
     operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
-    intent TEXT NOT NULL CHECK (intent IN ('reinforce', 'consolidate', 'correct', 'forget')),
+    intent TEXT NOT NULL CHECK (
+        intent IN ('reinforce', 'consolidate', 'correct', 'forget', 'identify')
+    ),
     trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
     model_id TEXT,
     recipe TEXT,
@@ -388,6 +394,58 @@ CREATE UNIQUE INDEX IF NOT EXISTS memory_operations_active_key_idx
     ON memory_operations (operation_key)
     WHERE rolled_back_at IS NULL;
 """
+
+# SQLite cannot add a REFERENCES column to a populated table with ALTER TABLE unless the value
+# defaults to NULL, which is exactly the shape wanted here: an existing claim is about nobody in
+# particular until something binds it.
+_SEMANTIC_IDENTITY_COLUMN_DDL = """
+ALTER TABLE memory_semantics
+ADD COLUMN identity_id TEXT REFERENCES identities (identity_id) ON DELETE SET NULL
+"""
+
+_SEMANTIC_IDENTITY_INDEX_DDL = """
+CREATE INDEX memory_semantics_identity_idx
+    ON memory_semantics (identity_id, memory_id)
+"""
+
+# Naming a person is its own logged intent, so the log's intent whitelist has to admit it. A
+# CHECK cannot be altered in place, so widening it is the usual copy-and-swap; the rows carry
+# over unchanged because no existing intent name changed.
+_OPERATION_INTENT_REBUILD_DDL = (
+    "ALTER TABLE memory_operations RENAME TO memory_operations_v11",
+    """
+    CREATE TABLE memory_operations (
+        operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
+        intent TEXT NOT NULL CHECK (
+            intent IN ('reinforce', 'consolidate', 'correct', 'forget', 'identify')
+        ),
+        trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
+        model_id TEXT,
+        recipe TEXT,
+        operation_json TEXT NOT NULL,
+        effects_json TEXT NOT NULL,
+        applied_at TEXT NOT NULL,
+        rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at)
+    )
+    """,
+    """
+    INSERT INTO memory_operations (
+        operation_id, operation_key, intent, trigger, model_id, recipe,
+        operation_json, effects_json, applied_at, rolled_back_at
+    )
+    SELECT
+        operation_id, operation_key, intent, trigger, model_id, recipe,
+        operation_json, effects_json, applied_at, rolled_back_at
+    FROM memory_operations_v11
+    """,
+    "DROP TABLE memory_operations_v11",
+    """
+    CREATE UNIQUE INDEX memory_operations_active_key_idx
+        ON memory_operations (operation_key)
+        WHERE rolled_back_at IS NULL
+    """,
+)
 
 _PLACE_COLUMN_DDL = """
 ALTER TABLE memory_records
@@ -409,7 +467,7 @@ CREATE INDEX memory_records_place_idx
     WHERE place_id IS NOT NULL
 """
 
-_SCHEMA_V10 = f"""
+_SCHEMA_V12 = f"""
 BEGIN IMMEDIATE;
 
 CREATE TABLE memory_records (
@@ -476,7 +534,7 @@ CREATE INDEX search_index_queue_order_idx
 
 {_INDEX_TRIGGERS}
 
-PRAGMA user_version = 11;
+PRAGMA user_version = 12;
 COMMIT;
 """
 
@@ -1071,6 +1129,11 @@ class LocalStore:
                     )
             for embedding in supplied_embeddings:
                 self._write_embedding(connection, embedding)
+            _reproject_named_identities(
+                connection,
+                tuple(memory.memory_id for memory in supplied_memories),
+                changed_at=datetime.now(timezone.utc),
+            )
         return tuple(created_flags)
 
     def write_captures(
@@ -1370,6 +1433,12 @@ class LocalStore:
                 supplied_memories,
                 changed_at=completed_at,
             )
+            _reproject_named_identities(
+                connection,
+                tuple(memory.memory_id for memory in supplied_memories)
+                + tuple(memory_id for memory_id, _source, _confidence in evidence),
+                changed_at=completed_at,
+            )
             connection.executemany(
                 """
                 INSERT INTO formation_runs (source_memory_id, recipe, completed_at)
@@ -1464,13 +1533,17 @@ class LocalStore:
         if not math.isfinite(confidence) or not 0 <= confidence <= 1:
             raise ValueError("confidence must be between zero and one")
         with self._transaction() as connection:
-            return _add_memory_evidence(
+            added = _add_memory_evidence(
                 connection,
                 memory_id,
                 source_memory_id,
                 confidence=float(confidence),
                 recorded_at=recorded_at,
             )
+            # Independent evidence is what makes an inferred naming assertion visible, so it is
+            # also what can move the projection.
+            _reproject_named_identities(connection, (memory_id,), changed_at=recorded_at)
+            return added
 
     def apply_control_operation(
         self,
@@ -1527,6 +1600,11 @@ class LocalStore:
             forgotten = _set_forgotten(connection, forget_ids, forgotten_at=operation.applied_at)
             _require_every(forgotten, forget_ids, "forget")
             changed.extend(forgotten)
+            _reproject_named_identities(
+                connection,
+                (*changed, *correct_ids, *forget_ids),
+                changed_at=operation.applied_at,
+            )
             applied = replace(
                 operation,
                 changed_ids=tuple(dict.fromkeys(changed)),
@@ -1542,6 +1620,7 @@ class LocalStore:
         rolled_back_at: datetime,
         retire_evidence: Sequence[tuple[str, str]] = (),
         restore_versions: Sequence[str | tuple[str, int]] = (),
+        retire_versions: Sequence[str] = (),
         clear_forgotten: Sequence[str] = (),
         delete_memory_ids: Sequence[str] = (),
         require_in_force: Sequence[str] = (),
@@ -1552,6 +1631,10 @@ class LocalStore:
         reversible, in which case no reversal is applied. Otherwise the second value lists the
         assets that the deleted records were the last to reference; index cleanup follows through
         the durable outbox.
+
+        `retire_versions` names records whose current version this reversal retires without
+        deleting the record, which is what retracting a naming assertion is: the record and its
+        log row stay readable while `restore_versions` brings back what it displaced.
 
         `require_in_force` names the records this operation put in force. If a later standing
         operation has since superseded one of them, reversing this one would restore a version
@@ -1579,8 +1662,22 @@ class LocalStore:
                 _deleted, orphaned = self._delete_memory(connection, memory_id)
                 unreferenced.extend(orphaned)
             _retire_memory_evidence(connection, retire_evidence, retired_at=reverted_at)
+            # Retired before the restore, so an assertion and the one it displaced are never both
+            # in force: a naming assertion is retracted rather than deleted, because the log row
+            # that recorded it stays readable and the audit trail must show both names.
+            _retire_memory_versions(connection, retire_versions, retired_at=reverted_at)
             _restore_memory_versions(connection, restore_versions, recorded_at=reverted_at)
             _set_forgotten(connection, clear_forgotten, forgotten_at=None)
+            _reproject_named_identities(
+                connection,
+                (
+                    *(memory_id for memory_id, _source in retire_evidence),
+                    *retire_versions,
+                    *(entry if isinstance(entry, str) else entry[0] for entry in restore_versions),
+                    *clear_forgotten,
+                ),
+                changed_at=reverted_at,
+            )
             connection.execute(
                 "UPDATE memory_operations SET rolled_back_at = ? WHERE operation_id = ?",
                 (_datetime_text(reverted_at), operation_id),
@@ -1872,18 +1969,57 @@ class LocalStore:
         if not ids:
             return ()
         with self._transaction() as connection:
-            return _set_forgotten(connection, ids, forgotten_at=forgotten_at)
+            changed = _set_forgotten(connection, ids, forgotten_at=forgotten_at)
+            _reproject_named_identities(
+                connection,
+                changed,
+                changed_at=forgotten_at or datetime.now(timezone.utc),
+            )
+            return changed
 
     def delete_memory(self, memory_id: str) -> bool:
         """Delete a memory; cascading embedding triggers enqueue index deletions."""
         deleted, _assets = self.delete_memory_with_assets(memory_id)
         return deleted
 
-    def delete_memory_with_assets(self, memory_id: str) -> tuple[bool, tuple[StoredAsset, ...]]:
-        """Delete one memory and return its assets that no remaining memory references."""
+    def naming_assertion_identity(self, memory_id: str) -> str | None:
+        """Return the identity one record names, or None when it names nobody.
+
+        A naming assertion is an ordinary memory record, so an ordinary caller can delete it.
+        This is how that caller finds out that it is about to move a projection.
+        """
         _require_identifier(memory_id, "memory_id")
+        with self._connection() as connection:
+            identities = _naming_assertion_identities(connection, (memory_id,))
+        return identities[0] if identities else None
+
+    def delete_memory_with_assets(
+        self,
+        memory_id: str,
+        *,
+        memories: Iterable[StoredMemory] = (),
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> tuple[bool, tuple[StoredAsset, ...]]:
+        """Delete one memory and return its assets that no remaining memory references.
+
+        Pass `memories` and `embeddings` to atomically replace indexed documents in the same
+        commit, which deleting a naming assertion needs: the projection it fed is recomputed
+        here, so the indexed text quoting the name has to be rebuilt with it.
+        """
+        _require_identifier(memory_id, "memory_id")
+        supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
+            memories,
+            embeddings,
+        )
         with self._transaction() as connection:
-            return self._delete_memory(connection, memory_id)
+            deleted, unreferenced = self._delete_memory(connection, memory_id)
+            self._replace_memory_embeddings(
+                connection,
+                supplied_memories,
+                supplied_embeddings,
+                supplied_by_memory,
+            )
+            return deleted, unreferenced
 
     def _delete_memory(
         self,
@@ -1941,6 +2077,12 @@ class LocalStore:
                     )
                 )
         affected_ids = [_row_text(row, "memory_id") for row in dependent_rows]
+        # Read before the delete, and over the dependents too: a derived record whose last
+        # evidence this delete removes is cascade-deleted with it, and an agent's naming
+        # assertion is exactly such a record, because IDENTIFY links it to the memories it
+        # cited. Reading only the target would leave the registry answering to a name whose
+        # assertion no longer exists.
+        named_identities = _naming_assertion_identities(connection, (memory_id, *affected_ids))
         for lineage_id, kind in reconciled:
             affected_ids.extend(
                 _row_text(row, "memory_id")
@@ -1995,6 +2137,7 @@ class LocalStore:
                 kind,
                 changed_at=changed_at,
             )
+        _reproject_identities(connection, named_identities, changed_at=changed_at)
         unreferenced = self._read_unreferenced_assets(
             connection,
             tuple(dict.fromkeys(linked_ids)),
@@ -2570,11 +2713,159 @@ class LocalStore:
             )
         return cursor.rowcount > 0
 
+    def projected_identity_name(
+        self,
+        identity_id: str,
+        *,
+        excluding: Sequence[str] = (),
+    ) -> tuple[str | None, str | None]:
+        """Return the name and relationship the current visible naming assertion projects.
+
+        Both are `None` for an unknown or as yet unnamed identity, which is exactly what the
+        projection should then write. `excluding` ignores assertions the caller is about to
+        delete, so it can rebuild indexed text for the projection the deletion will leave.
+        """
+        _require_identifier(identity_id, "identity_id")
+        with self._connection() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            row = (
+                None
+                if resolved_id is None
+                else _current_naming_assertion(connection, resolved_id, excluding=excluding)
+            )
+        if row is None:
+            return None, None
+        return _optional_row_text(row, "subject"), _optional_row_text(row, "value")
+
+    def refresh_identity_projection(
+        self,
+        identity_id: str,
+        *,
+        memories: Iterable[StoredMemory] = (),
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> IdentityProfile | None:
+        """Recompute `identities.name`/`relationship` from the current naming assertion.
+
+        The assertion is the record and this is the read path, the way `memory_versions`
+        carries the evidence and `_refresh_evidence_projection` recomputes what reads see.
+        Supplied documents replace their indexed vectors in the same transaction, so stored
+        text can never disagree with the projection it was rebuilt for. Returns the projected
+        profile, or None when the identity does not exist.
+        """
+        _require_identifier(identity_id, "identity_id")
+        supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
+            memories,
+            embeddings,
+        )
+        now = _datetime_text(datetime.now(timezone.utc))
+        with self._transaction() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            if resolved_id is None:
+                return None
+            row = _current_naming_assertion(connection, resolved_id)
+            name = None if row is None else _optional_row_text(row, "subject")
+            relationship = None if row is None else _optional_row_text(row, "value")
+            cursor = connection.execute(
+                """
+                UPDATE identities
+                SET name = ?, relationship = ?, updated_at = ?
+                WHERE identity_id = ?
+                """,
+                (name, relationship, now, resolved_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+            evidence_ids = (
+                ()
+                if row is None
+                else _current_evidence_ids(connection, _row_text(row, "memory_id"))
+            )
+            self._replace_memory_embeddings(
+                connection,
+                supplied_memories,
+                supplied_embeddings,
+                supplied_by_memory,
+            )
+        return IdentityProfile(
+            identity_id=resolved_id,
+            name=name,
+            relationship=relationship,
+            confirmed=row is not None,
+            evidence_ids=evidence_ids,
+        )
+
+    def identity_for_subject(self, subject: str) -> str | None:
+        """Return the identity whose visible naming assertion canonically names this subject.
+
+        Deterministic and never a model's decision: the comparison is the same NFKC casefold
+        the semantic layer already uses, and two identities that currently project the same
+        canonical name resolve to neither, because binding a claim to the wrong person is
+        worse than leaving it unbound.
+        """
+        canonical = _canonical_subject(subject)
+        if canonical is None:
+            return None
+        with self._connection() as connection:
+            matches = {
+                _row_text(row, "identity_id")
+                for row in _visible_naming_assertions(connection)
+                if _canonical_subject(_optional_row_text(row, "subject")) == canonical
+            }
+        return matches.pop() if len(matches) == 1 else None
+
+    def provisional_identities(self, memory_ids: Sequence[str]) -> dict[str, tuple[str, ...]]:
+        """Return, per memory, the identities it observes that no visible assertion names.
+
+        A person a memory saw or heard but nobody has named yet: present in the evidence and
+        absent from every projection. Empty entries are dropped, so a caller can treat a
+        missing key as "nobody unnamed here".
+        """
+        ids = tuple(dict.fromkeys(memory_ids))
+        for memory_id in ids:
+            _require_identifier(memory_id, "memory_id")
+        if not ids:
+            return {}
+        provisional: dict[str, tuple[str, ...]] = {}
+        with self._connection() as connection:
+            named = {
+                _row_text(row, "identity_id") for row in _visible_naming_assertions(connection)
+            }
+            for offset in range(0, len(ids), _SQLITE_PARAMETER_BATCH // 2):
+                batch = ids[offset : offset + _SQLITE_PARAMETER_BATCH // 2]
+                placeholders = ", ".join("?" for _memory_id in batch)
+                rows = connection.execute(
+                    f"""
+                    SELECT ma.memory_id AS memory_id, s.speaker_id AS identity_id
+                    FROM memory_assets AS ma
+                    JOIN speech_segments AS s ON s.asset_id = ma.asset_id
+                    WHERE ma.memory_id IN ({placeholders}) AND s.speaker_id IS NOT NULL
+                    UNION
+                    SELECT ma.memory_id AS memory_id, f.identity_id AS identity_id
+                    FROM memory_assets AS ma
+                    JOIN face_observations AS f ON f.asset_id = ma.asset_id
+                    WHERE ma.memory_id IN ({placeholders})
+                    """,
+                    (*batch, *batch),
+                ).fetchall()
+                for row in rows:
+                    identity_id = _row_text(row, "identity_id")
+                    if identity_id in named:
+                        continue
+                    memory_id = _row_text(row, "memory_id")
+                    provisional[memory_id] = (*provisional.get(memory_id, ()), identity_id)
+        return {
+            memory_id: tuple(sorted(set(identity_ids)))
+            for memory_id, identity_ids in sorted(provisional.items())
+        }
+
     def identity_profile(self, identity_id: str) -> IdentityProfile | None:
         """Return one identity's profile, or None when it does not exist.
 
         A merged identity resolves through its alias, like every other identity read, and the
         returned profile carries the canonical ID so a caller never has to resolve it twice.
+
+        `confirmed` and `evidence_ids` are derived, not stored: a person is confirmed exactly
+        while a visible naming assertion names them, and the evidence is that assertion's.
         """
         _require_identifier(identity_id, "identity_id")
         with self._connection() as connection:
@@ -2585,12 +2876,20 @@ class LocalStore:
                 "SELECT name, relationship FROM identities WHERE identity_id = ?",
                 (resolved_id,),
             ).fetchone()
-        if row is None:
-            return None
+            if row is None:
+                return None
+            assertion = _current_naming_assertion(connection, resolved_id)
+            evidence_ids = (
+                ()
+                if assertion is None
+                else _current_evidence_ids(connection, _row_text(assertion, "memory_id"))
+            )
         return IdentityProfile(
             identity_id=resolved_id,
             name=_optional_row_text(row, "name"),
             relationship=_optional_row_text(row, "relationship"),
+            confirmed=assertion is not None,
+            evidence_ids=evidence_ids,
         )
 
     def record_identity_link_evidence(self, voice_id: str, face_id: str, asset_id: str) -> int:
@@ -2711,15 +3010,18 @@ class LocalStore:
             connection.execute(
                 """
                 UPDATE identities
-                SET name = ?, created_at = ?, updated_at = ?
+                SET created_at = ?, updated_at = ?
                 WHERE identity_id = ?
                 """,
-                (
-                    plan.name,
-                    plan.created_at,
-                    now,
-                    target,
-                ),
+                (plan.created_at, now, target),
+            )
+            # The source's naming assertions move to the survivor before the source row goes,
+            # or `ON DELETE SET NULL` would strand the name that was asserted about this person
+            # and the projection would go on reporting a name nothing supports. The name is a
+            # projection here too: recomputed from the assertions, never assigned.
+            connection.execute(
+                "UPDATE memory_semantics SET identity_id = ? WHERE identity_id = ?",
+                (target, source),
             )
             connection.execute(
                 "UPDATE identity_aliases SET identity_id = ? WHERE identity_id = ?",
@@ -2757,6 +3059,8 @@ class LocalStore:
                 (source, target, now, contributed),
             )
             connection.execute("DELETE FROM identities WHERE identity_id = ?", (source,))
+            if _has_naming_assertion(connection, target):
+                _reproject_identities(connection, (target,), changed_at=_parse_datetime(now))
             self._replace_memory_embeddings(
                 connection,
                 supplied_memories,
@@ -2765,7 +3069,29 @@ class LocalStore:
             )
             return target
 
-    def unlink_identity(self, alias_id: str) -> str | None:
+    def identity_alias_modality(self, alias_id: str) -> Literal["face", "voice"] | None:
+        """Return the modality one merged alias contributed, or None when none is recorded.
+
+        A caller that must rebuild derived text before `unlink_identity` has to know which
+        modality is about to move back, and the alias row is the only record of it.
+        """
+        _require_identifier(alias_id, "alias_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT contributed_modality FROM identity_aliases WHERE alias_id = ?",
+                (alias_id,),
+            ).fetchone()
+        if row is None or row["contributed_modality"] is None:
+            return None
+        return _identity_modality(row["contributed_modality"])
+
+    def unlink_identity(
+        self,
+        alias_id: str,
+        *,
+        memories: Iterable[StoredMemory] = (),
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> str | None:
         """Reverse one recorded merge, restoring alias_id as an independent identity.
 
         Returns the restored identity_id, or None when alias_id is not a reversible
@@ -2784,8 +3110,21 @@ class LocalStore:
         Unlinking clears the pair's accumulated link evidence but does not suppress the
         pair, so continued ingestion can corroborate and merge them again. Treat this as
         resetting the evidence, not as recording that a human rejected the merge.
+
+        Pass `memories` and `embeddings` to atomically replace indexed documents that named
+        the merged person, exactly as `register_identity` does. They are applied only when the
+        unlink actually commits, so a refused unlink leaves the projection untouched.
+
+        Claims derived while the two were one identity are re-evaluated in the same
+        transaction: one resting only on media that moved back is re-attributed to the
+        restored identity, one resting on both people's media is unbound, and one that never
+        involved the restored modality keeps its binding.
         """
         _require_identifier(alias_id, "alias_id")
+        supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
+            memories,
+            embeddings,
+        )
         now = _datetime_text(datetime.now(timezone.utc))
         with self._transaction() as connection:
             alias = connection.execute(
@@ -2845,6 +3184,20 @@ class LocalStore:
                 WHERE voice_id IN (?, ?) AND face_id IN (?, ?)
                 """,
                 (target, alias_id, target, alias_id),
+            )
+            _rebind_unlinked_claims(
+                connection,
+                target=target,
+                restored=alias_id,
+                modality=modality,
+            )
+            if _has_naming_assertion(connection, target):
+                _reproject_identities(connection, (target,), changed_at=_parse_datetime(now))
+            self._replace_memory_embeddings(
+                connection,
+                supplied_memories,
+                supplied_embeddings,
+                supplied_by_memory,
             )
             return alias_id
 
@@ -2947,6 +3300,19 @@ class LocalStore:
                 "DELETE FROM face_observations WHERE identity_id = ?",
                 (resolved_id,),
             ).rowcount
+            # The naming assertions go with the person. `ON DELETE SET NULL` below would keep
+            # them as unattributed records still carrying the erased name in their content and
+            # their vectors, which is exactly what erasure promises to remove. Deleting the
+            # record cascades its semantics, versions, and embeddings, and the embedding trigger
+            # queues the index deletions.
+            for row in connection.execute(
+                "SELECT memory_id FROM memory_semantics WHERE identity_id = ? AND kind = ?",
+                (resolved_id, MemoryKind.ENTITY.value),
+            ).fetchall():
+                connection.execute(
+                    "DELETE FROM memory_records WHERE memory_id = ?",
+                    (_row_text(row, "memory_id"),),
+                )
             # Cascades the aliases, exemplars and link evidence; NULLs the speech segments.
             connection.execute("DELETE FROM identities WHERE identity_id = ?", (resolved_id,))
             self._replace_memory_embeddings(
@@ -3412,6 +3778,9 @@ class LocalStore:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version == 10:
                 _migrate_v10(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 11:
+                _migrate_v11(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
@@ -4024,6 +4393,45 @@ class LocalStore:
         if self._closed:
             raise LocalStoreClosedError("local store is closed")
 
+    def identity_evidence_memory_ids(
+        self,
+        identity_id: str,
+        memory_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Return which of `memory_ids` carry a face or voice occurrence of one identity.
+
+        The control plane asks this before it lets a proposal name a person: a name may only be
+        pinned on somebody the cited evidence actually contains. Unknown identities and unknown
+        memory IDs simply do not match, so the caller reads an empty result as "not involved".
+        """
+        _require_identifier(identity_id, "identity_id")
+        candidates = tuple(dict.fromkeys(memory_ids))
+        if not candidates:
+            return ()
+        placeholders = ", ".join("?" for _memory_id in candidates)
+        with self._connection() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            if resolved_id is None:
+                return ()
+            rows = connection.execute(
+                f"""
+                SELECT DISTINCT ma.memory_id
+                FROM memory_assets AS ma
+                WHERE ma.memory_id IN ({placeholders}) AND (
+                    EXISTS (
+                        SELECT 1 FROM speech_segments AS s
+                        WHERE s.asset_id = ma.asset_id AND s.speaker_id = ?
+                    ) OR EXISTS (
+                        SELECT 1 FROM face_observations AS f
+                        WHERE f.asset_id = ma.asset_id AND f.identity_id = ?
+                    )
+                )
+                ORDER BY ma.memory_id
+                """,
+                (*candidates, resolved_id, resolved_id),
+            ).fetchall()
+        return tuple(_row_text(row, "memory_id") for row in rows)
+
 
 def _delete_unobserved_identities(
     connection: sqlite3.Connection,
@@ -4114,7 +4522,7 @@ def _create_schema(
     if existing_tables:
         raise UnsupportedSchemaError("local data directory contains an unversioned SQLite schema")
     try:
-        connection.executescript(_SCHEMA_V10)
+        connection.executescript(_SCHEMA_V12)
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -4330,6 +4738,36 @@ def _migrate_v10(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_v11(connection: sqlite3.Connection) -> None:
+    """Bind typed claims to the recognized person they are about, and admit `identify`.
+
+    `ON DELETE SET NULL` is the erasure promise in the schema: forgetting a person drops the
+    attribution and keeps the claim, the same way forgetting a person keeps the evening.
+    """
+    try:
+        semantic_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(memory_semantics)")
+        }
+        indexes = {
+            str(row[1])
+            for row in connection.execute("PRAGMA index_list(memory_semantics)")
+            if row[1] is not None
+        }
+        connection.execute("BEGIN IMMEDIATE")
+        if "identity_id" not in semantic_columns:
+            connection.execute(_SEMANTIC_IDENTITY_COLUMN_DDL)
+        if "memory_semantics_identity_idx" not in indexes:
+            connection.execute(_SEMANTIC_IDENTITY_INDEX_DDL)
+        for statement in _OPERATION_INTENT_REBUILD_DDL:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 12")
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
 def _write_memory_context(
     connection: sqlite3.Connection,
     memory_id: str,
@@ -4369,12 +4807,12 @@ def _write_memory_context(
         """
         INSERT INTO memory_semantics (
             memory_id, lineage_id, kind, basis, source_id,
-            subject, predicate, value, model_id, recipe,
+            subject, predicate, value, model_id, recipe, identity_id,
             cue_modality, valence, arousal,
             spatial_frame_id, spatial_anchor, spatial_x, spatial_y, spatial_z,
             spatial_qx, spatial_qy, spatial_qz, spatial_qw, spatial_uncertainty_m
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         """,
         (
@@ -4388,6 +4826,7 @@ def _write_memory_context(
             context.value,
             context.model_id,
             context.recipe,
+            context.identity_id,
             None if context.cue_modality is None else context.cue_modality.value,
             context.valence,
             context.arousal,
@@ -4413,8 +4852,13 @@ def _write_memory_context(
         )
 
     supersedes_id = context.supersedes_id
-    reconcile_lineage = context.kind is MemoryKind.STATE or (
-        context.kind is MemoryKind.TRAIT and context.basis is EvidenceBasis.USER_STATEMENT
+    # A state changes, an asserted trait replaces the last one, and naming a person supersedes
+    # whatever they were called before -- so the retracted name stops answering to active reads
+    # instead of sitting beside the current one. Everything else accumulates evidence instead.
+    reconcile_lineage = (
+        context.kind is MemoryKind.STATE
+        or (context.kind is MemoryKind.TRAIT and context.basis is EvidenceBasis.USER_STATEMENT)
+        or (context.kind is MemoryKind.ENTITY and context.identity_id is not None)
     )
     if reconcile_lineage:
         old_rows = connection.execute(
@@ -4487,6 +4931,7 @@ def _write_memory_context(
         lineage_id=lineage_id,
         kind=context.kind.value,
         basis=context.basis.value,
+        identity_id=context.identity_id,
         evidence_count=evidence_count,
         valid_from=valid_from,
         valid_until=valid_until,
@@ -4845,6 +5290,255 @@ def _restore_memory_versions(
         )
 
 
+def _current_naming_assertion(
+    connection: sqlite3.Connection,
+    identity_id: str,
+    *,
+    excluding: Sequence[str] = (),
+) -> sqlite3.Row | None:
+    """Return the naming assertion `identities.name` currently projects, newest first.
+
+    `excluding` drops records a caller is about to delete, which is how it can rebuild indexed
+    text for the projection a deletion is going to leave behind rather than the current one.
+    """
+    dropped = tuple(dict.fromkeys(excluding))
+    placeholders = ", ".join("?" for _memory_id in dropped)
+    row: sqlite3.Row | None = connection.execute(
+        f"""
+        SELECT s.memory_id, s.subject, s.value
+        FROM memory_semantics AS s
+        JOIN memory_versions AS v ON v.memory_id = s.memory_id
+        JOIN memory_records AS r ON r.memory_id = s.memory_id
+        WHERE s.identity_id = ? AND s.kind = ?
+          AND v.retired_at IS NULL AND v.visible = 1 AND r.forgotten_at IS NULL
+          {f"AND s.memory_id NOT IN ({placeholders})" if dropped else ""}
+        ORDER BY v.recorded_at DESC, s.memory_id DESC
+        LIMIT 1
+        """,
+        (identity_id, MemoryKind.ENTITY.value, *dropped),
+    ).fetchone()
+    return row
+
+
+def _visible_naming_assertions(connection: sqlite3.Connection) -> tuple[sqlite3.Row, ...]:
+    """Return the identity and subject of every currently visible naming assertion."""
+    return tuple(
+        connection.execute(
+            """
+            SELECT s.identity_id, s.subject
+            FROM memory_semantics AS s
+            JOIN memory_versions AS v ON v.memory_id = s.memory_id
+            JOIN memory_records AS r ON r.memory_id = s.memory_id
+            WHERE s.kind = ? AND s.identity_id IS NOT NULL
+              AND v.retired_at IS NULL AND v.visible = 1 AND r.forgotten_at IS NULL
+            """,
+            (MemoryKind.ENTITY.value,),
+        ).fetchall()
+    )
+
+
+def _has_naming_assertion(connection: sqlite3.Connection, identity_id: str) -> bool:
+    """Return whether any naming assertion, visible or not, is bound to this identity.
+
+    A merge only recomputes a projection when there is an assertion to project. An identity
+    named through the store's own `register_identity`, with no assertion behind it, keeps the
+    name the merge plan chose -- which is always the surviving identity's own name.
+    """
+    return (
+        connection.execute(
+            "SELECT 1 FROM memory_semantics WHERE identity_id = ? AND kind = ? LIMIT 1",
+            (identity_id, MemoryKind.ENTITY.value),
+        ).fetchone()
+        is not None
+    )
+
+
+def _canonical_subject(subject: str | None) -> str | None:
+    """Normalize a semantic subject the one way the whole kernel compares them."""
+    if subject is None:
+        return None
+    canonical = unicodedata.normalize("NFKC", subject).casefold().strip()
+    return canonical or None
+
+
+def _naming_assertion_identities(
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+) -> tuple[str, ...]:
+    """Return the identities these records name, for the records that name one."""
+    ids = tuple(dict.fromkeys(memory_ids))
+    found: list[str] = []
+    for offset in range(0, len(ids), _SQLITE_PARAMETER_BATCH):
+        batch = ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+        placeholders = ", ".join("?" for _memory_id in batch)
+        found.extend(
+            _row_text(row, "identity_id")
+            for row in connection.execute(
+                f"""
+                SELECT DISTINCT identity_id
+                FROM memory_semantics
+                WHERE kind = ? AND identity_id IS NOT NULL
+                  AND memory_id IN ({placeholders})
+                """,
+                (MemoryKind.ENTITY.value, *batch),
+            ).fetchall()
+        )
+    return tuple(dict.fromkeys(found))
+
+
+def _reproject_identities(
+    connection: sqlite3.Connection,
+    identity_ids: Sequence[str],
+    *,
+    changed_at: datetime,
+) -> tuple[str, ...]:
+    """Recompute `identities.name` from each identity's current visible naming assertion.
+
+    This is the one rule behind the projection: whenever a bound naming assertion is written,
+    retired, hidden, re-pointed or deleted, the registry is recomputed in the same transaction,
+    so `identities.name` is never a name no visible assertion supports. Returns the identities
+    whose projection actually moved, which is what a caller has to repaint indexed text for.
+    """
+    now = _datetime_text(changed_at)
+    changed: list[str] = []
+    for identity_id in dict.fromkeys(identity_ids):
+        current = connection.execute(
+            "SELECT name, relationship FROM identities WHERE identity_id = ?",
+            (identity_id,),
+        ).fetchone()
+        if current is None:
+            continue
+        row = _current_naming_assertion(connection, identity_id)
+        projected = (
+            (None, None)
+            if row is None
+            else (_optional_row_text(row, "subject"), _optional_row_text(row, "value"))
+        )
+        if projected == (
+            _optional_row_text(current, "name"),
+            _optional_row_text(current, "relationship"),
+        ):
+            continue
+        connection.execute(
+            """
+            UPDATE identities
+            SET name = ?, relationship = ?, updated_at = ?
+            WHERE identity_id = ?
+            """,
+            (*projected, now, identity_id),
+        )
+        changed.append(identity_id)
+    return tuple(changed)
+
+
+def _reproject_named_identities(
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+    *,
+    changed_at: datetime,
+) -> tuple[str, ...]:
+    """Reproject every identity named by one of these records. The projection hook."""
+    identity_ids = _naming_assertion_identities(connection, memory_ids)
+    if not identity_ids:
+        return ()
+    return _reproject_identities(connection, identity_ids, changed_at=changed_at)
+
+
+def _rebind_unlinked_claims(
+    connection: sqlite3.Connection,
+    *,
+    target: str,
+    restored: str,
+    modality: Literal["face", "voice"],
+) -> tuple[str, ...]:
+    """Re-evaluate every claim bound to a person a merge is being undone for.
+
+    A merge made two people one, and claims derived while they were one are bound to the
+    survivor. Splitting them re-examines exactly the claims whose evidence involves media that
+    just moved back: a claim resting only on media that is now solely the restored person's is
+    re-attributed to them, and a claim resting on media the two still share, or on both
+    people's media, is unbound. Neither is left attributed to someone it was never about. A
+    claim whose evidence never touched the restored person is untouched, and naming assertions
+    stay with the survivor, which is the identity that keeps the profile.
+
+    Returns the memories whose binding changed. Nothing here alters indexed text: the binding
+    is a semantic column, and the projected name is repainted by the caller's index refresh.
+    """
+    restored_assets = _identity_asset_ids(connection, restored)
+    # A clip that still shows the survivor is not evidence about the restored person alone,
+    # even though their modality moved out of it.
+    moved_assets = restored_assets - _identity_asset_ids(connection, target)
+    if not restored_assets:
+        return ()
+    changed: list[str] = []
+    for row in connection.execute(
+        """
+        SELECT memory_id FROM memory_semantics
+        WHERE identity_id = ? AND kind <> ?
+        ORDER BY memory_id
+        """,
+        (target, MemoryKind.ENTITY.value),
+    ).fetchall():
+        memory_id = _row_text(row, "memory_id")
+        assets = {
+            asset_id
+            for source_id in _current_evidence_ids(connection, memory_id)
+            for asset_id in _memory_asset_ids(connection, source_id)
+        }
+        if not assets & restored_assets:
+            continue
+        connection.execute(
+            "UPDATE memory_semantics SET identity_id = ? WHERE memory_id = ?",
+            (restored if assets <= moved_assets else None, memory_id),
+        )
+        changed.append(memory_id)
+    return tuple(changed)
+
+
+def _identity_asset_ids(connection: sqlite3.Connection, identity_id: str) -> set[str]:
+    """Return every media asset that observed one identity, seen or heard."""
+    return {
+        _row_text(row, "asset_id")
+        for row in connection.execute(
+            """
+            SELECT DISTINCT asset_id FROM speech_segments WHERE speaker_id = ?
+            UNION
+            SELECT DISTINCT asset_id FROM face_observations WHERE identity_id = ?
+            """,
+            (identity_id, identity_id),
+        ).fetchall()
+    }
+
+
+def _memory_asset_ids(connection: sqlite3.Connection, memory_id: str) -> tuple[str, ...]:
+    """Return the media assets one memory references, in stored order."""
+    return tuple(
+        _row_text(row, "asset_id")
+        for row in connection.execute(
+            "SELECT asset_id FROM memory_assets WHERE memory_id = ? ORDER BY position",
+            (memory_id,),
+        ).fetchall()
+    )
+
+
+def _current_evidence_ids(
+    connection: sqlite3.Connection,
+    memory_id: str,
+) -> tuple[str, ...]:
+    """Return the memories currently cited as evidence for one derived record."""
+    return tuple(
+        _row_text(row, "source_memory_id")
+        for row in connection.execute(
+            """
+            SELECT source_memory_id FROM memory_evidence
+            WHERE memory_id = ? AND retired_at IS NULL
+            ORDER BY position
+            """,
+            (memory_id,),
+        ).fetchall()
+    )
+
+
 def _retire_memory_evidence(
     connection: sqlite3.Connection,
     pairs: Sequence[tuple[str, str]],
@@ -5167,12 +5861,20 @@ def _semantic_visibility(
     lineage_id: str,
     kind: str,
     basis: str,
+    identity_id: str | None,
     evidence_count: int,
     valid_from: datetime | None,
     valid_until: datetime | None,
     explicit_intervals: Sequence[tuple[datetime | None, datetime | None]] | None = None,
 ) -> bool:
-    if kind != MemoryKind.TRAIT.value or basis == EvidenceBasis.USER_STATEMENT.value:
+    if basis == EvidenceBasis.USER_STATEMENT.value:
+        return True
+    # A naming assertion bound to an identity is corroborated like an inferred trait: what an
+    # agent claims somebody is called stays hidden, and so stays out of the projected
+    # `identities.name`, until two independent evidence groups support it.
+    if kind != MemoryKind.TRAIT.value and not (
+        kind == MemoryKind.ENTITY.value and identity_id is not None
+    ):
         return True
     if evidence_count < 2:
         return False
@@ -5213,7 +5915,7 @@ def _refresh_evidence_projection(
     evidence_count, confidence = _evidence_summary(connection, memory_id)
     rows = connection.execute(
         """
-        SELECT v.*, s.lineage_id, s.kind, s.basis
+        SELECT v.*, s.lineage_id, s.kind, s.basis, s.identity_id
         FROM memory_versions AS v
         JOIN memory_semantics AS s ON s.memory_id = v.memory_id
         WHERE v.memory_id = ? AND v.retired_at IS NULL
@@ -5237,6 +5939,7 @@ def _refresh_evidence_projection(
             lineage_id=_row_text(row, "lineage_id"),
             kind=_row_text(row, "kind"),
             basis=_row_text(row, "basis"),
+            identity_id=_optional_row_text(row, "identity_id"),
             evidence_count=evidence_count,
             valid_from=_optional_datetime_from_row(row, "valid_from"),
             valid_until=_optional_datetime_from_row(row, "valid_until"),
@@ -5274,7 +5977,7 @@ def _rebuild_reconciled_lineage(  # noqa: C901 - replay order is the state contr
 ) -> None:
     assertions = connection.execute(
         """
-        SELECT v.*, s.kind, s.basis
+        SELECT v.*, s.kind, s.basis, s.identity_id
         FROM memory_semantics AS s
         JOIN memory_versions AS v ON v.memory_id = s.memory_id AND v.version = 1
         WHERE s.lineage_id = ? AND s.kind = ?
@@ -5370,6 +6073,7 @@ def _rebuild_reconciled_lineage(  # noqa: C901 - replay order is the state contr
             lineage_id=lineage_id,
             kind=kind,
             basis=_row_text(row, "basis"),
+            identity_id=_optional_row_text(row, "identity_id"),
             evidence_count=evidence_count,
             valid_from=valid_from,
             valid_until=valid_until,
@@ -5464,7 +6168,7 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
                     s.memory_id AS semantic_memory_id,
                     s.lineage_id, s.kind, s.basis, s.source_id,
                     s.subject, s.predicate, s.value, s.model_id, s.recipe,
-                    s.cue_modality, s.valence, s.arousal,
+                    s.identity_id, s.cue_modality, s.valence, s.arousal,
                     s.spatial_frame_id, s.spatial_anchor,
                     s.spatial_x, s.spatial_y, s.spatial_z,
                     s.spatial_qx, s.spatial_qy, s.spatial_qz, s.spatial_qw,
@@ -5583,6 +6287,7 @@ def _read_memory_contexts(  # noqa: C901 - one authoritative bitemporal hydratio
             supersedes_id=_optional_row_text(row, "supersedes_id"),
             model_id=_optional_row_text(row, "model_id"),
             recipe=_optional_row_text(row, "recipe"),
+            identity_id=_optional_row_text(row, "identity_id"),
             spatial=spatial,
             cue_modality=(
                 None if row["cue_modality"] is None else Modality(_row_text(row, "cue_modality"))

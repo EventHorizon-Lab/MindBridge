@@ -18,12 +18,17 @@ import pytest
 from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
 
 from mindbridge import (
+    AssetRef,
     AsyncMemory,
+    Blob,
     ConsolidationBackend,
     ConsolidationReport,
     EvidenceBasis,
+    FaceAnalysis,
+    FaceEmbedding,
     FormationInput,
     FormationProposal,
+    IdentityClaim,
     Memory,
     MemoryIntent,
     MemoryKind,
@@ -36,13 +41,81 @@ from mindbridge import (
     Modality,
     ModelError,
     ObservationContext,
+    SpeakerEmbedding,
+    SpeechAnalysis,
+    SpeechTurn,
     ValidationError,
 )
-from mindbridge.control import operation_key
+from mindbridge.control import dump_operation, load_operation, operation_key
 from mindbridge.infrastructure.local import LocalStore
 from mindbridge.infrastructure.local.store import StoredOperation
 
 OCCURRED = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
+
+
+class OnePersonSpeech:
+    """Hears the same single speaker in every clip, so one identity owns every segment."""
+
+    transcription_capabilities = frozenset({Modality.AUDIO, Modality.VIDEO})
+    transcription_model = "one-person-speech"
+    transcription_space = "one-person-speech:test"
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+        return tuple(
+            SpeechAnalysis(
+                turns=(SpeechTurn(0, 900, "I am Li, I live next door", "0"),),
+                speakers=(SpeakerEmbedding("0", (1.0, 0.0)),),
+            )
+            for _asset in assets
+        )
+
+    def close(self) -> None:
+        pass
+
+
+class OnePersonFace:
+    """Sees the same single face in every clip, so it corroborates with the voice."""
+
+    face_capabilities = frozenset({Modality.IMAGE, Modality.VIDEO})
+    face_model = "one-person-face"
+    face_space = "one-person-face:2:test"
+    face_analysis_space = "one-person-face-analysis:test"
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[FaceAnalysis, ...]:
+        return tuple(
+            FaceAnalysis((FaceEmbedding("face-0", (0.0, 1.0), (0.1, 0.1, 0.4, 0.5), None),))
+            for _asset in assets
+        )
+
+    def close(self) -> None:
+        pass
+
+
+def _identity_memory(tmp_path: Path, consolidator: object) -> Memory:
+    return Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        transcriber=OnePersonSpeech(),
+        face_analyzer=OnePersonFace(),
+        consolidator=consolidator,  # type: ignore[arg-type]
+        identity_link_min_assets=1,
+        minimum_relevance=0,
+    )
+
+
+def _asserted_name(memory: Memory, identity_id: str) -> str | None:
+    """Return the name the currently visible naming assertion of one identity claims."""
+    names = [
+        record.context.subject
+        for record in memory.list(limit=100).items
+        if record.context is not None
+        and record.context.kind is MemoryKind.ENTITY
+        and record.context.identity_id == identity_id
+        and record.context.visible
+        and record.context.retired_at is None
+    ]
+    assert len(names) <= 1
+    return names[0] if names else None
 
 
 class ScriptedConsolidator:
@@ -108,6 +181,7 @@ def _observations(memory: Memory, *contents: str) -> tuple[MemoryRecord, ...]:
 
 def test_operation_shape_follows_its_intent() -> None:
     proposal = _trait("Ana", "patient")
+    claim = IdentityClaim(identity_id="identity_1", name="Li")
     assert MemoryOperation(
         intent=MemoryIntent.CONSOLIDATE, evidence_ids=("a", "b"), proposal=proposal
     ).evidence_ids == ("a", "b")
@@ -135,10 +209,55 @@ def test_operation_shape_follows_its_intent() -> None:
         {"intent": MemoryIntent.FORGET},
         {"intent": MemoryIntent.FORGET, "target_ids": (" ",)},
         {"intent": "shred", "target_ids": ("t",)},
+        # IDENTIFY carries a claim and nothing else a kernel would have to reconcile with it.
+        {"intent": MemoryIntent.IDENTIFY},
+        {"intent": MemoryIntent.IDENTIFY, "evidence_ids": ("a",)},
+        {"intent": MemoryIntent.IDENTIFY, "claim": claim, "target_ids": ("t",)},
+        {"intent": MemoryIntent.IDENTIFY, "claim": claim, "proposal": proposal},
+        {"intent": MemoryIntent.IDENTIFY, "claim": "Li"},
+        {
+            "intent": MemoryIntent.CONSOLIDATE,
+            "evidence_ids": ("a",),
+            "proposal": proposal,
+            "claim": claim,
+        },
+        {"intent": MemoryIntent.FORGET, "target_ids": ("t",), "claim": claim},
     )
     for operation in malformed:
         with pytest.raises(ValidationError):
             MemoryOperation(**operation)  # type: ignore[arg-type]
+
+    # A host naming somebody cites nothing, so an empty evidence set is well formed.
+    assert MemoryOperation(intent=MemoryIntent.IDENTIFY, claim=claim).evidence_ids == ()
+    assert MemoryOperation(
+        intent=MemoryIntent.IDENTIFY, claim=claim, evidence_ids=("a", "a")
+    ).evidence_ids == ("a",)
+    with pytest.raises(ValidationError):
+        IdentityClaim(identity_id="identity_1", name="bad\nname")
+    with pytest.raises(ValidationError):
+        IdentityClaim(identity_id=" ", name="Li")
+
+
+def test_a_naming_claim_round_trips_through_the_log_and_keys_the_operation() -> None:
+    claim = IdentityClaim(identity_id="identity_1", name="Li", relationship="neighbour")
+    operation = MemoryOperation(
+        intent=MemoryIntent.IDENTIFY,
+        claim=claim,
+        evidence_ids=("memory_1",),
+        rationale="the stranger introduced themselves",
+    )
+
+    assert load_operation(dump_operation(operation)) == operation
+
+    key = operation_key(operation, recipe="r")
+    # Prose is logged and never interpreted, so it stays out of the idempotency identity; the
+    # claim is the operation, so every part of it stays in.
+    assert operation_key(replace(operation, rationale="reworded"), recipe="r") == key
+    assert operation_key(replace(operation, claim=replace(claim, name="Li Hua")), recipe="r") != key
+    assert (
+        operation_key(replace(operation, claim=replace(claim, relationship=None)), recipe="r")
+        != key
+    )
 
 
 def test_an_empty_report_is_valid_and_rejections_keep_their_reason() -> None:
@@ -745,6 +864,170 @@ def test_async_memory_mirrors_the_control_plane(tmp_path: Path) -> None:
             await memory.close()
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------------------------
+# Naming as a proposal
+
+
+def test_deleting_every_cited_source_takes_the_agent_asserted_name_with_it(
+    tmp_path: Path,
+) -> None:
+    """Losing evidence un-projects an inferred name; losing all of it removes the assertion.
+
+    An agent's IDENTIFY links its assertion to the memories it cited, so deleting one source
+    drops the name below the two-group threshold and deleting the last one cascade-deletes the
+    assertion itself. Reprojecting only the record the caller named left the registry and the
+    search index answering to a name no assertion supported any more, which is the
+    audit-versus-registry contradiction this round exists to remove.
+    """
+    consolidator = ScriptedConsolidator()
+    with _identity_memory(tmp_path / "cascade", consolidator) as memory:
+        first = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        second = memory.add(Blob(b"stranger speaks again", "video/mp4", "two.mp4"))
+        identity_id = memory.faces(first.id)[0].identity_id
+
+        def identify(*evidence: str) -> MemoryOperation:
+            return MemoryOperation(
+                intent=MemoryIntent.IDENTIFY,
+                claim=IdentityClaim(identity_id=identity_id, name="Li"),
+                evidence_ids=evidence,
+                rationale="the stranger said so",
+            )
+
+        for cited in (first.id, second.id):
+            consolidator._scripts.append((identify(cited),))
+            assert not memory.consolidate(evidence_ids=(first.id, second.id)).rejected
+        profile = memory.identity(identity_id)
+        assert profile is not None and profile.name == "Li"
+
+        # Losing one source drops an inferred name below the two-group threshold, so it stops
+        # being projected while the assertion itself survives on its remaining evidence.
+        assert memory.delete(first.id) is True
+        assert _asserted_name(memory, identity_id) is None
+        profile = memory.identity(identity_id)
+        assert profile is not None and profile.name is None
+
+        # The second delete removes the assertion's last evidence, so the assertion goes too.
+        assert memory.delete(second.id) is True
+        assert not [
+            item
+            for item in memory.list().items
+            if item.context is not None and item.context.identity_id == identity_id
+        ]
+        profile = memory.identity(identity_id)
+        assert profile is not None and profile.name is None
+        assert profile.confirmed is False
+
+
+def test_an_agent_names_a_person_only_from_evidence_that_contains_them(tmp_path: Path) -> None:
+    """Scenario step 3: the stranger introduces themselves and the agent proposes the name.
+
+    The claim is a proposal like any other, so the kernel checks that the person exists and that
+    the cited evidence actually contains them, and keeps an inferred name out of the projection
+    until two independent evidence groups support it.
+    """
+    consolidator = ScriptedConsolidator()
+    with _identity_memory(tmp_path / "identify", consolidator) as memory:
+        first = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        identity_id = memory.faces(first.id)[0].identity_id
+        assert identity_id == memory.speech(first.id)[0].speaker_id
+        second = memory.add(Blob(b"stranger speaks again", "video/mp4", "two.mp4"))
+        elsewhere = memory.add("the courier left a parcel", occurred_at=OCCURRED)
+
+        def identify(*evidence: str, identity: str = identity_id) -> MemoryOperation:
+            return MemoryOperation(
+                intent=MemoryIntent.IDENTIFY,
+                claim=IdentityClaim(identity_id=identity, name="Li", relationship="neighbour"),
+                evidence_ids=evidence,
+                rationale="the stranger said so",
+            )
+
+        consolidator._scripts.append((identify(first.id, identity="identity_missing"),))
+        rejected = memory.consolidate(evidence_ids=(first.id,)).rejected
+        assert [reason for _operation, reason in rejected] == ["unknown_identity"]
+
+        # A name pinned on somebody the cited evidence never contained is the failure the
+        # involvement check exists to make impossible.
+        consolidator._scripts.append((identify(elsewhere.id),))
+        rejected = memory.consolidate(evidence_ids=(elsewhere.id,)).rejected
+        assert [reason for _operation, reason in rejected] == ["identity_not_in_evidence"]
+
+        consolidator._scripts.append((identify(),))
+        rejected = memory.consolidate(evidence_ids=(first.id,)).rejected
+        assert [reason for _operation, reason in rejected] == ["identity_not_in_evidence"]
+
+        # One group of evidence logs the assertion but leaves the person unnamed.
+        consolidator._scripts.append((identify(first.id),))
+        report = memory.consolidate(evidence_ids=(first.id,))
+        assert report.rejected == ()
+        assert len(report.operations) == 1
+        assert report.operations[0].operation.intent is MemoryIntent.IDENTIFY
+        assert report.operations[0].operation.claim is not None
+        assert report.operations[0].operation.claim.name == "Li"
+        assert memory.identity(identity_id) is not None
+        assert memory.identity(identity_id).name is None  # type: ignore[union-attr]
+        assert _asserted_name(memory, identity_id) is None
+
+        # A second independent group corroborates it, and the projection follows.
+        consolidator._scripts.append((identify(second.id),))
+        report = memory.consolidate(evidence_ids=(second.id,))
+        assert report.rejected == ()
+        assert memory.identity(identity_id).name == "Li"  # type: ignore[union-attr]
+        assert _asserted_name(memory, identity_id) == "Li"
+        assert [record.operation.intent for record in memory.operations()] == [
+            MemoryIntent.IDENTIFY,
+            MemoryIntent.IDENTIFY,
+        ]
+
+        # Reversing the corroborating operation takes the projected name with it.
+        assert memory.rollback(memory.operations()[0].operation_id) is True
+        assert memory.identity(identity_id).name is None  # type: ignore[union-attr]
+        assert _asserted_name(memory, identity_id) is None
+
+
+def test_control_operations_refuse_to_touch_a_bound_naming_assertion(tmp_path: Path) -> None:
+    """A name is not an inference to reinforce, correct, or forget behind the projection.
+
+    Retiring the assertion through one of those intents left `identity()` and the indexed
+    speech text answering to a name nothing asserted any more. `rollback()` of the operation
+    that named the person is the reversal that recomputes both.
+    """
+    consolidator = ScriptedConsolidator()
+    with _identity_memory(tmp_path / "guarded", consolidator) as memory:
+        record = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+        memory.register_identity(identity_id, "Li", relationship="neighbour")
+        assertion = next(
+            item.id
+            for item in memory.list(limit=100).items
+            if item.context is not None and item.context.identity_id == identity_id
+        )
+
+        scripted = (
+            MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(assertion,)),
+            MemoryOperation(
+                intent=MemoryIntent.REINFORCE,
+                target_ids=(assertion,),
+                evidence_ids=(record.id,),
+            ),
+            MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(assertion,)),
+        )
+        for operation in scripted:
+            consolidator._scripts.append((operation,))
+            # The assertion is named in `evidence_ids`, so it is inside the window the kernel
+            # gathered: the refusal below is the naming guard, not the window check that would
+            # otherwise refuse a target the backend was never shown.
+            rejected = memory.consolidate(evidence_ids=(record.id, assertion)).rejected
+            assert [reason for _operation, reason in rejected] == ["naming_assertion"]
+
+        # `forget()` is the same kernel path under host authority, so it refuses too.
+        assert memory.forget((assertion,)) is None
+
+        # The invariant every accepted operation has to leave standing.
+        assert memory.identity(identity_id).name == "Li"  # type: ignore[union-attr]
+        assert _asserted_name(memory, identity_id) == "Li"
+        assert memory.operations()[0].operation.intent is MemoryIntent.IDENTIFY
 
 
 # ---------------------------------------------------------------------------------------------

@@ -137,6 +137,7 @@ from mindbridge.types import (
     EvidenceBasis,
     FaceObservation,
     FormationProposal,
+    IdentityClaim,
     IdentityErasure,
     IdentityProfile,
     IndexQuantization,
@@ -175,6 +176,11 @@ from mindbridge.types import (
 )
 
 _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
+# Naming a person is a claim the host asserts, so its recipe names the kernel rule that produced
+# it rather than a model space. That is what lets `register_identity` work with no former and no
+# consolidator configured.
+_NAMING_RECIPE = "mindbridge-identity-naming-v1"
+_NAMING_PREDICATE = "identity"
 _INDEX_RECIPE_PREFIX = (
     "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:context-keys-v10"
 )
@@ -1402,7 +1408,19 @@ class Memory:
                 started_at=started_at,
                 unknowns=self._request_unknowns(prepared, scope, outcome.hits),
                 candidate_limit=candidate_limit,
+                provisional=self._provisional_identities(outcome.hits),
             )
+
+    def _provisional_identities(self, hits: Sequence[SearchHit]) -> dict[str, tuple[str, ...]]:
+        """Resolve which people the candidate evidence observed but nobody has named.
+
+        Deterministic kernel policy, like every other identity decision: a person is
+        provisional exactly while no visible naming assertion names them.
+        """
+        if not hits:
+            return {}
+        with _translate_storage_errors("read provisional identities"):
+            return self._store.provisional_identities(tuple(hit.id for hit in hits))
 
     def _request_unknowns(
         self,
@@ -1616,14 +1634,108 @@ class Memory:
         """
         with (
             self._trace("mindbridge.unlink_identity", kind="operation"),
-            self._operation(),
+            self._operation() as operation,
             self._write_lock,
         ):
             requested_id = _identifier(alias_id, "alias_id")
+            memories, embeddings = self._unlinked_speaker_index(requested_id, operation)
             with _translate_storage_errors("unlink identity"):
-                restored = self._store.unlink_identity(requested_id)
+                restored = self._store.unlink_identity(
+                    requested_id,
+                    memories=memories,
+                    embeddings=embeddings,
+                )
             self._drain_outbox()
             return restored
+
+    def _unlinked_speaker_index(
+        self,
+        alias_id: str,
+        operation: _OperationAssets,
+    ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
+        """Rebuild the indexed speech text that a pending unlink is about to invalidate.
+
+        Reversing a merge moves every segment of the contributed modality back, so text
+        indexed under the surviving identity's name would go on quoting a name that is no
+        longer the speaker's, and answer to it in search. Only a voice contribution matters
+        here: a face name is projected at answer time and never written into stored content.
+        """
+        with _translate_storage_errors("read identity memories"):
+            if self._store.identity_alias_modality(alias_id) != "voice":
+                return (), ()
+            target_id = self._store.resolve_identity_id(alias_id)
+        if target_id is None:
+            return (), ()
+        # Every one of the target's segments moves to the restored identity, and a merge keeps
+        # one profile which the target keeps, so no naming assertion is bound to the identity
+        # coming back: its projection is a nameless speaker. Asking the store would resolve the
+        # alias straight back to the target and answer with the wrong person's name.
+        return self._reindex_identity_speech(
+            alias_id,
+            speaker_name=None,
+            operation=operation,
+            previous_speaker_id=target_id,
+        )
+
+    def _deleted_naming_index(
+        self,
+        memory_id: str,
+        operation: _OperationAssets,
+    ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
+        """Rebuild indexed speech text for the projection a pending delete will leave behind.
+
+        Deleting the record that names somebody is the ordinary delete path applied to an
+        extraordinary record. The name it projected has to stop answering to search in the same
+        commit that removes the assertion, so the text is rebuilt from the assertion that will
+        still be visible afterwards -- usually none, which reindexes the speaker as nameless.
+        """
+        with _translate_storage_errors("read identity naming assertion"):
+            identity_id = self._store.naming_assertion_identity(memory_id)
+            if identity_id is None:
+                return (), ()
+            projected, _relationship = self._store.projected_identity_name(
+                identity_id,
+                excluding=(memory_id,),
+            )
+        return self._reindex_identity_speech(
+            identity_id,
+            speaker_name=projected,
+            operation=operation,
+        )
+
+    def _projected_identity(self, identity_id: str) -> tuple[str | None, str | None]:
+        with _translate_storage_errors("read identity naming assertion"):
+            return self._store.projected_identity_name(identity_id)
+
+    def _reindex_identity_speech(
+        self,
+        identity_id: str,
+        *,
+        speaker_name: str | None,
+        operation: _OperationAssets,
+        previous_speaker_id: str | None = None,
+    ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
+        """Rebuild every indexed memory whose speech projection names one identity.
+
+        This always runs beside a projection recompute, so the text a search matches and the
+        name `identities` reports are written from the same assertion in one commit.
+        """
+        with _translate_storage_errors("read identity memories"):
+            memory_ids = self._store.speaker_memory_ids(previous_speaker_id or identity_id)
+            if not memory_ids:
+                return (), ()
+            stored = self._store.read_memories(memory_ids)
+        indexed = tuple(memory for memory in stored if _has_indexed_speech(memory))
+        if not indexed:
+            return (), ()
+        return self._refresh_speaker_memories(
+            indexed,
+            speaker_id=identity_id,
+            speaker_name=speaker_name,
+            previous_speaker_id=previous_speaker_id,
+            update_operation=previous_speaker_id is None,
+            operation=operation,
+        )
 
     def _register_identity(
         self,
@@ -1663,40 +1775,137 @@ class Memory:
                 raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
             assert normalized_id is not None
             assert memory_ids is not None
-            memories: tuple[StoredMemory, ...] = ()
-            embeddings: tuple[StoredEmbedding, ...] = ()
-            if memory_ids:
-                with _translate_storage_errors("read speaker memories"):
-                    stored = self._store.read_memories(memory_ids)
-                indexed = tuple(
-                    memory
-                    for memory in stored
-                    if any(
-                        f"[speech identities:{asset.asset_id}]\n" in memory.content
-                        for asset in memory.assets
-                        if asset.modality in {"audio", "video"}
-                    )
-                )
-                if indexed:
-                    memories, embeddings = self._refresh_speaker_memories(
-                        indexed,
-                        speaker_id=normalized_id,
-                        speaker_name=normalized_name,
-                        operation=operation,
-                    )
+            # The assertion commits first because the projection reads it. Naming is now one
+            # auditable step: assert the claim, then recompute the name and the indexed text
+            # that must agree with it, in one commit.
+            self._assert_identity_name(
+                normalized_id,
+                normalized_name,
+                relationship=(
+                    normalized_relationship
+                    if normalized_relationship is not None
+                    else self._recorded_relationship(normalized_id)
+                ),
+                operation=operation,
+            )
+            projected, _relationship = self._projected_identity(normalized_id)
+            memories, embeddings = self._reindex_identity_speech(
+                normalized_id,
+                speaker_name=projected,
+                operation=operation,
+            )
             with _translate_storage_errors("register identity"):
-                registered = self._store.register_identity(
+                registered = self._store.refresh_identity_projection(
                     normalized_id,
-                    normalized_name,
-                    relationship=normalized_relationship,
                     memories=memories,
                     embeddings=embeddings,
                 )
-            if not registered:
+            if registered is None:
                 if speaker:
                     raise SpeakerNotFoundError(f"speaker does not exist: {requested_id}")
                 raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
             self._drain_outbox()
+
+    def _bound_identity(self, proposal: FormationProposal) -> str | None:
+        """Resolve which recognized person a proposed claim is about, or None.
+
+        Deterministic and never the model's decision: the proposal's subject has to match the
+        canonical subject of one currently visible naming assertion, compared with the same
+        NFKC casefold the lineage key uses. `_formation_lineage_id` then keys on the identity,
+        so claims about one person converge however the model spelled the name that turn.
+
+        An ENTITY proposal is deliberately never bound. A bound ENTITY row *is* a naming
+        assertion, so binding one here would let a model's proposal rename a person; naming
+        stays with the host and with the identify path.
+        """
+        if proposal.kind is MemoryKind.ENTITY or proposal.subject is None:
+            return None
+        with _translate_storage_errors("resolve a claim's subject"):
+            return self._store.identity_for_subject(proposal.subject)
+
+    def _recorded_relationship(self, identity_id: str) -> str | None:
+        _name, relationship = self._projected_identity(identity_id)
+        return relationship
+
+    def _assert_identity_name(
+        self,
+        identity_id: str,
+        name: str,
+        *,
+        relationship: str | None,
+        operation: _OperationAssets,
+    ) -> str:
+        """Record naming one person as a typed ENTITY claim bound to that identity.
+
+        This is what makes a name retrievable knowledge instead of a label on a row, and it is
+        the versioned thing `identities.name` projects. It rests on the host's authority rather
+        than on a model, so it needs neither a former nor a consolidator to be configured, and
+        it carries no evidence: nothing was observed, somebody said so.
+
+        It is logged like any other control-plane operation, so naming is auditable through
+        `operations()` and reversible through `rollback()`. The logged intent is `IDENTIFY` and
+        the claim travels on the operation itself, so `operations()` never has to pass an
+        identity ID off as a memory ID in `evidence_ids`. A host cites nothing: nothing was
+        observed, somebody said so, so the evidence set is empty.
+
+        Re-asserting the same name and relationship is idempotent, because the derived memory ID
+        is a function of the claim; a different name supersedes through the shared lineage.
+        """
+        proposal = _naming_proposal(name, relationship, basis=EvidenceBasis.USER_STATEMENT)
+        now = datetime.now(timezone.utc)
+        context = _formation_context(
+            None,
+            proposal,
+            model_id=None,
+            recipe=_NAMING_RECIPE,
+            recorded_at=now,
+            identity_id=identity_id,
+        )
+        prepared = replace(
+            _prepare_memory(
+                self._prepare_content(proposal.content, operation),
+                occurred_at=None,
+                occurred_end=None,
+                metadata=None,
+                memory_type=_formation_memory_type(proposal.kind),
+            ),
+            memory_id=_formation_memory_id(
+                identity_id,
+                proposal,
+                recipe=_NAMING_RECIPE,
+                context=context,
+            ),
+            context=context,
+        )
+        proposed = MemoryOperation(
+            intent=MemoryIntent.IDENTIFY,
+            claim=IdentityClaim(identity_id=identity_id, name=name, relationship=relationship),
+            rationale="the host registered this name",
+        )
+        key = operation_key(proposed, recipe=_NAMING_RECIPE)
+        with _translate_storage_errors("check a naming operation"):
+            already_logged = bool(self._store.read_operations(operation_key=key))
+        self._commit_formation(
+            ((prepared, None, proposal.confidence),),
+            (),
+            completed_at=now,
+            recipe=_NAMING_RECIPE,
+            # Re-asserting a standing name changes nothing, so it logs nothing: the operation
+            # key is already active and the log's unique index would refuse it anyway.
+            operation=(
+                None
+                if already_logged
+                else StoredOperation(
+                    operation_key=key,
+                    intent=proposed.intent.value,
+                    trigger=MemoryTrigger.MANUAL.value,
+                    recipe=_NAMING_RECIPE,
+                    operation_json=dump_operation(proposed),
+                    applied_at=now,
+                )
+            ),
+        )
+        return prepared.memory_id
 
     def forget_identity(self, identity_id: str) -> IdentityErasure:
         """Erase a person: their biometric template, their aliases, and their indexed name.
@@ -1722,38 +1931,20 @@ class Memory:
         ):
             with _translate_storage_errors("read identity memories"):
                 normalized_id = self._store.resolve_identity_id(requested_id)
-                memory_ids = (
-                    None
-                    if normalized_id is None
-                    else self._store.identity_memory_ids(normalized_id)
+                known = normalized_id is not None and (
+                    self._store.identity_memory_ids(normalized_id) is not None
                 )
-            if normalized_id is None or memory_ids is None:
+            if normalized_id is None or not known:
                 raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
-            memories: tuple[StoredMemory, ...] = ()
-            embeddings: tuple[StoredEmbedding, ...] = ()
-            if memory_ids:
-                with _translate_storage_errors("read identity memories"):
-                    stored = self._store.read_memories(memory_ids)
-                indexed = tuple(
-                    memory
-                    for memory in stored
-                    if any(
-                        f"[speech identities:{asset.asset_id}]\n" in memory.content
-                        for asset in memory.assets
-                        if asset.modality in {"audio", "video"}
-                    )
-                )
-                if indexed:
-                    # `speaker_name=None` is what drops the name from the projection. The rebuilt
-                    # documents are handed to the store so the erasure and the reindex commit in
-                    # one transaction: a crash between them would leave the name searchable for a
-                    # person whose template was already gone.
-                    memories, embeddings = self._refresh_speaker_memories(
-                        indexed,
-                        speaker_id=normalized_id,
-                        speaker_name=None,
-                        operation=operation,
-                    )
+            # `speaker_name=None` is the projection of a person with no naming assertion left,
+            # which is what erasure makes them. The rebuilt documents are handed to the store so
+            # the erasure and the reindex commit in one transaction: a crash between them would
+            # leave the name searchable for a person whose template was already gone.
+            memories, embeddings = self._reindex_identity_speech(
+                normalized_id,
+                speaker_name=None,
+                operation=operation,
+            )
             with _translate_storage_errors("forget identity"):
                 erasure = self._store.forget_identity(
                     normalized_id,
@@ -1953,6 +2144,10 @@ class Memory:
                 return False
             row = logged[0]
             operation = load_operation(row.operation_json)
+            # A naming assertion is retracted, not deleted: the version it superseded has to
+            # come back, and the record itself stays in the log so the audit trail shows both
+            # names. That reversal rides the general `superseded` mechanism below.
+            naming = operation.intent is MemoryIntent.IDENTIFY
             with _translate_storage_errors("roll back a memory operation"):
                 # One transaction: the created records disappear in the same commit that marks
                 # the operation rolled back, so a crash between the two cannot leave an active
@@ -1974,6 +2169,9 @@ class Memory:
                         if operation.intent is MemoryIntent.CORRECT
                         else row.superseded
                     ),
+                    # A naming assertion is retracted rather than deleted: its own version is
+                    # retired here and `restore_versions` brings back the one it displaced.
+                    retire_versions=row.created_ids if naming else (),
                     require_in_force=(
                         (*row.created_ids, *row.changed_ids) if row.superseded else ()
                     ),
@@ -1986,7 +2184,27 @@ class Memory:
                 )
             self._queue_asset_cleanup(orphaned)
             self._drain_outbox()
+            if reverted and naming:
+                assert operation.claim is not None
+                self._reproject_identity(operation.claim.identity_id)
             return reverted
+
+    def _reproject_identity(self, identity_id: str) -> None:
+        """Repaint one identity's name and its indexed text from the assertion now current."""
+        with self._operation() as operation:
+            name, _relationship = self._projected_identity(identity_id)
+            memories, embeddings = self._reindex_identity_speech(
+                identity_id,
+                speaker_name=name,
+                operation=operation,
+            )
+            with _translate_storage_errors("refresh an identity projection"):
+                self._store.refresh_identity_projection(
+                    identity_id,
+                    memories=memories,
+                    embeddings=embeddings,
+                )
+            self._drain_outbox()
 
     def operations(self, *, limit: int = 100) -> tuple[MemoryOperationRecord, ...]:
         """List logged control-plane operations, newest first."""
@@ -2128,6 +2346,10 @@ class Memory:
                 return _operation_record(
                     self._apply_consolidation(operation, pending, shown=shown, assets=assets)
                 )
+            if operation.intent is MemoryIntent.IDENTIFY:
+                return _operation_record(
+                    self._apply_identification(operation, pending, shown=shown, assets=assets)
+                )
             return _operation_record(
                 self._apply_operation_effects(operation, pending, shown=shown, window=window)
             )
@@ -2161,6 +2383,12 @@ class Memory:
         # where the host names the IDs and is the authority.
         if window is not None and not set(operation.target_ids) <= window:
             raise _RejectedOperation("target_not_shown")
+        # A name is not an inference to be corrected, reinforced, or quietly forgotten: the
+        # registry and the indexed speech text both project it, and only `rollback()` of the
+        # operation that asserted it recomputes those. Retiring the assertion behind their back
+        # leaves `identity()` and the stored transcripts answering to a name nothing asserts.
+        if any(_is_bound_naming_assertion(targets, target) for target in operation.target_ids):
+            raise _RejectedOperation("naming_assertion")
         reinforce: tuple[tuple[str, str], ...] = ()
         correct_ids: tuple[str, ...] = ()
         forget_ids: tuple[str, ...] = ()
@@ -2259,6 +2487,7 @@ class Memory:
                 model_id=self._consolidation_model,
                 recipe=self._consolidation_recipe,
                 recorded_at=now,
+                identity_id=self._bound_identity(proposal),
             ),
             evidence_ids=tuple(sorted(source.id for source in sources)),
         )
@@ -2295,6 +2524,97 @@ class Memory:
             raise _RejectedOperation("duplicate")
         return logged
 
+    def _apply_identification(
+        self,
+        operation: MemoryOperation,
+        pending: StoredOperation,
+        *,
+        shown: Mapping[str, MemoryRecord] | None,
+        assets: _OperationAssets,
+    ) -> StoredOperation:
+        """Validate one agent-proposed naming and commit it as a bound ENTITY assertion.
+
+        The kernel builds the proposal from the claim, so a backend only names the identity and
+        cites its evidence. `MODEL_INFERENCE` basis keeps the assertion, and with it the
+        projected name, hidden until two independent evidence groups support it, exactly as an
+        inferred trait is. Committing it recomputes the projection, so the registry and the
+        indexed speech text never disagree with what is currently asserted.
+        """
+        claim = operation.claim
+        assert claim is not None
+        # The same window vocabulary the three direct intents use: a backend may only act on
+        # what the kernel gathered for it, and citing outside that window is `target_not_shown`.
+        if shown is None or not set(operation.evidence_ids) <= set(shown):
+            raise _RejectedOperation("target_not_shown")
+        with _translate_storage_errors("read identity memories"):
+            identity_id = self._store.resolve_identity_id(claim.identity_id)
+            if identity_id is not None and self._store.identity_memory_ids(identity_id) is None:
+                identity_id = None
+        if identity_id is None:
+            raise _RejectedOperation("unknown_identity")
+        if set(self._control_records(operation.evidence_ids)) != set(operation.evidence_ids):
+            raise _RejectedOperation("unknown_evidence")
+        with _translate_storage_errors("read identity evidence"):
+            involved = self._store.identity_evidence_memory_ids(
+                identity_id,
+                operation.evidence_ids,
+            )
+        # A name may only be pinned on somebody the cited evidence actually contains, so an
+        # agent cannot rename a person from a clip that person was never in. An empty citation
+        # fails here too: nothing it cites involves them.
+        if not involved:
+            raise _RejectedOperation("identity_not_in_evidence")
+        proposal = _naming_proposal(
+            claim.name,
+            claim.relationship,
+            basis=EvidenceBasis.MODEL_INFERENCE,
+        )
+        sources = tuple(shown[memory_id] for memory_id in operation.evidence_ids)
+        now = datetime.now(timezone.utc)
+        context = replace(
+            _formation_context(
+                None,
+                proposal,
+                model_id=self._consolidation_model,
+                recipe=self._consolidation_recipe,
+                recorded_at=now,
+                identity_id=identity_id,
+            ),
+            evidence_ids=tuple(sorted(source.id for source in sources)),
+        )
+        prepared = replace(
+            _prepare_memory(
+                self._prepare_content(proposal.content, assets),
+                occurred_at=None,
+                occurred_end=None,
+                metadata=None,
+                memory_type=_formation_memory_type(proposal.kind),
+            ),
+            memory_id=_formation_memory_id(
+                identity_id,
+                proposal,
+                recipe=self._consolidation_recipe,
+                context=context,
+            ),
+            context=context,
+        )
+        logged = self._commit_formation(
+            tuple((prepared, source.id, proposal.confidence) for source in sources),
+            (),
+            completed_at=now,
+            recipe=self._consolidation_recipe,
+            operation=pending,
+            # Re-checked inside the apply transaction, because everything above was read before
+            # it opened: cited evidence a CORRECT retired in between makes the naming stale, and
+            # the dispatch turns that into a `stale` rejection.
+            require_active=operation.evidence_ids,
+            require_unretired=operation.evidence_ids,
+        )
+        if logged is None:
+            raise _RejectedOperation("duplicate")
+        self._reproject_identity(identity_id)
+        return logged
+
     def _control_records(self, memory_ids: Sequence[str]) -> dict[str, StoredMemory]:
         if not memory_ids:
             return {}
@@ -2326,15 +2646,25 @@ class Memory:
             )
 
     def delete(self, memory_id: str) -> bool:
-        """Delete one memory and garbage-collect media no memory still references."""
+        """Delete one memory and garbage-collect media no memory still references.
+
+        A naming assertion is an ordinary record, so deleting one is allowed and moves the
+        projection it fed. The registry and the indexed text that quoted the name are rebuilt
+        in the same commit, because a name nothing asserts must not stay searchable.
+        """
         with (
             self._trace("mindbridge.delete", kind="operation"),
-            self._operation(),
+            self._operation() as operation,
             self._write_lock,
         ):
             normalized_id = _identifier(memory_id, "memory_id")
+            memories, embeddings = self._deleted_naming_index(normalized_id, operation)
             with _translate_storage_errors("delete memory"):
-                deleted, orphaned = self._store.delete_memory_with_assets(normalized_id)
+                deleted, orphaned = self._store.delete_memory_with_assets(
+                    normalized_id,
+                    memories=memories,
+                    embeddings=embeddings,
+                )
             self._queue_asset_cleanup(orphaned)
             self._drain_outbox()
             return deleted
@@ -2967,6 +3297,7 @@ class Memory:
                     model_id=self._formation_model,
                     recipe=self._formation_space,
                     recorded_at=now,
+                    identity_id=self._bound_identity(proposal),
                 )
                 pairs.append(
                     (
@@ -2989,7 +3320,7 @@ class Memory:
 
     def _commit_formation(
         self,
-        pairs: Sequence[tuple[_PreparedMemory, str, float]],
+        pairs: Sequence[tuple[_PreparedMemory, str | None, float]],
         sources: Sequence[MemoryRecord],
         *,
         completed_at: datetime,
@@ -2999,9 +3330,13 @@ class Memory:
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
     ) -> StoredOperation | None:
-        """Embed and commit derived records; return the log row when one was requested."""
+        """Embed and commit derived records; return the log row when one was requested.
+
+        A `None` source ID states that the record rests on no other memory, which is what an
+        asserted claim such as a naming assertion is: it cites nothing and needs no evidence row.
+        """
         recipe = self._formation_space if recipe is None else recipe
-        ordered_pairs = tuple(sorted(pairs, key=lambda value: (value[0].memory_id, value[1])))
+        ordered_pairs = tuple(sorted(pairs, key=lambda value: (value[0].memory_id, value[1] or "")))
         unique = tuple(
             {
                 prepared.memory_id: prepared
@@ -3073,6 +3408,7 @@ class Memory:
                     evidence=tuple(
                         (prepared.memory_id, source_id, confidence)
                         for prepared, source_id, confidence in ordered_pairs
+                        if source_id is not None
                     ),
                     source_memory_ids=tuple(source.id for source in sources),
                     recipe=recipe,
@@ -4180,11 +4516,7 @@ class Memory:
         indexed = tuple(
             memory
             for memory in self._store.read_memories(memory_ids)
-            if any(
-                f"[speech identities:{asset.asset_id}]\n" in memory.content
-                for asset in memory.assets
-                if asset.modality in {"audio", "video"}
-            )
+            if _has_indexed_speech(memory)
         )
         if not indexed:
             return (), ()
@@ -6586,6 +6918,41 @@ class _RejectedOperation(Exception):
         self.reason = reason
 
 
+def _naming_proposal(
+    name: str,
+    relationship: str | None,
+    *,
+    basis: EvidenceBasis,
+) -> FormationProposal:
+    """Build the ENTITY proposal one naming claim asserts, whoever claimed it."""
+    return FormationProposal(
+        kind=MemoryKind.ENTITY,
+        content=(
+            f"{name} is a recognized person."
+            if relationship is None
+            else f"{name} is a recognized person, {relationship}."
+        ),
+        basis=basis,
+        subject=name,
+        predicate=_NAMING_PREDICATE,
+        value=relationship,
+        confidence=1.0,
+    )
+
+
+def _is_bound_naming_assertion(
+    memories: Mapping[str, StoredMemory],
+    memory_id: str,
+) -> bool:
+    memory = memories.get(memory_id)
+    context = None if memory is None else memory.context
+    return (
+        context is not None
+        and context.kind is MemoryKind.ENTITY
+        and context.identity_id is not None
+    )
+
+
 def _is_derived(memories: Mapping[str, StoredMemory], memory_id: str) -> bool:
     memory = memories.get(memory_id)
     context = None if memory is None else memory.context
@@ -6658,10 +7025,10 @@ def _operation_record(logged: StoredOperation) -> MemoryOperationRecord:
 
 
 def _validate_formation_pairs(
-    pairs: Sequence[tuple[_PreparedMemory, str, float]],
+    pairs: Sequence[tuple[_PreparedMemory, str | None, float]],
 ) -> None:
-    seen: dict[tuple[str, str], _PreparedMemory] = {}
-    states: dict[tuple[str, str], builtins.list[MemoryContext]] = {}
+    seen: dict[tuple[str, str | None], _PreparedMemory] = {}
+    states: dict[tuple[str | None, str], builtins.list[MemoryContext]] = {}
     for prepared, source_id, _confidence in pairs:
         key = (prepared.memory_id, source_id)
         prior = seen.setdefault(key, prepared)
@@ -6708,19 +7075,29 @@ def _valid_intervals_overlap(
 
 
 def _formation_context(
-    source: MemoryRecord,
+    source: MemoryRecord | None,
     proposal: FormationProposal,
     *,
-    model_id: str,
+    model_id: str | None,
     recipe: str,
     recorded_at: datetime,
+    identity_id: str | None = None,
 ) -> MemoryContext:
-    source_context = _observation_from_record(source)
-    valid_from = proposal.valid_from or source_context.valid_from or source.occurred_at
+    """Build the typed context for one proposal, optionally derived from a source memory.
+
+    A naming assertion has no source memory and no model behind it: the household owner said
+    so. It passes `source=None` and carries the identity binding instead.
+    """
+    source_context = None if source is None else _observation_from_record(source)
+    valid_from = proposal.valid_from
+    valid_until = proposal.valid_until
+    spatial = proposal.spatial
+    if source is not None and source_context is not None:
+        valid_from = valid_from or source_context.valid_from or source.occurred_at
+        valid_until = valid_until or source_context.valid_until
+        spatial = spatial or source_context.spatial
     if valid_from is None and proposal.kind in {MemoryKind.STATE, MemoryKind.TRAIT}:
         valid_from = recorded_at
-    valid_until = proposal.valid_until or source_context.valid_until
-    spatial = proposal.spatial or source_context.spatial
     return MemoryContext(
         kind=proposal.kind,
         basis=proposal.basis,
@@ -6728,14 +7105,15 @@ def _formation_context(
         valid_from=valid_from,
         valid_until=valid_until,
         recorded_at=recorded_at,
-        lineage_id=_formation_lineage_id(proposal, spatial=spatial),
-        source_id=source_context.source_id,
+        lineage_id=_formation_lineage_id(proposal, spatial=spatial, identity_id=identity_id),
+        source_id=None if source_context is None else source_context.source_id,
         subject=proposal.subject,
         predicate=proposal.predicate,
         value=proposal.value,
-        evidence_ids=(source.id,),
+        evidence_ids=() if source is None else (source.id,),
         model_id=model_id,
         recipe=recipe,
+        identity_id=identity_id,
         spatial=spatial,
         cue_modality=proposal.cue_modality,
         valence=proposal.valence,
@@ -6747,16 +7125,26 @@ def _formation_lineage_id(
     proposal: FormationProposal,
     *,
     spatial: object = None,
+    identity_id: str | None = None,
 ) -> str:
     frame_id = getattr(spatial, "frame_id", None)
     anchor = getattr(getattr(spatial, "anchor", None), "value", None)
+    # A bound claim keys on the person, not on how the subject happened to be spelled, so every
+    # naming assertion about one identity lands in one lineage and a rename supersedes rather
+    # than forks. An unbound claim keeps the original payload byte for byte, so lineage IDs
+    # already on disk stay valid.
+    binding: dict[str, object] = (
+        {"subject": _semantic_text(proposal.subject)}
+        if identity_id is None
+        else {"subject": None, "identity_id": identity_id}
+    )
     payload = json.dumps(
         {
             "kind": proposal.kind.value,
-            "subject": _semantic_text(proposal.subject),
             "predicate": _semantic_text(proposal.predicate),
             "frame_id": frame_id,
             "anchor": anchor,
+            **binding,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -6787,6 +7175,9 @@ def _formation_memory_id(
         {
             "recipe": recipe,
             "kind": proposal.kind.value,
+            # Only present once something is bound, so two identities that share a name stay two
+            # records while every ID minted before the binding existed keeps its value.
+            **({} if context.identity_id is None else {"identity_id": context.identity_id}),
             "subject": _semantic_text(proposal.subject),
             "predicate": _semantic_text(proposal.predicate),
             "value": _semantic_text(proposal.value),
@@ -7137,6 +7528,15 @@ def _face_identity_text(
             + json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
         )
     return "\n\n".join(sections)
+
+
+def _has_indexed_speech(memory: StoredMemory) -> bool:
+    """Report whether stored content carries a speech projection that names its speakers."""
+    return any(
+        f"[speech identities:{asset.asset_id}]\n" in memory.content
+        for asset in memory.assets
+        if asset.modality in {"audio", "video"}
+    )
 
 
 def _without_speech_identities(text: str, asset_ids: Sequence[str]) -> str:

@@ -704,7 +704,12 @@ def _compile(memory: Memory, arguments: argparse.Namespace) -> _Document:
         "affect",
         "traits",
     ):
-        document[name] = [_memory_document(hit) for hit in getattr(bundle, name)]
+        # `actors` may carry a provisional identity beside the ranked hits: a person the
+        # evidence observed whom no visible naming assertion names.
+        document[name] = [
+            _memory_document(entry) if isinstance(entry, SearchHit) else asdict(entry)
+            for entry in getattr(bundle, name)
+        ]
     return document
 
 

@@ -37,6 +37,7 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     ObservationContext,
+    ProvisionalActor,
     RetrievalScope,
     RetrievalTrace,
     SearchHit,
@@ -312,6 +313,13 @@ class ContextConflictResult(BaseModel):
     memory_ids: tuple[str, ...]
 
 
+class ProvisionalActorResult(BaseModel):
+    """A recognized person in the evidence whom no visible naming assertion names."""
+
+    identity_id: str
+    memory_ids: tuple[str, ...]
+
+
 class ContextUnknownResult(BaseModel):
     kind: ContextUnknownKind
     detail: str
@@ -321,7 +329,10 @@ class ContextBundleResult(BaseModel):
     goal: str
     reference_at: AwareDatetime
     budget: ContextBudgetResult
-    actors: tuple[SearchHitResult, ...]
+    # An unnamed person present in the evidence is reported here beside the ranked entity
+    # hits, labelled, rather than omitted: what an agent may say depends on knowing they are
+    # there and that nobody has named them.
+    actors: tuple[SearchHitResult | ProvisionalActorResult, ...]
     relationships: tuple[SearchHitResult, ...]
     scene: tuple[SearchHitResult, ...]
     episodes: tuple[SearchHitResult, ...]
@@ -342,12 +353,22 @@ class ContextBundleResult(BaseModel):
     rendered: str
 
 
-def build_mcp_server(memory: Memory) -> MCPServer[None]:
+def build_mcp_server(
+    memory: Memory,
+    *,
+    identity_operations: bool = True,
+) -> MCPServer[None]:
     """Expose the typed agent tool surface without taking ownership of ``memory``.
 
     Every tool is one call on the injected ``Memory``: the embodied and identity tools are
     reachable here for the same reason the common-path tools are, because this server runs in the
     process that holds it.
+
+    ``identity_operations`` is the host's choice about naming and erasing people. It defaults to
+    True, which is the published fifteen-tool surface. Pass False and the five identity tools are
+    not registered at all -- naming, reading, unlinking and erasing a person stay with the
+    process that owns the memory -- and the server instructions say so, because a tool an agent
+    cannot see is better than one it must be trusted not to call.
     """
     server: MCPServer[None] = MCPServer(
         "mindbridge",
@@ -357,7 +378,7 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
         # configured composition when it connects instead of spending a tool call or discovering
         # a missing backend by failing. `/healthz` reports the same view per request, so a
         # composition swapped behind a long-lived server stays visible there.
-        instructions=_instructions(memory.capabilities),
+        instructions=_instructions(memory.capabilities, identity_operations=identity_operations),
         version="0.2.0",
         middleware=[cast(ServerMiddleware[Any], _strict_tool_arguments)],
     )
@@ -693,14 +714,15 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
         return ReinforceResult(reinforced=memory.reinforce(memory_ids))
 
     _register_embodied_tools(server, memory)
+    _register_identity_tools(server, memory, enabled=identity_operations)
     return server
 
 
 def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
-    """Register the embodied and identity tools on an existing server.
+    """Register the embodied tools on an existing server.
 
-    Split from `build_mcp_server` only to keep each registration function readable; the two sets
-    dispatch to the same injected memory.
+    Split from `build_mcp_server` only to keep each registration function readable; every set
+    dispatches to the same injected memory.
     """
 
     @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
@@ -742,6 +764,24 @@ def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
         """
         return FacesResult(observations=memory.faces(memory_id))
 
+
+def _register_identity_tools(
+    server: MCPServer[None],
+    memory: Memory,
+    *,
+    enabled: bool,
+) -> None:
+    """Register the identity tools, unless the host withheld them.
+
+    Naming a person, reading who they are, splitting a wrong merge and erasing them are host
+    authority: every one of them is recorded in the operation log and, apart from erasure,
+    reversible. A host that does not want an agent holding that authority builds the server
+    with `identity_operations=False`, and then these five tools are never registered at all --
+    an agent cannot call a tool it cannot see, which is stronger than trusting it not to.
+    """
+    if not enabled:
+        return
+
     @server.tool(annotations=_IDEMPOTENT_WRITE)
     @_stable_errors
     def register_speaker(
@@ -753,11 +793,16 @@ def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
     ) -> RegisterResult:
         """Name the person behind one `speaker_id` from `analyze_speech`.
 
-        Call this once a conversation establishes who a recognized voice belongs to. Repeating it
-        replaces the name, so retrying is safe; omitting `relationship` leaves any recorded
-        relationship intact rather than clearing it. Naming a speaker also rewrites the stored
-        memories that quote them, so later searches can find the person by name. Fails with
-        `speaker_not_found` when the ID is not a recognized speaker.
+        Naming a person is host authority, exercised through you: this asserts, on the host's
+        behalf, that this voice belongs to this name. Call it once a conversation establishes
+        who a recognized voice belongs to, and not to record a guess. The assertion is a
+        versioned memory record, it is written to the operation log, and it is reversible:
+        naming again supersedes it and a rollback restores the previous name.
+
+        Repeating the same name changes nothing, so retrying is safe; omitting `relationship`
+        leaves any recorded relationship intact rather than clearing it. Naming a speaker also
+        rewrites the stored memories that quote them, so later searches can find the person by
+        name. Fails with `speaker_not_found` when the ID is not a recognized speaker.
         """
         memory.register_speaker(speaker_id, name, relationship=relationship)
         return RegisterResult(registered=True)
@@ -773,11 +818,16 @@ def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
     ) -> RegisterResult:
         """Name the person behind one `identity_id` from `analyze_faces` or `analyze_speech`.
 
-        Call this for an identity that may have been seen as well as heard; use
-        `register_speaker` only for a voice-only speaker ID. Repeating it replaces the name, so
-        retrying is safe; omitting `relationship` leaves any recorded relationship intact rather
-        than clearing it. Fails with `identity_not_found` when the ID is not a recognized
-        identity.
+        Naming a person is host authority, exercised through you: this asserts, on the host's
+        behalf, that this recognized person is called this. Call it for an identity that may
+        have been seen as well as heard, and only once something establishes the name; use
+        `register_speaker` only for a voice-only speaker ID. The assertion is a versioned
+        memory record, it is written to the operation log, and it is reversible: naming again
+        supersedes it and a rollback restores the previous name.
+
+        Repeating the same name changes nothing, so retrying is safe; omitting `relationship`
+        leaves any recorded relationship intact rather than clearing it. Fails with
+        `identity_not_found` when the ID is not a recognized identity.
         """
         memory.register_identity(identity_id, name, relationship=relationship)
         return RegisterResult(registered=True)
@@ -963,7 +1013,7 @@ def _bundle_result(bundle: ContextBundle) -> ContextBundleResult:
         goal=bundle.goal,
         reference_at=bundle.reference_at,
         budget=_budget_result(bundle.budget),
-        actors=tuple(_search_hit_result(hit) for hit in bundle.actors),
+        actors=tuple(_actor_result(entry) for entry in bundle.actors),
         relationships=tuple(_search_hit_result(hit) for hit in bundle.relationships),
         scene=tuple(_search_hit_result(hit) for hit in bundle.scene),
         episodes=tuple(_search_hit_result(hit) for hit in bundle.episodes),
@@ -987,6 +1037,15 @@ def _bundle_result(bundle: ContextBundle) -> ContextBundleResult:
     )
 
 
+def _actor_result(entry: SearchHit | ProvisionalActor) -> SearchHitResult | ProvisionalActorResult:
+    if isinstance(entry, ProvisionalActor):
+        return ProvisionalActorResult(
+            identity_id=entry.identity_id,
+            memory_ids=entry.memory_ids,
+        )
+    return _search_hit_result(entry)
+
+
 def _budget_result(budget: ContextBudget) -> ContextBudgetResult:
     return ContextBudgetResult(
         max_chars=budget.max_chars,
@@ -1008,7 +1067,11 @@ def _conflict_result(conflict: ContextConflict) -> ContextConflictResult:
     )
 
 
-def _instructions(capabilities: MemoryCapabilities) -> str:
+def _instructions(
+    capabilities: MemoryCapabilities,
+    *,
+    identity_operations: bool = True,
+) -> str:
     """Render the declared capability view an agent reads when it connects.
 
     The document is `MemoryCapabilities.document()` verbatim -- the same object `/healthz` serves
@@ -1023,6 +1086,14 @@ def _instructions(capabilities: MemoryCapabilities) -> str:
             " one grounded sentence.",
             "Cognitive forgetting, consolidation and operation rollback have no tool here; they"
             " stay with the process that owns this memory.",
+            (
+                "Naming a person is host authority exercised through you: register_speaker and"
+                " register_identity assert a name on the host's behalf, are recorded in the"
+                " operation log, and are reversible."
+                if identity_operations
+                else "Identity operations are not exposed here: naming, reading, unlinking and"
+                " erasing a person stay with the process that owns this memory."
+            ),
             "Declared capabilities of this composition, the same JSON document GET /healthz"
             " serves. `operations` names the optional operations these backends can serve:",
             json.dumps(capabilities.document(), indent=2, sort_keys=True),

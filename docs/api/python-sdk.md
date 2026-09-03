@@ -365,11 +365,17 @@ enrollment call that creates a person from a photograph or a voice sample. Regis
 the recognizers have already observed instead: add the media, read `faces()` or `speech()` for its
 `identity_id`, then name it. Omitting `relationship` on a later call leaves any recorded
 relationship intact, so renaming never silently discards it, and there is deliberately no way to
-clear one. `identity` resolves an ID through any merge alias and returns what has been registered,
+clear one. Registration writes a typed naming assertion and projects the profile from it, so it
+also adds a searchable memory record, appears in `operations()`, and is reversible with
+`rollback()`; see
+[typed assertions](../memory-types-time-and-decay.md#naming-a-person-is-a-typed-assertion).
+`identity` resolves an ID through any merge alias and returns what has been registered,
 so an observation captured before a merge still reaches the surviving person. `unlink_identity`
 reverses one face-and-voice merge, returning the restored ID or `None` when the merge is not
 reversible; it resets the pair's accumulated evidence rather than suppressing the pair, so a voice
-and face that keep co-occurring are corroborated and merged again. `reinforce`
+and face that keep co-occurring are corroborated and merged again. Restoring a voice also rewrites
+the indexed transcript projection in the same commit, so search stops answering to the name the
+reversed merge had attributed to it. `reinforce`
 records explicit positive feedback and returns the number of existing distinct memories updated.
 `list` uses an opaque keyset cursor. `delete` is idempotent and reports whether the record existed;
 what it removes is spelled out below. `reindex` rebuilds Zvec from authoritative SQLite embeddings
@@ -450,6 +456,16 @@ back is rejected as `"duplicate"`.
 | `CONSOLIDATE` | Valid proposal; at least one shown evidence ID, each still standing; every `target_ids` entry among this proposal's own evidence; affect cue modality and spatial frame present in some source | New derived record citing every source, `forgotten_at` set on any named target, and the lineage supersession the kernel's own rule implies | Deletes the created records, un-forgets the targets, and restores the `superseded` versions |
 | `CORRECT` | Every target in the window, existing, and derived (`kind != OBSERVATION`) | Retires current versions at transaction time | Carries a new version with the same interval |
 | `FORGET` | Every target in the window, existing, and not already forgotten | Sets `forgotten_at` | Clears `forgotten_at` |
+| `IDENTIFY` | Identity exists; every evidence ID shown and existing, each still standing; at least one cited memory contains that identity through a speech or face observation | Commits the `ENTITY` naming assertion the kernel builds from `claim`, recomputes `identities.name` and the indexed speech text | Retracts the assertion, restores the `superseded` version, and repaints both |
+
+`REINFORCE`, `CORRECT`, and `FORGET` refuse a bound naming assertion with `"naming_assertion"`.
+A name is not an inference to be corrected: reverse it with `rollback` of the `IDENTIFY` that
+asserted it, which is what recomputes the projection. `IDENTIFY` adds `"unknown_identity"` and
+`"identity_not_in_evidence"` to the rejection vocabulary. An `IDENTIFY` proposed by a backend
+carries basis `MODEL_INFERENCE`, so it stays hidden, and out of `identities.name`, until two
+independent evidence groups support it, exactly like an inferred `TRAIT`. `register_identity` and
+`register_speaker` are the host entry points for the same intent: they assert the name on the
+host's authority with basis `USER_STATEMENT`, cite no evidence, and are visible immediately.
 
 Named targets and cited evidence are bounded by the window the kernel gathered: a proposal naming
 a target outside it is rejected as `"target_not_shown"` before any write. The window is the shown
@@ -491,7 +507,9 @@ which any record is already forgotten returns `None` having changed nothing.
 `operation_id`, and for one a later standing operation has built on. Operations that touched one
 lineage reverse newest first: while a second consolidation's derived record supersedes the first
 one's, rolling the first one back would leave two current versions in the lineage, so it is
-refused and its log row stays standing until the newer one is reversed. `operations` lists the log newest first. Physical deletion is not an intent, and
+refused and its log row stays standing until the newer one is reversed. The same rule orders a
+sequence of namings: reversing a naming a later one displaced is refused rather than reported
+as success. `operations` lists the log newest first. Physical deletion is not an intent, and
 none of these five operations is exposed on REST or MCP.
 
 The log is sufficient to replay a sequence against a fresh store holding the same sources:
@@ -648,13 +666,13 @@ semantics and complete examples.
 
 ### Root import inventory
 
-These are the 103 supported names exported by `mindbridge`:
+These are the 105 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `ProvisionalActor`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
@@ -685,18 +703,21 @@ The principal immutable values are:
 | `AnswerResult` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `Page` | `items`, `next_cursor` |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
-| `IdentityProfile` | `identity_id`, `name`, `relationship` |
+| `IdentityProfile` | `identity_id`, `name`, `relationship`, `confirmed`, `evidence_ids`; the last two are derived from the current visible naming assertion, never stored |
+| `ProvisionalActor` | `identity_id`, `memory_ids`: a recognized person in a compiled bundle's `actors` whom no visible naming assertion names |
 | `IdentityErasure` | `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`, `face_observations`, `speech_segments` |
 | `FaceObservation` | `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
 | `SpatialContext` | `frame_id`, `anchor`, `x`, `y`, `z`, `orientation_xyzw`, `position_uncertainty_m` |
 | `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial`, `place_id` |
-| `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `spatial`, `cue_modality`, `valence`, `arousal` |
+| `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `identity_id`, `spatial`, `cue_modality`, `valence`, `arousal` |
 | `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m`, `place_id` |
 | `ContextBudget` | `max_chars`, `max_items`, `memory_types`, `min_confidence`, `freshness`, `max_latency_ms` |
 | `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknown` | `kind` (a `ContextUnknownKind`), `detail` |
+| `ProvisionalActor` | `identity_id`, `memory_ids` |
 | `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`; `hits` property and `render()` |
-| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `rationale` |
+| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `rationale` |
+| `IdentityClaim` | `identity_id`, `name`, `relationship` |
 | `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `superseded`, `rolled_back_at` |
 | `ConsolidationCandidate` | `trigger`, `memory_ids`, `evidence_count` |
 | `ConsolidationReport` | `operations`, `rejected` as `(MemoryOperation, reason)` pairs |
@@ -731,7 +752,7 @@ Enum values are:
 | `RetrievalRejection` | `stale_index`, `occurrence_range`, `missing_memory`, `memory_type`, `minimum_relevance`, `ambiguity`, `limit` |
 | `EmbedTask` | `retrieval.query`, `retrieval.document` |
 | `MemoryKind` | `observation`, `entity`, `event`, `state`, `relation`, `affect`, `trait`, `response_policy` |
-| `MemoryIntent` | `reinforce`, `consolidate`, `correct`, `forget` |
+| `MemoryIntent` | `reinforce`, `consolidate`, `correct`, `forget`, `identify` |
 | `MemoryTrigger` | `manual`, `evidence`, `feedback`, `contradiction`, `query_failure`, `pressure`, `idle` |
 | `EvidenceBasis` | `observation`, `user_statement`, `model_inference`, `response_feedback` |
 | `SpatialAnchor` | `observer`, `subject` |
@@ -799,7 +820,9 @@ streaming extension implements `close()`.
 input, in the same order. A former never writes storage: the kernel validates each proposal
 against the source modality and spatial frame, assigns identity, links evidence, and commits.
 `consolidate` receives the bounded evidence set the kernel chose and may cite only IDs from it;
-like a former it proposes and never writes storage.
+like a former it proposes and never writes storage. An `IDENTIFY` proposal carries an
+`IdentityClaim` rather than a `FormationProposal`: the backend names the identity and cites the
+evidence, and the kernel builds the typed assertion.
 
 `ModelInput` contains normalized `text` and resolved `assets`. Speech adapters return
 `SpeechAnalysis(turns, speakers)` using `SpeechTurn` and `SpeakerEmbedding`; face adapters return

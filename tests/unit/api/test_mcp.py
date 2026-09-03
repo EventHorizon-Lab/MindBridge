@@ -43,6 +43,7 @@ from mindbridge.types import (
     Modality,
     ObservationContext,
     Page,
+    ProvisionalActor,
     RetrievalCandidateTrace,
     RetrievalRejection,
     RetrievalScope,
@@ -90,7 +91,13 @@ ERASURE = IdentityErasure(
     face_observations=7,
     speech_segments=11,
 )
-PROFILE = IdentityProfile(identity_id="identity_1", name="Ann", relationship="daughter")
+PROFILE = IdentityProfile(
+    identity_id="identity_1",
+    name="Ann",
+    relationship="daughter",
+    confirmed=True,
+    evidence_ids=("memory_1",),
+)
 ASSET = AssetRef(
     id="asset_image",
     modality=Modality.IMAGE,
@@ -111,6 +118,7 @@ CAPABILITIES = MemoryCapabilities(
     generation_model="qwen3-omni",
     speaker_recognition=True,
 )
+PROVISIONAL = ProvisionalActor(identity_id="identity_2", memory_ids=("memory_2",))
 CONFLICT = ContextConflict(
     lineage_id="lineage_1",
     subject="ana",
@@ -120,7 +128,7 @@ CONFLICT = ContextConflict(
 )
 UNKNOWN = ContextUnknown(
     kind=ContextUnknownKind.BUDGET_EXCLUDED,
-    detail="3 candidates did not fit 24 items and 6000 chars",
+    detail="3 candidates did not fit 24 items and 16000 chars",
 )
 
 
@@ -539,6 +547,8 @@ async def test_mcp_dispatches_the_embodied_and_identity_operations() -> None:
             "identity_id": "identity_1",
             "name": "Ann",
             "relationship": "daughter",
+            "confirmed": True,
+            "evidence_ids": ["memory_1"],
         }
     }
     assert unlinked.structured_content == {"restored_identity_id": "identity_3"}
@@ -1004,7 +1014,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
     }
     assert [hit["id"] for hit in bundle["facts"]] == ["memory_1"]
     assert [hit["id"] for hit in bundle["episodes"]] == ["memory_2"]
-    assert bundle["actors"] == []
+    assert bundle["actors"] == [{"identity_id": "identity_2", "memory_ids": ["memory_2"]}]
     assert bundle["conflicts"] == [
         {
             "lineage_id": "lineage_1",
@@ -1017,7 +1027,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
     assert bundle["unknowns"] == [
         {
             "kind": "budget_excluded",
-            "detail": "3 candidates did not fit 24 items and 6000 chars",
+            "detail": "3 candidates did not fit 24 items and 16000 chars",
         }
     ]
     assert bundle["frames"] == ["home/map"]
@@ -1092,6 +1102,44 @@ async def test_every_tool_and_argument_carries_usable_prose() -> None:
     assert "backend_not_configured" in cast(str, descriptions["ask_memory"])
 
 
+async def test_a_host_can_withhold_the_identity_tools_from_an_agent() -> None:
+    """Naming people is host authority, so the host decides whether it is on the wire."""
+    identity_tools = {
+        "register_speaker",
+        "register_identity",
+        "get_identity",
+        "unlink_identity",
+        "forget_identity",
+    }
+
+    async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
+        exposed = {tool.name for tool in (await client.list_tools()).tools}
+    server = build_mcp_server(cast(Memory, FakeMemory()), identity_operations=False)
+    async with Client(server) as client:
+        withheld = {tool.name for tool in (await client.list_tools()).tools}
+        refused = await client.call_tool(
+            "register_identity",
+            {"identity_id": "identity_1", "name": "Ann"},
+        )
+
+    assert refused.is_error is True
+    assert len(exposed) == 15
+    assert identity_tools <= exposed
+    assert withheld == exposed - identity_tools
+    assert "Identity operations are not exposed here" in cast(str, server.instructions)
+
+
+async def test_naming_tools_state_that_naming_is_host_authority() -> None:
+    async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+    for name in ("register_speaker", "register_identity"):
+        description = cast(str, tools[name].description)
+        assert "host authority" in description, name
+        assert "operation log" in description, name
+        assert "reversible" in description, name
+
+
 def _record(
     *,
     memory_id: str = "memory_1",
@@ -1122,7 +1170,7 @@ def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
         goal="What should I bring?",
         reference_at=reference_at,
         budget=budget,
-        actors=(),
+        actors=(PROVISIONAL,),
         relationships=(),
         scene=(),
         episodes=(_media_hit(),),

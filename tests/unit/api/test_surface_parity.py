@@ -48,6 +48,7 @@ from mindbridge.types import (
     MemoryRecord,
     Modality,
     Page,
+    ProvisionalActor,
     SearchHit,
     SpeakerSegment,
 )
@@ -517,6 +518,12 @@ def test_the_compiled_bundle_mirrors_the_sdk_value_on_both_transports() -> None:
         (ContextBundle, rest.ContextBundleResponse, mcp_adapter.ContextBundleResult, {}),
         (ContextConflict, rest.ContextConflictResponse, mcp_adapter.ContextConflictResult, {}),
         (ContextUnknown, rest.ContextUnknownResponse, mcp_adapter.ContextUnknownResult, {}),
+        (
+            ProvisionalActor,
+            rest.ProvisionalActorResponse,
+            mcp_adapter.ProvisionalActorResult,
+            {},
+        ),
         (
             ContextBudget,
             rest.ContextBudgetResponse,

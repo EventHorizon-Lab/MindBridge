@@ -31,8 +31,9 @@ from mindbridge.infrastructure.local import (
     StoredAsset,
     StoredEmbedding,
     StoredMemory,
+    StoredOperation,
 )
-from mindbridge.infrastructure.local.store import _SCHEMA_VERSION, StoredOperation
+from mindbridge.infrastructure.local.store import _SCHEMA_VERSION
 from mindbridge.models.base import (
     FaceAnalysis,
     FaceEmbedding,
@@ -1737,6 +1738,35 @@ def test_schema_v10_adds_forgetting_and_control_plane_state(tmp_path: Path) -> N
     assert version == _SCHEMA_VERSION
 
 
+def test_schema_v11_adds_the_identity_binding_on_typed_claims(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory(),), (_embedding(),))
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.executescript(
+            """
+            DROP INDEX memory_semantics_identity_idx;
+            ALTER TABLE memory_semantics DROP COLUMN identity_id;
+            PRAGMA user_version = 11;
+            """
+        )
+
+    with LocalStore(tmp_path) as store:
+        memory = store.read_memory("memory-1")
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(memory_semantics)")
+            }
+            indexes = {
+                str(row[1]) for row in connection.execute("PRAGMA index_list(memory_semantics)")
+            }
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert memory is not None
+    assert "identity_id" in columns
+    assert "memory_semantics_identity_idx" in indexes
+    assert version == _SCHEMA_VERSION
+
+
 def test_forgotten_memories_leave_active_reads_but_stay_auditable(tmp_path: Path) -> None:
     forgotten_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
     with LocalStore(tmp_path) as store:
@@ -1975,6 +2005,236 @@ def test_valid_at_keeps_records_without_a_declared_validity_interval(tmp_path: P
     assert [memory.memory_id for memory in before] == ["plain"]
     assert unknown == ()
     assert nowhere == ()
+
+
+def _naming_assertion(
+    memory_id: str,
+    identity_id: str,
+    name: str,
+    *,
+    recorded_at: datetime,
+    relationship: str | None = None,
+    basis: EvidenceBasis = EvidenceBasis.USER_STATEMENT,
+    evidence_ids: tuple[str, ...] = (),
+) -> StoredMemory:
+    """One naming assertion, shaped the way `Memory.register_identity` writes it."""
+    return replace(
+        _memory(memory_id, f"{name} is a recognized person", created_at=recorded_at),
+        context=MemoryContext(
+            kind=MemoryKind.ENTITY,
+            basis=basis,
+            confidence=1.0,
+            valid_from=None,
+            valid_until=None,
+            recorded_at=recorded_at,
+            lineage_id=f"naming:{identity_id}",
+            subject=name,
+            predicate="identity",
+            value=relationship,
+            identity_id=identity_id,
+            evidence_ids=evidence_ids,
+        ),
+    )
+
+
+def _bound_claim(
+    memory_id: str,
+    identity_id: str,
+    *,
+    evidence_ids: tuple[str, ...],
+    recorded_at: datetime,
+) -> StoredMemory:
+    return replace(
+        _memory(memory_id, "the neighbour prefers tea", created_at=recorded_at),
+        context=MemoryContext(
+            kind=MemoryKind.STATE,
+            basis=EvidenceBasis.MODEL_INFERENCE,
+            confidence=0.9,
+            valid_from=recorded_at,
+            valid_until=None,
+            recorded_at=recorded_at,
+            lineage_id=f"claim:{memory_id}",
+            subject="the neighbour",
+            predicate="preferred_drink",
+            value="tea",
+            identity_id=identity_id,
+            evidence_ids=evidence_ids,
+        ),
+    )
+
+
+def _semantic_bindings(store: LocalStore) -> dict[str, str | None]:
+    with closing(sqlite3.connect(store.database_path)) as connection:
+        return {
+            str(row[0]): None if row[1] is None else str(row[1])
+            for row in connection.execute("SELECT memory_id, identity_id FROM memory_semantics")
+        }
+
+
+def test_the_projection_follows_every_visibility_change_of_a_naming_assertion(
+    tmp_path: Path,
+) -> None:
+    """`identities.name` is the name of the currently visible assertion, or nothing.
+
+    The registry is a projection, so no path that retires, hides or deletes the assertion may
+    leave a name standing that nothing asserts -- including the paths that know nothing about
+    identities, which is every one of them but naming.
+    """
+    recorded_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        voice_id = _voice_identity(store, clip, (1.0, 0.0))
+        store.write_memories(
+            (
+                _naming_assertion("naming-1", voice_id, "Li", recorded_at=recorded_at),
+                _naming_assertion(
+                    "naming-2",
+                    voice_id,
+                    "Li Hua",
+                    recorded_at=recorded_at + timedelta(minutes=1),
+                ),
+            ),
+            (_embedding("e-naming-1", "naming-1"), _embedding("e-naming-2", "naming-2")),
+        )
+        # The store projects on write: the newer assertion supersedes the older one.
+        assert store.identity_profile(voice_id) == IdentityProfile(
+            identity_id=voice_id,
+            name="Li Hua",
+            confirmed=True,
+        )
+
+        # Cognitive forgetting hides the record, so it stops naming anybody.
+        store.set_forgotten(("naming-2",), forgotten_at=recorded_at + timedelta(minutes=2))
+        assert store.projected_identity_name(voice_id) == ("Li", None)
+
+        store.set_forgotten(("naming-2",), forgotten_at=None)
+        assert store.projected_identity_name(voice_id) == ("Li Hua", None)
+
+        # A correction through the control plane retires the version.
+        applied = store.apply_control_operation(
+            StoredOperation(
+                operation_key="correct-naming-2",
+                intent="correct",
+                trigger="manual",
+                operation_json="{}",
+                applied_at=recorded_at + timedelta(minutes=3),
+            ),
+            correct_ids=("naming-2",),
+        )
+        assert applied is not None
+        assert store.projected_identity_name(voice_id) == ("Li", None)
+
+        # And deleting the last one leaves nobody named, in the ordinary delete path.
+        assert store.delete_memory("naming-1") is True
+        speech = store.read_speech(clip.asset_id, space_id="cam++:test")
+        profile = store.identity_profile(voice_id)
+
+    assert profile == IdentityProfile(identity_id=voice_id)
+    assert speech is not None and speech[0].speaker_name is None
+
+
+def test_merging_identities_repoints_the_naming_assertion_onto_the_survivor(
+    tmp_path: Path,
+) -> None:
+    """A merge must not orphan the source's assertion, or the name becomes unsupported."""
+    recorded_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        face_id = _face_identity(store, clip, (1.0, 0.0))
+        voice_id = _voice_identity(store, clip, (1.0, 0.0))
+        store.write_memories(
+            (
+                _naming_assertion("naming-face", face_id, "Alice", recorded_at=recorded_at),
+                _naming_assertion(
+                    "naming-voice",
+                    voice_id,
+                    "Alice",
+                    recorded_at=recorded_at + timedelta(minutes=1),
+                ),
+            ),
+            (_embedding("e-face", "naming-face"), _embedding("e-voice", "naming-voice")),
+        )
+        plan = store.identity_link_plan(face_id, voice_id)
+        assert plan is not None and plan.name == "Alice"
+        target = store.link_identities(face_id, voice_id, expected=plan)
+
+        assert target == plan.target_id
+        assert _semantic_bindings(store) == {"naming-face": target, "naming-voice": target}
+        assert store.identity_profile(target) == IdentityProfile(
+            identity_id=target,
+            name="Alice",
+            confirmed=True,
+        )
+
+
+def test_unlinking_re_attributes_or_unbinds_the_claims_made_while_two_were_one(
+    tmp_path: Path,
+) -> None:
+    """Scenario step 6: a wrong merge must not leave claims attached to the wrong person."""
+    recorded_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        seen = _video_asset(store, "seen")
+        heard = _video_asset(store, "heard")
+        face_id = _face_identity(store, seen, (1.0, 0.0))
+        assert store.register_identity(face_id, "Li") is True
+        voice_id = _voice_identity(store, heard, (0.0, 1.0))
+        assert store.link_identities(face_id, voice_id) == face_id
+        store.write_memories(
+            (
+                _bound_claim(
+                    "heard-only",
+                    face_id,
+                    evidence_ids=("heard",),
+                    recorded_at=recorded_at,
+                ),
+                _bound_claim(
+                    "both",
+                    face_id,
+                    evidence_ids=("seen", "heard"),
+                    recorded_at=recorded_at,
+                ),
+                _bound_claim(
+                    "seen-only",
+                    face_id,
+                    evidence_ids=("seen",),
+                    recorded_at=recorded_at,
+                ),
+            ),
+            (
+                _embedding("e-heard-only", "heard-only"),
+                _embedding("e-both", "both"),
+                _embedding("e-seen-only", "seen-only"),
+            ),
+        )
+
+        assert store.unlink_identity(voice_id) == voice_id
+        bindings = _semantic_bindings(store)
+
+    # The claim resting only on the clip that moved back follows the restored person; the one
+    # resting on both people's media is attributed to nobody; the one that never involved the
+    # restored person is untouched.
+    assert bindings["heard-only"] == voice_id
+    assert bindings["both"] is None
+    assert bindings["seen-only"] == face_id
+
+
+def test_provisional_identities_name_the_people_no_assertion_names(tmp_path: Path) -> None:
+    recorded_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        seen = _video_asset(store, "seen")
+        heard = _video_asset(store, "heard")
+        face_id = _face_identity(store, seen, (1.0, 0.0))
+        voice_id = _voice_identity(store, heard, (0.0, 1.0))
+        store.write_memories(
+            (_naming_assertion("naming-face", face_id, "Li", recorded_at=recorded_at),),
+            (_embedding("e-naming-face", "naming-face"),),
+        )
+
+        assert store.identity_for_subject("  LI  ") == face_id
+        assert store.identity_for_subject("nobody") is None
+        assert store.provisional_identities(("seen", "heard", "memory-missing")) == {
+            "heard": (voice_id,)
+        }
 
 
 def test_rolling_back_an_operation_deletes_its_records_in_the_same_transaction(

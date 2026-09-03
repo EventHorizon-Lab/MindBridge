@@ -37,7 +37,7 @@ window came back full and the bundle still lost evidence, `unknowns` carries a
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `max_chars` | `16000` | Evidence character ceiling, charged with the same cost function `ask()` uses: record text plus a per-modality text equivalent for each media asset |
+| `max_chars` | `16000` | Evidence character ceiling, charged with the same cost function `ask()` uses: record text plus a per-modality text equivalent for each media asset. One image part is charged 2000, one audio part 4000, and one video part 12000, so a ceiling below 12000 omits every video record it ranks |
 | `max_items` | `24` | Maximum included memories |
 | `memory_types` | `None` | Keep only these `MemoryType` values; `None` keeps every type |
 | `min_confidence` | `0.0` | Minimum typed confidence; a record with no typed context counts as `1.0` |
@@ -115,7 +115,7 @@ A typed `MemoryKind` decides the section first; an untyped or generic record fal
 
 | Section | Contents |
 | --- | --- |
-| `actors` | Kind `entity` |
+| `actors` | Kind `entity`, plus one `ProvisionalActor` per unnamed person in the included evidence |
 | `relationships` | Kind `relation` |
 | `scene` | Kind `state` |
 | `facts` | Type `semantic`, except `entity`, `relation`, `state`, `affect`, and `trait` |
@@ -159,6 +159,19 @@ a thin bundle explains itself instead of looking like an empty store.
 | `modality_unsupported` | The goal carries media this composition's embedder cannot search |
 | `stage_skipped` | An optional stage the `max_latency_ms` deadline skipped |
 | `candidates_exhausted` | Retrieval filled its candidate window and the bundle still lost evidence, so the counts bound the window and not the store |
+
+## Provisional actors
+
+A recognized person whom no visible naming assertion names is reported in `actors` as a
+`ProvisionalActor` carrying `identity_id` and the `memory_ids` of the included evidence that
+observed them, sorted by identity. An unnamed person present in the room is not a person missing
+from context: what an agent may say depends on knowing they are there and that nobody has named
+them.
+
+A provisional actor is not a hit. It never appears in `hits`, it takes no item slot, it costs no
+characters, and it is dropped when the evidence that observed the person did not make it into the
+bundle -- the bundle never reports somebody the reader cannot see the evidence for. `render()`
+prints one plainly labelled line per entry, after the ranked actors.
 
 ## Conflicts
 
