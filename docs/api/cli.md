@@ -130,6 +130,13 @@ they require the matching capability. `compile` mirrors the
 [`ContextBudget` defaults](../context-compilation.md#budget) and repeats `--memory-type` to keep
 more than one type; `--max-latency-ms` is a deadline the compiler checks between stages, and the
 printed bundle carries `elapsed_ms`, `deadline_exceeded`, and `unknowns` alongside its sections.
+Each row `operations` prints carries `operation_id`, `intent`, `trigger`, `evidence_ids`,
+`target_ids`, `identity`, `rationale`, `model_id`, `recipe`, `created_ids`, `changed_ids`,
+`forgotten_ids`, `superseded`, `applied_at`, and `rolled_back_at`. `identity` is set on the three
+rows that name a person instead of records -- the cross-modal `merge` the kernel commits, the
+`correct` that `unlink-identity` logs, and the irreversible `forget` that `forget-identity`
+logs -- and is `null` on every other row.
+
 `forget` is cognitive forgetting, reversible with `rollback`; `delete` is erasure. With the
 default `reinforce_on_answer=True`, `ask` also reinforces the hits the answerer cites; use
 `--app` to construct a memory with that policy disabled.

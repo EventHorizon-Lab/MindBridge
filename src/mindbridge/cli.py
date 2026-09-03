@@ -879,6 +879,16 @@ def _operation_document(record: MemoryOperationRecord) -> _Document:
         "trigger": record.trigger.value,
         "evidence_ids": list(record.operation.evidence_ids),
         "target_ids": list(record.operation.target_ids),
+        # A merge, split, or identity erasure names people rather than records, so without this
+        # its row would report an intent and no subject at all.
+        "identity": (
+            None
+            if record.operation.identity is None
+            else {
+                "identity_id": record.operation.identity.identity_id,
+                "moved_ids": list(record.operation.identity.moved_ids),
+            }
+        ),
         "rationale": record.operation.rationale,
         "model_id": record.model_id,
         "recipe": record.recipe,

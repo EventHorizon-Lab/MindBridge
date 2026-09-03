@@ -16,6 +16,7 @@ import json
 import re
 import sys
 from collections.abc import Iterator, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
@@ -26,6 +27,7 @@ from urllib.request import Request
 import pytest
 from pydantic import TypeAdapter
 
+import mindbridge.cli as cli_module
 from mindbridge import Memory, recipes
 from mindbridge.api import app as rest
 from mindbridge.api import content as rest_content
@@ -40,7 +42,12 @@ from mindbridge.types import (
     AbstentionReason,
     AnswerResult,
     AssetRef,
+    IdentityChange,
+    MemoryIntent,
+    MemoryOperation,
+    MemoryOperationRecord,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
     Page,
@@ -1113,3 +1120,34 @@ def test_remote_timeout_must_be_positive_and_finite(
         main(("--url", "http://owner:8000", "--timeout", value, "list"))
     assert raised.value.code == 2
     assert "--timeout" in capsys.readouterr().err
+
+
+def test_an_operation_row_names_the_people_a_merge_moved() -> None:
+    """An identity operation names people, not records, so the row has to carry them.
+
+    `merge`, the `correct` a split logs, and the `forget` an erasure logs all leave every
+    memory-ID field empty. Without `identity` the operator surface would print an intent with no
+    subject at all.
+    """
+    record = MemoryOperationRecord(
+        operation_id=7,
+        operation=MemoryOperation(
+            intent=MemoryIntent.MERGE,
+            identity=IdentityChange(identity_id="identity-1", moved_ids=("identity-2",)),
+        ),
+        trigger=MemoryTrigger.EVIDENCE,
+        applied_at=datetime(2026, 3, 1, 12, tzinfo=timezone.utc),
+    )
+
+    document = cli_module._operation_document(record)
+
+    assert document["intent"] == "merge"
+    assert document["identity"] == {
+        "identity_id": "identity-1",
+        "moved_ids": ["identity-2"],
+    }
+    assert document["target_ids"] == []
+    assert cli_module._operation_document(replace(record, operation=_A_FORGET))["identity"] is None
+
+
+_A_FORGET = MemoryOperation(intent=MemoryIntent.FORGET, target_ids=("memory-1",))
