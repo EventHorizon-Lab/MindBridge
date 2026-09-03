@@ -1033,7 +1033,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
     assert "/private/mindbridge/assets" not in json.dumps(bundle)
     assert defaulted.structured_content is not None
     assert defaulted.structured_content["budget"] == {
-        "max_chars": 24_000,
+        "max_chars": 16_000,
         "max_items": 24,
         "memory_types": None,
         "min_confidence": 0.0,

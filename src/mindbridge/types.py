@@ -1507,7 +1507,7 @@ class ContextBudget:
     # of text equivalent, so a smaller ceiling silently omits every video record it ranks: the
     # selector skips a hit that cannot fit rather than truncating it, and reports it as omitted.
     # An embodied deployment's primary modality must fit the default, not require tuning first.
-    max_chars: int = 24_000
+    max_chars: int = 16_000
     max_items: int = 24
     memory_types: frozenset[MemoryType] | None = None
     min_confidence: float = 0.0

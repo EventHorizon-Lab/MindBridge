@@ -128,7 +128,7 @@ def test_a_budget_that_cannot_bound_anything_is_rejected(invalid: dict[str, obje
 
 def test_budget_defaults_are_the_documented_ones() -> None:
     budget = ContextBudget()
-    assert (budget.max_chars, budget.max_items) == (24_000, 24)
+    assert (budget.max_chars, budget.max_items) == (16_000, 24)
     assert (budget.memory_types, budget.min_confidence, budget.freshness) == (None, 0.0, None)
 
 
@@ -402,7 +402,7 @@ def test_render_is_deterministic_and_names_every_included_id() -> None:
         "# Context: what is going on",
         "Each line is one memory: [id] content (confidence; validity).",
         f"Reference time: {REFERENCE.isoformat()}",
-        f"Budget: {bundle.chars}/24000 chars, 4/4 items",
+        f"Budget: {bundle.chars}/16000 chars, 4/4 items",
     ]
     assert "## Actors" in rendered and "## Facts" in rendered
     assert "- [actor-1] evidence actor-1 (confidence 0.90)" in rendered
@@ -618,7 +618,7 @@ def test_the_cli_command_serializes_the_bundle(tmp_path: Path) -> None:
         document = _LOCAL["compile"](memory, arguments)
 
     assert json.loads(json.dumps(document))["budget"] == {
-        "max_chars": 24_000,
+        "max_chars": 16_000,
         "max_items": 1,
         "memory_types": ["semantic"],
         "min_confidence": 0.0,

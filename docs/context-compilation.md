@@ -28,7 +28,7 @@ forgotten record and a hidden inferred trait never reach a bundle.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `max_chars` | `24000` | Evidence character ceiling, charged with the same cost function `ask()` uses: record text plus a per-modality text equivalent for each media asset. One image part is charged 2000, one audio part 4000, and one video part 12000, so a ceiling below 12000 omits every video record it ranks |
+| `max_chars` | `16000` | Evidence character ceiling, charged with the same cost function `ask()` uses: record text plus a per-modality text equivalent for each media asset. One image part is charged 2000, one audio part 4000, and one video part 12000, so a ceiling below 12000 omits every video record it ranks |
 | `max_items` | `24` | Maximum included memories |
 | `memory_types` | `None` | Keep only these `MemoryType` values; `None` keeps every type |
 | `min_confidence` | `0.0` | Minimum typed confidence; a record with no typed context counts as `1.0` |
@@ -92,7 +92,7 @@ trailer only when something was omitted.
 # Context: what should I bring to the workshop?
 Each line is one memory: [id] content (confidence; validity).
 Reference time: 2026-09-03T12:00:00+00:00
-Budget: 132/24000 chars, 3/24 items
+Budget: 132/16000 chars, 3/24 items
 
 ## Facts
 - [a1b2] the spare key is in the blue toolbox (confidence 1.00)
