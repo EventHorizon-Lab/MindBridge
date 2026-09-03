@@ -8,6 +8,7 @@ have one place to stay current.
 | Goal | Start here | Continue with |
 | --- | --- | --- |
 | Try local memory | [Quick start](quickstart.md) | [Core concepts](concepts.md) |
+| Understand the product direction | [Context OS direction](context-os.md) | [Architecture](architecture.md) |
 | Build a Python integration | [Configuration](configuration.md) | [Python SDK](api/python-sdk.md) |
 | Expose memory to another process | [REST](api/rest.md), [MCP](api/mcp.md), or [CLI](api/cli.md) | [Deployment](deployment.md) |
 | Run a durable instance | [Architecture](architecture.md) | [Operations](operations.md) and [troubleshooting](troubleshooting.md) |
@@ -15,12 +16,14 @@ have one place to stay current.
 
 ## Learn
 
-1. [Quick start](quickstart.md) — install MindBridge and run one local memory.
-2. [Core concepts](concepts.md) — understand records, content, retrieval, and directory ownership.
-3. [Configuration](configuration.md) — select bundled adapters or inject application backends.
-4. [Memory types, time, and decay](memory-types-time-and-decay.md) — control cognitive role and
+1. [Context OS direction](context-os.md) — understand the long-term product boundary, fast and slow
+   context planes, agentic memory management, and context compilation.
+2. [Quick start](quickstart.md) — install MindBridge and run one local memory.
+3. [Core concepts](concepts.md) — understand records, content, retrieval, and directory ownership.
+4. [Configuration](configuration.md) — select bundled adapters or inject application backends.
+5. [Memory types, time, and decay](memory-types-time-and-decay.md) — control cognitive role and
    temporal ranking.
-5. [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) — ingest
+6. [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) — ingest
    completed observations and derive grounded interaction records.
 
 ## Integrate
