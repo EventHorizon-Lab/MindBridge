@@ -190,6 +190,18 @@ _OUTBOX_BATCH_SIZE = 256
 _REINDEX_PAGE_SIZE = 256
 _REEMBED_PAGE_SIZE = 32
 _RERANK_CANDIDATES = 100
+# Depth of every index route, deliberately not a function of the requested `limit`. Each route
+# is truncated to it and a memory's dense relevance is the maximum over the routes that reached
+# it, so a `limit`-derived depth made the score -- and the lexical term weights computed over the
+# candidate pool -- properties of the request: at limit 20 against limit 100, 27-39 % of the
+# candidates present in both runs reported a different dense relevance and 78-100 % a different
+# lexical bonus, over adjacent-rank cosine gaps whose median is 0.0026-0.0077. Every public
+# `limit` is capped at 100, so one pool of `_RERANK_CANDIDATES` serves them all and the rerank
+# pool and the route depth are the same number. Widening it to the deepest previous pool
+# (`limit * 3` at limit 100) instead would have cost 2.3x the p50 of a `limit` 8 search, which
+# is the common one; a caller who needs more survivors than this pool holds still deepens it
+# through the widening loop below.
+_ROUTE_CANDIDATES = _RERANK_CANDIDATES
 _RANK_FLOOR = 0.3
 _RANK_CEILING = 1.5
 _DEFAULT_CONFIG = MemoryConfig()
@@ -2329,7 +2341,7 @@ class Memory:
         lexical_query = focused_text
         if not _lexical_query_terms(lexical_query):
             lexical_query = ""
-        candidate_limit = max(_RERANK_CANDIDATES, limit * 3)
+        candidate_limit = _ROUTE_CANDIDATES
         candidate_ceiling = max(candidate_limit, limit * (_MAX_RETRIEVAL_KEYS + 1))
         seen_index_ids: set[str] = set()
         with self._write_lock:

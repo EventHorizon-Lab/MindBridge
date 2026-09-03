@@ -13,6 +13,7 @@ wherever the suite runs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from collections.abc import Mapping, Sequence
@@ -570,3 +571,59 @@ def test_a_chinese_question_can_reach_full_lexical_coverage(tmp_path: Path) -> N
         assert coverage[answer.id] == pytest.approx(1.0)
         assert coverage[shuffled.id] < _LEXICAL_FULL_COVERAGE
         assert [hit.content for hit in traced.hits] == [_ANSWER, _DECOY, _SHUFFLED]
+
+
+class _HashedDense:
+    """Places each text at its own angle in the first quadrant, so ranks are not all ties."""
+
+    embedding_model = "fake-hashed"
+    embedding_space = "fake-hashed:2:test"
+    embedding_dimension = 2
+    embedding_capabilities = frozenset({Modality.TEXT})
+
+    def embed(
+        self,
+        inputs: Sequence[ModelInput],
+        task: EmbedTask = EmbedTask.DOCUMENT,
+    ) -> tuple[tuple[float, ...], ...]:
+        del task
+        vectors = []
+        for value in inputs:
+            digest = hashlib.blake2b(value.text.encode(), digest_size=2).digest()
+            angle = int.from_bytes(digest, "big") / 65536.0 * (math.pi / 3.0)
+            vectors.append((math.cos(angle), math.sin(angle)))
+        return tuple(vectors)
+
+    def close(self) -> None:
+        return None
+
+
+def test_a_narrow_limit_returns_the_prefix_of_a_wide_one_with_the_same_scores(
+    tmp_path: Path,
+) -> None:
+    """The requested `limit` selects results; it must not change what they are worth.
+
+    Both mechanisms that used to break this are in play here. Every index route was truncated
+    to `max(_RERANK_CANDIDATES, limit * 3)`, so a memory's dense relevance -- the maximum over
+    the routes that reached it -- depended on the depth; and `_lexical_relevance` counted its
+    document frequencies over the candidate pool that depth produced, so the rerank bonus moved
+    with `limit` even for a memory both runs found. With 200 records, limit 5 read 100 documents
+    per route and limit 100 read 300.
+    """
+    with Memory(tmp_path, embedder=_HashedDense()) as memory:
+        memory.add_many(
+            (
+                *(f"lantern harbour drift {index:03d}" for index in range(197)),
+                "lantern harbour ledger alpha",
+                "lantern harbour ledger beta",
+                "harbour ledger only",
+            )
+        )
+
+        narrow = memory.search("lantern harbour ledger", limit=5)
+        wide = memory.search("lantern harbour ledger", limit=100)
+
+    assert len(narrow) == 5
+    assert len(wide) == 100
+    assert [hit.id for hit in narrow] == [hit.id for hit in wide[:5]]
+    assert [hit.score for hit in narrow] == [hit.score for hit in wide[:5]]

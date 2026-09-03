@@ -94,7 +94,8 @@ the three paths and their ownership rules.
 
 `search()` returns `tuple[SearchHit, ...]`. An empty tuple is normal when no candidate clears
 `minimum_relevance`. With `limit=1`, MindBridge may also withhold an unresolved top-two tie. A score
-ranks hits within that request; it is not a global probability.
+ranks hits against one query and does not move with the `limit` you ask for; it is not a global
+probability.
 
 `ask()` uses the same retrieval path before calling a configured generation backend. Its
 `AnswerResult` reports the answer, the canonical hits used, and explicit abstention state. Calling
