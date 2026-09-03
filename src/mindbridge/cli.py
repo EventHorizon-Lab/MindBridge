@@ -110,6 +110,7 @@ OPERATIONS: tuple[str, ...] = (
     "forget_identity",
     "unlink_identity",
     "reinforce",
+    "consolidation_candidates",
     "consolidate",
     "forget",
     "rollback",
@@ -734,6 +735,19 @@ def _reinforce(memory: Memory, arguments: argparse.Namespace) -> _Document:
     return {"reinforced": memory.reinforce(arguments.memory_ids)}
 
 
+def _consolidation_candidates(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {
+        "candidates": [
+            {
+                "trigger": candidate.trigger.value,
+                "memory_ids": list(candidate.memory_ids),
+                "evidence_count": candidate.evidence_count,
+            }
+            for candidate in memory.consolidation_candidates(limit=arguments.limit)
+        ]
+    }
+
+
 def _consolidate(memory: Memory, arguments: argparse.Namespace) -> _Document:
     report = memory.consolidate(
         evidence_ids=arguments.evidence_ids or None,
@@ -783,6 +797,7 @@ def _operation_document(record: MemoryOperationRecord) -> _Document:
         "recipe": record.recipe,
         "created_ids": list(record.created_ids),
         "changed_ids": list(record.changed_ids),
+        "forgotten_ids": list(record.forgotten_ids),
         "applied_at": record.applied_at.isoformat(),
         "rolled_back_at": (
             None if record.rolled_back_at is None else record.rolled_back_at.isoformat()
@@ -831,6 +846,7 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "forget-identity": _forget_identity,
     "unlink-identity": _unlink_identity,
     "reinforce": _reinforce,
+    "consolidation-candidates": _consolidation_candidates,
     "consolidate": _consolidate,
     "forget": _forget,
     "rollback": _rollback,
@@ -1720,6 +1736,16 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     unlink.add_argument("alias_id", metavar="ALIAS_ID")
     reinforce = commands.add_parser("reinforce", help="record positive feedback")
     reinforce.add_argument("memory_ids", nargs="+", metavar="MEMORY_ID")
+    candidates = commands.add_parser(
+        "consolidation-candidates",
+        help="ask what needs deliberation, derived from recorded evidence and feedback",
+    )
+    candidates.add_argument(
+        "--limit",
+        type=int,
+        default=_default("consolidation_candidates", "limit"),
+        help="candidate rows (default: %(default)s)",
+    )
     consolidate = _content_command(
         commands, "consolidate", "deliberate over evidence and apply memory operations"
     )

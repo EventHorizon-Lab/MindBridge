@@ -38,6 +38,23 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   policy. `MemoryCapabilities.consolidation_model` reports the injected backend. The four
   operations are reachable from the SDK and the `consolidate`, `forget`, `rollback`, and
   `operations` CLI commands only; neither REST nor MCP exposes them.
+- `consolidation_candidates()` on `Memory` and `AsyncMemory`, the `ConsolidationCandidate` value,
+  and the `consolidation-candidates` CLI command: the durable trigger the loop was missing. It
+  answers "what needs deliberation?" from state already committed — a derived record that gained
+  independent evidence no standing operation weighed, a lineage whose current visible claims
+  disagree, a record confirmed through `reinforce()` since an operation last saw it — with no new
+  table, queue, or timer. Every `MemoryTrigger` was previously a label the caller chose, so the
+  host was the trigger and nothing recorded why a pass ran. `QUERY_FAILURE`, `PRESSURE`, and `IDLE`
+  stay labels; nothing durable records them. Like the rest of the control plane it is SDK and CLI
+  only.
+- Consolidation forgetting: a `CONSOLIDATE` proposal may name `target_ids` among its own evidence,
+  and those sources leave ordinary recall in the same transaction that creates the derived record.
+  The evidence links stay, so lineage survives, and the log row carries them as
+  `MemoryOperationRecord.forgotten_ids` so one `rollback()` reverses both halves. The three
+  forgettings stay distinguishable in the log: `delete()` leaves no row, cognitive forgetting is a
+  `FORGET` row, and this is a `CONSOLIDATE` row with `forgotten_ids`. Previously the only way to
+  retire a consolidated source was a separate `FORGET` with no lineage relationship to the
+  consolidation that motivated it.
 - `MemoryRecord.forgotten_at`, cognitive forgetting as a policy state a host can set and clear.
   A forgotten record leaves `search()`, `ask()`, and `compile()` but stays readable through `get()`
   and `list()` with the state visible, so forgetting is auditable and reversible. Physical erasure
@@ -414,6 +431,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- A control-plane operation that lost the idempotency race on the consolidation write path raised
+  `StorageError` from a unique-index violation instead of being rejected as `"duplicate"`. The
+  formation transaction now makes the same in-transaction key check the other write path already
+  made, so one pass's rejection reason is the same whichever path applied it.
+- A consolidation stamped its derived record, evidence links, and log row with two clocks taken a
+  few microseconds apart. One operation now carries one transaction time.
 - Abstention is now detected structurally instead of by exact equality against one English
   sentence, so a refusal is still reported when the model re-punctuates it, wraps it in emphasis,
   appends an explanation, or answers in another language. The grounded prompt requests an opaque

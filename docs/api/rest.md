@@ -376,7 +376,7 @@ REST has no route for these Python operations:
 | `identity`, `unlink_identity`, `forget_identity` | No route; all three have an MCP tool |
 | `reindex`, `optimize` | Index maintenance an operator schedules |
 | `capture`, `settle`, `pending_captures` | No route; deferred enrichment is the owning process's loop |
-| `consolidate`, `forget`, `rollback`, `operations` | No route and no MCP tool; the memory control plane stays under host authority |
+| `consolidation_candidates`, `consolidate`, `forget`, `rollback`, `operations` | No route and no MCP tool; the memory control plane stays under host authority |
 
 Use the [Python SDK](python-sdk.md) in the owning process, or the MCP adapter where the table
 names a tool. None of these is a REST limitation: the adapter runs in the process that owns

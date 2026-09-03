@@ -242,7 +242,7 @@ the backend may cite only IDs it was shown.
 | Intent | Kernel semantics |
 | --- | --- |
 | `REINFORCE` | Link an independent source to an existing derived record. Confidence recombines by noisy-OR over independent sources, and a hidden inferred `TRAIT` can become visible. |
-| `CONSOLIDATE` | Derive one new record citing several sources. The sources stay as evidence. |
+| `CONSOLIDATE` | Derive one new record citing several sources. The sources stay as evidence, and stay in recall unless the same proposal names them in `target_ids`. |
 | `CORRECT` | Retire the current version of a bad derived inference. History is preserved, not overwritten. |
 | `FORGET` | Set `forgotten_at`. Recall skips the record; audit keeps it. |
 
@@ -254,27 +254,62 @@ re-proposing the same operation is rejected as `"duplicate"` rather than applied
 `rollback(operation_id)` reverses one operation and `operations()` lists the log newest first.
 Deletion is not an intent.
 
-Trigger the loop on durable evidence: new independent support, explicit feedback, a contradiction,
-repeated query failure, memory pressure, or an approved idle window. A periodic timer alone is not
-evidence that the work is useful. See the
+Two things share the name "reinforce" and are not the same mechanism. `reinforce()` is the
+*ranking-utility* signal: it bumps a bounded confirmation count, changes retrieval order only,
+writes no log row, and cannot be rolled back. `MemoryIntent.REINFORCE` is the *evidence-linkage*
+signal: it attaches an independent source to a derived record, is logged, and is reversible. Only
+`FORGET` has a host entry point for its intent, because `forget()` is a policy decision a host
+makes without a model; the other three intents exist only as backend proposals.
+
+"Update" is not a separate intent. It is what a `CONSOLIDATE` into an existing lineage does: the
+new version supersedes the prior one at transaction time and history is kept. That reconciliation
+runs for `STATE` and for `USER_STATEMENT` `TRAIT`. Any other kind gains a second record in the
+same lineage rather than superseding, which is why a model-inferred `TRAIT` can end up
+contradicting itself — and why the loop is given a way to see that.
+
+### What needs deliberation
+
+`consolidation_candidates()` derives due work from committed state rather than from a clock, so a
+host loop has a durable trigger instead of a timer:
+
+```python
+for candidate in memory.consolidation_candidates():
+    memory.consolidate(evidence_ids=candidate.memory_ids, trigger=candidate.trigger)
+```
+
+`EVIDENCE` rows are derived records that gained independent evidence no standing operation has
+weighed — what the formation path leaves behind. `CONTRADICTION` rows are lineages whose current
+visible claims disagree, and clear when a `CORRECT` retires one side. `FEEDBACK` rows are records
+confirmed through `reinforce()` since an operation last saw them. `QUERY_FAILURE`, `PRESSURE`, and
+`IDLE` stay labels a caller may pass: nothing durable records them today, and adding bookkeeping
+for a trigger no host asks for would be a scheduler by another name.
+
+A periodic timer alone is not evidence that the work is useful. See the
 [Python SDK reference](api/python-sdk.md#memory-management-operations) for signatures, effects, and
 rollback behavior.
 
 ## Decay and reinforcement
 
-MindBridge separates four forms of forgetting and never conflates them:
+MindBridge separates five forms of forgetting and never conflates them:
 
 | Form | Call | Effect |
 | --- | --- | --- |
 | Expiring validity | `valid_until` | Leaves default retrieval when the interval ends; a `valid_at` scope inside the window still retrieves it. |
 | Ranking decay | `decay_half_life_days` | Downranks stale records at query time. Nothing is removed or rewritten. |
 | Cognitive forgetting | `forget()` | Excludes a record from recall while `get()`, `list()`, and `MemoryRecord.forgotten_at` retain it. Reversible through `rollback()`. |
+| Consolidation forgetting | `CONSOLIDATE` naming `target_ids` | Retires the detail a new derived record replaces, in that record's own transaction and under its lineage. Logged on the `CONSOLIDATE` row as `forgotten_ids`, and reversed with it. |
 | Physical deletion | `delete()` | Removes the record and any media no other record references. Not recoverable, and never something a model proposes. |
 
 `forget()` is cognitive only. It is the host entry point for the `FORGET` intent, so it takes the
 same log row and the same rollback path as a proposed operation. It returns `None` when nothing
 changed, which makes an unknown or already-forgotten ID a no-op rather than an error. Unlike an
 expiring validity interval, it is a policy state a host sets rather than a property of the world.
+
+Consolidation forgetting sets the same `forgotten_at` column, reached a different way: the memory
+loop proposes it as part of the consolidation that justifies it, so the kernel can keep the
+evidence links and reverse both halves together. Telling the three apart in the log needs no
+convention — `delete()` leaves no row, cognitive forgetting is a `FORGET` row, and consolidation
+forgetting is a `CONSOLIDATE` row with `forgotten_ids`.
 
 Decay is disabled by default. Enable it with a positive `decay_half_life_days` setting. Decay
 changes query-time ranking only; it does not delete or rewrite records, assets, embeddings, or
@@ -284,7 +319,11 @@ Retention is anchored to the newest eligible explicit reinforcement, otherwise e
 start, or last update time. Repeated confirmations slow decay. Confirmations also provide a small
 ranking boost when decay is disabled, and public scores remain in `[0, 1]`.
 
-Search never reinforces a hit. Record positive application feedback explicitly:
+Search never reinforces a hit. `ask()` does reinforce the hits its answerer actually cited,
+because a citation is observed utility rather than retrieval: something read the evidence and
+used it. That is a default, not a rule — set `reinforce_on_answer=False` when one question must
+not change later rankings, which is what an evaluation needs. Record positive application
+feedback explicitly:
 
 ```python
 used = memory.search("How should I recover the deployment?", limit=1)

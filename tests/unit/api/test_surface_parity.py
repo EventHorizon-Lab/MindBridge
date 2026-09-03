@@ -85,6 +85,7 @@ UNEXPOSED_OPERATIONS: dict[str, str] = {
     "pending_captures": "queue depth for the process that runs settle",
     # The control plane rewrites derived memory under policy. `docs/context-os.md` keeps that
     # authority with the host: an agent must not gain it by holding ordinary recall access.
+    "consolidation_candidates": "the control plane's own due-work queue, read by the host loop",
     "consolidate": "derives and retires memory under host authority, not agent authority",
     "forget": "cognitive forgetting is a policy decision the host owns",
     "rollback": "reverses a committed operation, so it stays with the host that authorized it",

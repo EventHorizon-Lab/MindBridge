@@ -344,6 +344,8 @@ injected. `GET /healthz` and the MCP server instructions publish the same view.
 ### Memory management operations
 
 ```text
+consolidation_candidates(*, limit: int = 32) -> tuple[ConsolidationCandidate, ...]
+
 consolidate(
     *,
     evidence_ids: Sequence[str] | None = None,
@@ -357,6 +359,22 @@ rollback(operation_id: int) -> bool
 operations(*, limit: int = 100) -> tuple[MemoryOperationRecord, ...]
 ```
 
+`consolidation_candidates` is the durable trigger: it answers "what needs deliberation?" from
+state the store already committed, with no queue, timer, or scheduler behind it. Hand a row's
+`memory_ids` straight to `consolidate(evidence_ids=..., trigger=...)`. It needs no backend and
+takes no lock, so a host loop may poll it cheaply.
+
+| `trigger` | Row means | `evidence_count` |
+| --- | --- | --- |
+| `EVIDENCE` | A derived record gained independent evidence no standing operation has weighed. `memory_ids` is that record followed by the new sources. | New evidence links |
+| `CONTRADICTION` | One lineage carries two or more current visible claims with different values, the same disagreement `compile()` reports as a `ContextConflict`. It stays listed until a `CORRECT` retires one side. | Distinct conflicting values |
+| `FEEDBACK` | A record was confirmed through `reinforce()` since a standing operation last saw it. | Recorded confirmations |
+
+`QUERY_FAILURE`, `PRESSURE`, and `IDLE` remain labels a caller may pass to `consolidate`: nothing
+in the store records a failed query, memory pressure, or an approved idle window, and inventing
+bookkeeping for a trigger no host asks for would be a scheduler by another name. A rolled-back
+operation weighed nothing, so its evidence becomes due again.
+
 `consolidate` requires a `consolidator` and gathers the evidence set from `evidence_ids`, else the
 active search result for `query`, else the newest `limit` active records. Forgotten and hidden
 records never reach the backend. The backend proposes `MemoryOperation` values; the kernel
@@ -368,9 +386,19 @@ recipe)`; a key already applied and not rolled back is rejected as `"duplicate"`
 | Intent | Kernel checks | Effect | `rollback` |
 | --- | --- | --- | --- |
 | `REINFORCE` | One derived target; every evidence ID shown, existing, not the target, not already linked | Adds independent evidence; confidence and visibility recompute | Retires those evidence rows |
-| `CONSOLIDATE` | Valid proposal; at least one shown evidence ID; affect cue modality and spatial frame present in some source | New derived record citing every source | Deletes the created records |
+| `CONSOLIDATE` | Valid proposal; at least one shown evidence ID; every `target_ids` entry among this proposal's own evidence; affect cue modality and spatial frame present in some source | New derived record citing every source, and `forgotten_at` set on any named target | Deletes the created records and un-forgets the targets |
 | `CORRECT` | Targets exist and are derived (`kind != OBSERVATION`) | Retires current versions at transaction time | Carries a new version with the same interval |
 | `FORGET` | Targets exist and are not already forgotten | Sets `forgotten_at` | Clears `forgotten_at` |
+
+`target_ids` on a `CONSOLIDATE` is **consolidation forgetting**: sources the new derived record
+replaces in ordinary recall. They are retired in the same transaction that creates the derived
+record, stay linked to it as evidence so lineage survives, and are named in the log row's
+`forgotten_ids` so the operation reads as one reversible act. It is deliberately not a FORGET
+intent, not two unrelated operations, and not `delete()`; the operation log distinguishes the
+three by intent, by `forgotten_ids`, and by not appearing at all. One pass may not contradict
+itself either: an operation that would retire evidence an earlier accepted operation in the same
+pass built on, or that builds on evidence an earlier one retired, is rejected as
+`"inconsistent_batch"`.
 
 `forget` is the host entry point for the FORGET intent and needs no backend. It is cognitive
 forgetting only: recall skips the record while `get()`, `list()`, and `MemoryRecord.forgotten_at`
@@ -379,7 +407,15 @@ changed, so an unknown or already-forgotten ID is a no-op rather than an error.
 
 `rollback` reverses one applied operation and returns `False` for an unknown or already-reversed
 `operation_id`. `operations` lists the log newest first. Physical deletion is not an intent, and
-none of these four operations is exposed on REST or MCP.
+none of these five operations is exposed on REST or MCP.
+
+The log is sufficient to replay a sequence against a fresh store holding the same sources:
+`operation_key` is a pure function of the operation and its recipe, derived record IDs are
+content-addressed, and both are reproduced exactly on replay. Two values are not reproduced and
+are not meant to be: `applied_at` is re-stamped at replay, and any ID derived from event time
+reproduces only if the fresh store's sources carry the same `occurred_at`. There is no public
+`apply(operation)`; replay means driving a `ConsolidationBackend` that returns the logged
+proposals, which is what `tests/unit/test_memory_control_plane.py` does.
 
 ### Cross-modal identity binding
 
@@ -559,7 +595,8 @@ The principal immutable values are:
 | `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`; `hits` property and `render()` |
 | `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `rationale` |
-| `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `rolled_back_at` |
+| `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `rolled_back_at` |
+| `ConsolidationCandidate` | `trigger`, `memory_ids`, `evidence_count` |
 | `ConsolidationReport` | `operations`, `rejected` as `(MemoryOperation, reason)` pairs |
 | `StreamEvent` | `phase`, `item`, `stream_id` |
 | `StreamCommit` | `record`, `prefetch`, `retrieval_error`, `stream_id` |
