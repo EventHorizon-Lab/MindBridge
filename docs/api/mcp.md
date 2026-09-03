@@ -253,7 +253,7 @@ details are still never serialized.
 
 ### Operations without a tool
 
-Twelve Python operations have no MCP tool. One is a transport limitation and the rest are
+Thirteen Python operations have no MCP tool. One is a transport limitation and the rest are
 decisions; none is withheld because it touches owner-process state, since every tool already
 does.
 
@@ -265,7 +265,7 @@ does.
 | `reindex` | Rebuilds the whole search projection from SQLite. The duration grows with the store and has no upper bound, so it does not belong behind a client that expects one timely response. It is also an operator decision, not a caller's. |
 | `optimize` | Merges staged vectors into the index. An agent has no basis for deciding when that is worth doing, and the operator scheduling it has the CLI. |
 | `capture`, `settle`, `pending_captures` | Deferred enrichment is the owning process's scheduling decision: how long a record may stay unsearchable is a property of that host's loop, not of a caller's request. Use `add_memory`, which returns searchable. |
-| `consolidate`, `forget`, `rollback`, `operations` | The memory control plane rewrites and retires derived memory and is deliberately not reachable from a client. It stays with the process that owns the `Memory`, which is also the process that can audit and reverse it through the operation log. |
+| `consolidation_candidates`, `consolidate`, `forget`, `rollback`, `operations` | The memory control plane rewrites and retires derived memory and is deliberately not reachable from a client. It stays with the process that owns the `Memory`, which is also the process that can audit and reverse it through the operation log. |
 
 `Memory.capabilities` has no tool either: it is a property rather than an operation, published
 here as the server `instructions` and by REST in [`GET /healthz`](rest.md#endpoints). The tools

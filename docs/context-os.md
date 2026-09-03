@@ -129,10 +129,10 @@ The reasoning backend may change, but the proposal vocabulary and kernel validat
 
 | Intent | Kernel semantics |
 | --- | --- |
-| Reinforce | Record independent supporting evidence or observed utility; retrieval alone is not reinforcement. |
+| Reinforce | Record independent supporting evidence or observed utility; retrieval alone is not reinforcement, though a hit an answerer cited is observed utility. |
 | Consolidate | Create a higher-level derived memory with explicit evidence links; preserve source observations. |
 | Merge | Unify compatible derived identity or meaning while retaining reversible lineage. |
-| Update | Add a new valid and transaction-time version that supersedes prior state; do not overwrite history. |
+| Update | Add a new valid and transaction-time version that supersedes prior state; do not overwrite history. Realized as consolidate into an existing lineage. |
 | Correct or split | Reverse a bad inference, identity merge, or consolidation without manufacturing new source evidence. |
 | Forget | Change retrieval visibility or retention state under policy; do not equate it with physical deletion. |
 
@@ -144,7 +144,10 @@ never writes SQLite directly.
 observation while the kernel validates and persists it. `ConsolidationBackend` is the plane itself:
 `consolidate()` gathers a bounded, active evidence set, the backend proposes `MemoryOperation`
 values with the four intents reinforce, consolidate, correct, and forget, and the kernel validates
-each one, commits it with its log row, and can `rollback()` it. The Python SDK reference owns the
+each one, commits it with its log row, and can `rollback()` it. `consolidation_candidates()` is the
+durable trigger in front of that loop: it derives due work -- new independent evidence, a lineage
+that contradicts itself, a record confirmed since it was last weighed -- from committed state, so a
+host schedules deliberation on evidence rather than on a clock. The Python SDK reference owns the
 exact contract; the reasoning backend can change without changing that vocabulary.
 
 ## Forgetting is three operations
@@ -157,9 +160,14 @@ exact contract; the reasoning backend can change without changing that vocabular
 
 Decay is cognitive ranking only, and `forget()` is cognitive forgetting: a forgotten record leaves
 recall, stays readable through `get()` and `list()` with its `forgotten_at`, and returns through
-`rollback()`. Consolidation forgetting is a control-plane proposal over evidence lineage. Physical
-forgetting remains `delete()` under host authority and is not a proposal intent. Retention work must
-keep these meanings separate in APIs, telemetry, and user-facing controls.
+`rollback()`. Consolidation forgetting is a control-plane proposal over evidence lineage: a
+`CONSOLIDATE` may name sources of its own to retire, they leave recall in the same transaction that
+creates the derived record, the evidence links stay, and the log row carries them as
+`forgotten_ids` so the two halves reverse together. Physical forgetting remains `delete()` under
+host authority and is not a proposal intent. Retention work must keep these meanings separate in
+APIs, telemetry, and user-facing controls, and the operation log already does: `delete()` leaves no
+row, cognitive forgetting is a `FORGET` row, and consolidation forgetting is a `CONSOLIDATE` row
+carrying `forgotten_ids`.
 
 ## Context compiler
 
@@ -264,9 +272,13 @@ defaults or justify superiority claims.
 2. Add an explicit fast-capture path and SQLite-backed durable enrichment work without changing
    current `add()` semantics. Done: `capture()`, `settle()`, and `pending_captures()`.
 3. Generalize formation into one bounded memory-management loop with structured proposals,
-   replay, rollback, and privacy tests. Done for the operation log, rollback, and authority
-   tests: `consolidate()`, `forget()`, `rollback()`, and `operations()`. Open: replay of a logged
-   operation sequence against a fresh store, and companion-scenario privacy tests.
+   replay, rollback, and privacy tests. Done: the operation log and authority tests
+   (`consolidate()`, `forget()`, `rollback()`, `operations()`), the durable trigger
+   (`consolidation_candidates()`), consolidation forgetting as one reversible operation, and
+   replay of a logged sequence against a fresh store, covered as a test rather than as an
+   `apply(operation)` surface. Open: companion-scenario privacy tests; a post-hoc outcome field,
+   without which only rollback success of the slow-loop measurements is derivable; and identity
+   merge and split, which stay outside the operation log until the identity-governance round.
 4. Add a context compiler whose output improves downstream tasks within declared budgets. Done
    for selection, budgeting, the latency deadline, and the explicit unknowns a thin bundle
    reports: `compile()`. Open: a downstream-task measurement against the no-memory,

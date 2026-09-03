@@ -189,12 +189,12 @@ gate in the [benchmark protocol](benchmarking.md#mandatory-controls).
 Supported SDK values are imported from `mindbridge`. The `Memory` SDK exposes 27 product
 operations. REST exposes nine `/v1` routes: add, batch add, list, search, reinforce, get, delete,
 answer, and compile context. MCP exposes fifteen tools: the eight corresponding non-batch
-operations plus speech, face, and identity operations. The local CLI exposes the 27 operations
+operations plus speech, face, and identity operations. The local CLI exposes the 28 operations
 plus `doctor`; `--url` is limited to operations implemented by REST.
 
-Compiling context is a read-only view. The memory control plane — `consolidate()`, `forget()`,
-`rollback()`, and `operations()` — and physical deletion stay in the owner process, which is also
-the process that can audit and reverse an operation through its log.
+Compiling context is a read-only view. The memory control plane — `consolidation_candidates()`,
+`consolidate()`, `forget()`, `rollback()`, and `operations()` — and physical deletion stay in the
+owner process, which is also the process that can audit and reverse an operation through its log.
 
 `create_app(memory=...)` and `build_mcp_server(memory)` use a caller-owned instance and do not
 close it. They also do not add authentication, authorization, TLS, rate limits, quotas, or audit

@@ -105,6 +105,7 @@ trust, license, model identity, and credential behavior live in
 | `forget-identity` | `IDENTITY_ID` | erasure counts | no |
 | `unlink-identity` | `ALIAS_ID` | `{"restored_identity_id":...}` | no |
 | `reinforce` | one or more `MEMORY_ID` values | `{"reinforced":int}` | no |
+| `consolidation-candidates` | `--limit` | `{"candidates":[{"trigger":...,"memory_ids":[...],"evidence_count":int}]}` | no |
 | `consolidate` | optional goal content; `--evidence-id`; `--limit`; `--trigger` | `{"operations":[...],"rejected":[...]}` | no |
 | `forget` | one or more `MEMORY_ID` values | `{"operation":{...}}` or `{"operation":null}` | no |
 | `rollback` | `OPERATION_ID` | `{"rolled_back":bool}` | no |
@@ -117,7 +118,8 @@ trust, license, model identity, and credential behavior live in
 
 Defaults match the SDK: `add`, `add-many`, `add-stream`, and `capture` use
 `memory_type=semantic`; search uses `limit=10`; ask uses `limit=5`; list, `settle`, and
-`operations` use `limit=100`; `consolidate` uses `limit=32` with `trigger=manual`; optional
+`operations` use `limit=100`; `consolidate` and `consolidation-candidates` use `limit=32`,
+and `consolidate` defaults to `trigger=manual`; optional
 retrieval roles and timestamps are unset. Timestamps must be timezone-aware ISO 8601 values.
 Cursors are opaque and passed through unchanged. `ask` requires the selected composition to supply an answerer. `speech` and `faces`
 return an empty result without a model call when the record has no corresponding media; otherwise

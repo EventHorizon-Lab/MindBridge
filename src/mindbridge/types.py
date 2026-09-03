@@ -542,10 +542,12 @@ class MemoryOperation:
         if self.proposal is not None and not isinstance(self.proposal, FormationProposal):
             raise ValidationError("memory operation proposal is invalid")
         if self.intent is MemoryIntent.CONSOLIDATE:
-            if self.proposal is None or not self.evidence_ids or self.target_ids:
-                raise ValidationError(
-                    "consolidate requires a proposal and cited evidence, and names no target"
-                )
+            # `target_ids` on a consolidation is consolidation forgetting: the sources to retire
+            # from ordinary recall once the derived record exists. The kernel enforces the
+            # containment rule (a target must be one of this proposal's own evidence IDs); the
+            # value type only knows that naming a target requires evidence to name it from.
+            if self.proposal is None or not self.evidence_ids:
+                raise ValidationError("consolidate requires a proposal and cited evidence")
         elif self.proposal is not None:
             raise ValidationError(f"{self.intent.value} must not carry a proposal")
         elif self.intent is MemoryIntent.REINFORCE:
@@ -569,6 +571,10 @@ class MemoryOperationRecord:
     recipe: str | None = None
     created_ids: tuple[str, ...] = ()
     changed_ids: tuple[str, ...] = ()
+    # Records this operation moved out of ordinary recall. On a FORGET row that is cognitive
+    # forgetting; on a CONSOLIDATE row it is consolidation forgetting, the sources the derived
+    # record replaced. `rollback()` clears exactly these.
+    forgotten_ids: tuple[str, ...] = ()
     rolled_back_at: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -592,6 +598,34 @@ class MemoryOperationRecord:
             )
         object.__setattr__(self, "created_ids", _memory_ids(self.created_ids, "created_ids"))
         object.__setattr__(self, "changed_ids", _memory_ids(self.changed_ids, "changed_ids"))
+        object.__setattr__(self, "forgotten_ids", _memory_ids(self.forgotten_ids, "forgotten_ids"))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ConsolidationCandidate:
+    """One piece of deliberation work the store's own state says is due.
+
+    `memory_ids` is the set to hand straight to `consolidate(evidence_ids=...)`. `evidence_count`
+    is what the trigger counted: new evidence links for `EVIDENCE`, distinct conflicting values
+    for `CONTRADICTION`, and recorded confirmations for `FEEDBACK`.
+    """
+
+    trigger: MemoryTrigger
+    memory_ids: tuple[str, ...]
+    evidence_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.trigger, MemoryTrigger):
+            raise ValidationError("candidate trigger is invalid")
+        object.__setattr__(self, "memory_ids", _memory_ids(self.memory_ids, "memory_ids"))
+        if not self.memory_ids:
+            raise ValidationError("a consolidation candidate must name at least one memory")
+        if (
+            isinstance(self.evidence_count, bool)
+            or not isinstance(self.evidence_count, int)
+            or self.evidence_count <= 0
+        ):
+            raise ValidationError("evidence_count must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

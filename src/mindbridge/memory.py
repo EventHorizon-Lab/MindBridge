@@ -125,6 +125,7 @@ from mindbridge.types import (
     AudioBoundary,
     AudioStreamPacket,
     Blob,
+    ConsolidationCandidate,
     ConsolidationReport,
     ContentAtom,
     ContentInput,
@@ -1697,6 +1698,30 @@ class Memory:
     # deletion is not an intent: it stays on `delete()` under host authority. None of these
     # methods is exposed on REST or MCP.
 
+    def consolidation_candidates(self, *, limit: int = 32) -> tuple[ConsolidationCandidate, ...]:
+        """Ask what needs deliberation, at most `limit` rows, interleaved across triggers.
+
+        This is the durable trigger the slow loop runs on: every row is derived from state
+        already committed -- evidence links, lineage disagreement, recorded confirmations --
+        rather than from a clock. Hand a row's `memory_ids` straight to
+        `consolidate(evidence_ids=...)` with the row's `trigger`.
+        """
+        with (
+            self._trace("mindbridge.consolidation_candidates", kind="operation"),
+            self._operation(),
+        ):
+            _limit(limit, maximum=100)
+            with _translate_storage_errors("list consolidation candidates"):
+                rows = self._store.read_consolidation_candidates(limit=limit)
+            return tuple(
+                ConsolidationCandidate(
+                    trigger=MemoryTrigger(row.trigger),
+                    memory_ids=row.memory_ids,
+                    evidence_count=row.evidence_count,
+                )
+                for row in rows
+            )
+
     def consolidate(
         self,
         *,
@@ -1729,11 +1754,21 @@ class Memory:
                 return ConsolidationReport()
             applied: builtins.list[MemoryOperationRecord] = []
             rejected: builtins.list[tuple[MemoryOperation, str]] = []
+            # One pass must not contradict itself: an operation may not build on evidence an
+            # earlier accepted operation retired, nor retire evidence an earlier one built on.
+            # There is no way to submit a proposal built in some other pass, so this is the only
+            # reachable form of the staleness the kernel is required to reject.
+            consumed: set[str] = set()
+            retired: set[str] = set()
             with self._formation_lock:
                 for operation in self._propose_operations(
                     tuple(shown.values()),
                     trigger=trigger,
                 ):
+                    targets = _retiring_targets(operation)
+                    if targets & consumed or set(operation.evidence_ids) & retired:
+                        rejected.append((operation, "inconsistent_batch"))
+                        continue
                     try:
                         applied.append(
                             self._apply_memory_operation(
@@ -1747,6 +1782,9 @@ class Memory:
                         )
                     except _RejectedOperation as rejection:
                         rejected.append((operation, rejection.reason))
+                    else:
+                        consumed.update(set(operation.evidence_ids) - targets)
+                        retired.update(targets)
             return ConsolidationReport(operations=tuple(applied), rejected=tuple(rejected))
 
     def forget(self, memory_ids: Sequence[str]) -> MemoryOperationRecord | None:
@@ -1814,9 +1852,12 @@ class Memory:
                     restore_versions=(
                         row.changed_ids if operation.intent is MemoryIntent.CORRECT else ()
                     ),
-                    clear_forgotten=(
-                        row.changed_ids if operation.intent is MemoryIntent.FORGET else ()
-                    ),
+                    # Recorded per operation, so cognitive forgetting and the consolidation
+                    # forgetting a CONSOLIDATE carried both reverse through one field. A FORGET
+                    # row logged before that field existed carries the same IDs in `changed_ids`,
+                    # and must still un-forget rather than silently do nothing.
+                    clear_forgotten=row.forgotten_ids
+                    or (row.changed_ids if operation.intent is MemoryIntent.FORGET else ()),
                 )
             self._queue_asset_cleanup(orphaned)
             self._drain_outbox()
@@ -2036,13 +2077,20 @@ class Memory:
         """Validate one consolidation proposal and commit it through the formation path."""
         if shown is None or not set(operation.evidence_ids) <= set(shown):
             raise _RejectedOperation("evidence_not_shown")
+        # Consolidation forgetting retires sources *this* derived record replaces, so a target
+        # outside its own evidence has no lineage relationship to it and is refused. Retiring a
+        # record no derived memory now covers is a FORGET, not a consolidation.
+        if not set(operation.target_ids) <= set(operation.evidence_ids):
+            raise _RejectedOperation("target_not_evidence")
         proposal = operation.proposal
         assert proposal is not None
         sources = tuple(shown[memory_id] for memory_id in operation.evidence_ids)
         primary = _consolidation_primary(proposal, sources)
         if primary is None:
             raise _RejectedOperation("invalid_proposal")
-        now = datetime.now(timezone.utc)
+        # One operation, one transaction time: the derived record, its evidence links, and any
+        # consolidation forgetting all carry the timestamp the log row reports.
+        now = pending.applied_at
         context = replace(
             _formation_context(
                 primary,
@@ -2075,6 +2123,7 @@ class Memory:
             completed_at=now,
             recipe=self._consolidation_recipe,
             operation=pending,
+            forget_ids=operation.target_ids,
         )
         if logged is None:
             raise _RejectedOperation("duplicate")
@@ -2774,6 +2823,7 @@ class Memory:
         completed_at: datetime,
         recipe: str | None = None,
         operation: StoredOperation | None = None,
+        forget_ids: Sequence[str] = (),
     ) -> StoredOperation | None:
         """Embed and commit derived records; return the log row when one was requested."""
         recipe = self._formation_space if recipe is None else recipe
@@ -2843,7 +2893,7 @@ class Memory:
             )
         with self._write_lock:
             with _translate_storage_errors("commit automatic memory formation"):
-                self._store.apply_formation(
+                applied = self._store.apply_formation(
                     stored,
                     embeddings,
                     evidence=tuple(
@@ -2854,9 +2904,14 @@ class Memory:
                     recipe=recipe,
                     completed_at=completed_at,
                     operation=operation,
+                    forget_ids=forget_ids,
                 )
             self._drain_outbox()
         if operation is None:
+            return None
+        if not applied:
+            # A concurrent duplicate won the key inside the transaction. Its row is in the log
+            # under the same key, but it is not this call's operation, so report the duplicate.
             return None
         with _translate_storage_errors("read a memory operation"):
             logged = self._store.read_operations(operation_key=operation.operation_key)
@@ -5412,6 +5467,13 @@ class AsyncMemory:
     async def reinforce(self, memory_ids: Sequence[str]) -> int:
         return await asyncio.to_thread(self._memory.reinforce, memory_ids)
 
+    async def consolidation_candidates(
+        self,
+        *,
+        limit: int = 32,
+    ) -> tuple[ConsolidationCandidate, ...]:
+        return await asyncio.to_thread(partial(self._memory.consolidation_candidates, limit=limit))
+
     async def consolidate(
         self,
         *,
@@ -6343,6 +6405,17 @@ def _consolidation_primary(
     return None
 
 
+def _retiring_targets(operation: MemoryOperation) -> set[str]:
+    """IDs this operation would take out of ordinary recall or retire the current version of.
+
+    A `REINFORCE` target is strengthened rather than retired, so it is not one of these; a
+    `CONSOLIDATE` target is consolidation forgetting and is.
+    """
+    if operation.intent is MemoryIntent.REINFORCE:
+        return set()
+    return set(operation.target_ids)
+
+
 def _operation_record(logged: StoredOperation) -> MemoryOperationRecord:
     try:
         trigger = MemoryTrigger(logged.trigger)
@@ -6357,6 +6430,7 @@ def _operation_record(logged: StoredOperation) -> MemoryOperationRecord:
         recipe=logged.recipe,
         created_ids=logged.created_ids,
         changed_ids=logged.changed_ids,
+        forgotten_ids=logged.forgotten_ids,
         rolled_back_at=logged.rolled_back_at,
     )
 

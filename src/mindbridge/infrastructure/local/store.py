@@ -13,6 +13,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from itertools import zip_longest
 from pathlib import Path
 from typing import Literal, NoReturn
 
@@ -34,6 +35,11 @@ from mindbridge.types import (
 
 _SCHEMA_VERSION = 11
 _SQLITE_PARAMETER_BATCH = 900
+# Kinds whose claims can contradict inside one lineage. This must stay the set the context
+# compiler reports conflicts for; `tests/unit/test_memory_control_plane.py` asserts they agree,
+# because the compiler is a product module and this is infrastructure.
+_CONFLICT_KINDS: tuple[str, ...] = ("state", "relation", "trait")
+_CONFLICT_KIND_PLACEHOLDERS = ", ".join("?" for _kind in _CONFLICT_KINDS)
 _FACE_EXEMPLAR_LIMIT = 10
 _VOICE_EXEMPLAR_LIMIT = 20
 _MEMORY_MODALITIES = frozenset({"text", "image", "video", "audio", "omni"})
@@ -819,6 +825,9 @@ class StoredOperation:
     operation_id: int = 0
     created_ids: tuple[str, ...] = ()
     changed_ids: tuple[str, ...] = ()
+    # Records this operation moved out of ordinary recall, whether as a FORGET intent or as the
+    # consolidation forgetting a CONSOLIDATE carried. Rollback clears exactly these.
+    forgotten_ids: tuple[str, ...] = ()
     # Evidence rows this operation actually inserted. Rollback retires exactly these, so a link
     # that predated the operation survives it.
     linked: tuple[tuple[str, str], ...] = ()
@@ -835,12 +844,30 @@ class StoredOperation:
             _require_aware(self.rolled_back_at, "rolled_back_at")
         if self.operation_id < 0:
             raise ValueError("operation_id must not be negative")
-        for name in ("created_ids", "changed_ids"):
+        for name in ("created_ids", "changed_ids", "forgotten_ids"):
             for memory_id in getattr(self, name):
                 _require_identifier(memory_id, name)
         for memory_id, source_memory_id in self.linked:
             _require_identifier(memory_id, "memory_id")
             _require_identifier(source_memory_id, "source_memory_id")
+
+
+@dataclass(frozen=True, slots=True)
+class StoredCandidate:
+    """One unit of deliberation work derived from state the store already keeps."""
+
+    trigger: str
+    memory_ids: tuple[str, ...]
+    evidence_count: int
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.trigger, "trigger")
+        if not self.memory_ids:
+            raise ValueError("a candidate must name at least one memory")
+        for memory_id in self.memory_ids:
+            _require_identifier(memory_id, "memory_id")
+        if self.evidence_count <= 0:
+            raise ValueError("evidence_count must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1202,6 +1229,27 @@ class LocalStore:
                     break
         return tuple(queued[:limit])
 
+    def read_consolidation_candidates(self, *, limit: int) -> tuple[StoredCandidate, ...]:
+        """Derive due deliberation work from evidence, lineage, and feedback already recorded.
+
+        There is no queue and no timer behind this: every row is a fact the store already holds,
+        read back as a question. Rows are interleaved across triggers so a busy trigger cannot
+        starve the others out of the window.
+        """
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        with self._read_transaction() as connection:
+            consumed = _consumed_at_by_memory(connection)
+            groups = (
+                _evidence_candidates(connection, consumed, limit),
+                _contradiction_candidates(connection, limit),
+                _feedback_candidates(connection, consumed, limit),
+            )
+        interleaved = [
+            candidate for row in zip_longest(*groups) for candidate in row if candidate is not None
+        ]
+        return tuple(interleaved[:limit])
+
     def apply_formation(
         self,
         memories: Iterable[StoredMemory],
@@ -1212,28 +1260,33 @@ class LocalStore:
         recipe: str,
         completed_at: datetime,
         operation: StoredOperation | None = None,
+        forget_ids: Sequence[str] = (),
     ) -> bool:
         """Commit derived records, evidence, and source completion in one transaction.
 
         `operation` logs the control-plane operation that produced these records in the same
         transaction. Consolidation passes no `source_memory_ids`, so no `formation_runs` marker
         is written and the derived record stays open to further independent evidence.
+        `forget_ids` is consolidation forgetting: sources the derived record replaces in ordinary
+        recall, retired in this same commit and cleared again by rolling the operation back.
         """
         supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
             memories,
             embeddings,
         )
         sources = tuple(dict.fromkeys(source_memory_ids))
-        for source_memory_id in sources:
-            _require_identifier(source_memory_id, "source_memory_id")
         _require_identifier(recipe, "recipe")
         _require_aware(completed_at, "completed_at")
-        for memory_id, source_memory_id, confidence in evidence:
-            _require_identifier(memory_id, "memory_id")
-            _require_identifier(source_memory_id, "source_memory_id")
-            if not math.isfinite(confidence) or not 0 <= confidence <= 1:
-                raise ValueError("confidence must be between zero and one")
+        _validate_formation_links(sources, forget_ids, evidence)
         with self._transaction() as connection:
+            # Same in-transaction idempotency check `apply_control_operation` makes: a duplicate
+            # that arrives after the caller's pre-check must be refused, not surface as a
+            # unique-index violation.
+            if (
+                operation is not None
+                and _active_operation_id(connection, operation.operation_key) is not None
+            ):
+                return False
             if any(
                 connection.execute(
                     """
@@ -1283,7 +1336,11 @@ class LocalStore:
                 ),
             )
             if operation is not None:
-                _insert_operation(connection, replace(operation, linked=tuple(linked)))
+                forgotten = _set_forgotten(connection, forget_ids, forgotten_at=completed_at)
+                _insert_operation(
+                    connection,
+                    replace(operation, forgotten_ids=forgotten, linked=tuple(linked)),
+                )
         return True
 
     def replace_memory_embeddings(
@@ -1401,12 +1458,12 @@ class LocalStore:
             changed.extend(
                 _retire_memory_versions(connection, correct_ids, retired_at=operation.applied_at)
             )
-            changed.extend(
-                _set_forgotten(connection, forget_ids, forgotten_at=operation.applied_at)
-            )
+            forgotten = _set_forgotten(connection, forget_ids, forgotten_at=operation.applied_at)
+            changed.extend(forgotten)
             applied = replace(
                 operation,
                 changed_ids=tuple(dict.fromkeys(changed)),
+                forgotten_ids=forgotten,
                 linked=tuple(linked),
             )
             return replace(applied, operation_id=_insert_operation(connection, applied))
@@ -4622,6 +4679,193 @@ def _retire_memory_evidence(
     return tuple(dict.fromkeys(changed))
 
 
+def _validate_formation_links(
+    sources: Sequence[str],
+    forget_ids: Sequence[str],
+    evidence: Sequence[tuple[str, str, float]],
+) -> None:
+    """Check every identifier and confidence a formation commit is about to write."""
+    for source_memory_id in sources:
+        _require_identifier(source_memory_id, "source_memory_id")
+    for memory_id in forget_ids:
+        _require_identifier(memory_id, "forget_id")
+    for memory_id, source_memory_id, confidence in evidence:
+        _require_identifier(memory_id, "memory_id")
+        _require_identifier(source_memory_id, "source_memory_id")
+        if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+            raise ValueError("confidence must be between zero and one")
+
+
+def _consumed_at_by_memory(connection: sqlite3.Connection) -> dict[str, datetime]:
+    """Return, per memory, when a still-standing operation last consumed or produced it.
+
+    The log stores IDs inside its two JSON documents rather than in columns, so this reads them
+    back with `json_tree`. A rolled-back operation consumed nothing that still stands.
+    """
+    return {
+        _row_text(row, "memory_id"): _parse_datetime(_row_text(row, "consumed_at"))
+        for row in connection.execute(
+            """
+            SELECT j.value AS memory_id, MAX(o.applied_at) AS consumed_at
+            FROM memory_operations AS o
+            JOIN json_tree(json_array(
+                     json_extract(o.operation_json, '$.evidence_ids'),
+                     json_extract(o.operation_json, '$.target_ids'),
+                     json_extract(o.effects_json, '$.created_ids'),
+                     json_extract(o.effects_json, '$.changed_ids')
+                 )) AS j
+            WHERE o.rolled_back_at IS NULL AND j.type = 'text'
+            GROUP BY j.value
+            """
+        ).fetchall()
+    }
+
+
+def _evidence_candidates(
+    connection: sqlite3.Connection,
+    consumed: Mapping[str, datetime],
+    limit: int,
+) -> list[StoredCandidate]:
+    """Derived records that gained independent evidence no standing operation has weighed."""
+    # ponytail: over-fetch the newest window and filter, rather than push the consumed-time
+    # comparison into SQL. Raise the factor only if a store whose newest records are all already
+    # deliberated measurably under-fills the window.
+    newest = connection.execute(
+        """
+        SELECT e.memory_id AS memory_id, MAX(e.recorded_at) AS newest
+        FROM memory_evidence AS e
+        JOIN memory_records AS r ON r.memory_id = e.memory_id
+        WHERE e.retired_at IS NULL AND r.forgotten_at IS NULL
+        GROUP BY e.memory_id
+        ORDER BY newest DESC, e.memory_id
+        LIMIT ?
+        """,
+        (min(1_000, limit * 4),),
+    ).fetchall()
+    supported = {
+        _row_text(row, "memory_id"): _parse_datetime(_row_text(row, "newest")) for row in newest
+    }
+    due = {
+        memory_id: consumed.get(memory_id)
+        for memory_id, latest in supported.items()
+        if memory_id not in consumed or latest > consumed[memory_id]
+    }
+    if not due:
+        return []
+    placeholders = ", ".join("?" for _memory_id in due)
+    fresh: dict[str, list[str]] = {memory_id: [] for memory_id in due}
+    for row in connection.execute(
+        f"""
+        SELECT memory_id, source_memory_id, recorded_at
+        FROM memory_evidence
+        WHERE retired_at IS NULL AND memory_id IN ({placeholders})
+        ORDER BY memory_id, position
+        """,
+        tuple(due),
+    ).fetchall():
+        memory_id = _row_text(row, "memory_id")
+        threshold = due[memory_id]
+        if threshold is None or _parse_datetime(_row_text(row, "recorded_at")) > threshold:
+            fresh[memory_id].append(_row_text(row, "source_memory_id"))
+    return [
+        StoredCandidate(
+            trigger="evidence",
+            memory_ids=(memory_id, *sources),
+            evidence_count=len(sources),
+        )
+        for memory_id, sources in fresh.items()
+        if sources
+    ][:limit]
+
+
+def _contradiction_candidates(
+    connection: sqlite3.Connection,
+    limit: int,
+) -> list[StoredCandidate]:
+    """Lineages whose current visible claims disagree, the way the compiler reports them.
+
+    A contradiction stays listed until the data stops contradicting: retiring one side through
+    `CORRECT` is what clears it, so this needs no separate record of having been reported.
+    """
+    lineages = {
+        _row_text(row, "lineage_id"): int(row["values_count"])
+        for row in connection.execute(
+            f"""
+            SELECT s.lineage_id AS lineage_id, COUNT(DISTINCT s.value) AS values_count
+            FROM memory_semantics AS s
+            JOIN memory_versions AS v ON v.memory_id = s.memory_id
+            JOIN memory_records AS r ON r.memory_id = s.memory_id
+            WHERE v.retired_at IS NULL AND v.visible = 1 AND r.forgotten_at IS NULL
+              AND s.value IS NOT NULL AND s.kind IN ({_CONFLICT_KIND_PLACEHOLDERS})
+            GROUP BY s.lineage_id
+            HAVING values_count > 1
+            ORDER BY s.lineage_id
+            LIMIT ?
+            """,
+            (*_CONFLICT_KINDS, limit),
+        ).fetchall()
+    }
+    if not lineages:
+        return []
+    placeholders = ", ".join("?" for _lineage_id in lineages)
+    members: dict[str, list[str]] = {lineage_id: [] for lineage_id in lineages}
+    for row in connection.execute(
+        f"""
+        SELECT s.lineage_id AS lineage_id, s.memory_id AS memory_id
+        FROM memory_semantics AS s
+        JOIN memory_versions AS v ON v.memory_id = s.memory_id
+        JOIN memory_records AS r ON r.memory_id = s.memory_id
+        WHERE v.retired_at IS NULL AND v.visible = 1 AND r.forgotten_at IS NULL
+          AND s.value IS NOT NULL AND s.lineage_id IN ({placeholders})
+        ORDER BY s.lineage_id, s.memory_id
+        """,
+        tuple(lineages),
+    ).fetchall():
+        members[_row_text(row, "lineage_id")].append(_row_text(row, "memory_id"))
+    return [
+        StoredCandidate(
+            trigger="contradiction",
+            memory_ids=tuple(dict.fromkeys(memory_ids)),
+            evidence_count=lineages[lineage_id],
+        )
+        for lineage_id, memory_ids in members.items()
+        if memory_ids
+    ]
+
+
+def _feedback_candidates(
+    connection: sqlite3.Connection,
+    consumed: Mapping[str, datetime],
+    limit: int,
+) -> list[StoredCandidate]:
+    """Records confirmed through `reinforce_memories` since a standing operation last saw them."""
+    rows = connection.execute(
+        """
+        SELECT memory_id, last_accessed_at, access_count
+        FROM memory_records
+        WHERE last_accessed_at IS NOT NULL AND forgotten_at IS NULL
+        ORDER BY last_accessed_at DESC, memory_id
+        LIMIT ?
+        """,
+        (min(1_000, limit * 4),),
+    ).fetchall()
+    candidates: list[StoredCandidate] = []
+    for row in rows:
+        memory_id = _row_text(row, "memory_id")
+        threshold = consumed.get(memory_id)
+        accessed = _parse_datetime(_row_text(row, "last_accessed_at"))
+        count = int(row["access_count"])
+        if count > 0 and (threshold is None or accessed > threshold):
+            candidates.append(
+                StoredCandidate(
+                    trigger="feedback",
+                    memory_ids=(memory_id,),
+                    evidence_count=count,
+                )
+            )
+    return candidates[:limit]
+
+
 def _active_operation_id(connection: sqlite3.Connection, operation_key: str) -> int | None:
     row = connection.execute(
         """
@@ -4652,6 +4896,7 @@ def _insert_operation(connection: sqlite3.Connection, operation: StoredOperation
                 {
                     "created_ids": list(operation.created_ids),
                     "changed_ids": list(operation.changed_ids),
+                    "forgotten_ids": list(operation.forgotten_ids),
                     "linked": [list(pair) for pair in operation.linked],
                 },
                 ensure_ascii=False,
@@ -4680,6 +4925,7 @@ def _operation_from_row(row: sqlite3.Row) -> StoredOperation:
         operation_json=_row_text(row, "operation_json"),
         created_ids=tuple(effects.get("created_ids") or ()),
         changed_ids=tuple(effects.get("changed_ids") or ()),
+        forgotten_ids=tuple(effects.get("forgotten_ids") or ()),
         linked=tuple((pair[0], pair[1]) for pair in effects.get("linked") or ()),
         applied_at=_parse_datetime(_row_text(row, "applied_at")),
         rolled_back_at=_optional_datetime_from_row(row, "rolled_back_at"),
