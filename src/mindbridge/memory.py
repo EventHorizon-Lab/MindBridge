@@ -490,6 +490,10 @@ class _PreparedMemory:
     occurred_end: datetime | None
     memory_type: MemoryType
     context: ObservationContext | MemoryContext | None = None
+    # The record column, carried separately from `context` because both write paths need it and
+    # only an `ObservationContext` has one: a formed record's `MemoryContext` deliberately has no
+    # place, so formation sets this from the observation it was formed from.
+    place_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -1021,6 +1025,7 @@ class Memory:
                             occurred_end=prepared.occurred_end,
                             created_at=now,
                             updated_at=now,
+                            place_id=prepared.place_id,
                             context=_stored_memory_context(prepared, recorded_at=now),
                         ),
                     ),
@@ -2965,14 +2970,7 @@ class Memory:
                         occurred_end=memory.occurred_end,
                         created_at=now,
                         updated_at=now,
-                        # Only an `ObservationContext` carries a place: it is what the caller
-                        # supplies at capture time. `MemoryContext` is the formed-semantics shape
-                        # and deliberately has none.
-                        place_id=(
-                            memory.context.place_id
-                            if isinstance(memory.context, ObservationContext)
-                            else None
-                        ),
+                        place_id=memory.place_id,
                         context=_stored_memory_context(memory, recorded_at=now),
                     )
                     for memory in missing
@@ -3288,7 +3286,10 @@ class Memory:
                     self._prepare_content(proposal.content, operation),
                     occurred_at=source.occurred_at,
                     occurred_end=source.occurred_end,
-                    metadata=None,
+                    # Application data travels with the knowledge formed from it: a host that
+                    # filters recall by metadata expects the tag on the observation to hold for
+                    # what was learned from it.
+                    metadata=source.metadata,
                     memory_type=_formation_memory_type(proposal.kind),
                 )
                 context = _formation_context(
@@ -3310,6 +3311,11 @@ class Memory:
                                 context=context,
                             ),
                             context=context,
+                            # `place_id` is a hard filter on the record, so knowledge formed
+                            # from an observation in a room has to stand in that room too --
+                            # otherwise a place-scoped question sees the raw observation and
+                            # none of the entities, states, or relations formed from it.
+                            place_id=source.place_id,
                         ),
                         source.id,
                         proposal.confidence,
@@ -3369,6 +3375,7 @@ class Memory:
                 occurred_end=memory.occurred_end,
                 created_at=completed_at,
                 updated_at=completed_at,
+                place_id=memory.place_id,
                 context=cast(MemoryContext, memory.context),
             )
             for memory in missing
@@ -6797,6 +6804,7 @@ def _prepare_memory(
         occurred_end=normalized_occurred_end,
         memory_type=normalized_memory_type,
         context=context,
+        place_id=None if context is None else context.place_id,
     )
 
 

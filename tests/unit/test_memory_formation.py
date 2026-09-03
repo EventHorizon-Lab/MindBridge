@@ -19,6 +19,7 @@ from mindbridge import (
     ModelError,
     ObservationContext,
     RetrievalScope,
+    SearchHit,
 )
 
 
@@ -255,3 +256,70 @@ def test_affect_proposal_must_name_a_modality_present_in_its_source(tmp_path: Pa
             memory.add("I am happy")
 
         assert [item.content for item in memory.list().items] == ["I am happy"]
+
+
+def _formed(
+    memory: Memory, source_id: str, *, scope: RetrievalScope | None = None
+) -> list[SearchHit]:
+    hits = memory.search("preferred drink user", limit=10, scope=scope)
+    return [hit for hit in hits if hit.id != source_id]
+
+
+def test_formed_records_inherit_the_place_they_were_observed_in(tmp_path: Path) -> None:
+    """ "What do we know about the kitchen?" must see the knowledge, not only the raw observation.
+
+    `place_id` is a hard filter on the record, so a formed record that does not carry the place of
+    the observation it was formed from is unreachable from every place-scoped `search`, `ask`, and
+    `compile` -- the household question the symbolic axis exists for.
+    """
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=PreferenceFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        source = memory.add("I prefer tea", context=ObservationContext(place_id="kitchen"))
+
+        kitchen = _formed(memory, source.id, scope=RetrievalScope(place_id="kitchen"))
+        garage = _formed(memory, source.id, scope=RetrievalScope(place_id="garage"))
+
+        assert {hit.context.kind for hit in kitchen if hit.context} == {
+            MemoryKind.ENTITY,
+            MemoryKind.STATE,
+        }
+        assert {hit.place_id for hit in kitchen} == {"kitchen"}
+        assert garage == []
+        assert {memory.get(hit.id).place_id for hit in kitchen} == {"kitchen"}
+
+
+def test_formed_records_inherit_the_metadata_of_their_source(tmp_path: Path) -> None:
+    """A host that filters recall by metadata expects formed knowledge to carry the same tag."""
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=PreferenceFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        source = memory.add("I prefer tea", metadata={"household": "flat-2"})
+
+        formed = _formed(memory, source.id)
+
+        assert formed
+        assert all(hit.metadata == {"household": "flat-2"} for hit in formed)
+
+
+def test_a_formed_record_from_a_placeless_source_has_no_place(tmp_path: Path) -> None:
+    """Inheriting a place must not invent one: an unlabelled observation is not "everywhere"."""
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=PreferenceFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        source = memory.add("I prefer tea")
+
+        formed = _formed(memory, source.id)
+
+        assert formed
+        assert all(hit.place_id is None for hit in formed)
+        assert _formed(memory, source.id, scope=RetrievalScope(place_id="kitchen")) == []
