@@ -72,7 +72,12 @@ The ordering determines failure behavior:
 A memory ID is the SHA-256 digest of canonical ordered content, media digests, metadata, event
 time, memory type, and optional typed observation context. Repeating the same add is idempotent.
 `add_many()` uses one model batch and one SQLite transaction. `add_stream()` commits each completed
-item through the ordinary add path, so a later source failure preserves the committed prefix.
+item through the ordinary add path, so a later source failure preserves the committed prefix. It
+applies and acknowledges those commits to Zvec in bounded groups instead of once per item: the
+group ends after 32 items or 250 ms, and covers exactly the outbox rows the commits behind it left
+pending. Only the projection is grouped, so the order and the failure behavior above are unchanged;
+a group the process never reaches leaves its rows pending for the next drain, and `search` drains
+before it reads, so a committed item is retrievable during the stream either way.
 
 Formation follows the same authority rule: a `FormationBackend` only proposes. After the source
 observation commits, the kernel assigns identity, validates source binding and source modality,

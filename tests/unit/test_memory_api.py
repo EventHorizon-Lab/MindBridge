@@ -277,6 +277,7 @@ class _FakeIndex:
         self.dense_hits_override: tuple[IndexHit, ...] | None = None
         self.lexical_hits_override: tuple[IndexHit, ...] | None = None
         self.upsert_calls: list[tuple[str, ...]] = []
+        self.flush_calls = 0
         self.delete_calls: list[tuple[str, ...]] = []
         self.dense_search_calls = 0
         self.lexical_search_calls = 0
@@ -394,6 +395,7 @@ class _FakeIndex:
         )
 
     def flush(self) -> None:
+        self.flush_calls += 1
         if self.fail_next_flush:
             self.fail_next_flush = False
             raise RuntimeError("simulated flush failure")
@@ -5074,3 +5076,122 @@ def test_scoped_survivor_count_returns_the_hits_the_discarded_hydration_did(
     assert [hit.id for hit in counted[0]] == [target.id]
     assert len(counted[2]) == 10
     assert counted == hydrated
+
+
+def _stream_log(memory: Memory, index: _FakeIndex) -> list[tuple[str, tuple[str, ...]]]:
+    """Record SQLite commits and Zvec mutations on one timeline."""
+    log: list[tuple[str, tuple[str, ...]]] = []
+    write_memories = memory._store.write_memories
+    upsert = index.upsert
+    flush = index.flush
+
+    def logged_write(
+        memories: Iterable[StoredMemory],
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> tuple[bool, ...]:
+        batch = tuple(memories)
+        written: tuple[bool, ...] = write_memories(batch, embeddings)
+        log.append(("commit", tuple(memory.memory_id for memory in batch)))
+        return written
+
+    def logged_upsert(documents: Sequence[IndexDocument]) -> None:
+        upsert(documents)
+        log.append(("upsert", tuple(document.embedding.memory_id for document in documents)))
+
+    def logged_flush() -> None:
+        flush()
+        log.append(("flush", ()))
+
+    memory._store.write_memories = logged_write  # type: ignore[method-assign]
+    index.upsert = logged_upsert  # type: ignore[method-assign]
+    index.flush = logged_flush  # type: ignore[method-assign]
+    return log
+
+
+def test_add_stream_indexes_committed_items_in_bounded_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """One flush per group of 32, and every Zvec change follows its own SQLite commit."""
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        log = _stream_log(memory, index)
+        records = tuple(memory.add_stream(f"streamed clip {position}" for position in range(70)))
+        stream_flushes = index.flush_calls
+        found = memory.search("streamed clip", limit=100)
+
+    committed: set[str] = set()
+    for action, memory_ids in log:
+        if action == "commit":
+            committed.update(memory_ids)
+        elif action == "upsert":
+            # SQLite is authoritative: nothing reaches Zvec that is not already durable.
+            assert set(memory_ids) <= committed
+    assert [action for action, _ids in log].count("commit") == 70
+    # 32, 64, and the six left over when the source ends.
+    assert stream_flushes == 3
+    assert [action for action, _ids in log if action in {"upsert", "flush"}] == [
+        value for _group in range(3) for value in ["upsert", "flush"]
+    ]
+    assert {hit.id for hit in found} == {record.id for record in records}
+
+
+def test_add_stream_flushes_a_slow_source_on_the_time_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The elapsed bound is the one that fires when the source is slower than the group."""
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 0.0)
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        tuple(memory.add_stream(f"slow clip {position}" for position in range(4)))
+        assert index.flush_calls == 4
+
+
+def test_search_during_a_stream_sees_the_committed_items(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A group that has not flushed yet is still retrievable: `search` drains first."""
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        seen = []
+        for record in memory.add_stream(f"midstream clip {position}" for position in range(3)):
+            seen.append(record)
+            if len(seen) == 2:
+                break
+        assert index.flush_calls == 0
+        during = memory.search("midstream clip", limit=10)
+
+    assert {hit.id for hit in during} == {record.id for record in seen}
+
+
+def test_add_stream_source_failure_leaves_the_committed_prefix_searchable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+
+    def contents() -> Iterator[str]:
+        yield "first failing-stream clip"
+        yield "second failing-stream clip"
+        raise ModelError("the camera went away", reason="unavailable")
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        stream = memory.add_stream(contents())
+        prefix = [next(stream), next(stream)]
+        with pytest.raises(ModelError):
+            next(stream)
+        # The group never closed, so the projection work is still pending and durable.
+        assert index.flush_calls == 0
+        assert memory._store.pending_index_operations() != ()
+        assert [item.id for item in memory.list().items] == [prefix[1].id, prefix[0].id]
+        recovered = memory.search("failing-stream clip", limit=10)
+
+    assert {hit.id for hit in recovered} == {record.id for record in prefix}
