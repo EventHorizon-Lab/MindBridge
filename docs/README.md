@@ -10,6 +10,7 @@ have one place to stay current.
 | Try local memory | [Quick start](quickstart.md) | [Core concepts](concepts.md) |
 | Understand the product direction | [Context OS direction](context-os.md) | [Architecture](architecture.md) |
 | Build a Python integration | [Configuration](configuration.md) | [Python SDK](api/python-sdk.md) |
+| Give an agent a bounded context view | [Context compilation](context-compilation.md) | [Python SDK](api/python-sdk.md) |
 | Expose memory to another process | [REST](api/rest.md), [MCP](api/mcp.md), or [CLI](api/cli.md) | [Deployment](deployment.md) |
 | Run a durable instance | [Architecture](architecture.md) | [Operations](operations.md) and [troubleshooting](troubleshooting.md) |
 | Evaluate retrieval quality | [Benchmarking](benchmarking.md) | [Competitive review](competitive-memory-systems.md) |
@@ -25,6 +26,8 @@ have one place to stay current.
    temporal ranking.
 6. [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) — ingest
    completed observations and derive grounded interaction records.
+7. [Context compilation](context-compilation.md) — compile a bounded, structured context bundle
+   and advertise what one instance can do.
 
 ## Integrate
 

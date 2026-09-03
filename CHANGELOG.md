@@ -16,6 +16,14 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   transaction and returns before any model call; `settle()` runs the deferred transcription,
   embedding, indexing, and formation stages. `add()` and `add_many()` settle a queued record they
   encounter, so their searchable-on-return contract is unchanged.
+- `Memory.compile()`, a context compiler that runs the existing retrieval kernel once and returns
+  a `ContextBundle`: actors, facts, episodes, procedures, affect cues, and traits selected within a
+  `ContextBudget`, plus lineage conflicts it reports without resolving, temporal and spatial
+  bounds, an omitted count, and a deterministic `render()`. `ask()` is unchanged.
+- `Memory.capabilities()` and `MemoryCapabilities`, so an agent surface can advertise the
+  modalities and memory capabilities one instance is configured for instead of discovering a
+  missing backend by failing on first use.
+- `mindbridge compile` and `mindbridge capabilities` on the command line.
 
 - Face and speaker writes now record `mindbridge.identity.observations` and
   `mindbridge.identity.matched_existing` on their storage span, so a recognizer that cannot tell

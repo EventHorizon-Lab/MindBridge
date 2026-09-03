@@ -22,7 +22,7 @@ import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
@@ -51,6 +51,7 @@ from mindbridge.types import (
     Blob,
     ContentAtom,
     ContentInput,
+    ContextBudget,
     EvidenceBasis,
     FaceObservation,
     MemoryContext,
@@ -97,6 +98,8 @@ OPERATIONS: tuple[str, ...] = (
     "search",
     "search_with_trace",
     "ask",
+    "compile",
+    "capabilities",
     "get",
     "speech",
     "faces",
@@ -121,6 +124,7 @@ _QUERY_METAVAR: Mapping[str, str] = {
     "search": "QUERY",
     "search-with-trace": "QUERY",
     "ask": "QUESTION",
+    "compile": "GOAL",
 }
 _DEFAULT_REMOTE_TIMEOUT_SECONDS = 30.0
 _TUNING: tuple[str, ...] = (
@@ -584,6 +588,78 @@ def _ask(memory: Memory, arguments: argparse.Namespace) -> _Document:
     }
 
 
+def _compile(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    bundle = memory.compile(
+        _content_input(arguments),
+        budget=ContextBudget(
+            max_chars=arguments.max_chars,
+            max_items=arguments.max_items,
+            memory_types=(
+                None
+                if arguments.memory_type is None
+                else frozenset(MemoryType(value) for value in arguments.memory_type)
+            ),
+            min_confidence=arguments.min_confidence,
+            freshness=(
+                None
+                if arguments.freshness_seconds is None
+                else timedelta(seconds=arguments.freshness_seconds)
+            ),
+        ),
+        reference_at=_optional_time(arguments.reference_at, "reference_at"),
+        scope=_retrieval_scope(_json_source(arguments.scope)),
+    )
+    document: _Document = {
+        "goal": bundle.goal,
+        "reference_at": _encode_time(bundle.reference_at),
+        "budget": _budget_document(bundle.budget),
+        "conflicts": [asdict(conflict) for conflict in bundle.conflicts],
+        "occurred_from": _encode_optional_time(bundle.occurred_from),
+        "occurred_until": _encode_optional_time(bundle.occurred_until),
+        "frames": list(bundle.frames),
+        "omitted": bundle.omitted,
+        "chars": bundle.chars,
+        "rendered": bundle.render(),
+    }
+    for name in ("actors", "episodes", "facts", "procedures", "affect", "traits"):
+        document[name] = [_memory_document(hit) for hit in getattr(bundle, name)]
+    return document
+
+
+def _budget_document(budget: ContextBudget) -> _Document:
+    return {
+        "max_chars": budget.max_chars,
+        "max_items": budget.max_items,
+        "memory_types": (
+            None
+            if budget.memory_types is None
+            else sorted(value.value for value in budget.memory_types)
+        ),
+        "min_confidence": budget.min_confidence,
+        "freshness_seconds": (
+            None if budget.freshness is None else budget.freshness.total_seconds()
+        ),
+    }
+
+
+def _capabilities(memory: Memory, _arguments: argparse.Namespace) -> _Document:
+    capabilities = memory.capabilities()
+    document: _Document = {
+        "modalities": sorted(modality.value for modality in capabilities.modalities)
+    }
+    for name in (
+        "answer",
+        "transcribe",
+        "faces",
+        "describe_vision",
+        "form",
+        "consolidate",
+        "decay",
+    ):
+        document[name] = getattr(capabilities, name)
+    return document
+
+
 def _get(memory: Memory, arguments: argparse.Namespace) -> _Document:
     return _memory_document(memory.get(arguments.memory_id))
 
@@ -674,6 +750,8 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "search": _search,
     "search-with-trace": _search_with_trace,
     "ask": _ask,
+    "compile": _compile,
+    "capabilities": _capabilities,
     "get": _get,
     "speech": _speech,
     "faces": _faces,
@@ -1515,6 +1593,7 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         if operation != "ask":
             command.add_argument("--occurred-from", metavar="TIME", help="event overlap start")
             command.add_argument("--occurred-until", metavar="TIME", help="event overlap end")
+    _compile_command(commands)
     for name, help_text in (
         ("get", "read one memory"),
         ("speech", "transcribe and identify speakers"),
@@ -1553,11 +1632,51 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     )
     for name, help_text in (
         ("pending-captures", "count captured memories waiting to be settled"),
+        ("capabilities", "report configured modalities and memory capabilities"),
         ("reindex", "rebuild the search index from SQLite"),
         ("optimize", "merge staged index vectors"),
         (DOCTOR, "resolve the composition and exercise each loader"),
     ):
         commands.add_parser(name, help=help_text)
+
+
+def _compile_command(
+    commands: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    """Add `compile`, whose options are the `ContextBudget` fields plus retrieval scope."""
+    budget = ContextBudget()
+    command = _content_command(commands, "compile", "compile a bounded context bundle")
+    command.add_argument(
+        "--max-chars",
+        type=int,
+        default=budget.max_chars,
+        help="evidence character budget (default: %(default)s)",
+    )
+    command.add_argument(
+        "--max-items",
+        type=int,
+        default=budget.max_items,
+        help="maximum included memories (default: %(default)s)",
+    )
+    command.add_argument(
+        "--memory-type",
+        action="append",
+        choices=[item.value for item in MemoryType],
+        help="repeatable; keep only these memory types",
+    )
+    command.add_argument(
+        "--min-confidence",
+        type=float,
+        default=budget.min_confidence,
+        help="minimum typed confidence (default: %(default)s)",
+    )
+    command.add_argument(
+        "--freshness-seconds",
+        type=float,
+        help="keep only memories anchored within this many seconds of the reference clock",
+    )
+    command.add_argument("--reference-at", metavar="TIME", help="retrieval reference clock")
+    command.add_argument("--scope", metavar="JSON", help="temporal/spatial scope, @PATH, or -")
 
 
 def _content_command(
