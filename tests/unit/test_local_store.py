@@ -2349,10 +2349,7 @@ def test_the_projection_follows_every_visibility_change_of_a_naming_assertion(
     leave a name standing that nothing asserts -- including the paths that know nothing about
     identities, which is every one of them but naming.
     """
-    # Anchored to the run, not to a calendar date: `write_speech` stamps the identity row's
-    # `created_at` from the wall clock, and the projection writes this clock into `updated_at`,
-    # so a fixed past date trips the `updated_at >= created_at` check on the identities table.
-    recorded_at = datetime.now(timezone.utc)
+    recorded_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
     with LocalStore(tmp_path) as store:
         clip = _video_asset(store, "clip")
         voice_id = _voice_identity(store, clip, (1.0, 0.0))
