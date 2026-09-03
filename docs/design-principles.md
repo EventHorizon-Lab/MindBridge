@@ -147,7 +147,13 @@ For developers:
   invoke a model and persist identity state, so they are separate operations rather than variants of
   `get`; batching (`add_many`), diagnostics (`search_with_trace`), identity naming, explicit
   feedback (`reinforce`), and index maintenance (`reindex`, `optimize`) are each their own verb for
-  the same reason. An operation that only reshapes an existing result is not one of them.
+  the same reason. So are the three operations that split acknowledgement from enrichment
+  (`capture`, `settle`, `pending_captures`) and the four that manage stored memory rather than add
+  to it (`consolidate`, `forget`, `rollback`, `operations`): each changes when work happens or what
+  authority applies it, not just the shape of a result. `compile` is the one that pays for itself
+  on the common path, because an agent assembling its own prompt otherwise re-derives structure and
+  budget from a flat hit list. An operation that only reshapes an existing result is not one of
+  them.
 - The SDK is the canonical capability inventory. MCP and the product CLI expose the same product
   operations unless a transport limitation is documented explicitly; a gap is implementation work,
   not permission to create different behavior.
@@ -305,15 +311,15 @@ an owning reference for detail. A cell that stops being true is a defect in this
 
 | Concern | Current release | Product direction |
 | --- | --- | --- |
-| Input | Ordered text, image, video, and audio through `ContentInput`; lazy completed observations through `StreamInput`/`add_stream`; async speculative omni recall | More capture formats normalize into the same canonical contract |
+| Input | Ordered text, image, video, and audio through `ContentInput`; lazy completed observations through `StreamInput`/`add_stream`; deferred enrichment through `capture`/`settle`; async speculative omni recall | More capture formats normalize into the same canonical contract |
 | Embedding | Caller explicitly supplies a backend; Jina v5 Omni is the bundled omni adapter | Omni-capable recommended composition with route-specific execution |
 | Generation | Optional caller-supplied backend with explicit capabilities | Omni-capable recommended composition where the deployment supports it |
 | Speech runtime | Built-in FunASR adapter uses `AutoModel` | Additional measured runtime adapters, selected explicitly or by observable policy |
-| Extensions | The explicit model protocols in [architecture](architecture.md#model-and-plugin-boundary), one of them optional; no registry. Declarative configuration builds a subset of the slots; the rest are object injection only | Optional domain capabilities after a real implementation establishes the contract |
+| Extensions | The explicit model protocols in [architecture](architecture.md#model-and-plugin-boundary), including `ConsolidationBackend` for the memory control plane, one of them optional; no registry. Declarative configuration builds a subset of the slots; the rest are object injection only | Optional domain capabilities after a real implementation establishes the contract |
 | Hardware | Runs where Python, dependencies, and the selected models are supported | Verified device-class matrix with published quality, latency, and resource evidence |
 | Developer interfaces | Typed Python API, OpenAPI-documented REST adapter, and a JSON-only product CLI over the same composition | Same small vocabulary and time-to-first-success across supported transports |
 | Execution plane | Python SDK, REST, MCP, and the `mindbridge` CLI all dispatch to one `Memory`; none of them implements its own routing, persistence, or defaults | Every surface reaches the operations the SDK publishes, with no transport gap left undocumented |
-| Agent interfaces | Fourteen typed MCP tools and a `mindbridge` CLI whose commands are the SDK operations kebab-cased plus `doctor`. The common path — `add_memory`, `search_memories`, `ask_memory`, `get_memory`, `list_memories`, `delete_memory` — plus the embodied and identity operations an agent driving a robot needs: `analyze_speech`, `analyze_faces`, `register_speaker`, `register_identity`, `get_identity`, `unlink_identity`, `forget_identity`, `reinforce_memories`. Erasure is exposed, so a privacy request reaches an agent surface. What MCP still does not expose is batching, streaming, diagnostics and index maintenance; each is listed with its reason in [the MCP reference](api/mcp.md#operations-without-a-tool) | SDK-derived MCP and CLI capability parity, machine-readable schemas, and lifecycle integrations |
+| Agent interfaces | Fifteen typed MCP tools and a `mindbridge` CLI whose commands are the SDK operations kebab-cased plus `doctor`. The common path — `add_memory`, `search_memories`, `ask_memory`, `compile_context`, `get_memory`, `list_memories`, `delete_memory` — plus the embodied and identity operations an agent driving a robot needs: `analyze_speech`, `analyze_faces`, `register_speaker`, `register_identity`, `get_identity`, `unlink_identity`, `forget_identity`, `reinforce_memories`. Erasure is exposed, so a privacy request reaches an agent surface, and the composition's capability view is the server instructions rather than a tool. What MCP still does not expose is batching, streaming, diagnostics, index maintenance, deferred capture, and the memory control plane; each is listed with its reason in [the MCP reference](api/mcp.md#operations-without-a-tool) | SDK-derived MCP and CLI capability parity, machine-readable schemas, and lifecycle integrations |
 
 This distinction is deliberate: goals guide what to build next, while current API and deployment
 documentation remain the source of truth for what users can run now.

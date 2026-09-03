@@ -20,13 +20,13 @@ import json
 import math
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
-from typing import TextIO, TypeAlias, cast
+from typing import Any, TextIO, TypeAlias, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -45,16 +45,19 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
-from mindbridge.memory import Memory
+from mindbridge.memory import Memory, declared_capabilities
 from mindbridge.types import (
     AssetRef,
     Blob,
     ContentAtom,
     ContentInput,
+    ContextBudget,
     EvidenceBasis,
     FaceObservation,
     MemoryContext,
+    MemoryOperationRecord,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
     ObservationContext,
@@ -91,9 +94,13 @@ OPERATIONS: tuple[str, ...] = (
     "add",
     "add_many",
     "add_stream",
+    "capture",
+    "settle",
+    "pending_captures",
     "search",
     "search_with_trace",
     "ask",
+    "compile",
     "get",
     "speech",
     "faces",
@@ -103,6 +110,11 @@ OPERATIONS: tuple[str, ...] = (
     "forget_identity",
     "unlink_identity",
     "reinforce",
+    "consolidation_candidates",
+    "consolidate",
+    "forget",
+    "rollback",
+    "operations",
     "list",
     "delete",
     "reindex",
@@ -112,17 +124,22 @@ DOCTOR = "doctor"
 COMMANDS: tuple[str, ...] = (*(name.replace("_", "-") for name in OPERATIONS), DOCTOR)
 # Operations a running owner serves over `/v1`. Other operations have no route today; that is a
 # documented transport gap, reported honestly, not a CLI design choice.
-REMOTE_COMMANDS = frozenset({"add", "add-many", "search", "ask", "get", "list", "delete"})
+REMOTE_COMMANDS = frozenset(
+    {"add", "add-many", "search", "ask", "compile", "get", "list", "delete"}
+)
 _QUERY_METAVAR: Mapping[str, str] = {
     "add": "TEXT",
+    "capture": "TEXT",
     "search": "QUERY",
     "search-with-trace": "QUERY",
     "ask": "QUESTION",
+    "compile": "GOAL",
+    "consolidate": "GOAL",
 }
 _DEFAULT_REMOTE_TIMEOUT_SECONDS = 30.0
 # One list, because a slot added to `recipes` used to need remembering in four separate literals
 # here; the flag, the explain document, `doctor`, and the composition guard all derive from it.
-_SLOTS: tuple[str, ...] = ("embedder", "answerer", "former", "transcriber")
+_SLOTS: tuple[str, ...] = ("embedder", "answerer", "former", "consolidator", "transcriber")
 _OPTIONAL_SLOTS: tuple[str, ...] = _SLOTS[1:]
 _TUNING: tuple[str, ...] = (
     "index_speech",
@@ -284,6 +301,8 @@ def _open_memory(arguments: argparse.Namespace) -> Memory:
             backends["answerer"] = recipes.answerer(arguments.answerer)
         if arguments.former is not None:
             backends["former"] = recipes.former(arguments.former)
+        if arguments.consolidator is not None:
+            backends["consolidator"] = recipes.consolidator(arguments.consolidator)
         if arguments.transcriber is not None:
             backends["transcriber"] = recipes.transcriber(arguments.transcriber)
     try:
@@ -294,6 +313,7 @@ def _open_memory(arguments: argparse.Namespace) -> Memory:
             embedder=backends["embedder"],  # type: ignore[arg-type]
             answerer=backends.get("answerer"),  # type: ignore[arg-type]
             former=backends.get("former"),  # type: ignore[arg-type]
+            consolidator=backends.get("consolidator"),  # type: ignore[arg-type]
             transcriber=backends.get("transcriber"),  # type: ignore[arg-type]
             index_speech=arguments.index_speech,
             minimum_relevance=arguments.minimum_relevance,
@@ -378,6 +398,10 @@ def _doctor(arguments: argparse.Namespace, composition: _Document) -> _Document:
     report: _Document = {"source": composition["source"]}
     data_dir: Path | None = None
     state = "owned by the application"
+    loaded: dict[str, object] = {}
+    # `--app` owns its own backends and doctor never calls the factory, so there is nothing to
+    # declare there; a local composition declares what its probed backends can do.
+    capabilities: _Document | None = None
     if arguments.app is not None:
         report["app"] = composition["app"]
         # Calling the factory would open the store, so the check stops at "the target resolves".
@@ -386,16 +410,53 @@ def _doctor(arguments: argparse.Namespace, composition: _Document) -> _Document:
     else:
         data_dir = _data_dir(arguments)
         state = _data_dir_state(data_dir)
-        for slot in _SLOTS:
-            name = getattr(arguments, slot)
-            report[slot] = None if name is None else _probe(name, slot)
+        try:
+            for slot in _SLOTS:
+                name = getattr(arguments, slot)
+                report[slot] = None if name is None else _probe(name, slot, loaded)
+            capabilities = _doctor_capabilities(loaded)
+        finally:
+            for backend in loaded.values():
+                close = getattr(backend, "close", None)
+                if callable(close):
+                    # One slot that fails to shut down must not strand the weights of the rest.
+                    # doctor already reports what each slot could load; a close is pure cleanup.
+                    with suppress(Exception):
+                        close()
     return {
         "version": _installed_version(),
         "python": ".".join(str(part) for part in sys.version_info[:3]),
         "data_dir": None if data_dir is None else str(data_dir),
         "data_dir_state": state,
+        # The same document `/healthz` serves and the MCP server greets an agent with, so the
+        # three surfaces cannot describe one composition differently.
+        "capabilities": capabilities,
         "composition": report,
     }
+
+
+def _doctor_capabilities(loaded: Mapping[str, object]) -> _Document | None:
+    """Declare what the probed backends can do, without opening the store `Memory` would.
+
+    Every capability is a backend declaration, so this needs no `data_dir` and stays true to
+    doctor's rule that diagnosing a busy or absent directory must not create or lock anything.
+    """
+    embedder = loaded.get("embedder")
+    if embedder is None:
+        return None
+    try:
+        capabilities = declared_capabilities(
+            embedder=cast(Any, embedder),
+            answerer=cast(Any, loaded.get("answerer")),
+            transcriber=cast(Any, loaded.get("transcriber")),
+            former=cast(Any, loaded.get("former")),
+            consolidator=cast(Any, loaded.get("consolidator")),
+        )
+    except MindBridgeError:
+        # A backend that declares an invalid contract is already reported per slot above; the
+        # capability document is a summary, not a second place to fail the command.
+        return None
+    return capabilities.document()
 
 
 def _application_target_exists(spec: str) -> None:
@@ -406,8 +467,8 @@ def _application_target_exists(spec: str) -> None:
         getattr(import_module(module_name), attribute)
 
 
-def _probe(name: str, slot: str) -> _Document:
-    """Construct one recipe with its loader exercised, then close what was constructed."""
+def _probe(name: str, slot: str, loaded: dict[str, object]) -> _Document:
+    """Construct one recipe with its loader exercised, keeping it for the capability summary."""
     document: _Document = dict(recipes.describe(name))
     document["probe"] = recipes.probe(name)
     build: Callable[..., object] = getattr(recipes, slot)
@@ -424,13 +485,9 @@ def _probe(name: str, slot: str) -> _Document:
             detail=" ".join(str(error).split()) or type(error).__name__,
         )
         return document
-    try:
-        document["loader"] = "ok"
-        document.update(_identity(backend))
-    finally:
-        close = getattr(backend, "close", None)
-        if callable(close):
-            close()
+    loaded[slot] = backend
+    document["loader"] = "ok"
+    document.update(_identity(backend))
     return document
 
 
@@ -489,6 +546,19 @@ def _add(memory: Memory, arguments: argparse.Namespace) -> _Document:
     )
 
 
+def _capture(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return _memory_document(
+        memory.capture(
+            _content_input(arguments),
+            occurred_at=_optional_time(arguments.occurred_at, "occurred_at"),
+            occurred_end=_optional_time(arguments.occurred_end, "occurred_end"),
+            metadata=_metadata_value(_json_source(arguments.metadata)),
+            memory_type=MemoryType(arguments.memory_type),
+            context=_observation_context(_json_source(arguments.context)),
+        )
+    )
+
+
 def _add_many(memory: Memory, arguments: argparse.Namespace) -> _Document:
     items = _jsonl(arguments.source)
     return {
@@ -525,7 +595,12 @@ def _add_stream(memory: Memory, arguments: argparse.Namespace) -> _Document:
     )
     # ponytail: preserve the CLI's one-JSON-document contract by collecting result records; add
     # streaming output only if finite CLI imports outgrow memory. The SDK input path stays lazy.
-    return {"memories": [_memory_document(record) for record in memory.add_stream(inputs)]}
+    return {
+        "memories": [
+            _memory_document(record)
+            for record in memory.add_stream(inputs, capture=arguments.capture)
+        ]
+    }
 
 
 def _search(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -572,6 +647,81 @@ def _ask(memory: Memory, arguments: argparse.Namespace) -> _Document:
         "abstention_reason": (
             None if result.abstention_reason is None else result.abstention_reason.value
         ),
+    }
+
+
+def _budget(arguments: argparse.Namespace) -> ContextBudget:
+    return ContextBudget(
+        max_chars=arguments.max_chars,
+        max_items=arguments.max_items,
+        memory_types=(
+            None
+            if arguments.memory_type is None
+            else frozenset(MemoryType(value) for value in arguments.memory_type)
+        ),
+        min_confidence=arguments.min_confidence,
+        freshness=(
+            None
+            if arguments.freshness_seconds is None
+            else timedelta(seconds=arguments.freshness_seconds)
+        ),
+        max_latency_ms=arguments.max_latency_ms,
+    )
+
+
+def _compile(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    bundle = memory.compile(
+        _content_input(arguments),
+        budget=_budget(arguments),
+        reference_at=_optional_time(arguments.reference_at, "reference_at"),
+        scope=_retrieval_scope(_json_source(arguments.scope)),
+    )
+    document: _Document = {
+        "goal": bundle.goal,
+        "reference_at": _encode_time(bundle.reference_at),
+        "budget": _budget_document(bundle.budget),
+        "conflicts": [asdict(conflict) for conflict in bundle.conflicts],
+        "unknowns": [
+            {"kind": unknown.kind.value, "detail": unknown.detail} for unknown in bundle.unknowns
+        ],
+        "occurred_from": _encode_optional_time(bundle.occurred_from),
+        "occurred_until": _encode_optional_time(bundle.occurred_until),
+        "frames": list(bundle.frames),
+        "places": list(bundle.places),
+        "omitted": bundle.omitted,
+        "chars": bundle.chars,
+        "elapsed_ms": bundle.elapsed_ms,
+        "deadline_exceeded": bundle.deadline_exceeded,
+        "rendered": bundle.render(),
+    }
+    for name in (
+        "actors",
+        "relationships",
+        "scene",
+        "episodes",
+        "facts",
+        "procedures",
+        "affect",
+        "traits",
+    ):
+        document[name] = [_memory_document(hit) for hit in getattr(bundle, name)]
+    return document
+
+
+def _budget_document(budget: ContextBudget) -> _Document:
+    return {
+        "max_chars": budget.max_chars,
+        "max_items": budget.max_items,
+        "memory_types": (
+            None
+            if budget.memory_types is None
+            else sorted(value.value for value in budget.memory_types)
+        ),
+        "min_confidence": budget.min_confidence,
+        "freshness_seconds": (
+            None if budget.freshness is None else budget.freshness.total_seconds()
+        ),
+        "max_latency_ms": budget.max_latency_ms,
     }
 
 
@@ -635,8 +785,107 @@ def _unlink_identity(memory: Memory, arguments: argparse.Namespace) -> _Document
     return {"restored_identity_id": memory.unlink_identity(arguments.alias_id)}
 
 
+def _settle(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {
+        "settled": memory.settle(
+            limit=arguments.limit,
+            max_attempts=arguments.max_attempts,
+            memory_ids=tuple(arguments.memory_ids) or None,
+        )
+    }
+
+
+def _pending_captures(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {
+        "pending": [
+            {
+                "memory_id": pending.memory_id,
+                "enqueued_at": pending.enqueued_at.isoformat(),
+                "attempts": pending.attempts,
+                "last_error": pending.last_error,
+                "awaiting": pending.awaiting,
+            }
+            for pending in memory.pending_captures(
+                limit=arguments.limit,
+                memory_ids=tuple(arguments.memory_ids) or None,
+            )
+        ]
+    }
+
+
 def _reinforce(memory: Memory, arguments: argparse.Namespace) -> _Document:
     return {"reinforced": memory.reinforce(arguments.memory_ids)}
+
+
+def _consolidation_candidates(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {
+        "candidates": [
+            {
+                "trigger": candidate.trigger.value,
+                "memory_ids": list(candidate.memory_ids),
+                "evidence_count": candidate.evidence_count,
+            }
+            for candidate in memory.consolidation_candidates(limit=arguments.limit)
+        ]
+    }
+
+
+def _consolidate(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    report = memory.consolidate(
+        evidence_ids=arguments.evidence_ids or None,
+        query=(
+            _content_input(arguments)
+            if arguments.content or arguments.content_json is not None
+            else None
+        ),
+        limit=arguments.limit,
+        trigger=MemoryTrigger(arguments.trigger),
+    )
+    return {
+        "operations": [_operation_document(record) for record in report.operations],
+        "rejected": [
+            {"intent": operation.intent.value, "reason": reason}
+            for operation, reason in report.rejected
+        ],
+    }
+
+
+def _forget(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    record = memory.forget(arguments.memory_ids)
+    return {"operation": None if record is None else _operation_document(record)}
+
+
+def _rollback(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {"rolled_back": memory.rollback(arguments.operation_id)}
+
+
+def _operations(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {
+        "operations": [
+            _operation_document(record) for record in memory.operations(limit=arguments.limit)
+        ]
+    }
+
+
+def _operation_document(record: MemoryOperationRecord) -> _Document:
+    return {
+        "operation_id": record.operation_id,
+        "intent": record.operation.intent.value,
+        "trigger": record.trigger.value,
+        "evidence_ids": list(record.operation.evidence_ids),
+        "target_ids": list(record.operation.target_ids),
+        "rationale": record.operation.rationale,
+        "model_id": record.model_id,
+        "recipe": record.recipe,
+        "created_ids": list(record.created_ids),
+        "changed_ids": list(record.changed_ids),
+        "forgotten_ids": list(record.forgotten_ids),
+        "superseded": [[memory_id, version] for memory_id, version in record.superseded],
+        "applied_at": record.applied_at.isoformat(),
+        "rolled_back_at": (
+            None if record.rolled_back_at is None else record.rolled_back_at.isoformat()
+        ),
+    }
 
 
 def _list(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -664,9 +913,13 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "add": _add,
     "add-many": _add_many,
     "add-stream": _add_stream,
+    "capture": _capture,
+    "settle": _settle,
+    "pending-captures": _pending_captures,
     "search": _search,
     "search-with-trace": _search_with_trace,
     "ask": _ask,
+    "compile": _compile,
     "get": _get,
     "speech": _speech,
     "faces": _faces,
@@ -676,6 +929,11 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "forget-identity": _forget_identity,
     "unlink-identity": _unlink_identity,
     "reinforce": _reinforce,
+    "consolidation-candidates": _consolidation_candidates,
+    "consolidate": _consolidate,
+    "forget": _forget,
+    "rollback": _rollback,
+    "operations": _operations,
     "list": _list,
     "delete": _delete,
     "reindex": _reindex,
@@ -767,6 +1025,20 @@ def _remote_query(field: str, arguments: argparse.Namespace) -> _Document:
     return body
 
 
+def _remote_compile(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    body: _Document = {
+        "goal": _content_value(arguments),
+        "budget": _budget_document(_budget(arguments)),
+    }
+    _put(body, "reference_at", _remote_time(arguments.reference_at, "reference_at"))
+    _put(
+        body,
+        "scope",
+        _retrieval_scope_document(_retrieval_scope(_json_source(arguments.scope))),
+    )
+    return "POST", "/v1/context", body
+
+
 def _remote_get(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
     return "GET", f"/v1/memories/{quote(arguments.memory_id, safe='')}", None
 
@@ -788,6 +1060,7 @@ _REMOTE: Mapping[str, Callable[[argparse.Namespace], tuple[str, str, _Document |
     "add-many": _remote_add_many,
     "search": _remote_search,
     "ask": _remote_ask,
+    "compile": _remote_compile,
     "get": _remote_get,
     "list": _remote_list,
     "delete": _remote_delete,
@@ -1250,6 +1523,7 @@ def _memory_document(record: MemoryRecord | SearchHit) -> _Document:
         "occurred_end": _encode_optional_time(record.occurred_end),
         "metadata": dict(record.metadata),
         "context": _context_document(record.context),
+        "forgotten_at": _encode_optional_time(record.forgotten_at),
         "place_id": record.place_id,
     }
     if isinstance(record, SearchHit):
@@ -1431,6 +1705,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--answerer", metavar="NAME", help="generation recipe, with --embedder")
     parser.add_argument("--former", metavar="NAME", help="formation recipe, with --embedder")
+    parser.add_argument(
+        "--consolidator", metavar="NAME", help="consolidation recipe, with --embedder"
+    )
     parser.add_argument("--transcriber", metavar="NAME", help="speech recipe, with --embedder")
     # Derived from the SDK default, never hardcoded: `_reject_embedder_only_options` compares this
     # against `_MEMORY_DEFAULTS`, so a literal here silently rejects every --app/--url invocation
@@ -1479,17 +1756,34 @@ def _positive_seconds(value: str) -> float:
 
 
 def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    add = _content_command(commands, "add", "store one memory")
-    add.add_argument("--occurred-at", metavar="TIME", help="ISO 8601 event start")
-    add.add_argument("--occurred-end", metavar="TIME", help="ISO 8601 event end")
-    add.add_argument("--metadata", metavar="JSON", help="application metadata object, @PATH, or -")
-    add.add_argument("--context", metavar="JSON", help="typed observation context, @PATH, or -")
-    _memory_type_option(add, "add")
+    for name, help_text in (
+        ("add", "store one memory"),
+        ("capture", "store one memory without model work; settle makes it searchable"),
+    ):
+        observation = _content_command(commands, name, help_text)
+        observation.add_argument("--occurred-at", metavar="TIME", help="ISO 8601 event start")
+        observation.add_argument("--occurred-end", metavar="TIME", help="ISO 8601 event end")
+        observation.add_argument(
+            "--metadata",
+            metavar="JSON",
+            help="application metadata object, @PATH, or -",
+        )
+        observation.add_argument(
+            "--context",
+            metavar="JSON",
+            help="typed observation context, @PATH, or -",
+        )
+        _memory_type_option(observation, name)
     batch = commands.add_parser("add-many", help="store a JSONL batch in one transaction")
     batch.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
     _memory_type_option(batch, "add_many")
     stream = commands.add_parser("add-stream", help="store completed JSONL items incrementally")
     stream.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
+    stream.add_argument(
+        "--capture",
+        action="store_true",
+        help="commit each item through capture; settle makes them searchable",
+    )
     _memory_type_option(stream, "add")
     for operation in ("search", "search_with_trace", "ask"):
         name = operation.replace("_", "-")
@@ -1506,6 +1800,7 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         if operation != "ask":
             command.add_argument("--occurred-from", metavar="TIME", help="event overlap start")
             command.add_argument("--occurred-until", metavar="TIME", help="event overlap end")
+    _compile_command(commands)
     for name, help_text in (
         ("get", "read one memory"),
         ("speech", "transcribe and identify speakers"),
@@ -1532,6 +1827,44 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     unlink.add_argument("alias_id", metavar="ALIAS_ID")
     reinforce = commands.add_parser("reinforce", help="record positive feedback")
     reinforce.add_argument("memory_ids", nargs="+", metavar="MEMORY_ID")
+    candidates = commands.add_parser(
+        "consolidation-candidates",
+        help="ask what needs deliberation, derived from recorded evidence and feedback",
+    )
+    candidates.add_argument(
+        "--limit",
+        type=int,
+        default=_default("consolidation_candidates", "limit"),
+        help="candidate rows (default: %(default)s)",
+    )
+    consolidate = _content_command(
+        commands, "consolidate", "deliberate over evidence and apply memory operations"
+    )
+    consolidate.add_argument(
+        "--evidence-id", dest="evidence_ids", action="append", metavar="MEMORY_ID"
+    )
+    consolidate.add_argument(
+        "--limit",
+        type=int,
+        default=_default("consolidate", "limit"),
+        help="evidence set size (default: %(default)s)",
+    )
+    consolidate.add_argument(
+        "--trigger",
+        choices=[item.value for item in MemoryTrigger],
+        default=MemoryTrigger(_default("consolidate", "trigger")).value,
+    )
+    forget = commands.add_parser("forget", help="cognitively forget memories without deleting")
+    forget.add_argument("memory_ids", nargs="+", metavar="MEMORY_ID")
+    rollback = commands.add_parser("rollback", help="reverse one logged memory operation")
+    rollback.add_argument("operation_id", type=int, metavar="OPERATION_ID")
+    operations = commands.add_parser("operations", help="list logged memory operations")
+    operations.add_argument(
+        "--limit",
+        type=int,
+        default=_default("operations", "limit"),
+        help="page size (default: %(default)s)",
+    )
     listing = commands.add_parser("list", help="list newest memories")
     listing.add_argument(
         "--limit",
@@ -1540,12 +1873,91 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         help="page size (default: %(default)s)",
     )
     listing.add_argument("--cursor", help="opaque cursor from a previous page")
+    settle = commands.add_parser("settle", help="enrich and index captured memories")
+    settle.add_argument(
+        "--limit",
+        type=int,
+        default=_default("settle", "limit"),
+        help="maximum captured memories to settle (default: %(default)s)",
+    )
+    settle.add_argument(
+        "--max-attempts",
+        type=int,
+        default=_default("settle", "max_attempts"),
+        help="skip captures that already failed this often (default: %(default)s)",
+    )
+    settle.add_argument(
+        "memory_ids",
+        nargs="*",
+        metavar="MEMORY_ID",
+        help="settle only these memories, ignoring --max-attempts",
+    )
+    pending = commands.add_parser(
+        "pending-captures",
+        help="list captured memories waiting to be settled",
+    )
+    pending.add_argument(
+        "--limit",
+        type=int,
+        default=_default("pending_captures", "limit"),
+        help="maximum queued captures to report (default: %(default)s)",
+    )
+    pending.add_argument(
+        "memory_ids",
+        nargs="*",
+        metavar="MEMORY_ID",
+        help="report only these memories; absent from the result means not pending",
+    )
     for name, help_text in (
         ("reindex", "rebuild the search index from SQLite"),
         ("optimize", "merge staged index vectors"),
         (DOCTOR, "resolve the composition and exercise each loader"),
     ):
         commands.add_parser(name, help=help_text)
+
+
+def _compile_command(
+    commands: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    """Add `compile`, whose options are the `ContextBudget` fields plus retrieval scope."""
+    budget = ContextBudget()
+    command = _content_command(commands, "compile", "compile a bounded context bundle")
+    command.add_argument(
+        "--max-chars",
+        type=int,
+        default=budget.max_chars,
+        help="evidence character budget (default: %(default)s)",
+    )
+    command.add_argument(
+        "--max-items",
+        type=int,
+        default=budget.max_items,
+        help="maximum included memories (default: %(default)s)",
+    )
+    command.add_argument(
+        "--memory-type",
+        action="append",
+        choices=[item.value for item in MemoryType],
+        help="repeatable; keep only these memory types",
+    )
+    command.add_argument(
+        "--min-confidence",
+        type=float,
+        default=budget.min_confidence,
+        help="minimum typed confidence (default: %(default)s)",
+    )
+    command.add_argument(
+        "--freshness-seconds",
+        type=float,
+        help="keep only memories anchored within this many seconds of the reference clock",
+    )
+    command.add_argument(
+        "--max-latency-ms",
+        type=int,
+        help="deadline after which optional compilation stages are skipped, in milliseconds",
+    )
+    command.add_argument("--reference-at", metavar="TIME", help="retrieval reference clock")
+    command.add_argument("--scope", metavar="JSON", help="temporal/spatial scope, @PATH, or -")
 
 
 def _content_command(

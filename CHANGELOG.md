@@ -10,6 +10,95 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- `capture()`, `settle()`, and `pending_captures()` on `Memory` and `AsyncMemory`, plus the
+  `capture`, `settle`, and `pending-captures` CLI commands. `capture()` commits a record, its
+  media, its observation context, and one durable enrichment queue row in a single SQLite
+  transaction and returns before any model call; `settle()` runs the deferred speech identity,
+  transcription, embedding, indexing, and formation stages in enqueue order. Every write path
+  previously blocked on the complete model chain, so a host with a burst of observations had to
+  choose between dropping them and stalling its own loop. `add()` and `add_many()` settle a queued
+  record they encounter, so their searchable-on-return contract is unchanged, and `search()`,
+  `ask()`, and `compile()` never settle: time to searchable stays under host control.
+  `pending_captures()` returns `PendingCapture` values — `memory_id`, `enqueued_at`, `attempts`,
+  `last_error`, and `awaiting` — and takes an optional `memory_ids` filter, so a caller can ask
+  whether one record is searchable yet and an operator can see why one is not. `awaiting`
+  separates a record with no vectors (`"enrichment"`) from one that is already searchable and owes
+  only formation (`"formation"`). `settle()` attempts every record it read rather than stopping at
+  the first failure, and its `max_attempts` ceiling (default 3) skips a record that has already
+  failed that often, so one poisoned capture cannot block the queue; `settle(memory_ids=...)` and
+  `mindbridge settle MEMORY_ID...` run named records alone and ignore that ceiling for them, which
+  is how a parked capture is retried by hand. One settlement runs at a time per `Memory`, so a
+  concurrent `settle()` or an `add()` of the same captured content waits instead of running the
+  model stages twice. `capture()` applies the embedder-capability check `add()` applies, so an
+  unsettleable record is refused before it becomes durable. With a formation backend configured,
+  `add()` holds a queue row from its write transaction until formation returns, so a crash in
+  between leaves work the next `settle()` completes without re-embedding.
+- `capture=True` on `Memory.add_stream()`, `AsyncMemory.add_stream()`, `AsyncCaptureStream`,
+  `AsyncAudioStream`, and `AsyncVisionStream`, plus `mindbridge add-stream --capture`. A streaming
+  `FINAL` then commits through `capture()` instead of `add()`, which completes the path from
+  continuous observation through speculative working context to low-latency durable
+  acknowledgement and deferred enrichment; every `StreamCommit` carries the new
+  `pending_settlement` field so the caller knows the record owes a `settle()`. A `StreamInput`
+  transcript or description is folded in at capture time, so the deferred commit lands on the same
+  content-addressed record the strong path would have written. The default is unchanged: without
+  the flag a final still commits through `add()` and is searchable when the commit yields.
+- `Memory.compile()` and `AsyncMemory.compile()`, a context compiler that runs the existing
+  retrieval kernel once and returns a `ContextBundle`: actors, episodes, facts, procedures, affect
+  cues, and traits selected within a `ContextBudget`, plus the lineage conflicts it reports without
+  resolving, temporal and spatial bounds, an omitted count, and a deterministic `render()`.
+  Grounding selection existed only inside `ask()` and returned a flat hit list, so an agent
+  building its own prompt had to re-derive structure and budget from unranked hits. `ask()` is
+  unchanged. `mindbridge compile` reaches it locally and over `--url`, `POST /v1/context`
+  (`compileContext`) serves it over REST, and `compile_context` is the fifteenth MCP tool.
+- `consolidate()`, `forget()`, `rollback()`, and `operations()` on `Memory` and `AsyncMemory`, with
+  the `MemoryIntent`, `MemoryTrigger`, `MemoryOperation`, `MemoryOperationRecord`, and
+  `ConsolidationReport` vocabulary and the `ConsolidationBackend` protocol injected through
+  `MemoryPlugins.consolidator`. A model proposes reinforcement, consolidation, correction, and
+  forgetting over a bounded evidence set; the kernel validates every citation, applies each
+  accepted operation in its own transaction with an append-only log row, rejects a duplicate
+  `operation_key`, and can reverse any of them by `operation_id`. Derived memory could previously
+  only be produced one source at a time by formation, and nothing could retire or forget it under
+  policy. `MemoryCapabilities.consolidation_model` reports the injected backend. The four
+  operations are reachable from the SDK and the `consolidate`, `forget`, `rollback`, and
+  `operations` CLI commands only; neither REST nor MCP exposes them.
+- `consolidation_candidates()` on `Memory` and `AsyncMemory`, the `ConsolidationCandidate` value,
+  and the `consolidation-candidates` CLI command: the durable trigger the loop was missing. It
+  answers "what needs deliberation?" from state already committed — a derived record that gained
+  independent evidence no standing operation weighed, a lineage whose current visible claims
+  disagree, a record confirmed through `reinforce()` since an operation last saw it — with no new
+  table, queue, or timer. Every `MemoryTrigger` was previously a label the caller chose, so the
+  host was the trigger and nothing recorded why a pass ran. `QUERY_FAILURE`, `PRESSURE`, and `IDLE`
+  stay labels; nothing durable records them. Like the rest of the control plane it is SDK and CLI
+  only.
+- Consolidation forgetting: a `CONSOLIDATE` proposal may name `target_ids` among its own evidence,
+  and those sources leave ordinary recall in the same transaction that creates the derived record.
+  The evidence links stay, so lineage survives, and the log row carries them as
+  `MemoryOperationRecord.forgotten_ids` so one `rollback()` reverses both halves. The three
+  forgettings stay distinguishable in the log: `delete()` leaves no row, cognitive forgetting is a
+  `FORGET` row, and this is a `CONSOLIDATE` row with `forgotten_ids`. Previously the only way to
+  retire a consolidated source was a separate `FORGET` with no lineage relationship to the
+  consolidation that motivated it.
+- `MemoryRecord.forgotten_at`, cognitive forgetting as a policy state a host can set and clear.
+  A forgotten record leaves `search()`, `ask()`, and `compile()` but stays readable through `get()`
+  and `list()` with the state visible, so forgetting is auditable and reversible. Physical erasure
+  remains `delete()`.
+- `build_mcp_server` publishes the composition's capability view as the MCP server instructions, so
+  a connecting agent learns the configured modalities, models, and capabilities without a tool
+  call. There is no capabilities tool and no capabilities route: `GET /healthz` already reports the
+  same view over REST.
+
+- A `consolidation` slot on the declarative configuration surface, plus `recipes.consolidator`
+  and a `--consolidator` command-line flag, so a `ConsolidationBackend` is reachable from
+  `Memory.from_config()` and from the product CLI. `ConsolidationBackend` was implemented and
+  accepted by `MemoryPlugins`, but nothing built one: the memory-management loop existed and no
+  declarative deployment or CLI composition could run it. Consolidation stays absent by default:
+  it is a paid reasoning call over an evidence set.
+- `MemoryOperationRecord.superseded`, the `(memory_id, version)` pairs the kernel's own lineage
+  rule retired while applying a `CONSOLIDATE` — the records a new `STATE` or user-stated `TRAIT`
+  replaced in its lineage, which the backend never named and may never have been shown. They are
+  on the log row, in `mindbridge operations`, and `rollback()` restores exactly them. The
+  supersession previously happened outside the evidence window and could not be reversed.
+
 - A `formation` slot on the declarative configuration surface, plus `recipes.former` and a
   `--former` command-line flag, so a `FormationBackend` is reachable from `Memory.from_config()`
   and from the product CLI. `FormationBackend` was implemented, accepted by `MemoryPlugins`, and
@@ -89,7 +178,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - Per-record event-time and metadata sequences on `add_many`, retaining one embedding batch and one
   SQLite transaction.
 - Crash-recoverable index replay and rebuild from SQLite without re-embedding stored content.
-- An optional resource-oriented REST API under `/v1` and fourteen typed MCP tools over a
+- An optional resource-oriented REST API under `/v1` and fifteen typed MCP tools over a
   caller-supplied
   `Memory`; the documented MCP invocation uses stdio.
 - One ordered multimodal contract across Python, REST, and MCP; response assets expose stable
@@ -194,6 +283,25 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   one that was never configured.
 
 ### Changed
+
+- **Breaking for existing stores:** the bundled OpenAI consolidation recipe is
+  `mindbridge-consolidation-v2`. Its system prompt now describes the media parts attached to each
+  evidence item, and the recipe is a digest of that prompt. The recipe salts `operation_key` and
+  the content address of every derived record, so against a store written before this change the
+  duplicate guard no longer fires and an identical proposal mints a new derived record instead of
+  being rejected as `"duplicate"`. Rolled-back and re-proposed operations from such a store are
+  not recognized either. Re-consolidating a store written with `v1` is the intended migration;
+  there is no automatic rewrite, because the `v1` records remain the honest record of what the
+  `v1` recipe proposed.
+
+- `Memory.rollback()` and `AsyncMemory.rollback()` return `False` for an operation a later
+  standing operation has built on. Operations that touched one lineage reverse newest first;
+  reversing an older one out of order would restore a superseded version beside the current one.
+
+- The local schema is version 10. Version 9 directories upgrade in place, adding
+  `memory_records.forgotten_at`, the `capture_queue` table that makes deferred enrichment durable
+  across a crash, and the append-only `memory_operations` log that makes a control-plane operation
+  replayable and reversible.
 
 - **Breaking:** `minimum_relevance` now gates evidence relevance — the cosine the dense route
   reports, or the demoted full-text contribution when only the lexical route matched, times the
@@ -372,6 +480,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- A control-plane operation that lost the idempotency race on the consolidation write path raised
+  `StorageError` from a unique-index violation instead of being rejected as `"duplicate"`. The
+  formation transaction now makes the same in-transaction key check the other write path already
+  made, so one pass's rejection reason is the same whichever path applied it.
+- A consolidation stamped its derived record, evidence links, and log row with two clocks taken a
+  few microseconds apart. One operation now carries one transaction time.
 - Abstention is now detected structurally instead of by exact equality against one English
   sentence, so a refusal is still reported when the model re-punctuates it, wraps it in emphasis,
   appends an explanation, or answers in another language. The grounded prompt requests an opaque
@@ -394,7 +508,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   invocation with `option_not_applicable` as soon as that default changed.
 
 - `docs/design-principles.md` and `docs/plugin-architecture.md` are restored after being deleted,
-  corrected against the code: the extension surface is seven protocols plus one optional rather
+  corrected against the code: the extension surface is eight protocols plus one optional rather
   than five, MCP's tools covered the common path but no embodied or identity operation, and a
   dead `architecture.md` anchor is repointed. Caller-asserted validity via
   `ObservationContext(valid_from=..., valid_until=...)` is documented for the first time, including
@@ -560,7 +674,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - No built-in user authentication, rate limiting, quotas, or secure-erasure guarantee.
 - The CLI has no `--format` flag, configuration file, `MINDBRIDGE_*` composition variable, plugin
   registry, backend registration by name, streaming output, interactive prompt, `serve` command, or
-  named `SentenceTransformersEmbedder` recipe. `--url` mode covers seven of the routed operations plus
-  `doctor`; the other twelve CLI commands exit 10 and name the surfaces that do support them.
+  named `SentenceTransformersEmbedder` recipe. `--url` mode covers eight of the routed operations plus
+  `doctor`; the other nineteen CLI commands exit 10 and name the surfaces that do support them.
   `add-stream` reads finite JSONL lazily but collects return records until EOF to preserve the
   one-document stdout contract; unbounded sources use the Python SDK.

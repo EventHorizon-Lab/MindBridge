@@ -121,6 +121,7 @@ from mindbridge.benchmarks.task_catalog import (
 )
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
 from mindbridge.models.base import (
+    ConsolidationBackend,
     EmbeddingBackend,
     EmbedTask,
     FaceBackend,
@@ -690,6 +691,11 @@ class _BackendPool:
                 if plugins.former is None
                 else cast(FormationBackend, _BorrowedBackend(plugins.former))
             )
+            self._consolidator = (
+                None
+                if plugins.consolidator is None
+                else cast(ConsolidationBackend, _BorrowedBackend(plugins.consolidator))
+            )
             self._vision_describer = (
                 None
                 if plugins.vision_describer is None
@@ -761,6 +767,7 @@ class _BackendPool:
         )
         self._face_analyzer = None
         self._former = None
+        self._consolidator = None
         self._vision_describer = None
         self._settings = MemoryConfig(
             index_speech=self._transcriber is not None,
@@ -786,6 +793,7 @@ class _BackendPool:
             transcriber=self._transcriber,
             face_analyzer=self._face_analyzer,
             former=self._former,
+            consolidator=self._consolidator,
             vision_describer=self._vision_describer,
             tracer=self._tracer,
             **policy,

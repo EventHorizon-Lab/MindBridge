@@ -9,6 +9,7 @@ from pydantic import Field
 
 from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import (
+    ConsolidationBackend,
     EmbeddingBackend,
     FaceBackend,
     FormationBackend,
@@ -35,6 +36,7 @@ class MemoryPlugins:
     vision_describer: VisionDescriptionBackend | None = None
     face_analyzer: FaceBackend | None = None
     former: FormationBackend | None = None
+    consolidator: ConsolidationBackend | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.embedder, EmbeddingBackend):
@@ -59,6 +61,11 @@ class MemoryPlugins:
             raise ValidationError("plugins.face_analyzer must implement FaceBackend")
         if self.former is not None and not isinstance(self.former, FormationBackend):
             raise ValidationError("plugins.former must implement FormationBackend")
+        if self.consolidator is not None and not isinstance(
+            self.consolidator,
+            ConsolidationBackend,
+        ):
+            raise ValidationError("plugins.consolidator must implement ConsolidationBackend")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

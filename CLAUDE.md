@@ -9,7 +9,7 @@ Do not maintain another copy of MindBridge's API inventory in this file. Verify 
 
 - `src/mindbridge/__init__.py`, `memory.py`, `types.py`, and `exceptions.py` for the public Python
   surface;
-- `src/mindbridge/api/app.py` and `api/mcp.py` for REST and the fourteen MCP tools;
+- `src/mindbridge/api/app.py` and `api/mcp.py` for REST and the fifteen MCP tools;
 - `src/mindbridge/cli.py` and `benchmarks/cli.py` for console entry points;
 - [the architecture guide](docs/architecture.md) for storage, routing, isolation, and extension
   boundaries;

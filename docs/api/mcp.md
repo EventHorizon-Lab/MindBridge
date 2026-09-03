@@ -2,16 +2,17 @@
 
 ## Surface
 
-The optional MCP adapter exposes exactly fourteen typed tools over one injected synchronous
+The optional MCP adapter exposes exactly fifteen typed tools over one injected synchronous
 `Memory`.
 It validates tool input, calls the matching SDK operation, and returns structured public values.
 It does not own storage, provider selection, or the injected memory. Finalized media arrives
 through ordinary content parts; live audio and vision packet ingestion, and `StreamEvent`
 reduction, stay Python-only because a tool call is a finite request.
 
-The tools cover the common memory path and the embodied and identity operations: an agent driving
-a companion robot can ask who spoke and who was seen, name them, reverse a wrong face-and-voice
-merge, erase a person on request, and record which memories were useful. `build_mcp_server` runs
+The tools cover the common memory path, one context-compilation tool, and the embodied and
+identity operations: an agent driving a companion robot can compile a budgeted context bundle for
+its next turn, ask who spoke and who was seen, name them, reverse a wrong face-and-voice merge,
+erase a person on request, and record which memories were useful. `build_mcp_server` runs
 inside the process that holds the `Memory` it is given and every tool is one call on it, so an
 embodied operation is no less reachable here than `add_memory` is.
 
@@ -40,6 +41,14 @@ with Memory.from_config(
 ```text
 build_mcp_server(memory: Memory) -> MCPServer[None]
 ```
+
+`build_mcp_server` reads `memory.capabilities` once and publishes it as the server `instructions`,
+so a connecting agent learns the configured modalities, embedding identity, and backends without
+spending a tool call. There is no capabilities tool. The text also states that `compile_context` is
+the preferred way to obtain context, and that cognitive forgetting, consolidation, and operation
+rollback have no tool here. MCP fixes `instructions` at construction, so a server built before a
+composition change keeps advertising the composition it was built with;
+[`GET /healthz`](rest.md#endpoints) is the live reading.
 
 ## Lifecycle and ownership
 
@@ -71,6 +80,7 @@ rejected. The MCP-specific media bounds are listed below.
 | `add_memory` | required `content`; `occurred_at=None`; `occurred_end=None`; `metadata=None`; `memory_type="semantic"`; `context=None` | `MemoryResult` | write, idempotent |
 | `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None`; `explain=false` | `{"hits":[SearchHitResult,...],"trace":null}` | write, not idempotent |
 | `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None` | `AnswerResponse` | write, not idempotent |
+| `compile_context` | required `goal`; `budget=None`; `reference_at=None`; `scope=None` | `ContextBundleResult` | write, not idempotent |
 | `get_memory` | required `memory_id` | `MemoryResult` | read-only |
 | `list_memories` | `limit=100`; `cursor=None` | `PageResult` | read-only |
 | `delete_memory` | required `memory_id` | `{"deleted":bool}` | destructive, idempotent |
@@ -96,11 +106,23 @@ anchor must match the stored spatial context. SQLite reapplies every filter afte
 retrieval.
 
 `add_memory` is content-addressed. `delete_memory` reports whether a record existed. Search,
-answer, and the two analysis tools are not marked read-only because their SDK path persists lazy
-transcript caches and identity evidence; they are also not advertised as idempotent. Every tool
-has `open_world_hint=false`. `ask_memory` requires an answerer in the injected memory; without one
-it returns `model_error/backend_not_configured`. With the default `reinforce_on_answer=True`, it
-also reinforces the hits the answerer cites.
+answer, compile, and the two analysis tools are not marked read-only because their SDK path
+persists lazy transcript caches and identity evidence; they are also not advertised as
+idempotent. Every tool has `open_world_hint=false`. `ask_memory` requires an answerer in the
+injected memory; without one it returns `model_error/backend_not_configured`. With the default
+`reinforce_on_answer=True`, it also reinforces the hits the answerer cites.
+
+`compile_context` is the preferred way to get task-ready context: it returns a structured,
+budgeted bundle with provenance instead of one sentence, calls no generation model, and stores no
+memory. It shares the retrieval path with `search_memories`, including the one write both can
+make: a cached transcript for spoken query media, which is why neither is annotated read-only. It
+reports lineage conflicts and never resolves them, and names in `unknowns` what the request
+implied that the bundle does not carry. `ask_memory` remains a convenience for one grounded
+answer. The optional `budget` object is the transport form of `ContextBudget` with the
+`freshness` timedelta expressed as `freshness_seconds`; `max_chars`
+accepts 1 through 65,536, `max_items` 1 through 100, and `max_latency_ms` is a deadline the
+compiler checks between stages rather than a timeout that aborts. The
+[compiler reference](../context-compilation.md) owns section, selection, and conflict semantics.
 
 The embodied and identity tools follow the SDK operation they dispatch to:
 
@@ -162,12 +184,16 @@ Successful calls populate MCP `structuredContent`:
 | Object | Fields |
 | --- | --- |
 | `AssetResult` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name` |
-| `MemoryResult` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context`, `place_id` |
+| `MemoryResult` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context`, `place_id`, `forgotten_at` |
 | `SearchHitResult` | all memory fields plus `score` |
 | `SearchResult` | `hits`, `trace`; `trace` is `null` unless `explain=true` |
 | `ReinforceResult` | `reinforced` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResult` | `items`, `next_cursor` |
+| `ContextBudgetResult` | `max_chars`, `max_items`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
+| `ContextConflictResult` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
+| `ContextUnknownResult` | `kind`, `detail` |
+| `ContextBundleResult` | `goal`, `reference_at`, `budget`, the `SearchHitResult` arrays `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
 | `FaceObservation` | `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
 | `IdentityProfile` | `identity_id`, `name`, `relationship` |
@@ -189,7 +215,7 @@ described above.
 
 ### Validation and errors
 
-Only the fourteen documented names and their exact top-level arguments are accepted. An unknown
+Only the fifteen documented names and their exact top-level arguments are accepted. An unknown
 tool or top-level argument returns `validation_error/unknown_field`; schema and SDK input failures return
 `validation_error/input_invalid`. Unknown values are not echoed.
 
@@ -228,8 +254,9 @@ details are still never serialized.
 
 ### Operations without a tool
 
-Five Python operations have no MCP tool. One is a transport limitation and four are decisions;
-none is withheld because it touches owner-process state, since every tool already does.
+Thirteen Python operations have no MCP tool. One is a transport limitation and the rest are
+decisions; none is withheld because it touches owner-process state, since every tool already
+does.
 
 | Operation | Why, and what to call instead |
 | --- | --- |
@@ -238,10 +265,12 @@ none is withheld because it touches owner-process state, since every tool alread
 | `search_with_trace` | No tool of its own, because the same trace is reachable from the tool that produces the hits: call `search_memories` with `explain=true`. Use the SDK or the CLI when diagnosing retrieval outside an agent loop. |
 | `reindex` | Rebuilds the whole search projection from SQLite. The duration grows with the store and has no upper bound, so it does not belong behind a client that expects one timely response. It is also an operator decision, not a caller's. |
 | `optimize` | Merges staged vectors into the index. An agent has no basis for deciding when that is worth doing, and the operator scheduling it has the CLI. |
+| `capture`, `settle`, `pending_captures` | Deferred enrichment is the owning process's scheduling decision: how long a record may stay unsearchable is a property of that host's loop, not of a caller's request. Use `add_memory`, which returns searchable. |
+| `consolidation_candidates`, `consolidate`, `forget`, `rollback`, `operations` | The memory control plane rewrites and retires derived memory and is deliberately not reachable from a client. It stays with the process that owns the `Memory`, which is also the process that can audit and reverse it through the operation log. |
 
-`Memory.capabilities` has no tool either: it is a property rather than an operation, and REST
-reports it in [`GET /healthz`](rest.md#endpoints). The tools that need a backend say so in their
-description and return `model_error` when it is missing.
+`Memory.capabilities` has no tool either: it is a property rather than an operation, published
+here as the server `instructions` and by REST in [`GET /healthz`](rest.md#endpoints). The tools
+that need a backend say so in their description and return `model_error` when it is missing.
 
 `list_memories` supports the same default page size and opaque cursor contract as `Memory.list`.
 
@@ -254,6 +283,8 @@ description and return `model_error` when it is missing.
 | One decoded `file_data` value | 8 MiB |
 | Normalized text, including combined text parts | 65,536 characters |
 | Search, answer, or page `limit` | 1 through 100 |
+| Context `budget.max_chars` | 1 through 65,536 |
+| Context `budget.max_items` | 1 through 100 |
 | Serialized metadata | 262,144 UTF-8 bytes |
 | `file_id` or `filename` | 255 characters |
 

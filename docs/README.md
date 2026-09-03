@@ -10,10 +10,12 @@ have one place to stay current.
 | Understand what MindBridge can do | [Product capabilities](product-capabilities.md) | [Design principles](design-principles.md) |
 | Try MindBridge end to end | [Quick start](quickstart.md) | [Core concepts](concepts.md) |
 | Build a Python integration | [Configuration](configuration.md) | [Python SDK](api/python-sdk.md) |
+| Give an agent a bounded context view | [Context compilation](context-compilation.md) | [Python SDK](api/python-sdk.md) |
 | Expose memory to another process | [REST](api/rest.md), [MCP](api/mcp.md), or [CLI](api/cli.md) | [Deployment](deployment.md) |
 | Run a durable instance | [Architecture](architecture.md) | [Operations](operations.md) and [troubleshooting](troubleshooting.md) |
 | Evaluate memory quality | [Benchmarking](benchmarking.md) | [Example evaluation configuration](examples/eval.example.yaml) |
 | Understand or extend the design | [Design principles](design-principles.md) | [Plugin architecture](plugin-architecture.md) |
+| Follow where the product is going | [Context OS direction](context-os.md) | [Design principles](design-principles.md) |
 
 ## Learn
 
@@ -26,12 +28,14 @@ have one place to stay current.
    temporal ranking.
 6. [Omni streaming and interaction memory](omni-streaming-and-interaction-memory.md) — ingest
    completed observations and derive grounded interaction records.
+7. [Context compilation](context-compilation.md) — compile a bounded, structured context bundle for
+   one goal instead of a flat hit list.
 
 ## Integrate
 
 - [Python SDK](api/python-sdk.md) — complete `mindbridge` root-import contract.
 - [REST API](api/rest.md) — `/v1` requests, responses, errors, and limits.
-- [MCP tools](api/mcp.md) — the fourteen tool schemas and transport boundary.
+- [MCP tools](api/mcp.md) — the fifteen tool schemas and transport boundary.
 - [Command line](api/cli.md) — commands, input forms, JSON output, and exit codes.
 
 ## Deploy and operate
@@ -52,6 +56,8 @@ have one place to stay current.
   goals, and the criteria a change must answer. States direction, not implemented status.
 - [Plugin architecture](plugin-architecture.md) — the kernel/plugin boundary and the admission rule
   a new public capability must satisfy.
+- [Context OS direction](context-os.md) — the fast and slow context planes, agentic memory
+  management, and the evolution gates the current release is working through.
 
 ## Evaluate
 

@@ -2,7 +2,7 @@
 
 ## Surface
 
-`mindbridge` provides 19 SDK operation commands plus `doctor`; each invocation runs one command in
+`mindbridge` provides 27 SDK operation commands plus `doctor`; each invocation runs one command in
 one process and emits one JSON result. Local commands dispatch to the corresponding `Memory`
 method, except for the diagnostic `doctor`; remote commands forward to a running owner's `/v1`
 route. The CLI owns argument decoding, composition selection, JSON projection, and exit-code
@@ -40,6 +40,7 @@ Use `mindbridge COMMAND --help` for the command-specific flags summarized below.
 | `--timeout SECONDS` | positive finite remote timeout for `--url`; default `30` |
 | `--answerer NAME` | generation recipe for `--embedder` |
 | `--former NAME` | formation recipe for `--embedder`; omit it to disable formation |
+| `--consolidator NAME` | consolidation recipe for `--embedder`; omit it to disable `consolidate` |
 | `--transcriber NAME` | speech recipe for `--embedder` |
 | `--index-speech`, `--no-index-speech` | enable or disable transcript indexing; default enabled |
 | `--minimum-relevance FLOAT` | relevance floor; default `0.10` |
@@ -74,13 +75,14 @@ server's owner.
 | --- | --- | --- |
 | `jina-omni` | `--embedder` | pinned Jina Omni model, revision, and 1024 dimensions |
 | `funasr` | `--transcriber` | pinned FunASR model and component revisions |
-| `openai` | `--embedder`, `--answerer`, `--former`, `--transcriber` | `text-embedding-3-small`, `gpt-5-mini`, `gpt-5-mini`, `whisper-1` |
+| `openai` | `--embedder`, `--answerer`, `--former`, `--consolidator`, `--transcriber` | `text-embedding-3-small`, `gpt-5-mini`, `gpt-5-mini`, `gpt-5-mini`, `whisper-1` |
 
 Only `openai` accepts a model suffix, for example `--former openai:gpt-5-mini`. Selecting a former
 opts into one formation model call after each source observation commits; omitting `--former`
-keeps formation off. Recipe names form a closed table; use `--app` for other backends. Provider
-trust, license, model identity, and credential behavior live in
-[configuration](../configuration.md).
+keeps formation off. `--consolidator` is what the `consolidate` command needs, and it costs
+nothing until that command runs: unlike a former it is not on the write path. Recipe names form a
+closed table; use `--app` for other backends. Provider trust, license, model identity, and
+credential behavior live in [configuration](../configuration.md).
 
 ### Commands
 
@@ -88,10 +90,14 @@ trust, license, model identity, and credential behavior live in
 | --- | --- | --- | --- |
 | `add` | content; `--occurred-at`; `--occurred-end`; `--metadata`; `--memory-type`; `--context` | memory object | yes |
 | `add-many` | optional JSONL source; `--memory-type` | `{"memories":[...]}` | yes |
-| `add-stream` | optional JSONL source; `--memory-type` | `{"memories":[...]}` | no |
+| `add-stream` | optional JSONL source; `--memory-type`; `--capture` | `{"memories":[...]}` | no |
+| `capture` | same operands and options as `add` | memory object | no |
+| `settle` | optional `MEMORY_ID...`; `--limit`; `--max-attempts` | `{"settled":int}` | no |
+| `pending-captures` | optional `MEMORY_ID...`; `--limit` | `{"pending":[...]}` | no |
 | `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
 | `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | no |
 | `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope` | answer object | yes |
+| `compile` | content; `--max-chars`; `--max-items`; repeatable `--memory-type`; `--min-confidence`; `--freshness-seconds`; `--max-latency-ms`; `--reference-at`; `--scope` | context bundle plus `rendered` | yes |
 | `get` | `MEMORY_ID` | memory object | yes |
 | `speech` | `MEMORY_ID` | `{"segments":[...]}` | no |
 | `faces` | `MEMORY_ID` | `{"observations":[...]}` | no |
@@ -101,24 +107,37 @@ trust, license, model identity, and credential behavior live in
 | `forget-identity` | `IDENTITY_ID` | erasure counts | no |
 | `unlink-identity` | `ALIAS_ID` | `{"restored_identity_id":...}` | no |
 | `reinforce` | one or more `MEMORY_ID` values | `{"reinforced":int}` | no |
+| `consolidation-candidates` | `--limit` | `{"candidates":[{"trigger":...,"memory_ids":[...],"evidence_count":int}]}` | no |
+| `consolidate` | optional goal content; `--evidence-id`; `--limit`; `--trigger` | `{"operations":[...],"rejected":[...]}` | no |
+| `forget` | one or more `MEMORY_ID` values | `{"operation":{...}}` or `{"operation":null}` | no |
+| `rollback` | `OPERATION_ID` | `{"rolled_back":bool}` | no |
+| `operations` | `--limit` | `{"operations":[...]}` | no |
 | `list` | `--limit`; `--cursor` | `{"items":[...],"next_cursor":...}` | yes |
 | `delete` | `MEMORY_ID` | `{"deleted":bool}` | yes |
 | `reindex` | none | `{"memories":int}` | no |
 | `optimize` | none | `{}` | no |
 | `doctor` | none | composition and loader report | yes |
 
-Defaults match the SDK: `add`, `add-many`, and `add-stream` use `memory_type=semantic`; search uses
-`limit=10`; ask uses `limit=5`; list uses `limit=100`; optional retrieval roles and timestamps are
-unset. Timestamps must be timezone-aware ISO 8601 values. Cursors are opaque and passed through
-unchanged. `ask` requires the selected composition to supply an answerer. `speech` and `faces`
+Defaults match the SDK: `add`, `add-many`, `add-stream`, and `capture` use
+`memory_type=semantic`; search uses `limit=10`; ask uses `limit=5`; list, `settle`,
+`pending-captures`, and `operations` use `limit=100`; `settle` also uses `max-attempts=3`;
+`consolidate` and `consolidation-candidates` use `limit=32`,
+and `consolidate` defaults to `trigger=manual`; optional
+retrieval roles and timestamps are unset. Timestamps must be timezone-aware ISO 8601 values.
+Cursors are opaque and passed through unchanged. `ask` requires the selected composition to supply an answerer. `speech` and `faces`
 return an empty result without a model call when the record has no corresponding media; otherwise
-they require the matching capability. With the default `reinforce_on_answer=True`, `ask` also
-reinforces the hits the answerer cites; use `--app` to construct a memory with that policy disabled.
+they require the matching capability. `compile` mirrors the
+[`ContextBudget` defaults](../context-compilation.md#budget) and repeats `--memory-type` to keep
+more than one type; `--max-latency-ms` is a deadline the compiler checks between stages, and the
+printed bundle carries `elapsed_ms`, `deadline_exceeded`, and `unknowns` alongside its sections.
+`forget` is cognitive forgetting, reversible with `rollback`; `delete` is erasure. With the
+default `reinforce_on_answer=True`, `ask` also reinforces the hits the answerer cites; use
+`--app` to construct a memory with that policy disabled.
 
 ### Content and JSONL input
 
-Content commands (`add`, `search`, `search-with-trace`, and `ask`) accept exactly one of these
-forms:
+Content commands (`add`, `capture`, `search`, `search-with-trace`, `ask`, `compile`, and
+`consolidate`) accept exactly one of these forms:
 
 - Positional atoms: bare values are text, `@PATH` is a local file, `@@TEXT` is text beginning with
   a literal `@`, and `-` reads stdin. Order is preserved.
@@ -173,6 +192,18 @@ values as JSON strings and datetimes as ISO 8601.
 `forget-identity` returns `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`,
 `face_observations`, and `speech_segments`, matching the fields of `IdentityErasure`.
 
+`pending-captures` returns one object per record whose deferred work is not finished — `memory_id`,
+ISO 8601 `enqueued_at`, `attempts`, `last_error`, and `awaiting` — oldest first, matching the
+fields of `PendingCapture`. `awaiting` is `"enrichment"` for a record that has no vectors yet and
+`"formation"` for one that is already searchable and owes only formation. Naming memory IDs
+restricts the report to them; an ID that is absent from the result is not pending, so it is either
+settled or unknown, and `get` tells the two apart.
+
+`settle` accepts the same memory IDs. Naming records settles only those and ignores
+`--max-attempts` for them, which is how a capture parked at the retry ceiling is retried by hand.
+`add-stream --capture` commits each item through `capture` rather than `add`, so the items are
+durable but unsearchable until `settle` runs.
+
 Unless `--quiet` is set, commands write the resolved composition as one JSON document on stderr
 before executing. `--url` forwards successful owner response objects unchanged. Runtime
 failures write one [shared error envelope](rest.md#error-envelope) to stderr and nothing to stdout;
@@ -186,10 +217,15 @@ still syntactically required.
 
 `doctor` returns the installed MindBridge and Python versions plus composition-specific checks:
 
-- `--embedder` constructs each configured recipe, exercises its published loader probe, closes it,
-  and reports the data-directory state without writing memory data.
+- `--embedder` constructs each configured recipe, exercises its published loader probe, and
+  reports the data-directory state without writing memory data. The probed backends also fill
+  `capabilities`, which is `MemoryCapabilities.document()` -- the same document `GET /healthz`
+  serves and the MCP server greets an agent with, including the derived `operations` set. It is
+  declared by the backends, so producing it opens no store and creates no data directory. Every
+  probed backend stays loaded until the capability summary is built and is then closed, so a
+  doctor run holds the weights of all configured slots at once.
 - `--app` imports and resolves the target but does not call a factory, because that could open the
-  store.
+  store, so `capabilities` is `null`: the application owns its own backends.
 - `--url` calls the owner's `GET /healthz` with the configured timeout.
 
 Loader failures are reported inside the successful doctor document so all configured slots can be
@@ -223,10 +259,10 @@ exit 130 use their conventional plain stderr diagnostics.
 
 ### Operations without a remote route
 
-With `--url`, only `add`, `add-many`, `search`, `ask`, `get`, `list`, `delete`, and `doctor` are
-available. Other commands exit 10 with `unsupported_in_remote_mode`. Their SDK operations have no
-REST route except `reinforce`: REST exposes `POST /v1/memories/reinforce`, but the CLI does not
-currently wire that route into remote mode. The complete route boundary is listed in
+With `--url`, only `add`, `add-many`, `search`, `ask`, `compile`, `get`, `list`, `delete`, and
+`doctor` are available. Other commands exit 10 with `unsupported_in_remote_mode`. Their SDK
+operations have no REST route except `reinforce`: REST exposes `POST /v1/memories/reinforce`, but
+the CLI does not currently wire that route into remote mode. The complete route boundary is listed in
 [REST operations without a route](rest.md#operations-without-a-route).
 
 ### Input limits

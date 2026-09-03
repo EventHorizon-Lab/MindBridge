@@ -93,7 +93,15 @@ the final ranking score, while the gate compares a separate gate confidence, so 
 against observed scores gives the wrong value. `search_with_trace()` reports both per candidate;
 use it rather than inferring the threshold from hits that were returned.
 
-Before changing thresholds:
+Before changing thresholds, rule out a record that was captured but never settled:
+`pending_captures()` lists records that are durable and returned by `get()` and `list()` but hold
+no vectors, and nothing settles them on its own; pass `memory_ids=` to ask about one record, and
+read its `awaiting`, `attempts`, and `last_error` if it keeps failing. Call `settle()` —
+`settle(memory_ids=...)` for that record alone, past its retry ceiling — or add the same content,
+which settles it, and search again. A record whose `forgotten_at` is set is excluded
+from recall by policy; `rollback()` on the logged operation restores it.
+
+Then:
 
 1. Confirm the record exists with `get()` or `list()`.
 2. Confirm query and stored modalities are supported by the embedder.
@@ -157,7 +165,7 @@ part shapes and limits in the [REST reference](api/rest.md#input-limits).
 
 Separate Python, REST, and MCP processes cannot open the same `data_dir`. Put the required
 adapters around one constructed `Memory`, call the running REST owner, or allocate deliberately
-separate memory domains. REST has eight product routes under `/v1`; MCP has fourteen tools.
+separate memory domains. REST has nine product routes under `/v1`; MCP has fifteen tools.
 
 Neither network adapter adds authentication. Apply the controls in
 [deployment](deployment.md#choose-a-topology).

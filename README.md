@@ -48,14 +48,25 @@ reproduced.
 - **Evidence-grounded answers.** `ask()` returns the exact hits used by the answer backend and can
   abstain when evidence is absent or insufficient. `search_with_trace()` explains ranking and
   rejection without copying private content into the trace.
+- **Compiled context, not a hit list.** `compile()` returns a budgeted `ContextBundle` — actors,
+  episodes, facts, procedures, affect, and traits, with the lineage conflicts it reports and does
+  not resolve — so an agent building its own prompt does not re-derive structure from unranked
+  hits.
+- **Capture now, enrich later.** `capture()` commits a record and its media in one transaction
+  before any model call, and `settle()` runs the deferred stages when the host has time. `add()`
+  still returns searchable.
+- **An auditable memory control plane.** A `ConsolidationBackend` proposes reinforcement,
+  consolidation, correction, and forgetting over a bounded evidence set; the kernel validates every
+  citation, logs each applied operation, and can reverse it. Forgetting is a reversible policy
+  state, distinct from `delete()`.
 - **Recoverable embedded storage.** SQLite and the content-addressed media store are authoritative.
   Zvec is a rebuildable dense and lexical projection updated through a durable outbox.
 - **Plugin architecture without a second execution plane.** Typed embedding, generation, speech,
-  vision, face, and formation plugins remain replaceable while the kernel owns memory semantics,
+  vision, face, formation, and consolidation plugins remain replaceable while the kernel owns memory semantics,
   validation, evidence, and durability.
 - **A lifecycle for continuous perception.** Lazy ingestion, speculative omni-modal prefetch, and
   audio/vision reducers distinguish partial updates, final observations, and cancellation.
-- **Developer- and agent-friendly APIs.** A concise SDK, REST, fourteen self-described MCP tools,
+- **Developer- and agent-friendly APIs.** A concise SDK, REST, fifteen self-described MCP tools,
   and a machine-readable CLI dispatch to the same kernel and preserve the same contracts.
 
 ### Where it fits
@@ -213,7 +224,9 @@ Continue with the [Quick start](docs/quickstart.md) and
 | Formation | Optional entity, event, state, relation, affect, trait, and response-policy derivation | [Automatic formation](docs/configuration.md#automatic-memory-formation) |
 | Streaming | Durable streams, omni prefetch, audio/vision reducers, interaction memory | [Streaming and interaction memory](docs/omni-streaming-and-interaction-memory.md) |
 | Identity | Speech and face analysis, naming, corroborated linking, unlinking, and erasure | [Python SDK](docs/api/python-sdk.md#cross-modal-identity-binding) |
-| Interfaces | Complete SDK; eight REST operations; fourteen MCP tools; nineteen CLI operations plus `doctor` | [Python](docs/api/python-sdk.md) · [REST](docs/api/rest.md) · [MCP](docs/api/mcp.md) · [CLI](docs/api/cli.md) |
+| Context compilation | Budgeted, partitioned context bundles with conflicts and declared capabilities | [Context compilation](docs/context-compilation.md) |
+| Memory control plane | Deferred capture settlement, model-proposed consolidation, reversible forgetting, and the operation log | [Memory types, time, and decay](docs/memory-types-time-and-decay.md) |
+| Interfaces | Complete SDK; nine REST operations; fifteen MCP tools; twenty-seven CLI operations plus `doctor` | [Python](docs/api/python-sdk.md) · [REST](docs/api/rest.md) · [MCP](docs/api/mcp.md) · [CLI](docs/api/cli.md) |
 | Deployment and recovery | Ownership, backup, restore, reindex, telemetry, and security boundaries | [Deployment](docs/deployment.md) · [Operations](docs/operations.md) |
 | Extensibility | Narrow typed model protocols with no global plugin registry | [Plugin architecture](docs/plugin-architecture.md) |
 

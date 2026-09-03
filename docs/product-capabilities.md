@@ -233,13 +233,22 @@ arguments, schemas, limits, and errors.
 | Add one | `add` | `POST /v1/memories` | `add_memory` | `add` |
 | Add atomic batch | `add_many` | `POST /v1/memories/batch` | — | `add-many` |
 | Add completed stream | `add_stream` | — | — | `add-stream` |
+| Capture without a model | `capture` | — | — | `capture` |
+| Settle captured records | `settle` | — | — | `settle` |
+| Report unfinished captures | `pending_captures` | — | — | `pending-captures` |
 | Search | `search` | `POST /v1/memories/search` | `search_memories` | `search` |
 | Explain search | `search_with_trace` | Search with `explain=true` | Search with `explain=true` | `search-with-trace` |
 | Answer | `ask` | `POST /v1/answers` | `ask_memory` | `ask` |
+| Compile context | `compile` | `POST /v1/context` | `compile_context` | `compile` |
 | Get by ID | `get` | `GET /v1/memories/{memory_id}` | `get_memory` | `get` |
 | List newest | `list` | `GET /v1/memories` | `list_memories` | `list` |
 | Delete memory | `delete` | `DELETE /v1/memories/{memory_id}` | `delete_memory` | `delete` |
 | Reinforce | `reinforce` | `POST /v1/memories/reinforce` | `reinforce_memories` | `reinforce` |
+| List due deliberation | `consolidation_candidates` | — | — | `consolidation-candidates` |
+| Deliberate over evidence | `consolidate` | — | — | `consolidate` |
+| Cognitively forget | `forget` | — | — | `forget` |
+| Undo one operation | `rollback` | — | — | `rollback` |
+| Read the operation log | `operations` | — | — | `operations` |
 | Analyze speech | `speech` | — | `analyze_speech` | `speech` |
 | Analyze faces | `faces` | — | `analyze_faces` | `faces` |
 | Name speaker | `register_speaker` | — | `register_speaker` | `register-speaker` |
@@ -252,9 +261,9 @@ arguments, schemas, limits, and errors.
 | Declare capabilities | `capabilities` property | `GET /healthz` | — | `--explain` resolves composition |
 | Validate loaders | — | — | — | `doctor` |
 
-The synchronous SDK therefore exposes 19 product operations, plus construction, capability
-inspection, and lifecycle. REST exposes eight `/v1` product routes plus `/healthz`; MCP exposes
-fourteen tools; the product CLI exposes all 19 operations plus `doctor`. `AsyncMemory` mirrors the
+The synchronous SDK therefore exposes 28 product operations, plus construction, capability
+inspection, and lifecycle. REST exposes nine `/v1` product routes plus `/healthz`; MCP exposes
+fifteen tools; the product CLI exposes all 28 operations plus `doctor`. `AsyncMemory` mirrors the
 finite SDK operations except `forget_identity`, which currently requires synchronous `Memory`, and
 adds async stream consumption.
 
