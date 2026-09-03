@@ -1836,3 +1836,112 @@ def test_valid_at_keeps_records_without_a_declared_validity_interval(tmp_path: P
     assert [memory.memory_id for memory in before] == ["plain"]
     assert unknown == ()
     assert nowhere == ()
+
+
+_COUNT_RECORDED_AT = datetime(2026, 8, 27, 1, 2, 3, tzinfo=timezone.utc)
+_COUNT_HERE = SpatialContext(
+    frame_id="workshop",
+    anchor=SpatialAnchor.OBSERVER,
+    x=1.0,
+    y=1.0,
+    z=0.0,
+)
+
+
+def _count_corpus() -> tuple[StoredMemory, ...]:
+    """One record per scope axis: none, validity interval, pose, symbolic place."""
+    january = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    february = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    source = _memory("evidence", "tea evidence", created_at=_COUNT_RECORDED_AT)
+    current = _state_memory(
+        "typed-current",
+        source.memory_id,
+        "tea",
+        valid_from=january,
+        recorded_at=_COUNT_RECORDED_AT,
+    )
+    return (
+        _memory("plain", "the user drank tea", created_at=_COUNT_RECORDED_AT),
+        source,
+        current,
+        _state_memory(
+            "typed-expired",
+            source.memory_id,
+            "coffee",
+            valid_from=january,
+            valid_until=february,
+            recorded_at=_COUNT_RECORDED_AT,
+        ),
+        replace(
+            current,
+            memory_id="typed-here",
+            context=replace(_require_context(current.context), spatial=_COUNT_HERE),
+        ),
+        replace(_memory("placed", "in the kitchen", created_at=_COUNT_RECORDED_AT), place_id="k1"),
+    )
+
+
+def _require_context(context: MemoryContext | None) -> MemoryContext:
+    assert context is not None
+    return context
+
+
+# Every scope axis `read_memories` accepts, plus the requested-ID quirks the count has to
+# reproduce: a missing ID contributes nothing and a repeated ID is counted twice.
+_COUNT_SCOPES: tuple[tuple[str, dict[str, object], int], ...] = (
+    ("unscoped", {}, 7),
+    ("active_only", {"active_only": True}, 6),
+    (
+        "valid_at inside the expired interval",
+        {"active_only": True, "valid_at": datetime(2026, 1, 15, tzinfo=timezone.utc)},
+        7,
+    ),
+    (
+        "valid_at after it",
+        {"active_only": True, "valid_at": datetime(2026, 3, 1, tzinfo=timezone.utc)},
+        6,
+    ),
+    ("valid_at without active_only", {"valid_at": datetime(2026, 3, 1, tzinfo=timezone.utc)}, 7),
+    (
+        "known_at before anything was recorded",
+        {"active_only": True, "known_at": _COUNT_RECORDED_AT - timedelta(microseconds=1)},
+        0,
+    ),
+    ("known_at after", {"active_only": True, "known_at": _COUNT_RECORDED_AT}, 6),
+    ("near the pose", {"active_only": True, "near": _COUNT_HERE, "radius_m": 0.5}, 1),
+    ("near without active_only", {"near": _COUNT_HERE, "radius_m": 0.5}, 7),
+    (
+        "out of radius",
+        {"active_only": True, "near": replace(_COUNT_HERE, x=100.0), "radius_m": 0.5},
+        0,
+    ),
+    ("place_id", {"place_id": "k1"}, 1),
+    ("place_id with active_only", {"place_id": "k1", "active_only": True}, 1),
+    ("unknown place_id", {"place_id": "nowhere", "active_only": True}, 0),
+)
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [pytest.param(scope, expected, id=label) for label, scope, expected in _COUNT_SCOPES],
+)
+def test_count_memories_matches_the_scoped_hydration_it_replaces(
+    tmp_path: Path,
+    scope: dict[str, object],
+    expected: int,
+) -> None:
+    """The count drives candidate widening, so it has to equal the hydration exactly.
+
+    `expected` is asserted as well as the equality: two implementations that both return
+    nothing agree on every axis.
+    """
+    corpus = _count_corpus()
+    requested = (*(memory.memory_id for memory in corpus), "missing", "plain")
+
+    with LocalStore(tmp_path) as store:
+        assert store.write_memories(corpus) == (True,) * len(corpus)
+        hydrated = store.read_memories(requested, **scope)  # type: ignore[arg-type]
+        counted = store.count_memories(requested, **scope)  # type: ignore[arg-type]
+        assert store.count_memories((), **scope) == 0  # type: ignore[arg-type]
+
+    assert counted == len(hydrated) == expected

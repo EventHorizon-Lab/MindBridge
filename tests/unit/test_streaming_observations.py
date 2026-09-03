@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
+import os
+import signal
 import threading
 import wave
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timedelta, timezone
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, cast
 
@@ -24,6 +28,7 @@ from mindbridge import (
     Blob,
     EmbedTask,
     EvidenceBasis,
+    Memory,
     MemoryType,
     Modality,
     ModelError,
@@ -44,6 +49,7 @@ from mindbridge import (
     VisionPartial,
     VisionStreamPacket,
 )
+from mindbridge.infrastructure.local.zvec_index import ZvecIndex
 
 
 async def _events(*values: StreamEvent) -> AsyncIterator[StreamEvent]:
@@ -661,3 +667,64 @@ async def test_streamed_observations_carry_the_pose_sampled_at_each_boundary(
         assert (spoken.context.spatial.x, spoken.context.spatial.y) == (4.0, 5.0)
     finally:
         await memory.close()
+
+
+_KILLED_STREAM_ITEMS = 3
+
+
+def _stream_then_die(data_dir: str, sender: Connection) -> None:
+    """Commit a group's worth of stream items, report the state, then die uncleanly.
+
+    Both group bounds are pushed out of reach so the kill lands in the window the test is
+    about: after SQLite committed and before the deferred Zvec flush.
+    """
+    import mindbridge.memory as memory_module
+
+    memory_module._STREAM_GROUP_ITEMS = 1_000
+    memory_module._STREAM_GROUP_SECONDS = 1e9
+    with Memory(Path(data_dir), embedder=TinyEmbedder(), minimum_relevance=0) as memory:
+        committed = []
+        for record in memory.add_stream(
+            f"streamed clip {position}" for position in range(_KILLED_STREAM_ITEMS)
+        ):
+            committed.append(record.id)
+            if len(committed) == _KILLED_STREAM_ITEMS:
+                break
+        sender.send(
+            (
+                committed,
+                len(memory._store.pending_index_operations()),
+                cast(ZvecIndex, memory._index).doc_count,
+            )
+        )
+        sender.close()
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def test_a_stream_killed_before_its_flush_is_drained_by_the_next_open(tmp_path: Path) -> None:
+    data_dir = tmp_path / "killed-stream"
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_stream_then_die, args=(str(data_dir), sender))
+    process.start()
+    sender.close()
+    try:
+        assert receiver.poll(120), "child did not report its committed prefix"
+        committed, pending, indexed = receiver.recv()
+    finally:
+        receiver.close()
+        process.join(60)
+
+    # The child died between the SQLite commit and the group's flush, so the outbox is the
+    # only record that the projection is behind.
+    assert process.exitcode == -signal.SIGKILL
+    assert len(committed) == _KILLED_STREAM_ITEMS
+    assert pending == _KILLED_STREAM_ITEMS
+    assert indexed == 0
+
+    with Memory(data_dir, embedder=TinyEmbedder(), minimum_relevance=0) as memory:
+        assert memory._store.pending_index_operations() == ()
+        assert cast(ZvecIndex, memory._index).doc_count == _KILLED_STREAM_ITEMS
+        found = memory.search("streamed clip", limit=10)
+        assert {hit.id for hit in found} == set(committed)
+        assert [item.id for item in memory.list().items] == list(reversed(committed))

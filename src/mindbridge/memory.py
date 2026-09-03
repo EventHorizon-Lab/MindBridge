@@ -31,7 +31,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from threading import Condition, RLock
+from threading import Condition, RLock, get_ident
 from time import perf_counter
 from types import MappingProxyType
 from typing import Protocol, TypeVar, cast
@@ -187,6 +187,14 @@ _LEGACY_INDEX_RECIPES = frozenset(
     }
 )
 _OUTBOX_BATCH_SIZE = 256
+# `add_stream` group commit bounds. Every item still commits to SQLite on its own, and the Zvec
+# flush that follows it is deferred until one of these two bounds is reached, so a stream pays one
+# fsync-class operation per group instead of one per observation. Both bounds are fixed rather
+# than configurable: a caller cannot choose better values without knowing what a Zvec flush costs,
+# and the visible behaviour they trade against - when a committed item enters the index - is
+# already forced by `search`, which drains before it reads.
+_STREAM_GROUP_ITEMS = 32
+_STREAM_GROUP_SECONDS = 0.25
 _REINDEX_PAGE_SIZE = 256
 _REEMBED_PAGE_SIZE = 32
 _RERANK_CANDIDATES = 100
@@ -538,6 +546,9 @@ class Memory:
         self._owner_pid = os.getpid()
         self._write_lock = RLock()
         self._formation_lock = RLock()
+        # The thread currently inside an `add_stream` group, if any. Deferral is scoped to that
+        # thread so a concurrent `add` on another thread keeps flushing before it returns.
+        self._deferred_index_thread: int | None = None
         self._lifecycle = Condition()
         self._active_operations = 0
         self._closing = False
@@ -880,7 +891,7 @@ class Memory:
         self,
         contents: Iterable[ContentInput | StreamInput],
     ) -> Iterator[MemoryRecord]:
-        """Add a lazy omni stream one durable, searchable observation at a time."""
+        """Add a lazy omni stream one durable observation at a time, indexed in groups."""
         if isinstance(contents, (str, bytes, Path, Blob, AssetRef, Mapping)):
             raise ValidationError("contents must be an iterable of memory inputs")
         try:
@@ -888,26 +899,55 @@ class Memory:
         except TypeError:
             raise ValidationError("contents must be an iterable of memory inputs") from None
         index = 0
-        while True:
-            try:
-                content = next(iterator)
-            except StopIteration:
-                return
-            except MindBridgeError as error:
-                if error.subject is None:
-                    error.subject = f"contents[{index}]"
-                raise
-            try:
-                if isinstance(content, StreamInput):
-                    record = self._add_stream_input(content)
-                else:
-                    record = self.add(content)
-            except MindBridgeError as error:
-                if error.subject is None:
-                    error.subject = f"contents[{index}]"
-                raise
-            yield record
-            index += 1
+        grouped = 0
+        group_started = perf_counter()
+        outer_deferral = self._deferred_index_thread
+        self._deferred_index_thread = get_ident()
+        try:
+            while True:
+                try:
+                    content = next(iterator)
+                except StopIteration:
+                    break
+                except MindBridgeError as error:
+                    if error.subject is None:
+                        error.subject = f"contents[{index}]"
+                    raise
+                record = self._add_stream_item(content, index=index)
+                grouped += 1
+                if (
+                    grouped >= _STREAM_GROUP_ITEMS
+                    or perf_counter() - group_started >= _STREAM_GROUP_SECONDS
+                ):
+                    self._flush_stream_group()
+                    grouped = 0
+                    group_started = perf_counter()
+                yield record
+                index += 1
+            if grouped:
+                self._flush_stream_group()
+        finally:
+            self._deferred_index_thread = outer_deferral
+
+    def _add_stream_item(
+        self,
+        content: ContentInput | StreamInput,
+        *,
+        index: int,
+    ) -> MemoryRecord:
+        try:
+            if isinstance(content, StreamInput):
+                return self._add_stream_input(content)
+            return self.add(content)
+        except MindBridgeError as error:
+            if error.subject is None:
+                error.subject = f"contents[{index}]"
+            raise
+
+    def _flush_stream_group(self) -> None:
+        """Index and acknowledge exactly the outbox rows the group's commits left pending."""
+        with self._write_lock:
+            self._drain_outbox(force=True)
 
     def search(
         self,
@@ -2422,23 +2462,24 @@ class Memory:
                 dict.fromkeys(document.memory_id for document in documents)
             )
             with _translate_storage_errors("apply search scope"):
-                active_count = len(
-                    self._store.read_memories(
-                        candidate_parent_ids,
-                        valid_at=None if scope is None else scope.valid_at,
-                        known_at=None if scope is None else scope.known_at,
-                        near=None if scope is None else scope.near,
-                        radius_m=None if scope is None else scope.radius_m,
-                        # Passed here for consistency with every other scope axis, which all
-                        # reach both reads. This one is the survivor count that drives candidate
-                        # widening; no constructed corpus (30 or 120 memories) could make its
-                        # absence change a result, so it is unproven rather than proven needed.
-                        # Kept because omitting one axis at one of two sites is the anomaly a
-                        # reader would have to explain, and because narrowing a count can only
-                        # widen the search. The hydration site below is mutation-covered.
-                        place_id=None if scope is None else scope.place_id,
-                        active_only=True,
-                    )
+                # Only the number of survivors decides whether to widen, so count them under
+                # the same predicates instead of hydrating content, media assets and typed
+                # context rows and calling `len()` on the records.
+                active_count = self._store.count_memories(
+                    candidate_parent_ids,
+                    valid_at=None if scope is None else scope.valid_at,
+                    known_at=None if scope is None else scope.known_at,
+                    near=None if scope is None else scope.near,
+                    radius_m=None if scope is None else scope.radius_m,
+                    # Passed here for consistency with every other scope axis, which all
+                    # reach both reads. This one is the survivor count that drives candidate
+                    # widening; no constructed corpus (30 or 120 memories) could make its
+                    # absence change a result, so it is unproven rather than proven needed.
+                    # Kept because omitting one axis at one of two sites is the anomaly a
+                    # reader would have to explain, and because narrowing a count can only
+                    # widen the search. The hydration site below is mutation-covered.
+                    place_id=None if scope is None else scope.place_id,
+                    active_only=True,
                 )
             if (
                 active_count >= limit
@@ -3936,8 +3977,14 @@ class Memory:
             with _translate_storage_errors("delete orphaned media metadata"):
                 self._store.delete_asset_if_unreferenced(asset.asset_id)
 
-    def _drain_outbox(self) -> None:
-        """Apply current SQLite truth, then acknowledge the exact durable operation batch."""
+    def _drain_outbox(self, *, force: bool = False) -> None:
+        """Apply current SQLite truth, then acknowledge the exact durable operation batch.
+
+        Skipped inside an `add_stream` group, whose own bounds force it. Skipping only leaves
+        rows pending: they are still durable in SQLite and the next drain applies them.
+        """
+        if not force and self._deferred_index_thread == get_ident():
+            return
         with self._trace("mindbridge.index.sync", kind="stage"):
             self._apply_outbox()
 
