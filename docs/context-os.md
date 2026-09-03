@@ -95,9 +95,10 @@ discarded `CANCEL` events. The target fast path extends that distinction to ackn
 4. Perform model-dependent enrichment and indexing outside the capture deadline.
 
 The current `add()` contract remains the strong path: a successful return means the record is
-searchable through its completed model and index work. A future fast-capture surface must be
-explicit rather than silently weakening `add()`. Its exact API is deferred until readiness and
-failure semantics are specified.
+searchable through its completed model and index work. The fast path is explicit rather than a
+silent weakening of `add()`: `capture()` acknowledges after the SQLite commit and `settle()` runs
+the deferred model stages, with the contract in
+[the Python SDK reference](api/python-sdk.md#memory-operations).
 
 No universal millisecond promise is meaningful. Latency objectives must name the hardware,
 payload, modality, model placement, warm or cold state, percentile, and required readiness level.

@@ -198,6 +198,35 @@ and searchable before requesting the next. If a later item fails, earlier record
 error `subject` identifies `contents[N]`.
 
 ```text
+capture(
+    content: ContentInput,
+    *,
+    occurred_at: datetime | None = None,
+    occurred_end: datetime | None = None,
+    metadata: Mapping[str, object] | None = None,
+    memory_type: MemoryType = MemoryType.SEMANTIC,
+    context: ObservationContext | None = None,
+) -> MemoryRecord
+
+settle(*, limit: int = 100) -> int
+pending_captures() -> int
+```
+
+`capture` returns after the SQLite commit and before any model call. It returns the same
+content-addressed record `add` returns for the same input, so capturing and then adding the same
+content is one memory. A captured record is durable and readable through `get` and `list`
+immediately, and invisible to `search` and `ask` until it is settled.
+
+`settle` runs the deferred stages — speech identity, transcription, embedding, the SQLite embedding
+commit, the index flush, and formation — over up to `limit` captured records in enqueue order, and
+returns how many it settled. A model or storage failure on one record raises with `subject` set to
+that memory ID and leaves it queued with its attempt count and reason; records settled earlier in
+the same call stay settled. `add` and `add_many` settle a queued record they encounter, so their
+searchable-on-return contract holds. `search`, `ask`, `close`, and opening a store never settle:
+time to searchable is the host's choice, so call `settle` from an idle loop, a timer, or after a
+capture burst. `pending_captures` returns how many records are still waiting.
+
+```text
 search(
     query: ContentInput,
     *,
@@ -291,8 +320,8 @@ and reversible through `unlink_identity`.
 ### AsyncMemory
 
 `AsyncMemory` has the same constructor, class methods, operation names, keyword parameters,
-defaults, and result values as `Memory`. Finite operations are awaited; `close()` is asynchronous.
-Its stream boundary is:
+defaults, and result values as `Memory`, including `capture`, `settle`, and `pending_captures`.
+Finite operations are awaited; `close()` is asynchronous. Its stream boundary is:
 
 ```text
 add_stream(
