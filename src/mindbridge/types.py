@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Container, Mapping, Sequence
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import TypeAlias
+from typing import Literal, TypeAlias
 
 from mindbridge.exceptions import ValidationError
 
@@ -55,6 +55,17 @@ class MemoryKind(str, Enum):
     AFFECT = "affect"
     TRAIT = "trait"
     RESPONSE_POLICY = "response_policy"
+
+
+class ContextUnknownKind(str, Enum):
+    """Why a compiled bundle is missing something the request implied it might contain."""
+
+    SCOPE_EMPTY = "scope_empty"
+    SECTION_EMPTY = "section_empty"
+    BUDGET_EXCLUDED = "budget_excluded"
+    CANDIDATES_EXHAUSTED = "candidates_exhausted"
+    MODALITY_UNSUPPORTED = "modality_unsupported"
+    STAGE_SKIPPED = "stage_skipped"
 
 
 class SpatialAnchor(str, Enum):
@@ -571,10 +582,12 @@ class MemoryOperation:
         if self.claim is not None:
             raise ValidationError(f"{self.intent.value} must not carry a claim")
         if self.intent is MemoryIntent.CONSOLIDATE:
-            if self.proposal is None or not self.evidence_ids or self.target_ids:
-                raise ValidationError(
-                    "consolidate requires a proposal and cited evidence, and names no target"
-                )
+            # `target_ids` on a consolidation is consolidation forgetting: the sources to retire
+            # from ordinary recall once the derived record exists. The kernel enforces the
+            # containment rule (a target must be one of this proposal's own evidence IDs); the
+            # value type only knows that naming a target requires evidence to name it from.
+            if self.proposal is None or not self.evidence_ids:
+                raise ValidationError("consolidate requires a proposal and cited evidence")
         elif self.proposal is not None:
             raise ValidationError(f"{self.intent.value} must not carry a proposal")
         elif self.intent is MemoryIntent.REINFORCE:
@@ -598,6 +611,14 @@ class MemoryOperationRecord:
     recipe: str | None = None
     created_ids: tuple[str, ...] = ()
     changed_ids: tuple[str, ...] = ()
+    # Records this operation moved out of ordinary recall. On a FORGET row that is cognitive
+    # forgetting; on a CONSOLIDATE row it is consolidation forgetting, the sources the derived
+    # record replaced. `rollback()` clears exactly these.
+    forgotten_ids: tuple[str, ...] = ()
+    # `(memory_id, version)` pairs the kernel's own lineage rule superseded while applying this
+    # operation: the records a new `STATE` or user-stated `TRAIT` replaced in its lineage, which
+    # the backend never named and may never have been shown. `rollback()` restores exactly these.
+    superseded: tuple[tuple[str, int], ...] = ()
     rolled_back_at: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -621,6 +642,40 @@ class MemoryOperationRecord:
             )
         object.__setattr__(self, "created_ids", _memory_ids(self.created_ids, "created_ids"))
         object.__setattr__(self, "changed_ids", _memory_ids(self.changed_ids, "changed_ids"))
+        object.__setattr__(self, "forgotten_ids", _memory_ids(self.forgotten_ids, "forgotten_ids"))
+        superseded = tuple(self.superseded)
+        for memory_id, version in superseded:
+            _memory_ids((memory_id,), "superseded")
+            if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+                raise ValidationError("superseded version must be a positive integer")
+        object.__setattr__(self, "superseded", superseded)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ConsolidationCandidate:
+    """One piece of deliberation work the store's own state says is due.
+
+    `memory_ids` is the set to hand straight to `consolidate(evidence_ids=...)`. `evidence_count`
+    is what the trigger counted: new evidence links for `EVIDENCE`, distinct conflicting values
+    for `CONTRADICTION`, and recorded confirmations for `FEEDBACK`.
+    """
+
+    trigger: MemoryTrigger
+    memory_ids: tuple[str, ...]
+    evidence_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.trigger, MemoryTrigger):
+            raise ValidationError("candidate trigger is invalid")
+        object.__setattr__(self, "memory_ids", _memory_ids(self.memory_ids, "memory_ids"))
+        if not self.memory_ids:
+            raise ValidationError("a consolidation candidate must name at least one memory")
+        if (
+            isinstance(self.evidence_count, bool)
+            or not isinstance(self.evidence_count, int)
+            or self.evidence_count <= 0
+        ):
+            raise ValidationError("evidence_count must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1164,7 +1219,17 @@ def _assets(value: Sequence[AssetRef], modality: Modality) -> tuple[AssetRef, ..
 
 @dataclass(frozen=True, slots=True)
 class MemoryRecord:
-    """One stored memory."""
+    """One stored memory.
+
+    `content` is the caller's text followed by any text the configured models derived from the
+    media. Derived sections are appended, never substituted: what the caller supplied stays
+    byte-identical at the front, and each derived section is introduced by its own marker line --
+    `[transcript:<asset_id>]`, `[visual description:<asset_id>]`, or
+    `[speech identities:<asset_id>]` -- so a reader can tell interpretation from evidence and
+    which asset it came from. `add` derives before its first write and `settle` derives after
+    `capture` already committed, so the same record shape results either way; the raw media is
+    never rewritten and stays in `assets` under its content address.
+    """
 
     id: str
     content: str
@@ -1244,6 +1309,40 @@ class SearchHit:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingCapture:
+    """One record whose deferred work is not finished, and why it is still waiting.
+
+    `Memory.pending_captures` returns these. `awaiting` is the stage the record is stopped at:
+    `"enrichment"` has no vectors and is invisible to `search`, while `"formation"` is already
+    embedded, indexed, and searchable and owes only the formation `add` holds a row for between
+    its commit and its model call. A memory ID that is absent from the result is not pending: it
+    is either settled or unknown, and `get` distinguishes the two. `attempts` and `last_error` are
+    the failure state a poisoned record accumulates, so an operator can see the reason without
+    opening SQLite.
+    """
+
+    memory_id: str
+    enqueued_at: datetime
+    attempts: int = 0
+    last_error: str | None = None
+    awaiting: Literal["enrichment", "formation"] = "enrichment"
+
+    def __post_init__(self) -> None:
+        _text(self.memory_id, "memory_id")
+        _require_aware(self.enqueued_at, "enqueued_at")
+        if self.enqueued_at is None:
+            raise ValidationError("enqueued_at must include a timezone")
+        if self.awaiting not in {"enrichment", "formation"}:
+            raise ValidationError("awaiting must be enrichment or formation")
+        if isinstance(self.attempts, bool) or not isinstance(self.attempts, int):
+            raise ValidationError("attempts must be an integer")
+        if self.attempts < 0:
+            raise ValidationError("attempts must not be negative")
+        if self.last_error is not None and not isinstance(self.last_error, str):
+            raise ValidationError("last_error must be text")
+
+
+@dataclass(frozen=True, slots=True)
 class PrefetchResult:
     """The newest completed speculative search for one streaming turn."""
 
@@ -1265,16 +1364,24 @@ class PrefetchResult:
 
 @dataclass(frozen=True, slots=True)
 class StreamCommit:
-    """One durable final observation plus retrieval success or a visible retrieval failure."""
+    """One durable final observation plus retrieval success or a visible retrieval failure.
+
+    `pending_settlement` is true when the reducer committed through `capture` rather than `add`:
+    the record is durable and readable but has no vectors yet, so it stays invisible to `search`
+    until the host calls `settle`.
+    """
 
     record: MemoryRecord
     prefetch: PrefetchResult | None
     retrieval_error: str | None = None
     stream_id: str = "default"
+    pending_settlement: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.record, MemoryRecord):
             raise ValidationError("stream commit values are invalid")
+        if not isinstance(self.pending_settlement, bool):
+            raise ValidationError("stream commit pending_settlement must be a boolean")
         if self.prefetch is not None and not isinstance(self.prefetch, PrefetchResult):
             raise ValidationError("stream prefetch result is invalid")
         error = _optional_text(self.retrieval_error, "stream retrieval_error")
@@ -1362,6 +1469,43 @@ class MemoryCapabilities:
                 not isinstance(value, Modality) for value in values
             ):
                 raise ValidationError(f"{name} capabilities must be a frozenset of modalities")
+
+    @property
+    def operations(self) -> frozenset[str]:
+        """Optional operations this composition can serve, named by the backend each needs.
+
+        The mapping from an operation to its backend was prose in three reference pages, so a
+        caller had to know that `ask` needs generation and `consolidate` needs a consolidation
+        backend. It is derived, never declared: the backends above are the only source.
+        """
+        available = {
+            "ask": bool(self.generation),
+            "speech": self.speaker_recognition and bool(self.transcription),
+            "transcribe": bool(self.transcription),
+            "faces": bool(self.face),
+            "describe_vision": bool(self.vision),
+            "formation": bool(self.formation),
+            "consolidate": self.consolidation_model is not None,
+        }
+        return frozenset(name for name, ready in available.items() if ready)
+
+    def document(self) -> dict[str, object]:
+        """Return the JSON-ready capability document every surface publishes.
+
+        REST serves it from `/healthz`, the MCP server embeds it in its instructions, and
+        `mindbridge doctor` prints it, so the three cannot describe the same composition
+        differently. Modality sets and operation names are sorted so the document is stable.
+        """
+        values: dict[str, object] = {
+            declared.name: (
+                sorted(item.value for item in value)
+                if isinstance(value := getattr(self, declared.name), frozenset)
+                else value
+            )
+            for declared in fields(self)
+        }
+        values["operations"] = sorted(self.operations)
+        return values
 
 
 @dataclass(frozen=True, slots=True)
@@ -1501,21 +1645,40 @@ class Page:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ContextBudget:
-    """The size, type, confidence, and freshness bounds one context compilation may spend."""
+    """The size, type, confidence, and freshness bounds one context compilation may spend.
 
-    # Wide enough to admit one video memory. A video part is charged twelve thousand characters
-    # of text equivalent, so a smaller ceiling silently omits every video record it ranks: the
-    # selector skips a hit that cannot fit rather than truncating it, and reports it as omitted.
-    # An embodied deployment's primary modality must fit the default, not require tuning first.
-    max_chars: int = 16_000
+    `max_chars` bounds *evidence*, the same quantity `ContextBundle.chars` reports: record text
+    plus a text-equivalent price per grounded media part. It does not bound `render()`, which
+    adds a fixed four-line header (the goal, a one-line reading guide, the reference time, and
+    the budget line -- about 150 characters plus the goal), a blank line and a `## ` heading per
+    non-empty section, and per included memory a frame of `- [`, `] `, and ` (confidence 0.00)`,
+    which is 23 characters plus the id, plus any validity suffix. A caller shipping `render()`
+    should size against `len(bundle.render())`.
+
+    The default `max_chars` buys the most expensive single grounded part -- a video part is
+    priced at 12 000 characters -- and still leaves room for its record text and a cheaper
+    second part, so a default compilation can reach a media memory at all.
+    """
+
+    max_chars: int = 16000
     max_items: int = 24
     memory_types: frozenset[MemoryType] | None = None
     min_confidence: float = 0.0
     freshness: timedelta | None = None
+    # A deadline, not a timeout: the compiler checks the clock between stages and stops adding
+    # optional ones. It never interrupts work already in flight, so an exceeded deadline is
+    # reported on the bundle rather than raised.
+    max_latency_ms: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_chars", _positive_int(self.max_chars, "budget max_chars"))
         object.__setattr__(self, "max_items", _positive_int(self.max_items, "budget max_items"))
+        if self.max_latency_ms is not None:
+            object.__setattr__(
+                self,
+                "max_latency_ms",
+                _positive_int(self.max_latency_ms, "budget max_latency_ms"),
+            )
         if self.memory_types is not None:
             memory_types = frozenset(self.memory_types)
             if not memory_types or any(not isinstance(value, MemoryType) for value in memory_types):
@@ -1534,10 +1697,11 @@ class ContextBudget:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ContextConflict:
-    """Two or more included memories in one lineage that disagree on the same value.
+    """Two or more candidates in one lineage that disagree on the same value.
 
     The compiler reports a disagreement and never resolves it. `values` and `memory_ids` are
-    aligned: each value is paired with the highest-ranked included memory that asserts it.
+    aligned: each value is paired with the highest-ranked candidate that asserts it, whether or
+    not the budget included that memory; `render()` marks the ones it did not.
     """
 
     lineage_id: str
@@ -1575,6 +1739,25 @@ class ProvisionalActor:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ContextUnknown:
+    """One thing the request implied a bundle might contain that this bundle does not.
+
+    Every unknown is a deterministic statement about the compilation itself -- a scope that
+    matched nothing, a requested type nothing was included for, evidence the budget could not
+    buy, a modality this composition cannot search, a stage a deadline skipped. The compiler
+    calls no model to produce one, so an unknown is never a guess about the world.
+    """
+
+    kind: ContextUnknownKind
+    detail: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ContextUnknownKind):
+            raise ValidationError("unknown kind is invalid")
+        object.__setattr__(self, "detail", _text(self.detail, "unknown detail"))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ContextBundle:
     """One bounded, structured context view compiled for a goal."""
 
@@ -1582,17 +1765,23 @@ class ContextBundle:
     reference_at: datetime
     budget: ContextBudget
     actors: tuple[SearchHit | ProvisionalActor, ...]
+    relationships: tuple[SearchHit, ...]
+    scene: tuple[SearchHit, ...]
     episodes: tuple[SearchHit, ...]
     facts: tuple[SearchHit, ...]
     procedures: tuple[SearchHit, ...]
     affect: tuple[SearchHit, ...]
     traits: tuple[SearchHit, ...]
     conflicts: tuple[ContextConflict, ...]
+    unknowns: tuple[ContextUnknown, ...]
     occurred_from: datetime | None
     occurred_until: datetime | None
     frames: tuple[str, ...]
+    places: tuple[str, ...]
     omitted: int
     chars: int
+    elapsed_ms: int
+    deadline_exceeded: bool
 
     @property
     def hits(self) -> tuple[SearchHit, ...]:
@@ -1625,7 +1814,11 @@ class ContextBundle:
             lines.extend(_section_line(entry) for entry in section)
         if self.conflicts:
             lines.extend(("", "## Conflicts"))
-            lines.extend(_conflict_line(conflict) for conflict in self.conflicts)
+            included_ids = {hit.id for hit in self.hits}
+            lines.extend(_conflict_line(conflict, included_ids) for conflict in self.conflicts)
+        if self.unknowns:
+            lines.extend(("", "## Unknowns"))
+            lines.extend(f"- {item.kind.value}: {item.detail}" for item in self.unknowns)
         if self.omitted > 0:
             lines.extend(("", f"Omitted: {self.omitted} lower-ranked candidates"))
         return "\n".join(lines)
@@ -1634,6 +1827,8 @@ class ContextBundle:
         """Return the sections in their fixed rendering order."""
         return (
             ("Actors", self.actors),
+            ("Relationships", self.relationships),
+            ("Scene", self.scene),
             ("Facts", self.facts),
             ("Episodes", self.episodes),
             ("Procedures", self.procedures),
@@ -1670,10 +1865,14 @@ def _validity(hit: SearchHit) -> str:
     return f"; valid {start} → {context.valid_until.isoformat()}"
 
 
-def _conflict_line(conflict: ContextConflict) -> str:
+def _conflict_line(conflict: ContextConflict, included: Container[str]) -> str:
     label = " ".join(part for part in (conflict.subject, conflict.predicate) if part)
+    # A conflict may name a candidate the budget could not buy. Marking it keeps the `[id]`
+    # provenance honest: that memory has no line of its own anywhere above.
     values = " vs ".join(
         f'"{value}" [{memory_id}]'
+        if memory_id in included
+        else f'"{value}" [{memory_id}, not included]'
         for value, memory_id in zip(conflict.values, conflict.memory_ids, strict=True)
     )
     return f"- {label or conflict.lineage_id}: {values}"

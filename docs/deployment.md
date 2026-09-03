@@ -26,6 +26,9 @@ Before starting the owner, verify:
 - Python 3.10 through 3.14 and compatible 64-bit wheels exist for Zvec and every selected backend.
 - The data directory is on one local, durable filesystem with working SQLite WAL, file locking,
   atomic rename, and durable writes.
+- The Python build links SQLite 3.35 or newer with the JSON1 extension, which is compiled in by
+  default from 3.38. `consolidation_candidates` reads the operation log with `json_tree`, so a
+  build without it fails that one call.
 - The service account alone can read the directory, model credentials, and backups.
 - Disk capacity covers SQLite, original media, the derived index, and temporary rebuild or
   compaction space.

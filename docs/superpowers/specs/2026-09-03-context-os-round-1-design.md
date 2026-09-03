@@ -4,6 +4,10 @@ Date: 2026-09-03. Status: approved for implementation by the team lead under the
 [docs/context-os.md](../../context-os.md). This spec turns evolution gates 2, 3, and 4 of that page
 into concrete Python contracts. It does not change `add()`, `search()`, or `ask()` semantics.
 
+Amended 2026-09-03: the `ContextBudget.max_chars` default below stayed at 6000 in this record, but
+shipped as 16000 -- one video part is priced at 12 000 characters, so no default compilation could
+afford media evidence. [docs/context-compilation.md](../../context-compilation.md) is the contract.
+
 ## Starting point (verified against source on 2026-09-03)
 
 - `add()` blocks on every stage: asset materialization, speech recognition, transcription,

@@ -167,6 +167,7 @@ def _server() -> None:
     assert set(app.openapi()["paths"]) == {
         "/healthz",
         "/v1/answers",
+        "/v1/context",
         "/v1/memories",
         "/v1/memories/batch",
         "/v1/memories/reinforce",
@@ -176,7 +177,7 @@ def _server() -> None:
 
 
 def _mcp() -> None:
-    """Build the real MCP server and resolve the fourteen supported tool schemas."""
+    """Build the real MCP server and resolve the fifteen supported tool schemas."""
     import asyncio
 
     from mindbridge import Memory
@@ -193,6 +194,7 @@ def _mcp() -> None:
         "analyze_faces",
         "analyze_speech",
         "ask_memory",
+        "compile_context",
         "delete_memory",
         "forget_identity",
         "get_identity",

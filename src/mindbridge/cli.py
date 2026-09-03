@@ -20,13 +20,13 @@ import json
 import math
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
-from typing import TextIO, TypeAlias, cast
+from typing import Any, TextIO, TypeAlias, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -45,7 +45,7 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
-from mindbridge.memory import Memory
+from mindbridge.memory import Memory, declared_capabilities
 from mindbridge.types import (
     AssetRef,
     Blob,
@@ -110,6 +110,7 @@ OPERATIONS: tuple[str, ...] = (
     "forget_identity",
     "unlink_identity",
     "reinforce",
+    "consolidation_candidates",
     "consolidate",
     "forget",
     "rollback",
@@ -138,7 +139,7 @@ _QUERY_METAVAR: Mapping[str, str] = {
 _DEFAULT_REMOTE_TIMEOUT_SECONDS = 30.0
 # One list, because a slot added to `recipes` used to need remembering in four separate literals
 # here; the flag, the explain document, `doctor`, and the composition guard all derive from it.
-_SLOTS: tuple[str, ...] = ("embedder", "answerer", "former", "transcriber")
+_SLOTS: tuple[str, ...] = ("embedder", "answerer", "former", "consolidator", "transcriber")
 _OPTIONAL_SLOTS: tuple[str, ...] = _SLOTS[1:]
 _TUNING: tuple[str, ...] = (
     "index_speech",
@@ -300,6 +301,8 @@ def _open_memory(arguments: argparse.Namespace) -> Memory:
             backends["answerer"] = recipes.answerer(arguments.answerer)
         if arguments.former is not None:
             backends["former"] = recipes.former(arguments.former)
+        if arguments.consolidator is not None:
+            backends["consolidator"] = recipes.consolidator(arguments.consolidator)
         if arguments.transcriber is not None:
             backends["transcriber"] = recipes.transcriber(arguments.transcriber)
     try:
@@ -310,6 +313,7 @@ def _open_memory(arguments: argparse.Namespace) -> Memory:
             embedder=backends["embedder"],  # type: ignore[arg-type]
             answerer=backends.get("answerer"),  # type: ignore[arg-type]
             former=backends.get("former"),  # type: ignore[arg-type]
+            consolidator=backends.get("consolidator"),  # type: ignore[arg-type]
             transcriber=backends.get("transcriber"),  # type: ignore[arg-type]
             index_speech=arguments.index_speech,
             minimum_relevance=arguments.minimum_relevance,
@@ -394,6 +398,10 @@ def _doctor(arguments: argparse.Namespace, composition: _Document) -> _Document:
     report: _Document = {"source": composition["source"]}
     data_dir: Path | None = None
     state = "owned by the application"
+    loaded: dict[str, object] = {}
+    # `--app` owns its own backends and doctor never calls the factory, so there is nothing to
+    # declare there; a local composition declares what its probed backends can do.
+    capabilities: _Document | None = None
     if arguments.app is not None:
         report["app"] = composition["app"]
         # Calling the factory would open the store, so the check stops at "the target resolves".
@@ -402,16 +410,53 @@ def _doctor(arguments: argparse.Namespace, composition: _Document) -> _Document:
     else:
         data_dir = _data_dir(arguments)
         state = _data_dir_state(data_dir)
-        for slot in _SLOTS:
-            name = getattr(arguments, slot)
-            report[slot] = None if name is None else _probe(name, slot)
+        try:
+            for slot in _SLOTS:
+                name = getattr(arguments, slot)
+                report[slot] = None if name is None else _probe(name, slot, loaded)
+            capabilities = _doctor_capabilities(loaded)
+        finally:
+            for backend in loaded.values():
+                close = getattr(backend, "close", None)
+                if callable(close):
+                    # One slot that fails to shut down must not strand the weights of the rest.
+                    # doctor already reports what each slot could load; a close is pure cleanup.
+                    with suppress(Exception):
+                        close()
     return {
         "version": _installed_version(),
         "python": ".".join(str(part) for part in sys.version_info[:3]),
         "data_dir": None if data_dir is None else str(data_dir),
         "data_dir_state": state,
+        # The same document `/healthz` serves and the MCP server greets an agent with, so the
+        # three surfaces cannot describe one composition differently.
+        "capabilities": capabilities,
         "composition": report,
     }
+
+
+def _doctor_capabilities(loaded: Mapping[str, object]) -> _Document | None:
+    """Declare what the probed backends can do, without opening the store `Memory` would.
+
+    Every capability is a backend declaration, so this needs no `data_dir` and stays true to
+    doctor's rule that diagnosing a busy or absent directory must not create or lock anything.
+    """
+    embedder = loaded.get("embedder")
+    if embedder is None:
+        return None
+    try:
+        capabilities = declared_capabilities(
+            embedder=cast(Any, embedder),
+            answerer=cast(Any, loaded.get("answerer")),
+            transcriber=cast(Any, loaded.get("transcriber")),
+            former=cast(Any, loaded.get("former")),
+            consolidator=cast(Any, loaded.get("consolidator")),
+        )
+    except MindBridgeError:
+        # A backend that declares an invalid contract is already reported per slot above; the
+        # capability document is a summary, not a second place to fail the command.
+        return None
+    return capabilities.document()
 
 
 def _application_target_exists(spec: str) -> None:
@@ -422,8 +467,8 @@ def _application_target_exists(spec: str) -> None:
         getattr(import_module(module_name), attribute)
 
 
-def _probe(name: str, slot: str) -> _Document:
-    """Construct one recipe with its loader exercised, then close what was constructed."""
+def _probe(name: str, slot: str, loaded: dict[str, object]) -> _Document:
+    """Construct one recipe with its loader exercised, keeping it for the capability summary."""
     document: _Document = dict(recipes.describe(name))
     document["probe"] = recipes.probe(name)
     build: Callable[..., object] = getattr(recipes, slot)
@@ -440,13 +485,9 @@ def _probe(name: str, slot: str) -> _Document:
             detail=" ".join(str(error).split()) or type(error).__name__,
         )
         return document
-    try:
-        document["loader"] = "ok"
-        document.update(_identity(backend))
-    finally:
-        close = getattr(backend, "close", None)
-        if callable(close):
-            close()
+    loaded[slot] = backend
+    document["loader"] = "ok"
+    document.update(_identity(backend))
     return document
 
 
@@ -554,7 +595,12 @@ def _add_stream(memory: Memory, arguments: argparse.Namespace) -> _Document:
     )
     # ponytail: preserve the CLI's one-JSON-document contract by collecting result records; add
     # streaming output only if finite CLI imports outgrow memory. The SDK input path stays lazy.
-    return {"memories": [_memory_document(record) for record in memory.add_stream(inputs)]}
+    return {
+        "memories": [
+            _memory_document(record)
+            for record in memory.add_stream(inputs, capture=arguments.capture)
+        ]
+    }
 
 
 def _search(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -619,6 +665,7 @@ def _budget(arguments: argparse.Namespace) -> ContextBudget:
             if arguments.freshness_seconds is None
             else timedelta(seconds=arguments.freshness_seconds)
         ),
+        max_latency_ms=arguments.max_latency_ms,
     )
 
 
@@ -634,14 +681,29 @@ def _compile(memory: Memory, arguments: argparse.Namespace) -> _Document:
         "reference_at": _encode_time(bundle.reference_at),
         "budget": _budget_document(bundle.budget),
         "conflicts": [asdict(conflict) for conflict in bundle.conflicts],
+        "unknowns": [
+            {"kind": unknown.kind.value, "detail": unknown.detail} for unknown in bundle.unknowns
+        ],
         "occurred_from": _encode_optional_time(bundle.occurred_from),
         "occurred_until": _encode_optional_time(bundle.occurred_until),
         "frames": list(bundle.frames),
+        "places": list(bundle.places),
         "omitted": bundle.omitted,
         "chars": bundle.chars,
+        "elapsed_ms": bundle.elapsed_ms,
+        "deadline_exceeded": bundle.deadline_exceeded,
         "rendered": bundle.render(),
     }
-    for name in ("actors", "episodes", "facts", "procedures", "affect", "traits"):
+    for name in (
+        "actors",
+        "relationships",
+        "scene",
+        "episodes",
+        "facts",
+        "procedures",
+        "affect",
+        "traits",
+    ):
         # `actors` may carry a provisional identity beside the ranked hits: a person the
         # evidence observed whom no visible naming assertion names.
         document[name] = [
@@ -664,6 +726,7 @@ def _budget_document(budget: ContextBudget) -> _Document:
         "freshness_seconds": (
             None if budget.freshness is None else budget.freshness.total_seconds()
         ),
+        "max_latency_ms": budget.max_latency_ms,
     }
 
 
@@ -728,15 +791,48 @@ def _unlink_identity(memory: Memory, arguments: argparse.Namespace) -> _Document
 
 
 def _settle(memory: Memory, arguments: argparse.Namespace) -> _Document:
-    return {"settled": memory.settle(limit=arguments.limit)}
+    return {
+        "settled": memory.settle(
+            limit=arguments.limit,
+            max_attempts=arguments.max_attempts,
+            memory_ids=tuple(arguments.memory_ids) or None,
+        )
+    }
 
 
-def _pending_captures(memory: Memory, _arguments: argparse.Namespace) -> _Document:
-    return {"pending": memory.pending_captures()}
+def _pending_captures(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {
+        "pending": [
+            {
+                "memory_id": pending.memory_id,
+                "enqueued_at": pending.enqueued_at.isoformat(),
+                "attempts": pending.attempts,
+                "last_error": pending.last_error,
+                "awaiting": pending.awaiting,
+            }
+            for pending in memory.pending_captures(
+                limit=arguments.limit,
+                memory_ids=tuple(arguments.memory_ids) or None,
+            )
+        ]
+    }
 
 
 def _reinforce(memory: Memory, arguments: argparse.Namespace) -> _Document:
     return {"reinforced": memory.reinforce(arguments.memory_ids)}
+
+
+def _consolidation_candidates(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {
+        "candidates": [
+            {
+                "trigger": candidate.trigger.value,
+                "memory_ids": list(candidate.memory_ids),
+                "evidence_count": candidate.evidence_count,
+            }
+            for candidate in memory.consolidation_candidates(limit=arguments.limit)
+        ]
+    }
 
 
 def _consolidate(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -788,6 +884,8 @@ def _operation_document(record: MemoryOperationRecord) -> _Document:
         "recipe": record.recipe,
         "created_ids": list(record.created_ids),
         "changed_ids": list(record.changed_ids),
+        "forgotten_ids": list(record.forgotten_ids),
+        "superseded": [[memory_id, version] for memory_id, version in record.superseded],
         "applied_at": record.applied_at.isoformat(),
         "rolled_back_at": (
             None if record.rolled_back_at is None else record.rolled_back_at.isoformat()
@@ -836,6 +934,7 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "forget-identity": _forget_identity,
     "unlink-identity": _unlink_identity,
     "reinforce": _reinforce,
+    "consolidation-candidates": _consolidation_candidates,
     "consolidate": _consolidate,
     "forget": _forget,
     "rollback": _rollback,
@@ -1611,6 +1710,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--answerer", metavar="NAME", help="generation recipe, with --embedder")
     parser.add_argument("--former", metavar="NAME", help="formation recipe, with --embedder")
+    parser.add_argument(
+        "--consolidator", metavar="NAME", help="consolidation recipe, with --embedder"
+    )
     parser.add_argument("--transcriber", metavar="NAME", help="speech recipe, with --embedder")
     # Derived from the SDK default, never hardcoded: `_reject_embedder_only_options` compares this
     # against `_MEMORY_DEFAULTS`, so a literal here silently rejects every --app/--url invocation
@@ -1682,6 +1784,11 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     _memory_type_option(batch, "add_many")
     stream = commands.add_parser("add-stream", help="store completed JSONL items incrementally")
     stream.add_argument("source", nargs="?", default=_STDIN, metavar="JSONL", help="@PATH or -")
+    stream.add_argument(
+        "--capture",
+        action="store_true",
+        help="commit each item through capture; settle makes them searchable",
+    )
     _memory_type_option(stream, "add")
     for operation in ("search", "search_with_trace", "ask"):
         name = operation.replace("_", "-")
@@ -1725,6 +1832,16 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     unlink.add_argument("alias_id", metavar="ALIAS_ID")
     reinforce = commands.add_parser("reinforce", help="record positive feedback")
     reinforce.add_argument("memory_ids", nargs="+", metavar="MEMORY_ID")
+    candidates = commands.add_parser(
+        "consolidation-candidates",
+        help="ask what needs deliberation, derived from recorded evidence and feedback",
+    )
+    candidates.add_argument(
+        "--limit",
+        type=int,
+        default=_default("consolidation_candidates", "limit"),
+        help="candidate rows (default: %(default)s)",
+    )
     consolidate = _content_command(
         commands, "consolidate", "deliberate over evidence and apply memory operations"
     )
@@ -1768,8 +1885,35 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         default=_default("settle", "limit"),
         help="maximum captured memories to settle (default: %(default)s)",
     )
+    settle.add_argument(
+        "--max-attempts",
+        type=int,
+        default=_default("settle", "max_attempts"),
+        help="skip captures that already failed this often (default: %(default)s)",
+    )
+    settle.add_argument(
+        "memory_ids",
+        nargs="*",
+        metavar="MEMORY_ID",
+        help="settle only these memories, ignoring --max-attempts",
+    )
+    pending = commands.add_parser(
+        "pending-captures",
+        help="list captured memories waiting to be settled",
+    )
+    pending.add_argument(
+        "--limit",
+        type=int,
+        default=_default("pending_captures", "limit"),
+        help="maximum queued captures to report (default: %(default)s)",
+    )
+    pending.add_argument(
+        "memory_ids",
+        nargs="*",
+        metavar="MEMORY_ID",
+        help="report only these memories; absent from the result means not pending",
+    )
     for name, help_text in (
-        ("pending-captures", "count captured memories waiting to be settled"),
         ("reindex", "rebuild the search index from SQLite"),
         ("optimize", "merge staged index vectors"),
         (DOCTOR, "resolve the composition and exercise each loader"),
@@ -1811,6 +1955,11 @@ def _compile_command(
         "--freshness-seconds",
         type=float,
         help="keep only memories anchored within this many seconds of the reference clock",
+    )
+    command.add_argument(
+        "--max-latency-ms",
+        type=int,
+        help="deadline after which optional compilation stages are skipped, in milliseconds",
     )
     command.add_argument("--reference-at", metavar="TIME", help="retrieval reference clock")
     command.add_argument("--scope", metavar="JSON", help="temporal/spatial scope, @PATH, or -")

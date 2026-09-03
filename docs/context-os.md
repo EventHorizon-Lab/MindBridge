@@ -129,22 +129,28 @@ The reasoning backend may change, but the proposal vocabulary and kernel validat
 
 | Intent | Kernel semantics |
 | --- | --- |
-| Reinforce | Record independent supporting evidence or observed utility; retrieval alone is not reinforcement. |
+| Reinforce | Record independent supporting evidence or observed utility; retrieval alone is not reinforcement, though a hit an answerer cited is observed utility. |
 | Consolidate | Create a higher-level derived memory with explicit evidence links; preserve source observations. |
 | Merge | Unify compatible derived identity or meaning while retaining reversible lineage. |
-| Update | Add a new valid and transaction-time version that supersedes prior state; do not overwrite history. |
+| Update | Add a new valid and transaction-time version that supersedes prior state; do not overwrite history. Realized as consolidate into an existing lineage. |
 | Correct or split | Reverse a bad inference, identity merge, or consolidation without manufacturing new source evidence. |
 | Forget | Change retrieval visibility or retention state under policy; do not equate it with physical deletion. |
 
 Every proposal names its evidence, model and recipe, expected effect, and idempotency identity. The
 kernel rejects unsupported, unauthorized, internally inconsistent, or stale proposals. The loop
-never writes SQLite directly.
+never writes SQLite directly. All four rejections are enforced, not aspirational: a proposal may
+name targets only inside the window the kernel gathered for it, must be eligible in every target
+it names or be refused whole, and is re-checked inside the apply transaction so a target that was
+forgotten, corrected, or deleted since validation is refused as stale rather than half-applied.
 
 `FormationBackend` is the seed of this plane: it proposes typed state from one committed
 observation while the kernel validates and persists it. `ConsolidationBackend` is the plane itself:
 `consolidate()` gathers a bounded, active evidence set, the backend proposes `MemoryOperation`
 values with the four intents reinforce, consolidate, correct, and forget, and the kernel validates
-each one, commits it with its log row, and can `rollback()` it. The Python SDK reference owns the
+each one, commits it with its log row, and can `rollback()` it. `consolidation_candidates()` is the
+durable trigger in front of that loop: it derives due work -- new independent evidence, a lineage
+that contradicts itself, a record confirmed since it was last weighed -- from committed state, so a
+host schedules deliberation on evidence rather than on a clock. The Python SDK reference owns the
 exact contract; the reasoning backend can change without changing that vocabulary.
 
 ## Forgetting is three operations
@@ -157,9 +163,14 @@ exact contract; the reasoning backend can change without changing that vocabular
 
 Decay is cognitive ranking only, and `forget()` is cognitive forgetting: a forgotten record leaves
 recall, stays readable through `get()` and `list()` with its `forgotten_at`, and returns through
-`rollback()`. Consolidation forgetting is a control-plane proposal over evidence lineage. Physical
-forgetting remains `delete()` under host authority and is not a proposal intent. Retention work must
-keep these meanings separate in APIs, telemetry, and user-facing controls.
+`rollback()`. Consolidation forgetting is a control-plane proposal over evidence lineage: a
+`CONSOLIDATE` may name sources of its own to retire, they leave recall in the same transaction that
+creates the derived record, the evidence links stay, and the log row carries them as
+`forgotten_ids` so the two halves reverse together. Physical forgetting remains `delete()` under
+host authority and is not a proposal intent. Retention work must keep these meanings separate in
+APIs, telemetry, and user-facing controls, and the operation log already does: `delete()` leaves no
+row, cognitive forgetting is a `FORGET` row, and consolidation forgetting is a `CONSOLIDATE` row
+carrying `forgotten_ids`.
 
 ## Context compiler
 
@@ -170,10 +181,11 @@ A context compilation request supplies a goal or query plus constraints such as 
 text or media budget, freshness, allowed sensitivity, spatial scope, and minimum evidence quality.
 The resulting bundle may contain:
 
-- current actors, identities, relationships, and scene state;
+- current actors, relationships, and scene state, each in its own bundle section (identities
+  still need the asset-keyed identity edge, which no read path traverses yet);
 - relevant episodic, semantic, and procedural memories;
 - affect cues separated from longer-horizon traits;
-- temporal and spatial bounds;
+- temporal and spatial bounds, both metric frames and symbolic places;
 - conflicts, uncertainty, and explicit unknowns; and
 - provenance needed to inspect or correct the result.
 
@@ -211,9 +223,9 @@ every administrative method.
 
 The compiler is that view's centre. `POST /v1/context` and the `compile_context` MCP tool return a
 budgeted bundle with provenance, and `GET /healthz` and the MCP server instructions advertise the
-configured modalities and backends so an agent does not discover them through failure. Both are read-only: compiling context selects and structures existing evidence and
-resolves nothing. Answering stays available as a convenience rather than the operating-system
-boundary.
+configured modalities and backends so an agent does not discover them through failure. Both are
+read-only: compiling context selects and structures existing evidence and resolves nothing.
+Answering stays available as a convenience rather than the operating-system boundary.
 
 High-rate sensor streams stay on the embedded SDK boundary. Agents operate on completed
 observations or stable asset identifiers. Cognitive forgetting, consolidation, operation rollback,
@@ -261,19 +273,41 @@ defaults or justify superiority claims.
 1. Measure the current strong `add`, streaming prefetch, search, and formation paths on target
    hardware before setting latency objectives. Open: no named-hardware measurement exists yet.
 2. Add an explicit fast-capture path and SQLite-backed durable enrichment work without changing
-   current `add()` semantics. Done: `capture()`, `settle()`, and `pending_captures()`.
+   current `add()` semantics. Done: `capture()`, `settle()`, and `pending_captures()`;
+   `settle()` honours a retry ceiling so one poisoned capture cannot block the queue,
+   `pending_captures()` answers per-record readiness with attempts, last error, and the stage the
+   record is stopped at, `settle(memory_ids=...)` runs named records past that ceiling, one
+   settlement runs at a time per `Memory`, and a record whose formation was interrupted after
+   `add()` committed is completed by the next `settle()` through the same queue. `capture=True`
+   on `add_stream()` and the three async reducers routes streaming `FINAL` events through the
+   capture path, so continuous observation reaches durable acknowledgement without waiting for a
+   model.
 3. Generalize formation into one bounded memory-management loop with structured proposals,
-   replay, rollback, and privacy tests. Done for the operation log, rollback, and authority
-   tests: `consolidate()`, `forget()`, `rollback()`, `operations()`, and the `identify` intent
-   that makes naming a person an evidence-bearing, reversible claim. Open: replay of a logged
-   operation sequence against a fresh store, and companion-scenario privacy tests.
+   replay, rollback, and privacy tests. Done: the operation log and authority tests
+   (`consolidate()`, `forget()`, `rollback()`, `operations()`), the `identify` intent that
+   makes naming a person an evidence-bearing, reversible claim, the durable trigger
+   (`consolidation_candidates()`), consolidation forgetting as one reversible operation, the
+   declarative `consolidation` slot that makes the loop reachable without a Python app loader,
+   kernel rejection of proposals that name records the backend was not shown, of partial
+   multi-target operations, and of proposals whose targets moved before the commit, native media
+   in the bundled consolidation backend's input, and replay of a logged sequence against a fresh
+   store, covered as a test rather than as an `apply(operation)` surface. Open: companion-scenario
+   privacy tests; a post-hoc outcome field, without which only rollback success of the slow-loop
+   measurements is derivable; and identity merge and split, which stay outside the operation
+   log until the identity-governance round.
 4. Add a context compiler whose output improves downstream tasks within declared budgets. Done
-   for selection and budgeting: `compile()`. Open: a downstream-task measurement against the
-   no-memory, full-context, and retrieval-only baselines.
+   for selection, budgeting, the latency deadline, and the explicit unknowns a thin bundle
+   reports: `compile()`. Open: a downstream-task measurement against the no-memory,
+   full-context, and retrieval-only baselines, and the person link, which needs an identity edge
+   the bundle cannot reach today.
 5. Extend REST or MCP only after the Python contract and authority model are stable. Done for the
-   compiler and the capability advertisement; the control-plane intents stay off REST and MCP.
+   compiler and for one capability document rendered identically by `/healthz`, the MCP server
+   instructions, and `mindbridge doctor`; the control-plane intents stay off REST and MCP. Open:
+   a supported switch for withholding the embodied and identity tools from an MCP server, so a
+   host can expose recall and compile alone.
 
 Fast capture is now independent of slow reasoning, the control plane governs the lifecycle through
 validated, logged, reversible operations, and the compiler produces budgeted task-ready context.
-The remaining gates are measurements, not mechanisms: named-hardware latency, downstream task
-utility, and slow-loop quality on companion scenarios decide whether the defaults are right.
+Apart from the open items named above, the remaining gates are measurements, not mechanisms:
+named-hardware latency, downstream task utility, and slow-loop quality on companion scenarios
+decide whether the defaults are right.

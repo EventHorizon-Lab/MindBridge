@@ -263,12 +263,24 @@ for operation, reason in report.rejected:
 
 The evidence set comes from explicit `evidence_ids`, else the active search result for `query`,
 else the newest `limit` active records. Forgotten and hidden records never reach the backend, and
-the backend may cite only IDs it was shown.
+the backend may cite only IDs it was shown. Its `target_ids` are bounded too: they must fall
+inside the window the kernel gathered, which is the shown set plus whatever the host named in
+`evidence_ids`. That extra allowance is how a hidden derived record — the reason `REINFORCE` and
+`CORRECT` exist — stays reachable, without letting a backend act on records nobody put in front
+of it.
+
+Named targets and cited evidence are what the window bounds. Lineage supersession is not a
+backend choice at all: a new `STATE` or user-stated `TRAIT` retires the current version of every
+other record in its lineage whose validity it overlaps, by the kernel's own deterministic rule,
+including records the backend never saw. Those versions are recorded on the log row as
+`MemoryOperationRecord.superseded` and `rollback()` restores exactly them. Because a later
+consolidation can supersede an earlier one's record, operations on one lineage reverse newest
+first: `rollback()` returns `False` for an operation a standing later one has built on.
 
 | Intent | Kernel semantics |
 | --- | --- |
 | `REINFORCE` | Link an independent source to an existing derived record. Confidence recombines by noisy-OR over independent sources, and a hidden inferred `TRAIT` can become visible. |
-| `CONSOLIDATE` | Derive one new record citing several sources. The sources stay as evidence. |
+| `CONSOLIDATE` | Derive one new record citing several sources. The sources stay as evidence, and stay in recall unless the same proposal names them in `target_ids`. |
 | `CORRECT` | Retire the current version of a bad derived inference. History is preserved, not overwritten. |
 | `FORGET` | Set `forgotten_at`. Recall skips the record; audit keeps it. |
 | `IDENTIFY` | Name a recognized person. The kernel turns the `IdentityClaim` into an `ENTITY` assertion bound to that identity, and `identities.name` is a projection of the assertion currently visible. |
@@ -285,33 +297,81 @@ recomputes both the projected name and the indexed speech text.
 
 The backend proposes and never writes. Each proposal is validated against the shown evidence set
 and its intent's rules, then committed in its own transaction together with an append-only log
-row. A refused proposal is reported with a reason instead of raising, so one bad proposal does not
+row. A pass is therefore not atomic, by design: a proposal refused after an earlier one committed
+does not undo it, and `ConsolidationReport` names exactly which applied and which were rejected.
+A refused proposal is reported with a reason instead of raising, so one bad proposal does not
 discard the pass. Every operation is identified by `sha256(canonical operation JSON + recipe)`, so
 re-proposing the same operation is rejected as `"duplicate"` rather than applied twice.
 `rollback(operation_id)` reverses one operation and `operations()` lists the log newest first.
 Deletion is not an intent.
 
-Trigger the loop on durable evidence: new independent support, explicit feedback, a contradiction,
-repeated query failure, memory pressure, or an approved idle window. A periodic timer alone is not
-evidence that the work is useful. See the
+A proposal is all or nothing within itself. Every target it names must be eligible or the whole
+proposal is refused, so an applied row's `target_ids` are the IDs it actually acted on. The apply
+transaction re-checks what validation read: a target or cited source that moved in between makes
+the proposal `"stale"` with nothing written.
+
+Two things share the name "reinforce" and are not the same mechanism. `reinforce()` is the
+*ranking-utility* signal: it bumps a bounded confirmation count, changes retrieval order only,
+writes no log row, and cannot be rolled back. `MemoryIntent.REINFORCE` is the *evidence-linkage*
+signal: it attaches an independent source to a derived record, is logged, and is reversible. Only
+`FORGET` has a host entry point for its intent, because `forget()` is a policy decision a host
+makes without a model; the other three intents exist only as backend proposals.
+
+"Update" is not a separate intent. It is what a `CONSOLIDATE` into an existing lineage does: the
+new version supersedes the prior one at transaction time and history is kept. That reconciliation
+runs for `STATE` and for `USER_STATEMENT` `TRAIT`. Any other kind gains a second record in the
+same lineage rather than superseding, which is why a model-inferred `TRAIT` can end up
+contradicting itself — and why the loop is given a way to see that. Proposing a replacement value
+for a wrong inference is a `CORRECT` and a `CONSOLIDATE` in the same batch, which the
+consumed-evidence rule allows: correcting a derived record retires that record, not the sources
+the replacement is built from.
+
+### What needs deliberation
+
+`consolidation_candidates()` derives due work from committed state rather than from a clock, so a
+host loop has a durable trigger instead of a timer:
+
+```python
+for candidate in memory.consolidation_candidates():
+    memory.consolidate(evidence_ids=candidate.memory_ids, trigger=candidate.trigger)
+```
+
+`EVIDENCE` rows are derived records that gained independent evidence no standing operation has
+weighed — what the formation path leaves behind. `CONTRADICTION` rows are lineages whose current
+visible claims disagree, and clear when a `CORRECT` retires one side. `FEEDBACK` rows are records
+confirmed through `reinforce()`, or cited by an `ask()` answer under the default
+`reinforce_on_answer`, since an operation last saw them. `QUERY_FAILURE`, `PRESSURE`, and
+`IDLE` stay labels a caller may pass: nothing durable records them today, and adding bookkeeping
+for a trigger no host asks for would be a scheduler by another name.
+
+A periodic timer alone is not evidence that the work is useful. See the
 [Python SDK reference](api/python-sdk.md#memory-management-operations) for signatures, effects, and
 rollback behavior.
 
 ## Decay and reinforcement
 
-MindBridge separates four forms of forgetting and never conflates them:
+MindBridge separates five forms of forgetting and never conflates them:
 
 | Form | Call | Effect |
 | --- | --- | --- |
 | Expiring validity | `valid_until` | Leaves default retrieval when the interval ends; a `valid_at` scope inside the window still retrieves it. |
 | Ranking decay | `decay_half_life_days` | Downranks stale records at query time. Nothing is removed or rewritten. |
 | Cognitive forgetting | `forget()` | Excludes a record from recall while `get()`, `list()`, and `MemoryRecord.forgotten_at` retain it. Reversible through `rollback()`. |
+| Consolidation forgetting | `CONSOLIDATE` naming `target_ids` | Retires the detail a new derived record replaces, in that record's own transaction and under its lineage. Logged on the `CONSOLIDATE` row as `forgotten_ids`, and reversed with it. The lineage versions the same write superseded are logged beside them as `superseded`. |
 | Physical deletion | `delete()` | Removes the record and any media no other record references. Not recoverable, and never something a model proposes. |
 
 `forget()` is cognitive only. It is the host entry point for the `FORGET` intent, so it takes the
-same log row and the same rollback path as a proposed operation. It returns `None` when nothing
-changed, which makes an unknown or already-forgotten ID a no-op rather than an error. Unlike an
+same log row and the same rollback path as a proposed operation — and, like one, applies all of
+its IDs or none. An unknown ID raises `MemoryNotFoundError` the way `get()` and `delete()` do; an
+empty sequence, or a set containing an already-forgotten record, returns `None` having changed
+nothing. The host names the IDs and is the authority, so no evidence window bounds it. Unlike an
 expiring validity interval, it is a policy state a host sets rather than a property of the world.
+
+Consolidation forgetting sets the same `forgotten_at` column, reached a different way: the memory
+loop proposes it as part of the consolidation that justifies it, so the kernel can keep the
+evidence links and reverse both halves together. Telling the three apart in the log needs no
+convention — `delete()` leaves no row, cognitive forgetting is a `FORGET` row, and consolidation
+forgetting is a `CONSOLIDATE` row with `forgotten_ids`.
 
 Decay is disabled by default. Enable it with a positive `decay_half_life_days` setting. Decay
 changes query-time ranking only; it does not delete or rewrite records, assets, embeddings, or
@@ -321,7 +381,11 @@ Retention is anchored to the newest eligible explicit reinforcement, otherwise e
 start, or last update time. Repeated confirmations slow decay. Confirmations also provide a small
 ranking boost when decay is disabled, and public scores remain in `[0, 1]`.
 
-Search never reinforces a hit. Record positive application feedback explicitly:
+Search never reinforces a hit. `ask()` does reinforce the hits its answerer actually cited,
+because a citation is observed utility rather than retrieval: something read the evidence and
+used it. That is a default, not a rule — set `reinforce_on_answer=False` when one question must
+not change later rankings, which is what an evaluation needs. Record positive application
+feedback explicitly:
 
 ```python
 used = memory.search("How should I recover the deployment?", limit=1)

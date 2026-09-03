@@ -30,6 +30,7 @@ from mindbridge import (
     ModelInput,
     ObservationContext,
     ProvisionalActor,
+    RetrievalScope,
     SearchHit,
     SpatialAnchor,
     SpatialContext,
@@ -37,8 +38,11 @@ from mindbridge import (
 )
 from mindbridge.cli import _LOCAL, _parser
 from mindbridge.context import compile_context, evidence_cost
+from mindbridge.infrastructure.local.store import StoredAsset
+from mindbridge.memory import _PreparedContent
 
 REFERENCE = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+DAYS_10 = timedelta(days=10)
 
 
 def _hit(
@@ -57,6 +61,7 @@ def _hit(
     valid_from: datetime | None = None,
     valid_until: datetime | None = None,
     frame_id: str | None = None,
+    place_id: str | None = None,
     assets: tuple[AssetRef, ...] = (),
     modality: Modality = Modality.TEXT,
 ) -> SearchHit:
@@ -92,6 +97,7 @@ def _hit(
         modality=modality,
         assets=assets,
         context=context,
+        place_id=place_id,
     )
 
 
@@ -119,6 +125,9 @@ def _compile(hits: Sequence[SearchHit], **budget: object) -> ContextBundle:
         {"freshness": 60},
         {"memory_types": frozenset()},
         {"memory_types": frozenset({"semantic"})},
+        {"max_latency_ms": 0},
+        {"max_latency_ms": 1.5},
+        {"max_latency_ms": True},
     ),
 )
 def test_a_budget_that_cannot_bound_anything_is_rejected(invalid: dict[str, object]) -> None:
@@ -128,8 +137,9 @@ def test_a_budget_that_cannot_bound_anything_is_rejected(invalid: dict[str, obje
 
 def test_budget_defaults_are_the_documented_ones() -> None:
     budget = ContextBudget()
-    assert (budget.max_chars, budget.max_items) == (16_000, 24)
+    assert (budget.max_chars, budget.max_items) == (16000, 24)
     assert (budget.memory_types, budget.min_confidence, budget.freshness) == (None, 0.0, None)
+    assert budget.max_latency_ms is None
 
 
 def test_the_default_budget_admits_one_video_memory() -> None:
@@ -171,7 +181,8 @@ def test_hits_partition_by_memory_type_and_kind() -> None:
     bundle = _compile(
         (
             _hit("actor", kind=MemoryKind.ENTITY, memory_type=MemoryType.SEMANTIC),
-            _hit("fact", kind=MemoryKind.STATE, memory_type=MemoryType.SEMANTIC),
+            _hit("state", kind=MemoryKind.STATE, memory_type=MemoryType.SEMANTIC),
+            _hit("relation", kind=MemoryKind.RELATION, memory_type=MemoryType.SEMANTIC),
             _hit("untyped", memory_type=MemoryType.SEMANTIC),
             _hit("episode", kind=MemoryKind.EVENT, memory_type=MemoryType.EPISODIC),
             _hit("procedure", kind=MemoryKind.RESPONSE_POLICY, memory_type=MemoryType.PROCEDURAL),
@@ -181,12 +192,16 @@ def test_hits_partition_by_memory_type_and_kind() -> None:
     )
 
     assert [hit.id for hit in bundle.actors if isinstance(hit, SearchHit)] == ["actor"]
-    assert [hit.id for hit in bundle.facts] == ["fact", "untyped"]
+    # Relationships and scene state are the doc's own words and now their own sections; `facts`
+    # keeps only what is neither, so the two are no longer indistinguishable inside it.
+    assert [hit.id for hit in bundle.relationships] == ["relation"]
+    assert [hit.id for hit in bundle.scene] == ["state"]
+    assert [hit.id for hit in bundle.facts] == ["untyped"]
     assert [hit.id for hit in bundle.episodes] == ["episode"]
     assert [hit.id for hit in bundle.procedures] == ["procedure"]
     assert [hit.id for hit in bundle.affect] == ["cue"]
     assert [hit.id for hit in bundle.traits] == ["trait"]
-    assert len(bundle.hits) == 7
+    assert len(bundle.hits) == 8
 
 
 def test_every_non_empty_section_is_served_before_any_section_is_served_twice() -> None:
@@ -214,7 +229,7 @@ def test_selection_stays_in_rank_order_within_a_section() -> None:
 
     bundle = _compile(hits, max_items=3)
 
-    assert [hit.id for hit in bundle.facts] == ["fact-0", "fact-1", "fact-2"]
+    assert [hit.id for hit in bundle.scene] == ["fact-0", "fact-1", "fact-2"]
     assert [hit.id for hit in bundle.hits] == ["fact-0", "fact-1", "fact-2"]
     assert bundle.omitted == 1
 
@@ -257,6 +272,10 @@ def test_a_media_hit_is_charged_far_above_its_record_text() -> None:
     bundle = _compile((video, text), max_chars=100)
     assert [hit.id for hit in bundle.hits] == ["note"]
     assert bundle.omitted == 1
+    # ... but the default budget must be able to buy the most expensive single grounded part,
+    # or no default compilation could ever reach a video memory.
+    assert evidence_cost(video) < ContextBudget().max_chars
+    assert [hit.id for hit in _compile((video, text)).hits] == ["clip", "note"]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -281,8 +300,16 @@ def test_memory_types_and_min_confidence_filter_candidates() -> None:
         ),
         min_confidence=0.5,
     )
-    # A record with no typed context counts as fully confident rather than as an unknown.
+    # A record with no typed context counts as fully confident rather than as an unknown: it is
+    # an observation, which carries no inference to discount. It therefore survives the
+    # strictest possible bound, and renders at the same 1.00 the filter used.
     assert {hit.id for hit in weak.hits} == {"strong", "untyped"}
+    certain = _compile(
+        (_hit("untyped"), _hit("inferred", kind=MemoryKind.STATE, confidence=0.99)),
+        min_confidence=1.0,
+    )
+    assert [hit.id for hit in certain.hits] == ["untyped"]
+    assert "- [untyped] evidence untyped (confidence 1.00)" in certain.render()
 
 
 def test_freshness_anchors_on_event_end_then_event_start_then_creation() -> None:
@@ -328,6 +355,60 @@ def test_disagreeing_states_in_one_lineage_produce_one_conflict() -> None:
     assert conflict.memory_ids == ("first", "second")
 
 
+def test_a_conflict_survives_the_budget_dropping_one_side() -> None:
+    bundle = _compile(
+        (
+            _hit(
+                "berlin", score=0.9, kind=MemoryKind.STATE, lineage_id="lineage-1", value="berlin"
+            ),
+            _hit("paris", score=0.5, kind=MemoryKind.STATE, lineage_id="lineage-1", value="paris"),
+        ),
+        max_items=1,
+    )
+
+    assert [hit.id for hit in bundle.hits] == ["berlin"]
+    assert bundle.conflicts[0].memory_ids == ("berlin", "paris")
+    # The dropped side has no line of its own, so the conflict line says where it is not.
+    assert '- ana location: "berlin" [berlin] vs "paris" [paris, not included]' in bundle.render()
+
+
+def test_a_conflict_no_included_memory_asserts_is_not_this_bundles_disagreement() -> None:
+    bundle = _compile(
+        (
+            _hit("kept", score=0.9),
+            _hit(
+                "berlin", score=0.5, kind=MemoryKind.STATE, lineage_id="lineage-1", value="berlin"
+            ),
+            _hit("paris", score=0.4, kind=MemoryKind.STATE, lineage_id="lineage-1", value="paris"),
+        ),
+        max_items=1,
+    )
+
+    assert [hit.id for hit in bundle.hits] == ["kept"]
+    assert bundle.conflicts == ()
+
+
+def test_a_filtered_out_side_of_a_conflict_stays_filtered_out() -> None:
+    bundle = _compile(
+        (
+            _hit(
+                "berlin", score=0.9, kind=MemoryKind.STATE, lineage_id="lineage-1", value="berlin"
+            ),
+            _hit(
+                "paris",
+                score=0.5,
+                kind=MemoryKind.STATE,
+                confidence=0.1,
+                lineage_id="lineage-1",
+                value="paris",
+            ),
+        ),
+        min_confidence=0.5,
+    )
+
+    assert bundle.conflicts == ()
+
+
 def test_bounds_and_frames_summarize_only_included_hits() -> None:
     start = REFERENCE - timedelta(hours=5)
     end = REFERENCE - timedelta(hours=4)
@@ -361,6 +442,20 @@ def test_bounds_and_frames_summarize_only_included_hits() -> None:
     assert bundle.omitted == 1
 
 
+def test_the_spatial_summary_carries_symbolic_places_beside_metric_frames() -> None:
+    bundle = _compile(
+        (
+            _hit("kept", score=0.9, kind=MemoryKind.EVENT, frame_id="map", place_id="kitchen"),
+            _hit("also", score=0.8, kind=MemoryKind.EVENT, place_id="hall"),
+            _hit("nowhere", score=0.7, kind=MemoryKind.EVENT),
+        )
+    )
+
+    # `place_id` is the axis a household query uses, and every hit already carries it.
+    assert bundle.places == ("hall", "kitchen")
+    assert bundle.frames == ("map",)
+
+
 def test_an_empty_retrieval_compiles_an_empty_bundle() -> None:
     bundle = _compile(())
 
@@ -368,6 +463,219 @@ def test_an_empty_retrieval_compiles_an_empty_bundle() -> None:
     assert (bundle.occurred_from, bundle.occurred_until) == (None, None)
     assert (bundle.frames, bundle.conflicts, bundle.omitted, bundle.chars) == ((), (), 0, 0)
     assert "Omitted" not in bundle.render()
+
+
+# ---------------------------------------------------------------------------------------------
+# Explicit unknowns and the latency deadline
+
+
+def test_every_budget_bound_that_removed_evidence_is_named_with_its_count() -> None:
+    bundle = _compile(
+        (
+            _hit("kept", score=0.9, kind=MemoryKind.STATE),
+            _hit("wrong-type", score=0.8, memory_type=MemoryType.EPISODIC),
+            _hit("weak", score=0.7, kind=MemoryKind.STATE, confidence=0.1),
+            _hit("stale", score=0.6, kind=MemoryKind.STATE, created_at=REFERENCE - DAYS_10),
+            _hit("crowded", score=0.5, kind=MemoryKind.STATE),
+        ),
+        max_items=1,
+        memory_types=frozenset({MemoryType.SEMANTIC, MemoryType.PROCEDURAL}),
+        min_confidence=0.5,
+        freshness=timedelta(days=1),
+    )
+
+    assert [(item.kind.value, item.detail) for item in bundle.unknowns] == [
+        ("budget_excluded", "1 candidates below the requested minimum confidence"),
+        ("budget_excluded", "1 candidates did not fit 1 items and 16000 chars"),
+        ("budget_excluded", "1 candidates older than the requested freshness window"),
+        ("budget_excluded", "1 candidates outside the requested memory types"),
+        ("section_empty", "no procedural memory was included"),
+    ]
+    # Ordering is stable, so a caller can diff two bundles.
+    assert (
+        bundle.unknowns
+        == _compile(
+            (
+                _hit("kept", score=0.9, kind=MemoryKind.STATE),
+                _hit("wrong-type", score=0.8, memory_type=MemoryType.EPISODIC),
+                _hit("weak", score=0.7, kind=MemoryKind.STATE, confidence=0.1),
+                _hit("stale", score=0.6, kind=MemoryKind.STATE, created_at=REFERENCE - DAYS_10),
+                _hit("crowded", score=0.5, kind=MemoryKind.STATE),
+            ),
+            max_items=1,
+            memory_types=frozenset({MemoryType.SEMANTIC, MemoryType.PROCEDURAL}),
+            min_confidence=0.5,
+            freshness=timedelta(days=1),
+        ).unknowns
+    )
+
+
+def test_a_full_candidate_window_is_named_beside_what_the_bundle_lost() -> None:
+    hits = tuple(_hit(f"hit-{index}", score=0.9 - index / 100) for index in range(4))
+
+    def _window(limit: int | None, **budget: object) -> tuple[str, ...]:
+        bundle = compile_context(
+            "what is going on",
+            hits,
+            budget=ContextBudget(**budget),  # type: ignore[arg-type]
+            reference_at=REFERENCE,
+            candidate_limit=limit,
+        )
+        return tuple(item.detail for item in bundle.unknowns if item.kind.value == exhausted)
+
+    exhausted = "candidates_exhausted"
+    assert _window(4, max_items=2) == (
+        "retrieval filled its 4 candidate window, so the counts above bound what this window"
+        " held and not what the store holds",
+    )
+    # Room left in the window means the ranking really did end where the bundle says it did.
+    assert _window(8, max_items=2) == ()
+    # A full window that cost the bundle nothing is not an unknown.
+    assert _window(4) == ()
+    # A caller compiling hits it retrieved itself declares no window and is told about none.
+    assert _window(None, max_items=2) == ()
+
+
+def test_a_bundle_that_lost_nothing_reports_no_unknowns() -> None:
+    bundle = _compile((_hit("kept", kind=MemoryKind.STATE),))
+
+    assert bundle.unknowns == ()
+    assert "## Unknowns" not in bundle.render()
+
+
+def test_the_renderer_names_every_unknown() -> None:
+    bundle = _compile((_hit("kept"), _hit("crowded", score=0.1)), max_items=1)
+
+    rendered = bundle.render()
+
+    assert "## Unknowns" in rendered
+    assert "- budget_excluded: 1 candidates did not fit 1 items and 16000 chars" in rendered
+
+
+def test_the_deadline_skips_optional_enrichment_and_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deadline is a checkpoint, never a cancellation: sections survive, enrichment does not."""
+    hits = (
+        _hit("first", score=0.9, kind=MemoryKind.STATE, lineage_id="lineage-1", value="berlin"),
+        _hit("second", score=0.8, kind=MemoryKind.STATE, lineage_id="lineage-1", value="paris"),
+    )
+    # Two readings: the checkpoint before optional enrichment, then the reported elapsed time.
+    clock = iter((0.5, 0.75))
+    monkeypatch.setattr("mindbridge.context.perf_counter", lambda: next(clock))
+
+    bundle = compile_context(
+        "what is going on",
+        hits,
+        budget=ContextBudget(max_latency_ms=100),
+        reference_at=REFERENCE,
+        started_at=0.0,
+    )
+
+    assert [hit.id for hit in bundle.scene] == ["first", "second"]
+    assert bundle.conflicts == ()
+    assert bundle.deadline_exceeded is True
+    assert bundle.elapsed_ms == 750
+    assert [(item.kind.value, item.detail) for item in bundle.unknowns] == [
+        ("stage_skipped", "conflict detection was skipped after the 100 ms deadline passed")
+    ]
+
+
+def test_a_deadline_that_holds_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    hits = (
+        _hit("first", score=0.9, kind=MemoryKind.STATE, lineage_id="lineage-1", value="berlin"),
+        _hit("second", score=0.8, kind=MemoryKind.STATE, lineage_id="lineage-1", value="paris"),
+    )
+    clock = iter((0.01, 0.02))
+    monkeypatch.setattr("mindbridge.context.perf_counter", lambda: next(clock))
+
+    bundle = compile_context(
+        "what is going on",
+        hits,
+        budget=ContextBudget(max_latency_ms=100),
+        reference_at=REFERENCE,
+        started_at=0.0,
+    )
+
+    assert len(bundle.conflicts) == 1
+    assert (bundle.deadline_exceeded, bundle.elapsed_ms, bundle.unknowns) == (False, 20, ())
+
+
+def test_a_bundle_without_a_deadline_still_reports_what_it_spent() -> None:
+    bundle = _compile((_hit("kept"),))
+
+    assert bundle.deadline_exceeded is False
+    assert bundle.elapsed_ms >= 0
+
+
+def test_a_scope_that_matched_nothing_is_reported_as_an_unknown(tmp_path: Path) -> None:
+    with _memory(tmp_path) as memory:
+        memory.add("the spare key is in the blue toolbox")
+
+        bundle = memory.compile(
+            "what do you know",
+            reference_at=REFERENCE,
+            scope=RetrievalScope(place_id="workshop"),
+        )
+
+    assert bundle.hits == ()
+    assert [(item.kind.value, item.detail) for item in bundle.unknowns] == [
+        ("scope_empty", "no memory matched the requested scope: place workshop")
+    ]
+
+
+def test_a_scope_that_matched_is_not_reported(tmp_path: Path) -> None:
+    with _memory(tmp_path) as memory:
+        memory.add(
+            "the spare key is in the blue toolbox",
+            context=ObservationContext(place_id="workshop"),
+        )
+
+        bundle = memory.compile(
+            "what do you know",
+            reference_at=REFERENCE,
+            scope=RetrievalScope(place_id="workshop"),
+        )
+
+    assert bundle.places == ("workshop",)
+    assert bundle.unknowns == ()
+
+
+def test_goal_media_the_embedder_cannot_take_natively_is_reported(tmp_path: Path) -> None:
+    """A text-only composition still answers a spoken goal, from a transcript rather than audio."""
+
+    class TextOnly(TinyEmbedder):
+        embedding_capabilities = frozenset({Modality.TEXT})
+
+    digest = "a" * 64
+    audio = StoredAsset(
+        asset_id=digest,
+        modality="audio",
+        mime_type="audio/wav",
+        size_bytes=1,
+        sha256=digest,
+        relative_path=f"assets/aa/{digest}",
+        created_at=REFERENCE,
+    )
+    with Memory(tmp_path, embedder=TextOnly(), minimum_relevance=0) as memory:
+        unknowns = memory._request_unknowns(
+            _PreparedContent(
+                text="what do you know",
+                assets=(audio,),
+                modality=Modality.OMNI,
+                canonical_parts=(),
+            ),
+            None,
+            (),
+        )
+
+    assert [(item.kind.value, item.detail) for item in unknowns] == [
+        (
+            "modality_unsupported",
+            "the goal's audio was not embedded natively; embedding accepts text,"
+            " so only derived text could have matched",
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -404,7 +712,7 @@ def test_render_is_deterministic_and_names_every_included_id() -> None:
         f"Reference time: {REFERENCE.isoformat()}",
         f"Budget: {bundle.chars}/16000 chars, 4/4 items",
     ]
-    assert "## Actors" in rendered and "## Facts" in rendered
+    assert "## Actors" in rendered and "## Scene" in rendered
     assert "- [actor-1] evidence actor-1 (confidence 0.90)" in rendered
     # A stored newline collapses so one memory stays one line.
     assert "- [episode-1] a b (confidence 1.00)" in rendered
@@ -423,7 +731,9 @@ def test_render_keeps_the_section_order_fixed() -> None:
             _hit("cue-1", kind=MemoryKind.AFFECT),
             _hit("procedure-1", memory_type=MemoryType.PROCEDURAL),
             _hit("episode-1", memory_type=MemoryType.EPISODIC),
-            _hit("fact-1", kind=MemoryKind.STATE),
+            _hit("fact-1"),
+            _hit("state-1", kind=MemoryKind.STATE),
+            _hit("relation-1", kind=MemoryKind.RELATION),
             _hit("actor-1", kind=MemoryKind.ENTITY),
         )
     )
@@ -431,6 +741,8 @@ def test_render_keeps_the_section_order_fixed() -> None:
     headings = [line for line in bundle.render().splitlines() if line.startswith("## ")]
     assert headings == [
         "## Actors",
+        "## Relationships",
+        "## Scene",
         "## Facts",
         "## Episodes",
         "## Procedures",
@@ -618,11 +930,12 @@ def test_the_cli_command_serializes_the_bundle(tmp_path: Path) -> None:
         document = _LOCAL["compile"](memory, arguments)
 
     assert json.loads(json.dumps(document))["budget"] == {
-        "max_chars": 16_000,
+        "max_chars": 16000,
         "max_items": 1,
         "memory_types": ["semantic"],
         "min_confidence": 0.0,
         "freshness_seconds": 86400.0,
+        "max_latency_ms": None,
     }
     assert len(document["facts"]) == 1  # type: ignore[arg-type]
     assert "Budget: " in str(document["rendered"])

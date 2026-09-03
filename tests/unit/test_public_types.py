@@ -24,10 +24,17 @@ from mindbridge.types import (
     AnswerResult,
     AssetRef,
     Blob,
+    ContextUnknown,
+    ContextUnknownKind,
+    MemoryIntent,
+    MemoryOperation,
+    MemoryOperationRecord,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
     Page,
+    PendingCapture,
     RetrievalCandidateTrace,
     RetrievalRejection,
     RetrievalTrace,
@@ -246,6 +253,18 @@ def test_answer_and_page_reuse_the_public_values() -> None:
     assert Page(items=(memory,), next_cursor="cursor_1").items == (memory,)
 
 
+def test_a_context_unknown_states_one_typed_reason() -> None:
+    unknown = ContextUnknown(
+        kind=ContextUnknownKind.SCOPE_EMPTY,
+        detail="no memory matched the requested scope: place workshop",
+    )
+
+    assert unknown.kind is ContextUnknownKind.SCOPE_EMPTY
+    for invalid in ({"kind": "scope_empty"}, {"detail": "  "}, {"detail": 7}):
+        with pytest.raises(ValidationError):
+            ContextUnknown(**{"kind": unknown.kind, "detail": unknown.detail, **invalid})  # type: ignore[arg-type]
+
+
 def test_public_exceptions_have_stable_categories() -> None:
     assert issubclass(ValidationError, MindBridgeError)
     assert issubclass(ValidationError, ValueError)
@@ -300,6 +319,66 @@ def test_single_condition_errors_default_their_own_reason() -> None:
     assert ValidationError("bad").reason == "input_invalid"
     assert ModelOutputTruncatedError("cut off").reason == "output_truncated"
     assert ModelOutputTruncatedError("cut off").retryable is False
+
+
+def test_a_pending_capture_refuses_a_naive_clock_and_a_nonsense_attempt_count() -> None:
+    assert PendingCapture(memory_id="a", enqueued_at=NOW).attempts == 0
+    for enqueued_at in (None, NOW.replace(tzinfo=None)):
+        with pytest.raises(ValidationError, match="enqueued_at must include a timezone"):
+            PendingCapture(memory_id="a", enqueued_at=enqueued_at)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="attempts must not be negative"):
+        PendingCapture(memory_id="a", enqueued_at=NOW, attempts=-1)
+    # `bool` is an `int`, so a flag passed where a count belongs is rejected rather than counted.
+    for attempts in (True, 1.0):
+        with pytest.raises(ValidationError, match="attempts must be an integer"):
+            PendingCapture(memory_id="a", enqueued_at=NOW, attempts=attempts)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="last_error must be text"):
+        PendingCapture(memory_id="a", enqueued_at=NOW, last_error=7)  # type: ignore[arg-type]
+    # The stage is the difference between "not searchable yet" and "searchable, owes formation",
+    # so an unknown value is refused rather than reported as either.
+    assert PendingCapture(memory_id="a", enqueued_at=NOW).awaiting == "enrichment"
+    embedded = PendingCapture(memory_id="a", enqueued_at=NOW, awaiting="formation")
+    assert embedded.awaiting == "formation"
+    with pytest.raises(ValidationError, match="awaiting must be enrichment or formation"):
+        PendingCapture(memory_id="a", enqueued_at=NOW, awaiting="indexing")  # type: ignore[arg-type]
+
+
+def test_operation_record_superseded_names_a_version_per_memory() -> None:
+    operation = MemoryOperation(intent=MemoryIntent.FORGET, target_ids=("a",))
+    record = MemoryOperationRecord(
+        operation_id=1,
+        operation=operation,
+        trigger=MemoryTrigger.MANUAL,
+        applied_at=NOW,
+        superseded=[("a", 1)],  # type: ignore[arg-type]
+    )
+
+    # The version is what makes the supersession reversible: a lineage rule may have split the
+    # record's remaining validity, so restoring "whatever is newest" would restore the wrong one.
+    assert record.superseded == (("a", 1),)
+    assert (
+        MemoryOperationRecord(
+            operation_id=1, operation=operation, trigger=MemoryTrigger.MANUAL, applied_at=NOW
+        ).superseded
+        == ()
+    )
+    for version in (0, -1, True, 1.0):
+        with pytest.raises(ValidationError, match="superseded version"):
+            MemoryOperationRecord(
+                operation_id=1,
+                operation=operation,
+                trigger=MemoryTrigger.MANUAL,
+                applied_at=NOW,
+                superseded=(("a", version),),  # type: ignore[arg-type]
+            )
+    with pytest.raises(ValidationError, match="superseded"):
+        MemoryOperationRecord(
+            operation_id=1,
+            operation=operation,
+            trigger=MemoryTrigger.MANUAL,
+            applied_at=NOW,
+            superseded=((" ", 1),),
+        )
 
 
 def _asset(

@@ -32,6 +32,7 @@ from mindbridge.api import content as rest_content
 from mindbridge.api.errors import ErrorEnvelope
 from mindbridge.cli import COMMANDS, EXIT_CODES, OPERATIONS, main
 from mindbridge.exceptions import MindBridgeError, ValidationError
+from mindbridge.memory import declared_capabilities
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.models.funasr import DEFAULT_FUNASR_MODEL_ID
 from mindbridge.models.jina import DEFAULT_JINA_MODEL_ID, DEFAULT_JINA_REVISION
@@ -568,6 +569,7 @@ def test_recipes_pin_identity_to_the_constants_in_the_source() -> None:
         "embedder": "gpt-5-mini",
         "answerer": "gpt-5-mini",
         "former": "gpt-5-mini",
+        "consolidator": "gpt-5-mini",
         "transcriber": "gpt-5-mini",
     }
     assert "OPENAI_API_KEY" in cast(str, recipes.describe("openai")["credential"])
@@ -596,6 +598,26 @@ def test_the_former_flag_reaches_the_memory_it_composes(
     cli._open_memory(arguments)
 
     assert captured["former"] is sentinel
+
+
+def test_the_consolidator_flag_reaches_the_memory_it_composes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without this the shipped `mindbridge consolidate` command needed `--app` to work at all."""
+    from mindbridge import cli
+
+    sentinel = object()
+    captured: dict[str, object] = {}
+    arguments = cli._parser().parse_args(
+        ["--data-dir", str(tmp_path), "--embedder", "openai", "--consolidator", "openai", "list"]
+    )
+    monkeypatch.setattr(recipes, "embedder", lambda name, **kw: object())
+    monkeypatch.setattr(recipes, "consolidator", lambda name, **kw: sentinel)
+    monkeypatch.setattr(cli, "Memory", lambda *args, **kwargs: captured.update(kwargs))
+
+    cli._open_memory(arguments)
+
+    assert captured["consolidator"] is sentinel
 
 
 def test_every_recipe_slot_has_a_command_line_flag() -> None:
@@ -695,6 +717,32 @@ def test_doctor_reports_a_failed_loader_without_writing(
     assert report["data_dir_state"] == "absent"
     assert not store.exists()
     assert status == 0
+
+
+def test_doctor_publishes_the_capability_document_without_opening_a_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`/healthz`, the MCP greeting, and `doctor` must render one document, not three views."""
+    monkeypatch.setattr(recipes, "embedder", lambda name, *, load=False: _Embedder())
+    store = tmp_path / "store"
+    _status, document, _ = _run(
+        capsys, "--embedder", "jina-omni", "--data-dir", str(store), "-q", "doctor"
+    )
+    report = cast(dict[str, object], document)
+
+    assert report["capabilities"] == declared_capabilities(embedder=_Embedder()).document()
+    assert cast(dict[str, object], report["capabilities"])["operations"] == []
+    # Declared by the backend, so the summary neither opens nor creates the data directory.
+    assert report["data_dir_state"] == "absent"
+    assert not store.exists()
+
+
+def test_doctor_declares_no_capabilities_for_an_application_it_must_not_call(
+    app: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _status, document, _ = _run(capsys, "--app", app, "-q", "doctor")
+
+    assert cast(dict[str, object], document)["capabilities"] is None
 
 
 def test_doctor_sees_a_directory_another_process_owns(
@@ -847,6 +895,8 @@ def test_remote_mode_compiles_over_v1(
         "episodic",
         "--freshness-seconds",
         "3600",
+        "--max-latency-ms",
+        "250",
     )
 
     assert calls == [
@@ -861,6 +911,7 @@ def test_remote_mode_compiles_over_v1(
                     "memory_types": ["episodic"],
                     "min_confidence": 0.0,
                     "freshness_seconds": 3600.0,
+                    "max_latency_ms": 250,
                 },
             },
         ),

@@ -14,7 +14,7 @@ decoding, frame selection, and turn detection remain application or adapter work
 | Need | API |
 | --- | --- |
 | Lazily add completed independent observations | `Memory.add_stream()` or `AsyncMemory.add_stream()` |
-| Acknowledge completed observations without waiting for models | `Memory.capture()` with `Memory.settle()` |
+| Acknowledge completed observations without waiting for models | `Memory.capture()` with `Memory.settle()`, or any stream API with `capture=True` |
 | Search while one query snapshot is changing | `AsyncOmniPrefetch` |
 | Associate speculative snapshots with final commits | `AsyncCaptureStream` |
 | Normalize PCM, VAD, and ASR state | `AsyncAudioStream` |
@@ -71,9 +71,17 @@ the SQLite commit; the record becomes searchable when the host calls `settle()`.
 for observation in burst:
     memory.capture(observation)
 
-while memory.pending_captures():
-    memory.settle(limit=32)
+while memory.settle(limit=32):
+    pass
 ```
+
+Loop on what `settle()` returns rather than on `pending_captures()`: a record that reached the
+retry ceiling stays queued on purpose, so a loop that waits for the queue to empty never ends.
+`pending_captures()` is how you then see which record it is and why, and `awaiting` says whether
+a queued record has no vectors yet or is already searchable and owes only formation.
+`settle(memory_ids=...)` runs named records alone and ignores the ceiling for them, so a parked
+capture is retried by hand rather than by raising the ceiling for everything. One settlement runs
+at a time per `Memory`: a concurrent call waits instead of running the same models twice.
 
 **Contract:** keep `add()` where a caller needs the record searchable on return, and keep the
 enrichment loop explicit. Nothing else settles for you, so an application that never calls
@@ -138,6 +146,25 @@ async for commit in capture.consume(camera_events()):
 
 `max_streams` defaults to 32 and bounds active prefetch workers. One search runs at a time per ID;
 different IDs may search concurrently. A final or cancel boundary frees the ID.
+
+`AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream`, and `add_stream()` all accept
+`capture=True`, which commits each final through `capture()` instead of `add()`. That is the
+complete path from continuous observation to acknowledgement: speculative `UPDATE` retrieval, a
+`FINAL` acknowledged after the SQLite commit, and enrichment deferred to `settle()`. Every
+`StreamCommit` then reports `pending_settlement=True`, and the record stays out of `search()`
+until the host settles it. A `StreamInput` transcript or description is folded in at capture time,
+so the deferred commit lands on the same content-addressed record the strong path would have
+written. The default is unchanged: without the flag, a final still commits through `add()` and is
+searchable when the commit yields.
+
+```python
+audio = AsyncAudioStream(async_memory, limit=8, capture=True)
+async for commit in audio.consume(audio_packets()):
+    assert commit.pending_settlement
+
+while await async_memory.settle(limit=32):
+    pass
+```
 
 If final retrieval fails, the observation still commits and `StreamCommit.retrieval_error` carries
 a stable public error code, or `retrieval_failed` for an unclassified exception. Cancellation

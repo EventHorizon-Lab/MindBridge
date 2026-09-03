@@ -12,9 +12,10 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
-from _feature_support import TinyEmbedder
+from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
 
 from mindbridge import (
     AssetRef,
@@ -25,6 +26,7 @@ from mindbridge import (
     EvidenceBasis,
     FaceAnalysis,
     FaceEmbedding,
+    FormationInput,
     FormationProposal,
     IdentityClaim,
     Memory,
@@ -32,6 +34,7 @@ from mindbridge import (
     MemoryKind,
     MemoryNotFoundError,
     MemoryOperation,
+    MemoryOperationRecord,
     MemoryPlugins,
     MemoryRecord,
     MemoryTrigger,
@@ -44,6 +47,8 @@ from mindbridge import (
     ValidationError,
 )
 from mindbridge.control import dump_operation, load_operation, operation_key
+from mindbridge.infrastructure.local import LocalStore
+from mindbridge.infrastructure.local.store import StoredOperation
 
 OCCURRED = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
 
@@ -183,6 +188,13 @@ def test_operation_shape_follows_its_intent() -> None:
     assert MemoryOperation(
         intent=MemoryIntent.REINFORCE, target_ids=("t",), evidence_ids=("a", "a")
     ).evidence_ids == ("a",)
+    # Consolidation forgetting: a consolidation may name sources of its own to retire.
+    assert MemoryOperation(
+        intent=MemoryIntent.CONSOLIDATE,
+        evidence_ids=("a", "b"),
+        target_ids=("a",),
+        proposal=proposal,
+    ).target_ids == ("a",)
 
     malformed: tuple[dict[str, object], ...] = (
         {"intent": MemoryIntent.CONSOLIDATE, "evidence_ids": ("a",)},
@@ -587,7 +599,8 @@ def test_reinforcement_refuses_a_proposal_that_re_cites_an_existing_source(
                 ),
             )
         )
-        report = memory.consolidate(evidence_ids=(first.id, second.id))
+        # `derived_id` is hidden, so it can only enter the target window by being named.
+        report = memory.consolidate(evidence_ids=(first.id, second.id, derived_id))
 
         assert [reason for _operation, reason in report.rejected] == ["already_linked"]
         stable = memory.get(derived_id)
@@ -676,8 +689,16 @@ def test_forgetting_leaves_search_but_stays_in_get_and_list(tmp_path: Path) -> N
         assert listed[second.id] is None
 
         assert memory.forget((first.id,)) is None
-        assert memory.forget(("unknown-id",)) is None
         assert memory.forget(()) is None
+        # The host names IDs directly, so an unknown one is an error like `get()` and `delete()`,
+        # and a set containing an already-forgotten record applies nothing at all.
+        with pytest.raises(MemoryNotFoundError):
+            memory.forget(("unknown-id",))
+        with pytest.raises(MemoryNotFoundError):
+            memory.forget((second.id, "unknown-id"))
+        assert memory.get(second.id).forgotten_at is None
+        assert memory.forget((first.id, second.id)) is None
+        assert memory.get(second.id).forgotten_at is None
 
         assert memory.rollback(record.operation_id) is True
         assert memory.get(first.id).forgotten_at is None
@@ -944,7 +965,10 @@ def test_control_operations_refuse_to_touch_a_bound_naming_assertion(tmp_path: P
         )
         for operation in scripted:
             consolidator._scripts.append((operation,))
-            rejected = memory.consolidate(evidence_ids=(record.id,)).rejected
+            # The assertion is named in `evidence_ids`, so it is inside the window the kernel
+            # gathered: the refusal below is the naming guard, not the window check that would
+            # otherwise refuse a target the backend was never shown.
+            rejected = memory.consolidate(evidence_ids=(record.id, assertion)).rejected
             assert [reason for _operation, reason in rejected] == ["naming_assertion"]
 
         # `forget()` is the same kernel path under host authority, so it refuses too.
@@ -954,3 +978,807 @@ def test_control_operations_refuse_to_touch_a_bound_naming_assertion(tmp_path: P
         assert memory.identity(identity_id).name == "Li"  # type: ignore[union-attr]
         assert _asserted_name(memory, identity_id) == "Li"
         assert memory.operations()[0].operation.intent is MemoryIntent.IDENTIFY
+
+
+# ---------------------------------------------------------------------------------------------
+# Consolidation forgetting
+
+
+def test_consolidation_can_retire_the_detail_its_derived_record_replaces(tmp_path: Path) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "consolidation-forgetting", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again, calmly")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    target_ids=(first.id, second.id),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        record = memory.consolidate(evidence_ids=(first.id, second.id)).operations[0]
+        derived_id = record.created_ids[0]
+
+        # One operation, not two: the log shows consolidation forgetting as a CONSOLIDATE row
+        # carrying `forgotten_ids`, distinct from a FORGET intent and from `delete()`.
+        assert record.operation.intent is MemoryIntent.CONSOLIDATE
+        assert set(record.forgotten_ids) == {first.id, second.id}
+        assert [row.operation.intent for row in memory.operations()] == [MemoryIntent.CONSOLIDATE]
+        assert not [hit for hit in memory.search("Ana waited", limit=10) if hit.id == first.id]
+        assert [hit.id for hit in memory.search("patient", limit=10) if hit.id == derived_id]
+        # Lineage survives: the sources are still readable and still cited as evidence.
+        assert memory.get(first.id).forgotten_at == record.applied_at
+        derived = memory.get(derived_id)
+        assert derived.context is not None
+        assert set(derived.context.evidence_ids) == {first.id, second.id}
+
+        assert memory.rollback(record.operation_id) is True
+        assert memory.get(first.id).forgotten_at is None
+        assert memory.get(second.id).forgotten_at is None
+        with pytest.raises(MemoryNotFoundError):
+            memory.get(derived_id)
+
+
+def test_consolidation_cannot_retire_a_record_it_did_not_cite(tmp_path: Path) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "retire-uncited", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "the door closed")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id,),
+                    target_ids=(second.id,),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id))
+
+        assert [reason for _operation, reason in report.rejected] == ["target_not_evidence"]
+        assert memory.get(second.id).forgotten_at is None
+        assert memory.operations() == ()
+
+
+def test_one_pass_may_not_contradict_itself(tmp_path: Path) -> None:
+    """op1 consolidating from A and op2 forgetting A is the reachable form of a stale proposal."""
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "inconsistent", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    proposal=_trait("Ana", "patient"),
+                ),
+                MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(first.id,)),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id))
+
+        assert len(report.operations) == 1
+        assert [reason for _operation, reason in report.rejected] == ["inconsistent_batch"]
+        assert memory.get(first.id).forgotten_at is None
+
+
+def test_one_pass_may_not_build_on_evidence_it_just_retired(tmp_path: Path) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "inconsistent-reverse", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(first.id,)),
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id))
+
+        assert [record.operation.intent for record in report.operations] == [MemoryIntent.FORGET]
+        assert [reason for _operation, reason in report.rejected] == ["inconsistent_batch"]
+
+
+def test_a_correction_and_its_replacement_fit_in_one_pass(tmp_path: Path) -> None:
+    """Update is CORRECT plus CONSOLIDATE in one batch; the consumed-set rule must allow it."""
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "update", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id))
+        wrong_id = report.operations[0].created_ids[0]
+
+        consolidator._scripts.append(
+            (
+                MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(wrong_id,)),
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    proposal=_trait("Ana", "impatient"),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id, wrong_id))
+
+        assert report.rejected == ()
+        assert [record.operation.intent for record in report.operations] == [
+            MemoryIntent.CORRECT,
+            MemoryIntent.CONSOLIDATE,
+        ]
+        replacement = memory.get(report.operations[1].created_ids[0])
+        assert replacement.context is not None and replacement.context.value == "impatient"
+
+
+# ---------------------------------------------------------------------------------------------
+# Trust boundary
+
+
+def test_a_backend_cannot_act_on_a_record_it_was_never_shown(tmp_path: Path) -> None:
+    """A backend shown only A may not forget or correct an unrelated B; the host still may."""
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "unshown", consolidator) as memory:
+        first, hidden = _observations(memory, "Ana waited calmly", "the door closed")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id,),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        derived_id = memory.consolidate(evidence_ids=(first.id,)).operations[0].created_ids[0]
+
+        consolidator._scripts.append(
+            (
+                MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(hidden.id,)),
+                MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(derived_id,)),
+                MemoryOperation(
+                    intent=MemoryIntent.REINFORCE,
+                    target_ids=(derived_id,),
+                    evidence_ids=(first.id,),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id,))
+
+        assert report.operations == ()
+        assert [reason for _operation, reason in report.rejected] == ["target_not_shown"] * 3
+        assert memory.get(hidden.id).forgotten_at is None
+        assert [record.operation.intent for record in memory.operations()] == [
+            MemoryIntent.CONSOLIDATE
+        ]
+
+        # The host names IDs directly and is the authority, so the same target still works.
+        applied = memory.forget((hidden.id,))
+        assert applied is not None and applied.forgotten_ids == (hidden.id,)
+
+
+def test_a_multi_target_operation_applies_all_of_it_or_none(tmp_path: Path) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "all-or-nothing", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        first_pass = memory.consolidate(evidence_ids=(first.id, second.id))
+        derived_id = first_pass.operations[0].created_ids[0]
+
+        consolidator._scripts.append(
+            (
+                # One derived target and one raw observation: the derived half used to be applied
+                # on its own while the log row still listed both.
+                MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(derived_id, first.id)),
+                MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(first.id, "no-such-id")),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id, derived_id))
+
+        assert report.operations == ()
+        assert [reason for _operation, reason in report.rejected] == [
+            "not_derived",
+            "unknown_target",
+        ]
+        assert memory.get(first.id).forgotten_at is None
+        assert [record.operation.intent for record in memory.operations()] == [
+            MemoryIntent.CONSOLIDATE
+        ]
+
+        # An already-forgotten record inside a larger FORGET refuses the whole operation too.
+        assert memory.forget((second.id,)) is not None
+        consolidator._scripts.append(
+            (MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(first.id, second.id)),)
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id, derived_id))
+
+        assert [reason for _operation, reason in report.rejected] == ["already_forgotten"]
+        assert memory.get(first.id).forgotten_at is None
+
+
+def test_a_target_forgotten_between_validation_and_apply_is_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The apply transaction re-checks what validation read; a target that moved is refused."""
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "stale-target", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
+        original = LocalStore.apply_control_operation
+        interleaved: list[str] = []
+
+        def forget_first(
+            self: LocalStore,
+            operation: StoredOperation,
+            **effects: object,
+        ) -> StoredOperation | None:
+            if not interleaved:
+                interleaved.append(first.id)
+                original(
+                    self,
+                    replace(operation, operation_key="interleaved-forget", intent="forget"),
+                    forget_ids=(first.id,),
+                )
+            return cast("StoredOperation | None", cast(Any, original)(self, operation, **effects))
+
+        monkeypatch.setattr(LocalStore, "apply_control_operation", forget_first)
+        consolidator._scripts.append(
+            (MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(first.id, second.id)),)
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id))
+
+        assert report.operations == ()
+        assert [reason for _operation, reason in report.rejected] == ["stale"]
+        # Only the interleaved write stands. The proposal applied nothing -- not even the half it
+        # could still have applied -- and left no log row.
+        assert memory.get(second.id).forgotten_at is None
+        assert [row.operation.intent for row in memory.operations()] == [MemoryIntent.FORGET]
+        assert memory.operations()[0].forgotten_ids == (first.id,)
+
+
+def test_evidence_forgotten_between_validation_and_apply_is_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "stale-evidence", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
+        original = LocalStore.apply_formation
+        interleaved: list[str] = []
+
+        def forget_first(self: LocalStore, *args: object, **kwargs: object) -> bool:
+            if not interleaved:
+                interleaved.append(first.id)
+                self.apply_control_operation(
+                    StoredOperation(
+                        operation_key="interleaved-forget",
+                        intent="forget",
+                        trigger="manual",
+                        operation_json="{}",
+                        applied_at=OCCURRED,
+                    ),
+                    forget_ids=(first.id,),
+                )
+            return cast(bool, cast(Any, original)(self, *args, **kwargs))
+
+        monkeypatch.setattr(LocalStore, "apply_formation", forget_first)
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id))
+
+        assert report.operations == ()
+        assert [reason for _operation, reason in report.rejected] == ["stale"]
+        assert [row.operation_key for row in memory._store.read_operations()] == [
+            "interleaved-forget"
+        ]
+
+
+# ---------------------------------------------------------------------------------------------
+# Durable triggers
+
+
+class DispositionFormer:
+    """Forms one model-inferred trait per observation, the way the fast path does."""
+
+    formation_capabilities = ATOMIC_MODALITIES
+    formation_model = "former-test"
+    formation_space = "former-test:v1"
+
+    def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+        return tuple((_trait("Ana", "patient"),) for _input in inputs)
+
+    def close(self) -> None:
+        pass
+
+
+def test_formed_evidence_no_operation_has_weighed_is_a_durable_candidate(tmp_path: Path) -> None:
+    with _memory(tmp_path / "due-evidence", former=DispositionFormer()) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
+
+        due = memory.consolidation_candidates()
+        evidence = [row for row in due if row.trigger is MemoryTrigger.EVIDENCE]
+
+        assert len(evidence) == 1
+        candidate = evidence[0]
+        assert candidate.evidence_count == 2
+        assert set(candidate.memory_ids) >= {first.id, second.id}
+        assert candidate.memory_ids[0] not in {first.id, second.id}
+        with pytest.raises(ValidationError):
+            memory.consolidation_candidates(limit=0)
+
+
+def test_a_forgotten_source_stops_supporting_the_candidate_it_formed(tmp_path: Path) -> None:
+    with _memory(tmp_path / "forgotten-source", former=DispositionFormer()) as memory:
+        (first,) = _observations(memory, "Ana waited calmly")
+        assert [row for row in memory.consolidation_candidates() if first.id in row.memory_ids]
+
+        memory.forget([first.id])
+
+        # `consolidate()` reads the shown records with `active_only=True`, so a candidate naming a
+        # forgotten source would ask the backend to weigh evidence it is never shown, and count it.
+        assert [
+            row
+            for row in memory.consolidation_candidates()
+            if row.trigger is MemoryTrigger.EVIDENCE and first.id in row.memory_ids
+        ] == []
+
+
+def test_a_deliberated_candidate_leaves_the_queue_until_new_evidence_arrives(
+    tmp_path: Path,
+) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "settled", consolidator, former=DispositionFormer()) as memory:
+        (first,) = _observations(memory, "Ana waited calmly")
+        candidate = memory.consolidation_candidates()[0]
+        derived_id = candidate.memory_ids[0]
+        assert first.id in candidate.memory_ids
+
+        consolidator._scripts.append(
+            (MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(derived_id,)),)
+        )
+        applied = memory.consolidate(
+            evidence_ids=candidate.memory_ids,
+            trigger=candidate.trigger,
+        )
+
+        assert len(applied.operations) == 1
+        assert applied.operations[0].trigger is MemoryTrigger.EVIDENCE
+        # The derived record's evidence now predates the operation that weighed it.
+        assert [
+            row for row in memory.consolidation_candidates() if row.memory_ids[0] == derived_id
+        ] == []
+
+
+def test_feedback_and_contradiction_are_derived_from_state_the_store_already_holds(
+    tmp_path: Path,
+) -> None:
+    from mindbridge.context import _CONFLICT_KINDS
+    from mindbridge.infrastructure.local.store import _CONFLICT_KINDS as _STORE_CONFLICT_KINDS
+
+    # One infrastructure copy of the compiler's rule; they must not drift apart.
+    assert set(_STORE_CONFLICT_KINDS) == {kind.value for kind in _CONFLICT_KINDS}
+
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "due-feedback", consolidator) as memory:
+        sources = _observations(
+            memory,
+            "Ana waited calmly",
+            "Ana waited again, calmly",
+            "Ana snapped at the delay",
+            "Ana snapped again at the delay",
+        )
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(sources[0].id, sources[1].id),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        memory.consolidate(evidence_ids=(sources[0].id, sources[1].id))
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(sources[2].id, sources[3].id),
+                    proposal=_trait("Ana", "impatient"),
+                ),
+            )
+        )
+        memory.consolidate(evidence_ids=(sources[2].id, sources[3].id))
+        memory.reinforce((sources[0].id,))
+
+        due = memory.consolidation_candidates()
+        by_trigger = {row.trigger: row for row in due}
+
+        contradiction = by_trigger[MemoryTrigger.CONTRADICTION]
+        assert contradiction.evidence_count == 2
+        assert len(contradiction.memory_ids) == 2
+        feedback = by_trigger[MemoryTrigger.FEEDBACK]
+        assert feedback.memory_ids == (sources[0].id,)
+        assert feedback.evidence_count == 1
+
+
+def test_a_concurrent_duplicate_is_refused_inside_the_transaction(tmp_path: Path) -> None:
+    """The caller's pre-check can lose a race; the write path must still refuse, not raise."""
+    applied_at = datetime(2026, 3, 2, tzinfo=timezone.utc)
+    pending = StoredOperation(
+        operation_key="shared-key",
+        intent="consolidate",
+        trigger="evidence",
+        operation_json="{}",
+        applied_at=applied_at,
+    )
+    with LocalStore(tmp_path / "race") as store:
+        assert (
+            store.apply_formation(
+                (),
+                (),
+                evidence=(),
+                source_memory_ids=(),
+                recipe="consolidator-test:v1",
+                completed_at=applied_at,
+                operation=pending,
+            )
+            is True
+        )
+        assert (
+            store.apply_formation(
+                (),
+                (),
+                evidence=(),
+                source_memory_ids=(),
+                recipe="consolidator-test:v1",
+                completed_at=applied_at,
+                operation=replace(pending, model_id="other"),
+            )
+            is False
+        )
+        assert len(store.read_operations()) == 1
+
+
+# ---------------------------------------------------------------------------------------------
+# Replay
+
+
+class Replayer:
+    """Replays whatever the log recorded for the evidence set it is shown."""
+
+    consolidation_model = "consolidator-test"
+    consolidation_recipe = "consolidator-test:v1"
+
+    def __init__(self, logged: Sequence[MemoryOperationRecord]) -> None:
+        self._logged = tuple(logged)
+
+    def consolidate(
+        self,
+        evidence: Sequence[MemoryRecord],
+        *,
+        trigger: MemoryTrigger,
+    ) -> tuple[MemoryOperation, ...]:
+        shown = {record.id for record in evidence}
+        return tuple(
+            row.operation for row in self._logged if set(row.operation.evidence_ids) <= shown
+        )
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_logged_operation_sequence_replays_against_a_fresh_store(tmp_path: Path) -> None:
+    """Gate 3's replay item: the log alone is enough to reproduce the derived state.
+
+    `applied_at` is re-stamped at replay, so transaction times differ by construction. What the
+    log is supposed to determine -- the operation keys, the derived IDs, and the evidence
+    lineage -- does not depend on it.
+    """
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "origin", consolidator) as origin:
+        first, second, third = _observations(
+            origin,
+            "Ana waited calmly",
+            "Ana waited again, calmly",
+            "Ana waited a third time",
+        )
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    target_ids=(second.id,),
+                    proposal=_trait("Ana", "patient"),
+                    rationale="two independent waits",
+                ),
+            )
+        )
+        origin.consolidate(evidence_ids=(first.id, second.id))
+        logged = tuple(reversed(origin.operations()))
+        recorded = [
+            (row.operation.intent, row.created_ids, row.changed_ids, row.forgotten_ids)
+            for row in logged
+        ]
+        keys = [operation_key(row.operation, recipe=row.recipe) for row in logged]
+
+    with _memory(tmp_path / "replayed", Replayer(logged)) as replayed:
+        sources = _observations(
+            replayed,
+            "Ana waited calmly",
+            "Ana waited again, calmly",
+            "Ana waited a third time",
+        )
+        # Content-addressed identity: the same observations get the same IDs in a fresh store.
+        assert [record.id for record in sources] == [first.id, second.id, third.id]
+        report = replayed.consolidate(evidence_ids=(first.id, second.id))
+
+        assert report.rejected == ()
+        replayed_log = tuple(reversed(replayed.operations()))
+        assert [
+            (row.operation.intent, row.created_ids, row.changed_ids, row.forgotten_ids)
+            for row in replayed_log
+        ] == recorded
+        assert [operation_key(row.operation, recipe=row.recipe) for row in replayed_log] == keys
+        derived = replayed.get(report.operations[0].created_ids[0])
+        assert derived.context is not None
+        assert set(derived.context.evidence_ids) == {first.id, second.id}
+        assert replayed.get(second.id).forgotten_at is not None
+
+
+# ---------------------------------------------------------------------------------------------
+# Lineage supersession
+
+
+def _state(value: str, *, valid_from: datetime) -> FormationProposal:
+    """A STATE proposal: the kind whose lineage rule supersedes the claim it replaces."""
+    return FormationProposal(
+        kind=MemoryKind.STATE,
+        content=f"Ana is in the {value}",
+        subject="Ana",
+        predicate="location",
+        value=value,
+        confidence=0.9,
+        valid_from=valid_from,
+    )
+
+
+def _consolidate_state(
+    memory: Memory,
+    consolidator: ScriptedConsolidator,
+    source: MemoryRecord,
+    value: str,
+) -> MemoryOperationRecord:
+    consolidator._scripts.append(
+        (
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE,
+                evidence_ids=(source.id,),
+                proposal=_state(value, valid_from=OCCURRED),
+            ),
+        )
+    )
+    return memory.consolidate(evidence_ids=(source.id,)).operations[0]
+
+
+def test_lineage_supersession_is_logged_and_reversed(tmp_path: Path) -> None:
+    """The kernel's own lineage rule reaches records the backend was never shown.
+
+    That is deliberate -- it is a deterministic kernel effect, not a backend choice -- but it
+    used to be invisible in the log and irreversible, so `rollback()` left the lineage with the
+    superseded claim still retired and nothing standing in its place.
+    """
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "supersession", consolidator) as memory:
+        first, second = _observations(memory, "Ana is in the kitchen", "Ana moved to the garden")
+        kitchen = _consolidate_state(memory, consolidator, first, "kitchen")
+        kitchen_id = kitchen.created_ids[0]
+        assert kitchen.superseded == ()
+
+        garden = _consolidate_state(memory, consolidator, second, "garden")
+
+        # The second pass only ever saw `second`; the record it superseded was never shown.
+        assert consolidator.calls[-1][0] == (second.id,)
+        assert garden.superseded == ((kitchen_id, 1),)
+        retired = memory.get(kitchen_id)
+        assert retired.context is not None and retired.context.retired_at is not None
+        assert not [hit for hit in memory.search("kitchen", limit=10) if hit.id == kitchen_id]
+
+        assert memory.rollback(garden.operation_id) is True
+        restored = memory.get(kitchen_id)
+        assert restored.context is not None and restored.context.retired_at is None
+        assert [hit.id for hit in memory.search("kitchen", limit=10) if hit.id == kitchen_id]
+        with pytest.raises(MemoryNotFoundError):
+            memory.get(garden.created_ids[0])
+        assert memory.operations()[0].rolled_back_at is not None
+
+
+def test_operations_on_one_lineage_reverse_newest_first(tmp_path: Path) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "supersession-order", consolidator) as memory:
+        first, second, third = _observations(
+            memory,
+            "Ana is in the kitchen",
+            "Ana moved to the garden",
+            "Ana moved to the hall",
+        )
+        kitchen = _consolidate_state(memory, consolidator, first, "kitchen")
+        garden = _consolidate_state(memory, consolidator, second, "garden")
+        hall = _consolidate_state(memory, consolidator, third, "hall")
+        assert garden.superseded == ((kitchen.created_ids[0], 1),)
+        assert hall.superseded == ((garden.created_ids[0], 1),)
+
+        # Reversing the middle operation first would restore the kitchen claim beside the hall
+        # claim and delete the record the hall claim supersedes. Refused, and nothing moves.
+        assert memory.rollback(garden.operation_id) is False
+        assert memory.get(kitchen.created_ids[0]).context is not None
+        assert memory.get(kitchen.created_ids[0]).context.retired_at is not None  # type: ignore[union-attr]
+        assert memory.get(garden.created_ids[0]) is not None
+        logged = {row.operation_id: row.rolled_back_at for row in memory.operations()}
+        assert logged[garden.operation_id] is None
+
+        assert memory.rollback(hall.operation_id) is True
+        current = memory.get(garden.created_ids[0])
+        assert current.context is not None and current.context.retired_at is None
+
+        assert memory.rollback(garden.operation_id) is True
+        oldest = memory.get(kitchen.created_ids[0])
+        assert oldest.context is not None and oldest.context.retired_at is None
+        assert [
+            hit.id for hit in memory.search("kitchen", limit=10) if hit.id == kitchen.created_ids[0]
+        ]
+
+
+def test_reinforcement_refuses_a_target_a_correction_already_retired(tmp_path: Path) -> None:
+    """A retired claim is not a standing derived claim, in this pass or an earlier one."""
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "reinforce-retired", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id,),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        derived_id = memory.consolidate(evidence_ids=(first.id,)).operations[0].created_ids[0]
+
+        # One pass. The CORRECT commits first, so the REINFORCE behind it names a claim this
+        # very pass withdrew; the batch guard used to compare only evidence against retirals.
+        consolidator._scripts.append(
+            (
+                MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(derived_id,)),
+                MemoryOperation(
+                    intent=MemoryIntent.REINFORCE,
+                    target_ids=(derived_id,),
+                    evidence_ids=(second.id,),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id, derived_id))
+
+        assert [row.operation.intent for row in report.operations] == [MemoryIntent.CORRECT]
+        assert [reason for _operation, reason in report.rejected] == ["inconsistent_batch"]
+
+        # A later pass cannot see the retiral in a batch, so the target itself is checked.
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.REINFORCE,
+                    target_ids=(derived_id,),
+                    evidence_ids=(second.id,),
+                ),
+            )
+        )
+        later = memory.consolidate(evidence_ids=(first.id, second.id, derived_id))
+
+        assert later.operations == ()
+        assert [reason for _operation, reason in later.rejected] == ["not_derived"]
+        unchanged = memory.get(derived_id)
+        assert unchanged.context is not None
+        assert unchanged.context.evidence_ids == (first.id,)
+
+
+def test_a_reinforce_target_corrected_between_validation_and_apply_is_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The version check belongs to REINFORCE, not to every caller of the apply transaction."""
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "stale-retired", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id,),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        derived_id = memory.consolidate(evidence_ids=(first.id,)).operations[0].created_ids[0]
+        original = LocalStore.apply_control_operation
+        interleaved: list[str] = []
+
+        def correct_first(
+            self: LocalStore,
+            operation: StoredOperation,
+            **effects: object,
+        ) -> StoredOperation | None:
+            if not interleaved:
+                interleaved.append(derived_id)
+                original(
+                    self,
+                    replace(operation, operation_key="interleaved-correct", intent="correct"),
+                    correct_ids=(derived_id,),
+                )
+            return cast("StoredOperation | None", cast(Any, original)(self, operation, **effects))
+
+        monkeypatch.setattr(LocalStore, "apply_control_operation", correct_first)
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.REINFORCE,
+                    target_ids=(derived_id,),
+                    evidence_ids=(second.id,),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(second.id, derived_id))
+
+        assert report.operations == ()
+        assert [reason for _operation, reason in report.rejected] == ["stale"]
+        assert memory._store.read_operations()[0].operation_key == "interleaved-correct"
+        # Two rows: the first consolidation and the interleaved correction. The refused
+        # reinforcement wrote nothing at all.
+        assert len(memory.operations()) == 2
+        supported = memory.get(derived_id)
+        assert supported.context is not None
+        assert supported.context.evidence_ids == (first.id,)
+        # The host may still forget an already-corrected record: `require_active` stays loose.
+        assert memory.forget((derived_id,)) is not None
+
+
+def test_a_query_gathered_window_is_never_widened(tmp_path: Path) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "query-window", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "the kettle boiled")
+        gathered = memory.search("Ana waited calmly", limit=1)[0].id
+        outside = second.id if gathered == first.id else first.id
+        consolidator._scripts.append(
+            (MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(outside,)),)
+        )
+        report = memory.consolidate(query="Ana waited calmly", limit=1)
+
+        # A query gathers the shown set and nothing else: with no host `evidence_ids`, the window
+        # is exactly what the backend saw.
+        assert [shown for shown, _trigger in consolidator.calls] == [(gathered,)]
+        assert report.operations == ()
+        assert [reason for _operation, reason in report.rejected] == ["target_not_shown"]
+        assert memory.get(outside).forgotten_at is None
+        assert memory.operations() == ()

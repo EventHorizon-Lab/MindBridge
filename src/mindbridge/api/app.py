@@ -37,6 +37,7 @@ from mindbridge.types import (
     ContentInput,
     ContextBudget,
     ContextBundle,
+    ContextUnknownKind,
     MemoryCapabilities,
     MemoryContext,
     MemoryRecord,
@@ -59,6 +60,7 @@ _BodyMemoryId = Annotated[str, StringConstraints(min_length=1, pattern=r"^\S(?:.
 _Chars = Annotated[int, Field(strict=True, ge=1, le=MAX_TEXT_CHARACTERS)]
 _Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 _Seconds = Annotated[float, Field(gt=0.0)]
+_Milliseconds = Annotated[int, Field(strict=True, ge=1)]
 # Budget defaults are read from the SDK value, so the published transport default cannot drift
 # from `ContextBudget`.
 _BUDGET = ContextBudget()
@@ -122,6 +124,7 @@ class ContextBudgetRequest(StrictModel):
     min_confidence: _Confidence = _BUDGET.min_confidence
     # `ContextBudget.freshness` is a timedelta; JSON carries the same bound as seconds.
     freshness_seconds: _Seconds | None = None
+    max_latency_ms: _Milliseconds | None = None
 
 
 class ContextRequest(StrictModel):
@@ -194,6 +197,7 @@ class ContextBudgetResponse(_ResponseModel):
     memory_types: tuple[MemoryType, ...] | None
     min_confidence: float
     freshness_seconds: float | None
+    max_latency_ms: int | None
 
 
 class ContextConflictResponse(_ResponseModel):
@@ -209,6 +213,11 @@ class ProvisionalActorResponse(_ResponseModel):
     memory_ids: tuple[str, ...]
 
 
+class ContextUnknownResponse(_ResponseModel):
+    kind: ContextUnknownKind
+    detail: str
+
+
 class ContextBundleResponse(_ResponseModel):
     goal: str
     reference_at: AwareDatetime
@@ -216,17 +225,23 @@ class ContextBundleResponse(_ResponseModel):
     # A recognized person in the evidence whom no visible naming assertion names is reported
     # here beside the ranked entity hits, labelled, rather than omitted.
     actors: tuple[SearchHitResponse | ProvisionalActorResponse, ...]
+    relationships: tuple[SearchHitResponse, ...]
+    scene: tuple[SearchHitResponse, ...]
     episodes: tuple[SearchHitResponse, ...]
     facts: tuple[SearchHitResponse, ...]
     procedures: tuple[SearchHitResponse, ...]
     affect: tuple[SearchHitResponse, ...]
     traits: tuple[SearchHitResponse, ...]
     conflicts: tuple[ContextConflictResponse, ...]
+    unknowns: tuple[ContextUnknownResponse, ...]
     occurred_from: AwareDatetime | None
     occurred_until: AwareDatetime | None
     frames: tuple[str, ...]
+    places: tuple[str, ...]
     omitted: int
     chars: int
+    elapsed_ms: int
+    deadline_exceeded: bool
     # The deterministic text of `ContextBundle.render()`, so a caller need not re-derive it.
     rendered: str
 
@@ -256,6 +271,9 @@ class CapabilitiesResponse(_ResponseModel):
     consolidation_model: str | None
     speaker_recognition: bool
     streaming_generation: bool
+    # Derived from the backends above, not declared: which optional operations this composition
+    # can serve. `MemoryCapabilities.document()` is the one place that derivation happens.
+    operations: tuple[str, ...]
 
 
 class HealthResponse(BaseModel):
@@ -576,6 +594,7 @@ def _context_budget(request: ContextBudgetRequest | None) -> ContextBudget | Non
             if request.freshness_seconds is None
             else timedelta(seconds=request.freshness_seconds)
         ),
+        max_latency_ms=request.max_latency_ms,
     )
 
 
@@ -598,19 +617,26 @@ def _bundle_response(bundle: ContextBundle) -> ContextBundleResponse:
                     if bundle.budget.freshness is None
                     else bundle.budget.freshness.total_seconds()
                 ),
+                "max_latency_ms": bundle.budget.max_latency_ms,
             },
             "actors": bundle.actors,
+            "relationships": bundle.relationships,
+            "scene": bundle.scene,
             "episodes": bundle.episodes,
             "facts": bundle.facts,
             "procedures": bundle.procedures,
             "affect": bundle.affect,
             "traits": bundle.traits,
             "conflicts": bundle.conflicts,
+            "unknowns": bundle.unknowns,
             "occurred_from": bundle.occurred_from,
             "occurred_until": bundle.occurred_until,
             "frames": bundle.frames,
+            "places": bundle.places,
             "omitted": bundle.omitted,
             "chars": bundle.chars,
+            "elapsed_ms": bundle.elapsed_ms,
+            "deadline_exceeded": bundle.deadline_exceeded,
             "rendered": bundle.render(),
         }
     )
@@ -643,16 +669,8 @@ def _search(service: _Memory, request: QueryRequest) -> SearchResponse:
 
 
 def _capabilities_response(capabilities: MemoryCapabilities) -> CapabilitiesResponse:
-    """Serialize declared capabilities, ordering modality sets so the document is stable."""
-    values: dict[str, object] = {}
-    for name in CapabilitiesResponse.model_fields:
-        value = getattr(capabilities, name)
-        values[name] = (
-            tuple(sorted(value, key=lambda modality: modality.value))
-            if isinstance(value, frozenset)
-            else value
-        )
-    return CapabilitiesResponse.model_validate(values)
+    """Serialize the one capability document MCP and the CLI publish too."""
+    return CapabilitiesResponse.model_validate(capabilities.document())
 
 
 def _headers(scope: Scope) -> list[tuple[bytes, bytes]]:

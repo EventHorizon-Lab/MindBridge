@@ -40,6 +40,9 @@ from opentelemetry.trace import Span, Tracer
 from opentelemetry.util.types import AttributeValue
 
 from mindbridge._telemetry import (
+    CAPTURE_FAILED,
+    CAPTURE_SETTLED,
+    CAPTURE_TIME_TO_SEARCHABLE,
     EMBEDDING_PARTS_ELIDED,
     IDENTITY_CACHED,
     IDENTITY_CREATED,
@@ -84,6 +87,7 @@ from mindbridge.infrastructure.local.store import (
     IndexDocument,
     LocalStore,
     SpeechRollback,
+    StaleOperationError,
     StoredAsset,
     StoredEmbedding,
     StoredMemory,
@@ -122,11 +126,14 @@ from mindbridge.types import (
     AudioBoundary,
     AudioStreamPacket,
     Blob,
+    ConsolidationCandidate,
     ConsolidationReport,
     ContentAtom,
     ContentInput,
     ContextBudget,
     ContextBundle,
+    ContextUnknown,
+    ContextUnknownKind,
     EvidenceBasis,
     FaceObservation,
     FormationProposal,
@@ -147,6 +154,7 @@ from mindbridge.types import (
     ObservationContext,
     Page,
     PCMChunk,
+    PendingCapture,
     PrefetchResult,
     RetrievalCandidateTrace,
     RetrievalRejection,
@@ -543,6 +551,11 @@ class Memory:
         self._owner_pid = os.getpid()
         self._write_lock = RLock()
         self._formation_lock = RLock()
+        # Settlement is the one path that runs the expensive model stages over rows another
+        # caller can already see queued, so two threads would otherwise embed the same record
+        # twice and discover it only at the commit. Blocking, like the other two: a second
+        # `settle()` waits and then finds the queue already drained.
+        self._settle_lock = RLock()
         self._lifecycle = Condition()
         self._active_operations = 0
         self._closing = False
@@ -811,10 +824,37 @@ class Memory:
             )
             record = self._add_prepared((prepared,), operation=assets)[0]
             self._form_sources((record,), operation=assets)
+            self._complete_formation((record,))
             return record
 
     def _add_stream_input(self, item: StreamInput) -> MemoryRecord:
         return self._add_one(
+            item.content,
+            occurred_at=item.occurred_at,
+            occurred_end=item.occurred_end,
+            metadata=item.metadata,
+            memory_type=item.memory_type,
+            context=item.context,
+            transcript=item.transcript,
+            description=item.description,
+        )
+
+    def _stream_record(
+        self,
+        content: ContentInput | StreamInput,
+        *,
+        capture: bool,
+    ) -> MemoryRecord:
+        if isinstance(content, StreamInput):
+            if capture:
+                return self._capture_stream_input(content)
+            return self._add_stream_input(content)
+        if capture:
+            return self.capture(content)
+        return self.add(content)
+
+    def _capture_stream_input(self, item: StreamInput) -> MemoryRecord:
+        return self._capture_one(
             item.content,
             occurred_at=item.occurred_at,
             occurred_end=item.occurred_end,
@@ -885,6 +925,7 @@ class Memory:
                 return ()
             records = self._add_prepared(prepared, operation=assets)
             self._form_sources(records, operation=assets)
+            self._complete_formation(records)
             return records
 
     def capture(
@@ -902,12 +943,44 @@ class Memory:
         The returned record is the content-addressed record `add()` returns for the same input, so
         capturing and then adding the same content is one memory. It is durable and readable
         through `get()` and `list()` immediately and invisible to `search()` until settled.
+
+        `settle()` appends the text its models derive to `content`; it never rewrites what the
+        caller supplied. See `MemoryRecord` for how derived sections are marked and where the raw
+        evidence lives.
         """
+        return self._capture_one(
+            content,
+            occurred_at=occurred_at,
+            occurred_end=occurred_end,
+            metadata=metadata,
+            memory_type=memory_type,
+            context=context,
+        )
+
+    def _capture_one(
+        self,
+        content: ContentInput,
+        *,
+        occurred_at: datetime | None,
+        occurred_end: datetime | None,
+        metadata: Mapping[str, object] | None,
+        memory_type: MemoryType,
+        context: ObservationContext | None,
+        transcript: str | None = None,
+        description: str | None = None,
+    ) -> MemoryRecord:
         with self._trace("mindbridge.capture", kind="operation"), self._operation() as assets:
             if self._former is not None and context is None:
                 context = ObservationContext()
             with self._trace("mindbridge.content.prepare", kind="stage"):
                 prepared_content = self._prepare_content(content, assets)
+                # Folded in here, exactly as `_add_one` folds them, so a streaming FINAL that
+                # already carries ASR or caption text keeps the same content-addressed ID on
+                # either commit path and `settle()` sees the marker instead of paying again.
+                if transcript is not None:
+                    prepared_content = _with_stream_transcript(prepared_content, transcript)
+                if description is not None:
+                    prepared_content = _with_stream_description(prepared_content, description)
             prepared = _prepare_memory(
                 prepared_content,
                 occurred_at=occurred_at,
@@ -915,6 +988,18 @@ class Memory:
                 metadata=metadata,
                 memory_type=memory_type,
                 context=context,
+            )
+            # Reject here what `add()` would reject, before the commit. Committing media no
+            # configured model can ever take would make the record durable and then fail every
+            # `settle()` forever, which is a queue entry no retry ceiling should have to absorb.
+            # Unconditional: `add()` rejects twice, once early and once inside
+            # `_embedding_content`, so guarding this on one capability would miss the second.
+            # With an embedder that takes everything it is a no-op.
+            _fallback_unsupported(
+                prepared.content,
+                self._embedding_capabilities,
+                "embedding",
+                rescuable=self._deferred_rescue(prepared.content.assets),
             )
             now = datetime.now(timezone.utc)
             # No index lock: a capture enqueues no vectors, so it has no outbox work to drain and
@@ -951,34 +1036,108 @@ class Memory:
             assets.persisted.update(asset.asset_id for asset in authoritative[0].assets)
             return self._memory_record(authoritative[0])
 
-    def settle(self, *, limit: int = 100) -> int:
-        """Enrich, embed, index, and form up to `limit` captured records in enqueue order."""
-        with self._trace("mindbridge.settle", kind="operation"), self._operation() as assets:
-            _limit(limit, maximum=100)
-            with _translate_storage_errors("read the capture queue"):
-                queued = self._store.pending_captures(limit=limit)
-            if not queued:
-                return 0
-            with _translate_storage_errors("hydrate captured memories"):
-                rows = self._store.read_memories(queued)
-            return self._settle_stored(rows, operation=assets)
+    def settle(
+        self,
+        *,
+        limit: int = 100,
+        max_attempts: int = 3,
+        memory_ids: Sequence[str] | None = None,
+    ) -> int:
+        """Enrich, embed, index, and form up to `limit` captured records in enqueue order.
 
-    def pending_captures(self) -> int:
-        """Return how many captured records are still waiting for `settle()`."""
+        Every readable record is attempted: a failing one keeps its queue row, its attempt count,
+        and its reason, and the records behind it still settle. The first failure is raised once
+        the batch is done, with `subject` naming its record; the rest are readable through
+        `pending_captures()`. A record that has already failed `max_attempts` times is skipped
+        rather than retried, so one poisoned capture cannot block the queue forever. It stays
+        queued and visible, and raising the ceiling is what retries it.
+
+        Pass `memory_ids` to settle only those records. Naming a record is the host asking for it
+        by hand, so the retry ceiling does not apply and `max_attempts` is ignored: that is how a
+        record parked at the ceiling is retried, quarantined by simply never being named, or
+        settled ahead of the queue. IDs that are not queued are skipped.
+
+        One settlement runs at a time per `Memory`. A concurrent call waits rather than paying
+        for the same model work twice, and usually then finds the queue already drained.
+        """
+        with (
+            self._trace("mindbridge.settle", kind="operation") as span,
+            self._operation() as assets,
+        ):
+            _limit(limit, maximum=100)
+            if (
+                isinstance(max_attempts, bool)
+                or not isinstance(max_attempts, int)
+                or max_attempts < 1
+            ):
+                raise ValidationError("max_attempts must be a positive integer")
+            memory_ids = _memory_id_filter(memory_ids)
+            with self._settle_lock:
+                with _translate_storage_errors("read the capture queue"):
+                    # Same filter `pending_captures()` publishes, so naming records reuses the
+                    # queue read rather than adding a second way to select them.
+                    queued = self._store.pending_captures(
+                        limit=limit,
+                        memory_ids=memory_ids,
+                        max_attempts=None if memory_ids is not None else max_attempts,
+                    )
+                span.set_attribute(CAPTURE_SETTLED, 0)
+                span.set_attribute(CAPTURE_FAILED, 0)
+                if not queued:
+                    return 0
+                with _translate_storage_errors("hydrate captured memories"):
+                    rows = self._store.read_memories(tuple(row.memory_id for row in queued))
+                settled, failures = self._settle_stored(rows, operation=assets)
+                span.set_attribute(CAPTURE_SETTLED, len(settled))
+                span.set_attribute(CAPTURE_FAILED, len(failures))
+            enqueued_at = {row.memory_id: row.enqueued_at for row in queued}
+            now = datetime.now(timezone.utc)
+            waits = tuple(
+                (now - enqueued_at[memory_id]).total_seconds() * 1000.0 for memory_id in settled
+            )
+            if waits:
+                span.set_attribute(CAPTURE_TIME_TO_SEARCHABLE, max(waits))
+            if failures:
+                raise failures[0]
+            return len(settled)
+
+    def pending_captures(
+        self,
+        *,
+        limit: int = 100,
+        memory_ids: Sequence[str] | None = None,
+    ) -> tuple[PendingCapture, ...]:
+        """Return up to `limit` records whose deferred work is not finished, oldest first.
+
+        With a formation backend, `add()` holds a row between its commit and formation, so a
+        queued record may already be searchable and owe formation only. Pass `memory_ids` to ask
+        whether specific records are still waiting: one that is absent from the result is not
+        pending, which means it is settled or was never stored, and `get()` tells the two apart.
+        """
         with (
             self._trace("mindbridge.pending_captures", kind="operation"),
             self._operation(),
-            _translate_storage_errors("count the capture queue"),
         ):
-            return self._store.pending_capture_count()
+            _limit(limit, maximum=100)
+            memory_ids = _memory_id_filter(memory_ids)
+            with _translate_storage_errors("read the capture queue"):
+                return self._store.pending_captures(limit=limit, memory_ids=memory_ids)
 
     def add_stream(
         self,
         contents: Iterable[ContentInput | StreamInput],
+        *,
+        capture: bool = False,
     ) -> Iterator[MemoryRecord]:
-        """Add a lazy omni stream one durable, searchable observation at a time."""
+        """Add a lazy omni stream one durable, searchable observation at a time.
+
+        With `capture=True` each item commits through `capture()` instead: every yielded record is
+        durable and readable but has no vectors, so the stream keeps its acknowledgement off the
+        model path and the host owes the matching `settle()` before anything is searchable.
+        """
         if isinstance(contents, (str, bytes, Path, Blob, AssetRef, Mapping)):
             raise ValidationError("contents must be an iterable of memory inputs")
+        capture = _capture_flag(capture)
         try:
             iterator = iter(contents)
         except TypeError:
@@ -994,10 +1153,7 @@ class Memory:
                     error.subject = f"contents[{index}]"
                 raise
             try:
-                if isinstance(content, StreamInput):
-                    record = self._add_stream_input(content)
-                else:
-                    record = self.add(content)
+                record = self._stream_record(content, capture=capture)
             except MindBridgeError as error:
                 if error.subject is None:
                     error.subject = f"contents[{index}]"
@@ -1206,6 +1362,9 @@ class Memory:
     ) -> ContextBundle:
         """Compile one bounded, structured context bundle for a goal."""
         with self._trace("mindbridge.compile", kind="operation"), self._operation() as assets:
+            # Taken before anything else, so `budget.max_latency_ms` bounds the compilation a
+            # caller waits for rather than the selection pass alone.
+            started_at = perf_counter()
             budget = ContextBudget() if budget is None else budget
             if not isinstance(budget, ContextBudget):
                 raise ValidationError("budget must be a ContextBudget")
@@ -1218,13 +1377,14 @@ class Memory:
                 explicit_reference or datetime.now(timezone.utc),
                 infer_reference=explicit_reference is None,
             )
+            # `_limit` bounds what a caller may ask a public search to return, not how deep the
+            # kernel ranks, so `_search_prepared` has no ceiling of its own and a bundle may rank
+            # past one hundred. Three candidates per slot is the same headroom `ask()` gives its
+            # modality round robin.
+            candidate_limit = max(_RERANK_CANDIDATES, budget.max_items * 3)
             outcome = self._search_prepared(
                 prepared,
-                # `_limit` bounds what a caller may ask a public search to return, not how deep
-                # the kernel ranks, so `_search_prepared` has no ceiling of its own and a bundle
-                # may rank past one hundred. Three candidates per slot is the same headroom
-                # `ask()` gives its modality round robin.
-                limit=max(_RERANK_CANDIDATES, budget.max_items * 3),
+                limit=candidate_limit,
                 operation=assets,
                 # The budget filters memory types itself, because it selects a set rather than
                 # the one type the retrieval plane can push into the index.
@@ -1237,12 +1397,17 @@ class Memory:
                 require_unambiguous=False,
                 capture_trace=False,
             )
+            # The same transcript cache `search()` writes for a spoken query. It is a cache of
+            # the query's own audio, not a memory: `compile()` stores nothing it retrieved.
             self._persist_transcripts(assets)
             return compile_context(
                 prepared.text,
                 outcome.hits,
                 budget=budget,
                 reference_at=reference,
+                started_at=started_at,
+                unknowns=self._request_unknowns(prepared, scope, outcome.hits),
+                candidate_limit=candidate_limit,
                 provisional=self._provisional_identities(outcome.hits),
             )
 
@@ -1257,6 +1422,36 @@ class Memory:
         with _translate_storage_errors("read provisional identities"):
             return self._store.provisional_identities(tuple(hit.id for hit in hits))
 
+    def _request_unknowns(
+        self,
+        prepared: _PreparedContent,
+        scope: RetrievalScope | None,
+        hits: Sequence[SearchHit],
+    ) -> tuple[ContextUnknown, ...]:
+        """Name what the request asked for that the compiler cannot see in the hits alone."""
+        unknowns: list[ContextUnknown] = []
+        unsupported = sorted(
+            {
+                asset.modality
+                for asset in prepared.assets
+                if Modality(asset.modality) not in self._embedding_capabilities
+            }
+        )
+        if unsupported:
+            unknowns.append(
+                ContextUnknown(
+                    kind=ContextUnknownKind.MODALITY_UNSUPPORTED,
+                    detail=(
+                        f"the goal's {', '.join(unsupported)} was not embedded natively;"
+                        f" embedding accepts {_modality_names(self._embedding_capabilities)},"
+                        " so only derived text could have matched"
+                    ),
+                )
+            )
+        if not hits and (described := _scope_description(scope)) is not None:
+            unknowns.append(ContextUnknown(kind=ContextUnknownKind.SCOPE_EMPTY, detail=described))
+        return tuple(unknowns)
+
     @property
     def capabilities(self) -> MemoryCapabilities:
         """What this composition supports, from the same declarations routing reads.
@@ -1264,28 +1459,14 @@ class Memory:
         Published so a caller does not have to construct a probe write to find out, and so a
         transport can report the composition instead of a bare liveness flag.
         """
-        return MemoryCapabilities(
-            embedding=self._embedding_capabilities,
-            embedding_model=self._embedding_model,
-            embedding_space=self._space_id,
-            embedding_dimension=self._embedding_dimension,
-            generation=self._generation_capabilities,
-            transcription=self._transcription_capabilities,
-            vision=self._vision_capabilities,
-            face=self._face_capabilities,
-            formation=self._formation_capabilities,
-            # The contracts substitute a `"none"` sentinel for an absent backend because the
-            # space and recipe digests hash these strings. That sentinel is an implementation
-            # detail, so the published value is absent when the backend is, keyed on the backend
-            # itself rather than on the string -- a real model could be named "none".
-            generation_model=getattr(self._answerer, "generation_model", None),
-            transcription_space=(None if self._transcriber is None else self._transcription_space),
-            vision_model=None if self._vision_describer is None else self._vision_model,
-            face_model=None if self._face_analyzer is None else self._face_model,
-            formation_model=None if self._former is None else self._formation_model,
-            consolidation_model=(None if self._consolidator is None else self._consolidation_model),
-            speaker_recognition=isinstance(self._transcriber, SpeechBackend),
-            streaming_generation=isinstance(self._answerer, StreamingGenerationBackend),
+        return declared_capabilities(
+            embedder=self._embedder,
+            answerer=self._answerer,
+            transcriber=self._transcriber,
+            vision_describer=self._vision_describer,
+            face_analyzer=self._face_analyzer,
+            former=self._former,
+            consolidator=self._consolidator,
         )
 
     def _reinforce_answered(self, hits: Sequence[SearchHit]) -> None:
@@ -1805,6 +1986,30 @@ class Memory:
     # deletion is not an intent: it stays on `delete()` under host authority. None of these
     # methods is exposed on REST or MCP.
 
+    def consolidation_candidates(self, *, limit: int = 32) -> tuple[ConsolidationCandidate, ...]:
+        """Ask what needs deliberation, at most `limit` rows, interleaved across triggers.
+
+        This is the durable trigger the slow loop runs on: every row is derived from state
+        already committed -- evidence links, lineage disagreement, recorded confirmations --
+        rather than from a clock. Hand a row's `memory_ids` straight to
+        `consolidate(evidence_ids=...)` with the row's `trigger`.
+        """
+        with (
+            self._trace("mindbridge.consolidation_candidates", kind="operation"),
+            self._operation(),
+        ):
+            _limit(limit, maximum=100)
+            with _translate_storage_errors("list consolidation candidates"):
+                rows = self._store.read_consolidation_candidates(limit=limit)
+            return tuple(
+                ConsolidationCandidate(
+                    trigger=MemoryTrigger(row.trigger),
+                    memory_ids=row.memory_ids,
+                    evidence_count=row.evidence_count,
+                )
+                for row in rows
+            )
+
     def consolidate(
         self,
         *,
@@ -1827,7 +2032,7 @@ class Memory:
                 )
             if not isinstance(trigger, MemoryTrigger):
                 raise ValidationError("trigger must be a MemoryTrigger")
-            shown = self._consolidation_evidence(
+            shown, window = self._consolidation_evidence(
                 evidence_ids,
                 query,
                 limit=limit,
@@ -1837,11 +2042,23 @@ class Memory:
                 return ConsolidationReport()
             applied: builtins.list[MemoryOperationRecord] = []
             rejected: builtins.list[tuple[MemoryOperation, str]] = []
+            # One pass must not contradict itself: an operation may not name -- as evidence or as
+            # a target -- a record an earlier accepted operation retired, nor retire evidence an
+            # earlier one built on.
+            # There is no way to submit a proposal built in some other pass, so this is the only
+            # reachable form of the staleness the kernel is required to reject.
+            consumed: set[str] = set()
+            retired: set[str] = set()
             with self._formation_lock:
                 for operation in self._propose_operations(
                     tuple(shown.values()),
                     trigger=trigger,
                 ):
+                    targets = _retiring_targets(operation)
+                    named = set(operation.evidence_ids) | set(operation.target_ids)
+                    if targets & consumed or named & retired:
+                        rejected.append((operation, "inconsistent_batch"))
+                        continue
                     try:
                         applied.append(
                             self._apply_memory_operation(
@@ -1850,11 +2067,15 @@ class Memory:
                                 model_id=self._consolidation_model,
                                 recipe=self._consolidation_recipe,
                                 shown=shown,
+                                window=window,
                                 assets=assets,
                             )
                         )
                     except _RejectedOperation as rejection:
                         rejected.append((operation, rejection.reason))
+                    else:
+                        consumed.update(set(operation.evidence_ids) - targets)
+                        retired.update(targets)
             return ConsolidationReport(operations=tuple(applied), rejected=tuple(rejected))
 
     def forget(self, memory_ids: Sequence[str]) -> MemoryOperationRecord | None:
@@ -1862,6 +2083,11 @@ class Memory:
 
         This is not deletion. `MemoryRecord.forgotten_at` stays readable for audit and
         `rollback()` restores recall. Use `delete()` to remove a record and its media.
+
+        All or nothing: an unknown ID raises `MemoryNotFoundError` the way `get()` and `delete()`
+        do, and a set in which any record is already forgotten changes nothing and returns
+        `None`. The host names the IDs here, so partially applying them and logging the rest
+        would make the operation log claim an effect that never happened.
         """
         with (
             self._trace("mindbridge.forget", kind="operation"),
@@ -1882,13 +2108,25 @@ class Memory:
                     model_id=None,
                     recipe=None,
                     shown=None,
+                    window=None,
                     assets=assets,
                 )
-            except _RejectedOperation:
+            except _RejectedOperation as rejection:
+                if rejection.reason == "unknown_target":
+                    missing = sorted(set(targets) - set(self._control_records(targets)))
+                    raise MemoryNotFoundError(
+                        f"memory does not exist: {', '.join(missing)}"
+                    ) from None
                 return None
 
     def rollback(self, operation_id: int) -> bool:
-        """Reverse one applied operation; an unknown or already-reversed one reports `False`."""
+        """Reverse one applied operation, newest first on a lineage.
+
+        Reports `False` for an unknown or already-reversed `operation_id`, and for one a later
+        standing operation has built on: when a second consolidation superseded the record this
+        one put in force, reversing this one first would leave two current versions in the
+        lineage, so the newer operation must be rolled back first.
+        """
         with (
             self._trace("mindbridge.rollback", kind="operation"),
             self._operation(),
@@ -1906,31 +2144,45 @@ class Memory:
                 return False
             row = logged[0]
             operation = load_operation(row.operation_json)
-            # A naming assertion is retracted, not deleted: the version it superseded has to come
-            # back, and the record itself stays in the log so the audit trail shows both names.
+            # A naming assertion is retracted, not deleted: the version it superseded has to
+            # come back, and the record itself stays in the log so the audit trail shows both
+            # names. That reversal rides the general `superseded` mechanism below.
             naming = operation.intent is MemoryIntent.IDENTIFY
-            if operation.intent is MemoryIntent.CONSOLIDATE:
-                # Deleting first keeps a lost race idempotent: a second rollback finds nothing to
-                # delete and the log claim below is what decides the return value.
-                for created in row.created_ids:
-                    with _translate_storage_errors("roll back a consolidation"):
-                        _deleted, orphaned = self._store.delete_memory_with_assets(created)
-                    self._queue_asset_cleanup(orphaned)
             with _translate_storage_errors("roll back a memory operation"):
-                reverted = self._store.rollback_operation(
+                # One transaction: the created records disappear in the same commit that marks
+                # the operation rolled back, so a crash between the two cannot leave an active
+                # operation whose recorded output is gone.
+                reverted, orphaned = self._store.rollback_operation(
                     row.operation_id,
                     rolled_back_at=datetime.now(timezone.utc),
+                    delete_memory_ids=(
+                        row.created_ids if operation.intent is MemoryIntent.CONSOLIDATE else ()
+                    ),
                     # `linked` is the evidence this operation actually inserted, so a link that
                     # predated it survives the reversal. Records deleted above take their own.
                     retire_evidence=row.linked,
+                    # A CORRECT retired the versions it named. A CONSOLIDATE may also have
+                    # superseded records in the derived record's lineage that no backend ever
+                    # saw; the log row names those exactly, so both halves reverse here.
                     restore_versions=(
-                        row.changed_ids if operation.intent is MemoryIntent.CORRECT else ()
+                        row.changed_ids
+                        if operation.intent is MemoryIntent.CORRECT
+                        else row.superseded
                     ),
-                    retract_assertions=row.created_ids if naming else (),
-                    clear_forgotten=(
-                        row.changed_ids if operation.intent is MemoryIntent.FORGET else ()
+                    # A naming assertion is retracted rather than deleted: its own version is
+                    # retired here and `restore_versions` brings back the one it displaced.
+                    retire_versions=row.created_ids if naming else (),
+                    require_in_force=(
+                        (*row.created_ids, *row.changed_ids) if row.superseded else ()
                     ),
+                    # Recorded per operation, so cognitive forgetting and the consolidation
+                    # forgetting a CONSOLIDATE carried both reverse through one field. A FORGET
+                    # row logged before that field existed carries the same IDs in `changed_ids`,
+                    # and must still un-forget rather than silently do nothing.
+                    clear_forgotten=row.forgotten_ids
+                    or (row.changed_ids if operation.intent is MemoryIntent.FORGET else ()),
                 )
+            self._queue_asset_cleanup(orphaned)
             self._drain_outbox()
             if reverted and naming:
                 assert operation.claim is not None
@@ -1969,8 +2221,17 @@ class Memory:
         *,
         limit: int,
         operation: _OperationAssets,
-    ) -> dict[str, MemoryRecord]:
-        """Resolve the bounded, active evidence set the backend is allowed to cite."""
+    ) -> tuple[dict[str, MemoryRecord], frozenset[str]]:
+        """Resolve what the backend may cite and, separately, what it may act on.
+
+        The first value is the shown set: active, visible records the backend sees and is allowed
+        to cite as evidence. The second is the window its `target_ids` are bounded by. They differ
+        only for explicit `evidence_ids`, because a hidden derived record -- an inferred `TRAIT`
+        below the visibility threshold, or a claim a `CORRECT` already retired -- is exactly what
+        `REINFORCE` and `CORRECT` exist for and can never appear in the shown set. Naming it is
+        the host's decision; a `query` or the default window never widens the window itself.
+        """
+        requested: tuple[str, ...] = ()
         if evidence_ids is not None:
             if isinstance(evidence_ids, (str, bytes)):
                 raise ValidationError("evidence_ids must be a sequence of memory IDs")
@@ -1982,6 +2243,7 @@ class Memory:
                 )
             except TypeError:
                 raise ValidationError("evidence_ids must be a sequence of memory IDs") from None
+            requested = candidates
         elif query is not None:
             prepared = self._prepare_content(query, operation)
             reference = datetime.now(timezone.utc)
@@ -2007,7 +2269,7 @@ class Memory:
                 newest = self._store.list_memories(limit=min(1_000, limit * 4))
             candidates = tuple(memory.memory_id for memory in newest)
         if not candidates:
-            return {}
+            return {}, frozenset()
         with _translate_storage_errors("read consolidation evidence"):
             memories = self._store.read_memories(candidates, active_only=True)
         memories = memories[:limit]
@@ -2015,7 +2277,8 @@ class Memory:
             tuple(asset for memory in memories for asset in memory.assets),
             operation.leased,
         )
-        return {memory.memory_id: self._memory_record(memory) for memory in memories}
+        shown = {memory.memory_id: self._memory_record(memory) for memory in memories}
+        return shown, frozenset(shown) | frozenset(requested)
 
     def _propose_operations(
         self,
@@ -2059,6 +2322,7 @@ class Memory:
         model_id: str | None,
         recipe: str | None,
         shown: Mapping[str, MemoryRecord] | None,
+        window: frozenset[str] | None,
         assets: _OperationAssets,
     ) -> MemoryOperationRecord:
         key = operation_key(operation, recipe=recipe)
@@ -2077,15 +2341,23 @@ class Memory:
             operation_json=dump_operation(operation),
             applied_at=datetime.now(timezone.utc),
         )
-        if operation.intent is MemoryIntent.CONSOLIDATE:
+        try:
+            if operation.intent is MemoryIntent.CONSOLIDATE:
+                return _operation_record(
+                    self._apply_consolidation(operation, pending, shown=shown, assets=assets)
+                )
+            if operation.intent is MemoryIntent.IDENTIFY:
+                return _operation_record(
+                    self._apply_identification(operation, pending, shown=shown, assets=assets)
+                )
             return _operation_record(
-                self._apply_consolidation(operation, pending, shown=shown, assets=assets)
+                self._apply_operation_effects(operation, pending, shown=shown, window=window)
             )
-        if operation.intent is MemoryIntent.IDENTIFY:
-            return _operation_record(
-                self._apply_identification(operation, pending, shown=shown, assets=assets)
-            )
-        return _operation_record(self._apply_operation_effects(operation, pending, shown=shown))
+        except StaleOperationError:
+            # The proposal was built on records the apply transaction found had moved. Nothing
+            # was written; the in-transaction re-check is the whole guarantee, so there is no
+            # expected-revision token to carry and no partial effect to undo.
+            raise _RejectedOperation("stale") from None
 
     def _apply_operation_effects(
         self,
@@ -2093,11 +2365,24 @@ class Memory:
         pending: StoredOperation,
         *,
         shown: Mapping[str, MemoryRecord] | None,
+        window: frozenset[str] | None,
     ) -> StoredOperation:
-        """Validate a REINFORCE, CORRECT, or FORGET proposal and commit its effect."""
+        """Validate a REINFORCE, CORRECT, or FORGET proposal and commit its effect.
+
+        Every named target must pass, or none of them is applied. A multi-target operation used
+        to execute the eligible subset while its log row still listed the rest, so the log
+        claimed effects that never happened; the whole proposal is now refused instead.
+        """
         targets = self._control_records(operation.target_ids)
-        if not targets:
+        if set(targets) != set(operation.target_ids):
             raise _RejectedOperation("unknown_target")
+        # A backend may only act inside the window the kernel gathered for it. Consolidation
+        # already gets this through `target_ids <= evidence_ids <= shown`; the three direct
+        # intents need it stated, or a backend shown record A could retire or correct an
+        # unrelated record B it never saw. `window` is None only for the host's own `forget()`,
+        # where the host names the IDs and is the authority.
+        if window is not None and not set(operation.target_ids) <= window:
+            raise _RejectedOperation("target_not_shown")
         # A name is not an inference to be corrected, reinforced, or quietly forgotten: the
         # registry and the indexed speech text both project it, and only `rollback()` of the
         # operation that asserted it recomputes those. Retiring the assertion behind their back
@@ -2110,21 +2395,13 @@ class Memory:
         if operation.intent is MemoryIntent.REINFORCE:
             reinforce = self._reinforcement_pairs(operation, targets, shown=shown)
         elif operation.intent is MemoryIntent.CORRECT:
-            correct_ids = tuple(
-                memory_id for memory_id in operation.target_ids if _is_derived(targets, memory_id)
-            )
-            if not correct_ids:
+            if not all(_is_derived(targets, memory_id) for memory_id in operation.target_ids):
                 raise _RejectedOperation("not_derived")
+            correct_ids = operation.target_ids
         else:
-            forget_ids = tuple(
-                memory_id
-                for memory_id, memory in (
-                    (value, targets.get(value)) for value in operation.target_ids
-                )
-                if memory is not None and memory.forgotten_at is None
-            )
-            if not forget_ids:
+            if any(targets[memory_id].forgotten_at is not None for memory_id in targets):
                 raise _RejectedOperation("already_forgotten")
+            forget_ids = operation.target_ids
         with self._write_lock:
             with _translate_storage_errors("apply a memory operation"):
                 logged = self._store.apply_control_operation(
@@ -2132,6 +2409,14 @@ class Memory:
                     reinforce=reinforce,
                     correct_ids=correct_ids,
                     forget_ids=forget_ids,
+                    # Re-checked inside the apply transaction, because everything above was read
+                    # before it opened. A REINFORCE target must additionally still stand: a
+                    # CORRECT between validation and here makes the proposal stale. `forget()`
+                    # deliberately gets no such check -- forgetting a corrected record is legal.
+                    require_active=(*operation.target_ids, *operation.evidence_ids),
+                    require_unretired=(
+                        operation.target_ids if operation.intent is MemoryIntent.REINFORCE else ()
+                    ),
                 )
             if logged is None:
                 raise _RejectedOperation("duplicate")
@@ -2146,10 +2431,13 @@ class Memory:
         shown: Mapping[str, MemoryRecord] | None,
     ) -> tuple[tuple[str, str], ...]:
         target = operation.target_ids[0]
-        record = targets.get(target)
-        if record is None:
-            raise _RejectedOperation("unknown_target")
-        if not _is_derived(targets, target):
+        record = targets[target]
+        # A retired claim is not a standing derived claim: reinforcing one would attach fresh
+        # independent support to a version a CORRECT already withdrew, in this pass or an
+        # earlier one. `_control_records` reads the current version, so both cases land here.
+        if not _is_derived(targets, target) or (
+            record.context is not None and record.context.retired_at is not None
+        ):
             raise _RejectedOperation("not_derived")
         # Self-citation first: a record that is its own evidence is malformed whatever set it
         # came from, and a hidden target is never in the shown set anyway.
@@ -2178,13 +2466,20 @@ class Memory:
         """Validate one consolidation proposal and commit it through the formation path."""
         if shown is None or not set(operation.evidence_ids) <= set(shown):
             raise _RejectedOperation("evidence_not_shown")
+        # Consolidation forgetting retires sources *this* derived record replaces, so a target
+        # outside its own evidence has no lineage relationship to it and is refused. Retiring a
+        # record no derived memory now covers is a FORGET, not a consolidation.
+        if not set(operation.target_ids) <= set(operation.evidence_ids):
+            raise _RejectedOperation("target_not_evidence")
         proposal = operation.proposal
         assert proposal is not None
         sources = tuple(shown[memory_id] for memory_id in operation.evidence_ids)
         primary = _consolidation_primary(proposal, sources)
         if primary is None:
             raise _RejectedOperation("invalid_proposal")
-        now = datetime.now(timezone.utc)
+        # One operation, one transaction time: the derived record, its evidence links, and any
+        # consolidation forgetting all carry the timestamp the log row reports.
+        now = pending.applied_at
         context = replace(
             _formation_context(
                 primary,
@@ -2218,6 +2513,12 @@ class Memory:
             completed_at=now,
             recipe=self._consolidation_recipe,
             operation=pending,
+            forget_ids=operation.target_ids,
+            # `shown` was read before this transaction opened; re-check inside it that every
+            # cited source still exists, is still active, and -- when it carries typed semantics
+            # -- still stands, so a source corrected in between makes the proposal stale.
+            require_active=operation.evidence_ids,
+            require_unretired=operation.evidence_ids,
         )
         if logged is None:
             raise _RejectedOperation("duplicate")
@@ -2241,8 +2542,10 @@ class Memory:
         """
         claim = operation.claim
         assert claim is not None
+        # The same window vocabulary the three direct intents use: a backend may only act on
+        # what the kernel gathered for it, and citing outside that window is `target_not_shown`.
         if shown is None or not set(operation.evidence_ids) <= set(shown):
-            raise _RejectedOperation("evidence_not_shown")
+            raise _RejectedOperation("target_not_shown")
         with _translate_storage_errors("read identity memories"):
             identity_id = self._store.resolve_identity_id(claim.identity_id)
             if identity_id is not None and self._store.identity_memory_ids(identity_id) is None:
@@ -2301,6 +2604,11 @@ class Memory:
             completed_at=now,
             recipe=self._consolidation_recipe,
             operation=pending,
+            # Re-checked inside the apply transaction, because everything above was read before
+            # it opened: cited evidence a CORRECT retired in between makes the naming stale, and
+            # the dispatch turns that into a `stale` rejection.
+            require_active=operation.evidence_ids,
+            require_unretired=operation.evidence_ids,
         )
         if logged is None:
             raise _RejectedOperation("duplicate")
@@ -2621,7 +2929,7 @@ class Memory:
                             memory.content,
                             self._embedding_capabilities,
                             "embedding",
-                            transcribable=self._transcript_fallback(memory.content.assets),
+                            rescuable=self._transcript_fallback(memory.content.assets),
                         )
                 if fallback:
                     self._cache_audio_transcripts(
@@ -2692,7 +3000,17 @@ class Memory:
                     self._trace("mindbridge.storage.write", kind="stage"),
                     _translate_storage_errors("write memories"),
                 ):
-                    self._store.write_memories(stored_memories, stored_embeddings)
+                    # With a former configured, the same transaction enqueues the formation this
+                    # call still owes. `add()` deletes the row once it returns, so the row only
+                    # outlives the commit when the process did not: the next `settle()` then
+                    # finds an embedded record that owes formation and finishes it.
+                    self._store.write_memories(
+                        stored_memories,
+                        stored_embeddings,
+                        formation_pending_at=(
+                            stored_memories[0].created_at if self._former is not None else None
+                        ),
+                    )
             with self._write_lock:
                 self._drain_outbox()
                 with (
@@ -2710,6 +3028,17 @@ class Memory:
             raise StorageError("written memories could not be read from SQLite", reason="io_failed")
         return tuple(self._memory_record(rows_by_id[memory.memory_id]) for memory in prepared)
 
+    def _complete_formation(self, records: Sequence[MemoryRecord]) -> None:
+        """Clear the queue rows `_add_prepared` wrote once formation has actually run.
+
+        A no-op without a former, and harmless for a record that was never enqueued or whose row
+        `_settle_queued` already removed: the delete simply matches nothing.
+        """
+        if self._former is None or not records:
+            return
+        with _translate_storage_errors("complete formation"):
+            self._store.complete_captures(tuple(record.id for record in records))
+
     def _settle_queued(
         self,
         existing: Sequence[StoredMemory],
@@ -2725,51 +3054,102 @@ class Memory:
             return
         with _translate_storage_errors("check the capture queue"):
             queued = frozenset(
-                self._store.pending_captures(
+                pending.memory_id
+                for pending in self._store.pending_captures(
                     limit=len(existing),
                     memory_ids=tuple(row.memory_id for row in existing),
                 )
             )
-        self._settle_stored(
+        # No attempt ceiling here: `add()` promises a searchable return, so a record it is being
+        # asked for has to be settled however many times it has already failed.
+        _settled, failures = self._settle_stored(
             tuple(row for row in existing if row.memory_id in queued),
             operation=operation,
         )
+        if failures:
+            raise failures[0]
 
     def _settle_stored(
         self,
         rows: Sequence[StoredMemory],
         *,
         operation: _OperationAssets,
-    ) -> int:
-        """Run the model stages `capture()` deferred over already-committed rows.
+    ) -> tuple[tuple[str, ...], tuple[MindBridgeError, ...]]:
+        """Run the stages `capture()` deferred over already-committed rows, and report both sides.
 
         `settle()` and the `add()` path share this routine, so a captured record reaches exactly
-        the state a blocking `add()` would have left it in. Each row commits on its own, so one
-        failing record keeps its queue row, its attempt count, and its reason while every earlier
-        record in the batch stays settled.
+        the state a blocking `add()` would have left it in. Each row commits on its own and a
+        failing one is collected rather than raised, so it keeps its queue row, its attempt count,
+        and its reason while every other record in the batch still settles. Returns the IDs that
+        settled and the failures, and the caller decides which of them to raise.
+
+        Held under `_settle_lock`, which is the whole cross-thread guard: a `settle()` and an
+        `add()` of the same captured content would otherwise both find the row unembedded and
+        run every model stage over it. Serialized, the second caller reaches `_settle_row`'s
+        vector check after the first committed and owes formation only.
         """
-        settled = 0
+        settled: list[str] = []
+        failures: list[MindBridgeError] = []
         for row in rows:
             try:
-                self._settle_row(row, operation=operation)
+                with self._settle_lock:
+                    self._settle_row(row, operation=operation)
             except MindBridgeError as error:
                 with _translate_storage_errors("record a failed settlement"):
                     self._store.record_capture_failure(row.memory_id, str(error))
                 if error.subject is None:
                     error.subject = row.memory_id
-                raise
-            settled += 1
-        return settled
+                failures.append(error)
+                continue
+            settled.append(row.memory_id)
+        return tuple(settled), tuple(failures)
 
     def _settle_row(self, row: StoredMemory, *, operation: _OperationAssets) -> None:
+        # An `add()` that crashed between its commit and formation leaves a queue row over a
+        # record that is already enriched, embedded, and indexed. Its vectors are final, so
+        # settling it owes formation only; re-running the model stages would buy the same
+        # vectors twice.
+        with _translate_storage_errors("check a captured memory's vectors"):
+            embedded = self._store.read_embedding(_embedding_id(row.memory_id, 0)) is not None
+        settled = row
+        if not embedded:
+            enriched = self._enrich_row(row, operation=operation)
+            if enriched is None:
+                return
+            settled = enriched
+        self._form_sources((self._memory_record(settled),), operation=operation)
+        with _translate_storage_errors("complete captured memory"):
+            self._store.complete_captures((row.memory_id,))
+
+    def _enrich_row(
+        self,
+        row: StoredMemory,
+        *,
+        operation: _OperationAssets,
+    ) -> StoredMemory | None:
+        """Derive, embed, and commit one captured row, or return `None` if it lost the race."""
         memory = _prepared_from_stored(row)
         speech_assets = self._answer_speech_assets(memory.content.assets)
         speech_indexed = self._index_speech and bool(speech_assets)
         with self._speech_index_guard(operation, enabled=speech_indexed):
             if speech_indexed:
                 self._recognize_speech(speech_assets, operation, reversible=True)
+            # Same order as `_add_prepared`: derived visual text has to exist before the fallback
+            # guard decides whether this embedder can take the media at all.
+            described = self._pending_visual_descriptions((memory.content,))
+            memory = replace(
+                memory,
+                content=self._with_visual_descriptions(memory.content, described),
+            )
             if Modality.AUDIO not in self._embedding_capabilities:
-                _fallback_unsupported(memory.content, self._embedding_capabilities, "embedding")
+                # Same rescue set `_add_prepared` allows, so a composition `add()` accepts is not
+                # one `settle()` refuses after the record is already durable.
+                _fallback_unsupported(
+                    memory.content,
+                    self._embedding_capabilities,
+                    "embedding",
+                    rescuable=self._transcript_fallback(memory.content.assets),
+                )
                 if not memory.content.audio_transcript:
                     self._cache_audio_transcripts(memory.content.assets, operation)
             elif self._derives_transcripts(memory.content.assets):
@@ -2790,7 +3170,9 @@ class Memory:
                 _translate_storage_errors("settle captured memory"),
             ):
                 # The captured row already carries its assets and its observation context, so
-                # this commit replaces only the derived text and adds the queued vectors.
+                # this commit replaces only the derived text and adds the queued vectors. The
+                # queue row survives it: formation is still owed, and a former failure below must
+                # leave the record retryable rather than searchable but silently unformed.
                 committed = self._store.settle_capture(
                     replace(enriched, context=None),
                     tuple(
@@ -2815,8 +3197,7 @@ class Memory:
                 operation.persisted.update(asset.asset_id for asset in row.assets)
                 if operation.speech_updates:
                     self._persist_transcripts(operation)
-        if committed:
-            self._form_sources((self._memory_record(enriched),), operation=operation)
+        return enriched if committed else None
 
     def _form_sources(
         self,
@@ -2945,6 +3326,9 @@ class Memory:
         completed_at: datetime,
         recipe: str | None = None,
         operation: StoredOperation | None = None,
+        forget_ids: Sequence[str] = (),
+        require_active: Sequence[str] = (),
+        require_unretired: Sequence[str] = (),
     ) -> StoredOperation | None:
         """Embed and commit derived records; return the log row when one was requested.
 
@@ -3018,7 +3402,7 @@ class Memory:
             )
         with self._write_lock:
             with _translate_storage_errors("commit automatic memory formation"):
-                self._store.apply_formation(
+                applied = self._store.apply_formation(
                     stored,
                     embeddings,
                     evidence=tuple(
@@ -3030,9 +3414,16 @@ class Memory:
                     recipe=recipe,
                     completed_at=completed_at,
                     operation=operation,
+                    forget_ids=forget_ids,
+                    require_active=require_active,
+                    require_unretired=require_unretired,
                 )
             self._drain_outbox()
         if operation is None:
+            return None
+        if not applied:
+            # A concurrent duplicate won the key inside the transaction. Its row is in the log
+            # under the same key, but it is not this call's operation, so report the duplicate.
             return None
         with _translate_storage_errors("read a memory operation"):
             logged = self._store.read_operations(operation_key=operation.operation_key)
@@ -3841,7 +4232,7 @@ class Memory:
             prepared,
             self._embedding_capabilities,
             "embedding",
-            transcribable=rescues,
+            rescuable=rescues,
         )
         if Modality.AUDIO in unsupported:
             if prepared.audio_transcript:
@@ -4263,6 +4654,18 @@ class Memory:
         if not self._derives_transcripts(assets):
             return frozenset()
         return self._transcription_capabilities & {Modality.AUDIO, Modality.VIDEO}
+
+    def _deferred_rescue(self, assets: Sequence[StoredAsset]) -> frozenset[Modality]:
+        """Modalities `settle()` can still rescue for an embedder that cannot take them.
+
+        `capture()` commits before any model runs, so it cannot see the transcript or the visual
+        description that will exist by the time the record is embedded -- only which of them the
+        configured composition will derive.
+        """
+        rescued = self._transcript_fallback(assets)
+        if self._vision_describer is not None:
+            rescued |= self._vision_capabilities
+        return rescued
 
     def _derives_transcripts(self, assets: Sequence[StoredAsset]) -> bool:
         # A SpeechBackend indexes the same text through the explicit `index_speech` opt-in, so its
@@ -5356,6 +5759,9 @@ class AsyncMemory:
     async def _add_stream_input(self, item: StreamInput) -> MemoryRecord:
         return await asyncio.to_thread(self._memory._add_stream_input, item)
 
+    async def _capture_stream_input(self, item: StreamInput) -> MemoryRecord:
+        return await asyncio.to_thread(self._memory._capture_stream_input, item)
+
     async def add_many(
         self,
         contents: Sequence[ContentInput],
@@ -5396,19 +5802,43 @@ class AsyncMemory:
             context=context,
         )
 
-    async def settle(self, *, limit: int = 100) -> int:
-        return await asyncio.to_thread(self._memory.settle, limit=limit)
+    async def settle(
+        self,
+        *,
+        limit: int = 100,
+        max_attempts: int = 3,
+        memory_ids: Sequence[str] | None = None,
+    ) -> int:
+        return await asyncio.to_thread(
+            self._memory.settle,
+            limit=limit,
+            max_attempts=max_attempts,
+            memory_ids=memory_ids,
+        )
 
-    async def pending_captures(self) -> int:
-        return await asyncio.to_thread(self._memory.pending_captures)
+    async def pending_captures(
+        self,
+        *,
+        limit: int = 100,
+        memory_ids: Sequence[str] | None = None,
+    ) -> tuple[PendingCapture, ...]:
+        return await asyncio.to_thread(
+            self._memory.pending_captures, limit=limit, memory_ids=memory_ids
+        )
 
     async def add_stream(
         self,
         contents: AsyncIterable[ContentInput | StreamInput],
+        *,
+        capture: bool = False,
     ) -> AsyncIterator[MemoryRecord]:
-        """Add an async omni stream one durable, searchable observation at a time."""
+        """Add an async omni stream one durable, searchable observation at a time.
+
+        With `capture=True` each item commits through `capture()` and owes a later `settle()`.
+        """
         if not isinstance(contents, AsyncIterable):
             raise ValidationError("contents must be an async iterable of memory inputs")
+        capture = _capture_flag(capture)
         iterator = aiter(contents)
         index = 0
         while True:
@@ -5422,7 +5852,13 @@ class AsyncMemory:
                 raise
             try:
                 if isinstance(content, StreamInput):
-                    record = await self._add_stream_input(content)
+                    record = (
+                        await self._capture_stream_input(content)
+                        if capture
+                        else await self._add_stream_input(content)
+                    )
+                elif capture:
+                    record = await self.capture(content)
                 else:
                     record = await self.add(content)
             except MindBridgeError as error:
@@ -5564,6 +6000,13 @@ class AsyncMemory:
 
     async def reinforce(self, memory_ids: Sequence[str]) -> int:
         return await asyncio.to_thread(self._memory.reinforce, memory_ids)
+
+    async def consolidation_candidates(
+        self,
+        *,
+        limit: int = 32,
+    ) -> tuple[ConsolidationCandidate, ...]:
+        return await asyncio.to_thread(partial(self._memory.consolidation_candidates, limit=limit))
 
     async def consolidate(
         self,
@@ -5715,7 +6158,12 @@ class AsyncOmniPrefetch:
 
 
 class AsyncCaptureStream:
-    """Reduce associated capture streams into retrieval and durable memories."""
+    """Reduce associated capture streams into retrieval and durable memories.
+
+    `capture=True` commits each `FINAL` through `Memory.capture()` instead of `Memory.add()`, so
+    the acknowledgement leaves the model path and every `StreamCommit` reports
+    `pending_settlement`. The host then owes `settle()`; the default stays the strong `add()`.
+    """
 
     def __init__(
         self,
@@ -5725,15 +6173,19 @@ class AsyncCaptureStream:
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
         max_streams: int = 32,
+        capture: bool = False,
     ) -> None:
         if not isinstance(memory, AsyncMemory):
             raise ValidationError("memory must be an AsyncMemory")
         _limit(limit, maximum=100)
+        if not isinstance(capture, bool):
+            raise ValidationError("capture must be a boolean")
         self._memory = memory
         self._limit = limit
         self._memory_type = _optional_memory_type(memory_type)
         self._reference_at = _reference_at(reference_at)
         self._max_streams = _positive_dimension(max_streams, "max_streams")
+        self._capture = capture
 
     async def consume(  # noqa: C901 - the three-state reducer is intentionally inline
         self,
@@ -5805,6 +6257,7 @@ class AsyncCaptureStream:
                             else "retrieval_failed"
                         ),
                         stream_id=stream_id,
+                        pending_settlement=self._capture,
                     )
                 else:
                     assert retrieval is not None
@@ -5812,6 +6265,7 @@ class AsyncCaptureStream:
                         record=record,
                         prefetch=retrieval,
                         stream_id=stream_id,
+                        pending_settlement=self._capture,
                     )
         finally:
             for prefetch in tuple(prefetches.values()):
@@ -5869,7 +6323,11 @@ class AsyncCaptureStream:
 
     async def _add_final(self, item: ContentInput | StreamInput) -> MemoryRecord:
         if isinstance(item, StreamInput):
+            if self._capture:
+                return await self._memory._capture_stream_input(item)
             return await self._memory._add_stream_input(item)
+        if self._capture:
+            return await self._memory.capture(item)
         return await self._memory.add(item)
 
 
@@ -5906,6 +6364,7 @@ class AsyncAudioStream:
         context: StreamContext = None,
         reference_at: datetime | None = None,
         max_streams: int = 32,
+        capture: bool = False,
     ) -> None:
         if not isinstance(memory, AsyncMemory):
             raise ValidationError("memory must be an AsyncMemory")
@@ -5923,6 +6382,7 @@ class AsyncAudioStream:
             memory_type=memory_type,
             reference_at=reference_at,
             max_streams=max_streams,
+            capture=capture,
         )
 
     async def consume(
@@ -6069,6 +6529,7 @@ class AsyncVisionStream:
         context: StreamContext = None,
         reference_at: datetime | None = None,
         max_streams: int = 32,
+        capture: bool = False,
     ) -> None:
         if not isinstance(memory, AsyncMemory):
             raise ValidationError("memory must be an AsyncMemory")
@@ -6085,6 +6546,7 @@ class AsyncVisionStream:
             memory_type=memory_type,
             reference_at=reference_at,
             max_streams=max_streams,
+            capture=capture,
         )
 
     async def consume(
@@ -6346,7 +6808,7 @@ def _prepared_from_stored(memory: StoredMemory) -> _PreparedMemory:
             text=memory.content,
             assets=memory.assets,
             modality=Modality(memory.modality),
-            canonical_parts=(("text", memory.content),) if memory.content else (),
+            canonical_parts=_stored_canonical_parts(memory.content, memory.assets),
             audio_transcript=_has_stream_transcript(memory.content, memory.assets),
             visual_description=_has_stream_description(memory.content, memory.assets),
         ),
@@ -6531,6 +6993,17 @@ def _consolidation_primary(
     return None
 
 
+def _retiring_targets(operation: MemoryOperation) -> set[str]:
+    """IDs this operation would take out of ordinary recall or retire the current version of.
+
+    A `REINFORCE` target is strengthened rather than retired, so it is not one of these; a
+    `CONSOLIDATE` target is consolidation forgetting and is.
+    """
+    if operation.intent is MemoryIntent.REINFORCE:
+        return set()
+    return set(operation.target_ids)
+
+
 def _operation_record(logged: StoredOperation) -> MemoryOperationRecord:
     try:
         trigger = MemoryTrigger(logged.trigger)
@@ -6545,6 +7018,8 @@ def _operation_record(logged: StoredOperation) -> MemoryOperationRecord:
         recipe=logged.recipe,
         created_ids=logged.created_ids,
         changed_ids=logged.changed_ids,
+        forgotten_ids=logged.forgotten_ids,
+        superseded=logged.superseded,
         rolled_back_at=logged.rolled_back_at,
     )
 
@@ -6825,17 +7300,17 @@ def _fallback_unsupported(
     supported: frozenset[Modality],
     operation: str,
     *,
-    transcribable: frozenset[Modality] = frozenset(),
+    rescuable: frozenset[Modality] = frozenset(),
 ) -> frozenset[Modality]:
     unsupported = _prepared_modalities(prepared) - supported
     fallback = {Modality.AUDIO}
     if prepared.visual_description:
         fallback.update((Modality.IMAGE, Modality.VIDEO))
-    # This runs before any transcript exists, so a derived one cannot be seen yet -- only its
-    # possibility. `transcribable` is the modality set a transcript could still rescue, which is
-    # why a video reaching a video-less embedder is no longer fatal when the transcriber can read
-    # it. Empty by default, so a caller that does not pass it keeps the previous behaviour.
-    fallback.update(transcribable & {Modality.AUDIO, Modality.VIDEO})
+    # This runs before any derived text exists, so it cannot be seen yet -- only its possibility.
+    # `rescuable` is the modality set a transcript or a visual description could still rescue,
+    # which is why a video reaching a video-less embedder is no longer fatal when the transcriber
+    # can read it. Empty by default, so a caller that does not pass it keeps the strict behaviour.
+    fallback.update(rescuable)
     fatal = set(unsupported - fallback)
     if Modality.TEXT not in supported:
         fatal.update(unsupported & fallback)
@@ -6905,6 +7380,41 @@ def _with_stream_description(
         text=content,
         canonical_parts=(*prepared.canonical_parts, ("visual_description", section)),
         visual_description=True,
+    )
+
+
+def _stored_canonical_parts(
+    text: str,
+    assets: Sequence[StoredAsset],
+) -> tuple[tuple[str, str], ...]:
+    """Split stored content back into the parts the strong `add` path embedded separately.
+
+    A `StreamInput` folds its transcript and description into `content` before the row is
+    written, so a capture arrives here already flattened. Recovering each derived section keys
+    the same way `add()` did instead of hashing one merged text. Content with no marker for one
+    of its own assets is left as the single text part the caller wrote.
+    """
+    cuts: dict[int, str] = {}
+    for asset in assets:
+        if asset.modality == Modality.AUDIO.value:
+            kind, marker = "audio_transcript", f"[transcript:{asset.asset_id}]\n"
+        elif asset.modality in {Modality.IMAGE.value, Modality.VIDEO.value}:
+            kind, marker = "visual_description", f"[visual description:{asset.asset_id}]\n"
+        else:
+            continue
+        found = text.find(f"\n\n{marker}")
+        start = found + 2 if found >= 0 else (0 if text.startswith(marker) else -1)
+        if start >= 0:
+            cuts[start] = kind
+    if not cuts:
+        return (("text", text),) if text else ()
+    ordered = sorted(cuts.items())
+    # Each section was joined with "\n\n", so a cut ends two characters before the next one.
+    ends = [start - 2 for start, _ in ordered[1:]] + [len(text)]
+    head = text[: max(ordered[0][0] - 2, 0)]
+    return (
+        *((("text", head),) if head else ()),
+        *((kind, text[start:end]) for (start, kind), end in zip(ordered, ends, strict=True)),
     )
 
 
@@ -7397,6 +7907,75 @@ def _reference_at(value: datetime | None) -> datetime | None:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValidationError("reference_at must include a timezone")
     return value
+
+
+def _modality_names(modalities: Iterable[Modality]) -> str:
+    return ", ".join(sorted(modality.value for modality in modalities)) or "nothing"
+
+
+def _scope_description(scope: RetrievalScope | None) -> str | None:
+    """Describe a requested scope that matched nothing, or `None` when none was requested."""
+    if scope is None:
+        return None
+    bounds = []
+    if scope.place_id is not None:
+        bounds.append(f"place {scope.place_id}")
+    if scope.near is not None:
+        radius = "" if scope.radius_m is None else f" within {scope.radius_m} m"
+        bounds.append(f"frame {scope.near.frame_id}{radius}")
+    if scope.valid_at is not None:
+        bounds.append(f"valid at {scope.valid_at.isoformat()}")
+    if scope.known_at is not None:
+        bounds.append(f"known at {scope.known_at.isoformat()}")
+    if not bounds:
+        return None
+    return f"no memory matched the requested scope: {', '.join(bounds)}"
+
+
+def declared_capabilities(
+    *,
+    embedder: EmbeddingBackend,
+    answerer: GenerationBackend | None = None,
+    transcriber: SpeechBackend | TranscriptionBackend | None = None,
+    vision_describer: VisionDescriptionBackend | None = None,
+    face_analyzer: FaceBackend | None = None,
+    former: FormationBackend | None = None,
+    consolidator: ConsolidationBackend | None = None,
+) -> MemoryCapabilities:
+    """Declare what one set of backends can do, without opening a store.
+
+    `Memory.capabilities` reads it, and so does `mindbridge doctor`, which probes recipes without
+    owning a `data_dir`. Both therefore publish one document rather than two descriptions.
+    """
+    embedding, embedding_model, space_id, dimension = _embedding_contract(embedder)
+    transcription, transcription_space = _transcription_contract(transcriber)
+    vision, vision_model = _vision_contract(vision_describer)
+    face, face_model, _face_space, _face_analysis_space = _face_contract(face_analyzer)
+    formation, formation_model, _formation_space = _formation_contract(former)
+    consolidation_model, _consolidation_recipe = _consolidation_contract(consolidator)
+    return MemoryCapabilities(
+        embedding=embedding,
+        embedding_model=embedding_model,
+        embedding_space=space_id,
+        embedding_dimension=dimension,
+        generation=_generation_contract(answerer),
+        transcription=transcription,
+        vision=vision,
+        face=face,
+        formation=formation,
+        # The contracts substitute a `"none"` sentinel for an absent backend because the space
+        # and recipe digests hash these strings. That sentinel is an implementation detail, so
+        # the published value is absent when the backend is, keyed on the backend itself rather
+        # than on the string -- a real model could be named "none".
+        generation_model=getattr(answerer, "generation_model", None),
+        transcription_space=None if transcriber is None else transcription_space,
+        vision_model=None if vision_describer is None else vision_model,
+        face_model=None if face_analyzer is None else face_model,
+        formation_model=None if former is None else formation_model,
+        consolidation_model=None if consolidator is None else consolidation_model,
+        speaker_recognition=isinstance(transcriber, SpeechBackend),
+        streaming_generation=isinstance(answerer, StreamingGenerationBackend),
+    )
 
 
 def _retrieval_scope(value: RetrievalScope | None) -> RetrievalScope | None:
@@ -8199,6 +8778,25 @@ def _identifier(value: object, name: str) -> str:
     return value
 
 
+def _capture_flag(capture: object) -> bool:
+    """Read `capture` as the mode it is, so a truthy value is a mistake and not a silent yes."""
+    if not isinstance(capture, bool):
+        raise ValidationError("capture must be a boolean")
+    return capture
+
+
+def _memory_id_filter(memory_ids: Sequence[str] | None) -> tuple[str, ...] | None:
+    """Normalize an optional `memory_ids` filter the way `forget()` normalizes its argument."""
+    if memory_ids is None:
+        return None
+    if isinstance(memory_ids, (str, bytes)):
+        raise ValidationError("memory_ids must be a sequence of memory IDs")
+    try:
+        return tuple(_identifier(memory_id, "memory_id") for memory_id in memory_ids)
+    except TypeError:
+        raise ValidationError("memory_ids must be a sequence of memory IDs") from None
+
+
 def _embedding_id(memory_id: str, object_part: int) -> str:
     if object_part == 0:
         return memory_id
@@ -8280,7 +8878,9 @@ def _datetime_text(value: datetime) -> str:
 def _translate_storage_errors(action: str) -> Iterator[None]:
     try:
         yield
-    except MindBridgeError:
+    # A stale control-plane precondition is kernel policy, not an IO failure: the two apply call
+    # sites turn it into a `"stale"` rejection, and no other store method raises it.
+    except (MindBridgeError, StaleOperationError):
         raise
     except Exception as error:
         # `io_failed` is this wrapper's pre-existing contract and a test pins it. It is coarse by

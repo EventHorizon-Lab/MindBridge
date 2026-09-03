@@ -63,6 +63,19 @@ The ordering determines failure behavior:
   still durable and the unacknowledged projection work is retryable.
 - Stale IDs left in Zvec cannot resurrect deleted data because final hydration uses SQLite.
 
+`delete()` is physical forgetting and runs the same ordering in reverse. One SQLite transaction
+removes the record and everything keyed on it -- semantics, versions, evidence, formation runs,
+the capture-queue row, and the embeddings, whose delete triggers enqueue the projection work the
+call then drains. Media is content-addressed and therefore shared: the transaction returns the
+assets no remaining memory references, and only those lose their blob, their descriptor, their
+cached transcript, and the speech and face rows keyed on them. Removing the last observation of an
+anonymous identity also removes that identity and its exemplar template, so no biometric vector
+outlives the media it was derived from; a named or merged person survives, because a name is an
+assertion a caller made and `forget_identity()` is what erases one. The single deliberate survivor
+is `memory_operations`: the operation log is append-only audit history over ids, proposals, and
+rationales, and rewriting it would make `rollback()` unsound. The Python SDK reference owns the
+row-by-row contract.
+
 A memory ID is the SHA-256 digest of canonical ordered content, media digests, metadata, event
 time, memory type, and optional observation context. Repeating the same add is idempotent.
 `add_many()` uses one model batch and one SQLite transaction. `add_stream()` commits each completed
@@ -80,22 +93,45 @@ flowchart LR
     input["Validate and materialize content"] --> commit["Commit record, media, context, and queue row"]
     commit --> ack["Acknowledge capture"]
     ack -. later .-> settle["settle(): run the model stages"]
-    settle --> derived["Commit derived content, vectors, and queue-row deletion"]
-    derived --> zvec["Flush Zvec and acknowledge the outbox"]
+    settle --> derived["Commit derived content and vectors; the queue row survives"]
+    derived --> zvec["Flush Zvec, form, then delete the queue row"]
     settle -. failure .-> queued["Count the attempt, store the reason, keep the row queued"]
 ```
 
 A captured record is durable and readable but has no vectors, so it enqueues no index work and
 `search()` cannot return it. `settle()` and the `add()` path share one enrichment routine over the
 committed row, so a settled record holds exactly the derived content, vectors, and formation a
-blocking `add()` would have produced. Retrieval and shutdown never settle.
+blocking `add()` would have produced. Retrieval and shutdown never settle. That shared routine
+runs under one process-wide settlement lock, so a concurrent `settle()` or an `add()` of the same
+captured content waits instead of running the model stages twice.
+
+Enrichment appends. Derived text is added to `memory_records.content` behind a per-asset marker —
+`[transcript:<asset_id>]`, `[visual description:<asset_id>]`, or `[speech identities:<asset_id>]`
+— so the caller's own text stays byte-identical at the front of the record and model
+interpretation stays separable from evidence. Media bytes are never rewritten: they stay in
+`assets/` under their digest, and a transcript is also cached on the asset row.
+
+`settle()` attempts every record it read: a failing one keeps its queue row, its attempt count,
+and its reason while the records behind it still settle, and the first failure is raised once the
+batch is done. A record that has already failed `max_attempts` times is skipped rather than
+retried, so one poisoned capture cannot block the queue. `capture()` applies the same
+embedder-capability check `add()` applies, so media no configured model could ever take is
+refused before the commit instead of becoming a durable row that can never settle.
 
 ### Formation and consolidation
 
 Formation follows the same authority rule. A `FormationBackend` proposes typed state after the
 source observation commits; the kernel validates source binding, modality, identity, validity, and
 conflicts. Derived records, evidence, versions, embeddings, the per-source recipe marker, and
-outbox work commit together. A failed formation leaves the source durable and retryable.
+outbox work commit together.
+
+A failed formation leaves the source durable and retryable on both paths. `add()` enqueues each
+new record in `capture_queue` inside its own write transaction whenever a formation backend is
+configured, and deletes that row after formation returns; a crash in between leaves the row, and
+the next `settle()` finds a record that is already embedded and owes formation only, so it forms
+it without buying the same vectors twice. `capture()` keeps its queue row through the settle
+commit for the same reason. The per-source recipe marker makes the retry idempotent: a source
+that already formed is skipped.
 
 `memory_semantics.identity_id` binds a typed claim to a recognized person, and the kernel is the
 only writer of it. It is `ON DELETE SET NULL` on purpose: erasing a person drops the attribution
@@ -180,8 +216,11 @@ proposes typed semantics from one committed observation. A `ConsolidationBackend
 reinforcement, consolidation, correction, or cognitive forgetting over a bounded set of records
 that already exist. Neither writes SQLite: the kernel validates every field, applies only the
 effect the declared intent allows, and commits each operation with an append-only
-`memory_operations` row that `Memory.rollback()` can reverse. Physical deletion is not a proposable
-intent.
+`memory_operations` row that `Memory.rollback()` can reverse. A consolidation proposal may name
+targets only inside the evidence window the kernel gathered for it, must be eligible in every
+target it names or be refused whole, and has those preconditions re-checked inside the apply
+transaction, so a record that moved since validation is refused as stale rather than half
+applied. Physical deletion is not a proposable intent.
 
 Applications may inject backend objects directly or use `MemoryPlugins` and `Memory.from_plugins()`.
 `Memory.from_config()` validates the bundled provider catalog and delegates to the same kernel.
@@ -204,12 +243,12 @@ operations. REST exposes nine `/v1` routes: add, batch add, list, search, reinfo
 answer, and compile context. MCP exposes fifteen tools: the eight corresponding non-batch
 operations plus speech, face, and identity operations, or ten when the host builds it with
 `identity_operations=False`, because naming and erasing a person is host authority and the host
-decides whether it is on the wire at all. The local CLI exposes the 27 operations
+decides whether it is on the wire at all. The local CLI exposes the 28 operations
 plus `doctor`; `--url` is limited to operations implemented by REST.
 
-Compiling context is a read-only view. The memory control plane — `consolidate()`, `forget()`,
-`rollback()`, and `operations()` — and physical deletion stay in the owner process, which is also
-the process that can audit and reverse an operation through its log.
+Compiling context is a read-only view. The memory control plane — `consolidation_candidates()`,
+`consolidate()`, `forget()`, `rollback()`, and `operations()` — and physical deletion stay in the
+owner process, which is also the process that can audit and reverse an operation through its log.
 
 `create_app(memory=...)` and `build_mcp_server(memory)` use a caller-owned instance and do not
 close it. They also do not add authentication, authorization, TLS, rate limits, quotas, or audit

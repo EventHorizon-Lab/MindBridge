@@ -2122,6 +2122,59 @@ def test_naming_is_auditable_and_rollback_restores_the_previous_name(tmp_path: P
         assert '"speaker_name":null' in memory.get(record.id).content
 
 
+def test_naming_rollbacks_happen_newest_standing_first(tmp_path: Path) -> None:
+    """A reversal that changes nothing must say so, and must not resurrect a retracted name.
+
+    Reversing a naming operation that a later naming already displaced used to return True and
+    change nothing, after which reversing the standing one restored the middle name even though
+    its own operation was marked rolled back: the audit trail said the name was retracted while
+    the registry answered to it.
+    """
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=1,
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+
+        memory.register_identity(identity_id, "Li")
+        memory.register_identity(identity_id, "Li Hua")
+        memory.register_identity(identity_id, "Li Hua Ming")
+        by_name = {
+            entry.operation.claim.name: entry
+            for entry in memory.operations()
+            if entry.operation.claim is not None
+        }
+
+        # The middle assertion is not in force, so reversing it is refused rather than claimed.
+        assert memory.rollback(by_name["Li Hua"].operation_id) is False
+        assert memory.identity(identity_id).name == "Li Hua Ming"  # type: ignore[union-attr]
+        assert '"speaker_name":"Li Hua Ming"' in memory.get(record.id).content
+        standing = {
+            entry.operation_id for entry in memory.operations() if entry.rolled_back_at is not None
+        }
+        assert standing == set()
+
+        # Reversing the standing one restores its predecessor, name and index together.
+        assert memory.rollback(by_name["Li Hua Ming"].operation_id) is True
+        assert memory.identity(identity_id).name == "Li Hua"  # type: ignore[union-attr]
+        assert '"speaker_name":"Li Hua"' in memory.get(record.id).content
+
+        # Now the middle one is in force, so the same call that was refused above succeeds.
+        assert memory.rollback(by_name["Li Hua"].operation_id) is True
+        assert memory.identity(identity_id).name == "Li"  # type: ignore[union-attr]
+        assert '"speaker_name":"Li"' in memory.get(record.id).content
+        assert all(
+            "Li Hua" not in hit.content
+            for hit in memory.search("recognized person")
+            if hit.context is not None and hit.context.identity_id == identity_id
+        )
+
+
 def test_unlink_identity_stops_the_index_quoting_the_other_persons_name(tmp_path: Path) -> None:
     """Reversing a merge must repaint the indexed text, not only the identity rows.
 
@@ -3173,10 +3226,14 @@ def test_add_many_deduplicates_one_model_and_store_batch(
         store: LocalStore,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
+        *,
+        formation_pending_at: datetime | None = None,
     ) -> tuple[bool, ...]:
         batch = tuple(memories)
         store_batches.append(tuple(memory.memory_id for memory in batch))
-        result: tuple[bool, ...] = original(store, batch, embeddings)
+        result: tuple[bool, ...] = original(
+            store, batch, embeddings, formation_pending_at=formation_pending_at
+        )
         return result
 
     monkeypatch.setattr(LocalStore, "write_memories", counted_write)
@@ -3368,8 +3425,10 @@ def test_concurrent_adds_share_one_durable_index_flush(
         store: LocalStore,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
+        *,
+        formation_pending_at: datetime | None = None,
     ) -> tuple[bool, ...]:
-        result = original(store, memories, embeddings)
+        result = original(store, memories, embeddings, formation_pending_at=formation_pending_at)
         committed.wait(timeout=3)
         return result
 
@@ -3415,8 +3474,12 @@ def test_reindex_replays_an_add_committed_after_its_sqlite_scan(
         store: LocalStore,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
+        *,
+        formation_pending_at: datetime | None = None,
     ) -> tuple[bool, ...]:
-        result = original_write(store, memories, embeddings)
+        result = original_write(
+            store, memories, embeddings, formation_pending_at=formation_pending_at
+        )
         add_committed.set()
         return result
 
@@ -3810,6 +3873,69 @@ def test_path_media_uses_native_dense_search_and_cas_lifecycle(tmp_path: Path) -
 
         assert memory.delete(record.id) is True
         assert not record.assets[0].path.exists()
+
+
+def _table_counts(data_dir: Path) -> dict[str, int]:
+    with closing(sqlite3.connect(data_dir / "state.sqlite3")) as connection:
+        names = tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        )
+        return {
+            name: int(connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0])
+            for name in names
+        }
+
+
+def test_delete_leaves_no_trace_of_the_record_in_any_table_or_blob(tmp_path: Path) -> None:
+    """Deletion completeness: what a deleted record contributed is gone, everywhere.
+
+    Blobs are content-addressed and shared, so one is removed only once no memory references
+    it. The audit log is the deliberate exception and is asserted separately.
+    """
+    audio = Blob(b"spoken audio bytes", "audio/wav", "voice.wav")
+    image = Blob(b"portrait bytes", "image/png", "portrait.png")
+
+    with Memory(
+        tmp_path,
+        embedder=_FakeModels(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        index_speech=True,
+    ) as memory:
+        heard = memory.add(("red note one", audio))
+        echoed = memory.add(("red note two", audio))
+        seen = memory.add(("red portrait", image))
+        memory.speech(heard.id)
+        memory.faces(seen.id)
+        blobs = {path.name for path in (tmp_path / "assets").rglob("*") if path.is_file()}
+        assert len(blobs) == 2
+        populated = _table_counts(tmp_path)
+        assert populated["identity_exemplars"] > 0
+        assert populated["speech_segments"] > 0
+        assert populated["face_observations"] > 0
+        operations = populated["memory_operations"]
+
+        # The shared blob outlives the first of the two memories holding it.
+        assert memory.delete(heard.id) is True
+        assert {path.name for path in (tmp_path / "assets").rglob("*") if path.is_file()} == blobs
+        assert _table_counts(tmp_path)["media_assets"] == 2
+
+        assert memory.delete(echoed.id) is True
+        assert memory.delete(seen.id) is True
+
+        assert [path for path in (tmp_path / "assets").rglob("*") if path.is_file()] == []
+        # `memory_operations` is audit history that outlives the records it names; every other
+        # table holds record content, derived vectors, or a biometric template built from it.
+        remaining = _table_counts(tmp_path)
+        assert remaining["memory_operations"] == operations
+        assert {
+            name: count
+            for name, count in remaining.items()
+            if count and name not in {"memory_operations", "sqlite_sequence", "store_metadata"}
+        } == {}
 
 
 def test_persisted_media_reads_do_not_run_gc_ownership_queries(
