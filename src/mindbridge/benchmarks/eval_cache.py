@@ -220,3 +220,70 @@ def _evidence(value: object) -> EvidenceInterval:
 
 def _optional_number(value: object) -> bool:
     return value is None or (not isinstance(value, bool) and isinstance(value, int | float))
+
+
+class DescriptionCache:
+    """Persist one visual description per asset content hash, shared by every run.
+
+    A caption becomes indexed text, and the measured generation endpoint returns a different
+    completion for the same image on every call even at temperature 0 with a fixed seed. Two
+    ingests of one corpus would therefore build different libraries, which makes a paired arm
+    incomparable with itself. Keying on the asset's own SHA-256 plus the describer's model makes
+    the second ingest reproduce the first exactly and spend nothing, and keeps two models'
+    captions from colliding in one file.
+    """
+
+    def __init__(self, path: Path, model: str) -> None:
+        if not model:
+            raise ValueError("description cache model must not be empty")
+        self.path = path.expanduser().resolve()
+        self.model = model
+        self.hits = 0
+        self.misses = 0
+        self._closed = False
+        self._connection = _open_descriptions(self.path)
+
+    def get(self, digest: str) -> str | None:
+        row = self._connection.execute(
+            "SELECT description FROM descriptions WHERE cache_key = ?",
+            (self._key(digest),),
+        ).fetchone()
+        if row is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        return str(row[0])
+
+    def put(self, digest: str, description: str) -> None:
+        if not description.strip():
+            raise ValueError("description must not be blank")
+        self._connection.execute(
+            "INSERT OR REPLACE INTO descriptions(cache_key, description) VALUES (?, ?)",
+            (self._key(digest), description),
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._connection.close()
+        self._closed = True
+
+    def _key(self, digest: str) -> str:
+        if not digest:
+            raise ValueError("description cache digest must not be empty")
+        encoded = json.dumps((self.model, digest), ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _open_descriptions(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=60, isolation_level=None)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=FULL")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS descriptions ("
+        "cache_key TEXT PRIMARY KEY NOT NULL, description TEXT NOT NULL) WITHOUT ROWID"
+    )
+    if os.name == "posix":
+        os.chmod(path, 0o600)
+    return connection

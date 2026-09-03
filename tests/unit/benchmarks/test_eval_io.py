@@ -6,17 +6,26 @@ import json
 import os
 import stat
 import zipfile
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
+import mindbridge.benchmarks.eval as eval_module
+from mindbridge import MindBridgeConfig, Modality
 from mindbridge.benchmarks.atm_bench import ATM_BENCH_ADAPTER_VERSION
 from mindbridge.benchmarks.download import acquire_media
 from mindbridge.benchmarks.eval import _cache_task
 from mindbridge.benchmarks.eval_adapters import MediaResolver, load_task
-from mindbridge.benchmarks.eval_cache import CachedAnswer, EvidenceInterval, ResponseCache
+from mindbridge.benchmarks.eval_cache import (
+    CachedAnswer,
+    DescriptionCache,
+    EvidenceInterval,
+    ResponseCache,
+)
 from mindbridge.benchmarks.prepare_media import (
     _OPENEQA_FRAME_RATE,
     _egolife_manifest,
@@ -29,6 +38,8 @@ from mindbridge.benchmarks.prepare_media import (
     prepare_task_media,
 )
 from mindbridge.benchmarks.task_catalog import TASKS, MediaSource, TaskSpec
+from mindbridge.models.base import ModelInput
+from mindbridge.types import AssetRef
 
 
 def _media_spec() -> TaskSpec:
@@ -675,3 +686,148 @@ def test_openeqa_accepts_episode_histories_already_in_the_managed_root(
     assert isinstance(manifest, dict)
     units = cast(dict[str, object], manifest["units"])
     assert list(units) == list(episodes)
+
+
+class _CountingDescriber:
+    """One describer that reports how many visuals actually reached a model."""
+
+    vision_capabilities = frozenset({Modality.IMAGE})
+    vision_model = "caption-model"
+
+    def __init__(self, prefix: str = "caption") -> None:
+        self.described: list[str] = []
+        self.calls = 0
+        self._prefix = prefix
+
+    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+        batch = tuple(inputs)
+        self.calls += 1
+        digests = tuple(str(value.assets[0].sha256) for value in batch)
+        self.described.extend(digests)
+        return tuple(f"{self._prefix} for {digest[:4]}" for digest in digests)
+
+    def close(self) -> None:
+        return None
+
+
+def _description_input(tmp_path: Path, digest: str) -> ModelInput:
+    path = tmp_path / f"{digest[:8]}.png"
+    path.write_bytes(b"png-bytes")
+    return ModelInput(
+        assets=(
+            AssetRef(
+                id=digest[:8],
+                modality=Modality.IMAGE,
+                media_type="image/png",
+                size_bytes=path.stat().st_size,
+                sha256=digest,
+                name=path.name,
+                path=path,
+            ),
+        )
+    )
+
+
+def test_a_cached_description_is_reused_instead_of_described_again(tmp_path: Path) -> None:
+    """Two ingests of one corpus must build the same documents.
+
+    The measured generation endpoint returns a different caption for the same image on every
+    call even at temperature 0 with a fixed seed, and a caption becomes indexed text, so without
+    this an arm cannot be compared with itself across runs.
+    """
+    first_input = _description_input(tmp_path, "a" * 64)
+    second_input = _description_input(tmp_path, "b" * 64)
+    backend = _CountingDescriber()
+    cache = DescriptionCache(tmp_path / "descriptions.db", backend.vision_model)
+    try:
+        describer = eval_module._CachedVisionDescriber(cast(Any, backend), cache)
+
+        first = describer.describe((first_input,))
+        # A partially cached batch still costs exactly one request, for the misses only.
+        second = describer.describe((first_input, second_input))
+        third = describer.describe((first_input, second_input))
+    finally:
+        cache.close()
+
+    assert first == ("caption for aaaa",)
+    assert second == ("caption for aaaa", "caption for bbbb")
+    assert third == second
+    assert backend.calls == 2
+    assert backend.described == ["a" * 64, "b" * 64]
+    assert (cache.hits, cache.misses) == (3, 2)
+
+
+def test_a_description_cache_survives_the_process_that_wrote_it(tmp_path: Path) -> None:
+    value = _description_input(tmp_path, "c" * 64)
+    first_backend = _CountingDescriber()
+    cache = DescriptionCache(tmp_path / "descriptions.db", first_backend.vision_model)
+    try:
+        eval_module._CachedVisionDescriber(cast(Any, first_backend), cache).describe((value,))
+    finally:
+        cache.close()
+
+    second_backend = _CountingDescriber(prefix="different")
+    reopened = DescriptionCache(tmp_path / "descriptions.db", second_backend.vision_model)
+    try:
+        repeated = eval_module._CachedVisionDescriber(cast(Any, second_backend), reopened).describe(
+            (value,)
+        )
+    finally:
+        reopened.close()
+
+    # Same corpus, later run, zero description tokens, and the identical document.
+    assert repeated == ("caption for cccc",)
+    assert second_backend.calls == 0
+
+
+def test_two_describer_models_do_not_share_one_cached_caption(tmp_path: Path) -> None:
+    # Both sides go through the wrapper, so the test cannot pass by keying differently from the
+    # code under test -- an earlier version of this test wrote its own raw key and never
+    # exercised the model separation it claimed to.
+    value = _description_input(tmp_path, "d" * 64)
+    first_backend = _CountingDescriber(prefix="first-model")
+    first = DescriptionCache(tmp_path / "descriptions.db", "caption-model")
+    try:
+        original = eval_module._CachedVisionDescriber(cast(Any, first_backend), first).describe(
+            (value,)
+        )
+    finally:
+        first.close()
+
+    second_backend = _CountingDescriber(prefix="second-model")
+    second = DescriptionCache(tmp_path / "descriptions.db", "other-caption-model")
+    try:
+        described = eval_module._CachedVisionDescriber(cast(Any, second_backend), second).describe(
+            (value,)
+        )
+    finally:
+        second.close()
+
+    assert original == ("first-model for dddd",)
+    assert described == ("second-model for dddd",)
+    assert second_backend.calls == 1
+
+
+def test_the_description_cache_is_opened_only_for_a_configured_vision_slot(
+    tmp_path: Path,
+) -> None:
+    arguments = cast(
+        Any, SimpleNamespace(data_root=tmp_path, use_cache=tmp_path / "cache" / "run.db")
+    )
+    embedding = {"provider": "openai", "model": "tiny-test", "dimension": 4}
+    without = MindBridgeConfig.model_validate({"data_dir": tmp_path, "embedding": embedding})
+    described = MindBridgeConfig.model_validate(
+        {"data_dir": tmp_path, "embedding": embedding, "vision": {"provider": "openai"}}
+    )
+
+    assert eval_module._description_cache_path(arguments, None) is None
+    assert eval_module._description_cache_path(arguments, without) is None
+    # Beside the response cache, and deliberately not namespaced by run: a later run has to read
+    # what an earlier one wrote.
+    assert eval_module._description_cache_path(arguments, described) == (
+        tmp_path / "cache" / "descriptions.db"
+    )
+    no_response_cache = cast(Any, SimpleNamespace(data_root=tmp_path, use_cache=None))
+    assert eval_module._description_cache_path(no_response_cache, described) == (
+        tmp_path / "cache" / "descriptions.db"
+    )

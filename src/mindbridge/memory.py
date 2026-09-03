@@ -54,6 +54,7 @@ from mindbridge._telemetry import (
     MODEL_TTFT,
     SPAN_KIND,
     TRACER_NAME,
+    VISION_BATCHES_FAILED,
     current_model_request_count,
     mark_model_requests,
     model_span,
@@ -2127,9 +2128,18 @@ class Memory:
         )
         if not assets:
             return {}
-        descriptions = self._vision_descriptions(
-            tuple(self._resolved_model_input(_asset_content(asset)) for asset in assets)
-        )
+        try:
+            descriptions = self._vision_descriptions(
+                tuple(self._resolved_model_input(_asset_content(asset)) for asset in assets)
+            )
+        except ModelError:
+            # A description is derived convenience, and the caller handed us an observation to
+            # store: losing the caption must never lose the memory. One malformed reply from the
+            # describer used to fail the whole `add`, which an ingesting caller then reports as
+            # unwritten memories -- a far larger loss than the empty document this leaves behind.
+            # The batch is counted on the vision span as `mindbridge.vision.failed_batches`, so
+            # how much derived text a run did not get is measurable rather than silent.
+            return {}
         return dict(zip((asset.asset_id for asset in assets), descriptions, strict=True))
 
     def _with_visual_descriptions(
@@ -3701,27 +3711,20 @@ class Memory:
             model=self._vision_model,
             batch_size=len(inputs),
             modalities=(modality for value in inputs for modality in value.modalities),
-        ):
+        ) as span:
             mark_model_requests(1)
+            # Validated inside the span so that a reply the model did return but that cannot be
+            # used is counted as a failed batch too, and so that the count lands on a span the
+            # evaluation telemetry aggregates -- it reads counters only from model spans.
             try:
-                descriptions = self._vision_describer.describe(inputs)
-            except MindBridgeError:
-                raise
+                return _validated_descriptions(self._vision_describer.describe(inputs), inputs)
             except Exception as error:
+                span.set_attribute(VISION_BATCHES_FAILED, 1)
+                if isinstance(error, MindBridgeError):
+                    raise
                 raise ModelError(
                     "failed to describe vision input", reason="model_failed"
                 ) from error
-        if len(descriptions) != len(inputs) or any(
-            not isinstance(description, str) or not description.strip()
-            for description in descriptions
-        ):
-            raise ModelError("vision model returned invalid output", reason="response_invalid")
-        normalized = tuple(description.strip() for description in descriptions)
-        if any(len(description) > _MAX_TEXT_CHARACTERS for description in normalized):
-            raise ModelError(
-                "vision description exceeded the supported text length", reason="payload_too_large"
-            )
-        return normalized
 
     def _embed(
         self,
@@ -6291,6 +6294,26 @@ def _batch_values(
 def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _PreparedContent:
     note = f"Reference time for relative dates: {reference_at.isoformat(timespec='microseconds')}"
     return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
+
+
+def _validated_descriptions(
+    descriptions: object,
+    inputs: Sequence[ModelInput],
+) -> tuple[str, ...]:
+    """Accept one non-empty, storable caption per input, in order, and nothing else."""
+    if not isinstance(descriptions, tuple | list):
+        raise ModelError("vision model returned invalid output", reason="response_invalid")
+    values = tuple(descriptions)
+    if len(values) != len(inputs) or any(
+        not isinstance(description, str) or not description.strip() for description in values
+    ):
+        raise ModelError("vision model returned invalid output", reason="response_invalid")
+    normalized = tuple(cast(str, description).strip() for description in values)
+    if any(len(description) > _MAX_TEXT_CHARACTERS for description in normalized):
+        raise ModelError(
+            "vision description exceeded the supported text length", reason="payload_too_large"
+        )
+    return normalized
 
 
 def _record_elided_parts(count: int) -> None:

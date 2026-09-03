@@ -33,6 +33,7 @@ from mindbridge._telemetry import (
     TOKEN_REPORTED_REQUEST_COUNT,
     TOKEN_TOTAL,
     TRACER_NAME,
+    VISION_BATCHES_FAILED,
     token_modality_attribute,
 )
 from mindbridge.benchmarks.eval_statistics import percentile
@@ -249,6 +250,7 @@ class _TaskTelemetry:
     tokens_by_module: dict[str, _Tokens] = field(default_factory=dict)
     media_elided_hits: int = 0
     dropped_hits: int = 0
+    vision_failed_batches: int = 0
     ingest_items: int = 0
 
     def add(self, span: ReadableSpan) -> None:
@@ -274,6 +276,7 @@ class _TaskTelemetry:
             self.tokens.add(attributes)
             self.media_elided_hits += _int_attribute(attributes, GROUNDING_MEDIA_ELIDED) or 0
             self.dropped_hits += _int_attribute(attributes, GROUNDING_HITS_DROPPED) or 0
+            self.vision_failed_batches += _int_attribute(attributes, VISION_BATCHES_FAILED) or 0
             module = _string_attribute(attributes, MODEL_MODULE) or "unknown"
             self.tokens_by_module.setdefault(module, _Tokens()).add(attributes)
 
@@ -409,6 +412,10 @@ class _TaskTelemetry:
                 "media_elided_hits": self.media_elided_hits,
                 "dropped_hits": self.dropped_hits,
             },
+            # Write-path loss, not answer-path loss, so it is its own block: a describer whose
+            # reply could not be used leaves a media memory with no full-text document, which is
+            # invisible in a token count because a failed batch reports no tokens.
+            "vision": {"failed_batches": self.vision_failed_batches},
         }
 
 

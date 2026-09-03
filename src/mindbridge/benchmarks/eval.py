@@ -69,7 +69,12 @@ from mindbridge.benchmarks.eval_adapters import (
     load_media_manifest,
     load_task,
 )
-from mindbridge.benchmarks.eval_cache import CachedAnswer, EvidenceInterval, ResponseCache
+from mindbridge.benchmarks.eval_cache import (
+    CachedAnswer,
+    DescriptionCache,
+    EvidenceInterval,
+    ResponseCache,
+)
 from mindbridge.benchmarks.eval_statistics import (
     ScoredValue,
     paired_comparison,
@@ -563,6 +568,61 @@ class _BorrowedBackend:
         return None
 
 
+class _CachedVisionDescriber:
+    """Describe only the visuals no earlier run has described at this model.
+
+    The endpoint returns a different caption for the same image on every call, so without this
+    two ingests of one corpus build different full-text documents and a paired arm cannot be
+    compared with itself. Keyed on the asset's own SHA-256, so it is stable across runs, stores,
+    and machines, and a repeat run spends zero description tokens.
+    """
+
+    def __init__(self, backend: VisionDescriptionBackend, cache: DescriptionCache) -> None:
+        self._backend = backend
+        self._cache = cache
+
+    @property
+    def vision_capabilities(self) -> frozenset[Modality]:
+        return self._backend.vision_capabilities
+
+    @property
+    def vision_model(self) -> str:
+        return self._backend.vision_model
+
+    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+        batch = tuple(inputs)
+        keys = tuple(_description_digest(value) for value in batch)
+        known = tuple(None if key is None else self._cache.get(key) for key in keys)
+        pending = tuple(value for value, found in zip(batch, known, strict=True) if found is None)
+        # One call for the whole miss set, so a partially cached batch still costs one request.
+        fresh = iter(() if not pending else self._backend.describe(pending))
+        described: list[str] = []
+        for key, found in zip(keys, known, strict=True):
+            if found is not None:
+                described.append(found)
+                continue
+            value = next(fresh)
+            if key is not None:
+                self._cache.put(key, value)
+            described.append(value)
+        return tuple(described)
+
+    def close(self) -> None:
+        return None
+
+
+def _description_digest(value: ModelInput) -> str | None:
+    """Identify one description input by the content of the assets it carries.
+
+    An input with no resolved digest is describable but not cacheable; it is passed through
+    rather than silently sharing a key with everything else in its shape.
+    """
+    digests = tuple(asset.sha256 for asset in value.assets if asset.sha256)
+    if not digests or len(digests) != len(value.assets):
+        return None
+    return ":".join((*digests, value.text))
+
+
 class _BorrowedGenerationBackend(_BorrowedBackend):
     """Lend one answerer without transferring ownership to a per-unit memory."""
 
@@ -646,9 +706,11 @@ class _BackendPool:
         gen_kwargs: str = "",
         memory_config: MindBridgeConfig | None = None,
         tracer: Tracer | None = None,
+        description_cache: Path | None = None,
     ) -> None:
         self.config = config
         self._resolved_config = None
+        self._description_cache: DescriptionCache | None = None
         self._tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
         if memory_config is not None:
             if memory_config.generation is not None:
@@ -695,11 +757,23 @@ class _BackendPool:
                 if plugins.former is None
                 else cast(FormationBackend, _BorrowedBackend(plugins.former))
             )
-            self._vision_describer = (
-                None
-                if plugins.vision_describer is None
-                else cast(VisionDescriptionBackend, _BorrowedBackend(plugins.vision_describer))
-            )
+            if plugins.vision_describer is None:
+                self._vision_describer = None
+            else:
+                borrowed = cast(
+                    VisionDescriptionBackend, _BorrowedBackend(plugins.vision_describer)
+                )
+                # Opened only when `vision:` is configured, so a run without the slot touches no
+                # cache file at all and behaves exactly as it does today.
+                if description_cache is not None:
+                    self._description_cache = DescriptionCache(
+                        description_cache, plugins.vision_describer.vision_model
+                    )
+                    borrowed = cast(
+                        VisionDescriptionBackend,
+                        _CachedVisionDescriber(borrowed, self._description_cache),
+                    )
+                self._vision_describer = borrowed
             # Answer-time reinforcement is a product behaviour, not a measured one: it makes a
             # question's retrieval depend on which earlier questions ran, and under concurrency on
             # the order their updates committed, so a run stops being reproducible from its seed.
@@ -797,6 +871,10 @@ class _BackendPool:
         )
 
     def close(self) -> None:
+        if self._description_cache is not None:
+            with suppress(Exception):
+                self._description_cache.close()
+            self._description_cache = None
         if self._resolved_config is not None:
             self._resolved_config.close()
             return
@@ -1154,6 +1232,7 @@ def _execute(
                         gen_kwargs=arguments.gen_kwargs,
                         memory_config=memory_config,
                         tracer=telemetry.tracer,
+                        description_cache=_description_cache_path(arguments, memory_config),
                     )
                     memory_factory = pool.memory
                 with sampler:
@@ -4446,6 +4525,24 @@ def _replace_config(config: ModelConfig, key: str, value: str) -> ModelConfig:
     if key == "generation_min_video_seconds":
         return replace(config, generation_min_video_seconds=float(value))
     raise AssertionError(f"unhandled model setting: {key}")
+
+
+def _description_cache_path(
+    arguments: _Arguments,
+    memory_config: MindBridgeConfig | None,
+) -> Path | None:
+    """Where descriptions persist between runs, or ``None`` when nothing describes.
+
+    Beside the response cache when one is configured, so both live under the same directory a
+    sweep already owns; otherwise under the corpus root. Deliberately not namespaced by run or
+    by task: the whole point is that a later run reads what an earlier one wrote.
+    """
+    if memory_config is None or memory_config.vision is None:
+        return None
+    directory = (
+        arguments.data_root / "cache" if arguments.use_cache is None else arguments.use_cache.parent
+    )
+    return directory / "descriptions.db"
 
 
 def _batch_size(arguments: _Arguments, task: LoadedTask) -> int:
