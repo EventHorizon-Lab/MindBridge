@@ -237,7 +237,11 @@ for operation, reason in report.rejected:
 
 The evidence set comes from explicit `evidence_ids`, else the active search result for `query`,
 else the newest `limit` active records. Forgotten and hidden records never reach the backend, and
-the backend may cite only IDs it was shown.
+the backend may cite only IDs it was shown. Its `target_ids` are bounded too: they must fall
+inside the window the kernel gathered, which is the shown set plus whatever the host named in
+`evidence_ids`. That extra allowance is how a hidden derived record — the reason `REINFORCE` and
+`CORRECT` exist — stays reachable, without letting a backend act on records nobody put in front
+of it.
 
 | Intent | Kernel semantics |
 | --- | --- |
@@ -248,11 +252,18 @@ the backend may cite only IDs it was shown.
 
 The backend proposes and never writes. Each proposal is validated against the shown evidence set
 and its intent's rules, then committed in its own transaction together with an append-only log
-row. A refused proposal is reported with a reason instead of raising, so one bad proposal does not
+row. A pass is therefore not atomic, by design: a proposal refused after an earlier one committed
+does not undo it, and `ConsolidationReport` names exactly which applied and which were rejected.
+A refused proposal is reported with a reason instead of raising, so one bad proposal does not
 discard the pass. Every operation is identified by `sha256(canonical operation JSON + recipe)`, so
 re-proposing the same operation is rejected as `"duplicate"` rather than applied twice.
 `rollback(operation_id)` reverses one operation and `operations()` lists the log newest first.
 Deletion is not an intent.
+
+A proposal is all or nothing within itself. Every target it names must be eligible or the whole
+proposal is refused, so an applied row's `target_ids` are the IDs it actually acted on. The apply
+transaction re-checks what validation read: a target or cited source that moved in between makes
+the proposal `"stale"` with nothing written.
 
 Two things share the name "reinforce" and are not the same mechanism. `reinforce()` is the
 *ranking-utility* signal: it bumps a bounded confirmation count, changes retrieval order only,
@@ -265,7 +276,10 @@ makes without a model; the other three intents exist only as backend proposals.
 new version supersedes the prior one at transaction time and history is kept. That reconciliation
 runs for `STATE` and for `USER_STATEMENT` `TRAIT`. Any other kind gains a second record in the
 same lineage rather than superseding, which is why a model-inferred `TRAIT` can end up
-contradicting itself — and why the loop is given a way to see that.
+contradicting itself — and why the loop is given a way to see that. Proposing a replacement value
+for a wrong inference is a `CORRECT` and a `CONSOLIDATE` in the same batch, which the
+consumed-evidence rule allows: correcting a derived record retires that record, not the sources
+the replacement is built from.
 
 ### What needs deliberation
 
@@ -302,8 +316,10 @@ MindBridge separates five forms of forgetting and never conflates them:
 | Physical deletion | `delete()` | Removes the record and any media no other record references. Not recoverable, and never something a model proposes. |
 
 `forget()` is cognitive only. It is the host entry point for the `FORGET` intent, so it takes the
-same log row and the same rollback path as a proposed operation. It returns `None` when nothing
-changed, which makes an unknown or already-forgotten ID a no-op rather than an error. Unlike an
+same log row and the same rollback path as a proposed operation — and, like one, applies all of
+its IDs or none. An unknown ID raises `MemoryNotFoundError` the way `get()` and `delete()` do; an
+empty sequence, or a set containing an already-forgotten record, returns `None` having changed
+nothing. The host names the IDs and is the authority, so no evidence window bounds it. Unlike an
 expiring validity interval, it is a policy state a host sets rather than a property of the world.
 
 Consolidation forgetting sets the same `forgotten_at` column, reached a different way: the memory

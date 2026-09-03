@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
@@ -479,7 +480,8 @@ def test_reinforcement_refuses_a_proposal_that_re_cites_an_existing_source(
                 ),
             )
         )
-        report = memory.consolidate(evidence_ids=(first.id, second.id))
+        # `derived_id` is hidden, so it can only enter the target window by being named.
+        report = memory.consolidate(evidence_ids=(first.id, second.id, derived_id))
 
         assert [reason for _operation, reason in report.rejected] == ["already_linked"]
         stable = memory.get(derived_id)
@@ -568,8 +570,16 @@ def test_forgetting_leaves_search_but_stays_in_get_and_list(tmp_path: Path) -> N
         assert listed[second.id] is None
 
         assert memory.forget((first.id,)) is None
-        assert memory.forget(("unknown-id",)) is None
         assert memory.forget(()) is None
+        # The host names IDs directly, so an unknown one is an error like `get()` and `delete()`,
+        # and a set containing an already-forgotten record applies nothing at all.
+        with pytest.raises(MemoryNotFoundError):
+            memory.forget(("unknown-id",))
+        with pytest.raises(MemoryNotFoundError):
+            memory.forget((second.id, "unknown-id"))
+        assert memory.get(second.id).forgotten_at is None
+        assert memory.forget((first.id, second.id)) is None
+        assert memory.get(second.id).forgotten_at is None
 
         assert memory.rollback(record.operation_id) is True
         assert memory.get(first.id).forgotten_at is None
@@ -839,6 +849,220 @@ def test_one_pass_may_not_build_on_evidence_it_just_retired(tmp_path: Path) -> N
 
         assert [record.operation.intent for record in report.operations] == [MemoryIntent.FORGET]
         assert [reason for _operation, reason in report.rejected] == ["inconsistent_batch"]
+
+
+def test_a_correction_and_its_replacement_fit_in_one_pass(tmp_path: Path) -> None:
+    """Update is CORRECT plus CONSOLIDATE in one batch; the consumed-set rule must allow it."""
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "update", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id))
+        wrong_id = report.operations[0].created_ids[0]
+
+        consolidator._scripts.append(
+            (
+                MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(wrong_id,)),
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    proposal=_trait("Ana", "impatient"),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id, wrong_id))
+
+        assert report.rejected == ()
+        assert [record.operation.intent for record in report.operations] == [
+            MemoryIntent.CORRECT,
+            MemoryIntent.CONSOLIDATE,
+        ]
+        replacement = memory.get(report.operations[1].created_ids[0])
+        assert replacement.context is not None and replacement.context.value == "impatient"
+
+
+# ---------------------------------------------------------------------------------------------
+# Trust boundary
+
+
+def test_a_backend_cannot_act_on_a_record_it_was_never_shown(tmp_path: Path) -> None:
+    """A backend shown only A may not forget or correct an unrelated B; the host still may."""
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "unshown", consolidator) as memory:
+        first, hidden = _observations(memory, "Ana waited calmly", "the door closed")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id,),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        derived_id = memory.consolidate(evidence_ids=(first.id,)).operations[0].created_ids[0]
+
+        consolidator._scripts.append(
+            (
+                MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(hidden.id,)),
+                MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(derived_id,)),
+                MemoryOperation(
+                    intent=MemoryIntent.REINFORCE,
+                    target_ids=(derived_id,),
+                    evidence_ids=(first.id,),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id,))
+
+        assert report.operations == ()
+        assert [reason for _operation, reason in report.rejected] == ["target_not_shown"] * 3
+        assert memory.get(hidden.id).forgotten_at is None
+        assert [record.operation.intent for record in memory.operations()] == [
+            MemoryIntent.CONSOLIDATE
+        ]
+
+        # The host names IDs directly and is the authority, so the same target still works.
+        applied = memory.forget((hidden.id,))
+        assert applied is not None and applied.forgotten_ids == (hidden.id,)
+
+
+def test_a_multi_target_operation_applies_all_of_it_or_none(tmp_path: Path) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "all-or-nothing", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        first_pass = memory.consolidate(evidence_ids=(first.id, second.id))
+        derived_id = first_pass.operations[0].created_ids[0]
+
+        consolidator._scripts.append(
+            (
+                # One derived target and one raw observation: the derived half used to be applied
+                # on its own while the log row still listed both.
+                MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(derived_id, first.id)),
+                MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(first.id, "no-such-id")),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id, derived_id))
+
+        assert report.operations == ()
+        assert [reason for _operation, reason in report.rejected] == [
+            "not_derived",
+            "unknown_target",
+        ]
+        assert memory.get(first.id).forgotten_at is None
+        assert [record.operation.intent for record in memory.operations()] == [
+            MemoryIntent.CONSOLIDATE
+        ]
+
+        # An already-forgotten record inside a larger FORGET refuses the whole operation too.
+        assert memory.forget((second.id,)) is not None
+        consolidator._scripts.append(
+            (MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(first.id, second.id)),)
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id, derived_id))
+
+        assert [reason for _operation, reason in report.rejected] == ["already_forgotten"]
+        assert memory.get(first.id).forgotten_at is None
+
+
+def test_a_target_forgotten_between_validation_and_apply_is_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The apply transaction re-checks what validation read; a target that moved is refused."""
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "stale-target", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
+        original = LocalStore.apply_control_operation
+        interleaved: list[str] = []
+
+        def forget_first(
+            self: LocalStore,
+            operation: StoredOperation,
+            **effects: object,
+        ) -> StoredOperation | None:
+            if not interleaved:
+                interleaved.append(first.id)
+                original(
+                    self,
+                    replace(operation, operation_key="interleaved-forget", intent="forget"),
+                    forget_ids=(first.id,),
+                )
+            return cast("StoredOperation | None", cast(Any, original)(self, operation, **effects))
+
+        monkeypatch.setattr(LocalStore, "apply_control_operation", forget_first)
+        consolidator._scripts.append(
+            (MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(first.id, second.id)),)
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id))
+
+        assert report.operations == ()
+        assert [reason for _operation, reason in report.rejected] == ["stale"]
+        # Only the interleaved write stands. The proposal applied nothing -- not even the half it
+        # could still have applied -- and left no log row.
+        assert memory.get(second.id).forgotten_at is None
+        assert [row.operation.intent for row in memory.operations()] == [MemoryIntent.FORGET]
+        assert memory.operations()[0].forgotten_ids == (first.id,)
+
+
+def test_evidence_forgotten_between_validation_and_apply_is_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "stale-evidence", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
+        original = LocalStore.apply_formation
+        interleaved: list[str] = []
+
+        def forget_first(self: LocalStore, *args: object, **kwargs: object) -> bool:
+            if not interleaved:
+                interleaved.append(first.id)
+                self.apply_control_operation(
+                    StoredOperation(
+                        operation_key="interleaved-forget",
+                        intent="forget",
+                        trigger="manual",
+                        operation_json="{}",
+                        applied_at=OCCURRED,
+                    ),
+                    forget_ids=(first.id,),
+                )
+            return cast(bool, cast(Any, original)(self, *args, **kwargs))
+
+        monkeypatch.setattr(LocalStore, "apply_formation", forget_first)
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id))
+
+        assert report.operations == ()
+        assert [reason for _operation, reason in report.rejected] == ["stale"]
+        assert [row.operation_key for row in memory._store.read_operations()] == [
+            "interleaved-forget"
+        ]
 
 
 # ---------------------------------------------------------------------------------------------

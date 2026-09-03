@@ -94,8 +94,10 @@ or `MemoryPlugins`. `former` proposes typed memories after a source observation 
 it keeps ordinary add behavior and makes no formation model call. The bundled OpenAI former is
 selected by the declarative `formation` slot, which stays off unless it is configured; see
 [configuration](../configuration.md#automatic-memory-formation). `consolidator` proposes the
-control-plane operations `consolidate()` applies; omitting it leaves `consolidate()` unavailable
-and every other operation unchanged.
+control-plane operations `consolidate()` applies; the bundled OpenAI backend is selected by the
+declarative `consolidation` slot, which stays off unless it is configured, and omitting it leaves
+`consolidate()` unavailable and every other operation unchanged. See
+[configuration](../configuration.md#agentic-memory-management).
 
 Use `index_speech=True` when transcripts and resolved speaker names should become retrieval text.
 `evidence_budget_chars=None` grounds `ask()` on exactly `limit` hits. A positive integer may admit
@@ -398,17 +400,34 @@ operation weighed nothing, so its evidence becomes due again.
 `consolidate` requires a `consolidator` and gathers the evidence set from `evidence_ids`, else the
 active search result for `query`, else the newest `limit` active records. Forgotten and hidden
 records never reach the backend. The backend proposes `MemoryOperation` values; the kernel
-validates each one, applies only the effect its intent allows, and commits it with its own log
-row. Rejected proposals are returned with a reason instead of raising, so one bad proposal does
-not discard the pass. Every operation carries `operation_key = sha256(canonical operation JSON +
-recipe)`; a key already applied and not rolled back is rejected as `"duplicate"`.
+validates each one, applies only the effect its intent allows, and commits it in its own
+transaction with its own log row. A pass is therefore not atomic: `ConsolidationReport.operations`
+lists exactly what committed and `.rejected` exactly what the kernel refused, and a proposal
+refused after an earlier one committed does not undo it. Rejected proposals are returned with a
+reason instead of raising, so one bad proposal does not discard the pass. Every operation carries
+`operation_key = sha256(canonical operation JSON + recipe)`; a key already applied and not rolled
+back is rejected as `"duplicate"`.
 
 | Intent | Kernel checks | Effect | `rollback` |
 | --- | --- | --- | --- |
-| `REINFORCE` | One derived target; every evidence ID shown, existing, not the target, not already linked | Adds independent evidence; confidence and visibility recompute | Retires those evidence rows |
+| `REINFORCE` | One derived target in the window; every evidence ID shown, existing, not the target, not already linked | Adds independent evidence; confidence and visibility recompute | Retires those evidence rows |
 | `CONSOLIDATE` | Valid proposal; at least one shown evidence ID; every `target_ids` entry among this proposal's own evidence; affect cue modality and spatial frame present in some source | New derived record citing every source, and `forgotten_at` set on any named target | Deletes the created records and un-forgets the targets |
-| `CORRECT` | Targets exist and are derived (`kind != OBSERVATION`) | Retires current versions at transaction time | Carries a new version with the same interval |
-| `FORGET` | Targets exist and are not already forgotten | Sets `forgotten_at` | Clears `forgotten_at` |
+| `CORRECT` | Every target in the window, existing, and derived (`kind != OBSERVATION`) | Retires current versions at transaction time | Carries a new version with the same interval |
+| `FORGET` | Every target in the window, existing, and not already forgotten | Sets `forgotten_at` | Clears `forgotten_at` |
+
+A backend may act only inside the window the kernel gathered for it, and every intent that names
+targets is bounded: a proposal naming a target outside it is rejected as `"target_not_shown"`
+before any write. The window is the shown set plus, when the host supplied `evidence_ids`, the IDs
+it named -- a hidden derived record is exactly what `REINFORCE` and `CORRECT` exist for and can
+never appear in the shown set, so naming it stays the host's decision. A `query` or the default
+window never widens it.
+
+Multi-target operations are all or nothing. A proposal whose targets are not all eligible is
+rejected whole -- `"unknown_target"`, `"not_derived"`, or `"already_forgotten"` -- so an applied
+row's `target_ids` are always the IDs the operation actually acted on. The apply transaction
+re-checks the preconditions validation read: a target or cited source that was forgotten,
+corrected, deleted, or linked in between makes the proposal `"stale"` with nothing written. There
+is no expected-revision token to supply; the in-transaction re-check is the whole guarantee.
 
 `target_ids` on a `CONSOLIDATE` is **consolidation forgetting**: sources the new derived record
 replaces in ordinary recall. They are retired in the same transaction that creates the derived
@@ -420,10 +439,12 @@ itself either: an operation that would retire evidence an earlier accepted opera
 pass built on, or that builds on evidence an earlier one retired, is rejected as
 `"inconsistent_batch"`.
 
-`forget` is the host entry point for the FORGET intent and needs no backend. It is cognitive
-forgetting only: recall skips the record while `get()`, `list()`, and `MemoryRecord.forgotten_at`
-keep it for audit. Use `delete` to remove a record and its media. It returns `None` when nothing
-changed, so an unknown or already-forgotten ID is a no-op rather than an error.
+`forget` is the host entry point for the FORGET intent and needs no backend. The host names the
+IDs and is the authority, so no window bounds it. It is cognitive forgetting only: recall skips
+the record while `get()`, `list()`, and `MemoryRecord.forgotten_at` keep it for audit. Use
+`delete` to remove a record and its media. It is all or nothing like a proposal: an unknown ID
+raises `MemoryNotFoundError` the way `get` and `delete` do, and an empty sequence or a set in
+which any record is already forgotten returns `None` having changed nothing.
 
 `rollback` reverses one applied operation and returns `False` for an unknown or already-reversed
 `operation_id`. `operations` lists the log newest first. Physical deletion is not an intent, and

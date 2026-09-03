@@ -87,6 +87,7 @@ from mindbridge.infrastructure.local.store import (
     IndexDocument,
     LocalStore,
     SpeechRollback,
+    StaleOperationError,
     StoredAsset,
     StoredEmbedding,
     StoredMemory,
@@ -1747,7 +1748,7 @@ class Memory:
                 )
             if not isinstance(trigger, MemoryTrigger):
                 raise ValidationError("trigger must be a MemoryTrigger")
-            shown = self._consolidation_evidence(
+            shown, window = self._consolidation_evidence(
                 evidence_ids,
                 query,
                 limit=limit,
@@ -1780,6 +1781,7 @@ class Memory:
                                 model_id=self._consolidation_model,
                                 recipe=self._consolidation_recipe,
                                 shown=shown,
+                                window=window,
                                 assets=assets,
                             )
                         )
@@ -1795,6 +1797,11 @@ class Memory:
 
         This is not deletion. `MemoryRecord.forgotten_at` stays readable for audit and
         `rollback()` restores recall. Use `delete()` to remove a record and its media.
+
+        All or nothing: an unknown ID raises `MemoryNotFoundError` the way `get()` and `delete()`
+        do, and a set in which any record is already forgotten changes nothing and returns
+        `None`. The host names the IDs here, so partially applying them and logging the rest
+        would make the operation log claim an effect that never happened.
         """
         with (
             self._trace("mindbridge.forget", kind="operation"),
@@ -1815,9 +1822,15 @@ class Memory:
                     model_id=None,
                     recipe=None,
                     shown=None,
+                    window=None,
                     assets=assets,
                 )
-            except _RejectedOperation:
+            except _RejectedOperation as rejection:
+                if rejection.reason == "unknown_target":
+                    missing = sorted(set(targets) - set(self._control_records(targets)))
+                    raise MemoryNotFoundError(
+                        f"memory does not exist: {', '.join(missing)}"
+                    ) from None
                 return None
 
     def rollback(self, operation_id: int) -> bool:
@@ -1881,8 +1894,17 @@ class Memory:
         *,
         limit: int,
         operation: _OperationAssets,
-    ) -> dict[str, MemoryRecord]:
-        """Resolve the bounded, active evidence set the backend is allowed to cite."""
+    ) -> tuple[dict[str, MemoryRecord], frozenset[str]]:
+        """Resolve what the backend may cite and, separately, what it may act on.
+
+        The first value is the shown set: active, visible records the backend sees and is allowed
+        to cite as evidence. The second is the window its `target_ids` are bounded by. They differ
+        only for explicit `evidence_ids`, because a hidden derived record -- an inferred `TRAIT`
+        below the visibility threshold, or a claim a `CORRECT` already retired -- is exactly what
+        `REINFORCE` and `CORRECT` exist for and can never appear in the shown set. Naming it is
+        the host's decision; a `query` or the default window never widens the window itself.
+        """
+        requested: tuple[str, ...] = ()
         if evidence_ids is not None:
             if isinstance(evidence_ids, (str, bytes)):
                 raise ValidationError("evidence_ids must be a sequence of memory IDs")
@@ -1894,6 +1916,7 @@ class Memory:
                 )
             except TypeError:
                 raise ValidationError("evidence_ids must be a sequence of memory IDs") from None
+            requested = candidates
         elif query is not None:
             prepared = self._prepare_content(query, operation)
             reference = datetime.now(timezone.utc)
@@ -1919,7 +1942,7 @@ class Memory:
                 newest = self._store.list_memories(limit=min(1_000, limit * 4))
             candidates = tuple(memory.memory_id for memory in newest)
         if not candidates:
-            return {}
+            return {}, frozenset()
         with _translate_storage_errors("read consolidation evidence"):
             memories = self._store.read_memories(candidates, active_only=True)
         memories = memories[:limit]
@@ -1927,7 +1950,8 @@ class Memory:
             tuple(asset for memory in memories for asset in memory.assets),
             operation.leased,
         )
-        return {memory.memory_id: self._memory_record(memory) for memory in memories}
+        shown = {memory.memory_id: self._memory_record(memory) for memory in memories}
+        return shown, frozenset(shown) | frozenset(requested)
 
     def _propose_operations(
         self,
@@ -1971,6 +1995,7 @@ class Memory:
         model_id: str | None,
         recipe: str | None,
         shown: Mapping[str, MemoryRecord] | None,
+        window: frozenset[str] | None,
         assets: _OperationAssets,
     ) -> MemoryOperationRecord:
         key = operation_key(operation, recipe=recipe)
@@ -1989,11 +2014,19 @@ class Memory:
             operation_json=dump_operation(operation),
             applied_at=datetime.now(timezone.utc),
         )
-        if operation.intent is MemoryIntent.CONSOLIDATE:
+        try:
+            if operation.intent is MemoryIntent.CONSOLIDATE:
+                return _operation_record(
+                    self._apply_consolidation(operation, pending, shown=shown, assets=assets)
+                )
             return _operation_record(
-                self._apply_consolidation(operation, pending, shown=shown, assets=assets)
+                self._apply_operation_effects(operation, pending, shown=shown, window=window)
             )
-        return _operation_record(self._apply_operation_effects(operation, pending, shown=shown))
+        except StaleOperationError:
+            # The proposal was built on records the apply transaction found had moved. Nothing
+            # was written; the in-transaction re-check is the whole guarantee, so there is no
+            # expected-revision token to carry and no partial effect to undo.
+            raise _RejectedOperation("stale") from None
 
     def _apply_operation_effects(
         self,
@@ -2001,32 +2034,37 @@ class Memory:
         pending: StoredOperation,
         *,
         shown: Mapping[str, MemoryRecord] | None,
+        window: frozenset[str] | None,
     ) -> StoredOperation:
-        """Validate a REINFORCE, CORRECT, or FORGET proposal and commit its effect."""
+        """Validate a REINFORCE, CORRECT, or FORGET proposal and commit its effect.
+
+        Every named target must pass, or none of them is applied. A multi-target operation used
+        to execute the eligible subset while its log row still listed the rest, so the log
+        claimed effects that never happened; the whole proposal is now refused instead.
+        """
         targets = self._control_records(operation.target_ids)
-        if not targets:
+        if set(targets) != set(operation.target_ids):
             raise _RejectedOperation("unknown_target")
+        # A backend may only act inside the window the kernel gathered for it. Consolidation
+        # already gets this through `target_ids <= evidence_ids <= shown`; the three direct
+        # intents need it stated, or a backend shown record A could retire or correct an
+        # unrelated record B it never saw. `window` is None only for the host's own `forget()`,
+        # where the host names the IDs and is the authority.
+        if window is not None and not set(operation.target_ids) <= window:
+            raise _RejectedOperation("target_not_shown")
         reinforce: tuple[tuple[str, str], ...] = ()
         correct_ids: tuple[str, ...] = ()
         forget_ids: tuple[str, ...] = ()
         if operation.intent is MemoryIntent.REINFORCE:
             reinforce = self._reinforcement_pairs(operation, targets, shown=shown)
         elif operation.intent is MemoryIntent.CORRECT:
-            correct_ids = tuple(
-                memory_id for memory_id in operation.target_ids if _is_derived(targets, memory_id)
-            )
-            if not correct_ids:
+            if not all(_is_derived(targets, memory_id) for memory_id in operation.target_ids):
                 raise _RejectedOperation("not_derived")
+            correct_ids = operation.target_ids
         else:
-            forget_ids = tuple(
-                memory_id
-                for memory_id, memory in (
-                    (value, targets.get(value)) for value in operation.target_ids
-                )
-                if memory is not None and memory.forgotten_at is None
-            )
-            if not forget_ids:
+            if any(targets[memory_id].forgotten_at is not None for memory_id in targets):
                 raise _RejectedOperation("already_forgotten")
+            forget_ids = operation.target_ids
         with self._write_lock:
             with _translate_storage_errors("apply a memory operation"):
                 logged = self._store.apply_control_operation(
@@ -2034,6 +2072,9 @@ class Memory:
                     reinforce=reinforce,
                     correct_ids=correct_ids,
                     forget_ids=forget_ids,
+                    # Re-checked inside the apply transaction, because everything above was read
+                    # before it opened.
+                    require_active=(*operation.target_ids, *operation.evidence_ids),
                 )
             if logged is None:
                 raise _RejectedOperation("duplicate")
@@ -2048,9 +2089,7 @@ class Memory:
         shown: Mapping[str, MemoryRecord] | None,
     ) -> tuple[tuple[str, str], ...]:
         target = operation.target_ids[0]
-        record = targets.get(target)
-        if record is None:
-            raise _RejectedOperation("unknown_target")
+        record = targets[target]
         if not _is_derived(targets, target):
             raise _RejectedOperation("not_derived")
         # Self-citation first: a record that is its own evidence is malformed whatever set it
@@ -2127,6 +2166,9 @@ class Memory:
             recipe=self._consolidation_recipe,
             operation=pending,
             forget_ids=operation.target_ids,
+            # `shown` was read before this transaction opened; re-check inside it that every
+            # cited source still exists and is still active.
+            require_active=operation.evidence_ids,
         )
         if logged is None:
             raise _RejectedOperation("duplicate")
@@ -2827,6 +2869,7 @@ class Memory:
         recipe: str | None = None,
         operation: StoredOperation | None = None,
         forget_ids: Sequence[str] = (),
+        require_active: Sequence[str] = (),
     ) -> StoredOperation | None:
         """Embed and commit derived records; return the log row when one was requested."""
         recipe = self._formation_space if recipe is None else recipe
@@ -2908,6 +2951,7 @@ class Memory:
                     completed_at=completed_at,
                     operation=operation,
                     forget_ids=forget_ids,
+                    require_active=require_active,
                 )
             self._drain_outbox()
         if operation is None:
@@ -8205,7 +8249,9 @@ def _datetime_text(value: datetime) -> str:
 def _translate_storage_errors(action: str) -> Iterator[None]:
     try:
         yield
-    except MindBridgeError:
+    # A stale control-plane precondition is kernel policy, not an IO failure: the two apply call
+    # sites turn it into a `"stale"` rejection, and no other store method raises it.
+    except (MindBridgeError, StaleOperationError):
         raise
     except Exception as error:
         # `io_failed` is this wrapper's pre-existing contract and a test pins it. It is coarse by
