@@ -570,3 +570,22 @@ def test_a_chinese_question_can_reach_full_lexical_coverage(tmp_path: Path) -> N
         assert coverage[answer.id] == pytest.approx(1.0)
         assert coverage[shuffled.id] < _LEXICAL_FULL_COVERAGE
         assert [hit.content for hit in traced.hits] == [_ANSWER, _DECOY, _SHUFFLED]
+
+
+def test_temporal_factor_boosts_overlap_and_never_penalises() -> None:
+    """A memory outside the asked range keeps its relevance; only an overlapping one is lifted.
+
+    The penalty this replaces pushed a perfectly relevant memory that happened at the wrong time
+    under merely well-timed ones and, inside the gate, could delete it; replay showed the penalty
+    recovered no gold on 810 paired questions while the boost alone won or tied on all of them.
+    """
+    from mindbridge.memory import _RANK_CEILING, _temporal_factor
+
+    start = datetime(2024, 3, 1, tzinfo=timezone.utc)
+    until = datetime(2024, 4, 1, tzinfo=timezone.utc)
+    inside = datetime(2024, 3, 15, tzinfo=timezone.utc)
+    far_before = datetime(2019, 1, 1, tzinfo=timezone.utc)
+
+    assert _temporal_factor(inside, None, (start, until)) == _RANK_CEILING
+    assert _temporal_factor(far_before, None, (start, until)) == 1.0
+    assert _temporal_factor(None, None, (start, until)) == 1.0

@@ -245,9 +245,11 @@ was passed; the declaration is removed before the remaining temporal phrase is p
 includes the resolved reference time in the generation input when relative time is involved.
 
 For a detected range, retrieval considers in-range and global candidates. In-range events receive a
-boost; nearby events decay smoothly with distance, and records without event time are downranked.
-This is deliberately soft because event boundaries may be noisy. Use explicit bounds when outside
-events must be excluded.
+boost; events outside the range and records without event time keep the score their relevance
+earned and are neither pushed down nor gated out. The signal is deliberately additive because event
+boundaries may be noisy and a relevant memory that happened at the wrong time is still the answer
+more often than a well-timed irrelevant one. Use explicit bounds when outside events must be
+excluded.
 
 ## Decay and reinforcement
 
