@@ -59,6 +59,15 @@ SQLite, the media CAS, the durable outbox, and Zvec are not public plugins. They
 implementation, and abstracting them now would add indirection without a second product use case.
 Metadata remains application data, never an execution, isolation, or authorization boundary.
 
+A plugin whose output the kernel persists must declare that output's *space* — `embedding_space`,
+`transcription_space`, `face_space`, `formation_space`, `vision_space`. The kernel caches derived
+work per asset and space, so the space is what stops two recipes from sharing one result; the
+plugin owns it because only the plugin knows what its recipe is. It is not the model name: a
+describer that edits its prompt, or a transcriber that changes its keyword list, produces different
+output from the same model and must return a different space. Declaring a stable space over a
+changed recipe is the one failure the kernel cannot detect, because a stale derived value is
+indistinguishable from a fresh one once it is inside a searchable document.
+
 The optional `server` and `mcp` dependencies are packaging boundaries, not plugins. REST, MCP, and
 the product CLI remain thin transports over the application-composed `Memory`.
 
@@ -85,12 +94,12 @@ that works.
 
 ### Outstanding violation
 
-`VisionDescriptionBackend` breaches criterion 1 and is recorded here rather than quietly excused: no
-implementation ships in `src/`. The protocol is exported from `mindbridge`, and its only implementor
-in this repository is a test fake. A bundled adapter, or removal of the protocol from the public
-surface, closes this.
+`VisionDescriptionBackend` breached criterion 1 for as long as no implementation shipped in `src/`
+and its only implementor in this repository was a test fake. `OpenAIModels.describe` and the
+`vision` configuration key close it; the entry stays because the sequence is the point — a protocol
+admitted ahead of its implementation spent releases as exported surface with no user.
 
-Criterion 2 no longer applies to it. The describer used to be reachable only from the asynchronous
+Criterion 2 no longer applies to it either. The describer used to be reachable only from the asynchronous
 vision capture stream; `add` and `add_many` now call a configured one for every embedder whenever a
 visual asset has no description yet, so the capability reaches the path a user actually invokes.
 

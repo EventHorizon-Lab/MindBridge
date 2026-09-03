@@ -31,8 +31,12 @@ from mindbridge.infrastructure.local import (
     StoredAsset,
     StoredEmbedding,
     StoredMemory,
+    UnsupportedSchemaError,
 )
-from mindbridge.infrastructure.local.store import _SCHEMA_VERSION
+from mindbridge.infrastructure.local.store import (
+    _PRE_VISUAL_DESCRIPTION_VERSION,
+    _SCHEMA_VERSION,
+)
 from mindbridge.models.base import (
     FaceAnalysis,
     FaceEmbedding,
@@ -295,7 +299,7 @@ def test_schema_is_local_and_enforces_foreign_keys(tmp_path: Path) -> None:
                     "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
                 )
             )
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
             assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert "tenant" not in schema.casefold()
@@ -784,6 +788,162 @@ def test_media_assets_round_trip_in_order_and_cache_transcript(tmp_path: Path) -
         assert store.set_asset_transcript(first.asset_id, "") is True
         assert store.read_asset(first.asset_id) == replace(first, transcript="")
         assert store.set_asset_transcript("f" * 64, "missing") is False
+
+
+def test_visual_descriptions_are_keyed_by_asset_and_space(tmp_path: Path) -> None:
+    """One caption per (asset content, vision space), so a new recipe cannot serve an old caption.
+
+    `media_assets` enforces `asset_id = sha256`, so this key is the picture's own digest: a second
+    memory over the same bytes reads the row the first one wrote.
+    """
+    first = _asset()
+    second = _asset(b"second image", name="second.png")
+    memory = replace(_memory(), content="", modality="image", assets=(first, second))
+
+    with LocalStore(tmp_path) as store:
+        store.write_memory(memory, (_embedding(memory_id=memory.memory_id),))
+        assert store.read_visual_descriptions((), space_id="caption-v1") == {}
+        assert store.read_visual_descriptions((first.asset_id,), space_id="caption-v1") == {}
+
+        written = store.write_visual_descriptions(
+            {first.asset_id: "a red bicycle", second.asset_id: "a blue door"},
+            model_id="describer",
+            space_id="caption-v1",
+        )
+        assert written == 2
+        assert store.read_visual_descriptions(
+            (second.asset_id, first.asset_id, "0" * 64),
+            space_id="caption-v1",
+        ) == {first.asset_id: "a red bicycle", second.asset_id: "a blue door"}
+
+        # A different recipe shares no captions with the first, and does not evict it.
+        assert store.read_visual_descriptions((first.asset_id,), space_id="caption-v2") == {}
+        store.write_visual_descriptions(
+            {first.asset_id: "a bicycle against a fence"},
+            model_id="describer",
+            space_id="caption-v2",
+        )
+        assert store.read_visual_descriptions((first.asset_id,), space_id="caption-v1") == {
+            first.asset_id: "a red bicycle"
+        }
+        assert store.read_visual_descriptions((first.asset_id,), space_id="caption-v2") == {
+            first.asset_id: "a bicycle against a fence"
+        }
+
+        # Re-describing an asset keeps the stored caption: identical documents is the whole point.
+        assert (
+            store.write_visual_descriptions(
+                {first.asset_id: "something else entirely"},
+                model_id="describer",
+                space_id="caption-v1",
+            )
+            == 0
+        )
+        assert store.read_visual_descriptions((first.asset_id,), space_id="caption-v1") == {
+            first.asset_id: "a red bicycle"
+        }
+
+        for blank in ("", "   "):
+            with pytest.raises(ValueError, match="must not be blank"):
+                store.write_visual_descriptions(
+                    {first.asset_id: blank},
+                    model_id="describer",
+                    space_id="caption-v1",
+                )
+        with pytest.raises(ValueError):
+            store.write_visual_descriptions(
+                {first.asset_id: "orphan"},
+                model_id="describer",
+                space_id="   ",
+            )
+        # The foreign key is the asset: a caption for media this store never stored is refused.
+        with pytest.raises(sqlite3.IntegrityError):
+            store.write_visual_descriptions(
+                {"0" * 64: "never stored"},
+                model_id="describer",
+                space_id="caption-v1",
+            )
+
+
+def test_visual_descriptions_outlive_the_memory_and_die_with_the_asset(tmp_path: Path) -> None:
+    """Deleting a memory must not make re-adding the same picture pay for a caption again."""
+    picture = _asset()
+    memory = replace(_memory(), content="", modality="image", assets=(picture,))
+
+    with LocalStore(tmp_path) as store:
+        store.write_memory(memory, (_embedding(memory_id=memory.memory_id),))
+        store.write_visual_descriptions(
+            {picture.asset_id: "a red bicycle"},
+            model_id="describer",
+            space_id="caption-v1",
+        )
+        deleted, orphaned = store.delete_memory_with_assets(memory.memory_id)
+        assert deleted is True
+        assert tuple(asset.asset_id for asset in orphaned) == (picture.asset_id,)
+        assert store.read_visual_descriptions((picture.asset_id,), space_id="caption-v1") == {
+            picture.asset_id: "a red bicycle"
+        }
+
+        # It is the asset row that owns the caption, so erasing the asset cascades.
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("DELETE FROM media_assets WHERE asset_id = ?", (picture.asset_id,))
+            connection.commit()
+        assert store.read_visual_descriptions((picture.asset_id,), space_id="caption-v1") == {}
+
+
+def test_a_store_without_visual_descriptions_gains_the_table(tmp_path: Path) -> None:
+    """An existing library one step behind opens, keeps every row, and gains the caption cache.
+
+    Parametric on the version pair rather than on literals: this migration step is renumbered
+    when it merges alongside parallel schema work, and then only the two constants move.
+    """
+    previous_version = _PRE_VISUAL_DESCRIPTION_VERSION
+    picture = _asset()
+    memory = replace(_memory(), content="", modality="image", assets=(picture,))
+    with LocalStore(tmp_path) as store:
+        store.write_memory(memory, (_embedding(memory_id=memory.memory_id),))
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.executescript(
+            f"""
+            DROP TABLE visual_descriptions;
+            PRAGMA user_version = {previous_version};
+            """
+        )
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == previous_version
+
+    with LocalStore(tmp_path) as store:
+        preserved = store.read_memory(memory.memory_id)
+        # The migrated table is usable, not merely present.
+        store.write_visual_descriptions(
+            {picture.asset_id: "a red bicycle"},
+            model_id="describer",
+            space_id="caption-v1",
+        )
+        captions = store.read_visual_descriptions((picture.asset_id,), space_id="caption-v1")
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master")}
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert connection.execute("PRAGMA foreign_key_check").fetchone() is None
+
+    assert preserved is not None and preserved.assets == (picture,)
+    assert "visual_descriptions" in tables
+    assert version == _SCHEMA_VERSION
+    assert captions == {picture.asset_id: "a red bicycle"}
+
+
+def test_a_store_missing_the_caption_table_at_the_current_version_is_refused(
+    tmp_path: Path,
+) -> None:
+    """`_REQUIRED_TABLES` is what stops a half-migrated library from opening and writing."""
+    with LocalStore(tmp_path):
+        pass
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.executescript("DROP TABLE visual_descriptions;")
+
+    with pytest.raises(UnsupportedSchemaError, match="visual_descriptions"):
+        LocalStore(tmp_path).close()
 
 
 def test_speech_identity_is_stable_across_assets(tmp_path: Path) -> None:

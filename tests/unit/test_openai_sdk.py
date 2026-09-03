@@ -48,7 +48,11 @@ from mindbridge.models.base import (
     TranscriptionBackend,
     VisionDescriptionBackend,
 )
-from mindbridge.models.openai_sdk import UNKNOWN_ANSWER, OpenAIModels
+from mindbridge.models.openai_sdk import (
+    DEFAULT_GENERATION_MODEL,
+    UNKNOWN_ANSWER,
+    OpenAIModels,
+)
 from mindbridge.types import (
     AbstentionReason,
     AssetRef,
@@ -773,6 +777,39 @@ def test_formation_space_identifies_every_generation_control() -> None:
     assert baseline not in variants
     assert len(variants) == 5
     assert OpenAIModels(generation_seed=7).formation_space in variants
+
+
+def test_vision_space_identifies_the_prompt_as_well_as_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A store caches one caption per `vision_space`, so the space must cover the whole recipe.
+
+    The prompt decides what a caption contains and is still being iterated on, while the caption
+    itself lands inside a searchable document. A space that tracked only the model would make an
+    edited prompt serve captions written under the old one forever, with nothing to notice it.
+    """
+    baseline = OpenAIModels().vision_space
+    assert baseline.startswith(f"{DEFAULT_GENERATION_MODEL}:mindbridge-vision-v1:")
+    # Stable for one configuration: two identical compositions must share cached captions.
+    assert OpenAIModels().vision_space == baseline
+    # Distinct from `formation_space`, which digests the same knobs under a different prompt.
+    assert baseline != OpenAIModels().formation_space
+
+    variants = {
+        OpenAIModels(generation_model="other-model").vision_space,
+        OpenAIModels(generation_seed=7).vision_space,
+        OpenAIModels(generation_temperature=0.2).vision_space,
+        OpenAIModels(generation_max_tokens=128).vision_space,
+        OpenAIModels(generation_extra_body={"reasoning": {"effort": "low"}}).vision_space,
+        OpenAIModels(
+            generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE})
+        ).vision_space,
+    }
+    assert baseline not in variants
+    assert len(variants) == 6
+
+    monkeypatch.setattr(openai_backend, "_VISION_SYSTEM_PROMPT", "Describe it differently.")
+    assert OpenAIModels().vision_space != baseline
 
 
 def test_answer_marks_the_grounded_unknown_sentinel_as_insufficient_evidence() -> None:

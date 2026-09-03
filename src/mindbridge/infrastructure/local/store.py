@@ -31,7 +31,12 @@ from mindbridge.types import (
     SpeakerSegment,
 )
 
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 11
+# `visual_descriptions` is the newest step, so a store one migration behind is at this version.
+# Derived rather than written out because parallel work on this repository renumbers schema steps:
+# moving this one is then a change to `_SCHEMA_VERSION` alone. Whoever adds the *next* step must
+# pin this to its own literal, because it will no longer be the last.
+_PRE_VISUAL_DESCRIPTION_VERSION = _SCHEMA_VERSION - 1
 _SQLITE_PARAMETER_BATCH = 900
 _FACE_EXEMPLAR_LIMIT = 10
 _VOICE_EXEMPLAR_LIMIT = 20
@@ -58,6 +63,7 @@ _REQUIRED_TABLES = frozenset(
         "identity_link_evidence",
         "speech_analyses",
         "speech_segments",
+        "visual_descriptions",
         "store_metadata",
         "formation_runs",
         "memory_evidence",
@@ -374,7 +380,24 @@ CREATE INDEX memory_records_place_idx
     WHERE place_id IS NOT NULL
 """
 
-_SCHEMA_V10 = f"""
+# A derived caption is a paid model call whose output is indexed text, so it is cached per asset
+# *content* -- `media_assets` enforces `asset_id = sha256`, so this key is the asset's own digest
+# and a second memory over the same bytes reuses the row. `space_id` is the describer's
+# `vision_space`, which covers the prompt as well as the model, and it is part of the primary key
+# rather than a plain column (as on `speech_analyses`) so two describers can hold their own caption
+# for one asset instead of the newer recipe evicting the older one.
+_VISUAL_DESCRIPTION_DDL = """
+CREATE TABLE visual_descriptions (
+    asset_id TEXT NOT NULL REFERENCES media_assets (asset_id) ON DELETE CASCADE,
+    space_id TEXT NOT NULL CHECK (length(trim(space_id)) > 0),
+    model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
+    description TEXT NOT NULL CHECK (length(trim(description)) > 0),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (asset_id, space_id)
+)
+"""
+
+_SCHEMA_CURRENT = f"""
 BEGIN IMMEDIATE;
 
 CREATE TABLE memory_records (
@@ -439,7 +462,9 @@ CREATE INDEX search_index_queue_order_idx
 
 {_INDEX_TRIGGERS}
 
-PRAGMA user_version = 10;
+{_VISUAL_DESCRIPTION_DDL};
+
+PRAGMA user_version = {_SCHEMA_VERSION};
 COMMIT;
 """
 
@@ -1568,6 +1593,78 @@ class LocalStore:
             cursor = connection.executemany(
                 "UPDATE media_assets SET transcript = ? WHERE asset_id = ?",
                 ((text, asset_id) for asset_id, text in supplied),
+            )
+        return cursor.rowcount
+
+    def read_visual_descriptions(
+        self,
+        asset_ids: Sequence[str],
+        *,
+        space_id: str,
+    ) -> dict[str, str]:
+        """Return the cached caption for every supplied asset described in this vision space.
+
+        Batched because the write path describes a whole `add_many` at once, and an asset with no
+        caption in this space is simply absent rather than an error: a miss is the normal state.
+        """
+        _require_identifier(space_id, "vision space_id")
+        for asset_id in asset_ids:
+            _sha256(asset_id)
+        if not asset_ids:
+            return {}
+        unique_ids = tuple(dict.fromkeys(asset_ids))
+        found: dict[str, str] = {}
+        with self._connection() as connection:
+            for offset in range(0, len(unique_ids), _SQLITE_PARAMETER_BATCH):
+                batch = unique_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+                placeholders = ", ".join("?" for _asset_id in batch)
+                found.update(
+                    (_row_text(row, "asset_id"), _row_text(row, "description"))
+                    for row in connection.execute(
+                        f"""
+                        SELECT asset_id, description
+                        FROM visual_descriptions
+                        WHERE space_id = ? AND asset_id IN ({placeholders})
+                        """,
+                        (space_id, *batch),
+                    ).fetchall()
+                )
+        return found
+
+    def write_visual_descriptions(
+        self,
+        descriptions: Mapping[str, str],
+        *,
+        model_id: str,
+        space_id: str,
+    ) -> int:
+        """Cache derived captions for stored assets in one durable SQLite transaction.
+
+        An asset already described in this space keeps its stored caption: the point of the row is
+        that two ingests of one picture build the same document, so a concurrent writer that
+        described the same bytes first wins and the later caption is dropped.
+        """
+        _require_identifier(model_id, "vision model_id")
+        _require_identifier(space_id, "vision space_id")
+        for asset_id, description in descriptions.items():
+            _sha256(asset_id)
+            if not isinstance(description, str) or not description.strip():
+                raise ValueError("visual description must not be blank")
+        if not descriptions:
+            return 0
+        now = _datetime_text(datetime.now(timezone.utc))
+        with self._transaction() as connection:
+            cursor = connection.executemany(
+                """
+                INSERT INTO visual_descriptions (
+                    asset_id, space_id, model_id, description, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (asset_id, space_id) DO NOTHING
+                """,
+                (
+                    (asset_id, space_id, model_id, description, now)
+                    for asset_id, description in descriptions.items()
+                ),
             )
         return cursor.rowcount
 
@@ -2881,6 +2978,9 @@ class LocalStore:
             if version == 9:
                 _migrate_v9(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == _PRE_VISUAL_DESCRIPTION_VERSION:
+                _migrate_visual_descriptions(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
                 raise UnsupportedSchemaError(
@@ -3536,7 +3636,7 @@ def _create_schema(
     if existing_tables:
         raise UnsupportedSchemaError("local data directory contains an unversioned SQLite schema")
     try:
-        connection.executescript(_SCHEMA_V10)
+        connection.executescript(_SCHEMA_CURRENT)
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -3714,6 +3814,21 @@ def _migrate_v9(connection: sqlite3.Connection) -> None:
         if "memory_records_place_idx" not in indexes:
             connection.execute(_PLACE_INDEX_DDL)
         connection.execute("PRAGMA user_version = 10")
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def _migrate_visual_descriptions(connection: sqlite3.Connection) -> None:
+    """Add the caption cache to an existing store. Purely additive: no row is read or rewritten."""
+    has_descriptions = "visual_descriptions" in _table_names(connection)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if not has_descriptions:
+            connection.execute(_VISUAL_DESCRIPTION_DDL)
+        connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         connection.commit()
     except BaseException:
         if connection.in_transaction:

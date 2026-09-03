@@ -92,6 +92,7 @@ class RecordingEmbedder:
 class RecordingVisionDescriber:
     vision_capabilities = frozenset({Modality.IMAGE})
     vision_model = "test-vision"
+    vision_space = "test-vision:caption-v1"
 
     def __init__(self) -> None:
         self.inputs: list[ModelInput] = []

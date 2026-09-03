@@ -75,6 +75,7 @@ class _Describer:
 
     vision_capabilities = frozenset({Modality.IMAGE, Modality.VIDEO})
     vision_model = "fake-describer"
+    vision_space = "fake-describer:caption-v1"
 
     def __init__(self, description: str = "a red bicycle leaning on the fence") -> None:
         self.description = description
@@ -87,6 +88,45 @@ class _Describer:
 
     def close(self) -> None:
         return None
+
+
+class _CountingDescriber:
+    """A describer that never repeats itself, so a reused caption is distinguishable from a call.
+
+    Modelled on the measured endpoint, which returns a different completion for the same image on
+    every request: a fixed-caption fake would pass every cache assertion under a broken cache.
+    """
+
+    vision_capabilities = frozenset({Modality.IMAGE, Modality.VIDEO})
+    vision_model = "fake-describer"
+
+    def __init__(self, prefix: str = "caption") -> None:
+        self.vision_space = "fake-describer:caption-v1"
+        self.calls = 0
+        self.described: list[str] = []
+        self.captions: list[str] = []
+        self._prefix = prefix
+
+    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+        batch = tuple(inputs)
+        self.calls += 1
+        self.described.extend(str(value.assets[0].sha256) for value in batch)
+        fresh = tuple(
+            f"{self._prefix} bicycle number {len(self.captions) + index}"
+            for index in range(len(batch))
+        )
+        self.captions.extend(fresh)
+        return fresh
+
+    def close(self) -> None:
+        return None
+
+
+def _caption(content: str) -> str:
+    """Read back the one derived caption a memory's stored document carries."""
+    marker = "[visual description:"
+    assert marker in content, content
+    return content.split("]\n", 1)[1].strip()
 
 
 class _DirectionalEmbedder:
@@ -326,6 +366,90 @@ def test_a_text_only_embedder_reaches_an_image_through_the_describer(tmp_path: P
         assert other.id not in matched
         # No key carries the image, because this embedder cannot take one.
         assert all(not value.assets for value in embedder.document_inputs)
+
+
+def test_a_second_ingest_of_the_same_image_reuses_the_stored_caption(tmp_path: Path) -> None:
+    """Two ingests of one picture must build the same document and pay once.
+
+    The measured describe endpoint returns a different caption for the same image on every call
+    even at temperature 0 with a fixed seed, so without a store-side cache a re-ingest -- or a
+    re-derive after a crash -- silently rewrites what a memory's full-text document says, and pays
+    for every image again. The caption is keyed by the asset's own SHA-256, so a *different*
+    memory over the same bytes reuses it too.
+    """
+    describer = _CountingDescriber()
+    picture = Blob(b"bicycle-frame", "image/png", "bicycle.png")
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        first = memory.add(("morning note", picture))
+        assert describer.calls == 1
+
+        repeat = memory.add(("afternoon note", picture))
+        second_instance = memory.add(picture)
+
+        assert describer.calls == 1, "the same bytes were described again"
+        first_caption = _caption(memory.get(first.id).content)
+        assert first_caption == describer.captions[0]
+        assert _caption(memory.get(repeat.id).content) == first_caption
+        assert _caption(memory.get(second_instance.id).content) == first_caption
+
+    # A fresh `Memory` over the same data_dir is the crash-and-re-derive case.
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as reopened:
+        after_restart = reopened.add(("evening note", picture))
+        assert describer.calls == 1
+        assert _caption(reopened.get(after_restart.id).content) == first_caption
+
+
+def test_a_describer_in_another_vision_space_does_not_reuse_captions(tmp_path: Path) -> None:
+    """The cache is keyed by recipe, not by model name, so a new prompt re-describes.
+
+    A caption lands inside the searchable document, where a stale one written under a superseded
+    prompt is invisible. Keying on the model alone would serve it forever.
+    """
+    first_describer = _CountingDescriber(prefix="early")
+    second_describer = _CountingDescriber(prefix="revised")
+    second_describer.vision_space = "fake-describer:caption-v2"
+    picture = Blob(b"bicycle-frame", "image/png", "bicycle.png")
+
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=first_describer) as memory:
+        original = memory.add(("morning note", picture))
+        assert _caption(memory.get(original.id).content).startswith("early")
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=second_describer) as memory:
+        revised = memory.add(("afternoon note", picture))
+        assert second_describer.calls == 1, "a new recipe must not read the old space"
+        assert _caption(memory.get(revised.id).content).startswith("revised")
+        # The first space keeps its own caption rather than being evicted by the second.
+        assert _caption(memory.get(original.id).content).startswith("early")
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=first_describer) as memory:
+        back = memory.add(("evening note", picture))
+        assert first_describer.calls == 1
+        assert _caption(memory.get(back.id).content).startswith("early")
+
+
+def test_two_memories_over_one_picture_cost_one_description(tmp_path: Path) -> None:
+    """Derive-early: one describe per asset *content* within a write, not per memory."""
+    describer = _CountingDescriber()
+    picture = Blob(b"bicycle-frame", "image/png", "bicycle.png")
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        records = memory.add_many([("morning note", picture), ("afternoon note", picture)])
+
+        assert describer.calls == 1
+        assert len(describer.described) == 1, "one visual reached the model, not two"
+        captions = {_caption(memory.get(record.id).content) for record in records}
+        assert captions == {describer.captions[0]}
+
+
+def test_reindexing_does_not_re_describe_stored_visuals(tmp_path: Path) -> None:
+    """Zvec is rebuildable from SQLite alone, so a rebuild must not spend description tokens."""
+    describer = _CountingDescriber()
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        record = memory.add(("morning note", Blob(b"bicycle-frame", "image/png", "bicycle.png")))
+        caption = _caption(memory.get(record.id).content)
+        assert describer.calls == 1
+
+        assert memory.reindex() == 1
+
+        assert describer.calls == 1
+        assert _caption(memory.get(record.id).content) == caption
 
 
 def test_decay_demotes_an_old_memory_without_evicting_it(tmp_path: Path) -> None:

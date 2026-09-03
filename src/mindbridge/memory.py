@@ -512,6 +512,7 @@ class _OperationAssets:
     speech_segments: dict[str, tuple[SpeakerSegment, ...]]
     speech_rollbacks: builtins.list[SpeechRollback]
     face_observations: dict[str, tuple[FaceObservation, ...]]
+    descriptions: dict[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -617,6 +618,7 @@ class Memory:
             (
                 self._vision_capabilities,
                 self._vision_model,
+                self._vision_space,
             ) = _vision_contract(self._vision_describer)
             (
                 self._face_capabilities,
@@ -1798,7 +1800,8 @@ class Memory:
                 # Derived visual text can rescue media this embedder cannot take, so it has to
                 # exist before the fallback guard below decides the write is impossible.
                 described = self._pending_visual_descriptions(
-                    tuple(memory.content for memory in missing)
+                    tuple(memory.content for memory in missing),
+                    operation,
                 )
                 missing = [
                     replace(
@@ -1898,6 +1901,7 @@ class Memory:
                 )
                 if operation.speech_updates:
                     self._persist_transcripts(operation)
+                self._persist_descriptions(operation)
         rows_by_id = {memory.memory_id: memory for memory in authoritative}
         if rows_by_id.keys() != unique.keys():
             raise StorageError("written memories could not be read from SQLite", reason="io_failed")
@@ -2107,13 +2111,25 @@ class Memory:
             content=self._embedding_content(content, operation),
         )
 
-    def _pending_visual_descriptions(self, contents: Sequence[_PreparedContent]) -> dict[str, str]:
+    def _pending_visual_descriptions(
+        self,
+        contents: Sequence[_PreparedContent],
+        operation: _OperationAssets,
+    ) -> dict[str, str]:
         """Describe every yet-undescribed visual asset in one write, in one model call.
 
         Deriving the text is a paid call, so it follows from `vision_describer` being configured
         and from nothing else. Whether it is *indexed* is not a capability question -- see
         `_with_visual_descriptions`. Only the write path calls this: `_embedding_content` is
         shared with the query path, where describing an image query would buy a call per search.
+
+        An asset already described in this vision space is read back from SQLite instead of
+        described again, so two ingests of one corpus build identical documents and the second
+        spends nothing. The measured endpoint returns a different caption for the same image on
+        every call even at temperature 0 with a fixed seed, so without this a re-ingest -- or a
+        re-derive after a crash -- silently changes what a memory's full-text document says.
+        Freshly derived captions are staged on the operation and persisted after the asset rows
+        exist, exactly as transcripts are.
         """
         if self._vision_describer is None:
             return {}
@@ -2128,9 +2144,19 @@ class Memory:
         )
         if not assets:
             return {}
+        with _translate_storage_errors("read cached visual descriptions"):
+            cached = self._store.read_visual_descriptions(
+                tuple(asset.asset_id for asset in assets),
+                space_id=self._vision_space,
+            )
+        pending = tuple(asset for asset in assets if asset.asset_id not in cached)
+        if not pending:
+            # No request is made, so the vision span and its token counters never open: a run that
+            # re-ingests a described corpus reports zero vision cost because it paid none.
+            return dict(cached)
         try:
             descriptions = self._vision_descriptions(
-                tuple(self._resolved_model_input(_asset_content(asset)) for asset in assets)
+                tuple(self._resolved_model_input(_asset_content(asset)) for asset in pending)
             )
         except ModelError:
             # A description is derived convenience, and the caller handed us an observation to
@@ -2138,9 +2164,12 @@ class Memory:
             # describer used to fail the whole `add`, which an ingesting caller then reports as
             # unwritten memories -- a far larger loss than the empty document this leaves behind.
             # The batch is counted on the vision span as `mindbridge.vision.failed_batches`, so
-            # how much derived text a run did not get is measurable rather than silent.
-            return {}
-        return dict(zip((asset.asset_id for asset in assets), descriptions, strict=True))
+            # how much derived text a run did not get is measurable rather than silent. A failed
+            # batch is never cached, so a later ingest retries it.
+            return dict(cached)
+        fresh = dict(zip((asset.asset_id for asset in pending), descriptions, strict=True))
+        operation.descriptions.update(fresh)
+        return {**cached, **fresh}
 
     def _with_visual_descriptions(
         self,
@@ -3581,6 +3610,36 @@ class Memory:
                             minimum_margin=self._speaker_margin,
                         )
 
+    def _persist_descriptions(self, operation: _OperationAssets) -> None:
+        """Cache captions derived in this operation, once their assets are stored.
+
+        Captions are derived before the `media_assets` rows exist -- they can rescue media the
+        embedder cannot take, so they have to precede the write -- which is why they are staged on
+        the operation and written here instead of where they are computed. An asset that did not
+        reach storage is skipped rather than failing the write: the caption is derived convenience
+        and its foreign key is the asset.
+        """
+        if not operation.descriptions:
+            return
+        pending = {
+            asset_id: description
+            for asset_id, description in operation.descriptions.items()
+            if asset_id in operation.persisted and description.strip()
+        }
+        operation.descriptions.clear()
+        if not pending:
+            return
+        with (
+            self._trace("mindbridge.storage.write", kind="stage"),
+            self._write_lock,
+            _translate_storage_errors("cache visual descriptions"),
+        ):
+            self._store.write_visual_descriptions(
+                pending,
+                model_id=self._vision_model,
+                space_id=self._vision_space,
+            )
+
     def _analyze_speech(
         self,
         assets: Sequence[AssetRef],
@@ -4250,6 +4309,7 @@ class Memory:
             speech_segments={},
             speech_rollbacks=[],
             face_observations={},
+            descriptions={},
         )
         try:
             yield assets
@@ -6006,15 +6066,16 @@ def _generation_contract(answerer: GenerationBackend | None) -> frozenset[Modali
 
 def _vision_contract(
     describer: VisionDescriptionBackend | None,
-) -> tuple[frozenset[Modality], str]:
+) -> tuple[frozenset[Modality], str, str]:
     if describer is None:
-        return frozenset(), "none"
+        return frozenset(), "none", "none"
     capabilities = _modalities(describer.vision_capabilities, "vision")
     if not capabilities or capabilities - {Modality.IMAGE, Modality.VIDEO}:
         raise ValidationError("vision capabilities must contain image or video")
     return (
         capabilities,
         _model_text(describer.vision_model, "vision model"),
+        _model_text(describer.vision_space, "vision space"),
     )
 
 
