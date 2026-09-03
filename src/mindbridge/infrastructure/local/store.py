@@ -2560,7 +2560,29 @@ class LocalStore:
             )
             return target
 
-    def unlink_identity(self, alias_id: str) -> str | None:
+    def identity_alias_modality(self, alias_id: str) -> Literal["face", "voice"] | None:
+        """Return the modality one merged alias contributed, or None when none is recorded.
+
+        A caller that must rebuild derived text before `unlink_identity` has to know which
+        modality is about to move back, and the alias row is the only record of it.
+        """
+        _require_identifier(alias_id, "alias_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT contributed_modality FROM identity_aliases WHERE alias_id = ?",
+                (alias_id,),
+            ).fetchone()
+        if row is None or row["contributed_modality"] is None:
+            return None
+        return _identity_modality(row["contributed_modality"])
+
+    def unlink_identity(
+        self,
+        alias_id: str,
+        *,
+        memories: Iterable[StoredMemory] = (),
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> str | None:
         """Reverse one recorded merge, restoring alias_id as an independent identity.
 
         Returns the restored identity_id, or None when alias_id is not a reversible
@@ -2579,8 +2601,16 @@ class LocalStore:
         Unlinking clears the pair's accumulated link evidence but does not suppress the
         pair, so continued ingestion can corroborate and merge them again. Treat this as
         resetting the evidence, not as recording that a human rejected the merge.
+
+        Pass `memories` and `embeddings` to atomically replace indexed documents that named
+        the merged person, exactly as `register_identity` does. They are applied only when the
+        unlink actually commits, so a refused unlink leaves the projection untouched.
         """
         _require_identifier(alias_id, "alias_id")
+        supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
+            memories,
+            embeddings,
+        )
         now = _datetime_text(datetime.now(timezone.utc))
         with self._transaction() as connection:
             alias = connection.execute(
@@ -2640,6 +2670,12 @@ class LocalStore:
                 WHERE voice_id IN (?, ?) AND face_id IN (?, ?)
                 """,
                 (target, alias_id, target, alias_id),
+            )
+            self._replace_memory_embeddings(
+                connection,
+                supplied_memories,
+                supplied_embeddings,
+                supplied_by_memory,
             )
             return alias_id
 

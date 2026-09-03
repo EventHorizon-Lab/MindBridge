@@ -2034,6 +2034,46 @@ def test_unlink_identity_reverses_a_corroborated_merge(tmp_path: Path) -> None:
         assert memory.unlink_identity("identity_missing") is None
 
 
+def test_unlink_identity_stops_the_index_quoting_the_other_persons_name(tmp_path: Path) -> None:
+    """Reversing a merge must repaint the indexed text, not only the identity rows.
+
+    A merge writes the surviving person's name into every stored transcript projection of the
+    voice it absorbed. Restoring that voice as its own unnamed identity while leaving the name
+    burned into `memory_records.content` makes the reversal a lie: search still answers to the
+    retracted name, and the retrieved transcript still attributes the words to the wrong person.
+    """
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        index_speech=True,
+    ) as memory:
+        first = memory.add(Blob(b"first video", "video/mp4", "first.mp4"))
+        face_id = memory.faces(first.id)[0].identity_id
+        voice_id = memory.speech(first.id)[0].speaker_id
+        assert voice_id is not None
+
+        # Naming the face first makes it the merge target, so the voice is the half that is
+        # merged away and later restored -- the direction in which a name is burned in.
+        memory.register_identity(face_id, "Bob")
+        second = memory.add(Blob(b"second video", "video/mp4", "second.mp4"))
+        memory.faces(second.id)
+        assert memory.speech(first.id)[0].speaker_id == face_id
+        assert '"speaker_name":"Bob"' in memory.get(first.id).content
+
+        assert memory.unlink_identity(voice_id) == voice_id
+
+        assert memory.identity(voice_id) == IdentityProfile(identity_id=voice_id)
+        for record in (first, second):
+            content = memory.get(record.id).content
+            assert "Bob" not in content
+            assert f'"speaker_id":"{voice_id}"' in content
+        index = _FakeIndex.instances[-1]
+        assert all("Bob" not in document.content for document in index.documents.values())
+        assert index.lexical_search("Bob") == ()
+
+
 @pytest.mark.parametrize("value", ["x" * 256, "bad\nline", ""])
 def test_identity_relationship_rejects_unusable_text(tmp_path: Path, value: str) -> None:
     with Memory(

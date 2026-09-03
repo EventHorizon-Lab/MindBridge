@@ -1435,14 +1435,55 @@ class Memory:
         """
         with (
             self._trace("mindbridge.unlink_identity", kind="operation"),
-            self._operation(),
+            self._operation() as operation,
             self._write_lock,
         ):
             requested_id = _identifier(alias_id, "alias_id")
+            memories, embeddings = self._unlinked_speaker_index(requested_id, operation)
             with _translate_storage_errors("unlink identity"):
-                restored = self._store.unlink_identity(requested_id)
+                restored = self._store.unlink_identity(
+                    requested_id,
+                    memories=memories,
+                    embeddings=embeddings,
+                )
             self._drain_outbox()
             return restored
+
+    def _unlinked_speaker_index(
+        self,
+        alias_id: str,
+        operation: _OperationAssets,
+    ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
+        """Rebuild the indexed speech text that a pending unlink is about to invalidate.
+
+        Reversing a merge moves every segment of the contributed modality back, so text
+        indexed under the surviving identity's name would go on quoting a name that is no
+        longer the speaker's, and answer to it in search. Only a voice contribution matters
+        here: a face name is projected at answer time and never written into stored content.
+        """
+        with _translate_storage_errors("read identity memories"):
+            if self._store.identity_alias_modality(alias_id) != "voice":
+                return (), ()
+            target_id = self._store.resolve_identity_id(alias_id)
+            if target_id is None:
+                return (), ()
+            memory_ids = self._store.speaker_memory_ids(target_id)
+            if not memory_ids:
+                return (), ()
+            stored = self._store.read_memories(memory_ids)
+        indexed = tuple(memory for memory in stored if _has_indexed_speech(memory))
+        if not indexed:
+            return (), ()
+        # Every one of the target's segments moves to the restored identity, which a merge
+        # deliberately leaves unnamed, so the whole set is relabelled to a nameless speaker.
+        return self._refresh_speaker_memories(
+            indexed,
+            speaker_id=alias_id,
+            speaker_name=None,
+            previous_speaker_id=target_id,
+            update_operation=False,
+            operation=operation,
+        )
 
     def _register_identity(
         self,
@@ -1487,15 +1528,7 @@ class Memory:
             if memory_ids:
                 with _translate_storage_errors("read speaker memories"):
                     stored = self._store.read_memories(memory_ids)
-                indexed = tuple(
-                    memory
-                    for memory in stored
-                    if any(
-                        f"[speech identities:{asset.asset_id}]\n" in memory.content
-                        for asset in memory.assets
-                        if asset.modality in {"audio", "video"}
-                    )
-                )
+                indexed = tuple(memory for memory in stored if _has_indexed_speech(memory))
                 if indexed:
                     memories, embeddings = self._refresh_speaker_memories(
                         indexed,
@@ -1553,15 +1586,7 @@ class Memory:
             if memory_ids:
                 with _translate_storage_errors("read identity memories"):
                     stored = self._store.read_memories(memory_ids)
-                indexed = tuple(
-                    memory
-                    for memory in stored
-                    if any(
-                        f"[speech identities:{asset.asset_id}]\n" in memory.content
-                        for asset in memory.assets
-                        if asset.modality in {"audio", "video"}
-                    )
-                )
+                indexed = tuple(memory for memory in stored if _has_indexed_speech(memory))
                 if indexed:
                     # `speaker_name=None` is what drops the name from the projection. The rebuilt
                     # documents are handed to the store so the erasure and the reindex commit in
@@ -3799,11 +3824,7 @@ class Memory:
         indexed = tuple(
             memory
             for memory in self._store.read_memories(memory_ids)
-            if any(
-                f"[speech identities:{asset.asset_id}]\n" in memory.content
-                for asset in memory.assets
-                if asset.modality in {"audio", "video"}
-            )
+            if _has_indexed_speech(memory)
         )
         if not indexed:
             return (), ()
@@ -6637,6 +6658,15 @@ def _face_identity_text(
             + json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
         )
     return "\n\n".join(sections)
+
+
+def _has_indexed_speech(memory: StoredMemory) -> bool:
+    """Report whether stored content carries a speech projection that names its speakers."""
+    return any(
+        f"[speech identities:{asset.asset_id}]\n" in memory.content
+        for asset in memory.assets
+        if asset.modality in {"audio", "video"}
+    )
 
 
 def _without_speech_identities(text: str, asset_ids: Sequence[str]) -> str:

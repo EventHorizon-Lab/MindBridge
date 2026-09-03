@@ -329,7 +329,9 @@ clear one. `identity` resolves an ID through any merge alias and returns what ha
 so an observation captured before a merge still reaches the surviving person. `unlink_identity`
 reverses one face-and-voice merge, returning the restored ID or `None` when the merge is not
 reversible; it resets the pair's accumulated evidence rather than suppressing the pair, so a voice
-and face that keep co-occurring are corroborated and merged again. `reinforce`
+and face that keep co-occurring are corroborated and merged again. Restoring a voice also rewrites
+the indexed transcript projection in the same commit, so search stops answering to the name the
+reversed merge had attributed to it. `reinforce`
 records explicit positive feedback and returns the number of existing distinct memories updated.
 `list` uses an opaque keyset cursor. `delete` is idempotent and reports whether the record existed.
 `reindex` rebuilds Zvec from authoritative SQLite embeddings without calling the embedder and

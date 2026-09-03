@@ -200,6 +200,8 @@ boxes and local identity IDs. Results are cached under stable model-space recipe
 When one asset contains exactly one eligible voice and one eligible face, MindBridge records
 co-occurrence evidence. A face/voice merge requires corroboration across distinct assets (two by
 default), preserves the merged-away ID as an alias, and can be reversed with `unlink_identity`.
+Reversing a merge restores the alias as an unnamed identity and repaints the indexed transcript
+projection in the same commit, so no stored text keeps attributing the words to the other person.
 Applications can attach a name and relationship with `register_speaker` or `register_identity` and
 resolve either current IDs or aliases with `identity`.
 
