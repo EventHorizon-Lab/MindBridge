@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Container, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta
 from enum import Enum
@@ -63,6 +63,7 @@ class ContextUnknownKind(str, Enum):
     SCOPE_EMPTY = "scope_empty"
     SECTION_EMPTY = "section_empty"
     BUDGET_EXCLUDED = "budget_excluded"
+    CANDIDATES_EXHAUSTED = "candidates_exhausted"
     MODALITY_UNSUPPORTED = "modality_unsupported"
     STAGE_SKIPPED = "stage_skipped"
 
@@ -1581,9 +1582,22 @@ class Page:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ContextBudget:
-    """The size, type, confidence, and freshness bounds one context compilation may spend."""
+    """The size, type, confidence, and freshness bounds one context compilation may spend.
 
-    max_chars: int = 6000
+    `max_chars` bounds *evidence*, the same quantity `ContextBundle.chars` reports: record text
+    plus a text-equivalent price per grounded media part. It does not bound `render()`, which
+    adds a fixed four-line header (the goal, a one-line reading guide, the reference time, and
+    the budget line -- about 150 characters plus the goal), a blank line and a `## ` heading per
+    non-empty section, and per included memory a frame of `- [`, `] `, and ` (confidence 0.00)`,
+    which is 23 characters plus the id, plus any validity suffix. A caller shipping `render()`
+    should size against `len(bundle.render())`.
+
+    The default `max_chars` buys the most expensive single grounded part -- a video part is
+    priced at 12 000 characters -- and still leaves room for its record text and a cheaper
+    second part, so a default compilation can reach a media memory at all.
+    """
+
+    max_chars: int = 16000
     max_items: int = 24
     memory_types: frozenset[MemoryType] | None = None
     min_confidence: float = 0.0
@@ -1705,7 +1719,8 @@ class ContextBundle:
             lines.extend(_hit_line(hit) for hit in section)
         if self.conflicts:
             lines.extend(("", "## Conflicts"))
-            lines.extend(_conflict_line(conflict) for conflict in self.conflicts)
+            included_ids = {hit.id for hit in self.hits}
+            lines.extend(_conflict_line(conflict, included_ids) for conflict in self.conflicts)
         if self.unknowns:
             lines.extend(("", "## Unknowns"))
             lines.extend(f"- {item.kind.value}: {item.detail}" for item in self.unknowns)
@@ -1748,10 +1763,14 @@ def _validity(hit: SearchHit) -> str:
     return f"; valid {start} → {context.valid_until.isoformat()}"
 
 
-def _conflict_line(conflict: ContextConflict) -> str:
+def _conflict_line(conflict: ContextConflict, included: Container[str]) -> str:
     label = " ".join(part for part in (conflict.subject, conflict.predicate) if part)
+    # A conflict may name a candidate the budget could not buy. Marking it keeps the `[id]`
+    # provenance honest: that memory has no line of its own anywhere above.
     values = " vs ".join(
         f'"{value}" [{memory_id}]'
+        if memory_id in included
+        else f'"{value}" [{memory_id}, not included]'
         for value, memory_id in zip(conflict.values, conflict.memory_ids, strict=True)
     )
     return f"- {label or conflict.lineage_id}: {values}"

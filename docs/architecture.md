@@ -63,6 +63,19 @@ The ordering determines failure behavior:
   still durable and the unacknowledged projection work is retryable.
 - Stale IDs left in Zvec cannot resurrect deleted data because final hydration uses SQLite.
 
+`delete()` is physical forgetting and runs the same ordering in reverse. One SQLite transaction
+removes the record and everything keyed on it -- semantics, versions, evidence, formation runs,
+the capture-queue row, and the embeddings, whose delete triggers enqueue the projection work the
+call then drains. Media is content-addressed and therefore shared: the transaction returns the
+assets no remaining memory references, and only those lose their blob, their descriptor, their
+cached transcript, and the speech and face rows keyed on them. Removing the last observation of an
+anonymous identity also removes that identity and its exemplar template, so no biometric vector
+outlives the media it was derived from; a named or merged person survives, because a name is an
+assertion a caller made and `forget_identity()` is what erases one. The single deliberate survivor
+is `memory_operations`: the operation log is append-only audit history over ids, proposals, and
+rationales, and rewriting it would make `rollback()` unsound. The Python SDK reference owns the
+row-by-row contract.
+
 A memory ID is the SHA-256 digest of canonical ordered content, media digests, metadata, event
 time, memory type, and optional observation context. Repeating the same add is idempotent.
 `add_many()` uses one model batch and one SQLite transaction. `add_stream()` commits each completed

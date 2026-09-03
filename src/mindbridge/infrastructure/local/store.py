@@ -3050,6 +3050,8 @@ class LocalStore:
                 """,
                 (asset_id,),
             )
+            if cursor.rowcount > 0:
+                _delete_unobserved_identities(connection)
         return cursor.rowcount > 0
 
     def write_embedding(self, embedding: StoredEmbedding) -> bool:
@@ -3939,6 +3941,38 @@ class LocalStore:
     def _require_open(self) -> None:
         if self._closed:
             raise LocalStoreClosedError("local store is closed")
+
+
+def _delete_unobserved_identities(connection: sqlite3.Connection) -> None:
+    """Drop anonymous identities whose last observation went with the media just deleted.
+
+    An exemplar is a biometric template derived from stored media, so it is content: leaving one
+    behind after its last face observation and speech segment are gone would make `delete()`
+    incomplete. A named or merged identity is a person the caller asserted, not a by-product of
+    one recording; it survives, and `forget_identity()` is what erases a person.
+    """
+    connection.execute(
+        """
+        DELETE FROM identities
+        WHERE name IS NULL AND relationship IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM face_observations AS f
+              WHERE f.identity_id = identities.identity_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM speech_segments AS s
+              WHERE s.speaker_id = identities.identity_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM identity_aliases AS a
+              WHERE a.identity_id = identities.identity_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM identity_link_evidence AS e
+              WHERE e.voice_id = identities.identity_id OR e.face_id = identities.identity_id
+          )
+        """
+    )
 
 
 def _table_names(connection: sqlite3.Connection) -> frozenset[str]:
