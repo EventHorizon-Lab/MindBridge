@@ -1767,6 +1767,97 @@ def test_schema_v11_adds_the_identity_binding_on_typed_claims(tmp_path: Path) ->
     assert version == _SCHEMA_VERSION
 
 
+def test_schema_v12_adds_scheduler_state_the_outcome_and_the_merge_intent(
+    tmp_path: Path,
+) -> None:
+    """A v12 store carries its operation rows into the widened v13 log unchanged."""
+    applied_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory(),), (_embedding(),))
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        # Reconstruct the v12 log: no outcome columns, and `merge` outside the intent domain.
+        connection.executescript(
+            """
+            DROP TABLE memory_deliberation_memories;
+            DROP TABLE memory_deliberations;
+            DROP TABLE query_failures;
+            ALTER TABLE memory_operations RENAME TO memory_operations_old;
+            CREATE TABLE memory_operations (
+                operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
+                intent TEXT NOT NULL CHECK (
+                    intent IN ('reinforce', 'consolidate', 'correct', 'forget', 'identify')
+                ),
+                trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
+                model_id TEXT,
+                recipe TEXT,
+                operation_json TEXT NOT NULL,
+                effects_json TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at)
+            );
+            DROP TABLE memory_operations_old;
+            PRAGMA user_version = 12;
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO memory_operations (
+                operation_key, intent, trigger, operation_json, effects_json, applied_at
+            ) VALUES ('key-1', 'forget', 'manual', '{"intent": "forget"}', '{}', ?)
+            """,
+            (applied_at.isoformat(),),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO memory_operations (
+                    operation_key, intent, trigger, operation_json, effects_json, applied_at
+                ) VALUES ('key-2', 'merge', 'manual', '{"intent": "merge"}', '{}', ?)
+                """,
+                (applied_at.isoformat(),),
+            )
+        connection.commit()
+
+    with LocalStore(tmp_path) as store:
+        logged = store.read_operations()
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(memory_operations)")
+            }
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            # The widened intent domain: workstream A's `merge` rows now insert.
+            connection.execute(
+                """
+                INSERT INTO memory_operations (
+                    operation_key, intent, trigger, operation_json, effects_json, applied_at
+                ) VALUES ('key-2', 'merge', 'manual', '{"intent": "merge"}', '{}', ?)
+                """,
+                (applied_at.isoformat(),),
+            )
+            connection.commit()
+
+        assert store.record_operation_outcome(1, outcome="confirmed", note="held up") is True
+        assert store.read_operations(operation_id=1)[0].outcome == "confirmed"
+        assert store.record_operation_outcome(999, outcome="confirmed", note=None) is False
+
+    assert version == _SCHEMA_VERSION
+    assert {
+        "memory_deliberations",
+        "memory_deliberation_memories",
+        "query_failures",
+    } <= tables
+    assert {"outcome", "outcome_note"} <= columns
+    # The pre-existing row survived the copy-and-swap with its identity intact.
+    assert [(row.operation_id, row.operation_key, row.intent) for row in logged] == [
+        (1, "key-1", "forget")
+    ]
+
+
 def test_forgotten_memories_leave_active_reads_but_stay_auditable(tmp_path: Path) -> None:
     forgotten_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
     with LocalStore(tmp_path) as store:
