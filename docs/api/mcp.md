@@ -128,7 +128,8 @@ reports lineage conflicts and never resolves them, and names in `unknowns` what 
 implied that the bundle does not carry. `ask_memory` remains a convenience for one grounded
 answer. The optional `budget` object is the transport form of `ContextBudget` with the
 `freshness` timedelta expressed as `freshness_seconds`; `max_chars`
-accepts 1 through 65,536, `max_items` 1 through 100, and `max_latency_ms` is a deadline the
+accepts 1 through 65,536, `max_items` 1 through 100, `max_media_items` any non-negative count
+or `null`, and `max_latency_ms` is a deadline the
 compiler checks between stages rather than a timeout that aborts. The
 [compiler reference](../context-compilation.md) owns section, selection, and conflict semantics.
 
@@ -198,7 +199,7 @@ Successful calls populate MCP `structuredContent`:
 | `ReinforceResult` | `reinforced` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResult` | `items`, `next_cursor` |
-| `ContextBudgetResult` | `max_chars`, `max_items`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
+| `ContextBudgetResult` | `max_chars`, `max_items`, `max_media_items` or `null`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
 | `ContextConflictResult` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknownResult` | `kind`, `detail` |
 | `ContextBundleResult` | `goal`, `reference_at`, `budget`, the `SearchHitResult` arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, the mixed `actors` array of `SearchHitResult` and `ProvisionalActorResult`, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
@@ -294,6 +295,7 @@ that need a backend say so in their description and return `model_error` when it
 | Search, answer, or page `limit` | 1 through 100 |
 | Context `budget.max_chars` | 1 through 65,536 |
 | Context `budget.max_items` | 1 through 100 |
+| Context `budget.max_media_items` | 0 or more, or `null` |
 | Serialized metadata | 262,144 UTF-8 bytes |
 | `file_id` or `filename` | 255 characters |
 

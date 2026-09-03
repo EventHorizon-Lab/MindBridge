@@ -37,7 +37,13 @@ from mindbridge import (
     ValidationError,
 )
 from mindbridge.cli import _LOCAL, _parser
-from mindbridge.context import compile_context, evidence_cost
+from mindbridge.context import (
+    _frame_cost,
+    _heading_cost,
+    bundle_cost,
+    compile_context,
+    evidence_cost,
+)
 from mindbridge.infrastructure.local.store import StoredAsset
 from mindbridge.memory import _PreparedContent
 
@@ -101,6 +107,12 @@ def _hit(
     )
 
 
+def _frame_and_headings(bundle: ContextBundle, sections: Sequence[str]) -> int:
+    return _frame_cost(bundle.goal, bundle.reference_at, bundle.budget) + sum(
+        _heading_cost(name) for name in sections
+    )
+
+
 def _compile(hits: Sequence[SearchHit], **budget: object) -> ContextBundle:
     return compile_context(
         "what is going on",
@@ -125,6 +137,9 @@ def _compile(hits: Sequence[SearchHit], **budget: object) -> ContextBundle:
         {"freshness": 60},
         {"memory_types": frozenset()},
         {"memory_types": frozenset({"semantic"})},
+        {"max_media_items": -1},
+        {"max_media_items": True},
+        {"max_media_items": 1.5},
         {"max_latency_ms": 0},
         {"max_latency_ms": 1.5},
         {"max_latency_ms": True},
@@ -268,10 +283,75 @@ def test_item_and_character_budgets_are_never_exceeded() -> None:
     assert len(items.hits) == 4
     assert items.omitted == 6
 
-    chars = _compile(hits, max_chars=250)
-    assert chars.chars == 200
+    # `max_chars` prices the rendered evidence: the header, the section heading, and each
+    # memory's whole `- [id] ... (confidence 1.00)` line, not `len(content)` alone.
+    chars = _compile(hits, max_chars=500)
     assert len(chars.hits) == 2
     assert chars.omitted == 8
+    assert chars.chars <= 500
+
+
+def test_max_chars_bounds_the_rendered_evidence_and_not_only_the_record_text() -> None:
+    """A bundle carrying no diagnostics renders inside `max_chars`, frame and headers included.
+
+    The old accounting charged `len(content)` alone, so the header, the section headings and
+    every `- [id] ... (confidence 1.00)` frame were spent outside the budget the caller declared
+    and the docstring told callers to measure `render()` themselves.
+    """
+    hits = tuple(
+        _hit(f"fact-{index}", score=0.9 - index / 100, content="x" * 60) for index in range(40)
+    )
+
+    for ceiling in (200, 400, 1000, 4000):
+        bundle = _compile(hits, max_chars=ceiling)
+        # `omitted` puts an unknown and a trailer below the evidence; measure the evidence.
+        rendered = bundle.render().split("\n\n## Unknowns")[0]
+        assert len(rendered) <= bundle.chars <= ceiling, ceiling
+
+    # With nothing omitted there are no diagnostics at all, so the whole text is bounded.
+    whole = _compile(hits[:2], max_chars=4000)
+    assert whole.unknowns == ()
+    assert len(whole.render()) <= whole.chars <= 4000
+
+
+def test_max_media_items_bounds_grounded_parts_instead_of_their_price() -> None:
+    """`0` compiles a text-only bundle; a positive bound caps the parts, not the characters."""
+    clips = tuple(
+        _hit(
+            f"clip-{index}",
+            score=0.9 - index / 100,
+            modality=Modality.IMAGE,
+            assets=(
+                AssetRef(
+                    id=f"asset-{index}",
+                    modality=Modality.IMAGE,
+                    media_type="image/png",
+                    size_bytes=1,
+                    sha256=f"{index}" * 64,
+                    path=Path(f"frame-{index}.png"),
+                ),
+            ),
+        )
+        for index in range(4)
+    )
+    hits = (*clips, _hit("note", score=0.1, content="a short note"))
+
+    # Unbounded: the default `max_chars` decides, and it buys some of the parts.
+    assert [hit.id for hit in _compile(hits).hits] == [
+        "clip-0",
+        "clip-1",
+        "clip-2",
+        "clip-3",
+        "note",
+    ]
+    # No media at all, whatever it costs and however it ranks.
+    text_only = _compile(hits, max_media_items=0)
+    assert [hit.id for hit in text_only.hits] == ["note"]
+    assert text_only.omitted == 4
+    # At most two image parts, and the text behind them still gets in.
+    two = _compile(hits, max_media_items=2)
+    assert [hit.id for hit in two.hits] == ["clip-0", "clip-1", "note"]
+    assert two.omitted == 2
 
 
 def test_a_media_hit_is_charged_far_above_its_record_text() -> None:
@@ -293,7 +373,7 @@ def test_a_media_hit_is_charged_far_above_its_record_text() -> None:
 
     assert evidence_cost(video) > evidence_cost(text)
     # The clip alone overruns a small budget, and the cheaper text still gets in behind it.
-    bundle = _compile((video, text), max_chars=100)
+    bundle = _compile((video, text), max_chars=300)
     assert [hit.id for hit in bundle.hits] == ["note"]
     assert bundle.omitted == 1
     # ... but the default budget must be able to buy the most expensive single grounded part,
@@ -485,7 +565,9 @@ def test_an_empty_retrieval_compiles_an_empty_bundle() -> None:
 
     assert bundle.hits == ()
     assert (bundle.occurred_from, bundle.occurred_until) == (None, None)
-    assert (bundle.frames, bundle.conflicts, bundle.omitted, bundle.chars) == ((), (), 0, 0)
+    assert (bundle.frames, bundle.conflicts, bundle.omitted) == ((), (), 0)
+    # An empty bundle still renders its header, so the header is what it charged.
+    assert bundle.chars >= len(bundle.render())
     assert "Omitted" not in bundle.render()
 
 
@@ -875,7 +957,7 @@ def test_compile_reuses_the_retrieval_path_and_structures_what_it_returns(tmp_pa
         assert [hit.id for hit in bundle.episodes] == [walk.id]
         assert [hit.id for hit in bundle.facts] == [note.id]
         assert bundle.occurred_from == REFERENCE - timedelta(hours=3)
-        assert bundle.chars == len(note.content) + len(walk.content)
+        assert len(bundle.render()) <= bundle.chars <= bundle.budget.max_chars
         assert note.id in bundle.render()
 
 
@@ -994,6 +1076,7 @@ def test_the_cli_command_serializes_the_bundle(tmp_path: Path) -> None:
     assert json.loads(json.dumps(document))["budget"] == {
         "max_chars": 16000,
         "max_items": 1,
+        "max_media_items": None,
         "memory_types": ["semantic"],
         "min_confidence": 0.0,
         "freshness_seconds": 86400.0,
@@ -1028,7 +1111,12 @@ def test_a_provisional_actor_joins_the_actors_without_taking_a_hit_slot() -> Non
     ] == [("identity_1", ("episode",)), ("identity_2", ("episode",))]
     # Not a hit, not a budgeted item, and not the reason anything was omitted.
     assert [hit.id for hit in bundle.hits] == ["actor", "episode"]
-    assert (bundle.omitted, bundle.chars) == (0, sum(evidence_cost(hit) for hit in bundle.hits))
+    # A provisional actor renders a line of its own but is charged nothing for it, so the
+    # bundle's own price stays what the two hits cost.
+    assert bundle.omitted == 0
+    assert bundle.chars == sum(bundle_cost(hit) for hit in bundle.hits) + _frame_and_headings(
+        bundle, ("actors", "episodes")
+    )
 
 
 def test_a_provisional_actor_of_omitted_evidence_is_not_reported() -> None:

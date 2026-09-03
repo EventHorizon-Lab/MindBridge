@@ -52,6 +52,8 @@ _Chars = Annotated[int, Field(strict=True, ge=1, le=MAX_TEXT_CHARACTERS)]
 _Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 _Seconds = Annotated[float, Field(gt=0.0)]
 _Milliseconds = Annotated[int, Field(strict=True, ge=1)]
+# Zero is a real budget here -- a text-only bundle -- so this floor is not one.
+_MediaItems = Annotated[int, Field(strict=True, ge=0)]
 # Budget defaults are read from the SDK value, so the advertised tool default cannot drift from
 # `ContextBudget`.
 _BUDGET = ContextBudget()
@@ -290,6 +292,9 @@ class ReinforceResult(BaseModel):
 class ContextBudgetInput(StrictModel):
     max_chars: _Chars = _BUDGET.max_chars
     max_items: _Limit = _BUDGET.max_items
+    # Grounded media parts, not their price: 0 compiles a text-only bundle, null lets
+    # `max_chars` alone decide.
+    max_media_items: _MediaItems | None = None
     memory_types: Annotated[list[MemoryType], Field(min_length=1)] | None = None
     min_confidence: _Confidence = _BUDGET.min_confidence
     freshness_seconds: _Seconds | None = None
@@ -299,6 +304,7 @@ class ContextBudgetInput(StrictModel):
 class ContextBudgetResult(BaseModel):
     max_chars: int
     max_items: int
+    max_media_items: int | None
     memory_types: tuple[MemoryType, ...] | None
     min_confidence: float
     freshness_seconds: float | None
@@ -1051,6 +1057,7 @@ def _budget_result(budget: ContextBudget) -> ContextBudgetResult:
     return ContextBudgetResult(
         max_chars=budget.max_chars,
         max_items=budget.max_items,
+        max_media_items=budget.max_media_items,
         memory_types=None if budget.memory_types is None else tuple(sorted(budget.memory_types)),
         min_confidence=budget.min_confidence,
         freshness_seconds=(None if budget.freshness is None else budget.freshness.total_seconds()),

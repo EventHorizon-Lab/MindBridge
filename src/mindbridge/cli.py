@@ -654,6 +654,7 @@ def _budget(arguments: argparse.Namespace) -> ContextBudget:
     return ContextBudget(
         max_chars=arguments.max_chars,
         max_items=arguments.max_items,
+        max_media_items=arguments.max_media_items,
         memory_types=(
             None
             if arguments.memory_type is None
@@ -717,6 +718,7 @@ def _budget_document(budget: ContextBudget) -> _Document:
     return {
         "max_chars": budget.max_chars,
         "max_items": budget.max_items,
+        "max_media_items": budget.max_media_items,
         "memory_types": (
             None
             if budget.memory_types is None
@@ -1938,6 +1940,11 @@ def _compile_command(
         type=int,
         default=budget.max_items,
         help="maximum included memories (default: %(default)s)",
+    )
+    command.add_argument(
+        "--max-media-items",
+        type=int,
+        help="maximum grounded media parts; 0 compiles a text-only bundle",
     )
     command.add_argument(
         "--memory-type",

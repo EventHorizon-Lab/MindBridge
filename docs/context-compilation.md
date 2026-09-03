@@ -37,26 +37,32 @@ window came back full and the bundle still lost evidence, `unknowns` carries a
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `max_chars` | `16000` | Evidence character ceiling, charged with the same cost function `ask()` uses: record text plus a per-modality text equivalent for each media asset. One image part is charged 2000, one audio part 4000, and one video part 12000, so a ceiling below 12000 omits every video record it ranks |
+| `max_chars` | `16000` | Rendered-evidence character ceiling: the header, each section heading, each memory's whole rendered line, and a per-modality text equivalent for each media asset. One image part is charged 2000, one audio part 4000, and one video part 12000, so a ceiling below 12000 omits every video record it ranks |
 | `max_items` | `24` | Maximum included memories |
+| `max_media_items` | `None` | Maximum grounded media parts; `0` compiles a text-only bundle and `None` lets `max_chars` alone decide |
 | `memory_types` | `None` | Keep only these `MemoryType` values; `None` keeps every type |
 | `min_confidence` | `0.0` | Minimum typed confidence; a record with no typed context counts as `1.0` |
 | `freshness` | `None` | Keep only memories anchored within this `timedelta` of `reference_at` |
 | `max_latency_ms` | `None` | Deadline in milliseconds; optional stages are skipped once it passes |
 
 The freshness anchor is event end, then event start, then creation time. Every field is validated
-on construction: the two maxima and `max_latency_ms` are positive integers, `min_confidence` is in
-`[0, 1]`, and `freshness` is a positive `timedelta`.
+on construction: `max_chars`, `max_items` and `max_latency_ms` are positive integers,
+`max_media_items` is a non-negative one, `min_confidence` is in `[0, 1]`, and `freshness` is a
+positive `timedelta`.
 
 ### What a character costs
 
-There is one budget, not a text budget and a media budget. `max_chars` prices both against the
-same scale, because what a bundle spends is what the downstream model is charged for, and one
-grounded media part costs far more than the record text beside it. The prices are fixed:
+`max_chars` prices text and media against the same scale, because what a bundle spends is what
+the downstream model is charged for, and one grounded media part costs far more than the record
+text beside it. `max_media_items` is the second knob for the cases a shared scale cannot express:
+"at most two images" and "no media at all" are statements about parts, not about characters, and a
+character ceiling can only approximate them. The prices are fixed:
 
 | Charged | Characters |
 | --- | --- |
-| Record text | `len(hit.content)` |
+| One memory's rendered line | `len(render_hit_line(hit)) + 1` -- the `- [id]` frame, the squeezed record text, and the confidence and validity suffix |
+| The header | its four rendered lines, about 150 characters plus the goal |
+| One section heading | its blank line, `## `, and the name |
 | One `image` asset | 2000 |
 | One `audio` asset | 4000 |
 | One `video` asset | 12000 |
@@ -80,20 +86,23 @@ inference to discount -- it is a raw observation, evidence in its own right -- s
 so the filter and the rendered line never disagree. Raising `min_confidence` is therefore a way to
 demand better inferences, not a way to exclude observations; filter those by `memory_types`.
 
-### What `max_chars` does not bound
+### What `max_chars` does and does not bound
 
-`max_chars` bounds evidence, the quantity `ContextBundle.chars` reports. It does not bound
-`len(bundle.render())`, which adds a bounded frame around that evidence:
+`max_chars` bounds the *rendered* evidence, the quantity `ContextBundle.chars` reports and the
+quantity the selection charges: the header, every section heading, and every memory line with its
+frame. A bundle that reports no compilation diagnostics therefore satisfies
+`len(bundle.render()) <= bundle.chars <= max_chars`, and a caller shipping `render()` no longer
+has to size against it themselves.
 
-- a four-line header -- the goal, a 61-character reading guide, the reference time, and the
-  budget line -- which is roughly 150 characters plus the goal text;
-- a blank line and a two-character `##` heading, plus a space, for each non-empty section;
-- per included memory, the `- [id]` prefix and the `(confidence 0.00)` suffix, with their
-  separating spaces: 23 characters plus the id, plus a validity suffix when it carries one;
-- the optional `## Conflicts`, `## Unknowns`, and `Omitted:` blocks.
+`chars` is an upper bound rather than an exact length -- media parts are charged their text
+equivalent, which is far above the zero characters they render as, and the budget line is priced
+at its widest -- so the inequality can be slack, never violated.
 
-A caller who ships `render()` should size against `len(bundle.render())`; the bundle does not
-publish a second number for it.
+Four things `render()` appends are outside the ceiling, all of them explanations rather than
+grounding: the `## Conflicts` block, the `## Unknowns` block, the `Omitted:` trailer, and the
+provisional-actor lines. Suppressing any of them to fit a budget would make a thin bundle look
+like an empty store, which is the failure the unknowns exist to prevent, and a provisional actor
+is a person the evidence already paid for rather than evidence of its own.
 
 ### The deadline
 

@@ -545,6 +545,7 @@ def test_the_context_budget_transport_defaults_come_from_the_sdk_value() -> None
     expected = {
         "max_chars": budget.max_chars,
         "max_items": budget.max_items,
+        "max_media_items": budget.max_media_items,
         "memory_types": budget.memory_types,
         "min_confidence": budget.min_confidence,
         "freshness_seconds": budget.freshness,

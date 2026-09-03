@@ -1661,21 +1661,24 @@ class Page:
 class ContextBudget:
     """The size, type, confidence, and freshness bounds one context compilation may spend.
 
-    `max_chars` bounds *evidence*, the same quantity `ContextBundle.chars` reports: record text
-    plus a text-equivalent price per grounded media part. It does not bound `render()`, which
-    adds a fixed four-line header (the goal, a one-line reading guide, the reference time, and
-    the budget line -- about 150 characters plus the goal), a blank line and a `## ` heading per
-    non-empty section, and per included memory a frame of `- [`, `] `, and ` (confidence 0.00)`,
-    which is 23 characters plus the id, plus any validity suffix. A caller shipping `render()`
-    should size against `len(bundle.render())`.
+    `max_chars` bounds the rendered evidence, the same quantity `ContextBundle.chars` reports:
+    the four-line header, each section heading, each memory's rendered line with its `- [id]`
+    frame and confidence suffix, and a text-equivalent price per grounded media part. A bundle
+    that carries no compilation diagnostics therefore satisfies `len(bundle.render()) <=
+    max_chars`; the `## Conflicts`, `## Unknowns`, `Omitted:` and provisional-actor lines are
+    appended outside it, because they explain the bundle rather than ground it and suppressing
+    them to fit a budget would make a thin bundle look like an empty store.
 
-    The default `max_chars` buys the most expensive single grounded part -- a video part is
-    priced at 12 000 characters -- and still leaves room for its record text and a cheaper
-    second part, so a default compilation can reach a media memory at all.
+    `max_media_items` bounds grounded media parts instead of their price: `0` compiles a
+    text-only bundle, and `None` lets `max_chars` alone decide. The default `max_chars` buys the
+    most expensive single grounded part -- a video part is priced at 12 000 characters -- and
+    still leaves room for its record text and a cheaper second part, so a default compilation
+    can reach a media memory at all.
     """
 
     max_chars: int = 16000
     max_items: int = 24
+    max_media_items: int | None = None
     memory_types: frozenset[MemoryType] | None = None
     min_confidence: float = 0.0
     freshness: timedelta | None = None
@@ -1687,6 +1690,11 @@ class ContextBudget:
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_chars", _positive_int(self.max_chars, "budget max_chars"))
         object.__setattr__(self, "max_items", _positive_int(self.max_items, "budget max_items"))
+        if self.max_media_items is not None:
+            if isinstance(self.max_media_items, bool) or not isinstance(self.max_media_items, int):
+                raise ValidationError("budget max_media_items must be a non-negative integer")
+            if self.max_media_items < 0:
+                raise ValidationError("budget max_media_items must be a non-negative integer")
         if self.max_latency_ms is not None:
             object.__setattr__(
                 self,
@@ -1853,12 +1861,17 @@ class ContextBundle:
 
 def _section_line(entry: SearchHit | ProvisionalActor) -> str:
     if isinstance(entry, SearchHit):
-        return _hit_line(entry)
+        return render_hit_line(entry)
     seen = ", ".join(f"[{memory_id}]" for memory_id in entry.memory_ids)
     return f"- [{entry.identity_id}] unnamed person present (provisional identity; seen in {seen})"
 
 
-def _hit_line(hit: SearchHit) -> str:
+def render_hit_line(hit: SearchHit) -> str:
+    """Return the one line `render()` writes for this hit.
+
+    The compiler charges its length against `ContextBudget.max_chars`, so the price and the text
+    come from the same function and cannot drift.
+    """
     confidence = 1.0 if hit.context is None else hit.context.confidence
     marks = f"confidence {confidence:.2f}{_validity(hit)}"
     # One hit is one line, so stored newlines collapse rather than break the section shape.

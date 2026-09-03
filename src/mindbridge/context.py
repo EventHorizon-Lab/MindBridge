@@ -26,6 +26,7 @@ from mindbridge.types import (
     Modality,
     ProvisionalActor,
     SearchHit,
+    render_hit_line,
 )
 
 # Text-equivalent cost of one grounded media part, at the usual four characters per token. The
@@ -103,15 +104,49 @@ _Claim: TypeAlias = tuple[str, str, str | None, str | None]
 
 def evidence_cost(hit: SearchHit) -> int:
     """Return what grounding one hit costs, in characters of text-equivalent evidence."""
+    return len(hit.content) + _asset_cost(hit)
+
+
+def _asset_cost(hit: SearchHit) -> int:
     # `AssetRef.modality` is optional on the public type; an unresolved asset is charged the
     # default rather than being treated as free.
-    charges = (
+    return sum(
         _DEFAULT_ASSET_EVIDENCE_CHARS
         if asset.modality is None
         else _ASSET_EVIDENCE_CHARS.get(asset.modality, _DEFAULT_ASSET_EVIDENCE_CHARS)
         for asset in hit.assets
     )
-    return len(hit.content) + sum(charges)
+
+
+def bundle_cost(hit: SearchHit) -> int:
+    """Return what one hit costs a bundle: its rendered line plus its media parts.
+
+    The rendered line, not the record text: the `- [id]` frame and the confidence suffix are
+    characters the consumer pays for, so charging only `len(content)` would hand a caller a
+    budget that `render()` overruns. Media parts are charged their text equivalent, which is far
+    more than the zero characters they render as, so the number is an upper bound on the text.
+    """
+    return len(render_hit_line(hit)) + 1 + _asset_cost(hit)
+
+
+def _frame_cost(goal: str, reference_at: datetime, budget: ContextBudget) -> int:
+    """Return an upper bound on the fixed header `render()` writes above the first section."""
+    return (
+        len(f"# Context: {goal}")
+        + len("Each line is one memory: [id] content (confidence; validity).")
+        + len(f"Reference time: {reference_at.isoformat()}")
+        # `chars` cannot have more digits than `max_chars`, nor `included` than `max_items`.
+        + len(
+            f"Budget: {budget.max_chars}/{budget.max_chars} chars,"
+            f" {budget.max_items}/{budget.max_items} items"
+        )
+        + 4
+    )
+
+
+def _heading_cost(section: str) -> int:
+    """Return what one section heading costs: a blank line, `## `, the name, two newlines."""
+    return len(section) + 5
 
 
 def compile_context(
@@ -147,7 +182,8 @@ def compile_context(
             candidates.append(hit)
         else:
             excluded[reason] = excluded.get(reason, 0) + 1
-    sections = _select(candidates, budget)
+    overhead = _frame_cost(goal, reference_at, budget)
+    sections = _select(candidates, budget, overhead)
     # Rank order, not section order: `_lineage_conflict` pairs each value with the highest-ranked
     # memory asserting it, so a lineage whose claims land in different sections must still be read
     # by score. `ContextBundle.hits` sorts the same way.
@@ -206,7 +242,7 @@ def compile_context(
         frames=_frames(included),
         places=tuple(sorted({hit.place_id for hit in included if hit.place_id})),
         omitted=omitted,
-        chars=sum(evidence_cost(hit) for hit in included),
+        chars=_bundle_chars(overhead, sections),
         elapsed_ms=elapsed_ms,
         deadline_exceeded=(
             budget.max_latency_ms is not None and elapsed_ms > budget.max_latency_ms
@@ -244,6 +280,7 @@ def _anchor(hit: SearchHit) -> datetime:
 def _select(
     candidates: Sequence[SearchHit],
     budget: ContextBudget,
+    overhead: int,
 ) -> dict[str, tuple[SearchHit, ...]]:
     """Rank decides the top half of `max_items`; the bottom half seats the sections it missed.
 
@@ -254,7 +291,8 @@ def _select(
     """
     sections: dict[str, list[SearchHit]] = {name: [] for name in _SECTIONS}
     taken: set[str] = set()
-    used = 0
+    used = overhead
+    media = 0
     head = -(-budget.max_items // 2)
     spanned = {_section(hit) for hit in candidates}
     rounds: tuple[tuple[int, bool], ...] = (
@@ -269,7 +307,11 @@ def _select(
             section = _section(hit)
             if hit.id in taken or (floor and sections[section]):
                 continue
-            cost = evidence_cost(hit)
+            if budget.max_media_items is not None and (
+                media + len(hit.assets) > budget.max_media_items
+            ):
+                continue
+            cost = bundle_cost(hit) + (0 if sections[section] else _heading_cost(section))
             # One oversized hit does not close the bundle: a cheaper lower-ranked candidate can
             # still fit, and `omitted` reports everything the budget could not buy.
             if used + cost > budget.max_chars:
@@ -277,7 +319,17 @@ def _select(
             sections[section].append(hit)
             taken.add(hit.id)
             used += cost
+            media += len(hit.assets)
     return {name: tuple(section) for name, section in sections.items()}
+
+
+def _bundle_chars(overhead: int, sections: Mapping[str, tuple[SearchHit, ...]]) -> int:
+    """Return what this bundle charged against `max_chars`, priced exactly as `_select` did."""
+    return overhead + sum(
+        _heading_cost(name) + sum(bundle_cost(hit) for hit in section)
+        for name, section in sections.items()
+        if section
+    )
 
 
 def _section(hit: SearchHit) -> str:
