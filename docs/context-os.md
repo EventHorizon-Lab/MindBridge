@@ -140,9 +140,12 @@ Every proposal names its evidence, model and recipe, expected effect, and idempo
 kernel rejects unsupported, unauthorized, internally inconsistent, or stale proposals. The loop
 never writes SQLite directly.
 
-The existing `FormationBackend` is the seed of this plane: it proposes typed state from one
-committed observation while the kernel validates and persists it. The control plane expands the
-reasoning horizon and operation set without weakening that authority boundary.
+`FormationBackend` is the seed of this plane: it proposes typed state from one committed
+observation while the kernel validates and persists it. `ConsolidationBackend` is the plane itself:
+`consolidate()` gathers a bounded, active evidence set, the backend proposes `MemoryOperation`
+values with the four intents reinforce, consolidate, correct, and forget, and the kernel validates
+each one, commits it with its log row, and can `rollback()` it. The Python SDK reference owns the
+exact contract; the reasoning backend can change without changing that vocabulary.
 
 ## Forgetting is three operations
 
@@ -152,8 +155,11 @@ reasoning horizon and operation set without weakening that authority boundary.
 | Consolidation forgetting | Prefer a compact derived memory and move detailed evidence out of the normal recall path. | The memory loop may propose it; the kernel preserves lineage. |
 | Physical forgetting | Delete records and media so they cannot be recovered by MindBridge. | Explicit human or deterministic retention policy. |
 
-Current decay is cognitive ranking only. It neither archives nor deletes content. Future retention
-work must keep these meanings separate in APIs, telemetry, and user-facing controls.
+Decay is cognitive ranking only, and `forget()` is cognitive forgetting: a forgotten record leaves
+recall, stays readable through `get()` and `list()` with its `forgotten_at`, and returns through
+`rollback()`. Consolidation forgetting is a control-plane proposal over evidence lineage. Physical
+forgetting remains `delete()` under host authority and is not a proposal intent. Retention work must
+keep these meanings separate in APIs, telemetry, and user-facing controls.
 
 ## Context compiler
 
@@ -253,17 +259,20 @@ defaults or justify superiority claims.
 ## Evolution gates
 
 1. Measure the current strong `add`, streaming prefetch, search, and formation paths on target
-   hardware before setting latency objectives.
+   hardware before setting latency objectives. Open: no named-hardware measurement exists yet.
 2. Add an explicit fast-capture path and SQLite-backed durable enrichment work without changing
-   current `add()` semantics.
+   current `add()` semantics. Done: `capture()`, `settle()`, and `pending_captures()`.
 3. Generalize formation into one bounded memory-management loop with structured proposals,
-   replay, rollback, and privacy tests.
-4. Add a context compiler whose output improves downstream tasks within declared budgets.
-5. Extend REST or MCP only after the Python contract and authority model are stable. The
-   compiler and the capability advertisement are the first operations to pass that gate; the
-   control-plane intents have not.
+   replay, rollback, and privacy tests. Done for the operation log, rollback, and authority
+   tests: `consolidate()`, `forget()`, `rollback()`, and `operations()`. Open: replay of a logged
+   operation sequence against a fresh store, and companion-scenario privacy tests.
+4. Add a context compiler whose output improves downstream tasks within declared budgets. Done
+   for selection and budgeting: `compile()`. Open: a downstream-task measurement against the
+   no-memory, full-context, and retrieval-only baselines.
+5. Extend REST or MCP only after the Python contract and authority model are stable. Done for the
+   compiler and the capability advertisement; the control-plane intents stay off REST and MCP.
 
-MindBridge earns the Context OS label when fast capture is independent of slow reasoning, the
-agentic control plane can safely govern the memory lifecycle, and the compiler can produce
-budgeted task-ready context. Until then, the implemented package remains accurately described as
-an embedded multimodal memory runtime progressing toward that direction.
+Fast capture is now independent of slow reasoning, the control plane governs the lifecycle through
+validated, logged, reversible operations, and the compiler produces budgeted task-ready context.
+The remaining gates are measurements, not mechanisms: named-hardware latency, downstream task
+utility, and slow-loop quality on companion scenarios decide whether the defaults are right.
