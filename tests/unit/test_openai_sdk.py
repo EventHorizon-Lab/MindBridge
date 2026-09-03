@@ -487,9 +487,12 @@ def test_description_numbers_every_visual_in_one_request_and_sends_video_as_stil
         "text",
         *("image_url",) * 4,
     ]
+    # A visual sent as several stills says so. Without the count, a measured endpoint answered a
+    # single four-still clip with four descriptions on every attempt, and the "one string per
+    # input" contract then rejected the whole reply -- billed, and no caption stored.
     assert [part["text"] for part in parts if part["type"] == "text"] == [
         "Visual 1:",
-        "Visual 2:",
+        "Visual 2, as 4 ordered stills:",
     ]
     # The video travels as the four ordered stills the generation path samples, never as the file.
     frames = [part["image_url"]["url"] for part in parts[3:]]

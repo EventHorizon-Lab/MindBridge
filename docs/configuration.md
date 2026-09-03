@@ -214,7 +214,12 @@ Three things bound what it costs and what it can do:
   it is left undescribed, silently and by design.
 - Video is described from four ordered stills decoded locally, never by uploading the file, so it
   costs four image parts per memory; that is why the default is `[image]` and video is opted into.
-  A clip with no readable video stream fails the write rather than falling back to sending it.
+  A clip with no readable video stream fails the write rather than falling back to sending it. The
+  request marks such a visual with its still count (`Visual 2, as 4 ordered stills:`) and asks for
+  one caption per visual, never one per still: asked over an unmarked clip, a measured endpoint
+  returned four separate descriptions on every attempt, the one-caption-per-input contract below
+  rejected the reply whole, and `modalities: [image, video]` therefore stored no caption at all
+  while still paying for the request.
 - The caption is derived text, so the request carries pixels and an ordinal only -- no memory ID,
   file name, or store path -- and a reply that does not return exactly one non-empty caption per
   visual is rejected whole rather than mislabelling a memory with another's contents. One

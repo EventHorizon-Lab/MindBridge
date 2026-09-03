@@ -115,6 +115,10 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   empty cannot be matched and scores zero for the lexical re-ranking bonus. The caption is unioned
   into that document, never substituted for the caller's text, and the asset is still embedded
   natively. Video is described from four locally decoded stills rather than by uploading the file.
+  A visual sent as several stills is marked with the count, and one caption per *visual* is asked
+  for explicitly: over an unmarked four-still clip a measured endpoint returned four separate
+  descriptions on every attempt, the one-caption-per-input contract rejected the reply whole, and
+  `modalities: [image, video]` therefore paid for every request and stored no caption at all.
   Description stays absent by default: it adds a model call per visual on the write path, reported
   under its own model module so its tokens are separable from answer tokens. A malformed reply is
   retried once -- an endpoint can answer `200 OK` with invalid JSON, which an SDK retry policy
