@@ -2812,7 +2812,13 @@ def _metrics(
             "p99": percentile(latencies, 0.99),
         },
         "retrieval": retrieval,
-        "controls": _controls(task.spec.name, retrieval, blind, is_blind_run=arguments.blind),
+        "controls": _controls(
+            task.spec.name,
+            retrieval,
+            blind,
+            is_blind_run=arguments.blind,
+            retrieves=_Arm(arm).retrieves,
+        ),
         "noise_floor": _noise_floor(scored, primary),
         "cross_harness_comparable": False,
         "comparability_note": (
@@ -3033,20 +3039,26 @@ def _controls(
     blind: Mapping[str, object] | None,
     *,
     is_blind_run: bool,
+    retrieves: bool = True,
 ) -> dict[str, object]:
     """Report the three controls that make a score interpretable, and which are absent.
 
     Each of these has independently invalidated a conclusion on this project: a random ranker
     reached R@10 = 0.9941 on one benchmark, blind answering already scores 0.383 on another,
     and R@1 moving without R@20 moving is noise.
+
+    An arm that never retrieves (blind, full-context) has no retrieval to control for, so the two
+    retrieval controls do not apply to it rather than being missing. Requiring them turned
+    `controls_complete` false on every run that carried a blind arm, which hid the difference
+    between a task with no gold labels and a healthy one.
     """
     recall = retrieval.get("recall_at_k")
     random_ranker = retrieval.get("random_ranker_recall_at_k")
     recall_rows = recall if isinstance(recall, Mapping) else {}
     random_rows = random_ranker if isinstance(random_ranker, Mapping) else {}
     present = {
-        "random_ranker": bool(random_rows),
-        "recall_at_20": "20" in recall_rows and "1" in recall_rows,
+        "random_ranker": not retrieves or bool(random_rows),
+        "recall_at_20": not retrieves or ("20" in recall_rows and "1" in recall_rows),
         "blind": is_blind_run or blind is not None,
     }
     missing = tuple(name for name in _MANDATORY_CONTROLS if not present[name])
@@ -3056,6 +3068,7 @@ def _controls(
         "recall_at_20": recall_rows.get("20"),
         "blind": None if blind is None else dict(blind),
         "is_blind_run": is_blind_run,
+        "retrieval_controls_applicable": retrieves,
         "missing": list(missing),
         "interpretable": not missing,
         "reason": (

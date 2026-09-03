@@ -451,6 +451,18 @@ def test_controls_are_complete_only_with_all_three_baselines() -> None:
     }
 
     without_blind = eval_module._controls("fixture", retrieval, None, is_blind_run=False)
+    # A non-retrieving arm has nothing for the retrieval controls to check: they do not apply,
+    # so its row stays interpretable when the blind control is present.
+    non_retrieving = eval_module._controls(
+        "fixture",
+        {"recall_at_k": {}, "random_ranker_recall_at_k": {}},
+        {"mean": 0.1},
+        is_blind_run=False,
+        retrieves=False,
+    )
+    assert non_retrieving["retrieval_controls_applicable"] is False
+    assert non_retrieving["missing"] == []
+    assert non_retrieving["interpretable"] is True
     with_blind = eval_module._controls("fixture", retrieval, {"mean": 0.383}, is_blind_run=False)
     blind_run = eval_module._controls("fixture", retrieval, None, is_blind_run=True)
 
