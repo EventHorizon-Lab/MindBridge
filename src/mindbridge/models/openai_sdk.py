@@ -216,6 +216,7 @@ class OpenAIModels:
         "_transcription_model",
         "_transcription_prompt",
         "_transcription_space",
+        "_vision_space",
     )
 
     def __init__(  # noqa: C901 - validates independent adapter controls
@@ -366,6 +367,14 @@ class OpenAIModels:
             max_tokens=generation_max_tokens,
             extra_body=self._generation_extra_body,
         )
+        self._vision_space = _default_vision_space(
+            generation_model,
+            capabilities=self._generation_capabilities,
+            seed=generation_seed,
+            temperature=generation_temperature,
+            max_tokens=generation_max_tokens,
+            extra_body=self._generation_extra_body,
+        )
         self._consolidation_recipe = _default_reasoning_recipe(
             generation_model,
             prompt=_CONSOLIDATION_SYSTEM_PROMPT,
@@ -425,6 +434,10 @@ class OpenAIModels:
     @property
     def consolidation_recipe(self) -> str:
         return self._consolidation_recipe
+
+    @property
+    def vision_space(self) -> str:
+        return self._vision_space
 
     @property
     def transcription_capabilities(self) -> frozenset[Modality]:
@@ -1468,6 +1481,39 @@ def _default_transcription_space(
     payload = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(f"openai-transcription-v1:{payload}".encode()).hexdigest()[:16]
     return f"{model}:asr-v1:{digest}"
+
+
+def _default_vision_space(
+    model: str,
+    *,
+    capabilities: frozenset[Modality],
+    seed: int | None,
+    temperature: float | None,
+    max_tokens: int | None,
+    extra_body: Mapping[str, object] | None,
+) -> str:
+    """Identify the caption recipe, prompt included, not just the model.
+
+    `_VISION_SYSTEM_PROMPT` is inside the digest on purpose: it decides what a caption contains,
+    it is still being iterated on, and a store keyed on the model alone would serve captions
+    written under an older prompt forever, inside the indexed document, with nothing to notice it.
+    """
+    payload = json.dumps(
+        {
+            "prompt": _VISION_SYSTEM_PROMPT,
+            "capabilities": sorted(modality.value for modality in capabilities),
+            "seed": seed,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "extra_body": extra_body,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(f"mindbridge-vision-v1:{payload}".encode()).hexdigest()[:16]
+    return f"{model}:mindbridge-vision-v1:{digest}"
 
 
 def _default_reasoning_recipe(

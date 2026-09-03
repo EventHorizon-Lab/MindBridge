@@ -120,6 +120,16 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   retried once -- an endpoint can answer `200 OK` with invalid JSON, which an SDK retry policy
   never sees -- and a describer failure leaves the memory stored without a caption instead of
   failing the write, counted on the vision span as `mindbridge.vision.failed_batches`.
+- A store-side caption cache: a `visual_descriptions` table keyed by `(asset content SHA-256,
+  vision_space)` is read before any describe call and written with the memory, so a product caller
+  who ingests one corpus twice, or re-derives after a crash, pays once and gets the same indexed
+  documents. The measured describe endpoint returns a different caption for the same image on every
+  request even at temperature 0 with a fixed seed, and the caption is unioned into the memory's
+  full-text document, so without this a re-ingest silently rewrote what a memory said and paid for
+  every image again. One describe per asset *content*, so two memories over one picture in a single
+  write cost one call; the vision model span and its token counters only open when a call is
+  actually made. A failed batch is still never cached, so a later ingest retries it. Local schema
+  version 12 to 13, with a forward migration that adds the table and rewrites no existing row.
 - A description cache in the benchmark harness, keyed by asset SHA-256 and describer model, so two
   ingests of one corpus build identical full-text documents and a repeat run spends no description
   tokens. The measured generation endpoint returns a different caption for the same image on every
@@ -303,6 +313,15 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- **Breaking:** `VisionDescriptionBackend` now requires a `vision_space` property, mirroring
+  `embedding_space`, `transcription_space`, and `formation_space`. A custom describer without it
+  stops satisfying `MemoryPlugins`' `isinstance` check, because the protocol is `runtime_checkable`
+  and therefore validates on attribute presence. The store caches one caption per asset per space,
+  so the space -- not the model name -- is what keeps two describers from sharing captions:
+  `OpenAIModels.vision_space` digests the model, its generation controls, **and** the bundled
+  caption prompt, so editing the prompt invalidates captions written under the old one. Serving a
+  stale caption is the one failure nothing downstream can detect, since it is indistinguishable
+  from a fresh one once it is inside a searchable document.
 - `add_stream` now indexes its committed items in bounded groups (32 items or 250 ms) instead of
   flushing the search index after every observation. Each item still commits to SQLite on its own
   and the committed prefix survives a mid-stream failure; a group the process never reaches leaves
@@ -329,12 +348,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   standing operation has built on. Operations that touched one lineage reverse newest first;
   reversing an older one out of order would restore a superseded version beside the current one.
 
-- The local schema is version 12. Version 9 directories upgrade in place through three steps:
+- The local schema is version 13. Version 9 directories upgrade in place through four steps:
   version 10 adds `memory_records.place_id` and its index; version 11 adds
   `memory_records.forgotten_at`, the `capture_queue` table that makes deferred enrichment durable
   across a crash, and the append-only `memory_operations` log that makes a control-plane operation
   replayable and reversible; version 12 adds `memory_semantics.identity_id` and rebuilds the
-  operation-intent constraint so `identify` is an allowed intent.
+  operation-intent constraint so `identify` is an allowed intent; version 13 adds the
+  `visual_descriptions` caption cache.
 
 - **Breaking:** `minimum_relevance` now gates evidence relevance — the cosine the dense route
   reports, or the demoted full-text contribution when only the lexical route matched, times the

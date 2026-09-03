@@ -590,6 +590,10 @@ class _CachedVisionDescriber:
     def vision_model(self) -> str:
         return self._backend.vision_model
 
+    @property
+    def vision_space(self) -> str:
+        return self._backend.vision_space
+
     def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
         batch = tuple(inputs)
         keys = tuple(_description_digest(value) for value in batch)

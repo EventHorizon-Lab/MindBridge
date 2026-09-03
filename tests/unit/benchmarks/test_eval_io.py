@@ -694,6 +694,7 @@ class _CountingDescriber:
 
     vision_capabilities = frozenset({Modality.IMAGE})
     vision_model = "caption-model"
+    vision_space = "caption-model:caption-v1"
 
     def __init__(self, prefix: str = "caption") -> None:
         self.described: list[str] = []

@@ -365,13 +365,23 @@ class TranscriptionBackend(Protocol):
 
 @runtime_checkable
 class VisionDescriptionBackend(Protocol):
-    """One thread-safe visual-description adapter for text embedding fallback."""
+    """One thread-safe visual-description adapter for text embedding fallback.
+
+    ``vision_space`` identifies the whole caption recipe -- the model *and* the prompt or protocol
+    version -- so a store can cache one caption per asset without a later recipe silently serving
+    an earlier one. It is not the model name: an adapter that edits its prompt must return a
+    different space, because the caption lands inside a searchable document where a stale one is
+    invisible.
+    """
 
     @property
     def vision_capabilities(self) -> frozenset[Modality]: ...
 
     @property
     def vision_model(self) -> str: ...
+
+    @property
+    def vision_space(self) -> str: ...
 
     def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]: ...
 

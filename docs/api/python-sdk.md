@@ -833,11 +833,17 @@ ConsolidationBackend.consolidate(
 Required properties are `embedding_capabilities`, `embedding_model`, `embedding_space`, and
 `embedding_dimension` for embedding; `transcription_capabilities`, `transcription_model`, and
 `transcription_space` for transcription and speech; `face_capabilities`, `face_model`,
-`face_space`, and `face_analysis_space` for faces; `vision_capabilities` and `vision_model` for
-visual description; `formation_capabilities`, `formation_model`, and `formation_space` for
-formation; `consolidation_model` and `consolidation_recipe` for consolidation; and
-`generation_capabilities` for generation. Every base protocol except the optional
-streaming extension implements `close()`.
+`face_space`, and `face_analysis_space` for faces; `vision_capabilities`, `vision_model`, and
+`vision_space` for visual description; `formation_capabilities`, `formation_model`, and
+`formation_space` for formation; `consolidation_model` and `consolidation_recipe` for
+consolidation; and `generation_capabilities` for generation. Every base protocol except the
+optional streaming extension implements `close()`.
+
+A `*_space` value identifies the whole derivation recipe, not the model: `vision_space` must change
+when a describer's prompt changes, because captions are cached per `(asset content, vision_space)`
+in the local store and re-serving one written under a superseded prompt is invisible inside a
+searchable document. `OpenAIModels.vision_space` digests the model, its generation controls, and the
+bundled caption prompt.
 
 `form` receives one `FormationInput` per committed source and returns one proposal tuple per
 input, in the same order. A former never writes storage: the kernel validates each proposal

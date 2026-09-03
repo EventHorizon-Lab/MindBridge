@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -940,10 +941,18 @@ def test_the_vision_slot_stays_off_unless_it_is_configured(
             ) as memory:
                 picture = memory.add(Blob(b"bicycle-frame", "image/png"))
                 assert memory.get(picture.id).content == ""
+                # No describer means no caption to cache, and the caption table must stay empty:
+                # the store-side cache costs a read on every visual write, so a composition
+                # without the slot must not pay for one either.
+                with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+                    cached = connection.execute(
+                        "SELECT count(*) FROM visual_descriptions"
+                    ).fetchone()[0]
         finally:
             composition.close()
 
     assert calls == []
+    assert cached == 0
 
 
 def test_the_vision_slot_accepts_only_visual_modalities(tmp_path: Path) -> None:
