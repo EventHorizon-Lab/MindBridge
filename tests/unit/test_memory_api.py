@@ -5421,9 +5421,13 @@ def _stream_log(memory: Memory, index: _FakeIndex) -> list[tuple[str, tuple[str,
     def logged_write(
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding] = (),
+        *,
+        formation_pending_at: datetime | None = None,
     ) -> tuple[bool, ...]:
         batch = tuple(memories)
-        written: tuple[bool, ...] = write_memories(batch, embeddings)
+        written: tuple[bool, ...] = write_memories(
+            batch, embeddings, formation_pending_at=formation_pending_at
+        )
         log.append(("commit", tuple(memory.memory_id for memory in batch)))
         return written
 
