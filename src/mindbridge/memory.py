@@ -2534,7 +2534,16 @@ class Memory:
             lexical_relevance_by_rank,
             lexical_matches,
         ) = _parent_index_signals(candidates, documents)
-        parent_ids = tuple(dict.fromkeys((*dense_relevance, *lexical_matches)))
+        # `lexical_relevance_by_rank` rather than `lexical_matches`, which holds exactly the same
+        # memory ids and is a `set`. Both mappings are filled in one pass over `documents`, so
+        # this is the same ids in insertion order instead of an order that follows the
+        # interpreter's string hash seed. The visible effect is narrow -- `read_memories` does not
+        # order by its argument, so the ranking and the ranked part of the trace never depended on
+        # this, and the ranking sorts on `(-final_score, memory_id)` regardless -- but
+        # `_extend_missing_memory_traces` walks these ids directly, so a stale-index candidate's
+        # position in `search_with_trace` did. A trace is a debugging surface; two runs of one
+        # query on one library should print it in one order.
+        parent_ids = tuple(dict.fromkeys((*dense_relevance, *lexical_relevance_by_rank)))
         if not parent_ids:
             return _search_outcome(
                 (),

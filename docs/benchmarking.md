@@ -509,6 +509,18 @@ Three result fields carry a caveat that decides whether they can be quoted:
   none, is still not counted. Measured under the older exact-sentence detector, an EgoLifeQA slice
   reported 2 of 51 while 14 of 51 answers read as refusals; treat the field as a lower bound and
   read the predictions before drawing a conclusion about refusal rates.
+- **A task whose query prompt mandates a format or a refusal wording puts that wording into
+  retrieval, not only into generation.** `EvalQuestion.content` is what the runner passes to
+  `Memory.ask`, and `ask` takes one content input for both legs, so the instruction is matched
+  against memory alongside the question. MEMLENS is the extreme case: every one of its queries
+  carries `Answer with the exact amount (e.g., "$45.00") only.` and `answer exactly "Insufficient
+  information".`, so a retrieval rule keyed on literals the asker named -- numbers, dates, quoted
+  spans -- engages on 100 % of its questions on the strength of the template rather than the
+  question. The bare question is preserved as `EvalQuestion.source_question` and is what the
+  scorers and judges read, but no public surface routes it to retrieval while keeping the template
+  for generation. Read any retrieval-side result on a templated task as measuring the template
+  too, the same way the `[source_id: ...]` marker the runner prefixes to every stored memory is
+  part of what the full-text index sees.
 - **`retrieval_*` scores the retriever's ranked candidate list, not the answer's evidence.** The
   runner takes the top `retrieval_candidate_limit` (100) hits in score order through `search`, so
   a miss there is a retrieval failure. What the answer actually grounded on is separate:
