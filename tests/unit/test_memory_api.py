@@ -5171,6 +5171,31 @@ def test_search_during_a_stream_sees_the_committed_items(
     assert {hit.id for hit in during} == {record.id for record in seen}
 
 
+def test_search_inside_a_live_stream_loop_sees_the_item_just_yielded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A consumer that searches between two yields is the case the open group must close for.
+
+    The stream defers its flushes on its own thread; a search on that same thread would otherwise
+    skip the drain and miss every item committed since the last group boundary.
+    """
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        visible: list[tuple[str, set[str]]] = []
+        for record in memory.add_stream(f"live clip {position}" for position in range(3)):
+            hits = memory.search("live clip", limit=10)
+            visible.append((record.id, {hit.id for hit in hits}))
+        flushes = index.flush_calls
+
+    for record_id, ids in visible:
+        assert record_id in ids
+    # Each in-loop search closed the group that held the item just yielded.
+    assert flushes >= 3
+
+
 def test_add_stream_source_failure_leaves_the_committed_prefix_searchable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

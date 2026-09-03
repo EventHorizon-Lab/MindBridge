@@ -2373,7 +2373,10 @@ class Memory:
         candidate_ceiling = max(candidate_limit, limit * (_MAX_RETRIEVAL_KEYS + 1))
         seen_index_ids: set[str] = set()
         with self._write_lock:
-            self._drain_outbox()
+            # A read asks for the current truth, so it closes an `add_stream` group that is still
+            # open on this thread instead of skipping the drain with it: the consumer that searches
+            # between two yields must see the item it was just handed.
+            self._drain_outbox(force=True)
         while True:
             with _translate_index_errors("search memories"):
                 if temporal_range is None:
