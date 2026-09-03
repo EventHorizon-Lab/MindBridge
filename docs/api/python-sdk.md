@@ -325,7 +325,11 @@ enrollment call that creates a person from a photograph or a voice sample. Regis
 the recognizers have already observed instead: add the media, read `faces()` or `speech()` for its
 `identity_id`, then name it. Omitting `relationship` on a later call leaves any recorded
 relationship intact, so renaming never silently discards it, and there is deliberately no way to
-clear one. `identity` resolves an ID through any merge alias and returns what has been registered,
+clear one. Registration writes a typed naming assertion and projects the profile from it, so it
+also adds a searchable memory record, appears in `operations()`, and is reversible with
+`rollback()`; see
+[typed assertions](../memory-types-time-and-decay.md#naming-a-person-is-a-typed-assertion).
+`identity` resolves an ID through any merge alias and returns what has been registered,
 so an observation captured before a merge still reaches the surviving person. `unlink_identity`
 reverses one face-and-voice merge, returning the restored ID or `None` when the merge is not
 reversible; it resets the pair's accumulated evidence rather than suppressing the pair, so a voice

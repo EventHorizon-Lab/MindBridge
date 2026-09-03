@@ -77,6 +77,7 @@ from mindbridge.types import (
     IndexQuantization,
     MemoryKind,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
     ObservationContext,
@@ -2076,6 +2077,47 @@ def test_naming_a_person_records_a_typed_assertion_bound_to_the_identity(tmp_pat
     assert renamed_id == assertions[0].id
     assert "Alicia is a recognized person, sister." in contents
     assert "Alice is a recognized person, sister." not in contents
+
+
+def test_naming_is_auditable_and_rollback_restores_the_previous_name(tmp_path: Path) -> None:
+    """Mishearing a name must be reversible in both directions, index included."""
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=1,
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+
+        memory.register_identity(identity_id, "Li", relationship="neighbour")
+        memory.register_identity(identity_id, "Li Hua")
+
+        logged = memory.operations()
+        assert [entry.trigger for entry in logged] == [MemoryTrigger.MANUAL, MemoryTrigger.MANUAL]
+        assert memory.identity(identity_id) == IdentityProfile(
+            identity_id=identity_id, name="Li Hua", relationship="neighbour"
+        )
+        assert '"speaker_name":"Li Hua"' in memory.get(record.id).content
+
+        assert memory.rollback(logged[0].operation_id) is True
+
+        # The retracted name is gone from the projection, the registry, and the indexed text.
+        assert memory.identity(identity_id) == IdentityProfile(
+            identity_id=identity_id, name="Li", relationship="neighbour"
+        )
+        assert '"speaker_name":"Li"' in memory.get(record.id).content
+        contents = {hit.content for hit in memory.search("Li")}
+        assert "Li is a recognized person, neighbour." in contents
+        assert "Li Hua is a recognized person, neighbour." not in contents
+
+        # Rolling the same operation back twice is a no-op, and erasure takes the name with it.
+        assert memory.rollback(logged[0].operation_id) is False
+        memory.forget_identity(identity_id)
+        assert all("recognized person" not in hit.content for hit in memory.search("Li"))
+        assert '"speaker_name":null' in memory.get(record.id).content
 
 
 def test_unlink_identity_stops_the_index_quoting_the_other_persons_name(tmp_path: Path) -> None:

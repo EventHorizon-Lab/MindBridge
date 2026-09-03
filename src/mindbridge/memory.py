@@ -1470,23 +1470,50 @@ class Memory:
             if self._store.identity_alias_modality(alias_id) != "voice":
                 return (), ()
             target_id = self._store.resolve_identity_id(alias_id)
-            if target_id is None:
-                return (), ()
-            memory_ids = self._store.speaker_memory_ids(target_id)
+        if target_id is None:
+            return (), ()
+        # Every one of the target's segments moves to the restored identity, and a merge keeps
+        # one profile which the target keeps, so no naming assertion is bound to the identity
+        # coming back: its projection is a nameless speaker. Asking the store would resolve the
+        # alias straight back to the target and answer with the wrong person's name.
+        return self._reindex_identity_speech(
+            alias_id,
+            speaker_name=None,
+            operation=operation,
+            previous_speaker_id=target_id,
+        )
+
+    def _projected_identity(self, identity_id: str) -> tuple[str | None, str | None]:
+        with _translate_storage_errors("read identity naming assertion"):
+            return self._store.projected_identity_name(identity_id)
+
+    def _reindex_identity_speech(
+        self,
+        identity_id: str,
+        *,
+        speaker_name: str | None,
+        operation: _OperationAssets,
+        previous_speaker_id: str | None = None,
+    ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
+        """Rebuild every indexed memory whose speech projection names one identity.
+
+        This always runs beside a projection recompute, so the text a search matches and the
+        name `identities` reports are written from the same assertion in one commit.
+        """
+        with _translate_storage_errors("read identity memories"):
+            memory_ids = self._store.speaker_memory_ids(previous_speaker_id or identity_id)
             if not memory_ids:
                 return (), ()
             stored = self._store.read_memories(memory_ids)
         indexed = tuple(memory for memory in stored if _has_indexed_speech(memory))
         if not indexed:
             return (), ()
-        # Every one of the target's segments moves to the restored identity, which a merge
-        # deliberately leaves unnamed, so the whole set is relabelled to a nameless speaker.
         return self._refresh_speaker_memories(
             indexed,
-            speaker_id=alias_id,
-            speaker_name=None,
-            previous_speaker_id=target_id,
-            update_operation=False,
+            speaker_id=identity_id,
+            speaker_name=speaker_name,
+            previous_speaker_id=previous_speaker_id,
+            update_operation=previous_speaker_id is None,
             operation=operation,
         )
 
@@ -1528,32 +1555,9 @@ class Memory:
                 raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
             assert normalized_id is not None
             assert memory_ids is not None
-            memories: tuple[StoredMemory, ...] = ()
-            embeddings: tuple[StoredEmbedding, ...] = ()
-            if memory_ids:
-                with _translate_storage_errors("read speaker memories"):
-                    stored = self._store.read_memories(memory_ids)
-                indexed = tuple(memory for memory in stored if _has_indexed_speech(memory))
-                if indexed:
-                    memories, embeddings = self._refresh_speaker_memories(
-                        indexed,
-                        speaker_id=normalized_id,
-                        speaker_name=normalized_name,
-                        operation=operation,
-                    )
-            with _translate_storage_errors("register identity"):
-                registered = self._store.register_identity(
-                    normalized_id,
-                    normalized_name,
-                    relationship=normalized_relationship,
-                    memories=memories,
-                    embeddings=embeddings,
-                )
-            if not registered:
-                if speaker:
-                    raise SpeakerNotFoundError(f"speaker does not exist: {requested_id}")
-                raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
-            self._drain_outbox()
+            # The assertion commits first because the projection reads it. Naming is now one
+            # auditable step: assert the claim, then recompute the name and the indexed text
+            # that must agree with it, in one commit.
             self._assert_identity_name(
                 normalized_id,
                 normalized_name,
@@ -1564,11 +1568,27 @@ class Memory:
                 ),
                 operation=operation,
             )
+            projected, _relationship = self._projected_identity(normalized_id)
+            memories, embeddings = self._reindex_identity_speech(
+                normalized_id,
+                speaker_name=projected,
+                operation=operation,
+            )
+            with _translate_storage_errors("register identity"):
+                registered = self._store.refresh_identity_projection(
+                    normalized_id,
+                    memories=memories,
+                    embeddings=embeddings,
+                )
+            if registered is None:
+                if speaker:
+                    raise SpeakerNotFoundError(f"speaker does not exist: {requested_id}")
+                raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
+            self._drain_outbox()
 
     def _recorded_relationship(self, identity_id: str) -> str | None:
-        with _translate_storage_errors("read identity profile"):
-            profile = self._store.identity_profile(identity_id)
-        return None if profile is None else profile.relationship
+        _name, relationship = self._projected_identity(identity_id)
+        return relationship
 
     def _assert_identity_name(
         self,
@@ -1584,6 +1604,11 @@ class Memory:
         the versioned thing `identities.name` projects. It rests on the host's authority rather
         than on a model, so it needs neither a former nor a consolidator to be configured, and
         it carries no evidence: nothing was observed, somebody said so.
+
+        It is logged like any other control-plane operation, so naming is auditable through
+        `operations()` and reversible through `rollback()`. There is no naming intent yet, so
+        it is logged with consolidation semantics -- a proposal committed as a derived record --
+        and the cited "evidence" is the identity the claim is about rather than a memory.
 
         Re-asserting the same name and relationship is idempotent, because the derived memory ID
         is a function of the claim; a different name supersedes through the shared lineage.
@@ -1626,11 +1651,34 @@ class Memory:
             ),
             context=context,
         )
+        proposed = MemoryOperation(
+            intent=MemoryIntent.CONSOLIDATE,
+            evidence_ids=(identity_id,),
+            proposal=proposal,
+            rationale="the host registered this name",
+        )
+        key = operation_key(proposed, recipe=_NAMING_RECIPE)
+        with _translate_storage_errors("check a naming operation"):
+            already_logged = bool(self._store.read_operations(operation_key=key))
         self._commit_formation(
             ((prepared, None, proposal.confidence),),
             (),
             completed_at=now,
             recipe=_NAMING_RECIPE,
+            # Re-asserting a standing name changes nothing, so it logs nothing: the operation
+            # key is already active and the log's unique index would refuse it anyway.
+            operation=(
+                None
+                if already_logged
+                else StoredOperation(
+                    operation_key=key,
+                    intent=proposed.intent.value,
+                    trigger=MemoryTrigger.MANUAL.value,
+                    recipe=_NAMING_RECIPE,
+                    operation_json=dump_operation(proposed),
+                    applied_at=now,
+                )
+            ),
         )
         return prepared.memory_id
 
@@ -1658,30 +1706,20 @@ class Memory:
         ):
             with _translate_storage_errors("read identity memories"):
                 normalized_id = self._store.resolve_identity_id(requested_id)
-                memory_ids = (
-                    None
-                    if normalized_id is None
-                    else self._store.identity_memory_ids(normalized_id)
+                known = normalized_id is not None and (
+                    self._store.identity_memory_ids(normalized_id) is not None
                 )
-            if normalized_id is None or memory_ids is None:
+            if normalized_id is None or not known:
                 raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
-            memories: tuple[StoredMemory, ...] = ()
-            embeddings: tuple[StoredEmbedding, ...] = ()
-            if memory_ids:
-                with _translate_storage_errors("read identity memories"):
-                    stored = self._store.read_memories(memory_ids)
-                indexed = tuple(memory for memory in stored if _has_indexed_speech(memory))
-                if indexed:
-                    # `speaker_name=None` is what drops the name from the projection. The rebuilt
-                    # documents are handed to the store so the erasure and the reindex commit in
-                    # one transaction: a crash between them would leave the name searchable for a
-                    # person whose template was already gone.
-                    memories, embeddings = self._refresh_speaker_memories(
-                        indexed,
-                        speaker_id=normalized_id,
-                        speaker_name=None,
-                        operation=operation,
-                    )
+            # `speaker_name=None` is the projection of a person with no naming assertion left,
+            # which is what erasure makes them. The rebuilt documents are handed to the store so
+            # the erasure and the reindex commit in one transaction: a crash between them would
+            # leave the name searchable for a person whose template was already gone.
+            memories, embeddings = self._reindex_identity_speech(
+                normalized_id,
+                speaker_name=None,
+                operation=operation,
+            )
             with _translate_storage_errors("forget identity"):
                 erasure = self._store.forget_identity(
                     normalized_id,
@@ -1824,7 +1862,10 @@ class Memory:
                 return False
             row = logged[0]
             operation = load_operation(row.operation_json)
-            if operation.intent is MemoryIntent.CONSOLIDATE:
+            # A naming assertion is retracted, not deleted: the version it superseded has to come
+            # back, and the record itself stays in the log so the audit trail shows both names.
+            naming = row.recipe == _NAMING_RECIPE
+            if operation.intent is MemoryIntent.CONSOLIDATE and not naming:
                 # Deleting first keeps a lost race idempotent: a second rollback finds nothing to
                 # delete and the log claim below is what decides the return value.
                 for created in row.created_ids:
@@ -1841,12 +1882,32 @@ class Memory:
                     restore_versions=(
                         row.changed_ids if operation.intent is MemoryIntent.CORRECT else ()
                     ),
+                    retract_assertions=row.created_ids if naming else (),
                     clear_forgotten=(
                         row.changed_ids if operation.intent is MemoryIntent.FORGET else ()
                     ),
                 )
             self._drain_outbox()
+            if reverted and naming:
+                self._reproject_identity(operation.evidence_ids[0])
             return reverted
+
+    def _reproject_identity(self, identity_id: str) -> None:
+        """Repaint one identity's name and its indexed text from the assertion now current."""
+        with self._operation() as operation:
+            name, _relationship = self._projected_identity(identity_id)
+            memories, embeddings = self._reindex_identity_speech(
+                identity_id,
+                speaker_name=name,
+                operation=operation,
+            )
+            with _translate_storage_errors("refresh an identity projection"):
+                self._store.refresh_identity_projection(
+                    identity_id,
+                    memories=memories,
+                    embeddings=embeddings,
+                )
+            self._drain_outbox()
 
     def operations(self, *, limit: int = 100) -> tuple[MemoryOperationRecord, ...]:
         """List logged control-plane operations, newest first."""

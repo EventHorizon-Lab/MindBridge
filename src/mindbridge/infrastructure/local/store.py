@@ -1378,6 +1378,7 @@ class LocalStore:
         rolled_back_at: datetime,
         retire_evidence: Sequence[tuple[str, str]] = (),
         restore_versions: Sequence[str] = (),
+        retract_assertions: Sequence[str] = (),
         clear_forgotten: Sequence[str] = (),
     ) -> bool:
         """Apply the caller's reversal and mark one operation rolled back, atomically.
@@ -1399,6 +1400,7 @@ class LocalStore:
             reverted_at = max(rolled_back_at, _parse_datetime(_row_text(row, "applied_at")))
             _retire_memory_evidence(connection, retire_evidence, retired_at=reverted_at)
             _restore_memory_versions(connection, restore_versions, recorded_at=reverted_at)
+            _retract_assertions(connection, retract_assertions, retracted_at=reverted_at)
             _set_forgotten(connection, clear_forgotten, forgotten_at=None)
             connection.execute(
                 "UPDATE memory_operations SET rolled_back_at = ? WHERE operation_id = ?",
@@ -2381,6 +2383,72 @@ class LocalStore:
             )
         return cursor.rowcount > 0
 
+    def projected_identity_name(self, identity_id: str) -> tuple[str | None, str | None]:
+        """Return the name and relationship the current visible naming assertion projects.
+
+        Both are `None` for an unknown or as yet unnamed identity, which is exactly what the
+        projection should then write.
+        """
+        _require_identifier(identity_id, "identity_id")
+        with self._connection() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            row = (
+                None if resolved_id is None else _current_naming_assertion(connection, resolved_id)
+            )
+        if row is None:
+            return None, None
+        return _optional_row_text(row, "subject"), _optional_row_text(row, "value")
+
+    def refresh_identity_projection(
+        self,
+        identity_id: str,
+        *,
+        memories: Iterable[StoredMemory] = (),
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> IdentityProfile | None:
+        """Recompute `identities.name`/`relationship` from the current naming assertion.
+
+        The assertion is the record and this is the read path, the way `memory_versions`
+        carries the evidence and `_refresh_evidence_projection` recomputes what reads see.
+        Supplied documents replace their indexed vectors in the same transaction, so stored
+        text can never disagree with the projection it was rebuilt for. Returns the projected
+        profile, or None when the identity does not exist.
+        """
+        _require_identifier(identity_id, "identity_id")
+        supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
+            memories,
+            embeddings,
+        )
+        now = _datetime_text(datetime.now(timezone.utc))
+        with self._transaction() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            if resolved_id is None:
+                return None
+            row = _current_naming_assertion(connection, resolved_id)
+            name = None if row is None else _optional_row_text(row, "subject")
+            relationship = None if row is None else _optional_row_text(row, "value")
+            cursor = connection.execute(
+                """
+                UPDATE identities
+                SET name = ?, relationship = ?, updated_at = ?
+                WHERE identity_id = ?
+                """,
+                (name, relationship, now, resolved_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+            self._replace_memory_embeddings(
+                connection,
+                supplied_memories,
+                supplied_embeddings,
+                supplied_by_memory,
+            )
+        return IdentityProfile(
+            identity_id=resolved_id,
+            name=name,
+            relationship=relationship,
+        )
+
     def identity_profile(self, identity_id: str) -> IdentityProfile | None:
         """Return one identity's profile, or None when it does not exist.
 
@@ -2794,6 +2862,19 @@ class LocalStore:
                 "DELETE FROM face_observations WHERE identity_id = ?",
                 (resolved_id,),
             ).rowcount
+            # The naming assertions go with the person. `ON DELETE SET NULL` below would keep
+            # them as unattributed records still carrying the erased name in their content and
+            # their vectors, which is exactly what erasure promises to remove. Deleting the
+            # record cascades its semantics, versions, and embeddings, and the embedding trigger
+            # queues the index deletions.
+            for row in connection.execute(
+                "SELECT memory_id FROM memory_semantics WHERE identity_id = ? AND kind = ?",
+                (resolved_id, MemoryKind.ENTITY.value),
+            ).fetchall():
+                connection.execute(
+                    "DELETE FROM memory_records WHERE memory_id = ?",
+                    (_row_text(row, "memory_id"),),
+                )
             # Cascades the aliases, exemplars and link evidence; NULLs the speech segments.
             connection.execute("DELETE FROM identities WHERE identity_id = ?", (resolved_id,))
             self._replace_memory_embeddings(
@@ -4610,6 +4691,53 @@ def _restore_memory_versions(
             valid_until=_optional_datetime_from_row(row, "valid_until"),
             recorded_at=_next_semantic_transaction_time(connection, recorded_at, (memory_id,)),
         )
+
+
+def _retract_assertions(
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+    *,
+    retracted_at: datetime,
+) -> None:
+    """Retire these assertions and bring back whatever each of them superseded.
+
+    A version records which assertion it displaced, so undoing one needs no extra log field:
+    retire the current version and restore its predecessor's.
+    """
+    for memory_id in dict.fromkeys(memory_ids):
+        superseded = [
+            _row_text(row, "supersedes_id")
+            for row in connection.execute(
+                """
+                SELECT supersedes_id FROM memory_versions
+                WHERE memory_id = ? AND retired_at IS NULL AND supersedes_id IS NOT NULL
+                """,
+                (memory_id,),
+            ).fetchall()
+        ]
+        _retire_memory_versions(connection, (memory_id,), retired_at=retracted_at)
+        _restore_memory_versions(connection, superseded, recorded_at=retracted_at)
+
+
+def _current_naming_assertion(
+    connection: sqlite3.Connection,
+    identity_id: str,
+) -> sqlite3.Row | None:
+    """Return the naming assertion `identities.name` currently projects, newest first."""
+    row: sqlite3.Row | None = connection.execute(
+        """
+        SELECT s.subject, s.value
+        FROM memory_semantics AS s
+        JOIN memory_versions AS v ON v.memory_id = s.memory_id
+        JOIN memory_records AS r ON r.memory_id = s.memory_id
+        WHERE s.identity_id = ? AND s.kind = ?
+          AND v.retired_at IS NULL AND v.visible = 1 AND r.forgotten_at IS NULL
+        ORDER BY v.recorded_at DESC, s.memory_id DESC
+        LIMIT 1
+        """,
+        (identity_id, MemoryKind.ENTITY.value),
+    ).fetchone()
+    return row
 
 
 def _retire_memory_evidence(

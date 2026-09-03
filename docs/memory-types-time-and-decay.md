@@ -141,6 +141,16 @@ the spelling of the name, so renaming the person supersedes the previous asserti
 new `STATE` supersedes the one it overlaps. The retracted name stops reaching active retrieval;
 the retired version stays in the log.
 
+`identities.name` and `identities.relationship` are a projection of the current visible naming
+assertion, recomputed the way evidence recomputes confidence and visibility. Every recompute
+rewrites the indexed transcript text in the same commit, so what search matches and what
+`identity()` reports are always the same assertion.
+
+Naming is logged like any other control-plane operation with `MemoryTrigger.MANUAL`, so
+`operations()` shows it and `rollback(operation_id)` retracts the assertion, restores the one it
+superseded, and repaints both the projection and the index. Registering a name that already
+stands changes nothing and logs nothing.
+
 The consequence is deliberate and visible: naming a person creates a searchable memory record, and
 it appears in `list()` and `search()` results. That is what makes a name retrievable knowledge
 rather than a label on a registry row.

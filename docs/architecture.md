@@ -102,7 +102,11 @@ only writer of it. It is `ON DELETE SET NULL` on purpose: erasing a person drops
 and keeps the claim, which is the same promise as keeping the evening after forgetting who was in
 it. Naming a person travels this path too, as an `ENTITY` assertion carrying that binding, so it
 needs no formation backend and inherits versioning, visibility, and rollback rather than getting
-its own.
+its own. `identities.name` and `identities.relationship` are then a projection of the current
+visible assertion, not an independently writable field, and every recompute replaces the affected
+indexed documents in the same transaction. Naming, unlinking, and erasure all route through that
+one recompute, so no committed state exists in which the stored text and the projected name
+disagree.
 
 ## Retrieval consistency
 
