@@ -142,11 +142,26 @@ reachable through `speech()` and `faces()`, and no `identity_id` exists on a mem
 `MemoryContext`. Cross-modal person linkage in a bundle needs that edge; it is a known gap rather
 than a configuration mistake.
 
-Selection gives every non-empty section one slot in rank order before any section receives a
-second, so a small budget still describes the whole scene instead of spending everything on the
-top-ranked section. Remaining slots are filled by score. One oversized hit does not close the
-bundle: a cheaper lower-ranked candidate can still fit. `omitted` counts every candidate that
-passed the filters but did not fit, and `chars` is what the included hits cost.
+### How slots are shared
+
+**Rank decides the top half of `max_items`; the bottom half gives one slot to each section the
+top half missed, and only when it is large enough to seat every section the candidates span --
+otherwise rank decides the whole bundle.**
+
+Diversity is worth having, but not at the price of rank readability. Reserving a floor slot per
+section at a small budget lets a rank-fifty trait evict a rank-two episode, and a bundle that no
+longer reads by score is worse than one missing a section. So with eight sections spanned and
+`max_items=3` the selection is exactly the top three by rank; the default `max_items=24` leaves
+twelve slots for the floor round and every spanned section still gets one.
+
+Remaining slots are filled by score. One oversized hit does not close the bundle: a cheaper
+lower-ranked candidate can still fit. `omitted` counts every candidate that passed the filters
+but did not fit, and `chars` is what the included hits cost.
+
+This split is a default, not a measured optimum. Gate 4 of [the Context OS plan](context-os.md)
+still owes a downstream-utility measurement against the no-memory, full-context, and
+retrieval-only baselines; that measurement decides whether the halving point is right or whether
+the floor round should go entirely.
 
 `ContextBundle` also reports `occurred_from` and `occurred_until` over the included hits, `frames`
 (the distinct metric spatial frame IDs, sorted), `places` (the distinct symbolic `place_id`s,

@@ -611,8 +611,9 @@ def build_mcp_server(
         Prefer this tool whenever you need context to act on: it returns the actors, facts,
         episodes, procedures, affect cues and traits that matter, each with its provenance, inside
         a budget you declare, plus `rendered` text you can read straight into your own reasoning.
-        Every non-empty section gets a slot before any section gets a second one, so a small
-        budget still describes the whole scene, and `omitted` counts what did not fit. Lineage
+        Rank fills the top half of `max_items`; the bottom half gives a slot to each section the
+        top half missed, so a generous budget describes the whole scene while a small one stays
+        readable strictly by score. `omitted` counts what did not fit. Lineage
         disagreements are reported in `conflicts` and never resolved for you. `ask_memory` remains
         a convenience for when you want one grounded sentence instead of the evidence.
 

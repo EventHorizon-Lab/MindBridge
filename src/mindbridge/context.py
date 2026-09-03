@@ -245,16 +245,29 @@ def _select(
     candidates: Sequence[SearchHit],
     budget: ContextBudget,
 ) -> dict[str, tuple[SearchHit, ...]]:
-    """Fill the sections in rank order, one guaranteed slot each before any second slot."""
+    """Rank decides the top half of `max_items`; the bottom half seats the sections it missed.
+
+    Section diversity must not cost rank readability. A floor slot per section at a small budget
+    lets a rank-fifty trait evict a rank-two episode, and a bundle that no longer reads by score
+    is worse than one missing a section. So the floor round runs only when the bottom half of
+    `max_items` can seat every section the candidates span; below that, rank decides all of it.
+    """
     sections: dict[str, list[SearchHit]] = {name: [] for name in _SECTIONS}
     taken: set[str] = set()
     used = 0
-    for guaranteed in (True, False):
+    head = -(-budget.max_items // 2)
+    spanned = {_section(hit) for hit in candidates}
+    rounds: tuple[tuple[int, bool], ...] = (
+        ((head, False), (budget.max_items, True), (budget.max_items, False))
+        if budget.max_items - head >= len(spanned)
+        else ((budget.max_items, False),)
+    )
+    for ceiling, floor in rounds:
         for hit in candidates:
-            if len(taken) >= budget.max_items:
+            if len(taken) >= ceiling:
                 break
             section = _section(hit)
-            if hit.id in taken or (guaranteed and sections[section]):
+            if hit.id in taken or (floor and sections[section]):
                 continue
             cost = evidence_cost(hit)
             # One oversized hit does not close the bundle: a cheaper lower-ranked candidate can

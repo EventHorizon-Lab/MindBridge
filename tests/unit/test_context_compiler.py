@@ -204,8 +204,8 @@ def test_hits_partition_by_memory_type_and_kind() -> None:
     assert len(bundle.hits) == 8
 
 
-def test_every_non_empty_section_is_served_before_any_section_is_served_twice() -> None:
-    hits = (
+def _spanning_hits() -> tuple[SearchHit, ...]:
+    return (
         *(
             _hit(f"fact-{index}", score=0.9 - index / 100, kind=MemoryKind.STATE)
             for index in range(5)
@@ -214,12 +214,36 @@ def test_every_non_empty_section_is_served_before_any_section_is_served_twice() 
         _hit("cue-0", score=0.1, kind=MemoryKind.AFFECT),
     )
 
-    bundle = _compile(hits, max_items=3)
 
-    # The two lowest-ranked hits are the only members of their sections, so they take a slot
-    # before the second-ranked fact does.
-    assert {hit.id for hit in bundle.hits} == {"fact-0", "trait-0", "cue-0"}
+def test_a_small_budget_stays_in_pure_rank_order() -> None:
+    """Diversity never displaces rank when the budget cannot afford both.
+
+    Three sections and three slots would spend two of them on the two lowest-ranked candidates,
+    so the bundle would no longer be readable by score. Rank decides the whole of it instead.
+    """
+    bundle = _compile(_spanning_hits(), max_items=3)
+
+    assert [hit.id for hit in bundle.hits] == ["fact-0", "fact-1", "fact-2"]
+    assert (bundle.traits, bundle.affect) == ((), ())
     assert bundle.omitted == 4
+
+
+def test_a_budget_that_affords_both_seats_every_section_it_spans() -> None:
+    """Once the bottom half of `max_items` seats every spanned section, each one gets a slot."""
+    bundle = _compile(_spanning_hits(), max_items=6)
+
+    assert [hit.id for hit in bundle.hits] == [
+        "fact-0",
+        "fact-1",
+        "fact-2",
+        "fact-3",
+        "trait-0",
+        "cue-0",
+    ]
+    # The top half is rank alone; the floor round then buys the two sections it missed.
+    assert [hit.id for hit in bundle.traits] == ["trait-0"]
+    assert [hit.id for hit in bundle.affect] == ["cue-0"]
+    assert bundle.omitted == 1
 
 
 def test_selection_stays_in_rank_order_within_a_section() -> None:
