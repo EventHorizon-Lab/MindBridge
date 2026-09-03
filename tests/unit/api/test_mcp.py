@@ -66,6 +66,7 @@ class FakeMemory:
         self.calls: list[tuple[object, ...]] = []
         self.close_count = 0
         self.failure = failure
+        self.forgotten_at: datetime | None = None
 
     def add(
         self,
@@ -131,7 +132,7 @@ class FakeMemory:
     def get(self, memory_id: str) -> MemoryRecord:
         self._fail()
         self.calls.append(("get", memory_id))
-        return _record(memory_id=memory_id)
+        return _record(memory_id=memory_id, forgotten_at=self.forgotten_at)
 
     def list(self, *, limit: int = 100, cursor: str | None = None) -> Page:
         self._fail()
@@ -200,6 +201,19 @@ async def test_mcp_publishes_only_the_six_flat_local_tools() -> None:
     assert tools["delete_memory"].annotations.destructive_hint is True
     published = json.dumps({name: tool.input_schema for name, tool in tools.items()})
     assert all(field not in published for field in ("tenant_id", "user_id", "run_id"))
+
+
+async def test_mcp_serializes_the_cognitive_forgetting_state_of_a_record() -> None:
+    """Cognitive forgetting is auditable over the wire: `get_memory` still returns the record."""
+    memory = FakeMemory()
+    memory.forgotten_at = datetime(2026, 9, 3, 9, 0, tzinfo=timezone.utc)
+    server = build_mcp_server(cast(Memory, memory))
+
+    async with Client(server) as client:
+        found = await client.call_tool("get_memory", {"memory_id": "memory_1"})
+
+    assert found.structured_content is not None
+    assert found.structured_content["forgotten_at"] == "2026-09-03T09:00:00Z"
 
 
 async def test_mcp_returns_structured_results_and_does_not_close_injected_memory() -> None:
@@ -544,6 +558,7 @@ def _record(
     modality: Modality = Modality.TEXT,
     assets: tuple[AssetRef, ...] = (),
     memory_type: MemoryType = MemoryType.SEMANTIC,
+    forgotten_at: datetime | None = None,
 ) -> MemoryRecord:
     return MemoryRecord(
         id=memory_id,
@@ -555,6 +570,7 @@ def _record(
         occurred_at=occurred_at,
         occurred_end=occurred_end,
         metadata=metadata or {},
+        forgotten_at=forgotten_at,
     )
 
 

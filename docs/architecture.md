@@ -115,9 +115,18 @@ create a service or a second consistency model.
 ## Model boundary
 
 The extension contracts are `EmbeddingBackend`, `GenerationBackend`, `TranscriptionBackend`,
-`SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, and `FormationBackend`;
-`StreamingGenerationBackend` adds streamed generation. Routing follows declared modalities, not
-provider names. Provider output is validated before persistence or return.
+`SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, and
+`ConsolidationBackend`; `StreamingGenerationBackend` adds streamed generation. Routing follows
+declared modalities, not provider names. Provider output is validated before persistence or
+return.
+
+The two reasoning contracts differ only in horizon and authority scope. A `FormationBackend`
+proposes typed semantics from one committed observation. A `ConsolidationBackend` proposes
+reinforcement, consolidation, correction, or cognitive forgetting over a bounded set of records
+that already exist. Neither writes SQLite: the kernel validates every field, applies only the
+effect the declared intent allows, and commits each operation with an append-only
+`memory_operations` row that `Memory.rollback()` can reverse. Physical deletion is not a proposable
+intent.
 
 Applications may inject backend objects directly or use `MemoryPlugins` and `Memory.from_plugins()`.
 `Memory.from_config()` validates the bundled provider catalog and delegates to the same kernel.

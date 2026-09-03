@@ -177,9 +177,28 @@ with OpenAI(timeout=30.0, max_retries=3) as client:
 `Memory` closes the adapters passed to it. `OpenAIModels.close()` leaves a caller-supplied OpenAI
 client open, so the outer client context remains the application's responsibility.
 
-`vision_describer=` and `former=` are direct-injection-only capability slots; no declarative
-provider enables them implicitly. A `VisionDescriptionBackend` supplies final-frame text fallback.
-A `FormationBackend` proposes typed memories after the source observation commits.
+`vision_describer=`, `former=`, and `consolidator=` are direct-injection-only capability slots; no
+declarative provider enables them implicitly. A `VisionDescriptionBackend` supplies final-frame
+text fallback. A `FormationBackend` proposes typed memories after the source observation commits.
+A `ConsolidationBackend` proposes memory-management operations over records that already exist.
+
+`OpenAIModels` implements both reasoning protocols on its generation client, so one adapter can
+fill `answerer=`, `former=`, and `consolidator=`:
+
+```python
+models = OpenAIModels(generation_model="gpt-5-mini")
+memory = Memory(
+    "./data/assistant",
+    embedder=JinaOmniEmbedder(),
+    answerer=models,
+    former=models,
+    consolidator=models,
+)
+```
+
+`Memory` closes each distinct adapter once, so passing one object to several slots is safe. See
+[the memory management loop](memory-types-time-and-decay.md#memory-management-loop) for what the
+consolidator is allowed to propose.
 
 Use `MemoryPlugins` with `Memory.from_plugins()` when these constructed adapters should travel as
 one value. `resolve_memory_config()` is for hosts that need a `MemoryComposition` before opening

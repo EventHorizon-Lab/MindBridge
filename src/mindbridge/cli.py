@@ -54,7 +54,9 @@ from mindbridge.types import (
     EvidenceBasis,
     FaceObservation,
     MemoryContext,
+    MemoryOperationRecord,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
     ObservationContext,
@@ -102,6 +104,10 @@ OPERATIONS: tuple[str, ...] = (
     "identity",
     "unlink_identity",
     "reinforce",
+    "consolidate",
+    "forget",
+    "rollback",
+    "operations",
     "list",
     "delete",
     "reindex",
@@ -117,6 +123,7 @@ _QUERY_METAVAR: Mapping[str, str] = {
     "search": "QUERY",
     "search-with-trace": "QUERY",
     "ask": "QUESTION",
+    "consolidate": "GOAL",
 }
 _DEFAULT_REMOTE_TIMEOUT_SECONDS = 30.0
 _TUNING: tuple[str, ...] = (
@@ -618,6 +625,62 @@ def _reinforce(memory: Memory, arguments: argparse.Namespace) -> _Document:
     return {"reinforced": memory.reinforce(arguments.memory_ids)}
 
 
+def _consolidate(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    report = memory.consolidate(
+        evidence_ids=arguments.evidence_ids or None,
+        query=(
+            _content_input(arguments)
+            if arguments.content or arguments.content_json is not None
+            else None
+        ),
+        limit=arguments.limit,
+        trigger=MemoryTrigger(arguments.trigger),
+    )
+    return {
+        "operations": [_operation_document(record) for record in report.operations],
+        "rejected": [
+            {"intent": operation.intent.value, "reason": reason}
+            for operation, reason in report.rejected
+        ],
+    }
+
+
+def _forget(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    record = memory.forget(arguments.memory_ids)
+    return {"operation": None if record is None else _operation_document(record)}
+
+
+def _rollback(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {"rolled_back": memory.rollback(arguments.operation_id)}
+
+
+def _operations(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {
+        "operations": [
+            _operation_document(record) for record in memory.operations(limit=arguments.limit)
+        ]
+    }
+
+
+def _operation_document(record: MemoryOperationRecord) -> _Document:
+    return {
+        "operation_id": record.operation_id,
+        "intent": record.operation.intent.value,
+        "trigger": record.trigger.value,
+        "evidence_ids": list(record.operation.evidence_ids),
+        "target_ids": list(record.operation.target_ids),
+        "rationale": record.operation.rationale,
+        "model_id": record.model_id,
+        "recipe": record.recipe,
+        "created_ids": list(record.created_ids),
+        "changed_ids": list(record.changed_ids),
+        "applied_at": record.applied_at.isoformat(),
+        "rolled_back_at": (
+            None if record.rolled_back_at is None else record.rolled_back_at.isoformat()
+        ),
+    }
+
+
 def _list(memory: Memory, arguments: argparse.Namespace) -> _Document:
     page = memory.list(limit=arguments.limit, cursor=arguments.cursor)
     return {
@@ -654,6 +717,10 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "identity": _identity_profile,
     "unlink-identity": _unlink_identity,
     "reinforce": _reinforce,
+    "consolidate": _consolidate,
+    "forget": _forget,
+    "rollback": _rollback,
+    "operations": _operations,
     "list": _list,
     "delete": _delete,
     "reindex": _reindex,
@@ -1496,6 +1563,34 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     unlink.add_argument("alias_id", metavar="ALIAS_ID")
     reinforce = commands.add_parser("reinforce", help="record positive feedback")
     reinforce.add_argument("memory_ids", nargs="+", metavar="MEMORY_ID")
+    consolidate = _content_command(
+        commands, "consolidate", "deliberate over evidence and apply memory operations"
+    )
+    consolidate.add_argument(
+        "--evidence-id", dest="evidence_ids", action="append", metavar="MEMORY_ID"
+    )
+    consolidate.add_argument(
+        "--limit",
+        type=int,
+        default=_default("consolidate", "limit"),
+        help="evidence set size (default: %(default)s)",
+    )
+    consolidate.add_argument(
+        "--trigger",
+        choices=[item.value for item in MemoryTrigger],
+        default=MemoryTrigger(_default("consolidate", "trigger")).value,
+    )
+    forget = commands.add_parser("forget", help="cognitively forget memories without deleting")
+    forget.add_argument("memory_ids", nargs="+", metavar="MEMORY_ID")
+    rollback = commands.add_parser("rollback", help="reverse one logged memory operation")
+    rollback.add_argument("operation_id", type=int, metavar="OPERATION_ID")
+    operations = commands.add_parser("operations", help="list logged memory operations")
+    operations.add_argument(
+        "--limit",
+        type=int,
+        default=_default("operations", "limit"),
+        help="page size (default: %(default)s)",
+    )
     listing = commands.add_parser("list", help="list newest memories")
     listing.add_argument(
         "--limit",

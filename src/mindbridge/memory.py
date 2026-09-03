@@ -53,6 +53,7 @@ from mindbridge._telemetry import (
     traced_span,
 )
 from mindbridge.configuration import MindBridgeConfig, resolve_memory_config
+from mindbridge.control import dump_operation, load_operation, operation_key
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -77,6 +78,7 @@ from mindbridge.infrastructure.local.store import (
     StoredAsset,
     StoredEmbedding,
     StoredMemory,
+    StoredOperation,
     UnsupportedSchemaError,
 )
 from mindbridge.infrastructure.local.zvec_index import (
@@ -85,6 +87,7 @@ from mindbridge.infrastructure.local.zvec_index import (
     validate_index_configuration,
 )
 from mindbridge.models.base import (
+    ConsolidationBackend,
     EmbeddingBackend,
     EmbedTask,
     FaceAnalysis,
@@ -110,6 +113,7 @@ from mindbridge.types import (
     AudioBoundary,
     AudioStreamPacket,
     Blob,
+    ConsolidationReport,
     ContentAtom,
     ContentInput,
     EvidenceBasis,
@@ -118,8 +122,12 @@ from mindbridge.types import (
     IdentityProfile,
     IndexQuantization,
     MemoryContext,
+    MemoryIntent,
     MemoryKind,
+    MemoryOperation,
+    MemoryOperationRecord,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
     ObservationContext,
@@ -241,6 +249,7 @@ _NEGATED_CONTRACTION = re.compile(r"n['\u2019]t\b", re.IGNORECASE)
 _MAX_CONTENT_PARTS = 128
 # Model span modules mapped onto the failure stage a caller sees.
 _MODEL_STAGES = {
+    "consolidation": "consolidate",
     "embedding": "embed",
     "face": "recognize",
     "formation": "form",
@@ -469,6 +478,7 @@ class Memory:
         vision_describer: VisionDescriptionBackend | None = None,
         face_analyzer: FaceBackend | None = None,
         former: FormationBackend | None = None,
+        consolidator: ConsolidationBackend | None = None,
         index_speech: bool = _DEFAULT_CONFIG.index_speech,
         index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
         minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
@@ -516,6 +526,7 @@ class Memory:
         self._vision_describer = vision_describer
         self._face_analyzer = face_analyzer
         self._former = former
+        self._consolidator = consolidator
 
         try:
             (
@@ -551,6 +562,10 @@ class Memory:
                 self._formation_model,
                 self._formation_space,
             ) = _formation_contract(self._former)
+            (
+                self._consolidation_model,
+                self._consolidation_recipe,
+            ) = _consolidation_contract(self._consolidator)
             self._assets = AssetStore(self.data_dir)
             self._collect_orphan_assets(scan_physical=True)
             index_path = self.data_dir / "zvec"
@@ -612,6 +627,7 @@ class Memory:
             vision_describer=plugins.vision_describer,
             face_analyzer=plugins.face_analyzer,
             former=plugins.former,
+            consolidator=plugins.consolidator,
             index_speech=config.index_speech,
             index_quantization=config.index_quantization,
             minimum_relevance=config.minimum_relevance,
@@ -1271,6 +1287,403 @@ class Memory:
                 accessed_at=datetime.now(timezone.utc),
             )
 
+    # -- Agentic memory control plane ----------------------------------------------------------
+    # One bounded memory-management loop (gate 3 of docs/context-os.md). The backend sees a
+    # bounded evidence set and only proposes; every field is validated here, each accepted
+    # operation commits with its own append-only log row, and `rollback()` reverses it. Physical
+    # deletion is not an intent: it stays on `delete()` under host authority. None of these
+    # methods is exposed on REST or MCP.
+
+    def consolidate(
+        self,
+        *,
+        evidence_ids: Sequence[str] | None = None,
+        query: ContentInput | None = None,
+        limit: int = 32,
+        trigger: MemoryTrigger = MemoryTrigger.MANUAL,
+    ) -> ConsolidationReport:
+        """Deliberate over a bounded evidence set and apply the operations policy accepts."""
+        with (
+            self._trace("mindbridge.consolidate", kind="operation"),
+            self._operation() as assets,
+        ):
+            _limit(limit, maximum=100)
+            if self._consolidator is None:
+                raise ModelError(
+                    "consolidation backend is not configured",
+                    reason="backend_not_configured",
+                    stage="consolidate",
+                )
+            if not isinstance(trigger, MemoryTrigger):
+                raise ValidationError("trigger must be a MemoryTrigger")
+            shown = self._consolidation_evidence(
+                evidence_ids,
+                query,
+                limit=limit,
+                operation=assets,
+            )
+            if not shown:
+                return ConsolidationReport()
+            applied: builtins.list[MemoryOperationRecord] = []
+            rejected: builtins.list[tuple[MemoryOperation, str]] = []
+            with self._formation_lock:
+                for operation in self._propose_operations(
+                    tuple(shown.values()),
+                    trigger=trigger,
+                ):
+                    try:
+                        applied.append(
+                            self._apply_memory_operation(
+                                operation,
+                                trigger=trigger,
+                                model_id=self._consolidation_model,
+                                recipe=self._consolidation_recipe,
+                                shown=shown,
+                                assets=assets,
+                            )
+                        )
+                    except _RejectedOperation as rejection:
+                        rejected.append((operation, rejection.reason))
+            return ConsolidationReport(operations=tuple(applied), rejected=tuple(rejected))
+
+    def forget(self, memory_ids: Sequence[str]) -> MemoryOperationRecord | None:
+        """Cognitively forget memories: recall skips them, `get()` and `list()` keep them.
+
+        This is not deletion. `MemoryRecord.forgotten_at` stays readable for audit and
+        `rollback()` restores recall. Use `delete()` to remove a record and its media.
+        """
+        with (
+            self._trace("mindbridge.forget", kind="operation"),
+            self._operation() as assets,
+        ):
+            if isinstance(memory_ids, (str, bytes)):
+                raise ValidationError("memory_ids must be a sequence of memory IDs")
+            try:
+                targets = tuple(_identifier(memory_id, "memory_id") for memory_id in memory_ids)
+            except TypeError:
+                raise ValidationError("memory_ids must be a sequence of memory IDs") from None
+            if not targets:
+                return None
+            try:
+                return self._apply_memory_operation(
+                    MemoryOperation(intent=MemoryIntent.FORGET, target_ids=targets),
+                    trigger=MemoryTrigger.MANUAL,
+                    model_id=None,
+                    recipe=None,
+                    shown=None,
+                    assets=assets,
+                )
+            except _RejectedOperation:
+                return None
+
+    def rollback(self, operation_id: int) -> bool:
+        """Reverse one applied operation; an unknown or already-reversed one reports `False`."""
+        with (
+            self._trace("mindbridge.rollback", kind="operation"),
+            self._operation(),
+            self._write_lock,
+        ):
+            if (
+                isinstance(operation_id, bool)
+                or not isinstance(operation_id, int)
+                or operation_id <= 0
+            ):
+                raise ValidationError("operation_id must be a positive integer")
+            with _translate_storage_errors("read a memory operation"):
+                logged = self._store.read_operations(operation_id=operation_id)
+            if not logged or logged[0].rolled_back_at is not None:
+                return False
+            row = logged[0]
+            operation = load_operation(row.operation_json)
+            if operation.intent is MemoryIntent.CONSOLIDATE:
+                # Deleting first keeps a lost race idempotent: a second rollback finds nothing to
+                # delete and the log claim below is what decides the return value.
+                for created in row.created_ids:
+                    with _translate_storage_errors("roll back a consolidation"):
+                        _deleted, orphaned = self._store.delete_memory_with_assets(created)
+                    self._queue_asset_cleanup(orphaned)
+            with _translate_storage_errors("roll back a memory operation"):
+                reverted = self._store.rollback_operation(
+                    row.operation_id,
+                    rolled_back_at=datetime.now(timezone.utc),
+                    # `linked` is the evidence this operation actually inserted, so a link that
+                    # predated it survives the reversal. Records deleted above take their own.
+                    retire_evidence=row.linked,
+                    restore_versions=(
+                        row.changed_ids if operation.intent is MemoryIntent.CORRECT else ()
+                    ),
+                    clear_forgotten=(
+                        row.changed_ids if operation.intent is MemoryIntent.FORGET else ()
+                    ),
+                )
+            self._drain_outbox()
+            return reverted
+
+    def operations(self, *, limit: int = 100) -> tuple[MemoryOperationRecord, ...]:
+        """List logged control-plane operations, newest first."""
+        with self._trace("mindbridge.operations", kind="operation"), self._operation():
+            _limit(limit, maximum=100)
+            with _translate_storage_errors("list memory operations"):
+                logged = self._store.read_operations(limit=limit)
+            return tuple(_operation_record(row) for row in logged)
+
+    def _consolidation_evidence(
+        self,
+        evidence_ids: Sequence[str] | None,
+        query: ContentInput | None,
+        *,
+        limit: int,
+        operation: _OperationAssets,
+    ) -> dict[str, MemoryRecord]:
+        """Resolve the bounded, active evidence set the backend is allowed to cite."""
+        if evidence_ids is not None:
+            if isinstance(evidence_ids, (str, bytes)):
+                raise ValidationError("evidence_ids must be a sequence of memory IDs")
+            try:
+                candidates = tuple(
+                    dict.fromkeys(
+                        _identifier(memory_id, "evidence_id") for memory_id in evidence_ids
+                    )
+                )
+            except TypeError:
+                raise ValidationError("evidence_ids must be a sequence of memory IDs") from None
+        elif query is not None:
+            prepared = self._prepare_content(query, operation)
+            reference = datetime.now(timezone.utc)
+            outcome = self._search_prepared(
+                prepared,
+                limit=limit,
+                operation=operation,
+                memory_type=None,
+                reference_at=reference,
+                temporal_range=None,
+                occurred_from=None,
+                occurred_until=None,
+                scope=None,
+                require_unambiguous=False,
+                capture_trace=False,
+            )
+            candidates = tuple(hit.id for hit in outcome.hits)
+        else:
+            # ponytail: over-fetch and filter rather than teach the keyset query about
+            # visibility. Raise the factor only if a store of mostly forgotten records
+            # measurably under-fills the window.
+            with _translate_storage_errors("list consolidation evidence"):
+                newest = self._store.list_memories(limit=min(1_000, limit * 4))
+            candidates = tuple(memory.memory_id for memory in newest)
+        if not candidates:
+            return {}
+        with _translate_storage_errors("read consolidation evidence"):
+            memories = self._store.read_memories(candidates, active_only=True)
+        memories = memories[:limit]
+        self._lease_assets(
+            tuple(asset for memory in memories for asset in memory.assets),
+            operation.leased,
+        )
+        return {memory.memory_id: self._memory_record(memory) for memory in memories}
+
+    def _propose_operations(
+        self,
+        evidence: Sequence[MemoryRecord],
+        *,
+        trigger: MemoryTrigger,
+    ) -> tuple[MemoryOperation, ...]:
+        assert self._consolidator is not None
+        try:
+            with self._model_trace(
+                "consolidation",
+                "consolidate",
+                model=self._consolidation_model,
+                batch_size=len(evidence),
+                modalities=(record.modality for record in evidence),
+            ):
+                proposals = self._consolidator.consolidate(evidence, trigger=trigger)
+        except MindBridgeError:
+            raise
+        except Exception as error:
+            raise ModelError(
+                "memory consolidation failed",
+                reason="model_failed",
+                stage="consolidate",
+            ) from error
+        if not isinstance(proposals, tuple) or any(
+            not isinstance(value, MemoryOperation) for value in proposals
+        ):
+            raise ModelError(
+                "consolidation backend returned an invalid batch",
+                reason="response_invalid",
+                stage="consolidate",
+            )
+        return proposals
+
+    def _apply_memory_operation(
+        self,
+        operation: MemoryOperation,
+        *,
+        trigger: MemoryTrigger,
+        model_id: str | None,
+        recipe: str | None,
+        shown: Mapping[str, MemoryRecord] | None,
+        assets: _OperationAssets,
+    ) -> MemoryOperationRecord:
+        key = operation_key(operation, recipe=recipe)
+        with _translate_storage_errors("check a memory operation"):
+            # Raise the rejection outside this block: `_RejectedOperation` is not a
+            # `MindBridgeError`, so the translator would turn it into a StorageError.
+            duplicate = bool(self._store.read_operations(operation_key=key))
+        if duplicate:
+            raise _RejectedOperation("duplicate")
+        pending = StoredOperation(
+            operation_key=key,
+            intent=operation.intent.value,
+            trigger=trigger.value,
+            model_id=model_id,
+            recipe=recipe,
+            operation_json=dump_operation(operation),
+            applied_at=datetime.now(timezone.utc),
+        )
+        if operation.intent is MemoryIntent.CONSOLIDATE:
+            return _operation_record(
+                self._apply_consolidation(operation, pending, shown=shown, assets=assets)
+            )
+        return _operation_record(self._apply_operation_effects(operation, pending, shown=shown))
+
+    def _apply_operation_effects(
+        self,
+        operation: MemoryOperation,
+        pending: StoredOperation,
+        *,
+        shown: Mapping[str, MemoryRecord] | None,
+    ) -> StoredOperation:
+        """Validate a REINFORCE, CORRECT, or FORGET proposal and commit its effect."""
+        targets = self._control_records(operation.target_ids)
+        if not targets:
+            raise _RejectedOperation("unknown_target")
+        reinforce: tuple[tuple[str, str], ...] = ()
+        correct_ids: tuple[str, ...] = ()
+        forget_ids: tuple[str, ...] = ()
+        if operation.intent is MemoryIntent.REINFORCE:
+            reinforce = self._reinforcement_pairs(operation, targets, shown=shown)
+        elif operation.intent is MemoryIntent.CORRECT:
+            correct_ids = tuple(
+                memory_id for memory_id in operation.target_ids if _is_derived(targets, memory_id)
+            )
+            if not correct_ids:
+                raise _RejectedOperation("not_derived")
+        else:
+            forget_ids = tuple(
+                memory_id
+                for memory_id, memory in (
+                    (value, targets.get(value)) for value in operation.target_ids
+                )
+                if memory is not None and memory.forgotten_at is None
+            )
+            if not forget_ids:
+                raise _RejectedOperation("already_forgotten")
+        with self._write_lock:
+            with _translate_storage_errors("apply a memory operation"):
+                logged = self._store.apply_control_operation(
+                    pending,
+                    reinforce=reinforce,
+                    correct_ids=correct_ids,
+                    forget_ids=forget_ids,
+                )
+            if logged is None:
+                raise _RejectedOperation("duplicate")
+            self._drain_outbox()
+        return logged
+
+    def _reinforcement_pairs(
+        self,
+        operation: MemoryOperation,
+        targets: Mapping[str, StoredMemory],
+        *,
+        shown: Mapping[str, MemoryRecord] | None,
+    ) -> tuple[tuple[str, str], ...]:
+        target = operation.target_ids[0]
+        record = targets.get(target)
+        if record is None:
+            raise _RejectedOperation("unknown_target")
+        if not _is_derived(targets, target):
+            raise _RejectedOperation("not_derived")
+        # Self-citation first: a record that is its own evidence is malformed whatever set it
+        # came from, and a hidden target is never in the shown set anyway.
+        if target in operation.evidence_ids:
+            raise _RejectedOperation("target_is_evidence")
+        if shown is not None and not set(operation.evidence_ids) <= set(shown):
+            raise _RejectedOperation("evidence_not_shown")
+        if set(self._control_records(operation.evidence_ids)) != set(operation.evidence_ids):
+            raise _RejectedOperation("unknown_evidence")
+        context = record.context
+        linked = frozenset(() if context is None else context.evidence_ids)
+        # Every cited source must be new. Reinforcement is a claim about independent support, so
+        # a proposal that miscounts what already supports the record is refused, not trimmed.
+        if any(source in linked for source in operation.evidence_ids):
+            raise _RejectedOperation("already_linked")
+        return tuple((target, source) for source in operation.evidence_ids)
+
+    def _apply_consolidation(
+        self,
+        operation: MemoryOperation,
+        pending: StoredOperation,
+        *,
+        shown: Mapping[str, MemoryRecord] | None,
+        assets: _OperationAssets,
+    ) -> StoredOperation:
+        """Validate one consolidation proposal and commit it through the formation path."""
+        if shown is None or not set(operation.evidence_ids) <= set(shown):
+            raise _RejectedOperation("evidence_not_shown")
+        proposal = operation.proposal
+        assert proposal is not None
+        sources = tuple(shown[memory_id] for memory_id in operation.evidence_ids)
+        primary = _consolidation_primary(proposal, sources)
+        if primary is None:
+            raise _RejectedOperation("invalid_proposal")
+        now = datetime.now(timezone.utc)
+        context = replace(
+            _formation_context(
+                primary,
+                proposal,
+                model_id=self._consolidation_model,
+                recipe=self._consolidation_recipe,
+                recorded_at=now,
+            ),
+            evidence_ids=tuple(sorted(source.id for source in sources)),
+        )
+        prepared = replace(
+            _prepare_memory(
+                self._prepare_content(proposal.content, assets),
+                occurred_at=primary.occurred_at,
+                occurred_end=primary.occurred_end,
+                metadata=None,
+                memory_type=_formation_memory_type(proposal.kind),
+            ),
+            memory_id=_formation_memory_id(
+                "\n".join(sorted(source.id for source in sources)),
+                proposal,
+                recipe=self._consolidation_recipe,
+                context=context,
+            ),
+            context=context,
+        )
+        logged = self._commit_formation(
+            tuple((prepared, source.id, proposal.confidence) for source in sources),
+            (),
+            completed_at=now,
+            recipe=self._consolidation_recipe,
+            operation=pending,
+        )
+        if logged is None:
+            raise _RejectedOperation("duplicate")
+        return logged
+
+    def _control_records(self, memory_ids: Sequence[str]) -> dict[str, StoredMemory]:
+        if not memory_ids:
+            return {}
+        with _translate_storage_errors("read control-plane memories"):
+            memories = self._store.read_memories(tuple(memory_ids))
+        return {memory.memory_id: memory for memory in memories}
+
     def list(self, *, limit: int = 100, cursor: str | None = None) -> Page:
         """List newest memories with an opaque stable keyset cursor."""
         with (
@@ -1755,7 +2168,11 @@ class Memory:
         sources: Sequence[MemoryRecord],
         *,
         completed_at: datetime,
-    ) -> None:
+        recipe: str | None = None,
+        operation: StoredOperation | None = None,
+    ) -> StoredOperation | None:
+        """Embed and commit derived records; return the log row when one was requested."""
+        recipe = self._formation_space if recipe is None else recipe
         ordered_pairs = tuple(sorted(pairs, key=lambda value: (value[0].memory_id, value[1])))
         unique = tuple(
             {
@@ -1807,6 +2224,19 @@ class Memory:
             )
             for (memory, object_part, _model_input), vector in zip(parts, vectors, strict=True)
         )
+        if operation is not None:
+            created = tuple(value.memory_id for value in missing)
+            operation = replace(
+                operation,
+                created_ids=created,
+                changed_ids=tuple(
+                    memory_id
+                    for memory_id in dict.fromkeys(
+                        prepared.memory_id for prepared, _source, _score in ordered_pairs
+                    )
+                    if memory_id not in set(created)
+                ),
+            )
         with self._write_lock:
             with _translate_storage_errors("commit automatic memory formation"):
                 self._store.apply_formation(
@@ -1817,10 +2247,16 @@ class Memory:
                         for prepared, source_id, confidence in ordered_pairs
                     ),
                     source_memory_ids=tuple(source.id for source in sources),
-                    recipe=self._formation_space,
+                    recipe=recipe,
                     completed_at=completed_at,
+                    operation=operation,
                 )
             self._drain_outbox()
+        if operation is None:
+            return None
+        with _translate_storage_errors("read a memory operation"):
+            logged = self._store.read_operations(operation_key=operation.operation_key)
+        return logged[0] if logged else None
 
     def _prepare_for_embedding(
         self,
@@ -3698,6 +4134,7 @@ class Memory:
             self._vision_describer,
             self._face_analyzer,
             self._former,
+            self._consolidator,
             self._answerer,
             self._store,
         )
@@ -3713,6 +4150,7 @@ class Memory:
             self._vision_describer,
             self._face_analyzer,
             self._former,
+            self._consolidator,
             self._answerer,
             self._index,
             self._store,
@@ -3792,6 +4230,7 @@ class AsyncMemory:
         vision_describer: VisionDescriptionBackend | None = None,
         face_analyzer: FaceBackend | None = None,
         former: FormationBackend | None = None,
+        consolidator: ConsolidationBackend | None = None,
         index_speech: bool = _DEFAULT_CONFIG.index_speech,
         index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
         minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
@@ -3813,6 +4252,7 @@ class AsyncMemory:
             vision_describer=vision_describer,
             face_analyzer=face_analyzer,
             former=former,
+            consolidator=consolidator,
             index_speech=index_speech,
             index_quantization=index_quantization,
             minimum_relevance=minimum_relevance,
@@ -3851,6 +4291,7 @@ class AsyncMemory:
             vision_describer=plugins.vision_describer,
             face_analyzer=plugins.face_analyzer,
             former=plugins.former,
+            consolidator=plugins.consolidator,
             index_speech=config.index_speech,
             index_quantization=config.index_quantization,
             minimum_relevance=config.minimum_relevance,
@@ -4075,6 +4516,33 @@ class AsyncMemory:
 
     async def reinforce(self, memory_ids: Sequence[str]) -> int:
         return await asyncio.to_thread(self._memory.reinforce, memory_ids)
+
+    async def consolidate(
+        self,
+        *,
+        evidence_ids: Sequence[str] | None = None,
+        query: ContentInput | None = None,
+        limit: int = 32,
+        trigger: MemoryTrigger = MemoryTrigger.MANUAL,
+    ) -> ConsolidationReport:
+        return await asyncio.to_thread(
+            partial(
+                self._memory.consolidate,
+                evidence_ids=evidence_ids,
+                query=query,
+                limit=limit,
+                trigger=trigger,
+            )
+        )
+
+    async def forget(self, memory_ids: Sequence[str]) -> MemoryOperationRecord | None:
+        return await asyncio.to_thread(self._memory.forget, memory_ids)
+
+    async def rollback(self, operation_id: int) -> bool:
+        return await asyncio.to_thread(self._memory.rollback, operation_id)
+
+    async def operations(self, *, limit: int = 100) -> tuple[MemoryOperationRecord, ...]:
+        return await asyncio.to_thread(partial(self._memory.operations, limit=limit))
 
     async def list(self, *, limit: int = 100, cursor: str | None = None) -> Page:
         return await asyncio.to_thread(self._memory.list, limit=limit, cursor=cursor)
@@ -4874,6 +5342,72 @@ def _validate_formation_proposal(
             )
 
 
+class _RejectedOperation(Exception):
+    """Internal signal that kernel policy refused one proposed operation."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _is_derived(memories: Mapping[str, StoredMemory], memory_id: str) -> bool:
+    memory = memories.get(memory_id)
+    context = None if memory is None else memory.context
+    return context is not None and context.kind is not MemoryKind.OBSERVATION
+
+
+def _consolidation_primary(
+    proposal: FormationProposal,
+    sources: Sequence[MemoryRecord],
+) -> MemoryRecord | None:
+    """Return the newest cited source the proposal is grounded in, or `None`.
+
+    Formation binds one proposal to one source. A consolidation cites several, so the kernel
+    requires the AFFECT cue modality and the spatial frame to match at least one of them and
+    inherits validity from the newest such source, which keeps the derived ID stable when the
+    same evidence set is proposed again.
+    """
+    ranked = sorted(
+        sources,
+        key=lambda source: (
+            source.occurred_end or source.occurred_at or source.created_at,
+            source.id,
+        ),
+    )
+    for source in reversed(ranked):
+        try:
+            _validate_formation_proposal(
+                proposal,
+                FormationInput(
+                    memory_id=source.id,
+                    content=ModelInput(text=source.content, assets=source.assets),
+                    context=_observation_from_record(source),
+                ),
+            )
+        except ModelError:
+            continue
+        return source
+    return None
+
+
+def _operation_record(logged: StoredOperation) -> MemoryOperationRecord:
+    try:
+        trigger = MemoryTrigger(logged.trigger)
+    except ValueError:
+        raise StorageError("a logged memory operation has an unknown trigger") from None
+    return MemoryOperationRecord(
+        operation_id=logged.operation_id,
+        operation=load_operation(logged.operation_json),
+        trigger=trigger,
+        applied_at=logged.applied_at,
+        model_id=logged.model_id,
+        recipe=logged.recipe,
+        created_ids=logged.created_ids,
+        changed_ids=logged.changed_ids,
+        rolled_back_at=logged.rolled_back_at,
+    )
+
+
 def _validate_formation_pairs(
     pairs: Sequence[tuple[_PreparedMemory, str, float]],
 ) -> None:
@@ -5451,6 +5985,17 @@ def _formation_contract(
         capabilities,
         _model_text(former.formation_model, "formation model"),
         _model_text(former.formation_space, "formation space"),
+    )
+
+
+def _consolidation_contract(
+    consolidator: ConsolidationBackend | None,
+) -> tuple[str, str]:
+    if consolidator is None:
+        return "none", "none"
+    return (
+        _model_text(consolidator.consolidation_model, "consolidation model"),
+        _model_text(consolidator.consolidation_recipe, "consolidation recipe"),
     )
 
 
