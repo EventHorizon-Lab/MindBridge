@@ -258,9 +258,9 @@ arguments, schemas, limits, and errors.
 | Add one | `add` | `POST /v1/memories` | `add_memory` | `add` |
 | Add atomic batch | `add_many` | `POST /v1/memories/batch` | — | `add-many` |
 | Add completed stream | `add_stream` | — | — | `add-stream` |
-| Capture without a model | `capture` | — | — | `capture` |
-| Settle captured records | `settle` | — | — | `settle` |
-| Report unfinished captures | `pending_captures` | — | — | `pending-captures` |
+| Capture without a model | `capture` | `POST /v1/capture` | — | `capture` |
+| Settle captured records | `settle` | `POST /v1/settle` | — | `settle` |
+| Report unfinished captures | `pending_captures` | `GET /v1/pending_captures` | — | `pending-captures` |
 | Search | `search` | `POST /v1/memories/search` | `search_memories` | `search` |
 | Explain search | `search_with_trace` | Search with `explain=true` | Search with `explain=true` | `search-with-trace` |
 | Answer | `ask` | `POST /v1/answers` | `ask_memory` | `ask` |
@@ -274,23 +274,24 @@ arguments, schemas, limits, and errors.
 | Cognitively forget | `forget` | — | — | `forget` |
 | Undo one operation | `rollback` | — | — | `rollback` |
 | Read the operation log | `operations` | — | — | `operations` |
-| Analyze speech | `speech` | — | `analyze_speech` | `speech` |
-| Analyze faces | `faces` | — | `analyze_faces` | `faces` |
+| Analyze speech | `speech` | `POST /v1/speech`\* | `analyze_speech` | `speech` |
+| Analyze faces | `faces` | `POST /v1/faces`\* | `analyze_faces` | `faces` |
 | Name speaker | `register_speaker` | — | `register_speaker` | `register-speaker` |
-| Name identity | `register_identity` | — | `register_identity` | `register-identity` |
-| Read identity | `identity` | — | `get_identity` | `identity` |
-| Reverse merge | `unlink_identity` | — | `unlink_identity` | `unlink-identity` |
-| Erase person | `forget_identity` | — | `forget_identity` | `forget-identity` |
+| Name identity | `register_identity` | `POST /v1/identities`† | `register_identity` | `register-identity` |
+| Read identity | `identity` | `GET /v1/identities/{id}`† | `get_identity` | `identity` |
+| Reverse merge | `unlink_identity` | `POST /v1/identities/{id}/unlink`† | `unlink_identity` | `unlink-identity` |
+| Erase person | `forget_identity` | `DELETE /v1/identities/{id}`† | `forget_identity` | `forget-identity` |
 | Rebuild index | `reindex` | — | — | `reindex` |
 | Optimize index | `optimize` | — | — | `optimize` |
 | Declare capabilities | `capabilities` property | `GET /healthz` | — | `--explain` resolves composition |
 | Validate loaders | — | — | — | `doctor` |
 
 The synchronous SDK therefore exposes 28 product operations, plus construction, capability
-inspection, and lifecycle. REST exposes nine `/v1` product routes plus `/healthz`; MCP exposes
-fifteen tools; the product CLI exposes all 28 operations plus `doctor`. `AsyncMemory` mirrors the
-finite SDK operations except `forget_identity`, which currently requires synchronous `Memory`, and
-adds async stream consumption.
+inspection, and lifecycle. REST exposes twelve `/v1` product routes plus `/healthz`, or eighteen
+when the host also enables `create_app`'s `embodied_operations` (\* above) and `identity_operations`
+(† above) switches; MCP exposes fifteen tools; the product CLI exposes all 28 operations plus
+`doctor`. `AsyncMemory` mirrors the finite SDK operations except `forget_identity`, which currently
+requires synchronous `Memory`, and adds async stream consumption.
 
 ## Deployment and isolation model
 

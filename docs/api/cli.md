@@ -260,9 +260,11 @@ exit 130 use their conventional plain stderr diagnostics.
 ### Operations without a remote route
 
 With `--url`, only `add`, `add-many`, `search`, `ask`, `compile`, `get`, `list`, `delete`, and
-`doctor` are available. Other commands exit 10 with `unsupported_in_remote_mode`. Their SDK
-operations have no REST route except `reinforce`: REST exposes `POST /v1/memories/reinforce`, but
-the CLI does not currently wire that route into remote mode. The complete route boundary is listed in
+`doctor` are available. Other commands exit 10 with `unsupported_in_remote_mode`, whether or not
+their operation has a REST route: `reinforce`, `capture`, `settle`, and `pending-captures` always
+have one, and `speech`, `faces`, `register-identity`, `identity`, `unlink-identity`, and
+`forget-identity` have one when the owner enables the matching switch, but the CLI does not
+currently wire any of those routes into remote mode. The complete route boundary is listed in
 [REST operations without a route](rest.md#operations-without-a-route).
 
 ### Input limits

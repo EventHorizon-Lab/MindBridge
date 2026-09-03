@@ -239,12 +239,16 @@ gate in the [benchmark protocol](benchmarking.md#mandatory-controls).
 ## Public and trust boundaries
 
 Supported SDK values are imported from `mindbridge`. The `Memory` SDK exposes 28 product
-operations. REST exposes nine `/v1` routes: add, batch add, list, search, reinforce, get, delete,
-answer, and compile context. MCP exposes fifteen tools: the eight corresponding non-batch
+operations. REST exposes twelve `/v1` routes: add, batch add, list, search, reinforce, get,
+delete, answer, compile context, capture, settle, and pending captures. Six more -- speech, face,
+register identity, get identity, unlink identity, and forget identity -- exist only when the host
+enables the matching `identity_operations` or `embodied_operations` switch on `create_app`,
+mirroring the same-named MCP switch. MCP exposes fifteen tools: the eight corresponding non-batch
 operations plus speech, face, and identity operations, or ten when the host builds it with
 `identity_operations=False`, because naming and erasing a person is host authority and the host
 decides whether it is on the wire at all. The local CLI exposes the 28 operations
-plus `doctor`; `--url` is limited to operations implemented by REST.
+plus `doctor`; `--url` is limited to a fixed subset of operations regardless of what REST exposes,
+listed in [the CLI reference](api/cli.md#operations-without-a-remote-route).
 
 Compiling context is a read-only view. The memory control plane — `consolidation_candidates()`,
 `consolidate()`, `forget()`, `rollback()`, and `operations()` — and physical deletion stay in the

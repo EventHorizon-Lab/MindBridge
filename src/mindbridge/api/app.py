@@ -38,6 +38,9 @@ from mindbridge.types import (
     ContextBudget,
     ContextBundle,
     ContextUnknownKind,
+    FaceObservation,
+    IdentityErasure,
+    IdentityProfile,
     MemoryCapabilities,
     MemoryContext,
     MemoryRecord,
@@ -45,9 +48,11 @@ from mindbridge.types import (
     Modality,
     ObservationContext,
     Page,
+    PendingCapture,
     RetrievalScope,
     RetrievalTrace,
     SearchHit,
+    SpeakerSegment,
     TracedSearchResult,
 )
 
@@ -134,6 +139,22 @@ class ContextRequest(StrictModel):
     scope: RetrievalScope | None = None
 
 
+class SettleRequest(StrictModel):
+    limit: _Limit = 100
+    max_attempts: Annotated[int, Field(strict=True, ge=1)] = 3
+    memory_ids: Annotated[list[_BodyMemoryId], Field(min_length=1, max_length=100)] | None = None
+
+
+class AnalyzeRequest(StrictModel):
+    memory_id: _BodyMemoryId
+
+
+class IdentityRegisterRequest(StrictModel):
+    identity_id: _BodyMemoryId
+    name: _BodyMemoryId
+    relationship: _BodyMemoryId | None = None
+
+
 class _ResponseModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -189,6 +210,46 @@ class DeleteResponse(_ResponseModel):
 
 class ReinforceResponse(_ResponseModel):
     reinforced: int
+
+
+class SettleResponse(_ResponseModel):
+    settled: int
+
+
+class PendingCaptureResponse(_ResponseModel):
+    memory_id: str
+    enqueued_at: AwareDatetime
+    attempts: int
+    last_error: str | None = None
+    awaiting: Literal["enrichment", "formation"]
+
+
+class PendingCapturesResponse(_ResponseModel):
+    items: tuple[PendingCaptureResponse, ...]
+
+
+class SpeechResponse(_ResponseModel):
+    segments: tuple[SpeakerSegment, ...]
+
+
+class FacesResponse(_ResponseModel):
+    observations: tuple[FaceObservation, ...]
+
+
+class IdentityResponse(_ResponseModel):
+    identity: IdentityProfile | None
+
+
+class RegisterResponse(_ResponseModel):
+    registered: bool
+
+
+class UnlinkResponse(_ResponseModel):
+    restored_identity_id: str | None
+
+
+class ForgetResponse(_ResponseModel):
+    erasure: IdentityErasure
 
 
 class ContextBudgetResponse(_ResponseModel):
@@ -358,6 +419,50 @@ class _Memory(Protocol):
 
     def delete(self, memory_id: str) -> bool: ...
 
+    def capture(
+        self,
+        content: ContentInput,
+        *,
+        occurred_at: datetime | None = None,
+        occurred_end: datetime | None = None,
+        metadata: Mapping[str, object] | None = None,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: ObservationContext | None = None,
+    ) -> MemoryRecord: ...
+
+    def settle(
+        self,
+        *,
+        limit: int = 100,
+        max_attempts: int = 3,
+        memory_ids: Sequence[str] | None = None,
+    ) -> int: ...
+
+    def pending_captures(
+        self,
+        *,
+        limit: int = 100,
+        memory_ids: Sequence[str] | None = None,
+    ) -> tuple[PendingCapture, ...]: ...
+
+    def speech(self, memory_id: str) -> tuple[SpeakerSegment, ...]: ...
+
+    def faces(self, memory_id: str) -> tuple[FaceObservation, ...]: ...
+
+    def register_identity(
+        self,
+        identity_id: str,
+        name: str,
+        *,
+        relationship: str | None = None,
+    ) -> None: ...
+
+    def identity(self, identity_id: str) -> IdentityProfile | None: ...
+
+    def unlink_identity(self, alias_id: str) -> str | None: ...
+
+    def forget_identity(self, identity_id: str) -> IdentityErasure: ...
+
 
 class _RequestBodyLimit:
     """Bound `/v1` request bodies before framework parsing."""
@@ -405,8 +510,17 @@ class _RequestBodyLimit:
 def create_app(
     *,
     memory: _Memory,
+    identity_operations: bool = False,
+    embodied_operations: bool = False,
 ) -> FastAPI:
-    """Create an unauthenticated API over one caller-owned memory instance."""
+    """Create an unauthenticated API over one caller-owned memory instance.
+
+    ``identity_operations`` and ``embodied_operations`` mirror the same-named switches on
+    ``build_mcp_server``. Both default to off: REST is a network surface, and naming, erasing,
+    or analyzing a person is host authority that no route grants unless the host opts in. When a
+    switch is off the routes it gates are never registered, so a caller gets 404 rather than 403 --
+    it cannot discover through the error what an enabled deployment would offer.
+    """
     app = FastAPI(title="MindBridge", version="0.2.0")
     register_error_handlers(app)
     app.add_middleware(_RequestBodyLimit)
@@ -422,11 +536,22 @@ def create_app(
         # process is reported rather than a snapshot taken at construction.
         return HealthResponse(capabilities=_capabilities_response(memory.capabilities))
 
-    app.include_router(_v1_router(memory))
+    app.include_router(
+        _v1_router(
+            memory,
+            identity_operations=identity_operations,
+            embodied_operations=embodied_operations,
+        )
+    )
     return app
 
 
-def _v1_router(memory: _Memory) -> APIRouter:
+def _v1_router(
+    memory: _Memory,
+    *,
+    identity_operations: bool,
+    embodied_operations: bool,
+) -> APIRouter:
     """Register every `/v1` route against one caller-owned memory instance."""
 
     def current_service() -> _Memory:
@@ -552,7 +677,199 @@ def _v1_router(memory: _Memory) -> APIRouter:
         )
 
     _add_context_route(router, current_service, responses=model_errors)
+    _add_capture_routes(
+        router,
+        current_service,
+        model_errors=model_errors,
+        standard_errors=standard_errors,
+    )
+    _add_gated_routes(
+        router,
+        current_service,
+        identity_operations=identity_operations,
+        embodied_operations=embodied_operations,
+        standard_statuses=standard_statuses,
+        standard_errors=standard_errors,
+        not_found_errors=not_found_errors,
+    )
     return router
+
+
+def _add_gated_routes(
+    router: APIRouter,
+    current_service: Callable[[], _Memory],
+    *,
+    identity_operations: bool,
+    embodied_operations: bool,
+    standard_statuses: tuple[int, ...],
+    standard_errors: dict[int | str, dict[str, Any]],
+    not_found_errors: dict[int | str, dict[str, Any]],
+) -> None:
+    """Register the opt-in identity and embodied routes, split out to keep `_v1_router` readable."""
+    if embodied_operations:
+        embodied_errors = error_responses(
+            *standard_statuses,
+            status.HTTP_404_NOT_FOUND,
+            status.HTTP_501_NOT_IMPLEMENTED,
+            status.HTTP_502_BAD_GATEWAY,
+        )
+        _add_embodied_routes(router, current_service, responses=embodied_errors)
+    if identity_operations:
+        _add_identity_routes(
+            router,
+            current_service,
+            not_found_errors=not_found_errors,
+            standard_errors=standard_errors,
+        )
+
+
+def _add_capture_routes(
+    router: APIRouter,
+    current_service: Callable[[], _Memory],
+    *,
+    model_errors: dict[int | str, dict[str, Any]],
+    standard_errors: dict[int | str, dict[str, Any]],
+) -> None:
+    """Register the fast-capture plane: `capture`, `settle`, and `pending_captures`.
+
+    These are always on, unlike the identity and embodied routes below: they are ordinary
+    application operations on the caller's own records, not administrative authority over a
+    person.
+    """
+
+    @router.post(
+        "/capture",
+        response_model=MemoryResponse,
+        status_code=status.HTTP_201_CREATED,
+        operation_id="captureMemory",
+        responses=model_errors,
+    )
+    def capture_memory(request: MemoryCreate) -> MemoryResponse:
+        record = current_service().capture(
+            content_input(request.content),
+            occurred_at=request.occurred_at,
+            occurred_end=request.occurred_end,
+            metadata=request.metadata,
+            memory_type=request.memory_type,
+            context=request.context,
+        )
+        return MemoryResponse.model_validate(record)
+
+    @router.post(
+        "/settle",
+        response_model=SettleResponse,
+        operation_id="settleCaptures",
+        responses=model_errors,
+    )
+    def settle_captures(request: SettleRequest) -> SettleResponse:
+        return SettleResponse(
+            settled=current_service().settle(
+                limit=request.limit,
+                max_attempts=request.max_attempts,
+                memory_ids=request.memory_ids,
+            )
+        )
+
+    @router.get(
+        "/pending_captures",
+        response_model=PendingCapturesResponse,
+        operation_id="pendingCaptures",
+        responses=standard_errors,
+    )
+    def pending_captures_route(
+        limit: Annotated[int, Query(ge=1, le=100)] = 100,
+        memory_ids: Annotated[list[str] | None, Query(min_length=1, max_length=100)] = None,
+    ) -> PendingCapturesResponse:
+        return PendingCapturesResponse.model_validate(
+            {
+                "items": current_service().pending_captures(
+                    limit=limit,
+                    memory_ids=memory_ids,
+                )
+            }
+        )
+
+
+def _add_embodied_routes(
+    router: APIRouter,
+    current_service: Callable[[], _Memory],
+    *,
+    responses: dict[int | str, dict[str, Any]],
+) -> None:
+    """Register `analyze_speech` and `analyze_faces`, gated by the host's `embodied_operations`."""
+
+    @router.post(
+        "/speech",
+        response_model=SpeechResponse,
+        operation_id="analyzeSpeech",
+        responses=responses,
+    )
+    def analyze_speech(request: AnalyzeRequest) -> SpeechResponse:
+        return SpeechResponse(segments=current_service().speech(request.memory_id))
+
+    @router.post(
+        "/faces",
+        response_model=FacesResponse,
+        operation_id="analyzeFaces",
+        responses=responses,
+    )
+    def analyze_faces(request: AnalyzeRequest) -> FacesResponse:
+        return FacesResponse(observations=current_service().faces(request.memory_id))
+
+
+def _add_identity_routes(
+    router: APIRouter,
+    current_service: Callable[[], _Memory],
+    *,
+    not_found_errors: dict[int | str, dict[str, Any]],
+    standard_errors: dict[int | str, dict[str, Any]],
+) -> None:
+    """Register naming, reading, unlinking, and erasing identities.
+
+    Gated by the host's `identity_operations`: naming and erasing a person is host authority,
+    exercised through the caller, exactly as it is on MCP.
+    """
+
+    @router.post(
+        "/identities",
+        response_model=RegisterResponse,
+        operation_id="registerIdentity",
+        responses=not_found_errors,
+    )
+    def register_identity(request: IdentityRegisterRequest) -> RegisterResponse:
+        current_service().register_identity(
+            request.identity_id,
+            request.name,
+            relationship=request.relationship,
+        )
+        return RegisterResponse(registered=True)
+
+    @router.get(
+        "/identities/{identity_id}",
+        response_model=IdentityResponse,
+        operation_id="getIdentity",
+        responses=standard_errors,
+    )
+    def get_identity(identity_id: _MemoryId) -> IdentityResponse:
+        return IdentityResponse(identity=current_service().identity(identity_id))
+
+    @router.post(
+        "/identities/{alias_id}/unlink",
+        response_model=UnlinkResponse,
+        operation_id="unlinkIdentity",
+        responses=standard_errors,
+    )
+    def unlink_identity(alias_id: _MemoryId) -> UnlinkResponse:
+        return UnlinkResponse(restored_identity_id=current_service().unlink_identity(alias_id))
+
+    @router.delete(
+        "/identities/{identity_id}",
+        response_model=ForgetResponse,
+        operation_id="forgetIdentity",
+        responses=not_found_errors,
+    )
+    def forget_identity(identity_id: _MemoryId) -> ForgetResponse:
+        return ForgetResponse(erasure=current_service().forget_identity(identity_id))
 
 
 def _add_context_route(

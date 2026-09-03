@@ -221,6 +221,21 @@ The Python SDK is the full developer and device integration surface. REST expose
 application operations. MCP exposes a small agent-appropriate capability view rather than mirroring
 every administrative method.
 
+The three surfaces carry different authority, not different capability. The SDK is the full
+surface: every public `Memory` operation, including the control plane, is reachable because the
+SDK runs inside the process that owns the memory. REST is a network-safe subset of that same
+process: the ordinary application path -- add, search, ask, compile, and the fast-capture plane
+(`capture`, `settle`, `pending_captures`) -- is always on, because it is an operation on the
+caller's own records rather than authority over a person, while identity administration (naming,
+reading, unlinking, and erasing a person) and embodied analysis (`speech`, `faces`) are opt-in
+behind `create_app`'s `identity_operations` and `embodied_operations`, both defaulting to off,
+because a caller reaching REST over a network is not automatically the memory's owner. MCP is the
+agent view of the same process and carries its own `identity_operations` switch with the same
+name and the same default-on-for-a-trusted-agent-host reasoning; a host that wants REST and MCP to
+grant the same agent the same authority sets both switches the same way. Neither transport ever
+reaches the control plane -- `consolidation_candidates`, `consolidate`, `forget`, `rollback`, and
+`operations` stay SDK-only regardless of any switch.
+
 The compiler is that view's centre. `POST /v1/context` and the `compile_context` MCP tool return a
 budgeted bundle with provenance, and `GET /healthz` and the MCP server instructions advertise the
 configured modalities and backends so an agent does not discover them through failure. Both are
@@ -302,9 +317,14 @@ defaults or justify superiority claims.
    the bundle cannot reach today.
 5. Extend REST or MCP only after the Python contract and authority model are stable. Done for the
    compiler and for one capability document rendered identically by `/healthz`, the MCP server
-   instructions, and `mindbridge doctor`; the control-plane intents stay off REST and MCP. Open:
-   a supported switch for withholding the embodied and identity tools from an MCP server, so a
-   host can expose recall and compile alone.
+   instructions, and `mindbridge doctor`; the control-plane intents stay off REST and MCP. Done for
+   a supported switch withholding the identity tools from an MCP server (`identity_operations`) and
+   for REST reaching the fast-capture plane and the same identity and embodied operations behind
+   its own `identity_operations` and `embodied_operations` switches, so an application over the
+   network can use `capture`/`settle`/`pending_captures` always, and, where the host opts in, name,
+   read, unlink, or erase a person or run face and speech analysis exactly as an MCP-connected
+   agent can. Open: withholding the embodied tools from an MCP server, so a host can expose recall
+   and compile alone without also withholding naming.
 
 Fast capture is now independent of slow reasoning, the control plane governs the lifecycle through
 validated, logged, reversible operations, and the compiler produces budgeted task-ready context.

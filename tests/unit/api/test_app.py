@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from mindbridge.api.app import create_app
 from mindbridge.exceptions import (
+    IdentityNotFoundError,
     IndexUnavailableError,
     MemoryNotFoundError,
     ModelError,
@@ -31,18 +32,23 @@ from mindbridge.types import (
     ContextConflict,
     ContextUnknown,
     ContextUnknownKind,
+    FaceObservation,
+    IdentityErasure,
+    IdentityProfile,
     MemoryCapabilities,
     MemoryRecord,
     MemoryType,
     Modality,
     ObservationContext,
     Page,
+    PendingCapture,
     ProvisionalActor,
     RetrievalCandidateTrace,
     RetrievalRejection,
     RetrievalScope,
     RetrievalTrace,
     SearchHit,
+    SpeakerSegment,
     TracedSearchResult,
 )
 
@@ -95,6 +101,45 @@ UNKNOWN = ContextUnknown(
     kind=ContextUnknownKind.BUDGET_EXCLUDED,
     detail="3 candidates did not fit 24 items and 16000 chars",
 )
+SEGMENT = SpeakerSegment(
+    asset_id="b" * 64,
+    start_ms=0,
+    end_ms=1500,
+    text="Where is the toolbox?",
+    speaker_id="speaker_1",
+    speaker_name="Ann",
+    identity_score=0.82,
+)
+FACE = FaceObservation(
+    asset_id="c" * 64,
+    bounding_box=(0.1, 0.2, 0.3, 0.4),
+    identity_id="identity_1",
+    identity_name="Ann",
+    identity_score=0.77,
+    observed_at_ms=250,
+)
+ERASURE = IdentityErasure(
+    identity_id="identity_1",
+    alias_ids=("identity_4",),
+    face_exemplars=3,
+    voice_exemplars=2,
+    face_observations=7,
+    speech_segments=11,
+)
+PROFILE = IdentityProfile(
+    identity_id="identity_1",
+    name="Ann",
+    relationship="daughter",
+    confirmed=True,
+    evidence_ids=("memory_1",),
+)
+PENDING = PendingCapture(
+    memory_id="memory_1",
+    enqueued_at=NOW,
+    attempts=1,
+    last_error="model timed out",
+    awaiting="enrichment",
+)
 
 
 class FakeMemory:
@@ -104,6 +149,8 @@ class FakeMemory:
         self.failure = failure
         self.deleted = True
         self.declared = CAPABILITIES
+        self.profile: IdentityProfile | None = PROFILE
+        self.restored: str | None = "identity_2"
 
     @property
     def capabilities(self) -> MemoryCapabilities:
@@ -264,6 +311,88 @@ class FakeMemory:
         self._fail()
         self.calls.append(("delete", memory_id))
         return self.deleted
+
+    def capture(
+        self,
+        content: ContentInput,
+        *,
+        occurred_at: datetime | None = None,
+        occurred_end: datetime | None = None,
+        metadata: Mapping[str, object] | None = None,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: ObservationContext | None = None,
+    ) -> MemoryRecord:
+        self._fail()
+        copied_metadata = dict(metadata or {})
+        self.calls.append(
+            ("capture", content, occurred_at, occurred_end, copied_metadata, memory_type)
+        )
+        return _record(
+            "memory_1",
+            content if isinstance(content, str) else "Multimodal memory.",
+            occurred_at=occurred_at,
+            occurred_end=occurred_end,
+            metadata=copied_metadata,
+            memory_type=memory_type,
+        )
+
+    def settle(
+        self,
+        *,
+        limit: int = 100,
+        max_attempts: int = 3,
+        memory_ids: Sequence[str] | None = None,
+    ) -> int:
+        self._fail()
+        self.calls.append(
+            ("settle", limit, max_attempts, tuple(memory_ids) if memory_ids else None)
+        )
+        return 2
+
+    def pending_captures(
+        self,
+        *,
+        limit: int = 100,
+        memory_ids: Sequence[str] | None = None,
+    ) -> tuple[PendingCapture, ...]:
+        self._fail()
+        self.calls.append(("pending_captures", limit, tuple(memory_ids) if memory_ids else None))
+        return (PENDING,)
+
+    def speech(self, memory_id: str) -> tuple[SpeakerSegment, ...]:
+        self._fail()
+        self.calls.append(("speech", memory_id))
+        return (SEGMENT,)
+
+    def faces(self, memory_id: str) -> tuple[FaceObservation, ...]:
+        self._fail()
+        self.calls.append(("faces", memory_id))
+        return (FACE,)
+
+    def register_identity(
+        self,
+        identity_id: str,
+        name: str,
+        *,
+        relationship: str | None = None,
+    ) -> None:
+        self._fail()
+        self.calls.append(("register_identity", identity_id, name, relationship))
+
+    def identity(self, identity_id: str) -> IdentityProfile | None:
+        self._fail()
+        self.calls.append(("identity", identity_id))
+        return self.profile
+
+    def unlink_identity(self, alias_id: str) -> str | None:
+        self._fail()
+        self.calls.append(("unlink_identity", alias_id))
+        return self.restored
+
+    def forget_identity(self, identity_id: str) -> IdentityErasure:
+        self._fail()
+        self.calls.append(("forget_identity", identity_id))
+        return ERASURE
 
     def close(self) -> None:
         self.close_count += 1
@@ -980,6 +1109,177 @@ def test_reinforce_route_reaches_the_sdk_and_rejects_an_empty_list() -> None:
     assert memory.calls == [("reinforce", ("memory_1", "memory_1", "memory_2"))]
     assert empty.status_code == 422
     assert empty.json()["code"] == "validation_error"
+
+
+def test_capture_settle_and_pending_captures_are_always_on() -> None:
+    """The fast plane is an ordinary application operation, unlike identity and embodied access."""
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory)) as client:
+        captured = client.post(
+            "/v1/capture",
+            json={"content": "The spare key is in the blue toolbox.", "metadata": {"room": "hall"}},
+        )
+        settled = client.post(
+            "/v1/settle",
+            json={"limit": 10, "max_attempts": 5, "memory_ids": ["memory_1", "memory_2"]},
+        )
+        settled_defaults = client.post("/v1/settle", json={})
+        pending = client.get(
+            "/v1/pending_captures", params={"limit": 5, "memory_ids": ["memory_1"]}
+        )
+
+    assert captured.status_code == 201
+    assert captured.json()["content"] == "The spare key is in the blue toolbox."
+    assert settled.status_code == 200
+    assert settled.json() == {"settled": 2}
+    assert settled_defaults.json() == {"settled": 2}
+    assert pending.status_code == 200
+    assert pending.json() == {
+        "items": [
+            {
+                "memory_id": "memory_1",
+                "enqueued_at": "2026-08-27T12:00:00Z",
+                "attempts": 1,
+                "last_error": "model timed out",
+                "awaiting": "enrichment",
+            }
+        ]
+    }
+    assert memory.calls == [
+        (
+            "capture",
+            "The spare key is in the blue toolbox.",
+            None,
+            None,
+            {"room": "hall"},
+            MemoryType.SEMANTIC,
+        ),
+        ("settle", 10, 5, ("memory_1", "memory_2")),
+        ("settle", 100, 3, None),
+        ("pending_captures", 5, ("memory_1",)),
+    ]
+
+
+def test_identity_and_embodied_routes_are_off_by_default_and_404_not_403() -> None:
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory)) as client:
+        speech = client.post("/v1/speech", json={"memory_id": "memory_1"})
+        faces = client.post("/v1/faces", json={"memory_id": "memory_1"})
+        registered = client.post(
+            "/v1/identities", json={"identity_id": "identity_1", "name": "Ann"}
+        )
+        got = client.get("/v1/identities/identity_1")
+        unlinked = client.post("/v1/identities/identity_1/unlink")
+        forgotten = client.delete("/v1/identities/identity_1")
+        openapi = client.get("/openapi.json").json()
+
+    for response in (speech, faces, registered, got, unlinked, forgotten):
+        assert response.status_code == 404
+    assert "/v1/speech" not in openapi["paths"]
+    assert "/v1/identities" not in openapi["paths"]
+    assert memory.calls == []
+
+
+def test_embodied_routes_dispatch_to_the_sdk_when_enabled() -> None:
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory, embodied_operations=True)) as client:
+        speech = client.post("/v1/speech", json={"memory_id": "memory_1"})
+        faces = client.post("/v1/faces", json={"memory_id": "memory_1"})
+
+    assert speech.status_code == 200
+    assert speech.json() == {
+        "segments": [
+            {
+                "asset_id": "b" * 64,
+                "start_ms": 0,
+                "end_ms": 1500,
+                "text": "Where is the toolbox?",
+                "speaker_id": "speaker_1",
+                "speaker_name": "Ann",
+                "identity_score": 0.82,
+            }
+        ]
+    }
+    assert faces.status_code == 200
+    assert faces.json()["observations"][0]["identity_id"] == "identity_1"
+    assert memory.calls == [("speech", "memory_1"), ("faces", "memory_1")]
+
+
+def test_embodied_routes_map_memory_not_found() -> None:
+    memory = FakeMemory(MemoryNotFoundError("memory is missing"))
+
+    with TestClient(create_app(memory=memory, embodied_operations=True)) as client:
+        response = client.post("/v1/speech", json={"memory_id": "memory_1"})
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "memory_not_found"
+
+
+def test_embodied_routes_map_unsupported_modality() -> None:
+    memory = FakeMemory(ModelError("no face backend", reason="unsupported_modality"))
+
+    with TestClient(create_app(memory=memory, embodied_operations=True)) as client:
+        response = client.post("/v1/faces", json={"memory_id": "memory_1"})
+
+    assert response.status_code == 422
+    assert response.json()["reason"] == "unsupported_modality"
+
+
+def test_identity_routes_dispatch_to_the_sdk_when_enabled() -> None:
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory, identity_operations=True)) as client:
+        registered = client.post(
+            "/v1/identities",
+            json={"identity_id": "identity_1", "name": "Ann", "relationship": "daughter"},
+        )
+        got = client.get("/v1/identities/identity_1")
+        unlinked = client.post("/v1/identities/identity_1/unlink")
+        forgotten = client.delete("/v1/identities/identity_1")
+
+    assert registered.status_code == 200
+    assert registered.json() == {"registered": True}
+    assert got.status_code == 200
+    assert got.json()["identity"]["name"] == "Ann"
+    assert unlinked.status_code == 200
+    assert unlinked.json() == {"restored_identity_id": "identity_2"}
+    assert forgotten.status_code == 200
+    assert forgotten.json()["erasure"]["identity_id"] == "identity_1"
+    assert memory.calls == [
+        ("register_identity", "identity_1", "Ann", "daughter"),
+        ("identity", "identity_1"),
+        ("unlink_identity", "identity_1"),
+        ("forget_identity", "identity_1"),
+    ]
+
+
+def test_get_identity_reports_no_registered_profile_without_failing() -> None:
+    memory = FakeMemory()
+    memory.profile = None
+
+    with TestClient(create_app(memory=memory, identity_operations=True)) as client:
+        response = client.get("/v1/identities/unknown_id")
+
+    assert response.status_code == 200
+    assert response.json() == {"identity": None}
+
+
+def test_identity_routes_map_identity_not_found() -> None:
+    memory = FakeMemory(IdentityNotFoundError("identity does not exist: identity_1"))
+
+    with TestClient(create_app(memory=memory, identity_operations=True)) as client:
+        registered = client.post(
+            "/v1/identities", json={"identity_id": "identity_1", "name": "Ann"}
+        )
+        forgotten = client.delete("/v1/identities/identity_1")
+
+    assert registered.status_code == 404
+    assert registered.json()["code"] == "identity_not_found"
+    assert forgotten.status_code == 404
+    assert forgotten.json()["code"] == "identity_not_found"
 
 
 def _record(
