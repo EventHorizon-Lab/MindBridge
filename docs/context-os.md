@@ -287,6 +287,14 @@ defaults or justify superiority claims.
 
 1. Measure the current strong `add`, streaming prefetch, search, and formation paths on target
    hardware before setting latency objectives. Open: no named-hardware measurement exists yet.
+   The [benchmark harness](benchmarking.md#reported-performance-and-resource-metrics) can now
+   produce most of these numbers from a real run: capture acknowledgement, time to searchable,
+   and formation lag from `mindbridge-bench eval --ingest capture`, search and answer latency
+   from any run, and CPU, memory, disk, and energy (Intel RAPL and `nvidia-smi` power draw, where
+   the platform exposes them) for the whole run. Speculative first-hit latency stays unmeasured:
+   the streaming prefetch path issues an ordinary `Memory.search()`, indistinguishable in
+   telemetry from any other search, and the harness does not exercise streaming ingest. Running
+   this on named hardware and publishing the result is still what closes the gate.
 2. Add an explicit fast-capture path and SQLite-backed durable enrichment work without changing
    current `add()` semantics. Done: `capture()`, `settle()`, and `pending_captures()`;
    `settle()` honours a retry ceiling so one poisoned capture cannot block the queue,
@@ -314,7 +322,12 @@ defaults or justify superiority claims.
    for selection, budgeting, the latency deadline, and the explicit unknowns a thin bundle
    reports: `compile()`. Open: a downstream-task measurement against the no-memory,
    full-context, and retrieval-only baselines, and the person link, which needs an identity edge
-   the bundle cannot reach today.
+   the bundle cannot reach today. The [benchmark harness's `compile`
+   arm](benchmarking.md#baseline-arms) can now produce that comparison -- it answers from
+   `compile()`'s rendered bundle beside `blind`, `full-context`, and the product's own
+   `mindbridge` (retrieval-only) arm on the same questions, and reports each answered question's
+   bundle chars and item count as the numerator half of useful evidence per token. Running it
+   across the benchmark suite and publishing the result is still what closes the gate.
 5. Extend REST or MCP only after the Python contract and authority model are stable. Done for the
    compiler and for one capability document rendered identically by `/healthz`, the MCP server
    instructions, and `mindbridge doctor`; the control-plane intents stay off REST and MCP. Done for
