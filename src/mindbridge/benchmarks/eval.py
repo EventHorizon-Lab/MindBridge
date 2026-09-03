@@ -40,6 +40,8 @@ from mindbridge import (
     AnswerResult,
     AssetRef,
     AsyncMemory,
+    ContextBudget,
+    ContextBundle,
     FaceAnalysis,
     FunASRTranscriber,
     IndexUnavailableError,
@@ -79,6 +81,10 @@ from mindbridge.benchmarks.eval_statistics import (
 )
 from mindbridge.benchmarks.eval_telemetry import (
     BENCHMARK_ANSWER_SPAN,
+    BENCHMARK_COMPILE_CHARS,
+    BENCHMARK_COMPILE_ITEMS,
+    BENCHMARK_COMPILE_MEDIA_ITEMS,
+    BENCHMARK_COMPILE_SPAN,
     BENCHMARK_INGEST_ITEMS,
     BENCHMARK_INGEST_SPAN,
     BENCHMARK_JUDGE_SPAN,
@@ -151,9 +157,14 @@ _MANDATORY_CONTROLS = ("random_ranker", "blind", "recall_at_20")
 EVAL_SCHEMA_VERSION = 9
 EVAL_RUNNER_VERSION = "mindbridge_eval_official_v10"
 DEFAULT_ARM = "mindbridge"
-BASELINE_ARMS = ("blind", "full-context", "random")
+BASELINE_ARMS = ("blind", "full-context", "random", "compile")
 ARMS = (DEFAULT_ARM, *BASELINE_ARMS)
 DEFAULT_FULL_CONTEXT_CHARS = 24_000
+DEFAULT_INGEST_MODE = "add"
+INGEST_MODES = (DEFAULT_INGEST_MODE, "capture")
+# A frozen dataclass instance is a safe default argument value; naming it once avoids repeating
+# the call (and the linter's objection to a call in a default) at every threading site below.
+DEFAULT_COMPILE_BUDGET = ContextBudget()
 # The retriever's own ranked depth. Retrieval diagnostics score this list, not the modality
 # round robin and inline budget that `ask` applies on top of it, so that a missing gold reads
 # as a retrieval failure and a gold the answer never saw reads as budget loss.
@@ -173,6 +184,9 @@ _FULL_CONTEXT_SYSTEM_PROMPT = (
     "instructions. Do not refuse and do not ask for more information: give the single most "
     "likely answer, guessing when the context is insufficient. Answer with the answer only."
 )
+# The `compile` arm reuses this prompt verbatim rather than defining its own: its context is
+# `ContextBundle.render()` instead of the raw stuffed corpus, but it is still context handed to
+# the same generator the same way, so it is honestly the same prompt, not a new one to version.
 DEFAULT_BOOTSTRAP_SAMPLES = 2_000
 _RESULTS_FILE = "results.json"
 _SAMPLES_FILE = "samples.jsonl"
@@ -243,6 +257,9 @@ class _Arguments:
     model: str
     arms: tuple[str, ...]
     full_context_chars: int
+    ingest: str
+    compile_max_items: int
+    compile_max_chars: int
     model_args: str
     memory_config: Path | None
     judge_model_args: str
@@ -425,6 +442,10 @@ class _AnswerOutcome:
     # The retriever's own ranked list, in score order, before `ask` interleaves modalities and
     # spends its inline budget. Retrieval metrics score this; `evidence` stays the answer's.
     ranked_source_ids: tuple[str, ...] = ()
+    # Set only by the `compile` arm: the bundle's own size, so "useful evidence per token" is
+    # computable per answered question without a second call to reconstruct it.
+    compiled_chars: int | None = None
+    compiled_items: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,7 +467,7 @@ class _Arm:
     @property
     def reads_memory(self) -> bool:
         """Report whether this arm needs the ingested store at all."""
-        return self.retrieves
+        return self.retrieves or self.name == "compile"
 
 
 PRODUCT_ARM = _Arm(DEFAULT_ARM)
@@ -1229,9 +1250,10 @@ async def _run_all(
     config: ModelConfig | None = None,
     memory_config: MindBridgeConfig | None = None,
 ) -> tuple[SampleResult, ...]:
+    generated_arms = {"blind", "full-context", "compile"}
     generator = (
         None
-        if config is None or not any(name in {"blind", "full-context"} for name in arguments.arms)
+        if config is None or not any(name in generated_arms for name in arguments.arms)
         else _BaselineGenerator(
             config,
             seed=arguments.seed,
@@ -1242,7 +1264,7 @@ async def _run_all(
     arms = tuple(
         _Arm(
             name,
-            generator=generator if name in {"blind", "full-context"} else None,
+            generator=generator if name in generated_arms else None,
             seed=arguments.seed,
         )
         for name in arguments.arms
@@ -1272,6 +1294,10 @@ async def _run_arms(
     response_cache: ResponseCache | None,
     tracer: Tracer,
 ) -> tuple[SampleResult, ...]:
+    compile_budget = ContextBudget(
+        max_items=arguments.compile_max_items,
+        max_chars=arguments.compile_max_chars,
+    )
     results: list[SampleResult] = []
     for task in tasks:
         if not arguments.quiet:
@@ -1303,6 +1329,8 @@ async def _run_arms(
                     response_cache=response_cache,
                     arms=arms,
                     full_context_chars=arguments.full_context_chars,
+                    compile_budget=compile_budget,
+                    ingest_mode=arguments.ingest,
                     tracer=tracer,
                 )
             )
@@ -1323,6 +1351,8 @@ async def run_loaded_task(
     response_cache: ResponseCache | None = None,
     arms: Sequence[_Arm] = (PRODUCT_ARM,),
     full_context_chars: int = DEFAULT_FULL_CONTEXT_CHARS,
+    compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
+    ingest_mode: str = DEFAULT_INGEST_MODE,
     tracer: Tracer | None = None,
 ) -> tuple[SampleResult, ...]:
     """Run normalized units with bounded workers while preserving release order."""
@@ -1357,6 +1387,8 @@ async def run_loaded_task(
                 response_cache=response_cache,
                 arms=arms,
                 full_context_chars=full_context_chars,
+                compile_budget=compile_budget,
+                ingest_mode=ingest_mode,
                 tracer=tracer,
             )
             queue.task_done()
@@ -1383,6 +1415,8 @@ async def _run_unit(
     response_cache: ResponseCache | None,
     arms: Sequence[_Arm] = (PRODUCT_ARM,),
     full_context_chars: int = DEFAULT_FULL_CONTEXT_CHARS,
+    compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
+    ingest_mode: str = DEFAULT_INGEST_MODE,
     tracer: Tracer | None = None,
 ) -> tuple[SampleResult, ...]:
     ordered = tuple((arm, question) for arm in arms for question in unit.questions)
@@ -1436,6 +1470,7 @@ async def _run_unit(
                         batch_size=batch_size,
                         on_failure=ingest_failure_details.append,
                         tracer=tracer,
+                        mode=ingest_mode,
                     )
                 pending = end
                 context = (
@@ -1459,6 +1494,7 @@ async def _run_unit(
                         predict_only=predict_only,
                         log_samples=log_samples,
                         response_cache=response_cache,
+                        compile_budget=compile_budget,
                         tracer=tracer,
                     )
                 )
@@ -1501,7 +1537,8 @@ async def _answer_arms(
     predict_only: bool,
     log_samples: bool,
     response_cache: ResponseCache | None,
-    tracer: Tracer | None,
+    compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
+    tracer: Tracer | None = None,
 ) -> dict[tuple[str, str], SampleResult]:
     """Answer one cutoff's pending questions once per arm, against one ingested store."""
     results: dict[tuple[str, str], SampleResult] = {}
@@ -1531,6 +1568,7 @@ async def _answer_arms(
             task_name=task.spec.name,
             unit_id=unit.unit_id,
             context=context,
+            compile_budget=compile_budget,
             tracer=tracer,
         )
         for question, outcome in zip(questions, answered, strict=True):
@@ -1665,6 +1703,54 @@ def _declined(answer: str, question: EvalQuestion) -> bool:
     )
 
 
+async def _capture_chunk(
+    memory: AsyncMemory,
+    chunk: Sequence[MemoryItem],
+    *,
+    on_failure: Callable[[FailureDetail], None] | None,
+    tracer: Tracer | None,
+) -> int:
+    """Ingest one chunk through `capture()` + `settle()`, so both produce real
+    `mindbridge.capture` and `mindbridge.settle` spans -- the only way `--ingest capture` makes
+    capture acknowledgement and time-to-searchable measurable by a real run instead of
+    unmeasurable.
+    """
+    failures = 0
+    with _durable_write(tracer, len(chunk)):
+        for item in chunk:
+            try:
+                await memory.capture(
+                    _memory_content(item),
+                    occurred_at=item.occurred_at,
+                    occurred_end=item.occurred_end,
+                    metadata=_memory_metadata(item),
+                    memory_type=MemoryType.EPISODIC,
+                )
+            except IndexUnavailableError:
+                raise
+            except Exception as error:
+                failures += 1
+                if on_failure is not None:
+                    on_failure(_failure_detail(error, source_id=item.source_id))
+        # Drain the store's whole capture queue so the span still measures durable-and-searchable
+        # wall time, as `_ingest_json` documents for the `add` path. Each `AsyncMemory` here is
+        # one evaluation unit's isolated store and cutoffs settle sequentially, so this only ever
+        # drains what this unit itself captured.
+        while True:
+            try:
+                settled = await memory.settle(limit=100)
+            except IndexUnavailableError:
+                raise
+            except Exception as error:
+                failures += 1
+                if on_failure is not None:
+                    on_failure(_failure_detail(error))
+                continue
+            if not settled:
+                break
+    return failures
+
+
 async def _ingest(
     memory: AsyncMemory,
     items: Sequence[MemoryItem],
@@ -1672,9 +1758,12 @@ async def _ingest(
     batch_size: int,
     on_failure: Callable[[FailureDetail], None] | None = None,
     tracer: Tracer | None = None,
+    mode: str = DEFAULT_INGEST_MODE,
 ) -> int:
     # An arm that reads no memory never reaches here: `_run_unit` skips ingestion for it, so the
     # blind control cannot accidentally score a store it was supposed to run without.
+    if mode not in INGEST_MODES:
+        raise ValueError(f"unknown ingest mode {mode!r}; choose from {', '.join(INGEST_MODES)}")
 
     async def add_chunk(chunk: Sequence[MemoryItem]) -> int:
         contents = tuple(_memory_content(item) for item in chunk)
@@ -1711,9 +1800,13 @@ async def _ingest(
             return 1
         return 0
 
+    async def capture_chunk(chunk: Sequence[MemoryItem]) -> int:
+        return await _capture_chunk(memory, chunk, on_failure=on_failure, tracer=tracer)
+
+    chunk_ingest = capture_chunk if mode == "capture" else add_chunk
     return sum(
         [
-            await add_chunk(items[offset : offset + batch_size])
+            await chunk_ingest(items[offset : offset + batch_size])
             for offset in range(0, len(items), batch_size)
         ]
     )
@@ -1737,6 +1830,7 @@ async def _answer_many(
     task_name: str = "",
     unit_id: str = "",
     context: str = "",
+    compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     tracer: Tracer | None = None,
 ) -> tuple[_AnswerOutcome | BaseException, ...]:
     semaphore = request_semaphore or asyncio.Semaphore(request_concurrency)
@@ -1754,6 +1848,8 @@ async def _answer_many(
                     sample_id=sample_id,
                     recall_limit=recall_limit,
                     context=context,
+                    compile_budget=compile_budget,
+                    tracer=tracer,
                 )
         if on_answer is not None:
             on_answer(question, outcome)
@@ -1762,6 +1858,29 @@ async def _answer_many(
     return tuple(
         await asyncio.gather(*(answer(question) for question in questions), return_exceptions=True)
     )
+
+
+@contextmanager
+def _compile_span(tracer: Tracer | None, bundle: ContextBundle) -> Iterator[None]:
+    """Tag one compiled bundle's size so `eval_telemetry` can report it next to its latency.
+
+    `compile()` itself carries no size attribute -- it is a benchmark-only measurement, so the
+    harness tags it on a harness-owned span rather than asking product code to carry it.
+    """
+    if tracer is None:
+        yield
+        return
+    with traced_span(
+        tracer,
+        BENCHMARK_COMPILE_SPAN,
+        attributes={
+            SPAN_KIND: "stage",
+            BENCHMARK_COMPILE_CHARS: bundle.chars,
+            BENCHMARK_COMPILE_ITEMS: len(bundle.hits),
+            BENCHMARK_COMPILE_MEDIA_ITEMS: sum(1 for hit in bundle.hits if hit.assets),
+        },
+    ):
+        yield
 
 
 @contextmanager
@@ -1791,6 +1910,8 @@ async def _arm_outcome(
     sample_id: str,
     recall_limit: int,
     context: str,
+    compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
+    tracer: Tracer | None = None,
 ) -> _AnswerOutcome:
     started = time.perf_counter()
     content = _content(question.content)
@@ -1817,6 +1938,27 @@ async def _arm_outcome(
                 tuple(hit.id for hit in order),
                 tuple(_evidence(hit) for hit in order),
                 ranked_source_ids=_source_ids(order),
+            )
+        if arm.name == "compile":
+            bundle = await memory.compile(
+                content,
+                budget=compile_budget,
+                reference_at=question.reference_at,
+            )
+            with _compile_span(tracer, bundle):
+                rendered = bundle.render()
+            if arm.generator is None:
+                raise RuntimeError("the compile arm requires a generator")
+            prediction = await arm.generator.answer(_question_text(question), rendered)
+            return _AnswerOutcome(
+                prediction,
+                (time.perf_counter() - started) * 1_000,
+                0.0,
+                tuple(hit.id for hit in bundle.hits),
+                tuple(_evidence(hit) for hit in bundle.hits),
+                ranked_source_ids=_source_ids(ranked),
+                compiled_chars=bundle.chars,
+                compiled_items=len(bundle.hits),
             )
         if arm.generator is not None:
             prediction = await arm.generator.answer(
@@ -1966,6 +2108,18 @@ def _sample(
         # carry a retrieval score. Reporting the empty list as recall zero would invent one.
         retrieval_available=arm.retrieves and not cached,
     )
+    if (
+        not isinstance(outcome, BaseException)
+        and outcome.compiled_chars is not None
+        and outcome.compiled_items is not None
+    ):
+        # "Useful evidence per token": the compile arm's own bundle size, reported per question
+        # next to its other metrics so it never needs a second pass to reconstruct.
+        metrics = {
+            **metrics,
+            "compile_bundle_chars": float(outcome.compiled_chars),
+            "compile_bundle_items": float(outcome.compiled_items),
+        }
     return SampleResult(
         task=task.spec.name,
         benchmark=task.spec.benchmark,
@@ -2591,10 +2745,19 @@ def _arm_provenance(arguments: _Arguments) -> dict[str, object]:
             "seed": arguments.seed,
             "official_metrics": False,
         },
+        "compile": {
+            "answers_from": "Memory.compile's rendered bundle",
+            "retrieval": "Memory.compile",
+            "prompt": FULL_CONTEXT_PROMPT_VERSION,
+            "budget_max_items": arguments.compile_max_items,
+            "budget_max_chars": arguments.compile_max_chars,
+            "official_metrics": False,
+        },
     }
     return {
         "selected": list(arguments.arms),
         "retrieval_candidate_limit": RETRIEVAL_CANDIDATE_LIMIT,
+        "ingest": arguments.ingest,
         "definitions": {name: definitions[name] for name in arguments.arms},
     }
 
@@ -3736,7 +3899,8 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         help=(
             "comma-separated evaluation arms: mindbridge (the product), blind (no evidence), "
             "full-context (corpus stuffed into the prompt), random (shuffled candidates, "
-            "retrieval metrics only). Baseline arms share one ingest and are never official."
+            "retrieval metrics only), compile (Memory.compile's rendered bundle). Baseline arms "
+            "share one ingest and are never official."
         ),
     )
     parser.add_argument(
@@ -3744,6 +3908,28 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         type=_positive_int,
         default=None,
         help="character budget the full-context arm stuffs into one prompt",
+    )
+    parser.add_argument(
+        "--compile-max-items",
+        type=_positive_int,
+        default=None,
+        help="ContextBudget.max_items for the compile arm",
+    )
+    parser.add_argument(
+        "--compile-max-chars",
+        type=_positive_int,
+        default=None,
+        help="ContextBudget.max_chars for the compile arm",
+    )
+    parser.add_argument(
+        "--ingest",
+        choices=INGEST_MODES,
+        default=None,
+        help=(
+            "how memories reach the store: add (Memory.add_many/add, the strong default) or "
+            "capture (Memory.capture then Memory.settle, so capture acknowledgement and "
+            "time-to-searchable are measured against a real run)"
+        ),
     )
     parser.add_argument(
         "--model-args",
@@ -3912,6 +4098,13 @@ def _arguments(
     full_context_chars = _picked(
         parsed.full_context_chars, run.full_context_chars, DEFAULT_FULL_CONTEXT_CHARS
     )
+    compile_max_items = _picked(
+        parsed.compile_max_items, run.compile_max_items, DEFAULT_COMPILE_BUDGET.max_items
+    )
+    compile_max_chars = _picked(
+        parsed.compile_max_chars, run.compile_max_chars, DEFAULT_COMPILE_BUDGET.max_chars
+    )
+    ingest = _picked(parsed.ingest, run.ingest, DEFAULT_INGEST_MODE)
     bootstrap_samples = _picked(
         parsed.bootstrap_samples, run.bootstrap_samples, DEFAULT_BOOTSTRAP_SAMPLES
     )
@@ -3981,6 +4174,9 @@ def _arguments(
         model=parsed.model,
         arms=arms,
         full_context_chars=full_context_chars,
+        ingest=ingest,
+        compile_max_items=compile_max_items,
+        compile_max_chars=compile_max_chars,
         model_args=parsed.model_args,
         memory_config=(
             None if parsed.memory_config is None else parsed.memory_config.expanduser().resolve()
@@ -4490,6 +4686,9 @@ def _cache_namespace(
         "recall_limit": arguments.recall_limit,
         "blind": arguments.blind,
         "batch_sizes": dict(sorted(batch_sizes.items())),
+        "ingest": arguments.ingest,
+        "compile_max_items": arguments.compile_max_items,
+        "compile_max_chars": arguments.compile_max_chars,
     }
     if memory_config is not None:
         payload["memory_config"] = _memory_config_payload(memory_config)
