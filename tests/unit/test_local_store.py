@@ -1338,6 +1338,92 @@ def test_unlink_identity_refuses_an_alias_without_a_recorded_modality(tmp_path: 
     assert set(exemplars) == {(face_id, "face"), (face_id, "voice")}
 
 
+def _drop_asset(store: LocalStore, label: str, asset: StoredAsset) -> None:
+    """Delete the memory that owns one asset and then collect the orphaned asset."""
+    deleted, unreferenced = store.delete_memory_with_assets(label)
+    assert deleted is True
+    assert [row.asset_id for row in unreferenced] == [asset.asset_id]
+    assert store.delete_asset_if_unreferenced(asset.asset_id) is True
+
+
+def _identity_rows(store: LocalStore) -> tuple[set[str], set[tuple[str, str]]]:
+    with closing(sqlite3.connect(store.database_path)) as connection:
+        identities = {
+            str(row[0]) for row in connection.execute("SELECT identity_id FROM identities")
+        }
+        exemplars = {
+            (str(row[0]), str(row[1]))
+            for row in connection.execute("SELECT identity_id, modality FROM identity_exemplars")
+        }
+    return identities, exemplars
+
+
+def test_deleting_an_asset_collects_the_anonymous_identities_it_alone_observed(
+    tmp_path: Path,
+) -> None:
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        anonymous = _face_identity(store, clip, (1.0, 0.0))
+        named = _voice_identity(store, clip, (0.0, 1.0))
+        assert store.register_identity(named, "Alice") is True
+
+        _drop_asset(store, "clip", clip)
+        identities, exemplars = _identity_rows(store)
+
+    # The anonymous identity was a by-product of the deleted recording, so its exemplar goes
+    # with it. The named one is a person the caller asserted; `forget_identity()` erases that.
+    assert anonymous not in identities
+    assert identities == {named}
+    assert exemplars == {(named, "voice")}
+
+
+def test_an_identity_another_asset_still_observes_survives_the_collection(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        first = _video_asset(store, "first")
+        second = _video_asset(store, "second")
+        face_id = _face_identity(store, first, (1.0, 0.0))
+        voice_id = _voice_identity(store, first, (0.0, 1.0))
+        # The same person recorded twice resolves to the same identity both times.
+        assert _face_identity(store, second, (1.0, 0.0)) == face_id
+        assert _voice_identity(store, second, (0.0, 1.0)) == voice_id
+
+        # `face_observations.identity_id` RESTRICTs, so a regression raises here, but
+        # `speech_segments.speaker_id` only SET NULLs, so the speaker has to be read back.
+        _drop_asset(store, "first", first)
+        identities, _ = _identity_rows(store)
+        faces = store.read_faces(second.asset_id, space_id="sface:test")
+        speech = store.read_speech(second.asset_id, space_id="cam++:test")
+
+    assert identities == {face_id, voice_id}
+    assert faces is not None and faces[0].identity_id == face_id
+    assert speech is not None and speech[0].speaker_id == voice_id
+
+
+def test_collecting_one_asset_leaves_an_unlinked_identity_waiting_for_corroboration(
+    tmp_path: Path,
+) -> None:
+    """An identity `unlink_identity()` restored is untouched by an unrelated asset's collection."""
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        face_id = _face_identity(store, clip, (1.0, 0.0))
+        voice_id = _voice_identity(store, clip, (1.0, 0.0))
+        assert store.link_identities(face_id, voice_id) == face_id
+
+        # Reversing the merge after the recording is gone leaves two anonymous identities that
+        # hold exemplars and observe nothing, which is what continued ingestion re-corroborates.
+        _drop_asset(store, "clip", clip)
+        assert store.unlink_identity(voice_id) == voice_id
+
+        other = _video_asset(store, "other")
+        stranger = _face_identity(store, other, (0.0, 1.0))
+        _drop_asset(store, "other", other)
+        identities, exemplars = _identity_rows(store)
+
+    assert stranger not in identities
+    assert identities == {face_id, voice_id}
+    assert exemplars == {(face_id, "face"), (voice_id, "voice")}
+
+
 def test_unlink_identity_refuses_to_strip_the_target_of_every_exemplar(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         first = _video_asset(store, "first")

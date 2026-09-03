@@ -1634,10 +1634,11 @@ class ContextBudget:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ContextConflict:
-    """Two or more included memories in one lineage that disagree on the same value.
+    """Two or more candidates in one lineage that disagree on the same value.
 
     The compiler reports a disagreement and never resolves it. `values` and `memory_ids` are
-    aligned: each value is paired with the highest-ranked included memory that asserts it.
+    aligned: each value is paired with the highest-ranked candidate that asserts it, whether or
+    not the budget included that memory; `render()` marks the ones it did not.
     """
 
     lineage_id: str

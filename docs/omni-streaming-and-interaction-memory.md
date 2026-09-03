@@ -80,7 +80,7 @@ retry ceiling stays queued on purpose, so a loop that waits for the queue to emp
 `pending_captures()` is how you then see which record it is and why, and `awaiting` says whether
 a queued record has no vectors yet or is already searchable and owes only formation.
 `settle(memory_ids=...)` runs named records alone and ignores the ceiling for them, so a parked
-capture is retried by hand rather than by lowering the ceiling for everything. One settlement runs
+capture is retried by hand rather than by raising the ceiling for everything. One settlement runs
 at a time per `Memory`: a concurrent call waits instead of running the same models twice.
 
 **Contract:** keep `add()` where a caller needs the record searchable on return, and keep the

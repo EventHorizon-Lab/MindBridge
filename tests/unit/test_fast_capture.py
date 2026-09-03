@@ -28,6 +28,7 @@ from mindbridge import (
     Modality,
     ModelError,
     ModelInput,
+    ValidationError,
 )
 from mindbridge._telemetry import CAPTURE_FAILED, CAPTURE_SETTLED, CAPTURE_TIME_TO_SEARCHABLE
 from mindbridge.memory import AsyncMemory
@@ -610,6 +611,25 @@ def test_settle_can_name_the_records_it_runs_and_ignores_the_ceiling_for_them(
         embedder.poison = None
         assert memory.settle(memory_ids=(poisoned.id,)) == 1
         assert memory.pending_captures() == ()
+
+
+def test_naming_records_rejects_ids_the_store_would_only_reject_later(tmp_path: Path) -> None:
+    with Memory(tmp_path, embedder=CountingEmbedder(), minimum_relevance=0) as memory:
+        record = memory.capture("the ladder is in the garage")
+
+        # A bare string is a caller mistake, not a sequence of one-character IDs.
+        with pytest.raises(ValidationError):
+            memory.settle(memory_ids=cast(Sequence[str], record.id))
+        with pytest.raises(ValidationError):
+            memory.pending_captures(memory_ids=cast(Sequence[str], record.id))
+
+        # A malformed ID is rejected here rather than surfacing as a storage failure.
+        with pytest.raises(ValidationError):
+            memory.settle(memory_ids=(f" {record.id} ",))
+        with pytest.raises(ValidationError):
+            memory.pending_captures(memory_ids=(f" {record.id} ",))
+
+        assert [row.memory_id for row in memory.pending_captures()] == [record.id]
 
 
 class SlowEmbedder(CountingEmbedder):

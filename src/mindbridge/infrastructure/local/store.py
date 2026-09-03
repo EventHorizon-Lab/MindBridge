@@ -3040,6 +3040,20 @@ class LocalStore:
         """Delete one unreferenced descriptor after its CAS file has been removed."""
         _sha256(asset_id)
         with self._transaction() as connection:
+            # Read before the delete cascades the observations away: these are the only
+            # identities this asset can have orphaned.
+            observed = tuple(
+                _row_text(row, "identity_id")
+                for row in connection.execute(
+                    """
+                    SELECT identity_id FROM face_observations WHERE asset_id = ?
+                    UNION
+                    SELECT speaker_id FROM speech_segments
+                    WHERE asset_id = ? AND speaker_id IS NOT NULL
+                    """,
+                    (asset_id, asset_id),
+                ).fetchall()
+            )
             cursor = connection.execute(
                 """
                 DELETE FROM media_assets
@@ -3051,7 +3065,7 @@ class LocalStore:
                 (asset_id,),
             )
             if cursor.rowcount > 0:
-                _delete_unobserved_identities(connection)
+                _delete_unobserved_identities(connection, observed)
         return cursor.rowcount > 0
 
     def write_embedding(self, embedding: StoredEmbedding) -> bool:
@@ -3943,18 +3957,29 @@ class LocalStore:
             raise LocalStoreClosedError("local store is closed")
 
 
-def _delete_unobserved_identities(connection: sqlite3.Connection) -> None:
-    """Drop anonymous identities whose last observation went with the media just deleted.
+def _delete_unobserved_identities(
+    connection: sqlite3.Connection,
+    identity_ids: Sequence[str],
+) -> None:
+    """Drop the anonymous identities the deleted media just left with no observation at all.
 
     An exemplar is a biometric template derived from stored media, so it is content: leaving one
     behind after its last face observation and speech segment are gone would make `delete()`
     incomplete. A named or merged identity is a person the caller asserted, not a by-product of
     one recording; it survives, and `forget_identity()` is what erases a person.
+
+    Only identities this asset observed are candidates. A sweep of every unobserved identity
+    would also destroy one `unlink_identity()` deliberately left anonymous with its exemplars and
+    no observations, which is the state continued ingestion is supposed to corroborate again.
     """
+    if not identity_ids:
+        return
+    placeholders = ", ".join("?" for _identity_id in identity_ids)
     connection.execute(
-        """
+        f"""
         DELETE FROM identities
-        WHERE name IS NULL AND relationship IS NULL
+        WHERE identity_id IN ({placeholders})
+          AND name IS NULL AND relationship IS NULL
           AND NOT EXISTS (
               SELECT 1 FROM face_observations AS f
               WHERE f.identity_id = identities.identity_id
@@ -3971,7 +3996,8 @@ def _delete_unobserved_identities(connection: sqlite3.Connection) -> None:
               SELECT 1 FROM identity_link_evidence AS e
               WHERE e.voice_id = identities.identity_id OR e.face_id = identities.identity_id
           )
-        """
+        """,
+        tuple(identity_ids),
     )
 
 

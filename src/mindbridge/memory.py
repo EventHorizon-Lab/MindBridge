@@ -1043,7 +1043,7 @@ class Memory:
         the batch is done, with `subject` naming its record; the rest are readable through
         `pending_captures()`. A record that has already failed `max_attempts` times is skipped
         rather than retried, so one poisoned capture cannot block the queue forever. It stays
-        queued and visible, and lowering the ceiling is what retries it.
+        queued and visible, and raising the ceiling is what retries it.
 
         Pass `memory_ids` to settle only those records. Naming a record is the host asking for it
         by hand, so the retry ceiling does not apply and `max_attempts` is ignored: that is how a
@@ -1064,6 +1064,7 @@ class Memory:
                 or max_attempts < 1
             ):
                 raise ValidationError("max_attempts must be a positive integer")
+            memory_ids = _memory_id_filter(memory_ids)
             with self._settle_lock:
                 with _translate_storage_errors("read the capture queue"):
                     # Same filter `pending_captures()` publishes, so naming records reuses the
@@ -1111,6 +1112,7 @@ class Memory:
             self._operation(),
         ):
             _limit(limit, maximum=100)
+            memory_ids = _memory_id_filter(memory_ids)
             with _translate_storage_errors("read the capture queue"):
                 return self._store.pending_captures(limit=limit, memory_ids=memory_ids)
 
@@ -1128,6 +1130,7 @@ class Memory:
         """
         if isinstance(contents, (str, bytes, Path, Blob, AssetRef, Mapping)):
             raise ValidationError("contents must be an iterable of memory inputs")
+        capture = _capture_flag(capture)
         try:
             iterator = iter(contents)
         except TypeError:
@@ -5429,6 +5432,7 @@ class AsyncMemory:
         """
         if not isinstance(contents, AsyncIterable):
             raise ValidationError("contents must be an async iterable of memory inputs")
+        capture = _capture_flag(capture)
         iterator = aiter(contents)
         index = 0
         while True:
@@ -6398,7 +6402,7 @@ def _prepared_from_stored(memory: StoredMemory) -> _PreparedMemory:
             text=memory.content,
             assets=memory.assets,
             modality=Modality(memory.modality),
-            canonical_parts=(("text", memory.content),) if memory.content else (),
+            canonical_parts=_stored_canonical_parts(memory.content, memory.assets),
             audio_transcript=_has_stream_transcript(memory.content, memory.assets),
             visual_description=_has_stream_description(memory.content, memory.assets),
         ),
@@ -6910,6 +6914,41 @@ def _with_stream_description(
         text=content,
         canonical_parts=(*prepared.canonical_parts, ("visual_description", section)),
         visual_description=True,
+    )
+
+
+def _stored_canonical_parts(
+    text: str,
+    assets: Sequence[StoredAsset],
+) -> tuple[tuple[str, str], ...]:
+    """Split stored content back into the parts the strong `add` path embedded separately.
+
+    A `StreamInput` folds its transcript and description into `content` before the row is
+    written, so a capture arrives here already flattened. Recovering each derived section keys
+    the same way `add()` did instead of hashing one merged text. Content with no marker for one
+    of its own assets is left as the single text part the caller wrote.
+    """
+    cuts: dict[int, str] = {}
+    for asset in assets:
+        if asset.modality == Modality.AUDIO.value:
+            kind, marker = "audio_transcript", f"[transcript:{asset.asset_id}]\n"
+        elif asset.modality in {Modality.IMAGE.value, Modality.VIDEO.value}:
+            kind, marker = "visual_description", f"[visual description:{asset.asset_id}]\n"
+        else:
+            continue
+        found = text.find(f"\n\n{marker}")
+        start = found + 2 if found >= 0 else (0 if text.startswith(marker) else -1)
+        if start >= 0:
+            cuts[start] = kind
+    if not cuts:
+        return (("text", text),) if text else ()
+    ordered = sorted(cuts.items())
+    # Each section was joined with "\n\n", so a cut ends two characters before the next one.
+    ends = [start - 2 for start, _ in ordered[1:]] + [len(text)]
+    head = text[: max(ordered[0][0] - 2, 0)]
+    return (
+        *((("text", head),) if head else ()),
+        *((kind, text[start:end]) for (start, kind), end in zip(ordered, ends, strict=True)),
     )
 
 
@@ -8262,6 +8301,25 @@ def _identifier(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         raise ValidationError(f"{name} must be non-empty and trimmed")
     return value
+
+
+def _capture_flag(capture: object) -> bool:
+    """Read `capture` as the mode it is, so a truthy value is a mistake and not a silent yes."""
+    if not isinstance(capture, bool):
+        raise ValidationError("capture must be a boolean")
+    return capture
+
+
+def _memory_id_filter(memory_ids: Sequence[str] | None) -> tuple[str, ...] | None:
+    """Normalize an optional `memory_ids` filter the way `forget()` normalizes its argument."""
+    if memory_ids is None:
+        return None
+    if isinstance(memory_ids, (str, bytes)):
+        raise ValidationError("memory_ids must be a sequence of memory IDs")
+    try:
+        return tuple(_identifier(memory_id, "memory_id") for memory_id in memory_ids)
+    except TypeError:
+        raise ValidationError("memory_ids must be a sequence of memory IDs") from None
 
 
 def _embedding_id(memory_id: str, object_part: int) -> str:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 import wave
 from collections.abc import AsyncIterator, Sequence
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -60,6 +62,14 @@ async def _audio_packets(*values: AudioStreamPacket) -> AsyncIterator[AudioStrea
 async def _vision_packets(*values: VisionStreamPacket) -> AsyncIterator[VisionStreamPacket]:
     for value in values:
         yield value
+
+
+def _stored_embeddings(directory: Path) -> set[tuple[str, int]]:
+    with closing(sqlite3.connect(directory / "state.sqlite3")) as connection:
+        return {
+            (str(row[0]), int(row[1]))
+            for row in connection.execute("SELECT embedding_id, object_part FROM embeddings")
+        }
 
 
 class RecordingEmbedder:
@@ -734,6 +744,35 @@ async def test_a_captured_audio_final_settles_into_the_record_add_would_have_wri
     assert captured.id == added.id
     assert captured.content == added.content
     assert "red toolbox" in captured.content
+    assert _stored_embeddings(tmp_path / "captured") == _stored_embeddings(tmp_path / "added")
+
+
+def test_a_captured_stream_input_keys_its_folded_transcript_like_add(tmp_path: Path) -> None:
+    """A folded transcript keys as its own part, not merged into the caller's text."""
+    from mindbridge import Memory
+
+    def commit_one(directory: Path, *, capture: bool) -> tuple[str, set[tuple[str, int]]]:
+        with Memory(
+            directory,
+            embedder=RecordingEmbedder(frozenset({Modality.TEXT})),
+            minimum_relevance=0,
+        ) as memory:
+            (record,) = memory.add_stream(
+                (
+                    StreamInput(
+                        ["the headset sits on the bench", Blob(b"speech", "audio/wav", "a.wav")],
+                        transcript="the red toolbox is by the door",
+                    ),
+                ),
+                capture=capture,
+            )
+            if capture:
+                assert memory.settle() == 1
+        return record.id, _stored_embeddings(directory)
+
+    assert commit_one(tmp_path / "captured", capture=True) == commit_one(
+        tmp_path / "added", capture=False
+    )
 
 
 @pytest.mark.asyncio
@@ -777,3 +816,7 @@ def test_add_stream_can_capture_instead_of_adding(tmp_path: Path) -> None:
         assert memory.search("ladder") == ()
         assert memory.settle() == 2
         assert records[0].id in {hit.id for hit in memory.search("ladder")}
+
+        # `capture` is a mode, not a truthiness test, exactly as `AsyncCaptureStream` reads it.
+        with pytest.raises(ValidationError):
+            next(memory.add_stream(("a note",), capture=cast(Any, 1)))
