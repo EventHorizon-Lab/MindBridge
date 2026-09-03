@@ -322,6 +322,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   caption prompt, so editing the prompt invalidates captions written under the old one. Serving a
   stale caption is the one failure nothing downstream can detect, since it is indistinguishable
   from a fresh one once it is inside a searchable document.
+- `search_with_trace` orders its candidate list without going through a `set`, so two runs of one
+  query on one library print it in one order whatever the interpreter's string hash seed. The
+  ranking never depended on this and does not change: it sorts on `(-final_score, memory_id)`, and
+  the record read that hydrates it does not order by its argument. The reachable effect was on a
+  stale-index candidate's position in the trace.
 - `add_stream` now indexes its committed items in bounded groups (32 items or 250 ms) instead of
   flushing the search index after every observation. Each item still commits to SQLite on its own
   and the committed prefix survives a mid-stream failure; a group the process never reaches leaves

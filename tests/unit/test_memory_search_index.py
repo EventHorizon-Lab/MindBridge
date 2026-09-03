@@ -16,6 +16,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -770,3 +773,96 @@ def test_a_narrow_limit_returns_the_prefix_of_a_wide_one_with_the_same_scores(
     assert len(wide) == 100
     assert [hit.id for hit in narrow] == [hit.id for hit in wide[:5]]
     assert [hit.score for hit in narrow] == [hit.score for hit in wide[:5]]
+
+
+_TRACE_ORDER_PROBE = '''
+import hashlib
+import json
+import math
+import sys
+from pathlib import Path
+
+from mindbridge import Memory
+from mindbridge.models.base import EmbedTask, ModelInput
+from mindbridge.types import Modality
+
+
+class _Sha256Embedder:
+    """Deterministic across processes: the vector is a hash of the text, not of an object id."""
+
+    embedding_model = "fake-sha256"
+    embedding_space = "fake-sha256:8:test"
+    embedding_dimension = 8
+    embedding_capabilities = frozenset({Modality.TEXT})
+
+    def embed(self, inputs, task=EmbedTask.DOCUMENT):
+        del task
+        vectors = []
+        for value in inputs:
+            digest = hashlib.sha256(value.text.encode("utf-8")).digest()
+            raw = [byte / 255.0 - 0.5 for byte in digest[:8]]
+            norm = math.sqrt(sum(component * component for component in raw)) or 1.0
+            vectors.append(tuple(component / norm for component in raw))
+        return tuple(vectors)
+
+    def close(self):
+        return None
+
+
+directory = Path(sys.argv[1])
+query = "which note mentions the harbour wall"
+fresh = not directory.exists()
+with Memory(directory, embedder=_Sha256Embedder()) as memory:
+    if fresh:
+        memory.add_many(
+            [
+                f"note {index} about the harbour wall, ledger {index} and roadmap {index}"
+                for index in range(150)
+            ]
+        )
+    traced = memory.search_with_trace(query, limit=20)
+print(
+    json.dumps(
+        {
+            "candidates": [candidate.memory_id for candidate in traced.trace.candidates],
+            "hits": [hit.id for hit in traced.hits],
+        }
+    )
+)
+'''
+
+
+def test_the_candidate_trace_order_does_not_depend_on_the_process_hash_seed(
+    tmp_path: Path,
+) -> None:
+    """`search_with_trace`'s candidate order must be reproducible across processes.
+
+    A trace is a debugging surface and an arm-comparison input, so two runs of one query on one
+    library must print it in one order. Hydration used to be ordered through `lexical_matches`, a
+    `set` of memory ids, whose iteration order follows the interpreter's string hash seed.
+
+    This test is the reason that is stated narrowly. It was written to reproduce a candidate-dump
+    difference observed between two replays, and it **passes on the pre-fix code**: `read_memories`
+    does not order by its argument, so the ranked trace never followed the set, and the observed
+    difference turned out to be two genuinely different ranking rules rather than a seed effect.
+    What remains is the general guarantee, which is what is worth pinning: the corpus deliberately
+    exceeds the route depth so the union of the two routes is larger than either, which is the
+    only situation in which any set-derived ordering could reach the trace at all.
+    """
+    script = tmp_path / "probe.py"
+    script.write_text(_TRACE_ORDER_PROBE, encoding="utf-8")
+    library = tmp_path / "library"
+    runs = []
+    for seed in ("0", "1"):
+        completed = subprocess.run(
+            [sys.executable, str(script), str(library)],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**os.environ, "PYTHONHASHSEED": seed},
+        )
+        runs.append(json.loads(completed.stdout))
+
+    assert len(runs[0]["candidates"]) > 100, "the corpus must exceed the route depth"
+    assert runs[0]["hits"] == runs[1]["hits"], "the ranking must not depend on the hash seed"
+    assert runs[0]["candidates"] == runs[1]["candidates"]
