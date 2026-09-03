@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -55,6 +55,16 @@ class MemoryKind(str, Enum):
     AFFECT = "affect"
     TRAIT = "trait"
     RESPONSE_POLICY = "response_policy"
+
+
+class ContextUnknownKind(str, Enum):
+    """Why a compiled bundle is missing something the request implied it might contain."""
+
+    SCOPE_EMPTY = "scope_empty"
+    SECTION_EMPTY = "section_empty"
+    BUDGET_EXCLUDED = "budget_excluded"
+    MODALITY_UNSUPPORTED = "modality_unsupported"
+    STAGE_SKIPPED = "stage_skipped"
 
 
 class SpatialAnchor(str, Enum):
@@ -1310,6 +1320,43 @@ class MemoryCapabilities:
             ):
                 raise ValidationError(f"{name} capabilities must be a frozenset of modalities")
 
+    @property
+    def operations(self) -> frozenset[str]:
+        """Optional operations this composition can serve, named by the backend each needs.
+
+        The mapping from an operation to its backend was prose in three reference pages, so a
+        caller had to know that `ask` needs generation and `consolidate` needs a consolidation
+        backend. It is derived, never declared: the backends above are the only source.
+        """
+        available = {
+            "ask": bool(self.generation),
+            "speech": self.speaker_recognition and bool(self.transcription),
+            "transcribe": bool(self.transcription),
+            "faces": bool(self.face),
+            "describe_vision": bool(self.vision),
+            "formation": bool(self.formation),
+            "consolidate": self.consolidation_model is not None,
+        }
+        return frozenset(name for name, ready in available.items() if ready)
+
+    def document(self) -> dict[str, object]:
+        """Return the JSON-ready capability document every surface publishes.
+
+        REST serves it from `/healthz`, the MCP server embeds it in its instructions, and
+        `mindbridge doctor` prints it, so the three cannot describe the same composition
+        differently. Modality sets and operation names are sorted so the document is stable.
+        """
+        values: dict[str, object] = {
+            declared.name: (
+                sorted(item.value for item in value)
+                if isinstance(value := getattr(self, declared.name), frozenset)
+                else value
+            )
+            for declared in fields(self)
+        }
+        values["operations"] = sorted(self.operations)
+        return values
+
 
 @dataclass(frozen=True, slots=True)
 class RetrievalCandidateTrace:
@@ -1455,10 +1502,20 @@ class ContextBudget:
     memory_types: frozenset[MemoryType] | None = None
     min_confidence: float = 0.0
     freshness: timedelta | None = None
+    # A deadline, not a timeout: the compiler checks the clock between stages and stops adding
+    # optional ones. It never interrupts work already in flight, so an exceeded deadline is
+    # reported on the bundle rather than raised.
+    max_latency_ms: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_chars", _positive_int(self.max_chars, "budget max_chars"))
         object.__setattr__(self, "max_items", _positive_int(self.max_items, "budget max_items"))
+        if self.max_latency_ms is not None:
+            object.__setattr__(
+                self,
+                "max_latency_ms",
+                _positive_int(self.max_latency_ms, "budget max_latency_ms"),
+            )
         if self.memory_types is not None:
             memory_types = frozenset(self.memory_types)
             if not memory_types or any(not isinstance(value, MemoryType) for value in memory_types):
@@ -1495,6 +1552,25 @@ class ContextConflict:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ContextUnknown:
+    """One thing the request implied a bundle might contain that this bundle does not.
+
+    Every unknown is a deterministic statement about the compilation itself -- a scope that
+    matched nothing, a requested type nothing was included for, evidence the budget could not
+    buy, a modality this composition cannot search, a stage a deadline skipped. The compiler
+    calls no model to produce one, so an unknown is never a guess about the world.
+    """
+
+    kind: ContextUnknownKind
+    detail: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ContextUnknownKind):
+            raise ValidationError("unknown kind is invalid")
+        object.__setattr__(self, "detail", _text(self.detail, "unknown detail"))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ContextBundle:
     """One bounded, structured context view compiled for a goal."""
 
@@ -1502,17 +1578,23 @@ class ContextBundle:
     reference_at: datetime
     budget: ContextBudget
     actors: tuple[SearchHit, ...]
+    relationships: tuple[SearchHit, ...]
+    scene: tuple[SearchHit, ...]
     episodes: tuple[SearchHit, ...]
     facts: tuple[SearchHit, ...]
     procedures: tuple[SearchHit, ...]
     affect: tuple[SearchHit, ...]
     traits: tuple[SearchHit, ...]
     conflicts: tuple[ContextConflict, ...]
+    unknowns: tuple[ContextUnknown, ...]
     occurred_from: datetime | None
     occurred_until: datetime | None
     frames: tuple[str, ...]
+    places: tuple[str, ...]
     omitted: int
     chars: int
+    elapsed_ms: int
+    deadline_exceeded: bool
 
     @property
     def hits(self) -> tuple[SearchHit, ...]:
@@ -1538,6 +1620,9 @@ class ContextBundle:
         if self.conflicts:
             lines.extend(("", "## Conflicts"))
             lines.extend(_conflict_line(conflict) for conflict in self.conflicts)
+        if self.unknowns:
+            lines.extend(("", "## Unknowns"))
+            lines.extend(f"- {item.kind.value}: {item.detail}" for item in self.unknowns)
         if self.omitted > 0:
             lines.extend(("", f"Omitted: {self.omitted} lower-ranked candidates"))
         return "\n".join(lines)
@@ -1546,6 +1631,8 @@ class ContextBundle:
         """Return the sections in their fixed rendering order."""
         return (
             ("Actors", self.actors),
+            ("Relationships", self.relationships),
+            ("Scene", self.scene),
             ("Facts", self.facts),
             ("Episodes", self.episodes),
             ("Procedures", self.procedures),

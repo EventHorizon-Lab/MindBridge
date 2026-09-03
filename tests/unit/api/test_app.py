@@ -29,6 +29,8 @@ from mindbridge.types import (
     ContextBudget,
     ContextBundle,
     ContextConflict,
+    ContextUnknown,
+    ContextUnknownKind,
     MemoryCapabilities,
     MemoryRecord,
     MemoryType,
@@ -86,6 +88,10 @@ CONFLICT = ContextConflict(
     predicate="location",
     values=("berlin", "paris"),
     memory_ids=("memory_1", "memory_2"),
+)
+UNKNOWN = ContextUnknown(
+    kind=ContextUnknownKind.BUDGET_EXCLUDED,
+    detail="3 candidates did not fit 24 items and 6000 chars",
 )
 
 
@@ -679,6 +685,9 @@ def test_health_reports_the_live_composition() -> None:
         "consolidation_model": None,
         "speaker_recognition": True,
         "streaming_generation": False,
+        # Derived from the backends above: an agent reads which operations it may call instead
+        # of inferring the mapping from a modality set.
+        "operations": ["ask"],
     }
 
 
@@ -789,6 +798,7 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
                     "memory_types": ["episodic", "semantic"],
                     "min_confidence": 0.5,
                     "freshness_seconds": 3_600,
+                    "max_latency_ms": 250,
                 },
                 "reference_at": NOW.isoformat(),
             },
@@ -805,6 +815,7 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
                 memory_types=frozenset({MemoryType.EPISODIC, MemoryType.SEMANTIC}),
                 min_confidence=0.5,
                 freshness=timedelta(hours=1),
+                max_latency_ms=250,
             ),
             NOW,
             None,
@@ -818,6 +829,7 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
         "memory_types": ["episodic", "semantic"],
         "min_confidence": 0.5,
         "freshness_seconds": 3_600.0,
+        "max_latency_ms": 250,
     }
     assert [hit["id"] for hit in bundle["facts"]] == ["memory_1"]
     assert [hit["id"] for hit in bundle["episodes"]] == ["memory_2"]
@@ -831,11 +843,20 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
             "memory_ids": ["memory_1", "memory_2"],
         }
     ]
+    assert bundle["unknowns"] == [
+        {
+            "kind": "budget_excluded",
+            "detail": "3 candidates did not fit 24 items and 6000 chars",
+        }
+    ]
     assert bundle["occurred_from"] == "2026-08-27T00:00:00Z"
     assert bundle["occurred_until"] == "2026-08-28T00:00:00Z"
     assert bundle["frames"] == ["home/map"]
+    assert bundle["places"] == ["kitchen"]
+    assert bundle["relationships"] == [] and bundle["scene"] == []
     assert bundle["omitted"] == 3
     assert bundle["chars"] == 42
+    assert (bundle["elapsed_ms"], bundle["deadline_exceeded"]) == (7, False)
     assert bundle["rendered"].startswith("# Context: What should I bring?")
     # The bundle serializes hits through the same asset model every other route uses.
     assert bundle["episodes"][0]["assets"] == [
@@ -864,6 +885,7 @@ def test_the_context_route_defaults_to_the_sdk_budget() -> None:
         "memory_types": None,
         "min_confidence": 0.0,
         "freshness_seconds": None,
+        "max_latency_ms": None,
     }
 
 
@@ -982,23 +1004,29 @@ def _record(
 
 
 def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
-    """Two populated sections, one empty one, and one conflict."""
+    """Two populated sections, empty ones, one conflict, and one explicit unknown."""
     return ContextBundle(
         goal="What should I bring?",
         reference_at=reference_at,
         budget=budget,
         actors=(),
+        relationships=(),
+        scene=(),
         episodes=(_media_hit(),),
         facts=(_hit(),),
         procedures=(),
         affect=(),
         traits=(),
         conflicts=(CONFLICT,),
+        unknowns=(UNKNOWN,),
         occurred_from=OCCURRED_FROM,
         occurred_until=OCCURRED_UNTIL,
         frames=("home/map",),
+        places=("kitchen",),
         omitted=3,
         chars=42,
+        elapsed_ms=7,
+        deadline_exceeded=False,
     )
 
 

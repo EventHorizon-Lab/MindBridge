@@ -32,6 +32,8 @@ from mindbridge.types import (
     ContextBudget,
     ContextBundle,
     ContextConflict,
+    ContextUnknown,
+    ContextUnknownKind,
     FaceObservation,
     IdentityErasure,
     IdentityProfile,
@@ -115,6 +117,10 @@ CONFLICT = ContextConflict(
     predicate="location",
     values=("berlin", "paris"),
     memory_ids=("memory_1", "memory_2"),
+)
+UNKNOWN = ContextUnknown(
+    kind=ContextUnknownKind.BUDGET_EXCLUDED,
+    detail="3 candidates did not fit 24 items and 6000 chars",
 )
 
 
@@ -960,6 +966,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
                     "memory_types": ["episodic", "semantic"],
                     "min_confidence": 0.5,
                     "freshness_seconds": 3_600,
+                    "max_latency_ms": 250,
                 },
                 "reference_at": NOW.isoformat(),
             },
@@ -977,6 +984,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
                 memory_types=frozenset({MemoryType.EPISODIC, MemoryType.SEMANTIC}),
                 min_confidence=0.5,
                 freshness=timedelta(hours=1),
+                max_latency_ms=250,
             ),
             NOW,
             None,
@@ -992,6 +1000,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
         "memory_types": ["episodic", "semantic"],
         "min_confidence": 0.5,
         "freshness_seconds": 3_600.0,
+        "max_latency_ms": 250,
     }
     assert [hit["id"] for hit in bundle["facts"]] == ["memory_1"]
     assert [hit["id"] for hit in bundle["episodes"]] == ["memory_2"]
@@ -1005,9 +1014,18 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
             "memory_ids": ["memory_1", "memory_2"],
         }
     ]
+    assert bundle["unknowns"] == [
+        {
+            "kind": "budget_excluded",
+            "detail": "3 candidates did not fit 24 items and 6000 chars",
+        }
+    ]
     assert bundle["frames"] == ["home/map"]
+    assert bundle["places"] == ["kitchen"]
+    assert bundle["relationships"] == [] and bundle["scene"] == []
     assert bundle["omitted"] == 3
     assert bundle["chars"] == 42
+    assert (bundle["elapsed_ms"], bundle["deadline_exceeded"]) == (7, False)
     assert bundle["rendered"].startswith("# Context: What should I bring?")
     # The bundle serializes hits through the same asset model every other tool uses.
     assert bundle["episodes"][0]["assets"] == [
@@ -1028,6 +1046,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
         "memory_types": None,
         "min_confidence": 0.0,
         "freshness_seconds": None,
+        "max_latency_ms": None,
     }
 
 
@@ -1037,11 +1056,10 @@ async def test_the_server_greeting_advertises_the_configured_composition() -> No
         instructions = client.instructions
 
     assert instructions is not None
-    assert "Embedding accepts: image, text" in instructions
-    assert "Configured backends: generation." in instructions
-    assert "Not configured: consolidation, face, formation, transcription, vision." in instructions
-    assert "Speaker recognition: yes. Streaming generation: no." in instructions
     assert "Prefer compile_context for task-ready context" in instructions
+    # The greeting embeds the capability document verbatim, so an agent reads every model
+    # identity and every modality set, not the prose subset this used to publish.
+    assert json.loads(instructions[instructions.index("{") :]) == CAPABILITIES.document()
 
 
 def test_the_guard_only_trusts_codes_derived_from_the_exception_tree() -> None:
@@ -1099,23 +1117,29 @@ def _record(
 
 
 def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
-    """Two populated sections, one empty one, and one conflict."""
+    """Two populated sections, empty ones, one conflict, and one explicit unknown."""
     return ContextBundle(
         goal="What should I bring?",
         reference_at=reference_at,
         budget=budget,
         actors=(),
+        relationships=(),
+        scene=(),
         episodes=(_media_hit(),),
         facts=(_hit(),),
         procedures=(),
         affect=(),
         traits=(),
         conflicts=(CONFLICT,),
+        unknowns=(UNKNOWN,),
         occurred_from=OCCURRED_FROM,
         occurred_until=OCCURRED_UNTIL,
         frames=("home/map",),
+        places=("kitchen",),
         omitted=3,
         chars=42,
+        elapsed_ms=7,
+        deadline_exceeded=False,
     )
 
 

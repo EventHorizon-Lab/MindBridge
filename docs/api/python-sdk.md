@@ -296,8 +296,12 @@ compile(
 
 `compile` runs the same retrieval path once with a candidate limit of
 `max(100, 3 * budget.max_items)`, then partitions, filters, and budgets the result into a
-`ContextBundle`. It calls no generation model and never resolves a conflict; `ask` is unchanged.
-[Context compilation](../context-compilation.md) owns the contract.
+`ContextBundle`. It calls no generation model, stores no memory, and never resolves a conflict;
+like `search`, and through the same helper, it may cache a transcript for spoken query media.
+`budget.max_latency_ms` is a deadline checked between stages, never a cancellation, and the bundle
+reports `elapsed_ms`, `deadline_exceeded`, and the `unknowns` the request implied but the bundle
+does not carry. `ask` is unchanged. [Context compilation](../context-compilation.md) owns the
+contract.
 
 ```text
 capabilities -> MemoryCapabilities  # property
@@ -527,7 +531,7 @@ These are the 99 supported names exported by `mindbridge`:
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `ContextUnknownKind`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
@@ -555,9 +559,10 @@ The principal immutable values are:
 | `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial`, `place_id` |
 | `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `spatial`, `cue_modality`, `valence`, `arousal` |
 | `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m`, `place_id` |
-| `ContextBudget` | `max_chars`, `max_items`, `memory_types`, `min_confidence`, `freshness` |
+| `ContextBudget` | `max_chars`, `max_items`, `memory_types`, `min_confidence`, `freshness`, `max_latency_ms` |
 | `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
-| `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`; `hits` property and `render()` |
+| `ContextUnknown` | `kind` (a `ContextUnknownKind`), `detail` |
+| `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`; `hits` property and `render()` |
 | `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `rationale` |
 | `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `rolled_back_at` |
 | `ConsolidationReport` | `operations`, `rejected` as `(MemoryOperation, reason)` pairs |
@@ -574,7 +579,7 @@ The principal immutable values are:
 | `TracedSearchResult` | `hits`, `trace` |
 | `RetrievalTrace` | `candidates`, `candidate_limit`, `exhaustive`, `ambiguous` |
 | `RetrievalCandidateTrace` | `memory_id`, `index_ids`, `dense_relevance`, `dense_confidence`, `lexical_relevance`, `lexical_rerank_bonus`, `lexical_match`, `gate_relevance`, `base_relevance`, `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`, `rejected_by` |
-| `MemoryCapabilities` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `consolidation_model`, `speaker_recognition`, `streaming_generation` |
+| `MemoryCapabilities` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `consolidation_model`, `speaker_recognition`, `streaming_generation`; `operations` property and `document()` |
 
 `abstained` is true only when the answerer returns MindBridge's reserved no-evidence sentence. A
 provider refusal expressed another way is an ordinary answer unless the adapter maps it to this

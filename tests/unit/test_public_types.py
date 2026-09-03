@@ -24,6 +24,8 @@ from mindbridge.types import (
     AnswerResult,
     AssetRef,
     Blob,
+    ContextUnknown,
+    ContextUnknownKind,
     MemoryRecord,
     MemoryType,
     Modality,
@@ -244,6 +246,18 @@ def test_answer_and_page_reuse_the_public_values() -> None:
     with pytest.raises(ValidationError, match="must agree"):
         AnswerResult(answer="unknown", abstained=True)
     assert Page(items=(memory,), next_cursor="cursor_1").items == (memory,)
+
+
+def test_a_context_unknown_states_one_typed_reason() -> None:
+    unknown = ContextUnknown(
+        kind=ContextUnknownKind.SCOPE_EMPTY,
+        detail="no memory matched the requested scope: place workshop",
+    )
+
+    assert unknown.kind is ContextUnknownKind.SCOPE_EMPTY
+    for invalid in ({"kind": "scope_empty"}, {"detail": "  "}, {"detail": 7}):
+        with pytest.raises(ValidationError):
+            ContextUnknown(**{"kind": unknown.kind, "detail": unknown.detail, **invalid})  # type: ignore[arg-type]
 
 
 def test_public_exceptions_have_stable_categories() -> None:

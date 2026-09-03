@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import timedelta
 from functools import wraps
 from typing import Annotated, Any, ParamSpec, TypeVar, cast
@@ -27,6 +27,7 @@ from mindbridge.types import (
     ContextBudget,
     ContextBundle,
     ContextConflict,
+    ContextUnknownKind,
     FaceObservation,
     IdentityErasure,
     IdentityProfile,
@@ -49,18 +50,10 @@ _Cursor = Annotated[str, StringConstraints(min_length=1)]
 _Chars = Annotated[int, Field(strict=True, ge=1, le=MAX_TEXT_CHARACTERS)]
 _Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 _Seconds = Annotated[float, Field(gt=0.0)]
+_Milliseconds = Annotated[int, Field(strict=True, ge=1)]
 # Budget defaults are read from the SDK value, so the advertised tool default cannot drift from
 # `ContextBudget`.
 _BUDGET = ContextBudget()
-# The optional backends whose presence an agent needs before it calls the tool that needs them.
-# Each names a modality set on `MemoryCapabilities`; a non-empty set means one is configured.
-_OPTIONAL_BACKENDS: tuple[str, ...] = (
-    "generation",
-    "transcription",
-    "vision",
-    "face",
-    "formation",
-)
 _READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 _NON_IDEMPOTENT_WRITE = ToolAnnotations(
     read_only_hint=False,
@@ -165,7 +158,9 @@ _BUDGET_DESCRIPTION = (
     " `max_items` (1 through 100) the number of memories; `memory_types` keeps only the named"
     " types; `min_confidence` drops typed memories below it, counting an untyped record as 1.0;"
     " `freshness_seconds` keeps only memories anchored within that many seconds of the reference"
-    " clock. Null uses the defaults, which are 6,000 characters and 24 items."
+    " clock; `max_latency_ms` is a deadline after which optional work is skipped rather than a"
+    " timeout that aborts, and the bundle reports `elapsed_ms` and `deadline_exceeded`. Null uses"
+    " the defaults, which are 6,000 characters and 24 items with no deadline."
 )
 _MEMORY_ID_DESCRIPTION = (
     "The `id` a previous `add_memory`, `search_memories`, or `list_memories` result returned."
@@ -297,6 +292,7 @@ class ContextBudgetInput(StrictModel):
     memory_types: Annotated[list[MemoryType], Field(min_length=1)] | None = None
     min_confidence: _Confidence = _BUDGET.min_confidence
     freshness_seconds: _Seconds | None = None
+    max_latency_ms: _Milliseconds | None = None
 
 
 class ContextBudgetResult(BaseModel):
@@ -305,6 +301,7 @@ class ContextBudgetResult(BaseModel):
     memory_types: tuple[MemoryType, ...] | None
     min_confidence: float
     freshness_seconds: float | None
+    max_latency_ms: int | None
 
 
 class ContextConflictResult(BaseModel):
@@ -315,22 +312,33 @@ class ContextConflictResult(BaseModel):
     memory_ids: tuple[str, ...]
 
 
+class ContextUnknownResult(BaseModel):
+    kind: ContextUnknownKind
+    detail: str
+
+
 class ContextBundleResult(BaseModel):
     goal: str
     reference_at: AwareDatetime
     budget: ContextBudgetResult
     actors: tuple[SearchHitResult, ...]
+    relationships: tuple[SearchHitResult, ...]
+    scene: tuple[SearchHitResult, ...]
     episodes: tuple[SearchHitResult, ...]
     facts: tuple[SearchHitResult, ...]
     procedures: tuple[SearchHitResult, ...]
     affect: tuple[SearchHitResult, ...]
     traits: tuple[SearchHitResult, ...]
     conflicts: tuple[ContextConflictResult, ...]
+    unknowns: tuple[ContextUnknownResult, ...]
     occurred_from: AwareDatetime | None
     occurred_until: AwareDatetime | None
     frames: tuple[str, ...]
+    places: tuple[str, ...]
     omitted: int
     chars: int
+    elapsed_ms: int
+    deadline_exceeded: bool
     rendered: str
 
 
@@ -564,6 +572,9 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
             abstention_reason=result.abstention_reason,
         )
 
+    # The same annotation `search_memories` carries, because it is the same side effect: the
+    # shared retrieval path may cache a transcript for spoken query media. Compiling stores no
+    # memory, but it is not read-only, so the honest hint is the one search already publishes.
     @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
     @_stable_errors
     def compile_context(
@@ -584,8 +595,13 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
         disagreements are reported in `conflicts` and never resolved for you. `ask_memory` remains
         a convenience for when you want one grounded sentence instead of the evidence.
 
-        Calls no generation model and writes no memory, so it needs no generation backend and is
-        safe to retry, though it may cache a transcript for media it had to transcribe.
+        Sections it cannot fill and evidence a bound excluded are named in `unknowns`, so a thin
+        bundle says why it is thin instead of looking like an empty store.
+
+        Calls no generation model and stores no memory, so it needs no generation backend and is
+        safe to retry. Like `search_memories`, and through the same code path, it may cache a
+        transcript for spoken query media -- a cache of your own input, never a new memory --
+        which is why it is not annotated read-only.
         """
         return _bundle_result(
             memory.compile(
@@ -938,6 +954,7 @@ def _context_budget(budget: ContextBudgetInput | None) -> ContextBudget | None:
             if budget.freshness_seconds is None
             else timedelta(seconds=budget.freshness_seconds)
         ),
+        max_latency_ms=budget.max_latency_ms,
     )
 
 
@@ -947,17 +964,25 @@ def _bundle_result(bundle: ContextBundle) -> ContextBundleResult:
         reference_at=bundle.reference_at,
         budget=_budget_result(bundle.budget),
         actors=tuple(_search_hit_result(hit) for hit in bundle.actors),
+        relationships=tuple(_search_hit_result(hit) for hit in bundle.relationships),
+        scene=tuple(_search_hit_result(hit) for hit in bundle.scene),
         episodes=tuple(_search_hit_result(hit) for hit in bundle.episodes),
         facts=tuple(_search_hit_result(hit) for hit in bundle.facts),
         procedures=tuple(_search_hit_result(hit) for hit in bundle.procedures),
         affect=tuple(_search_hit_result(hit) for hit in bundle.affect),
         traits=tuple(_search_hit_result(hit) for hit in bundle.traits),
         conflicts=tuple(_conflict_result(conflict) for conflict in bundle.conflicts),
+        unknowns=tuple(
+            ContextUnknownResult(kind=item.kind, detail=item.detail) for item in bundle.unknowns
+        ),
         occurred_from=bundle.occurred_from,
         occurred_until=bundle.occurred_until,
         frames=bundle.frames,
+        places=bundle.places,
         omitted=bundle.omitted,
         chars=bundle.chars,
+        elapsed_ms=bundle.elapsed_ms,
+        deadline_exceeded=bundle.deadline_exceeded,
         rendered=bundle.render(),
     )
 
@@ -969,6 +994,7 @@ def _budget_result(budget: ContextBudget) -> ContextBudgetResult:
         memory_types=None if budget.memory_types is None else tuple(sorted(budget.memory_types)),
         min_confidence=budget.min_confidence,
         freshness_seconds=(None if budget.freshness is None else budget.freshness.total_seconds()),
+        max_latency_ms=budget.max_latency_ms,
     )
 
 
@@ -985,37 +1011,23 @@ def _conflict_result(conflict: ContextConflict) -> ContextConflictResult:
 def _instructions(capabilities: MemoryCapabilities) -> str:
     """Render the declared capability view an agent reads when it connects.
 
-    MCP fixes `instructions` at construction, so this is a snapshot of the composition the server
-    was built with rather than a live reading; `/healthz` is the live one.
+    The document is `MemoryCapabilities.document()` verbatim -- the same object `/healthz` serves
+    and `mindbridge doctor` prints -- rather than a prose subset that used to omit every model
+    identity and every non-embedding modality set. MCP fixes `instructions` at construction, so
+    this is a snapshot of the composition the server was built with; `/healthz` is the live one.
     """
-    optional = (*_OPTIONAL_BACKENDS, "consolidation")
-    configured = [name for name in _OPTIONAL_BACKENDS if getattr(capabilities, name)]
-    if capabilities.consolidation_model is not None:
-        configured.append("consolidation")
     return "\n".join(
         (
             "MindBridge is local multimodal memory for one physical data directory.",
-            f"Embedding accepts: {_names(m.value for m in capabilities.embedding)}"
-            f" (model {capabilities.embedding_model}, space {capabilities.embedding_space},"
-            f" {capabilities.embedding_dimension} dimensions).",
-            f"Configured backends: {_names(configured)}.",
-            f"Not configured: {_names(n for n in optional if n not in configured)}.",
-            f"Speaker recognition: {_yes_no(capabilities.speaker_recognition)}."
-            f" Streaming generation: {_yes_no(capabilities.streaming_generation)}.",
             "Prefer compile_context for task-ready context; ask_memory remains a convenience for"
             " one grounded sentence.",
             "Cognitive forgetting, consolidation and operation rollback have no tool here; they"
             " stay with the process that owns this memory.",
+            "Declared capabilities of this composition, the same JSON document GET /healthz"
+            " serves. `operations` names the optional operations these backends can serve:",
+            json.dumps(capabilities.document(), indent=2, sort_keys=True),
         )
     )
-
-
-def _names(values: Iterable[str]) -> str:
-    return ", ".join(sorted(values)) or "none"
-
-
-def _yes_no(available: bool) -> str:
-    return "yes" if available else "no"
 
 
 def _asset_result(asset: AssetRef) -> AssetResult:
