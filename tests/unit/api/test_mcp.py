@@ -1102,6 +1102,79 @@ async def test_every_tool_and_argument_carries_usable_prose() -> None:
     assert "backend_not_configured" in cast(str, descriptions["ask_memory"])
 
 
+_READ_TOOLS = {
+    "search_memories",
+    "ask_memory",
+    "compile_context",
+    "get_memory",
+    "list_memories",
+}
+_WRITE_TOOLS = {"add_memory", "delete_memory", "reinforce_memories"}
+_EMBODIED_TOOLS = {"analyze_speech", "analyze_faces"}
+_IDENTITY_TOOLS = {
+    "register_speaker",
+    "register_identity",
+    "get_identity",
+    "unlink_identity",
+    "forget_identity",
+}
+
+
+async def _exposed(**switches: bool) -> set[str]:
+    async with Client(build_mcp_server(cast(Memory, FakeMemory()), **switches)) as client:
+        return {tool.name for tool in (await client.list_tools()).tools}
+
+
+async def test_every_tool_belongs_to_exactly_one_withholdable_group() -> None:
+    """Gate 5 wants recall and compile alone, so every group has to be nameable.
+
+    The read tools are the floor: `compile_context` and `search_memories` in particular must
+    survive every combination, because withholding them would leave an agent nothing to consume.
+    """
+    groups = (_READ_TOOLS, _WRITE_TOOLS, _EMBODIED_TOOLS, _IDENTITY_TOOLS)
+    published = await _exposed()
+
+    assert published == set().union(*groups)
+    assert len(published) == sum(len(group) for group in groups) == 15
+
+    assert await _exposed(write_operations=False) == published - _WRITE_TOOLS
+    assert await _exposed(embodied_operations=False) == published - _EMBODIED_TOOLS
+    # One mixed combination: an agent that may name people but not create or analyze anything.
+    assert (
+        await _exposed(write_operations=False, embodied_operations=False)
+        == _READ_TOOLS | _IDENTITY_TOOLS
+    )
+    assert (
+        await _exposed(
+            write_operations=False,
+            embodied_operations=False,
+            identity_operations=False,
+        )
+        == _READ_TOOLS
+    )
+
+
+async def test_a_withheld_group_is_announced_and_its_tools_are_unknown() -> None:
+    """A withheld tool must fail as unknown, and the instructions must say what is missing."""
+    server = build_mcp_server(
+        cast(Memory, FakeMemory()),
+        identity_operations=False,
+        embodied_operations=False,
+        write_operations=False,
+    )
+    async with Client(server) as client:
+        refused = [
+            await client.call_tool("add_memory", {"content": "x"}),
+            await client.call_tool("analyze_faces", {"memory_id": "memory_1"}),
+        ]
+
+    assert all(result.is_error is True for result in refused)
+    instructions = cast(str, server.instructions)
+    assert "Identity operations are not exposed here" in instructions
+    assert "Embodied operations are not exposed here" in instructions
+    assert "This memory is read-only to you" in instructions
+
+
 async def test_a_host_can_withhold_the_identity_tools_from_an_agent() -> None:
     """Naming people is host authority, so the host decides whether it is on the wire."""
     identity_tools = {

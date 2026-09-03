@@ -226,7 +226,8 @@ it as `confirmed=False` with the naming evidence in `evidence_ids`, and a compil
 lists them in `actors` as a labelled `ProvisionalActor`, so an agent can say that somebody it does
 not recognize is present rather than omitting them. Naming stays host authority: the MCP adapter
 says so in the tool descriptions and can withhold the identity tools entirely with
-`build_mcp_server(memory, identity_operations=False)`.
+`build_mcp_server(memory, identity_operations=False)`, the two analysis tools with
+`embodied_operations=False`, and every mutating tool with `write_operations=False`.
 
 `forget_identity` removes the person's biometric exemplars, aliases, naming assertions, and
 indexed name while retaining the surrounding memories, media, and transcript words. It is intentionally different from

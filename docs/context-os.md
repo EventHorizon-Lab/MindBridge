@@ -239,7 +239,8 @@ High-rate sensor streams stay on the embedded SDK boundary. Agents operate on co
 observations or stable asset identifiers. Cognitive forgetting, consolidation, operation rollback,
 retention policy, and physical deletion stay with the process that owns the memory; identity
 naming, merge reversal, and erasure are separate trusted tools that no ordinary recall or compile
-call grants.
+call grants, and a host withholds them, the two analysis tools, or every mutating tool by
+building the server without that group.
 
 All interfaces call one owner of one physical `data_dir`. Supporting several agents against that
 owner does not introduce logical account or request scope into the memory contract. A hosted
@@ -310,11 +311,16 @@ defaults or justify superiority claims.
    reports: `compile()`. Open: a downstream-task measurement against the no-memory,
    full-context, and retrieval-only baselines, and the person link, which needs an identity edge
    the bundle cannot reach today.
-5. Extend REST or MCP only after the Python contract and authority model are stable. Done for the
-   compiler and for one capability document rendered identically by `/healthz`, the MCP server
-   instructions, and `mindbridge doctor`; the control-plane intents stay off REST and MCP. Open:
-   a supported switch for withholding the embodied and identity tools from an MCP server, so a
-   host can expose recall and compile alone.
+5. Extend REST or MCP only after the Python contract and authority model are stable. Done: the
+   compiler; one capability document rendered identically by `/healthz`, the MCP server
+   instructions, and `mindbridge doctor`; and the three switches
+   `build_mcp_server(identity_operations=, embodied_operations=, write_operations=)`, which
+   withhold naming and erasing a person, the two analysis tools -- and with them the
+   cross-modal identity merge `analyze_faces` commits -- and adding, deleting and reinforcing.
+   Each withholds by never registering the group, so a withheld tool is unknown rather than
+   refused, and the instructions name what is missing. All three False leaves exactly the five
+   read tools, which is recall and compile alone. The control-plane intents stay off REST and
+   MCP.
 
 Fast capture is now independent of slow reasoning, the control plane governs the lifecycle through
 validated, logged, reversible operations, and the compiler produces budgeted task-ready context.

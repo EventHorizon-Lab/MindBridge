@@ -241,9 +241,11 @@ gate in the [benchmark protocol](benchmarking.md#mandatory-controls).
 Supported SDK values are imported from `mindbridge`. The `Memory` SDK exposes 28 product
 operations. REST exposes nine `/v1` routes: add, batch add, list, search, reinforce, get, delete,
 answer, and compile context. MCP exposes fifteen tools: the eight corresponding non-batch
-operations plus speech, face, and identity operations, or ten when the host builds it with
-`identity_operations=False`, because naming and erasing a person is host authority and the host
-decides whether it is on the wire at all. The local CLI exposes the 28 operations
+operations plus speech, face, and identity operations, or fewer when the host withholds a group
+with `identity_operations=False`, `embodied_operations=False`, or `write_operations=False`,
+because naming a person, binding a face to a voice, and changing durable state are host
+authority and the host decides whether each is on the wire at all. All three withheld leaves the
+five read tools. The local CLI exposes the 28 operations
 plus `doctor`; `--url` is limited to operations implemented by REST.
 
 Compiling context is a read-only view. The memory control plane — `consolidation_candidates()`,
