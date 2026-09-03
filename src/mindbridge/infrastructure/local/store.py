@@ -21,6 +21,7 @@ from mindbridge.models.base import FaceAnalysis, SpeechAnalysis
 from mindbridge.types import (
     EvidenceBasis,
     FaceObservation,
+    IdentityErasure,
     IdentityProfile,
     MemoryContext,
     MemoryKind,
@@ -30,7 +31,7 @@ from mindbridge.types import (
     SpeakerSegment,
 )
 
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 11
 _SQLITE_PARAMETER_BATCH = 900
 _FACE_EXEMPLAR_LIMIT = 10
 _VOICE_EXEMPLAR_LIMIT = 20
@@ -381,6 +382,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS memory_operations_active_key_idx
     WHERE rolled_back_at IS NULL;
 """
 
+_PLACE_COLUMN_DDL = """
+ALTER TABLE memory_records
+ADD COLUMN place_id TEXT CHECK (
+    place_id IS NULL OR (length(place_id) > 0 AND place_id = trim(place_id))
+)
+"""
+
+# A symbolic room-level label, complementary to the metric pose on `memory_semantics`: the pose
+# answers "within 2 m of here", this answers "in the kitchen", which is what a household query
+# asks and the only spatial label a robot can supply when it cannot localise. It lives on
+# `memory_records` rather than on the semantic row because the semantic row is conditional -- a
+# memory added without a former and without an `ObservationContext` has none -- and a place scope
+# that silently skipped those memories would be worse than no place scope. Partial, so a store
+# that labels nothing carries no index pages.
+_PLACE_INDEX_DDL = """
+CREATE INDEX memory_records_place_idx
+    ON memory_records (place_id, memory_id)
+    WHERE place_id IS NOT NULL
+"""
+
 _SCHEMA_V10 = f"""
 BEGIN IMMEDIATE;
 
@@ -399,11 +420,15 @@ CREATE TABLE memory_records (
     access_count INTEGER NOT NULL DEFAULT 0 CHECK (access_count BETWEEN 0 AND 20),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL CHECK (updated_at >= created_at),
+    place_id TEXT CHECK (
+        place_id IS NULL OR (length(place_id) > 0 AND place_id = trim(place_id))
+    ),
     forgotten_at TEXT
 );
 
 CREATE INDEX memory_records_created_idx
     ON memory_records (created_at DESC, memory_id DESC);
+{_PLACE_INDEX_DDL};
 
 CREATE TABLE embeddings (
     embedding_id TEXT PRIMARY KEY,
@@ -444,7 +469,7 @@ CREATE INDEX search_index_queue_order_idx
 
 {_INDEX_TRIGGERS}
 
-PRAGMA user_version = 10;
+PRAGMA user_version = 11;
 COMMIT;
 """
 
@@ -706,9 +731,11 @@ class StoredMemory:
     access_count: int = 0
     forgotten_at: datetime | None = None
     context: MemoryContext | None = None
+    place_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.memory_id, "memory_id")
+        _require_optional_identifier(self.place_id, "place_id")
         object.__setattr__(self, "modality", _modality(self.modality, asset=False))
         if self.memory_type not in _MEMORY_TYPES:
             raise ValueError("memory_type must be semantic, episodic, or procedural")
@@ -740,7 +767,16 @@ class StoredMemory:
 
 @dataclass(frozen=True, slots=True)
 class StoredEmbedding:
-    """An FP32 vector retained in SQLite so the search index is rebuildable."""
+    """An FP32 vector retained in SQLite so the search index is rebuildable.
+
+    Vector *content* is checked once, where a vector enters SQLite (`_write_embedding`), and not
+    here. Hydrating a search candidate rebuilds this value ~100 times per search while the search
+    path reads only `embedding_id`, `memory_id` and `object_part` from it -- the vector itself is
+    consumed solely by `ZvecIndex.upsert`, which validates what it consumes. Re-checking finiteness
+    and unit length in `__post_init__` therefore cost two O(dimension) Python loops per candidate
+    per search and bought nobody anything: 4.91 ms to hydrate 100 candidates of 1024 dimensions, of
+    which 3.39 ms was those loops.
+    """
 
     embedding_id: str
     memory_id: str
@@ -761,15 +797,6 @@ class StoredEmbedding:
         _require_aware(self.created_at, "created_at")
         if self.object_part < 0:
             raise ValueError("object_part must not be negative")
-        if not self.values or not all(math.isfinite(value) for value in self.values):
-            raise ValueError("embedding values must be finite and non-empty")
-        if self.normalized and not math.isclose(
-            math.sqrt(sum(value * value for value in self.values)),
-            1.0,
-            rel_tol=1e-4,
-            abs_tol=1e-6,
-        ):
-            raise ValueError("normalized embedding must have unit length")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -838,6 +865,27 @@ class IndexDocument:
     def __post_init__(self) -> None:
         if self.memory_type not in _MEMORY_TYPES:
             raise ValueError("memory_type must be semantic, episodic, or procedural")
+        _require_interval(self.occurred_at, self.occurred_end)
+
+
+@dataclass(frozen=True, slots=True)
+class IndexCandidate:
+    """Ranking-path projection of an indexed embedding.
+
+    Retrieval ranks on index scores and event times; it never reads the stored vector or the
+    memory content. Hydrating a full ``IndexDocument`` for that would unpack and revalidate one
+    FP32 vector per candidate, which measured at twenty-one times the cost of the query that
+    produced the row. This projection reads the four columns ranking uses.
+    """
+
+    embedding_id: str
+    memory_id: str
+    occurred_at: datetime | None = None
+    occurred_end: datetime | None = None
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.embedding_id, "embedding_id")
+        _require_identifier(self.memory_id, "memory_id")
         _require_interval(self.occurred_at, self.occurred_end)
 
 
@@ -1383,7 +1431,7 @@ class LocalStore:
                 """
                 SELECT memory_id, content, modality, memory_type, metadata_json,
                        occurred_at, occurred_end, last_accessed_at, access_count,
-                       created_at, updated_at, forgotten_at
+                       created_at, updated_at, place_id, forgotten_at
                 FROM memory_records
                 WHERE memory_id = ?
                 """,
@@ -1407,13 +1455,22 @@ class LocalStore:
         known_at: datetime | None = None,
         near: SpatialContext | None = None,
         radius_m: float | None = None,
+        place_id: str | None = None,
         active_only: bool = False,
     ) -> tuple[StoredMemory, ...]:
-        """Hydrate existing memories with one query and preserve input ranking."""
+        """Hydrate existing memories with one query and preserve input ranking.
+
+        `place_id` scopes the slate to one symbolic place. It is a hard filter, unlike `near`/
+        `radius_m` which the caller applies to metric pose, and it is applied in SQL so a scoped
+        hydration reads only the rows it returns.
+        """
         if not memory_ids:
             return ()
         for memory_id in memory_ids:
             _require_identifier(memory_id, "memory_id")
+        _require_optional_identifier(place_id, "place_id")
+        place_clause = "" if place_id is None else "AND place_id = ?"
+        place_parameters: tuple[object, ...] = () if place_id is None else (place_id,)
         rows: list[sqlite3.Row] = []
         with self._read_transaction() as connection:
             for offset in range(0, len(memory_ids), _SQLITE_PARAMETER_BATCH):
@@ -1424,11 +1481,12 @@ class LocalStore:
                         f"""
                         SELECT memory_id, content, modality, memory_type, metadata_json,
                                occurred_at, occurred_end, last_accessed_at, access_count,
-                               created_at, updated_at, forgotten_at
+                               created_at, updated_at, place_id, forgotten_at
                         FROM memory_records
                         WHERE memory_id IN ({placeholders})
+                        {place_clause}
                         """,
-                        tuple(batch),
+                        (*batch, *place_parameters),
                     ).fetchall()
                 )
             assets_by_memory = self._read_memory_assets(connection, tuple(memory_ids))
@@ -1453,8 +1511,13 @@ class LocalStore:
                 row["forgotten_at"] is None
                 and (
                     (
-                        valid_at is None
-                        and near is None
+                        # A record with no `memory_semantics` row declares no validity interval, so
+                        # it is valid at every `valid_at` exactly like a version row whose
+                        # `valid_from` and `valid_until` are NULL; only recorded time can exclude
+                        # it, and there `created_at` is the honest bound. `near` is separate and
+                        # spatial: a record with no pose is not at any location, so it drops just
+                        # as a semantic row without a pose does above.
+                        near is None
                         and _row_text(row, "memory_id") not in semantic_ids
                         and (
                             known_at is None
@@ -1548,7 +1611,7 @@ class LocalStore:
                 f"""
                 SELECT memory_id, content, modality, memory_type, metadata_json,
                        occurred_at, occurred_end, last_accessed_at, access_count,
-                       created_at, updated_at, forgotten_at
+                       created_at, updated_at, place_id, forgotten_at
                 FROM memory_records
                 {where}
                 ORDER BY created_at DESC, memory_id DESC
@@ -1841,6 +1904,9 @@ class LocalStore:
         *,
         model_id: str,
         space_id: str,
+        # Provenance and calibration live on MemoryConfig.speaker_similarity/speaker_margin in
+        # plugins.py; every product call site passes them, so treat these literals as a test
+        # convenience and not as a settled threshold.
         minimum_similarity: float = 0.78,
         minimum_margin: float = 0.05,
         preferred_identity: str | None = None,
@@ -1864,6 +1930,7 @@ class LocalStore:
         *,
         model_id: str,
         space_id: str,
+        # See write_speech: MemoryConfig.speaker_similarity/speaker_margin own these values.
         minimum_similarity: float = 0.78,
         minimum_margin: float = 0.05,
         preferred_identity: str | None = None,
@@ -2072,6 +2139,7 @@ class LocalStore:
         model_id: str,
         space_id: str,
         analysis_space_id: str | None = None,
+        # See write_speech: MemoryConfig.face_similarity/face_margin own these values.
         minimum_similarity: float = 0.363,
         minimum_margin: float = 0.05,
         preferred_identity: str | None = None,
@@ -2575,6 +2643,126 @@ class LocalStore:
             )
             return alias_id
 
+    def identity_equivalence_class(self, identity_id: str) -> tuple[str, ...] | None:
+        """Return every ID that names one identity: the canonical ID first, then its aliases.
+
+        Accepts a canonical ID or any merged alias, and returns None when none of them is
+        known. Note what this is *not* useful for: `link_identities` re-points every speech
+        segment, face observation and exemplar onto the canonical ID, so expanding a read
+        across the returned class retrieves exactly what the canonical ID alone retrieves.
+        The class is the erasure and audit surface -- which IDs still admit a forgotten
+        person -- not a recall lever.
+        """
+        _require_identifier(identity_id, "identity_id")
+        with self._connection() as connection:
+            return self._identity_equivalence_class(connection, identity_id)
+
+    @staticmethod
+    def _identity_equivalence_class(
+        connection: sqlite3.Connection,
+        identity_id: str,
+    ) -> tuple[str, ...] | None:
+        resolved_id = _resolve_identity_id(connection, identity_id)
+        if resolved_id is None:
+            return None
+        aliases = connection.execute(
+            "SELECT alias_id FROM identity_aliases WHERE identity_id = ? ORDER BY alias_id",
+            (resolved_id,),
+        ).fetchall()
+        return (resolved_id, *(_row_text(row, "alias_id") for row in aliases))
+
+    def forget_identity(
+        self,
+        identity_id: str,
+        *,
+        memories: Iterable[StoredMemory] = (),
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> IdentityErasure | None:
+        """Erase one person's identity cluster, keeping the memories that mention them.
+
+        Accepts a canonical ID or any merged alias and removes the whole cluster: the profile,
+        every face and voice exemplar, every alias, and the accumulated cross-modal link
+        evidence. Returns None, changing nothing, when no such identity exists.
+
+        Memories, their content and their media assets survive -- deleting a person must not
+        delete the family's memory of the events. Their identity annotations do not: speech
+        segments keep their transcript with `speaker_id` scrubbed to NULL, and face
+        observations are removed outright, because a face row's entire payload is a box plus
+        the identity claim and stripping the claim leaves only a biometric locator. The
+        cached `face_analyses`/`speech_analyses` rows deliberately stay, so re-analysing
+        already stored media cannot re-mint the person from the same clip.
+
+        No tombstone is recorded, and this deliberately does not stop a future encounter from
+        minting a fresh identity. Recognising someone as previously-forgotten requires keeping
+        their template, which is the one thing the request asked to destroy; a deployment that
+        wants "never recognise this person again" needs a retained blocklist, which is not a
+        deletion and must not be spelled like one.
+
+        Pass `memories` and `embeddings` to atomically replace indexed documents that named the
+        person, exactly as `register_identity` does -- the erasure commits in SQLite before the
+        outbox tells the projection.
+
+        Recoverability, stated plainly: freed cells are zero-filled (`PRAGMA secure_delete`) and
+        the write-ahead log is checkpointed and truncated afterwards, so the exemplar bytes are
+        no longer present in `state.sqlite3` or its `-wal`. This store runs no `VACUUM`, and
+        nothing here reaches filesystem snapshots, backups, or blocks an SSD retains through
+        wear levelling; full-disk encryption remains the only defence against those.
+        """
+        _require_identifier(identity_id, "identity_id")
+        supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
+            memories,
+            embeddings,
+        )
+        with self._transaction(secure_delete=True) as connection:
+            members = self._identity_equivalence_class(connection, identity_id)
+            if members is None:
+                return None
+            resolved_id = members[0]
+            exemplars = {
+                _identity_modality(row["modality"]): int(row["count"])
+                for row in connection.execute(
+                    """
+                    SELECT modality, COUNT(*) AS count
+                    FROM identity_exemplars
+                    WHERE identity_id = ?
+                    GROUP BY modality
+                    """,
+                    (resolved_id,),
+                ).fetchall()
+            }
+            segments = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM speech_segments WHERE speaker_id = ?",
+                    (resolved_id,),
+                ).fetchone()["count"]
+            )
+            # face_observations.identity_id is NOT NULL, so the RESTRICT that guards it cannot
+            # be satisfied by anonymising in place the way speech segments are.
+            observations = connection.execute(
+                "DELETE FROM face_observations WHERE identity_id = ?",
+                (resolved_id,),
+            ).rowcount
+            # Cascades the aliases, exemplars and link evidence; NULLs the speech segments.
+            connection.execute("DELETE FROM identities WHERE identity_id = ?", (resolved_id,))
+            self._replace_memory_embeddings(
+                connection,
+                supplied_memories,
+                supplied_embeddings,
+                supplied_by_memory,
+            )
+        # After the commit, and best effort: a busy checkpoint leaves the zeroed pages in the
+        # log rather than losing them, and the next checkpoint still applies them.
+        with self._connection() as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return IdentityErasure(
+            identity_id=resolved_id,
+            alias_ids=members[1:],
+            face_exemplars=exemplars.get("face", 0),
+            voice_exemplars=exemplars.get("voice", 0),
+            face_observations=observations,
+            speech_segments=segments,
+        )
+
     @staticmethod
     def _identity_link_plan(
         connection: sqlite3.Connection,
@@ -2663,6 +2851,51 @@ class LocalStore:
                 (limit,),
             ).fetchall()
         return tuple(_asset_from_row(row) for row in rows)
+
+    def asset_retention_candidates(
+        self,
+        *,
+        created_before: datetime | None = None,
+        limit: int = 100,
+    ) -> tuple[StoredAsset, ...]:
+        """List stored assets oldest first, so a retention window can be expressed.
+
+        Media is the overwhelming majority of storage growth, so retention is a cost and
+        privacy mechanism. This is the read half only: it reports what a policy could drop,
+        never drops anything, and includes assets a memory still references -- `memory_assets`
+        holds those under RESTRICT, so dropping one is a separate decision with its own
+        contract. Pair with `asset_storage_bytes` for a size budget and
+        `list_unreferenced_assets` for the already-collectable subset.
+        """
+        if not 1 <= limit <= 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        if created_before is not None:
+            _require_aware(created_before, "created_before")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT asset_id, modality, mime_type, size_bytes, sha256,
+                       relative_path, name, transcript, created_at
+                FROM media_assets
+                WHERE ? IS NULL OR created_at < ?
+                ORDER BY created_at, asset_id
+                LIMIT ?
+                """,
+                (
+                    _optional_datetime_text(created_before),
+                    _optional_datetime_text(created_before),
+                    limit,
+                ),
+            ).fetchall()
+        return tuple(_asset_from_row(row) for row in rows)
+
+    def asset_storage_bytes(self) -> int:
+        """Return the total size of every stored media asset descriptor."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(SUM(size_bytes), 0) AS total FROM media_assets"
+            ).fetchone()
+        return int(row["total"])
 
     def delete_asset_if_unreferenced(self, asset_id: str) -> bool:
         """Delete one unreferenced descriptor after its CAS file has been removed."""
@@ -2756,6 +2989,38 @@ class LocalStore:
         for row in rows:
             document = _index_document_from_row(row)
             by_id[document.embedding.embedding_id] = document
+        return tuple(by_id[embedding_id] for embedding_id in embedding_ids if embedding_id in by_id)
+
+    def read_index_candidates(
+        self,
+        embedding_ids: Sequence[str],
+    ) -> tuple[IndexCandidate, ...]:
+        """Project indexed embeddings onto the columns ranking reads, preserving input order."""
+        if not embedding_ids:
+            return ()
+        for embedding_id in embedding_ids:
+            _require_identifier(embedding_id, "embedding_id")
+        by_id: dict[str, IndexCandidate] = {}
+        with self._connection() as connection:
+            for offset in range(0, len(embedding_ids), _SQLITE_PARAMETER_BATCH):
+                batch = embedding_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+                placeholders = ", ".join("?" for _embedding_id in batch)
+                for row in connection.execute(
+                    f"""
+                    SELECT e.embedding_id, e.memory_id, m.occurred_at, m.occurred_end
+                    FROM embeddings AS e
+                    JOIN memory_records AS m ON m.memory_id = e.memory_id
+                    WHERE e.embedding_id IN ({placeholders})
+                    """,
+                    tuple(batch),
+                ):
+                    candidate = IndexCandidate(
+                        embedding_id=_row_text(row, "embedding_id"),
+                        memory_id=_row_text(row, "memory_id"),
+                        occurred_at=_optional_datetime_from_row(row, "occurred_at"),
+                        occurred_end=_optional_datetime_from_row(row, "occurred_end"),
+                    )
+                    by_id[candidate.embedding_id] = candidate
         return tuple(by_id[embedding_id] for embedding_id in embedding_ids if embedding_id in by_id)
 
     def read_memory_index_documents(
@@ -2924,6 +3189,9 @@ class LocalStore:
             if version == 9:
                 _migrate_v9(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 10:
+                _migrate_v10(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
                 raise UnsupportedSchemaError(
@@ -2935,7 +3203,7 @@ class LocalStore:
                 raise UnsupportedSchemaError(f"local schema is missing required tables: {names}")
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
+    def _connection(self, *, secure_delete: bool = False) -> Iterator[sqlite3.Connection]:
         self._require_open()
         connection = sqlite3.connect(self.database_path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
@@ -2945,13 +3213,18 @@ class LocalStore:
                 connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = FULL")
             connection.execute("PRAGMA busy_timeout = 30000")
+            if secure_delete:
+                # Zero-fill freed cells instead of leaving them legible in free pages. Scoped
+                # to erasure: it costs extra page writes on every DELETE, and the outbox
+                # acknowledges by deleting rows on the hot path.
+                connection.execute("PRAGMA secure_delete = ON")
             yield connection
         finally:
             connection.close()
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
-        with self._connection() as connection:
+    def _transaction(self, *, secure_delete: bool = False) -> Iterator[sqlite3.Connection]:
+        with self._connection(secure_delete=secure_delete) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 yield connection
@@ -2976,6 +3249,9 @@ class LocalStore:
         connection: sqlite3.Connection,
         embedding: StoredEmbedding,
     ) -> None:
+        # The only place a caller-supplied vector reaches the authoritative table, and so the only
+        # place its content is checked. See StoredEmbedding for why hydration does not repeat this.
+        _require_storable_vector(embedding.values, normalized=embedding.normalized)
         connection.execute(
             """
             INSERT INTO embeddings (
@@ -3077,8 +3353,9 @@ class LocalStore:
             """
             INSERT INTO memory_records (
                 memory_id, content, modality, memory_type, metadata_json,
-                occurred_at, occurred_end, last_accessed_at, access_count, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                occurred_at, occurred_end, last_accessed_at, access_count, created_at, updated_at,
+                place_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (memory_id) DO UPDATE SET
                 content = excluded.content,
                 modality = excluded.modality,
@@ -3086,7 +3363,8 @@ class LocalStore:
                 metadata_json = excluded.metadata_json,
                 occurred_at = excluded.occurred_at,
                 occurred_end = excluded.occurred_end,
-                updated_at = MAX(memory_records.updated_at, excluded.updated_at)
+                updated_at = MAX(memory_records.updated_at, excluded.updated_at),
+                place_id = excluded.place_id
             """,
             (
                 memory.memory_id,
@@ -3100,6 +3378,7 @@ class LocalStore:
                 memory.access_count,
                 _datetime_text(memory.created_at),
                 _datetime_text(memory.updated_at),
+                memory.place_id,
             ),
         )
         for asset in memory.assets:
@@ -3735,11 +4014,48 @@ def _migrate_v9(connection: sqlite3.Connection) -> None:
         record_columns = {
             str(row[1]) for row in connection.execute("PRAGMA table_info(memory_records)")
         }
+        indexes = {
+            str(row[1])
+            for row in connection.execute("PRAGMA index_list(memory_records)")
+            if row[1] is not None
+        }
         connection.execute("BEGIN IMMEDIATE")
+        if "place_id" not in record_columns:
+            connection.execute(_PLACE_COLUMN_DDL)
+        if "memory_records_place_idx" not in indexes:
+            connection.execute(_PLACE_INDEX_DDL)
+        connection.execute("PRAGMA user_version = 10")
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def _migrate_v10(connection: sqlite3.Connection) -> None:
+    """Add forgetting state and the control-plane tables.
+
+    A store created by a v10 development build may carry either the place column or the
+    forgetting column but not both, so every step is guarded rather than assumed.
+    """
+    try:
+        record_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(memory_records)")
+        }
+        indexes = {
+            str(row[1])
+            for row in connection.execute("PRAGMA index_list(memory_records)")
+            if row[1] is not None
+        }
+        connection.execute("BEGIN IMMEDIATE")
+        if "place_id" not in record_columns:
+            connection.execute(_PLACE_COLUMN_DDL)
+        if "memory_records_place_idx" not in indexes:
+            connection.execute(_PLACE_INDEX_DDL)
         if "forgotten_at" not in record_columns:
             connection.execute("ALTER TABLE memory_records ADD COLUMN forgotten_at TEXT")
         connection.executescript(_CONTROL_SCHEMA)
-        connection.execute("PRAGMA user_version = 10")
+        connection.execute("PRAGMA user_version = 11")
         connection.commit()
     except BaseException:
         if connection.in_transaction:
@@ -4565,6 +4881,7 @@ def _memory_from_row(
         content=_row_text(row, "content"),
         modality=_row_text(row, "modality"),
         memory_type=_row_text(row, "memory_type"),
+        place_id=_optional_row_text(row, "place_id"),
         assets=assets,
         metadata_json=_row_text(row, "metadata_json"),
         occurred_at=_optional_datetime_from_row(row, "occurred_at"),
@@ -4891,6 +5208,19 @@ def _merge_identity_exemplars(
         )
 
 
+def _require_storable_vector(values: tuple[float, ...], *, normalized: bool) -> None:
+    """Check vector content once, at the boundary where it becomes authoritative."""
+    if not values or not all(math.isfinite(value) for value in values):
+        raise ValueError("embedding values must be finite and non-empty")
+    if normalized and not math.isclose(
+        math.sqrt(sum(value * value for value in values)),
+        1.0,
+        rel_tol=1e-4,
+        abs_tol=1e-6,
+    ):
+        raise ValueError("normalized embedding must have unit length")
+
+
 def _pack_vector(values: tuple[float, ...]) -> bytes:
     return struct.pack(f"<{len(values)}f", *values)
 
@@ -5092,6 +5422,11 @@ def _require_interval(start: datetime | None, end: datetime | None) -> None:
 def _require_identifier(value: str, name: str) -> None:
     if not value or value != value.strip():
         raise ValueError(f"{name} must be non-empty and trimmed")
+
+
+def _require_optional_identifier(value: str | None, name: str) -> None:
+    if value is not None:
+        _require_identifier(value, name)
 
 
 def _identity_name(value: str, field: str = "name") -> str:

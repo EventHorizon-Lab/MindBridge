@@ -1,8 +1,8 @@
-"""Focused checks for the seven local-memory MCP tools."""
+"""Focused checks for the local-memory MCP tools."""
 
 import base64
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -12,6 +12,7 @@ from mcp import Client
 from mcp.types import CallToolResult, TextContent
 
 from mindbridge import Memory
+from mindbridge.api import content
 from mindbridge.api import mcp as mcp_adapter
 from mindbridge.api.mcp import build_mcp_server
 from mindbridge.exceptions import (
@@ -31,14 +32,22 @@ from mindbridge.types import (
     ContextBudget,
     ContextBundle,
     ContextConflict,
+    FaceObservation,
+    IdentityErasure,
+    IdentityProfile,
     MemoryCapabilities,
     MemoryRecord,
     MemoryType,
     Modality,
     ObservationContext,
     Page,
+    RetrievalCandidateTrace,
+    RetrievalRejection,
     RetrievalScope,
+    RetrievalTrace,
     SearchHit,
+    SpeakerSegment,
+    TracedSearchResult,
 )
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
@@ -54,6 +63,32 @@ ENVELOPE_FIELDS = {
     "trace_id",
     "issues",
 }
+SEGMENT = SpeakerSegment(
+    asset_id="b" * 64,
+    start_ms=0,
+    end_ms=1500,
+    text="Where is the toolbox?",
+    speaker_id="speaker_1",
+    speaker_name="Ann",
+    identity_score=0.82,
+)
+FACE = FaceObservation(
+    asset_id="c" * 64,
+    bounding_box=(0.1, 0.2, 0.3, 0.4),
+    identity_id="identity_1",
+    identity_name="Ann",
+    identity_score=0.77,
+    observed_at_ms=250,
+)
+ERASURE = IdentityErasure(
+    identity_id="identity_1",
+    alias_ids=("identity_4",),
+    face_exemplars=3,
+    voice_exemplars=2,
+    face_observations=7,
+    speech_segments=11,
+)
+PROFILE = IdentityProfile(identity_id="identity_1", name="Ann", relationship="daughter")
 ASSET = AssetRef(
     id="asset_image",
     modality=Modality.IMAGE,
@@ -63,15 +98,16 @@ ASSET = AssetRef(
     name="frame.png",
     path=Path("/private/mindbridge/assets/frame.png"),
 )
+
+
 CAPABILITIES = MemoryCapabilities(
-    modalities=frozenset({Modality.TEXT, Modality.IMAGE, Modality.AUDIO}),
-    answer=True,
-    transcribe=True,
-    faces=False,
-    describe_vision=False,
-    form=True,
-    consolidate=False,
-    decay=True,
+    embedding=frozenset({Modality.TEXT, Modality.IMAGE}),
+    embedding_model="jina-v5-omni",
+    embedding_space="space_1",
+    embedding_dimension=1024,
+    generation=frozenset({Modality.TEXT}),
+    generation_model="qwen3-omni",
+    speaker_recognition=True,
 )
 CONFLICT = ContextConflict(
     lineage_id="lineage_1",
@@ -87,7 +123,8 @@ class FakeMemory:
         self.calls: list[tuple[object, ...]] = []
         self.close_count = 0
         self.failure = failure
-        self.forgotten_at: datetime | None = None
+        self.profile: IdentityProfile | None = PROFILE
+        self.restored: str | None = "identity_3"
 
     def add(
         self,
@@ -137,18 +174,34 @@ class FakeMemory:
         )
         return (_hit(),)
 
-    def ask(
+    def search_with_trace(
         self,
-        question: ContentInput,
+        query: ContentInput,
         *,
-        limit: int = 5,
+        limit: int = 10,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
         scope: RetrievalScope | None = None,
-    ) -> AnswerResult:
+    ) -> TracedSearchResult:
         self._fail()
-        self.calls.append(("ask", question, limit, memory_type, reference_at))
-        return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
+        self.calls.append(
+            (
+                "search_with_trace",
+                query,
+                limit,
+                memory_type,
+                reference_at,
+                occurred_from,
+                occurred_until,
+            )
+        )
+        return TracedSearchResult(hits=(), trace=_trace())
+
+    @property
+    def capabilities(self) -> MemoryCapabilities:
+        return CAPABILITIES
 
     def compile(
         self,
@@ -162,13 +215,28 @@ class FakeMemory:
         self.calls.append(("compile", goal, budget, reference_at, scope))
         return _bundle(budget or ContextBudget(), reference_at or NOW)
 
-    def capabilities(self) -> MemoryCapabilities:
-        return CAPABILITIES
+    def reinforce(self, memory_ids: Sequence[str]) -> int:
+        self._fail()
+        self.calls.append(("reinforce", tuple(memory_ids)))
+        return len(tuple(dict.fromkeys(memory_ids)))
+
+    def ask(
+        self,
+        question: ContentInput,
+        *,
+        limit: int = 5,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> AnswerResult:
+        self._fail()
+        self.calls.append(("ask", question, limit, memory_type, reference_at))
+        return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
 
     def get(self, memory_id: str) -> MemoryRecord:
         self._fail()
         self.calls.append(("get", memory_id))
-        return _record(memory_id=memory_id, forgotten_at=self.forgotten_at)
+        return _record(memory_id=memory_id)
 
     def list(self, *, limit: int = 100, cursor: str | None = None) -> Page:
         self._fail()
@@ -180,6 +248,51 @@ class FakeMemory:
         self.calls.append(("delete", memory_id))
         return True
 
+    def speech(self, memory_id: str) -> tuple[SpeakerSegment, ...]:
+        self._fail()
+        self.calls.append(("speech", memory_id))
+        return (SEGMENT,)
+
+    def faces(self, memory_id: str) -> tuple[FaceObservation, ...]:
+        self._fail()
+        self.calls.append(("faces", memory_id))
+        return (FACE,)
+
+    def register_speaker(
+        self,
+        speaker_id: str,
+        name: str,
+        *,
+        relationship: str | None = None,
+    ) -> None:
+        self._fail()
+        self.calls.append(("register_speaker", speaker_id, name, relationship))
+
+    def register_identity(
+        self,
+        identity_id: str,
+        name: str,
+        *,
+        relationship: str | None = None,
+    ) -> None:
+        self._fail()
+        self.calls.append(("register_identity", identity_id, name, relationship))
+
+    def identity(self, identity_id: str) -> IdentityProfile | None:
+        self._fail()
+        self.calls.append(("identity", identity_id))
+        return self.profile
+
+    def unlink_identity(self, alias_id: str) -> str | None:
+        self._fail()
+        self.calls.append(("unlink_identity", alias_id))
+        return self.restored
+
+    def forget_identity(self, identity_id: str) -> IdentityErasure:
+        self._fail()
+        self.calls.append(("forget_identity", identity_id))
+        return ERASURE
+
     def close(self) -> None:
         self.close_count += 1
 
@@ -188,7 +301,7 @@ class FakeMemory:
             raise self.failure
 
 
-async def test_mcp_publishes_only_the_seven_flat_local_tools() -> None:
+async def test_mcp_publishes_only_the_flat_local_tools() -> None:
     server = build_mcp_server(cast(Memory, FakeMemory()))
 
     async with Client(server) as client:
@@ -202,6 +315,14 @@ async def test_mcp_publishes_only_the_seven_flat_local_tools() -> None:
         "get_memory",
         "list_memories",
         "delete_memory",
+        "analyze_speech",
+        "analyze_faces",
+        "register_speaker",
+        "register_identity",
+        "get_identity",
+        "unlink_identity",
+        "forget_identity",
+        "reinforce_memories",
     }
     assert {name: set(tool.input_schema["properties"]) for name, tool in tools.items()} == {
         "add_memory": {
@@ -220,12 +341,21 @@ async def test_mcp_publishes_only_the_seven_flat_local_tools() -> None:
             "occurred_from",
             "occurred_until",
             "scope",
+            "explain",
         },
         "ask_memory": {"question", "limit", "memory_type", "reference_at", "scope"},
         "compile_context": {"goal", "budget", "reference_at", "scope"},
         "get_memory": {"memory_id"},
         "list_memories": {"limit", "cursor"},
         "delete_memory": {"memory_id"},
+        "analyze_speech": {"memory_id"},
+        "analyze_faces": {"memory_id"},
+        "register_speaker": {"speaker_id", "name", "relationship"},
+        "register_identity": {"identity_id", "name", "relationship"},
+        "get_identity": {"identity_id"},
+        "unlink_identity": {"alias_id"},
+        "forget_identity": {"identity_id"},
+        "reinforce_memories": {"memory_ids"},
     }
     assert tools["get_memory"].annotations is not None
     assert tools["get_memory"].annotations.read_only_hint is True
@@ -237,122 +367,27 @@ async def test_mcp_publishes_only_the_seven_flat_local_tools() -> None:
     assert tools["ask_memory"].annotations.read_only_hint is False
     assert tools["delete_memory"].annotations is not None
     assert tools["delete_memory"].annotations.destructive_hint is True
+    # Compiling reads only, but may cache a transcript, so it cannot claim to be read-only.
     assert tools["compile_context"].annotations is not None
     assert tools["compile_context"].annotations.read_only_hint is False
-    description = tools["compile_context"].description or ""
-    assert "Prefer this tool" in description
-    assert "`ask_memory` remains a convenience" in description
+    assert tools["get_identity"].annotations is not None
+    assert tools["get_identity"].annotations.read_only_hint is True
+    assert tools["register_speaker"].annotations is not None
+    assert tools["register_speaker"].annotations.idempotent_hint is True
+    # Reversing a merge discards the alias's evidence, and reinforcement accumulates, so neither
+    # may claim to be a safe no-op on retry.
+    assert tools["unlink_identity"].annotations is not None
+    assert tools["unlink_identity"].annotations.destructive_hint is True
+    assert tools["reinforce_memories"].annotations is not None
+    assert tools["reinforce_memories"].annotations.read_only_hint is False
+    assert tools["reinforce_memories"].annotations.idempotent_hint is False
+    # Analysis persists identity evidence, so it cannot be advertised read-only.
+    for analysis in ("analyze_speech", "analyze_faces"):
+        annotations = tools[analysis].annotations
+        assert annotations is not None
+        assert annotations.read_only_hint is False
     published = json.dumps({name: tool.input_schema for name, tool in tools.items()})
     assert all(field not in published for field in ("tenant_id", "user_id", "run_id"))
-
-
-async def test_mcp_serializes_the_cognitive_forgetting_state_of_a_record() -> None:
-    """Cognitive forgetting is auditable over the wire: `get_memory` still returns the record."""
-    memory = FakeMemory()
-    memory.forgotten_at = datetime(2026, 9, 3, 9, 0, tzinfo=timezone.utc)
-    server = build_mcp_server(cast(Memory, memory))
-
-    async with Client(server) as client:
-        found = await client.call_tool("get_memory", {"memory_id": "memory_1"})
-
-    assert found.structured_content is not None
-    assert found.structured_content["forgotten_at"] == "2026-09-03T09:00:00Z"
-
-
-async def test_mcp_instructions_advertise_the_configured_capability_view() -> None:
-    async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
-        instructions = client.instructions
-
-    assert instructions is not None
-    assert "Modalities: audio, image, text." in instructions
-    assert "Capabilities: answer, decay, form, transcribe." in instructions
-    assert "Unavailable: consolidate, describe_vision, faces." in instructions
-    assert "Prefer compile_context for task-ready context" in instructions
-    assert "cognitive forgetting" in instructions
-
-
-async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_paths() -> None:
-    memory = FakeMemory()
-
-    async with Client(build_mcp_server(cast(Memory, memory))) as client:
-        compiled = await client.call_tool(
-            "compile_context",
-            {
-                "goal": "  What should I bring?  ",
-                "budget": {
-                    "max_chars": 2_000,
-                    "max_items": 8,
-                    "memory_types": ["episodic", "semantic"],
-                    "min_confidence": 0.5,
-                    "freshness_seconds": 3_600,
-                },
-                "reference_at": NOW.isoformat(),
-            },
-        )
-        defaulted = await client.call_tool("compile_context", {"goal": "What should I bring?"})
-
-    assert compiled.is_error is False
-    assert memory.calls == [
-        (
-            "compile",
-            "What should I bring?",
-            ContextBudget(
-                max_chars=2_000,
-                max_items=8,
-                memory_types=frozenset({MemoryType.EPISODIC, MemoryType.SEMANTIC}),
-                min_confidence=0.5,
-                freshness=timedelta(hours=1),
-            ),
-            NOW,
-            None,
-        ),
-        ("compile", "What should I bring?", None, None, None),
-    ]
-    bundle = compiled.structured_content
-    assert bundle is not None
-    assert bundle["goal"] == "What should I bring?"
-    assert bundle["budget"] == {
-        "max_chars": 2_000,
-        "max_items": 8,
-        "memory_types": ["episodic", "semantic"],
-        "min_confidence": 0.5,
-        "freshness_seconds": 3_600.0,
-    }
-    assert [hit["id"] for hit in bundle["facts"]] == ["memory_1"]
-    assert [hit["id"] for hit in bundle["episodes"]] == ["memory_2"]
-    assert bundle["actors"] == []
-    assert bundle["conflicts"] == [
-        {
-            "lineage_id": "lineage_1",
-            "subject": "ana",
-            "predicate": "location",
-            "values": ["berlin", "paris"],
-            "memory_ids": ["memory_1", "memory_2"],
-        }
-    ]
-    assert bundle["frames"] == ["home/map"]
-    assert bundle["omitted"] == 3
-    assert bundle["chars"] == 42
-    assert bundle["rendered"].startswith("# Context: What should I bring?")
-    assert bundle["episodes"][0]["assets"] == [
-        {
-            "id": "asset_image",
-            "modality": "image",
-            "media_type": "image/png",
-            "size_bytes": 3,
-            "sha256": "a" * 64,
-            "name": "frame.png",
-        }
-    ]
-    assert "/private/mindbridge/assets" not in json.dumps(bundle)
-    assert defaulted.structured_content is not None
-    assert defaulted.structured_content["budget"] == {
-        "max_chars": 6_000,
-        "max_items": 24,
-        "memory_types": None,
-        "min_confidence": 0.0,
-        "freshness_seconds": None,
-    }
 
 
 async def test_mcp_returns_structured_results_and_does_not_close_injected_memory() -> None:
@@ -403,6 +438,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
         "occurred_end": None,
         "metadata": {"room": "workshop"},
         "context": None,
+        "place_id": None,
         "forgotten_at": None,
     }
     assert searched.structured_content is not None
@@ -441,6 +477,133 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
         ("delete", "memory_1"),
     ]
     assert memory.close_count == 0
+
+
+async def test_mcp_dispatches_the_embodied_and_identity_operations() -> None:
+    """An agent driving a robot can ask who spoke and who was seen, and name them."""
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        speech = await client.call_tool("analyze_speech", {"memory_id": "memory_1"})
+        faces = await client.call_tool("analyze_faces", {"memory_id": "memory_1"})
+        named_speaker = await client.call_tool(
+            "register_speaker",
+            {"speaker_id": "speaker_1", "name": "Ann", "relationship": "daughter"},
+        )
+        named_identity = await client.call_tool(
+            "register_identity",
+            {"identity_id": "identity_1", "name": "Ann"},
+        )
+        identity = await client.call_tool("get_identity", {"identity_id": "identity_1"})
+        unlinked = await client.call_tool("unlink_identity", {"alias_id": "identity_3"})
+        reinforced = await client.call_tool(
+            "reinforce_memories",
+            {"memory_ids": ["memory_1", "memory_2", "memory_1"]},
+        )
+
+    assert speech.structured_content == {
+        "segments": [
+            {
+                "asset_id": "b" * 64,
+                "start_ms": 0,
+                "end_ms": 1500,
+                "text": "Where is the toolbox?",
+                "speaker_id": "speaker_1",
+                "speaker_name": "Ann",
+                "identity_score": 0.82,
+            }
+        ]
+    }
+    assert faces.structured_content == {
+        "observations": [
+            {
+                "asset_id": "c" * 64,
+                "bounding_box": [0.1, 0.2, 0.3, 0.4],
+                "identity_id": "identity_1",
+                "identity_name": "Ann",
+                "identity_score": 0.77,
+                "observed_at_ms": 250,
+            }
+        ]
+    }
+    assert named_speaker.structured_content == {"registered": True}
+    assert named_identity.structured_content == {"registered": True}
+    assert identity.structured_content == {
+        "identity": {
+            "identity_id": "identity_1",
+            "name": "Ann",
+            "relationship": "daughter",
+        }
+    }
+    assert unlinked.structured_content == {"restored_identity_id": "identity_3"}
+    assert reinforced.structured_content == {"reinforced": 2}
+    assert memory.calls == [
+        ("speech", "memory_1"),
+        ("faces", "memory_1"),
+        ("register_speaker", "speaker_1", "Ann", "daughter"),
+        # An omitted relationship stays omitted rather than clearing the recorded one.
+        ("register_identity", "identity_1", "Ann", None),
+        ("identity", "identity_1"),
+        ("unlink_identity", "identity_3"),
+        ("reinforce", ("memory_1", "memory_2", "memory_1")),
+    ]
+
+
+async def test_mcp_reports_an_absent_identity_and_an_irreversible_merge_structurally() -> None:
+    """The two "nothing to report" answers are typed nulls, not prose an agent must read."""
+    memory = FakeMemory()
+    memory.profile = None
+    memory.restored = None
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        identity = await client.call_tool("get_identity", {"identity_id": "identity_9"})
+        unlinked = await client.call_tool("unlink_identity", {"alias_id": "identity_9"})
+
+    assert identity.is_error is False
+    assert identity.structured_content == {"identity": None}
+    assert unlinked.is_error is False
+    assert unlinked.structured_content == {"restored_identity_id": None}
+
+
+async def test_mcp_erases_a_person_and_reports_what_was_destroyed() -> None:
+    """ "Forget me" is an agent-facing request wherever "who was that" is."""
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        forgotten = await client.call_tool("forget_identity", {"identity_id": "identity_1"})
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+    assert forgotten.structured_content == {
+        "erasure": {
+            "identity_id": "identity_1",
+            "alias_ids": ["identity_4"],
+            "face_exemplars": 3,
+            "voice_exemplars": 2,
+            "face_observations": 7,
+            "speech_segments": 11,
+        }
+    }
+    assert memory.calls == [("forget_identity", "identity_1")]
+    # A second call reports the person as unknown, so this is destructive and not idempotent.
+    annotations = tools["forget_identity"].annotations
+    assert annotations is not None
+    assert annotations.destructive_hint is True
+    assert annotations.idempotent_hint is False
+
+
+async def test_reinforce_bounds_its_input_before_memory() -> None:
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        empty = await client.call_tool("reinforce_memories", {"memory_ids": []})
+        oversize = await client.call_tool(
+            "reinforce_memories",
+            {"memory_ids": [f"memory_{index}" for index in range(101)]},
+        )
+
+    assert _error_envelope(empty)["code"] == "validation_error"
+    assert _error_envelope(oversize)["code"] == "validation_error"
+    assert memory.calls == []
 
 
 async def test_mcp_maps_ordered_openai_parts_and_returns_safe_asset_metadata() -> None:
@@ -549,7 +712,7 @@ async def test_mcp_bounds_inline_media_before_memory(
     part: dict[str, object],
 ) -> None:
     memory = FakeMemory()
-    monkeypatch.setattr(mcp_adapter, "_MAX_INLINE_MEDIA_BYTES", 2)
+    monkeypatch.setattr(content, "MAX_INLINE_MEDIA_BYTES", 2)
 
     async with Client(build_mcp_server(cast(Memory, memory))) as client:
         result = await client.call_tool("add_memory", {"content": [part]})
@@ -687,6 +850,230 @@ async def test_mcp_never_serializes_a_provider_exception_behind_a_model_error() 
     assert _error_envelope(result)["reason"] == "auth_failed"
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (MemoryNotFoundError("memory is missing"), "memory_not_found"),
+        (ModelError("provider is busy", reason="rate_limited"), "model_error"),
+        (StorageError("durable write failed"), "storage_error"),
+        (IndexUnavailableError("index rebuild failed"), "index_unavailable"),
+        (RuntimeError("private bug"), "internal_error"),
+    ],
+)
+async def test_every_failure_text_is_a_bare_json_envelope(
+    failure: Exception,
+    expected_code: str,
+) -> None:
+    """The recoverable codes are exactly the ones an agent must parse to decide to retry."""
+    async with Client(build_mcp_server(cast(Memory, FakeMemory(failure)))) as client:
+        result = await client.call_tool("get_memory", {"memory_id": "memory_1"})
+
+    text = _error_text(result)
+    envelope = json.loads(text)
+    assert result.is_error is True
+    assert text.lstrip().startswith("{")
+    assert set(envelope) == ENVELOPE_FIELDS
+    assert envelope["code"] == expected_code
+
+
+async def test_middleware_and_tool_failures_share_one_parse() -> None:
+    async with Client(build_mcp_server(cast(Memory, FakeMemory(StorageError("no disk"))))) as (
+        client
+    ):
+        from_middleware = await client.call_tool(
+            "get_memory", {"memory_id": "memory_1", "run_id": "x"}
+        )
+        from_tool = await client.call_tool("get_memory", {"memory_id": "memory_1"})
+
+    assert json.loads(_error_text(from_middleware))["code"] == "validation_error"
+    assert json.loads(_error_text(from_tool))["code"] == "storage_error"
+
+
+async def test_search_keeps_its_default_shape_and_explains_an_empty_result() -> None:
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        plain = await client.call_tool("search_memories", {"query": "toolbox"})
+        explained = await client.call_tool("search_memories", {"query": "toolbox", "explain": True})
+
+    assert plain.structured_content is not None
+    assert plain.structured_content["hits"][0]["id"] == "memory_1"
+    assert plain.structured_content["trace"] is None
+    assert explained.structured_content is not None
+    assert explained.structured_content["hits"] == []
+    trace = explained.structured_content["trace"]
+    assert trace is not None
+    assert trace["ambiguous"] is True
+    assert trace["candidate_limit"] == 50
+    assert trace["exhaustive"] is True
+    assert trace["candidates"] == [
+        {
+            "memory_id": "memory_1",
+            "index_ids": ["index_1"],
+            "dense_relevance": 0.42,
+            "dense_confidence": None,
+            "lexical_relevance": None,
+            "lexical_rerank_bonus": None,
+            "lexical_match": False,
+            "gate_relevance": 0.31,
+            "base_relevance": None,
+            "reinforcement_factor": None,
+            "temporal_factor": None,
+            "retention_factor": None,
+            "final_score": 0.4,
+            "rank": None,
+            "rejected_by": "minimum_relevance",
+        }
+    ]
+    assert memory.calls == [
+        ("search", "toolbox", 10, None, None, None, None),
+        ("search_with_trace", "toolbox", 10, None, None, None, None),
+    ]
+
+
+async def test_reinforce_reaches_the_sdk_and_deduplicates_ids() -> None:
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        result = await client.call_tool(
+            "reinforce_memories", {"memory_ids": ["memory_1", "memory_1", "memory_2"]}
+        )
+        empty = await client.call_tool("reinforce_memories", {"memory_ids": []})
+
+    assert result.structured_content == {"reinforced": 2}
+    assert memory.calls == [("reinforce", ("memory_1", "memory_1", "memory_2"))]
+    assert empty.is_error is True
+    assert _error_envelope(empty)["code"] == "validation_error"
+
+
+async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_paths() -> None:
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        compiled = await client.call_tool(
+            "compile_context",
+            {
+                "goal": "  What should I bring?  ",
+                "budget": {
+                    "max_chars": 2_000,
+                    "max_items": 8,
+                    "memory_types": ["episodic", "semantic"],
+                    "min_confidence": 0.5,
+                    "freshness_seconds": 3_600,
+                },
+                "reference_at": NOW.isoformat(),
+            },
+        )
+        defaulted = await client.call_tool("compile_context", {"goal": "What should I bring?"})
+
+    assert compiled.is_error is False
+    assert memory.calls == [
+        (
+            "compile",
+            "What should I bring?",
+            ContextBudget(
+                max_chars=2_000,
+                max_items=8,
+                memory_types=frozenset({MemoryType.EPISODIC, MemoryType.SEMANTIC}),
+                min_confidence=0.5,
+                freshness=timedelta(hours=1),
+            ),
+            NOW,
+            None,
+        ),
+        ("compile", "What should I bring?", None, None, None),
+    ]
+    bundle = compiled.structured_content
+    assert bundle is not None
+    assert bundle["goal"] == "What should I bring?"
+    assert bundle["budget"] == {
+        "max_chars": 2_000,
+        "max_items": 8,
+        "memory_types": ["episodic", "semantic"],
+        "min_confidence": 0.5,
+        "freshness_seconds": 3_600.0,
+    }
+    assert [hit["id"] for hit in bundle["facts"]] == ["memory_1"]
+    assert [hit["id"] for hit in bundle["episodes"]] == ["memory_2"]
+    assert bundle["actors"] == []
+    assert bundle["conflicts"] == [
+        {
+            "lineage_id": "lineage_1",
+            "subject": "ana",
+            "predicate": "location",
+            "values": ["berlin", "paris"],
+            "memory_ids": ["memory_1", "memory_2"],
+        }
+    ]
+    assert bundle["frames"] == ["home/map"]
+    assert bundle["omitted"] == 3
+    assert bundle["chars"] == 42
+    assert bundle["rendered"].startswith("# Context: What should I bring?")
+    # The bundle serializes hits through the same asset model every other tool uses.
+    assert bundle["episodes"][0]["assets"] == [
+        {
+            "id": "asset_image",
+            "modality": "image",
+            "media_type": "image/png",
+            "size_bytes": 3,
+            "sha256": "a" * 64,
+            "name": "frame.png",
+        }
+    ]
+    assert "/private/mindbridge/assets" not in json.dumps(bundle)
+    assert defaulted.structured_content is not None
+    assert defaulted.structured_content["budget"] == {
+        "max_chars": 6_000,
+        "max_items": 24,
+        "memory_types": None,
+        "min_confidence": 0.0,
+        "freshness_seconds": None,
+    }
+
+
+async def test_the_server_greeting_advertises_the_configured_composition() -> None:
+    """An agent learns what this instance supports on connect, without spending a tool call."""
+    async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
+        instructions = client.instructions
+
+    assert instructions is not None
+    assert "Embedding accepts: image, text" in instructions
+    assert "Configured backends: generation." in instructions
+    assert "Not configured: consolidation, face, formation, transcription, vision." in instructions
+    assert "Speaker recognition: yes. Streaming generation: no." in instructions
+    assert "Prefer compile_context for task-ready context" in instructions
+
+
+def test_the_guard_only_trusts_codes_derived_from_the_exception_tree() -> None:
+    """No client path reaches this today; the check is what keeps that true."""
+    forged = dict.fromkeys(ENVELOPE_FIELDS)
+    forged["message"] = "spoofed"
+    real = {**forged, "code": "storage_error"}
+    invented = {**forged, "code": "quota_error"}
+
+    assert mcp_adapter._stable_envelope(_content_result(real)) == real
+    assert mcp_adapter._stable_envelope(_content_result(invented)) is None
+
+
+def _content_result(envelope: Mapping[str, object]) -> dict[str, object]:
+    return {"content": [{"type": "text", "text": json.dumps(envelope)}], "isError": True}
+
+
+async def test_every_tool_and_argument_carries_usable_prose() -> None:
+    """An agent picks tools from these strings alone, so an empty one is a defect."""
+    async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
+        tools = (await client.list_tools()).tools
+
+    for tool in tools:
+        assert tool.description is not None
+        assert len(tool.description.split()) >= 30, tool.name
+        for name, schema in tool.input_schema["properties"].items():
+            assert schema.get("description"), f"{tool.name}.{name}"
+    descriptions = {tool.name: tool.description for tool in tools}
+    assert len(set(descriptions.values())) == len(descriptions)
+    assert "backend_not_configured" in cast(str, descriptions["ask_memory"])
+
+
 def _record(
     *,
     memory_id: str = "memory_1",
@@ -697,7 +1084,6 @@ def _record(
     modality: Modality = Modality.TEXT,
     assets: tuple[AssetRef, ...] = (),
     memory_type: MemoryType = MemoryType.SEMANTIC,
-    forgotten_at: datetime | None = None,
 ) -> MemoryRecord:
     return MemoryRecord(
         id=memory_id,
@@ -709,35 +1095,17 @@ def _record(
         occurred_at=occurred_at,
         occurred_end=occurred_end,
         metadata=metadata or {},
-        forgotten_at=forgotten_at,
-    )
-
-
-def _hit(
-    memory_id: str = "memory_1",
-    *,
-    score: float = 0.9,
-    assets: tuple[AssetRef, ...] = (),
-    memory_type: MemoryType = MemoryType.SEMANTIC,
-) -> SearchHit:
-    return SearchHit(
-        id=memory_id,
-        content="The toolbox is blue.",
-        score=score,
-        modality=Modality.IMAGE if assets else Modality.TEXT,
-        memory_type=memory_type,
-        assets=assets,
-        created_at=NOW,
     )
 
 
 def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
+    """Two populated sections, one empty one, and one conflict."""
     return ContextBundle(
         goal="What should I bring?",
         reference_at=reference_at,
         budget=budget,
         actors=(),
-        episodes=(_hit("memory_2", score=0.7, assets=(ASSET,), memory_type=MemoryType.EPISODIC),),
+        episodes=(_media_hit(),),
         facts=(_hit(),),
         procedures=(),
         affect=(),
@@ -751,6 +1119,47 @@ def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
     )
 
 
+def _media_hit() -> SearchHit:
+    """A hit carrying a stored asset, whose local path must never be serialized."""
+    return SearchHit(
+        id="memory_2",
+        content="The toolbox is blue.",
+        score=0.7,
+        modality=Modality.IMAGE,
+        memory_type=MemoryType.EPISODIC,
+        assets=(ASSET,),
+        created_at=NOW,
+    )
+
+
+def _trace() -> RetrievalTrace:
+    return RetrievalTrace(
+        candidates=(
+            RetrievalCandidateTrace(
+                memory_id="memory_1",
+                index_ids=("index_1",),
+                dense_relevance=0.42,
+                gate_relevance=0.31,
+                final_score=0.4,
+                rejected_by=RetrievalRejection.MINIMUM_RELEVANCE,
+            ),
+        ),
+        candidate_limit=50,
+        exhaustive=True,
+        ambiguous=True,
+    )
+
+
+def _hit() -> SearchHit:
+    return SearchHit(
+        id="memory_1",
+        content="The toolbox is blue.",
+        score=0.9,
+        modality=Modality.TEXT,
+        created_at=NOW,
+    )
+
+
 def _error_text(result: CallToolResult) -> str:
     content = result.content[0]
     assert isinstance(content, TextContent)
@@ -758,5 +1167,5 @@ def _error_text(result: CallToolResult) -> str:
 
 
 def _error_envelope(result: CallToolResult) -> dict[str, object]:
-    text = _error_text(result)
-    return cast(dict[str, object], json.loads(text[text.index("{") :]))
+    # A bare `json.loads` is the contract: no prefix to strip on any failure shape.
+    return cast(dict[str, object], json.loads(_error_text(result)))

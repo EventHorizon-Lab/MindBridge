@@ -243,8 +243,17 @@ class ObservationContext:
     valid_from: datetime | None = None
     valid_until: datetime | None = None
     spatial: SpatialContext | None = None
+    # The symbolic room-level place, as distinct from `spatial`'s metric pose: a robot can label
+    # "kitchen" when it cannot localise, and "in the kitchen" is the query a household asks.
+    # Equality-matched, so a producer must label consistently -- "kitchen" and "the kitchen" would
+    # partition the store, and nothing normalises it beyond rejecting untrimmed text.
+    place_id: str | None = None
 
     def __post_init__(self) -> None:
+        if self.place_id is not None:
+            place = self.place_id
+            if not isinstance(place, str) or not place.strip() or place != place.strip():
+                raise ValidationError("place_id must be non-empty and trimmed")
         if not isinstance(self.basis, EvidenceBasis):
             try:
                 object.__setattr__(self, "basis", EvidenceBasis(self.basis))
@@ -272,16 +281,31 @@ class ObservationContext:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RetrievalScope:
-    """Optional world-time, knowledge-time, and same-frame spatial retrieval scope."""
+    """Optional world-time, knowledge-time, and spatial retrieval scope.
+
+    Two spatial axes, because a household asks in both. `near`/`radius_m` is metric and answers
+    "within two metres of here". `place_id` is symbolic and answers "in the kitchen" — the query a
+    person actually asks, and the one a robot can label when it cannot localise metrically. They
+    are independent: a symbolic equality is the one spatial predicate SQLite indexes cheaply,
+    while the metric radius is a filter over retrieved candidates.
+    """
 
     valid_at: datetime | None = None
     known_at: datetime | None = None
     near: SpatialContext | None = None
     radius_m: float | None = None
+    # `None` means "do not scope by place", never "memories that have no place".
+    place_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.valid_at, "scope valid_at")
         _require_aware(self.known_at, "scope known_at")
+        if self.place_id is not None:
+            place = self.place_id
+            # Matches the store's own rule and its SQLite CHECK, so a value that would be
+            # rejected on the write path cannot be silently accepted on the read path.
+            if not isinstance(place, str) or not place.strip() or place != place.strip():
+                raise ValidationError("scope place_id must be non-empty and trimmed")
         if (self.near is None) != (self.radius_m is None):
             raise ValidationError("scope near and radius_m must be supplied together")
         if self.near is not None and not isinstance(self.near, SpatialContext):
@@ -1099,6 +1123,10 @@ class MemoryRecord:
     modality: Modality = Modality.TEXT
     memory_type: MemoryType = MemoryType.SEMANTIC
     context: MemoryContext | None = None
+    # The symbolic place this was captured in, as supplied on `ObservationContext`. Read-back
+    # matters because the label is equality-matched: an application cannot notice it wrote
+    # "the kitchen" where "kitchen" was meant unless it can see what was stored.
+    place_id: str | None = None
     forgotten_at: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -1106,6 +1134,10 @@ class MemoryRecord:
         _require_aware(self.created_at, "created_at")
         _require_interval(self.occurred_at, self.occurred_end)
         _require_aware(self.forgotten_at, "forgotten_at")
+        if self.place_id is not None:
+            place = self.place_id
+            if not isinstance(place, str) or not place.strip() or place != place.strip():
+                raise ValidationError("place_id must be non-empty and trimmed")
         if not isinstance(self.modality, Modality):
             raise ValidationError("memory modality is invalid")
         if not isinstance(self.memory_type, MemoryType):
@@ -1134,6 +1166,8 @@ class SearchHit:
     modality: Modality = Modality.TEXT
     memory_type: MemoryType = MemoryType.SEMANTIC
     context: MemoryContext | None = None
+    # A hit is a memory, so a place-scoped search reports which place each came from.
+    place_id: str | None = None
     forgotten_at: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -1210,6 +1244,74 @@ class RetrievalRejection(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class IdentityErasure:
+    """What one `forget_identity` call actually destroyed.
+
+    The counts are the audit record for a privacy operation: a caller that erased a person can
+    state how many biometric templates and annotations were removed instead of assuming. It lives
+    here rather than in the storage layer because it is the return type of a public `Memory`
+    operation, and the supported import path is `mindbridge`.
+    """
+
+    identity_id: str
+    alias_ids: tuple[str, ...]
+    face_exemplars: int
+    voice_exemplars: int
+    face_observations: int
+    speech_segments: int
+
+    def __post_init__(self) -> None:
+        _text(self.identity_id, "identity_id")
+        for name in ("face_exemplars", "voice_exemplars", "face_observations", "speech_segments"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValidationError(f"{name} must be a non-negative integer")
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryCapabilities:
+    """What one composition can actually do, declared by its backends rather than inferred.
+
+    Routing is by declared capability, so this is the same information `Memory` routes on. It is
+    published because a caller and an agent both need to know which modalities an operation will
+    accept before sending one, and because the embedding identity is what decides whether stored
+    vectors and a new backend belong to the same space.
+    """
+
+    embedding: frozenset[Modality]
+    embedding_model: str
+    embedding_space: str
+    embedding_dimension: int
+    generation: frozenset[Modality] = frozenset()
+    transcription: frozenset[Modality] = frozenset()
+    vision: frozenset[Modality] = frozenset()
+    face: frozenset[Modality] = frozenset()
+    formation: frozenset[Modality] = frozenset()
+    generation_model: str | None = None
+    transcription_space: str | None = None
+    vision_model: str | None = None
+    face_model: str | None = None
+    formation_model: str | None = None
+    consolidation_model: str | None = None
+    # A `TranscriptionBackend` yields text; only a `SpeechBackend` resolves speakers, and the two
+    # occupy the same slot, so whether `speech()` will work is not visible from the modalities.
+    speaker_recognition: bool = False
+    streaming_generation: bool = False
+
+    def __post_init__(self) -> None:
+        _text(self.embedding_model, "embedding_model")
+        _text(self.embedding_space, "embedding_space")
+        if not isinstance(self.embedding_dimension, int) or self.embedding_dimension <= 0:
+            raise ValidationError("embedding_dimension must be a positive integer")
+        for name in ("embedding", "generation", "transcription", "vision", "face", "formation"):
+            values = getattr(self, name)
+            if not isinstance(values, frozenset) or any(
+                not isinstance(value, Modality) for value in values
+            ):
+                raise ValidationError(f"{name} capabilities must be a frozenset of modalities")
+
+
+@dataclass(frozen=True, slots=True)
 class RetrievalCandidateTrace:
     """Effective score components and final disposition for one considered parent memory."""
 
@@ -1220,7 +1322,7 @@ class RetrievalCandidateTrace:
     lexical_relevance: float | None = None
     lexical_rerank_bonus: float | None = None
     lexical_match: bool = False
-    gate_confidence: float | None = None
+    gate_relevance: float | None = None
     base_relevance: float | None = None
     reinforcement_factor: float | None = None
     temporal_factor: float | None = None
@@ -1242,7 +1344,7 @@ class RetrievalCandidateTrace:
             "dense_confidence",
             "lexical_relevance",
             "lexical_rerank_bonus",
-            "gate_confidence",
+            "gate_relevance",
             "base_relevance",
             "reinforcement_factor",
             "temporal_factor",
@@ -1255,7 +1357,7 @@ class RetrievalCandidateTrace:
             "dense_confidence",
             "lexical_relevance",
             "lexical_rerank_bonus",
-            "gate_confidence",
+            "gate_relevance",
             "base_relevance",
             "final_score",
         ):
@@ -1480,17 +1582,3 @@ def _conflict_line(conflict: ContextConflict) -> str:
         for value, memory_id in zip(conflict.values, conflict.memory_ids, strict=True)
     )
     return f"- {label or conflict.lineage_id}: {values}"
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class MemoryCapabilities:
-    """What one configured instance can do, so an agent need not discover it by failing."""
-
-    modalities: frozenset[Modality]
-    answer: bool
-    transcribe: bool
-    faces: bool
-    describe_vision: bool
-    form: bool
-    consolidate: bool
-    decay: bool

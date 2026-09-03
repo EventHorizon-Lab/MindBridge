@@ -7,6 +7,7 @@ from mindbridge.infrastructure.local.assets import (
     AssetTooLargeError,
 )
 from mindbridge.infrastructure.local.store import (
+    IndexCandidate,
     IndexDocument,
     IndexOperation,
     LocalStore,
@@ -23,6 +24,7 @@ __all__ = [
     "AssetStoreError",
     "AssetTooLargeError",
     "DataDirectoryInUseError",
+    "IndexCandidate",
     "IndexDocument",
     "IndexOperation",
     "LocalStore",

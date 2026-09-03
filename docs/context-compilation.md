@@ -1,8 +1,7 @@
 # Context compilation
 
 This page owns `compile()`: what a `ContextBudget` bounds, how hits become sections, how conflicts
-are reported, and what `render()` emits. It also owns `capabilities()`, the advertisement an agent
-surface reads instead of discovering a missing backend by failing on first use.
+are reported, and what `render()` emits.
 
 `compile()` selects and structures evidence. It calls no generation model, writes nothing, and
 never resolves a conflict. `ask()` is unchanged and remains the grounded-generation surface; see
@@ -18,8 +17,6 @@ compile(
     reference_at: datetime | None = None,
     scope: RetrievalScope | None = None,
 ) -> ContextBundle
-
-capabilities() -> MemoryCapabilities
 ```
 
 `compile()` runs the same retrieval kernel `search()` uses, once, with a candidate limit of
@@ -122,23 +119,23 @@ with Memory.from_config(config) as memory:
     print(f"{bundle.omitted} candidates did not fit")
 ```
 
-## Capabilities
+## Knowing what an instance can do
 
-`capabilities()` returns a frozen `MemoryCapabilities`: `modalities` (the embedding contract this
-instance accepts) plus the booleans `answer`, `transcribe`, `faces`, `describe_vision`, `form`,
-`consolidate`, and `decay`. It reports the configured composition, so an agent surface can publish
-what the instance can do before a caller tries it.
+A caller does not have to compile a bundle to learn what a composition supports. The
+`Memory.capabilities` property returns a frozen `MemoryCapabilities` describing the declarations
+routing reads: the embedding modalities, model, space and dimension, the modality sets for
+generation, transcription, vision, face, and formation with their model identities,
+`consolidation_model` when a `ConsolidationBackend` is injected, and the `speaker_recognition` and
+`streaming_generation` flags. Its fields are listed in
+[the Python SDK reference](api/python-sdk.md#public-values).
 
 ```python
-capabilities = memory.capabilities()
-if capabilities.answer:
+if memory.capabilities.generation:
     print(memory.ask("Where is the spare key?").answer)
 ```
 
-`AsyncMemory` mirrors both methods. The command line exposes them as `mindbridge compile` and
-`mindbridge capabilities`, locally and against `--url`; see [the CLI reference](api/cli.md).
-
-Both operations reach agents over the transports as well: `POST /v1/context` with
-`GET /v1/capabilities` on [REST](api/rest.md#endpoints), and the `compile_context` tool with the
-capability view in the server instructions on [MCP](api/mcp.md#tools). Both are read-only views of
-existing evidence.
+`AsyncMemory` mirrors `compile()`. The command line exposes it as `mindbridge compile`, locally and
+against `--url`; see [the CLI reference](api/cli.md). Agents reach it as `POST /v1/context` on
+[REST](api/rest.md#endpoints) and as the `compile_context` tool on [MCP](api/mcp.md#tools), which
+also publishes the capability view as its server instructions. REST publishes the same view from
+`GET /healthz`.

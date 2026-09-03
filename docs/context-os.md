@@ -210,16 +210,16 @@ application operations. MCP exposes a small agent-appropriate capability view ra
 every administrative method.
 
 The compiler is that view's centre. `POST /v1/context` and the `compile_context` MCP tool return a
-budgeted bundle with provenance, and `GET /v1/capabilities` and the MCP server instructions
-advertise the configured modalities and memory capabilities so an agent does not discover them
-through failure. Both are read-only: compiling context selects and structures existing evidence and
+budgeted bundle with provenance, and `GET /healthz` and the MCP server instructions advertise the
+configured modalities and backends so an agent does not discover them through failure. Both are read-only: compiling context selects and structures existing evidence and
 resolves nothing. Answering stays available as a convenience rather than the operating-system
 boundary.
 
 High-rate sensor streams stay on the embedded SDK boundary. Agents operate on completed
-observations or stable asset identifiers. Identity naming, merge reversal, cognitive forgetting,
-operation rollback, retention policy, and physical deletion remain opt-in trusted capabilities that
-no ordinary recall or compile call grants.
+observations or stable asset identifiers. Cognitive forgetting, consolidation, operation rollback,
+retention policy, and physical deletion stay with the process that owns the memory; identity
+naming, merge reversal, and erasure are separate trusted tools that no ordinary recall or compile
+call grants.
 
 All interfaces call one owner of one physical `data_dir`. Supporting several agents against that
 owner does not introduce logical account or request scope into the memory contract. A hosted

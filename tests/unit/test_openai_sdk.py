@@ -2,7 +2,12 @@
 
 import base64
 import json
+import math
+import re
+import sys
+from array import array
 from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
@@ -15,8 +20,10 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+import mindbridge.memory as memory_module
 import mindbridge.models.openai_sdk as openai_backend
 from mindbridge._telemetry import (
+    FORMATION_PROPOSALS_DROPPED,
     GEN_AI_FINISH_REASONS,
     GEN_AI_TTFC,
     GROUNDING_HITS_DROPPED,
@@ -46,6 +53,7 @@ from mindbridge.types import (
     AbstentionReason,
     AssetRef,
     EvidenceBasis,
+    FormationProposal,
     MemoryContext,
     MemoryIntent,
     MemoryKind,
@@ -54,10 +62,15 @@ from mindbridge.types import (
     Modality,
     ObservationContext,
     SearchHit,
+    SpatialAnchor,
+    SpatialContext,
 )
 
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
 ALL_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
+# Deliberately not the 16 kHz the adapter demuxes to, so a passthrough cannot look like a resample.
+_SOURCE_AUDIO_RATE = 44_100
+_VIDEO_MEDIA_TYPES = {".mp4": "video/mp4", ".mkv": "video/x-matroska"}
 
 
 def test_text_embedding_keeps_standard_batch_shape_and_restores_order() -> None:
@@ -283,6 +296,7 @@ def test_answer_maps_native_hit_media_and_abstains_without_hits(tmp_path: Path) 
         memory = json.loads(content[1]["text"])["memory"]
         assert memory["created_at"] == NOW.isoformat()
         assert not {"score", "occurred_at", "occurred_end"} & memory.keys()
+        assert "memory_1" not in request.content.decode()
         return httpx.Response(
             200,
             json={
@@ -329,7 +343,10 @@ def test_formation_batches_grounded_observations_and_validates_typed_output(
         assert "source_audio" not in serialized
         assert "microphone" not in serialized
         assert payload["response_format"] == {"type": "json_object"}
-        assert "affect uses subject, value, and cue_modality" in payload["messages"][0]["content"]
+        # The per-kind field requirements are pinned by
+        # `test_formation_prompt_states_every_field_the_validator_demands`, which checks them
+        # against the validator instead of against one sentence's wording.
+        assert "cue_modality" in payload["messages"][0]["content"]
         parts = payload["messages"][1]["content"]
         assert [part["type"] for part in parts] == ["text", "text", "input_audio"]
         assert json.loads(parts[0]["text"])["observation"]["observation_id"] == "observation_0"
@@ -603,6 +620,116 @@ def test_answer_marks_the_grounded_unknown_sentinel_as_insufficient_evidence() -
     assert result.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
 
 
+def test_grounded_prompt_requires_the_marker_the_refusal_meter_reads() -> None:
+    """The prompt must demand the same token detection reads, or nothing is ever detected."""
+    prompts: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        prompts.append(json.loads(request.content)["messages"][0]["content"])
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": openai_backend._ABSTENTION_MARKER},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    hit = SearchHit(id="memory_1", content="partial evidence", score=0.9, created_at=NOW)
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = _model(_sdk_client(client)).answer(ModelInput(text="What?"), (hit,))
+
+    assert openai_backend._ABSTENTION_MARKER in prompts[0]
+    assert result.abstained is True
+    assert result.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "[insufficient_evidence]",
+        "[INSUFFICIENT_EVIDENCE]",
+        "  insufficient_evidence\n",
+        '"[insufficient_evidence]"',
+        "根据可用记忆无法回答。[insufficient_evidence]",
+        UNKNOWN_ANSWER,
+        "I don't know based on the available memories",
+        "**I don\u2019t know based on the available memories.**",
+        "\nI don't know  based on the available memories! ",
+        "I don't know based on the available memories. The hits show a cat, not its location.",
+    ],
+)
+def test_refusals_are_reported_however_the_model_formats_them(answer: str) -> None:
+    assert openai_backend._abstention_reason(answer) is AbstentionReason.INSUFFICIENT_EVIDENCE
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "The cat is on the sofa.",
+        "The cat is on the sofa, though I don't know based on the available memories when it moved.",
+        "I don't know why the cat moved, but the memories place it on the sofa.",
+        "The evidence is insufficient to say when the cat moved, but it is on the sofa.",
+        "",
+    ],
+)
+def test_a_hedge_inside_a_real_answer_is_not_reported_as_a_refusal(answer: str) -> None:
+    assert openai_backend._abstention_reason(answer) is None
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "The runbook says the API returns insufficient_evidence when no memory matches.",
+        "Alice logged: status=insufficient_evidence at 09:12, then retried.",
+    ],
+)
+def test_evidence_that_quotes_the_marker_word_is_not_a_refusal(answer: str) -> None:
+    """The brackets are what make the marker a machine token rather than an ordinary word.
+
+    Matching the bare word anywhere reported a correct answer as a refusal whenever the corpus
+    itself mentioned `insufficient_evidence` -- a runbook line, a logged status -- which corrupts
+    the refusal meter in the opposite direction from the exact-equality check it replaced.
+    """
+    assert openai_backend._abstention_reason(answer) is None
+
+
+def test_a_refusal_reports_prose_and_not_the_marker_as_its_answer() -> None:
+    """`answer` is what a caller shows or speaks; the machine signal is `abstention_reason`."""
+    hit = SearchHit(id="memory_1", content="a note", score=0.9, created_at=NOW)
+    result = openai_backend._answer_result(openai_backend._ABSTENTION_MARKER, (hit,))
+
+    assert result.answer == UNKNOWN_ANSWER
+    assert openai_backend._ABSTENTION_MARKER not in result.answer
+    assert result.abstained is True
+    assert result.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
+
+
+@pytest.mark.parametrize(
+    ("field", "bounds"),
+    [("confidence", ("0", "1")), ("valence", ("-1", "1")), ("arousal", ("0", "1"))],
+)
+def test_formation_prompt_states_the_range_of_every_bounded_field(
+    field: str, bounds: tuple[str, ...]
+) -> None:
+    """A model that guesses a 1-5 scale loses the whole add(); the prompt must state the range."""
+    sentences = openai_backend._FORMATION_SYSTEM_PROMPT.replace("\n", " ").split(". ")
+    stated = [
+        sentence
+        for sentence in sentences
+        if field in sentence
+        and all(
+            re.search(rf"(?<![\d.\-]){re.escape(bound)}(?![\d.])", sentence) for bound in bounds
+        )
+    ]
+
+    assert stated, f"the formation prompt never states that {field} is in {bounds}"
+
+
 def test_answer_serializes_temporal_and_metadata_evidence() -> None:
     occurred_at = datetime(2026, 8, 26, 12, 30, tzinfo=timezone.utc)
     occurred_end = occurred_at + timedelta(minutes=5)
@@ -611,13 +738,13 @@ def test_answer_serializes_temporal_and_metadata_evidence() -> None:
         content = json.loads(request.content)["messages"][1]["content"]
         hit = json.loads(content)["hits"][0]
         assert hit == {
-            "memory_id": "memory_1",
             "content": "The red parcel arrived.",
             "memory_type": "semantic",
             "occurred_at": occurred_at.isoformat(),
             "occurred_end": occurred_end.isoformat(),
             "metadata": {"dialog": "delivery", "turn": 7},
         }
+        assert "memory_1" not in request.content.decode()
         return httpx.Response(
             200,
             json={
@@ -1640,6 +1767,81 @@ def test_transcription_uses_its_own_endpoint_key_and_multipart_file(tmp_path: Pa
     assert result == ("hello there",)
 
 
+@pytest.mark.parametrize("suffix", [".mp4", ".mkv"])
+def test_video_transcription_uploads_the_whole_demuxed_audio_track(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    """A video's speech must reach the endpoint, in a container the endpoint accepts.
+
+    `/v1/audio/transcriptions` takes flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav or webm, while
+    MindBridge also ingests .mkv, .mov, .avi and .ogv, so forwarding the container would drop
+    the speech of every video it does not list. Both suffixes are checked because passing only
+    .mp4 would also pass if the adapter simply forwarded the file.
+    """
+    seconds = 2.0
+    video = _video_asset(tmp_path, "clip", 8, audio_seconds=seconds, suffix=suffix)
+    source = video.path
+    assert source is not None
+    uploaded: list[bytes] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://sdk.example.test/v1/audio/transcriptions"
+        body = request.read()
+        assert b'filename="clip.wav"' in body
+        assert b"audio/wav" in body
+        assert source.read_bytes() not in body
+        uploaded.append(_wav_part(body))
+        return httpx.Response(200, json={"text": "the kettle is boiling"})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = _model(_sdk_client(client)).transcribe((video,))
+
+    assert result == ("the kettle is boiling",)
+    rate, channels, samples, peak = _decoded_audio(uploaded[0])
+    assert (rate, channels) == (16_000, 1)
+    # Measured against an independent decode of the source rather than a nominal duration, so
+    # losing even the resampler's final millisecond fails here. A tolerance would not: the same
+    # earlier defect that cut multi-window audio to its first 30 seconds would have passed a
+    # duration check that only bounded the length from below.
+    assert samples == _source_samples(source)
+    assert peak > 0
+
+
+def test_video_without_an_audio_track_costs_no_transcription_request(tmp_path: Path) -> None:
+    video = _video_asset(tmp_path, "silent", 8)
+
+    def respond(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
+        raise AssertionError("a silent video must not reach the transcription endpoint")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        assert _model(_sdk_client(client)).transcribe((video,)) == ("",)
+
+
+def test_transcription_declares_video_so_a_cloud_route_keeps_a_video_s_speech() -> None:
+    assert OpenAIModels().transcription_capabilities == frozenset({Modality.AUDIO, Modality.VIDEO})
+
+
+def test_video_transcription_fails_before_inference_without_a_demuxer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Losing the demuxer must fail, not silently drop the speech track."""
+    video = _video_asset(tmp_path, "clip", 8, audio_seconds=0.5)
+    monkeypatch.setitem(sys.modules, "av", None)
+
+    def respond(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
+        raise AssertionError("no request may be issued when the audio track cannot be read")
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        pytest.raises(ModelError, match="av package") as raised,
+    ):
+        _model(_sdk_client(client)).transcribe((video,))
+
+    assert raised.value.reason == "unsupported_modality"
+
+
 def test_gpt_transcribe_sends_context_and_names_its_recipe(tmp_path: Path) -> None:
     audio = _asset(tmp_path, "audio", Modality.AUDIO, "audio/wav", b"speech")
 
@@ -1912,27 +2114,244 @@ def _asset(
     )
 
 
-def _video_asset(directory: Path, asset_id: str, frame_count: int) -> AssetRef:
+def _video_asset(
+    directory: Path,
+    asset_id: str,
+    frame_count: int,
+    *,
+    audio_seconds: float = 0.0,
+    suffix: str = ".mp4",
+) -> AssetRef:
     av = pytest.importorskip("av")
     image_module = pytest.importorskip("PIL.Image")
-    path = directory / f"{asset_id}.mp4"
+    path = directory / f"{asset_id}{suffix}"
     with av.open(str(path), "w") as container:
         stream = container.add_stream("mpeg4", rate=4)
         stream.width = 16
         stream.height = 16
         stream.pix_fmt = "yuv420p"
+        audio = None
+        if audio_seconds:
+            audio = container.add_stream("aac", rate=_SOURCE_AUDIO_RATE)
+            audio.layout = "mono"
         for index in range(frame_count):
             frame = av.VideoFrame.from_image(image_module.new("RGB", (16, 16), (index * 30, 0, 0)))
             for packet in stream.encode(frame):
                 container.mux(packet)
         for packet in stream.encode():
             container.mux(packet)
+        if audio is not None:
+            for frame in _tone_frames(audio_seconds):
+                for packet in audio.encode(frame):
+                    container.mux(packet)
+            for packet in audio.encode():
+                container.mux(packet)
     return AssetRef(
         id=asset_id,
         modality=Modality.VIDEO,
-        media_type="video/mp4",
+        media_type=_VIDEO_MEDIA_TYPES[suffix],
         size_bytes=path.stat().st_size,
         sha256="a" * 64,
         name=path.name,
         path=path,
     )
+
+
+def _tone_frames(seconds: float) -> list[Any]:
+    """Encode a 440 Hz mono tone as s16 frames, so a decode can tell it from silence."""
+    av = pytest.importorskip("av")
+    total = int(_SOURCE_AUDIO_RATE * seconds)
+    frames = []
+    for start in range(0, total, 1024):
+        count = min(1024, total - start)
+        samples = array(
+            "h",
+            (
+                int(0.5 * 32767 * math.sin(2 * math.pi * 440 * index / _SOURCE_AUDIO_RATE))
+                for index in range(start, start + count)
+            ),
+        )
+        frame = av.AudioFrame(format="s16", layout="mono", samples=count)
+        frame.sample_rate = _SOURCE_AUDIO_RATE
+        frame.pts = start
+        frame.time_base = Fraction(1, _SOURCE_AUDIO_RATE)
+        frame.planes[0].update(samples.tobytes())
+        frames.append(frame)
+    return frames
+
+
+def _source_samples(path: Path) -> int:
+    """Decode a container's whole audio track and report its length at the ASR sample rate."""
+    av = pytest.importorskip("av")
+    with av.open(str(path)) as container:
+        stream = container.streams.audio[0]
+        total = sum(frame.samples for frame in container.decode(stream))
+        return int(total) * 16_000 // int(stream.rate)
+
+
+def _wav_part(body: bytes) -> bytes:
+    """Slice one WAV file out of a multipart body using its own declared RIFF length."""
+    start = body.index(b"RIFF")
+    return body[start : start + int.from_bytes(body[start + 4 : start + 8], "little") + 8]
+
+
+def _decoded_audio(data: bytes) -> tuple[int, int, int, int]:
+    """Report a WAV payload's sample rate, channel count, sample count and peak amplitude."""
+    av = pytest.importorskip("av")
+    with av.open(BytesIO(data)) as container:
+        stream = container.streams.audio[0]
+        samples = 0
+        peak = 0
+        for frame in container.decode(stream):
+            values = array("h")
+            values.frombytes(bytes(frame.planes[0])[: frame.samples * 2])
+            samples += frame.samples
+            peak = max(peak, max(abs(value) for value in values))
+        return stream.rate, len(stream.layout.channels), samples, peak
+
+
+# The fields `FormationProposal` requires per kind, as the system prompt states them. Keeping the
+# table here rather than parsing the prompt makes both directions fail loudly: a validator that
+# gains a requirement the prompt never mentions, and a prompt that stops mentioning one.
+_FORMATION_REQUIREMENTS = {
+    "event": (),
+    "entity": ("subject",),
+    "affect": ("subject", "value", "cue_modality"),
+    "state": ("subject", "predicate", "value"),
+    "relation": ("subject", "predicate", "value"),
+    "trait": ("subject", "predicate", "value"),
+    "response_policy": ("subject", "predicate", "value"),
+}
+
+
+@pytest.mark.parametrize(("kind", "extra"), sorted(_FORMATION_REQUIREMENTS.items()))
+def test_formation_prompt_states_every_field_the_validator_demands(
+    kind: str, extra: tuple[str, ...]
+) -> None:
+    # Measured against qwen3.8-flash, a prompt that omitted `entity`'s subject, did not say
+    # `content` is required for every kind, and did not say values are strings produced proposals
+    # the validator rejected 79% of the time. Naming exactly what is enforced took that to 0%.
+    payload: dict[str, object] = {"kind": kind, "content": "a formed memory", "confidence": 0.9}
+    for field in extra:
+        payload[field] = "text" if field == "cue_modality" else "a value"
+    if kind == "affect":
+        payload["valence"] = 0.5
+        payload["arousal"] = 0.2
+
+    proposal = openai_backend._formation_proposal(payload)
+
+    assert proposal is not None, (
+        f"the prompt's stated fields for {kind} do not satisfy the validator"
+    )
+    # Match this kind's own row in the prompt's table, not the prompt as a whole: every field name
+    # appears somewhere for some other kind, so a substring search over the whole text passes even
+    # when this kind's row has lost a requirement.
+    row = next(
+        (
+            line
+            for line in openai_backend._FORMATION_SYSTEM_PROMPT.splitlines()
+            if line.strip().startswith(f"{kind} ") or line.strip().startswith(f"{kind}  ")
+        ),
+        None,
+    )
+    assert row is not None, f"the prompt's kind table has no row for {kind}"
+    stated = {token.strip(" ,.") for token in row.split("--", 1)[1].split()}
+    assert set(extra) <= stated, f"{kind} row omits {sorted(set(extra) - stated)}"
+
+
+def test_a_malformed_proposal_does_not_discard_its_valid_siblings() -> None:
+    # `add` commits the source before formation runs, so raising here failed a write that had
+    # already succeeded -- and the retry re-ran formation, failed again, and could never store the
+    # memory at all. One badly shaped derived opinion must cost only itself.
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    content = json.dumps(
+        {
+            "items": [
+                {
+                    "observation_id": "observation_0",
+                    "proposals": [
+                        {"kind": "event", "content": "a real event", "confidence": 0.9},
+                        {"kind": "entity", "confidence": 1.0},
+                        {
+                            "kind": "state",
+                            "subject": "Dad",
+                            "predicate": "is",
+                            "value": True,
+                            "content": "a boolean value",
+                            "confidence": 0.9,
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+    inputs = (
+        FormationInput(
+            memory_id="m0",
+            content=ModelInput(text="x"),
+            context=ObservationContext(source_id="user"),
+        ),
+    )
+
+    with provider.get_tracer("test").start_as_current_span("formation"):
+        results = openai_backend._formation_results(content, inputs)
+
+    assert [proposal.content for proposal in results[0]] == ["a real event"]
+    dropped = [
+        span.attributes[FORMATION_PROPOSALS_DROPPED]
+        for span in exporter.get_finished_spans()
+        if span.attributes is not None and FORMATION_PROPOSALS_DROPPED in span.attributes
+    ]
+    assert dropped == [2]
+
+
+@pytest.mark.parametrize(
+    ("proposal", "phrase"),
+    [
+        pytest.param(
+            FormationProposal(
+                kind=MemoryKind.AFFECT,
+                content="The speaker sounded exhausted",
+                subject="dad",
+                value="exhausted",
+                cue_modality=Modality.AUDIO,
+                valence=-0.6,
+                arousal=0.2,
+                confidence=0.8,
+            ),
+            "one the observation itself carried",
+            id="cue_modality",
+        ),
+        pytest.param(
+            FormationProposal(
+                kind=MemoryKind.EVENT,
+                content="The call happened in the kitchen",
+                spatial=SpatialContext(
+                    frame_id="house", anchor=SpatialAnchor.OBSERVER, x=1.0, y=2.0
+                ),
+                confidence=0.7,
+            ),
+            "reuse that frame_id and anchor unchanged",
+            id="spatial",
+        ),
+    ],
+)
+def test_formation_prompt_states_every_source_rule_the_validator_enforces(
+    proposal: FormationProposal, phrase: str
+) -> None:
+    # These two rules are enforced in `memory.py`, not by the adapter's shape checks, and they
+    # fail the whole `add()` after the source has committed -- so a proposal that breaks one is
+    # unrecoverable for the caller, and the prompt is the only place the model can learn the rule.
+    # Red in both directions: if the prompt drops the sentence, or if the validator drops the rule.
+    source = FormationInput(
+        memory_id="observation_0",
+        content=ModelInput(text="Dad sounded exhausted on the phone."),
+        context=ObservationContext(),
+    )
+
+    with pytest.raises(ModelError):
+        memory_module._validate_formation_proposal(proposal, source)
+
+    assert phrase in openai_backend._FORMATION_SYSTEM_PROMPT

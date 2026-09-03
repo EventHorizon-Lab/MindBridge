@@ -23,11 +23,16 @@ from mindbridge import (
     AudioStreamPacket,
     Blob,
     EmbedTask,
+    EvidenceBasis,
+    MemoryType,
     Modality,
     ModelError,
     ModelInput,
+    ObservationContext,
     PCMChunk,
     SceneBoundary,
+    SpatialAnchor,
+    SpatialContext,
     StorageError,
     StreamEvent,
     StreamInput,
@@ -578,4 +583,81 @@ async def test_a_rejected_final_query_still_drains_its_speculative_search(
         assert all(prefetch._worker is None or prefetch._worker.done() for prefetch in prefetches)
     finally:
         cast(Any, AsyncCaptureStream)._prefetch_for = build
+        await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_streamed_observations_carry_the_pose_sampled_at_each_boundary(
+    tmp_path: Path,
+) -> None:
+    """A moving robot's pose belongs to the observation, not to the stream that outlives it.
+
+    Both adapters previously built `StreamInput` from timing and text alone, so every memory a
+    microphone or camera wrote had a null pose and the default `MemoryType` regardless of what
+    the caller asked for. The context is read once per closed observation, so the second scene
+    is stamped with where the robot was when that scene ended, not where it started.
+    """
+    memory = AsyncMemory(tmp_path, embedder=TinyEmbedder(), minimum_relevance=0)
+    poses = iter(
+        (
+            ObservationContext(
+                basis=EvidenceBasis.OBSERVATION,
+                spatial=SpatialContext(frame_id="map", anchor=SpatialAnchor.OBSERVER, x=1.0, y=2.0),
+            ),
+            ObservationContext(
+                basis=EvidenceBasis.OBSERVATION,
+                spatial=SpatialContext(frame_id="map", anchor=SpatialAnchor.OBSERVER, x=9.0, y=8.0),
+            ),
+        )
+    )
+    try:
+        commits = [
+            value
+            async for value in AsyncVisionStream(
+                memory,
+                memory_type=MemoryType.EPISODIC,
+                context=lambda: next(poses),
+            ).consume(
+                _vision_packets(
+                    VisionPartial("a red toolbox on the bench", stream_id="head"),
+                    SceneBoundary(VisionBoundary.END, stream_id="head"),
+                    VisionPartial("a blue mug by the sink", stream_id="head"),
+                    SceneBoundary(VisionBoundary.END, stream_id="head"),
+                )
+            )
+        ]
+
+        assert len(commits) == 2
+        records = [await memory.get(commit.record.id) for commit in commits]
+        assert [record.memory_type for record in records] == [MemoryType.EPISODIC] * 2
+        spatial = [record.context.spatial for record in records if record.context is not None]
+        assert [(value.x, value.y) for value in spatial if value is not None] == [
+            (1.0, 2.0),
+            (9.0, 8.0),
+        ]
+
+        heard = [
+            value
+            async for value in AsyncAudioStream(
+                memory,
+                memory_type=MemoryType.EPISODIC,
+                context=ObservationContext(
+                    spatial=SpatialContext(
+                        frame_id="map", anchor=SpatialAnchor.OBSERVER, x=4.0, y=5.0
+                    )
+                ),
+            ).consume(
+                _audio_packets(
+                    ASRPartial("put the wrench away", stream_id="mic"),
+                    AcousticBoundary(AudioBoundary.END, stream_id="mic"),
+                )
+            )
+        ]
+
+        assert len(heard) == 1
+        spoken = await memory.get(heard[0].record.id)
+        assert spoken.memory_type is MemoryType.EPISODIC
+        assert spoken.context is not None and spoken.context.spatial is not None
+        assert (spoken.context.spatial.x, spoken.context.spatial.y) == (4.0, 5.0)
+    finally:
         await memory.close()

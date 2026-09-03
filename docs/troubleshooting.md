@@ -85,10 +85,21 @@ Do not delete SQLite rows or clear `search_index_queue` to make the error disapp
 
 ## Search returns no hits
 
-An empty tuple is valid. Candidates below `minimum_relevance` are rejected, and an unresolved
-top-two tie may be withheld when `limit=1`.
+An empty tuple is a valid search result. Candidates whose gate confidence falls below
+`minimum_relevance` are rejected; an unresolved top-two tie may also be withheld when `limit=1`.
 
-Before changing thresholds:
+`minimum_relevance` is not compared against the `score` on a returned `SearchHit`. That score is
+the final ranking score, while the gate compares a separate gate confidence, so tuning the floor
+against observed scores gives the wrong value. `search_with_trace()` reports both per candidate;
+use it rather than inferring the threshold from hits that were returned.
+
+Before changing thresholds, rule out a record that was captured but never settled:
+`pending_captures()` counts records that are durable and returned by `get()` and `list()` but hold
+no vectors, and nothing settles them on its own. Call `settle()` — or add the same content, which
+settles it — and search again. A record whose `forgotten_at` is set is excluded from recall by
+policy; `rollback()` on the logged operation restores it.
+
+Then:
 
 1. Confirm the record exists with `get()` or `list()`.
 2. Confirm query and stored modalities are supported by the embedder.
@@ -152,7 +163,7 @@ part shapes and limits in the [REST reference](api/rest.md#input-limits).
 
 Separate Python, REST, and MCP processes cannot open the same `data_dir`. Put the required
 adapters around one constructed `Memory`, call the running REST owner, or allocate deliberately
-separate memory domains. The supported REST surface is under `/v1`; MCP has exactly seven tools.
+separate memory domains. REST has nine product routes under `/v1`; MCP has fifteen tools.
 
 Neither network adapter adds authentication. Apply the controls in
 [deployment](deployment.md#choose-a-topology).

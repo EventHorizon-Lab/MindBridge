@@ -14,7 +14,7 @@ decoding, frame selection, and turn detection remain application or adapter work
 | Need | API |
 | --- | --- |
 | Lazily add completed independent observations | `Memory.add_stream()` or `AsyncMemory.add_stream()` |
-| Acknowledge final observations without waiting for models | `Memory.capture()` with `Memory.settle()` |
+| Acknowledge completed observations without waiting for models | `Memory.capture()` with `Memory.settle()` |
 | Search while one query snapshot is changing | `AsyncOmniPrefetch` |
 | Associate speculative snapshots with final commits | `AsyncCaptureStream` |
 | Normalize PCM, VAD, and ASR state | `AsyncAudioStream` |
@@ -75,10 +75,10 @@ while memory.pending_captures():
     memory.settle(limit=32)
 ```
 
-Keep `add()` where a caller needs the record searchable on return, and keep the enrichment loop
-explicit: nothing else settles for you, so an application that never calls `settle()` accumulates
-durable memories that `search()` and `ask()` cannot see. See the
-[Python SDK reference](api/python-sdk.md#memory-operations) for the exact failure semantics.
+**Contract:** keep `add()` where a caller needs the record searchable on return, and keep the
+enrichment loop explicit. Nothing else settles for you, so an application that never calls
+`settle()` accumulates durable memories that `search()`, `ask()`, and `compile()` cannot see. See
+the [Python SDK reference](api/python-sdk.md#memory-operations) for the exact failure semantics.
 
 ## Prefetch a changing query
 
@@ -144,6 +144,11 @@ a stable public error code, or `retrieval_failed` for an unclassified exception.
 before the final write starts stores nothing. Once that write starts, cancellation waits for it and
 then propagates, so no worker writes after the cancelled task has returned.
 
+`AsyncAudioStream` and `AsyncVisionStream` accept a `memory_type` and `context`. The context may be
+one fixed `ObservationContext` for a static sensor or a zero-argument sampler for a moving sensor;
+the sampler is read once when each observation closes, so its metric pose or symbolic `place_id`
+belongs to that durable observation. Speculative updates do not persist the sampled context.
+
 ## Native audio protocol
 
 `AsyncAudioStream` accepts four immutable values:
@@ -181,8 +186,8 @@ async for commit in audio.consume(audio_packets()):
 PCM accumulates independently per ID and is stored in a standard WAV container. A native-audio
 embedder receives changing audio snapshots. A text-only embedder uses ASR partials for speculative
 retrieval; the final transcript remains attached to the WAV and drives text embedding. A configured
-speech backend can transcribe final audio when no external hypothesis exists. With no supported
-route, finalization fails instead of dropping audio.
+transcription backend can transcribe final audio when no external hypothesis exists. With no
+supported route, finalization fails instead of dropping audio.
 
 `VADPacket(active=False)` and `AudioBoundary.END` finalize a segment. `CANCEL` and incomplete EOF do
 not write. A PCM format change inside a segment, or a buffer beyond the local asset limit, fails
@@ -221,11 +226,22 @@ async for commit in vision.consume(vision_packets()):
     print(commit.stream_id, commit.record.id)
 ```
 
-Each scene keeps only its latest frame as the durable keyframe. Use `AsyncCaptureStream` with an
-encoded video when the complete clip must be stored. Native image embedding searches frame
-snapshots directly. A text-only embedder uses `VisionPartial`; without one, an injected
-`VisionDescriptionBackend` can describe the final frame once. With none of those routes,
-finalization fails instead of discarding the image.
+State and prefetch work stay independent per ID. Each scene retains only its latest frame as the
+durable keyframe, which bounds memory without imposing a hidden codec or sampler. Finalize an
+encoded video through `AsyncCaptureStream` when a full clip is required.
+
+With native image embedding, frame changes drive speculative retrieval directly. With a text-only
+embedder, `VisionPartial` drives retrieval and its final value attaches to the keyframe through
+`StreamInput.description`. Without a partial, a configured `VisionDescriptionBackend` describes the
+final frame once, before finalization, so speculative retrieval has a query to work with. With none
+of those routes, finalization fails instead of discarding the frame.
+
+That early call is the text-only case only. It is a scheduling choice, not the condition for
+describing at all: `add` and `add_many` call a configured describer for **every** embedder whenever
+a visual asset still has no description, and union the text into the stored and indexed document
+regardless of embedder capability, because what the lexical document contains is a separate question
+from which modality the embedder accepts. Configuring no describer stays an exact no-op on both
+paths.
 
 ## Interaction-derived records
 

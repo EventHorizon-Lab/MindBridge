@@ -35,8 +35,12 @@ from mindbridge.types import (
     Modality,
     ObservationContext,
     Page,
+    RetrievalCandidateTrace,
+    RetrievalRejection,
     RetrievalScope,
+    RetrievalTrace,
     SearchHit,
+    TracedSearchResult,
 )
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
@@ -61,16 +65,21 @@ ASSET = AssetRef(
     name="frame.png",
     path=Path("/private/mindbridge/assets/frame.png"),
 )
+
+
+# Every modality, because `frozenset` iterates in hash order and enum members hash by identity:
+# with five values an unsorted serializer produces the documented order once in 120 runs.
 CAPABILITIES = MemoryCapabilities(
-    modalities=frozenset({Modality.TEXT, Modality.IMAGE, Modality.AUDIO}),
-    answer=True,
-    transcribe=True,
-    faces=False,
-    describe_vision=False,
-    form=True,
-    consolidate=False,
-    decay=True,
+    embedding=frozenset(Modality),
+    embedding_model="jina-v5-omni",
+    embedding_space="space_1",
+    embedding_dimension=1024,
+    generation=frozenset({Modality.TEXT}),
+    generation_model="qwen3-omni",
+    speaker_recognition=True,
 )
+
+
 CONFLICT = ContextConflict(
     lineage_id="lineage_1",
     subject="ana",
@@ -86,7 +95,11 @@ class FakeMemory:
         self.close_count = 0
         self.failure = failure
         self.deleted = True
-        self.forgotten_at: datetime | None = None
+        self.declared = CAPABILITIES
+
+    @property
+    def capabilities(self) -> MemoryCapabilities:
+        return self.declared
 
     def add(
         self,
@@ -174,18 +187,30 @@ class FakeMemory:
         )
         return (_hit(),)
 
-    def ask(
+    def search_with_trace(
         self,
-        question: ContentInput,
+        query: ContentInput,
         *,
-        limit: int = 5,
+        limit: int = 10,
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
         scope: RetrievalScope | None = None,
-    ) -> AnswerResult:
+    ) -> TracedSearchResult:
         self._fail()
-        self.calls.append(("ask", question, limit, memory_type, reference_at))
-        return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
+        self.calls.append(
+            (
+                "search_with_trace",
+                query,
+                limit,
+                memory_type,
+                reference_at,
+                occurred_from,
+                occurred_until,
+            )
+        )
+        return TracedSearchResult(hits=(), trace=_trace())
 
     def compile(
         self,
@@ -199,23 +224,33 @@ class FakeMemory:
         self.calls.append(("compile", goal, budget, reference_at, scope))
         return _bundle(budget or ContextBudget(), reference_at or NOW)
 
-    def capabilities(self) -> MemoryCapabilities:
+    def reinforce(self, memory_ids: Sequence[str]) -> int:
         self._fail()
-        self.calls.append(("capabilities",))
-        return CAPABILITIES
+        self.calls.append(("reinforce", tuple(memory_ids)))
+        return len(tuple(dict.fromkeys(memory_ids)))
+
+    def ask(
+        self,
+        question: ContentInput,
+        *,
+        limit: int = 5,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> AnswerResult:
+        self._fail()
+        self.calls.append(("ask", question, limit, memory_type, reference_at))
+        return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
 
     def get(self, memory_id: str) -> MemoryRecord:
         self._fail()
         self.calls.append(("get", memory_id))
-        return _record(memory_id, "The toolbox is blue.", forgotten_at=self.forgotten_at)
+        return _record(memory_id, "The toolbox is blue.")
 
     def list(self, *, limit: int = 100, cursor: str | None = None) -> Page:
         self._fail()
         self.calls.append(("list", limit, cursor))
-        return Page(
-            items=(_record("memory_1", "The toolbox is blue.", forgotten_at=self.forgotten_at),),
-            next_cursor="next",
-        )
+        return Page(items=(_record("memory_1", "The toolbox is blue."),), next_cursor="next")
 
     def delete(self, memory_id: str) -> bool:
         self._fail()
@@ -280,7 +315,7 @@ def test_resource_routes_map_the_public_memory_values() -> None:
         deleted = client.delete("/v1/memories/memory_1")
         openapi = client.get("/openapi.json").json()
 
-    assert health.json() == {"status": "ok"}
+    assert health.json()["status"] == "ok"
     assert created.status_code == 201
     assert created.json()["content"] == "The toolbox is blue."
     assert created.json()["memory_type"] == "episodic"
@@ -601,6 +636,69 @@ def test_status_follows_whether_the_same_call_can_ever_succeed(
     )
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    [
+        # One oversized-input condition, one status, whichever side noticed it. This used to be
+        # 413 from the request middleware and 502 from the provider path.
+        (ModelError("asset exceeds the request budget", reason="payload_too_large"), 413),
+        # Not retryable, so it must not claim to be transient with 503.
+        (StorageError("failed to read memory", reason="io_failed"), 500),
+    ],
+)
+def test_one_reason_answers_with_one_status(failure: Exception, expected_status: int) -> None:
+    with TestClient(create_app(memory=FakeMemory(failure))) as client:
+        response = client.get("/v1/memories/memory_1")
+
+    assert response.status_code == expected_status
+    assert response.json()["retryable"] is False
+    assert response.headers.get("Retry-After") is None
+
+
+def test_health_reports_the_live_composition() -> None:
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory)) as client:
+        body = client.get("/healthz").json()
+
+    assert body["status"] == "ok"
+    assert body["capabilities"] == {
+        "embedding": ["audio", "image", "omni", "text", "video"],
+        "embedding_model": "jina-v5-omni",
+        "embedding_space": "space_1",
+        "embedding_dimension": 1024,
+        "generation": ["text"],
+        "transcription": [],
+        "vision": [],
+        "face": [],
+        "formation": [],
+        "generation_model": "qwen3-omni",
+        "transcription_space": None,
+        "vision_model": None,
+        "face_model": None,
+        "formation_model": None,
+        "consolidation_model": None,
+        "speaker_recognition": True,
+        "streaming_generation": False,
+    }
+
+
+def test_health_reads_the_injected_memory_rather_than_a_captured_snapshot() -> None:
+    memory = FakeMemory()
+    memory.declared = MemoryCapabilities(
+        embedding=frozenset({Modality.TEXT}),
+        embedding_model="text-embedder",
+        embedding_space="space_2",
+        embedding_dimension=8,
+    )
+
+    with TestClient(create_app(memory=memory)) as client:
+        body = client.get("/healthz").json()
+
+    assert body["capabilities"]["embedding_space"] == "space_2"
+    assert body["capabilities"]["embedding"] == ["text"]
+    assert body["capabilities"]["speaker_recognition"] is False
+
+
 def test_error_envelope_reports_reason_stage_and_subject() -> None:
     failure = ModelError(
         "local media asset is unavailable",
@@ -739,6 +837,7 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
     assert bundle["omitted"] == 3
     assert bundle["chars"] == 42
     assert bundle["rendered"].startswith("# Context: What should I bring?")
+    # The bundle serializes hits through the same asset model every other route uses.
     assert bundle["episodes"][0]["assets"] == [
         {
             "id": "asset_image",
@@ -766,25 +865,6 @@ def test_the_context_route_defaults_to_the_sdk_budget() -> None:
         "min_confidence": 0.0,
         "freshness_seconds": None,
     }
-
-
-def test_the_capabilities_route_reports_sorted_modalities_and_every_flag() -> None:
-    memory = FakeMemory()
-    with TestClient(create_app(memory=memory)) as client:
-        response = client.get("/v1/capabilities")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "modalities": ["audio", "image", "text"],
-        "answer": True,
-        "transcribe": True,
-        "faces": False,
-        "describe_vision": False,
-        "form": True,
-        "consolidate": False,
-        "decay": True,
-    }
-    assert memory.calls == [("capabilities",)]
 
 
 def test_unexpected_and_framework_errors_keep_the_flat_envelope() -> None:
@@ -820,20 +900,61 @@ def test_size_limit_runs_before_body_parsing() -> None:
     assert memory.calls == []
 
 
-def test_a_forgotten_record_serializes_its_cognitive_forgetting_state() -> None:
-    """Cognitive forgetting is auditable over the wire: `get` still returns the record."""
-    forgotten_at = datetime(2026, 9, 3, 9, 0, tzinfo=timezone.utc)
+def test_search_keeps_its_default_shape_and_explains_an_empty_result() -> None:
     memory = FakeMemory()
-    memory.forgotten_at = forgotten_at
-    app = create_app(memory=memory)
 
-    with TestClient(app) as client:
-        found = client.get("/v1/memories/memory_1")
-        listed = client.get("/v1/memories")
+    with TestClient(create_app(memory=memory)) as client:
+        plain = client.post("/v1/memories/search", json={"query": "toolbox"})
+        explained = client.post("/v1/memories/search", json={"query": "toolbox", "explain": True})
 
-    expected = forgotten_at.isoformat().replace("+00:00", "Z")
-    assert found.json()["forgotten_at"] == expected
-    assert listed.json()["items"][0]["forgotten_at"] == expected
+    assert plain.status_code == 200
+    assert plain.json()["hits"][0]["id"] == "memory_1"
+    assert plain.json()["trace"] is None
+    assert explained.status_code == 200
+    body = explained.json()
+    assert body["hits"] == []
+    assert body["trace"]["ambiguous"] is True
+    assert body["trace"]["candidate_limit"] == 50
+    assert body["trace"]["exhaustive"] is True
+    assert body["trace"]["candidates"] == [
+        {
+            "memory_id": "memory_1",
+            "index_ids": ["index_1"],
+            "dense_relevance": 0.42,
+            "dense_confidence": None,
+            "lexical_relevance": None,
+            "lexical_rerank_bonus": None,
+            "lexical_match": False,
+            "gate_relevance": 0.31,
+            "base_relevance": None,
+            "reinforcement_factor": None,
+            "temporal_factor": None,
+            "retention_factor": None,
+            "final_score": 0.4,
+            "rank": None,
+            "rejected_by": "minimum_relevance",
+        }
+    ]
+    assert memory.calls == [
+        ("search", "toolbox", 10, None, None, None, None),
+        ("search_with_trace", "toolbox", 10, None, None, None, None),
+    ]
+
+
+def test_reinforce_route_reaches_the_sdk_and_rejects_an_empty_list() -> None:
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory)) as client:
+        reinforced = client.post(
+            "/v1/memories/reinforce", json={"memory_ids": ["memory_1", "memory_1", "memory_2"]}
+        )
+        empty = client.post("/v1/memories/reinforce", json={"memory_ids": []})
+
+    assert reinforced.status_code == 200
+    assert reinforced.json() == {"reinforced": 2}
+    assert memory.calls == [("reinforce", ("memory_1", "memory_1", "memory_2"))]
+    assert empty.status_code == 422
+    assert empty.json()["code"] == "validation_error"
 
 
 def _record(
@@ -846,7 +967,6 @@ def _record(
     assets: tuple[AssetRef, ...] = (),
     modality: Modality = Modality.TEXT,
     memory_type: MemoryType = MemoryType.SEMANTIC,
-    forgotten_at: datetime | None = None,
 ) -> MemoryRecord:
     return MemoryRecord(
         id=memory_id,
@@ -858,35 +978,17 @@ def _record(
         occurred_at=occurred_at,
         occurred_end=occurred_end,
         metadata=metadata or {},
-        forgotten_at=forgotten_at,
-    )
-
-
-def _hit(
-    memory_id: str = "memory_1",
-    *,
-    score: float = 0.9,
-    assets: tuple[AssetRef, ...] = (),
-    memory_type: MemoryType = MemoryType.SEMANTIC,
-) -> SearchHit:
-    return SearchHit(
-        id=memory_id,
-        content="The toolbox is blue.",
-        score=score,
-        modality=Modality.IMAGE if assets else Modality.TEXT,
-        memory_type=memory_type,
-        assets=assets,
-        created_at=NOW,
     )
 
 
 def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
+    """Two populated sections, one empty one, and one conflict."""
     return ContextBundle(
         goal="What should I bring?",
         reference_at=reference_at,
         budget=budget,
         actors=(),
-        episodes=(_hit("memory_2", score=0.7, assets=(ASSET,), memory_type=MemoryType.EPISODIC),),
+        episodes=(_media_hit(),),
         facts=(_hit(),),
         procedures=(),
         affect=(),
@@ -897,4 +999,45 @@ def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
         frames=("home/map",),
         omitted=3,
         chars=42,
+    )
+
+
+def _media_hit() -> SearchHit:
+    """A hit carrying a stored asset, whose local path must never be serialized."""
+    return SearchHit(
+        id="memory_2",
+        content="The toolbox is blue.",
+        score=0.7,
+        modality=Modality.IMAGE,
+        memory_type=MemoryType.EPISODIC,
+        assets=(ASSET,),
+        created_at=NOW,
+    )
+
+
+def _trace() -> RetrievalTrace:
+    return RetrievalTrace(
+        candidates=(
+            RetrievalCandidateTrace(
+                memory_id="memory_1",
+                index_ids=("index_1",),
+                dense_relevance=0.42,
+                gate_relevance=0.31,
+                final_score=0.4,
+                rejected_by=RetrievalRejection.MINIMUM_RELEVANCE,
+            ),
+        ),
+        candidate_limit=50,
+        exhaustive=True,
+        ambiguous=True,
+    )
+
+
+def _hit() -> SearchHit:
+    return SearchHit(
+        id="memory_1",
+        content="The toolbox is blue.",
+        score=0.9,
+        modality=Modality.TEXT,
+        created_at=NOW,
     )

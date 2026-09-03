@@ -300,7 +300,14 @@ def test_dependency_surface_is_exact() -> None:
         extra: {_name(item) for item in items} for extra, items in EXTRAS.items() if extra != "all"
     }
     assert extras == {
-        "benchmarks": {"httpx", "huggingface-hub", "nltk", "opentelemetry-sdk", "pyarrow"},
+        "benchmarks": {
+            "httpx",
+            "huggingface-hub",
+            "nltk",
+            "opentelemetry-sdk",
+            "pyarrow",
+            "pyyaml",
+        },
         "observability": {"opentelemetry-sdk"},
         "openai": {"av", "openai", "pillow"},
         "face": {"opencv-python-headless"},

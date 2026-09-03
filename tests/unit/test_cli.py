@@ -28,6 +28,7 @@ from pydantic import TypeAdapter
 
 from mindbridge import Memory, recipes
 from mindbridge.api import app as rest
+from mindbridge.api import content as rest_content
 from mindbridge.api.errors import ErrorEnvelope
 from mindbridge.cli import COMMANDS, EXIT_CODES, OPERATIONS, main
 from mindbridge.exceptions import MindBridgeError, ValidationError
@@ -46,7 +47,7 @@ from mindbridge.types import (
 )
 
 # The REST content union itself, so the two decoders are compared over one schema.
-_REST_CONTENT: TypeAdapter[rest._Content] = TypeAdapter(rest._Content)
+_REST_CONTENT: TypeAdapter[rest_content.Content] = TypeAdapter(rest_content.Content)
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode("ascii")
 WAV = base64.b64encode(b"RIFF____WAVE").decode("ascii")
 APP_SOURCE = '''
@@ -268,7 +269,7 @@ PART_CASES: tuple[list[dict[str, object]], ...] = (
 def test_parts_decode_exactly_as_rest_decodes_them(parts: list[dict[str, object]]) -> None:
     from mindbridge.cli import _parts_input
 
-    assert _parts_input(parts) == rest._content_input(_REST_CONTENT.validate_python(parts))
+    assert _parts_input(parts) == rest_content.content_input(_REST_CONTENT.validate_python(parts))
 
 
 @pytest.mark.parametrize(
@@ -297,7 +298,7 @@ def test_invalid_parts_are_rejected_by_both_surfaces(parts: list[dict[str, objec
     with pytest.raises(ValidationError):
         _parts_input(parts)
     with pytest.raises(ValueError):
-        rest._content_input(_REST_CONTENT.validate_python(parts))
+        rest_content.content_input(_REST_CONTENT.validate_python(parts))
 
 
 def test_the_cli_only_path_part_reaches_memory_as_a_path(tmp_path: Path) -> None:
@@ -345,7 +346,7 @@ def test_add_search_get_list_and_delete_round_trip(
     trace = cast(dict[str, object], traced_document["trace"])
     candidate = cast(list[dict[str, object]], trace["candidates"])[0]
     assert candidate["memory_id"] == record["id"]
-    assert {"lexical_relevance", "lexical_rerank_bonus", "gate_confidence"} <= candidate.keys()
+    assert {"lexical_relevance", "lexical_rerank_bonus", "gate_relevance"} <= candidate.keys()
 
     status, page, _ = _run(capsys, "--app", app, "-q", "list", "--limit", "1")
     assert status == 0
@@ -519,7 +520,10 @@ def test_an_application_target_that_is_not_a_memory_exits_ten(
     assert cast(dict[str, object], stderr[0])["reason"] == "app_invalid"
 
 
-@pytest.mark.parametrize(("option", "value"), (("--answerer", "openai"), ("--timeout", "1")))
+@pytest.mark.parametrize(
+    ("option", "value"),
+    (("--answerer", "openai"), ("--former", "openai"), ("--timeout", "1")),
+)
 def test_composition_specific_options_are_refused_by_other_compositions(
     option: str,
     value: str,
@@ -563,9 +567,43 @@ def test_recipes_pin_identity_to_the_constants_in_the_source() -> None:
     assert recipes.describe("openai:gpt-5-mini")["models"] == {
         "embedder": "gpt-5-mini",
         "answerer": "gpt-5-mini",
+        "former": "gpt-5-mini",
         "transcriber": "gpt-5-mini",
     }
     assert "OPENAI_API_KEY" in cast(str, recipes.describe("openai")["credential"])
+
+
+def test_the_former_flag_reaches_the_memory_it_composes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--former` is only wired if the constructed backend arrives as `Memory(former=...)`.
+
+    Asserting the `--explain` document instead would stay green while `_open_memory` dropped the
+    slot on the floor, which is the failure this flag was added to prevent.
+    """
+    from mindbridge import cli
+
+    sentinel = object()
+    captured: dict[str, object] = {}
+    # Parse before patching: `_parser` derives its defaults from `Memory`'s own signature.
+    arguments = cli._parser().parse_args(
+        ["--data-dir", str(tmp_path), "--embedder", "openai", "--former", "openai", "list"]
+    )
+    monkeypatch.setattr(recipes, "embedder", lambda name, **kw: object())
+    monkeypatch.setattr(recipes, "former", lambda name, **kw: sentinel)
+    monkeypatch.setattr(cli, "Memory", lambda *args, **kwargs: captured.update(kwargs))
+
+    cli._open_memory(arguments)
+
+    assert captured["former"] is sentinel
+
+
+def test_every_recipe_slot_has_a_command_line_flag() -> None:
+    """The four literals this used to need are now one list; keep the flag set derived from it."""
+    from mindbridge import cli
+
+    flags = {action.dest for action in cli._parser()._actions}
+    assert set(cli._SLOTS) <= flags
 
 
 def test_recipes_return_an_object_the_caller_owns() -> None:
@@ -589,7 +627,7 @@ class _SdkClient:
         self.close_calls += 1
 
 
-@pytest.mark.parametrize("slot", ("embedder", "answerer", "transcriber"))
+@pytest.mark.parametrize("slot", ("embedder", "answerer", "former", "transcriber"))
 def test_a_recipe_closes_the_sdk_client_it_constructed(
     slot: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -793,7 +831,7 @@ def test_remote_mode_serializes_typed_observation_context(
     }
 
 
-def test_remote_mode_compiles_and_reads_capabilities_over_v1(
+def test_remote_mode_compiles_over_v1(
     calls: list[tuple[str, str, object]], capsys: pytest.CaptureFixture[str]
 ) -> None:
     _run(
@@ -810,7 +848,6 @@ def test_remote_mode_compiles_and_reads_capabilities_over_v1(
         "--freshness-seconds",
         "3600",
     )
-    _run(capsys, "--url", "http://owner:8000", "-q", "capabilities")
 
     assert calls == [
         (
@@ -827,7 +864,6 @@ def test_remote_mode_compiles_and_reads_capabilities_over_v1(
                 },
             },
         ),
-        ("GET", "http://owner:8000/v1/capabilities", None),
     ]
 
 

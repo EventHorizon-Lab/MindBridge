@@ -101,13 +101,13 @@ OPERATIONS: tuple[str, ...] = (
     "search_with_trace",
     "ask",
     "compile",
-    "capabilities",
     "get",
     "speech",
     "faces",
     "register_speaker",
     "register_identity",
     "identity",
+    "forget_identity",
     "unlink_identity",
     "reinforce",
     "consolidate",
@@ -124,7 +124,7 @@ COMMANDS: tuple[str, ...] = (*(name.replace("_", "-") for name in OPERATIONS), D
 # Operations a running owner serves over `/v1`. Other operations have no route today; that is a
 # documented transport gap, reported honestly, not a CLI design choice.
 REMOTE_COMMANDS = frozenset(
-    {"add", "add-many", "search", "ask", "compile", "capabilities", "get", "list", "delete"}
+    {"add", "add-many", "search", "ask", "compile", "get", "list", "delete"}
 )
 _QUERY_METAVAR: Mapping[str, str] = {
     "add": "TEXT",
@@ -136,6 +136,10 @@ _QUERY_METAVAR: Mapping[str, str] = {
     "consolidate": "GOAL",
 }
 _DEFAULT_REMOTE_TIMEOUT_SECONDS = 30.0
+# One list, because a slot added to `recipes` used to need remembering in four separate literals
+# here; the flag, the explain document, `doctor`, and the composition guard all derive from it.
+_SLOTS: tuple[str, ...] = ("embedder", "answerer", "former", "transcriber")
+_OPTIONAL_SLOTS: tuple[str, ...] = _SLOTS[1:]
 _TUNING: tuple[str, ...] = (
     "index_speech",
     "minimum_relevance",
@@ -258,7 +262,7 @@ def _resolve(arguments: argparse.Namespace) -> _Document:
         "data_dir": str(_data_dir(arguments)),
     }
     with _composing():
-        for slot in ("embedder", "answerer", "transcriber"):
+        for slot in _SLOTS:
             name = getattr(arguments, slot)
             if name is None:
                 document[slot] = None
@@ -274,7 +278,7 @@ def _reject_embedder_only_options(arguments: argparse.Namespace) -> None:
     """`--app` and `--url` compose elsewhere, so a knob meant for a recipe must not be ignored."""
     given = [
         f"--{name.replace('_', '-')}"
-        for name in ("data_dir", "answerer", "transcriber", *_TUNING)
+        for name in ("data_dir", *_OPTIONAL_SLOTS, *_TUNING)
         if getattr(arguments, name) != _MEMORY_DEFAULTS[name]
     ]
     if given:
@@ -294,6 +298,8 @@ def _open_memory(arguments: argparse.Namespace) -> Memory:
         backends["embedder"] = recipes.embedder(arguments.embedder)
         if arguments.answerer is not None:
             backends["answerer"] = recipes.answerer(arguments.answerer)
+        if arguments.former is not None:
+            backends["former"] = recipes.former(arguments.former)
         if arguments.transcriber is not None:
             backends["transcriber"] = recipes.transcriber(arguments.transcriber)
     try:
@@ -303,6 +309,7 @@ def _open_memory(arguments: argparse.Namespace) -> Memory:
             _data_dir(arguments),
             embedder=backends["embedder"],  # type: ignore[arg-type]
             answerer=backends.get("answerer"),  # type: ignore[arg-type]
+            former=backends.get("former"),  # type: ignore[arg-type]
             transcriber=backends.get("transcriber"),  # type: ignore[arg-type]
             index_speech=arguments.index_speech,
             minimum_relevance=arguments.minimum_relevance,
@@ -395,7 +402,7 @@ def _doctor(arguments: argparse.Namespace, composition: _Document) -> _Document:
     else:
         data_dir = _data_dir(arguments)
         state = _data_dir_state(data_dir)
-        for slot in ("embedder", "answerer", "transcriber"):
+        for slot in _SLOTS:
             name = getattr(arguments, slot)
             report[slot] = None if name is None else _probe(name, slot)
     return {
@@ -655,24 +662,6 @@ def _budget_document(budget: ContextBudget) -> _Document:
     }
 
 
-def _capabilities(memory: Memory, _arguments: argparse.Namespace) -> _Document:
-    capabilities = memory.capabilities()
-    document: _Document = {
-        "modalities": sorted(modality.value for modality in capabilities.modalities)
-    }
-    for name in (
-        "answer",
-        "transcribe",
-        "faces",
-        "describe_vision",
-        "form",
-        "consolidate",
-        "decay",
-    ):
-        document[name] = getattr(capabilities, name)
-    return document
-
-
 def _get(memory: Memory, arguments: argparse.Namespace) -> _Document:
     return _memory_document(memory.get(arguments.memory_id))
 
@@ -713,6 +702,19 @@ def _identity_profile(memory: Memory, arguments: argparse.Namespace) -> _Documen
             "name": profile.name,
             "relationship": profile.relationship,
         }
+    }
+
+
+def _forget_identity(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    erasure = memory.forget_identity(arguments.identity_id)
+    # The audit record is the point: an operator running this needs to see what was destroyed.
+    return {
+        "identity_id": erasure.identity_id,
+        "alias_ids": list(erasure.alias_ids),
+        "face_exemplars": erasure.face_exemplars,
+        "voice_exemplars": erasure.voice_exemplars,
+        "face_observations": erasure.face_observations,
+        "speech_segments": erasure.speech_segments,
     }
 
 
@@ -820,13 +822,13 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "search-with-trace": _search_with_trace,
     "ask": _ask,
     "compile": _compile,
-    "capabilities": _capabilities,
     "get": _get,
     "speech": _speech,
     "faces": _faces,
     "register-speaker": _register_speaker,
     "register-identity": _register_identity,
     "identity": _identity_profile,
+    "forget-identity": _forget_identity,
     "unlink-identity": _unlink_identity,
     "reinforce": _reinforce,
     "consolidate": _consolidate,
@@ -938,10 +940,6 @@ def _remote_compile(arguments: argparse.Namespace) -> tuple[str, str, _Document 
     return "POST", "/v1/context", body
 
 
-def _remote_capabilities(_arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    return "GET", "/v1/capabilities", None
-
-
 def _remote_get(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
     return "GET", f"/v1/memories/{quote(arguments.memory_id, safe='')}", None
 
@@ -964,7 +962,6 @@ _REMOTE: Mapping[str, Callable[[argparse.Namespace], tuple[str, str, _Document |
     "search": _remote_search,
     "ask": _remote_ask,
     "compile": _remote_compile,
-    "capabilities": _remote_capabilities,
     "get": _remote_get,
     "list": _remote_list,
     "delete": _remote_delete,
@@ -1428,6 +1425,7 @@ def _memory_document(record: MemoryRecord | SearchHit) -> _Document:
         "metadata": dict(record.metadata),
         "context": _context_document(record.context),
         "forgotten_at": _encode_optional_time(record.forgotten_at),
+        "place_id": record.place_id,
     }
     if isinstance(record, SearchHit):
         document["score"] = record.score
@@ -1577,7 +1575,7 @@ def _default(operation: str, parameter: str) -> object:
 
 
 _MEMORY_DEFAULTS: Mapping[str, object] = {
-    name: _default("__init__", name) for name in ("data_dir", "answerer", "transcriber", *_TUNING)
+    name: _default("__init__", name) for name in ("data_dir", *_OPTIONAL_SLOTS, *_TUNING)
 }
 
 
@@ -1607,8 +1605,17 @@ def _parser() -> argparse.ArgumentParser:
         help=f"remote request timeout (default: {_DEFAULT_REMOTE_TIMEOUT_SECONDS:g})",
     )
     parser.add_argument("--answerer", metavar="NAME", help="generation recipe, with --embedder")
+    parser.add_argument("--former", metavar="NAME", help="formation recipe, with --embedder")
     parser.add_argument("--transcriber", metavar="NAME", help="speech recipe, with --embedder")
-    parser.add_argument("--index-speech", action="store_true", help="index transcripts on add")
+    # Derived from the SDK default, never hardcoded: `_reject_embedder_only_options` compares this
+    # against `_MEMORY_DEFAULTS`, so a literal here silently rejects every --app/--url invocation
+    # the moment the SDK default moves. `BooleanOptionalAction` also supplies --no-index-speech.
+    parser.add_argument(
+        "--index-speech",
+        action=argparse.BooleanOptionalAction,
+        default=_MEMORY_DEFAULTS["index_speech"],
+        help="index transcripts on add (default: %(default)s)",
+    )
     parser.add_argument(
         "--minimum-relevance",
         type=float,
@@ -1704,6 +1711,11 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     identity.add_argument("--relationship", help="how this person relates to the owner")
     profile = commands.add_parser("identity", help="read one identity's name and relationship")
     profile.add_argument("identity_id", metavar="IDENTITY_ID")
+    forget = commands.add_parser(
+        "forget-identity",
+        help="erase a person: their face and voice templates, aliases, and indexed name",
+    )
+    forget.add_argument("identity_id", metavar="IDENTITY_ID")
     unlink = commands.add_parser("unlink-identity", help="reverse one face/voice merge")
     unlink.add_argument("alias_id", metavar="ALIAS_ID")
     reinforce = commands.add_parser("reinforce", help="record positive feedback")
@@ -1753,7 +1765,6 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     )
     for name, help_text in (
         ("pending-captures", "count captured memories waiting to be settled"),
-        ("capabilities", "report configured modalities and memory capabilities"),
         ("reindex", "rebuild the search index from SQLite"),
         ("optimize", "merge staged index vectors"),
         (DOCTOR, "resolve the composition and exercise each loader"),

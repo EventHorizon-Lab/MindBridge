@@ -12,7 +12,7 @@ This page defines implementation invariants. See [core concepts](concepts.md) fo
 | Component | Responsibility |
 | --- | --- |
 | `Memory` | Coordinate public operations, model capabilities, storage, retrieval, and lifecycle. |
-| Model backends | Embed, generate, transcribe or analyze speech, analyze faces, describe images, or propose typed formations. |
+| Model backends | Embed, generate, transcribe or analyze speech, analyze faces, describe images, propose typed formations, or propose memory-control-plane operations. |
 | `LocalStore` | Persist authoritative records, FP32 embeddings, analysis and identity state, compatibility metadata, and the index outbox in SQLite. |
 | `AssetStore` | Persist immutable image, video, and audio bytes by SHA-256. |
 | `ZvecIndex` | Maintain rebuildable dense, lexical, type, and event-time search projections. |
@@ -68,10 +68,6 @@ time, memory type, and optional observation context. Repeating the same add is i
 `add_many()` uses one model batch and one SQLite transaction. `add_stream()` commits each completed
 item through the ordinary add path, so a later source failure preserves the committed prefix.
 
-Formation follows the same authority rule. A `FormationBackend` proposes typed state after the
-source observation commits; the kernel validates and identifies it. Derived records, evidence,
-versions, embeddings, the per-source completion marker, and outbox work commit together.
-
 ### Deferred capture
 
 `capture()` takes the same path with the model stages removed. It validates content, materializes
@@ -94,6 +90,13 @@ A captured record is durable and readable but has no vectors, so it enqueues no 
 committed row, so a settled record holds exactly the derived content, vectors, and formation a
 blocking `add()` would have produced. Retrieval and shutdown never settle.
 
+### Formation and consolidation
+
+Formation follows the same authority rule. A `FormationBackend` proposes typed state after the
+source observation commits; the kernel validates source binding, modality, identity, validity, and
+conflicts. Derived records, evidence, versions, embeddings, the per-source recipe marker, and
+outbox work commit together. A failed formation leaves the source durable and retryable.
+
 ## Retrieval consistency
 
 ```mermaid
@@ -108,15 +111,15 @@ flowchart LR
 ```
 
 Zvec proposes candidates; SQLite decides whether they exist and whether hard event-time,
-bitemporal, spatial, and memory-type filters pass. Composite records use an aggregate embedding
-plus bounded, de-duplicated text and media keys. Dense routes and the lexical route may run
-concurrently, with at most four outer search workers.
+bitemporal, symbolic-place, metric-spatial, and memory-type filters pass. Composite records use an
+aggregate embedding plus bounded, de-duplicated text and media keys. Dense routes and the lexical
+route may run concurrently, with at most four outer search workers.
 
 `search_with_trace()` exposes bounded ranking signals and terminal rejection reasons without
 copying memory content or metadata into the trace. `ask()` uses the same retrieval path, applies
 the evidence budget, and returns only evidence the generation backend actually used.
-`compile()` reuses that same retrieval path, so SQLite reapplies authoritative visibility and
-scope before any hit reaches a [context bundle](context-compilation.md).
+`compile()` reuses that same retrieval path, so SQLite reapplies authoritative visibility, scope,
+and forgetting before any hit reaches a [context bundle](context-compilation.md).
 
 ## Ownership and concurrency
 
@@ -157,17 +160,36 @@ Applications may inject backend objects directly or use `MemoryPlugins` and `Mem
 There is no global plugin registry, package discovery, or live backend swap. SQLite, the asset
 store, and Zvec are internal components rather than public storage plugins.
 
+Model code is part of the application's trust boundary. The bundled Jina adapter, for example,
+executes pinned upstream model code; [configuration](configuration.md) owns its exact recipe and
+license constraints. No backend can bypass validation, stable identity, durability, or final
+SQLite hydration.
+
+Typed lineage and evidence are a SQLite projection, not a graph database or traversal service. A
+future entity/relation search projection must remain derived and rebuildable and pass the evidence
+gate in the [benchmark protocol](benchmarking.md#mandatory-controls).
+
 ## Public and trust boundaries
 
-Supported SDK values are imported from `mindbridge`. REST exposes add, batch add, search, ask,
-compile, capabilities, get, list, and delete under `/v1`. MCP exposes exactly seven tools: add,
-search, ask, compile, get, list, and delete, and advertises `capabilities()` in the server
-instructions instead of as a tool. Compiling context is a read-only view; identity naming,
-cognitive forgetting, operation rollback, and physical deletion stay in the owner process. Transport adapters do not create another owner: `create_app(memory=...)` and
-`build_mcp_server(memory)` use a caller-owned instance and never close it.
+Supported SDK values are imported from `mindbridge`. The `Memory` SDK exposes 27 product
+operations. REST exposes nine `/v1` routes: add, batch add, list, search, reinforce, get, delete,
+answer, and compile context. MCP exposes fifteen tools: the eight corresponding non-batch
+operations plus speech, face, and identity operations. The local CLI exposes the 27 operations
+plus `doctor`; `--url` is limited to operations implemented by REST.
 
-MindBridge does not add authentication, authorization, TLS, rate limits, quotas, or audit policy.
-Python callers may pass regular local `Path` values. REST and MCP accept inline bytes or existing
-asset IDs, and reject server paths and remote URLs. Protocol adapters never serialize provider
-exception bodies or credentials. REST also redacts subjects that identify storage, index, or
-internal state; MCP and the local CLI retain owner-local subjects.
+Compiling context is a read-only view. The memory control plane — `consolidate()`, `forget()`,
+`rollback()`, and `operations()` — and physical deletion stay in the owner process, which is also
+the process that can audit and reverse an operation through its log.
+
+`create_app(memory=...)` and `build_mcp_server(memory)` use a caller-owned instance and do not
+close it. They also do not add authentication, authorization, TLS, rate limits, quotas, or audit
+policy. See [deployment](deployment.md) for process and network setup.
+
+Python callers may intentionally pass local `Path` values; MindBridge opens only regular files and
+avoids following the final symlink where the platform supports it. REST and MCP accept inline
+bytes or existing asset IDs, and reject local paths and remote URLs. Provider output is validated
+before persistence or return. Every transport omits provider bodies and credentials. REST also
+withholds subjects naming storage, index, or internal state; MCP retains SDK subjects and can expose
+owner-local paths, so a network host must protect or redact its error envelope.
+
+Backup, restore, index repair, and telemetry procedures are in [operations](operations.md).

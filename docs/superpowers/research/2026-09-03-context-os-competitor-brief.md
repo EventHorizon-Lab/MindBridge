@@ -1,7 +1,7 @@
 # Context OS competitor brief: fast capture, memory control plane, context compiler
 
-Research date 2026-09-03. This extends [the competitive review](../../competitive-memory-systems.md)
-and answers only questions raised by [the round 1 design](../specs/2026-09-03-context-os-round-1-design.md).
+Research date 2026-09-03. This answers only questions raised by
+[the round 1 design](../specs/2026-09-03-context-os-round-1-design.md).
 Snapshots inspected: ByteDance-Seed/m3-agent `0e3e419` (`master`, 2026-02-12); MemTensor/MemOS
 `28dfb4e` (`main`, 2026-09-01); letta-ai/letta `archive` branch `56ba9c2` (2026-08-13, the retired
 V1 Python server) and letta-ai/letta-code `680cba4` (2026-09-02); mem0ai/mem0 `9a7924b`

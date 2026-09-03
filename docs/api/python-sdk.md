@@ -63,12 +63,13 @@ Memory(
     face_analyzer: FaceBackend | None = None,
     former: FormationBackend | None = None,
     consolidator: ConsolidationBackend | None = None,
-    index_speech: bool = False,
+    index_speech: bool = True,
     index_quantization: IndexQuantization = IndexQuantization.NONE,
-    minimum_relevance: float = 0.55,
+    minimum_relevance: float = 0.10,
     ambiguity_margin: float = 0.01,
     evidence_budget_chars: int | None = None,
     decay_half_life_days: float | None = None,
+    reinforce_on_answer: bool = True,
     speaker_similarity: float = 0.78,
     speaker_margin: float = 0.05,
     face_similarity: float = 0.363,
@@ -78,25 +79,31 @@ Memory(
 ) -> None
 ```
 
-`embedder` is required. `index_speech=True` requires a speech-capable `SpeechBackend` and stores
-transcripts and resolved speaker names with new memories. `index_quantization` changes only the
-rebuildable vector index; supported values are `none`, `fp16`, `int8`, and `rabitq`. The similarity,
-margin, relevance, and decay settings are validated when the instance opens. Their behavior and
-the supported provider configuration fields live in [configuration](../configuration.md).
+`embedder` is required. With a speech-capable `SpeechBackend`, the default `index_speech=True`
+stores transcripts and resolved speaker names with new memories; setting it to `False` defers that
+analysis until `speech()` is called. `index_quantization` changes only the rebuildable vector
+index; supported values are `none`, `fp16`, `int8`, and `rabitq`. The similarity, margin,
+relevance, and decay settings are validated when the instance opens. Their behavior and the
+supported provider configuration fields live in [configuration](../configuration.md).
 
 A plain `TranscriptionBackend` transcribes supported audio/video during `add` regardless of
 `index_speech`; `SpeechBackend` analysis and identity resolution stay behind the explicit flag.
 
-`vision_describer`, `former`, and `consolidator` have no declarative provider and are reachable
-through direct construction or `MemoryPlugins`. `former` proposes typed memories only after the
-source observation commits; `consolidator` proposes memory-management operations over records that
-already exist. `identity_link_min_assets` is the number of distinct co-occurring assets required before a
-face and voice are bound; its default is `2`.
+`vision_describer` has no declarative provider and is reachable only through direct construction
+or `MemoryPlugins`. `former` proposes typed memories after a source observation commits; omitting
+it keeps ordinary add behavior and makes no formation model call. The bundled OpenAI former is
+selected by the declarative `formation` slot, which stays off unless it is configured; see
+[configuration](../configuration.md#automatic-memory-formation). `consolidator` proposes the
+control-plane operations `consolidate()` applies; omitting it leaves `consolidate()` unavailable
+and every other operation unchanged.
 
 Use `index_speech=True` when transcripts and resolved speaker names should become retrieval text.
 `evidence_budget_chars=None` grounds `ask()` on exactly `limit` hits. A positive integer may admit
 more ranked evidence while its text-equivalent cost fits the budget: 2,000 characters per image,
 4,000 per audio asset, and 12,000 per video asset.
+
+`reinforce_on_answer=True` records positive feedback for the hits an answerer actually cites.
+Set it to `False` for evaluations that require one question not to change later rankings.
 
 The two other construction boundaries are:
 
@@ -121,8 +128,8 @@ resolve_memory_config(
 ```
 
 `MemoryPlugins` contains `embedder` plus optional `answerer`, `transcriber`, `vision_describer`,
-`face_analyzer`, `former`, and `consolidator`. `MemoryConfig` contains the value-only constructor settings;
-`MemorySettings` is its public alias. `MemoryComposition` contains `data_dir`, `plugins`, and
+`face_analyzer`, `former`, and `consolidator`. `MemoryConfig` contains the value-only constructor
+settings; `MemorySettings` is its public alias. `MemoryComposition` contains `data_dir`, `plugins`, and
 `settings`; call `close()` unless its plugins have been transferred to a `Memory`.
 
 ### Content contract
@@ -217,16 +224,16 @@ pending_captures() -> int
 `capture` returns after the SQLite commit and before any model call. It returns the same
 content-addressed record `add` returns for the same input, so capturing and then adding the same
 content is one memory. A captured record is durable and readable through `get` and `list`
-immediately, and invisible to `search` and `ask` until it is settled.
+immediately, and invisible to `search`, `ask`, and `compile` until it is settled.
 
 `settle` runs the deferred stages — speech identity, transcription, embedding, the SQLite embedding
 commit, the index flush, and formation — over up to `limit` captured records in enqueue order, and
 returns how many it settled. A model or storage failure on one record raises with `subject` set to
 that memory ID and leaves it queued with its attempt count and reason; records settled earlier in
 the same call stay settled. `add` and `add_many` settle a queued record they encounter, so their
-searchable-on-return contract holds. `search`, `ask`, `close`, and opening a store never settle:
-time to searchable is the host's choice, so call `settle` from an idle loop, a timer, or after a
-capture burst. `pending_captures` returns how many records are still waiting.
+searchable-on-return contract holds. `search`, `ask`, `compile`, `close`, and opening a store never
+settle: time to searchable is the host's choice, so call `settle` from an idle loop, a timer, or
+after a capture burst. `pending_captures` returns how many records are still waiting.
 
 ```text
 search(
@@ -285,23 +292,22 @@ compile(
     reference_at: datetime | None = None,
     scope: RetrievalScope | None = None,
 ) -> ContextBundle
-
-capabilities() -> MemoryCapabilities
 ```
 
-`compile()` runs the same retrieval path once with a candidate limit of
+`compile` runs the same retrieval path once with a candidate limit of
 `max(100, 3 * budget.max_items)`, then partitions, filters, and budgets the result into a
-`ContextBundle`. It calls no generation model and never resolves a conflict; `ask()` is unchanged.
-`capabilities()` reports the configured composition so an agent surface can advertise it instead of
-failing on first use. [Context compilation](../context-compilation.md) owns both contracts.
+`ContextBundle`. It calls no generation model and never resolves a conflict; `ask` is unchanged.
+[Context compilation](../context-compilation.md) owns the contract.
 
 ```text
+capabilities -> MemoryCapabilities  # property
 get(memory_id: str) -> MemoryRecord
 speech(memory_id: str) -> tuple[SpeakerSegment, ...]
 faces(memory_id: str) -> tuple[FaceObservation, ...]
 register_speaker(speaker_id: str, name: str, *, relationship: str | None = None) -> None
 register_identity(identity_id: str, name: str, *, relationship: str | None = None) -> None
 identity(identity_id: str) -> IdentityProfile | None
+forget_identity(identity_id: str) -> IdentityErasure
 unlink_identity(alias_id: str) -> str | None
 reinforce(memory_ids: Sequence[str]) -> int
 list(*, limit: int = 100, cursor: str | None = None) -> Page
@@ -329,6 +335,11 @@ records explicit positive feedback and returns the number of existing distinct m
 `reindex` rebuilds Zvec from authoritative SQLite embeddings without calling the embedder and
 returns the number of memories rebuilt. `optimize` merges and flushes staged index vectors.
 Repeated `close()` calls are harmless.
+
+`capabilities` reports what the composition's backends declare rather than what a provider name
+suggests, so an agent surface can advertise the instance instead of discovering a missing backend
+by failing on first use. `consolidation_model` is set only when a `ConsolidationBackend` is
+injected. `GET /healthz` and the MCP server instructions publish the same view.
 
 ### Memory management operations
 
@@ -373,15 +384,57 @@ none of these four operations is exposed on REST or MCP.
 ### Cross-modal identity binding
 
 A face and a voice become one identity only after the same pair co-occurs in
-`identity_link_min_assets` distinct assets. The default `2` avoids binding on a single ambiguous
-co-occurrence; set it to `1` only when first-observation binding is intended. Binding is durable
-and reversible through `unlink_identity`.
+`identity_link_min_assets` distinct assets (default `2`). A single asset cannot separate "this
+face spoke" from "this face was listening to someone off camera", which is the ordinary case in
+egocentric capture: the wearer talks while somebody else fills the frame. Binding on one asset
+therefore attaches the wearer's voice to whoever happened to be visible. Set
+`identity_link_min_assets=1` to bind on first co-occurrence.
+
+Counting assets raises the price of that mistake without preventing it: a wearer talks to the same
+person across many clips, so the wrong pair accumulates as fast as a genuine speaker's. Binding is
+therefore also contained. Only a voice-only and a face-only identity may fuse, so an identity that
+already holds both modalities absorbs nothing further and one wrong bind cannot cascade into the
+next person. A fragment whose modality the identity already holds stays orphaned; merge it
+deliberately through the store if the claim is established some other way.
+
+Binding is recorded, not guessed at read time, so it is durable and reversible through
+`unlink_identity`. Recognizer yield per asset is reported under the `mindbridge.identity.*` span
+attributes, including when nothing was detected.
+
+`forget_identity` erases a person rather than a memory. It removes the profile, every face and
+voice exemplar, every merged alias, and the accumulated link evidence, and it rewrites the indexed
+documents so a registered name stops being searchable — erasing the rows alone would leave the
+name in the search projection. Memories, their content and their media survive, and a transcript
+keeps its words with the speaker attribution dropped: forgetting a person is not forgetting the
+evening. Face observation rows are deleted because their whole payload is a box plus the identity
+claim. The returned `IdentityErasure` reports what was destroyed, which is what an audit needs.
+
+Freed database cells are zero-filled and the write-ahead log is checkpointed, so the stored
+vectors are gone from the database and its log. Filesystem snapshots, backups and wear-levelled
+storage are not covered. `forget_identity` deliberately does **not** prevent a later encounter
+from minting a fresh identity for the same person: recognizing someone as previously-forgotten
+would require keeping the template the request destroys. A deployment that needs "never recognize
+this person again" needs a retained blocklist, which is the opposite of a deletion.
+
+`ObservationContext(place_id=...)` records the symbolic room-level place a memory was captured
+in, `RetrievalScope(place_id=...)` scopes retrieval to it, and `MemoryRecord.place_id` reads it
+back. This is a second spatial axis alongside `spatial`'s metric pose: a robot that cannot
+localise can still label a room, and "in the kitchen" is the question a household asks. The label
+is matched by equality and nothing normalises it beyond rejecting empty or untrimmed text, so a
+producer that writes both `kitchen` and `the kitchen` partitions its own store — which is why the
+value is readable rather than write-only. A place scope excludes memories with no place; it does
+not treat them as being everywhere.
+
+`capabilities` publishes what the composition declared — the modality set each backend accepts,
+the embedding model, space and dimension, the optional model identities, and whether speaker
+recognition and streaming generation are available. It is a field read: it cannot raise or block.
 
 ### AsyncMemory
 
-`AsyncMemory` has the same constructor, class methods, operation names, keyword parameters,
-defaults, and result values as `Memory`, including `capture`, `settle`, and `pending_captures`.
-Finite operations are awaited; `close()` is asynchronous. Its stream boundary is:
+`AsyncMemory` has the same constructor, class methods, keyword parameters, defaults, and result
+values as `Memory`. Finite operations are awaited and `close()` is asynchronous. It mirrors every
+listed operation except `forget_identity`; identity erasure currently requires synchronous
+`Memory`. Its stream boundary is:
 
 ```text
 add_stream(
@@ -403,7 +456,7 @@ AsyncOmniPrefetch(
     reference_at: datetime | None = None,
     occurred_from: datetime | None = None,
     occurred_until: datetime | None = None,
-)
+) -> None
 
 latest: PrefetchResult | None
 submit(query: ContentInput) -> int
@@ -417,7 +470,7 @@ exact final revision and closes the helper. Snapshots reject mutable `Path` atom
 
 ### Async capture streams
 
-The three capture helpers share the same keyword parameters and defaults:
+The capture helpers use these signatures:
 
 ```text
 AsyncCaptureStream(
@@ -433,6 +486,7 @@ AsyncAudioStream(
     *,
     limit: int = 10,
     memory_type: MemoryType | None = None,
+    context: StreamContext = None,
     reference_at: datetime | None = None,
     max_streams: int = 32,
 ) -> None
@@ -441,6 +495,7 @@ AsyncVisionStream(
     *,
     limit: int = 10,
     memory_type: MemoryType | None = None,
+    context: StreamContext = None,
     reference_at: datetime | None = None,
     max_streams: int = 32,
 ) -> None
@@ -459,19 +514,20 @@ AsyncVisionStream.consume(
 `AsyncCaptureStream` treats `update` as speculative retrieval, `final` as the durable write, and
 `cancel` as discard. `AsyncAudioStream` reduces `PCMChunk`, `VADPacket`, `ASRPartial`, and
 `AcousticBoundary`; `AsyncVisionStream` reduces `VisionFrame`, `VisionPartial`, and
-`SceneBoundary`. Up to `max_streams` independent `stream_id` values may be active. See
+`SceneBoundary`. `StreamContext` is an `ObservationContext`, a callable sampled once per completed
+observation, or `None`. Up to `max_streams` independent `stream_id` values may be active. See
 [omni streaming and interaction memory](../omni-streaming-and-interaction-memory.md) for event
 semantics and complete examples.
 
 ### Root import inventory
 
-These are the supported names exported by `mindbridge`:
+These are the 99 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `FaceObservation`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `MemoryCapabilities`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
@@ -487,21 +543,22 @@ The principal immutable values are:
 | `Blob` | `data`, `media_type`, `name` |
 | `AssetRef` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name`, `path`; `is_resolved` property |
 | `StreamInput` | `content`, `occurred_at`, `occurred_end`, `metadata`, `memory_type`, `context`, `transcript`, `description` |
-| `MemoryRecord` | `id`, `content`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `assets`, `modality`, `memory_type`, `context`, `forgotten_at` |
+| `MemoryRecord` | `id`, `content`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `assets`, `modality`, `memory_type`, `context`, `place_id`, `forgotten_at` |
 | `SearchHit` | all visible memory fields plus `score` |
 | `AnswerResult` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `Page` | `items`, `next_cursor` |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
 | `IdentityProfile` | `identity_id`, `name`, `relationship` |
+| `IdentityErasure` | `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`, `face_observations`, `speech_segments` |
 | `FaceObservation` | `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
 | `SpatialContext` | `frame_id`, `anchor`, `x`, `y`, `z`, `orientation_xyzw`, `position_uncertainty_m` |
-| `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial` |
+| `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial`, `place_id` |
 | `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `spatial`, `cue_modality`, `valence`, `arousal` |
-| `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m` |
+| `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m`, `place_id` |
 | `ContextBudget` | `max_chars`, `max_items`, `memory_types`, `min_confidence`, `freshness` |
 | `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `occurred_from`, `occurred_until`, `frames`, `omitted`, `chars`; `hits` property and `render()` |
-| `MemoryCapabilities` | `modalities`, `answer`, `transcribe`, `faces`, `describe_vision`, `form`, `consolidate`, `decay` |
+| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `rationale` |
 | `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `rolled_back_at` |
 | `ConsolidationReport` | `operations`, `rejected` as `(MemoryOperation, reason)` pairs |
 | `StreamEvent` | `phase`, `item`, `stream_id` |
@@ -516,7 +573,8 @@ The principal immutable values are:
 | `PrefetchResult` | positive `revision`, `hits` |
 | `TracedSearchResult` | `hits`, `trace` |
 | `RetrievalTrace` | `candidates`, `candidate_limit`, `exhaustive`, `ambiguous` |
-| `RetrievalCandidateTrace` | `memory_id`, `index_ids`, `dense_relevance`, `dense_confidence`, `lexical_relevance`, `lexical_rerank_bonus`, `lexical_match`, `gate_confidence`, `base_relevance`, `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`, `rejected_by` |
+| `RetrievalCandidateTrace` | `memory_id`, `index_ids`, `dense_relevance`, `dense_confidence`, `lexical_relevance`, `lexical_rerank_bonus`, `lexical_match`, `gate_relevance`, `base_relevance`, `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`, `rejected_by` |
+| `MemoryCapabilities` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `consolidation_model`, `speaker_recognition`, `streaming_generation` |
 
 `abstained` is true only when the answerer returns MindBridge's reserved no-evidence sentence. A
 provider refusal expressed another way is an ordinary answer unless the adapter maps it to this
@@ -533,9 +591,9 @@ Enum values are:
 | `RetrievalRejection` | `stale_index`, `occurrence_range`, `missing_memory`, `memory_type`, `minimum_relevance`, `ambiguity`, `limit` |
 | `EmbedTask` | `retrieval.query`, `retrieval.document` |
 | `MemoryKind` | `observation`, `entity`, `event`, `state`, `relation`, `affect`, `trait`, `response_policy` |
-| `EvidenceBasis` | `observation`, `user_statement`, `model_inference`, `response_feedback` |
 | `MemoryIntent` | `reinforce`, `consolidate`, `correct`, `forget` |
 | `MemoryTrigger` | `manual`, `evidence`, `feedback`, `contradiction`, `query_failure`, `pressure`, `idle` |
+| `EvidenceBasis` | `observation`, `user_statement`, `model_inference`, `response_feedback` |
 | `SpatialAnchor` | `observer`, `subject` |
 | `StreamPhase` | `update`, `final`, `cancel` |
 | `AudioBoundary` | `start`, `end`, `cancel` |
@@ -600,10 +658,8 @@ streaming extension implements `close()`.
 `form` receives one `FormationInput` per committed source and returns one proposal tuple per
 input, in the same order. A former never writes storage: the kernel validates each proposal
 against the source modality and spatial frame, assigns identity, links evidence, and commits.
-
-`consolidate` receives the bounded evidence set the kernel selected and may cite only IDs from
-it. It proposes; the kernel authorizes. `consolidation_recipe` identifies every control that
-changes what the backend proposes, so it is part of each operation's idempotency key.
+`consolidate` receives the bounded evidence set the kernel chose and may cite only IDs from it;
+like a former it proposes and never writes storage.
 
 `ModelInput` contains normalized `text` and resolved `assets`. Speech adapters return
 `SpeechAnalysis(turns, speakers)` using `SpeechTurn` and `SpeakerEmbedding`; face adapters return
@@ -619,7 +675,6 @@ changes what the backend proposes, so it is part of each operation's idempotency
 | `FaceAnalysis` | `faces` |
 | `FormationInput` | `memory_id`, `content`, `context` |
 | `FormationProposal` | `kind`, `content`, `basis`, `subject`, `predicate`, `value`, `confidence`, `valid_from`, `valid_until`, `spatial`, `cue_modality`, `valence`, `arousal` |
-| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `rationale` |
 
 ### Bundled adapters
 
@@ -714,7 +769,7 @@ OpenAIModels(
     transcription_languages: Sequence[str] | None = None,
     embedding_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
     generation_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
-    transcription_capabilities: frozenset[Modality] = frozenset({Modality.AUDIO}),
+    transcription_capabilities: frozenset[Modality] = frozenset({Modality.AUDIO, Modality.VIDEO}),
     generation_seed: int | None = None,
     generation_temperature: float | None = None,
     generation_max_tokens: int | None = None,
@@ -758,10 +813,11 @@ answer text is capped at 4 MiB. Answer fitting reserves media capacity for the q
 highest-ranked evidence that fits, and leaves overflow evidence as text when possible; use a
 provider-specific upload adapter for larger media.
 
-Named recipes are also available as a small, closed construction API:
+Named recipes are available through the supported `mindbridge.recipes` submodule, not as a root
+re-export:
 
 ```text
-from mindbridge import recipes
+import mindbridge.recipes as recipes
 
 recipes.names() -> tuple[str, ...]
 recipes.slots(name: str) -> tuple[str, ...]
@@ -770,6 +826,7 @@ recipes.probe(name: str) -> str
 recipes.describe(name: str) -> dict[str, object]
 recipes.embedder(name: str, *, load: bool = False) -> EmbeddingBackend
 recipes.answerer(name: str, *, load: bool = False) -> GenerationBackend
+recipes.former(name: str, *, load: bool = False) -> FormationBackend
 recipes.transcriber(
     name: str,
     *,

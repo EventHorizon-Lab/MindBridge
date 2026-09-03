@@ -768,3 +768,153 @@ def test_openeqa_catalog_pins_one_release_for_both_scene_splits() -> None:
     assert hm3d.media_source.acquirer == "open-eqa-hm3d-frames"
     assert scannet.media_source.acquirer == "scannet"
     assert hm3d.repository == "facebookresearch/open-eqa"
+
+
+# --- gold evidence: which adapters can carry a source-level retrieval label -----------------
+
+
+def test_locomo_refined_labels_the_dialogue_turns_that_hold_the_answer(tmp_path: Path) -> None:
+    """`evidence` names `dia_id` values, which are this unit's memory source IDs.
+
+    The join is not assumed. An evidence ID that names no stored turn is reported
+    under its own key instead of being dropped, so a release whose label vocabulary
+    is not the source-ID vocabulary reads as a join failure rather than as recall
+    over the handful of IDs that happened to match.
+    """
+    from mindbridge.benchmarks.eval_adapters import load_task
+
+    _write(
+        tmp_path / "locomo-refined" / "data" / "raw" / "locomo_refined.json",
+        [
+            {
+                "sample_id": "conv-1",
+                "conversation": {
+                    "session_1_date_time": "1:56 pm on 8 May, 2023",
+                    "session_1": [
+                        {"speaker": "Ana", "dia_id": "D1:1", "text": "I adopted a beagle."},
+                        {"speaker": "Bo", "dia_id": "D1:2", "text": "What did you name her?"},
+                        {"speaker": "Ana", "dia_id": "D1:3", "text": "Her name is Juno."},
+                    ],
+                },
+                "qa": [
+                    {
+                        "question": "What is the dog called?",
+                        "answer": ["Juno"],
+                        # The release packs several IDs into one string.
+                        "evidence": ["D1:1; D1:3"],
+                        "category": 1,
+                    },
+                    {
+                        "question": "Which turn is missing?",
+                        "answer": ["none"],
+                        "evidence": ["D1:2", "D7:9"],
+                        "category": 2,
+                    },
+                    {
+                        "question": "Unlabelled question.",
+                        "answer": ["none"],
+                        "evidence": [],
+                        "category": 3,
+                    },
+                ],
+            }
+        ],
+    )
+
+    unit = load_task(TASKS["locomo-refined"], root=tmp_path, verify_digest=False).units[0]
+    stored = {item.source_id for item in unit.memories}
+    labels = {question.question_id: question.metadata for question in unit.questions}
+
+    assert stored == {"D1:1", "D1:2", "D1:3"}
+    # Exact, source-level gold: the packed string is split and both IDs kept in order.
+    assert labels["conv-1#q0000"]["evidence_ids"] == ("D1:1", "D1:3")
+    assert labels["conv-1#q0000"]["unresolved_evidence_ids"] == ()
+    # `D7:9` names no stored turn, so it is reported rather than silently absorbed.
+    assert labels["conv-1#q0001"]["evidence_ids"] == ("D1:2",)
+    assert labels["conv-1#q0001"]["unresolved_evidence_ids"] == ("D7:9",)
+    # A question the release left unlabelled carries no label, so it is excluded
+    # from recall rather than counted as a miss.
+    assert labels["conv-1#q0002"]["evidence_ids"] == ()
+
+
+def test_longmemeval_labels_the_answer_turn_and_every_block_it_was_split_into(
+    tmp_path: Path,
+) -> None:
+    """`has_answer` marks the turn, which is finer than `answer_session_ids`.
+
+    A turn over the part limit is stored as several `_B####` blocks, and every block
+    of a marked turn is gold: labelling only the unsplit ID would score a correct
+    retrieval as a miss on exactly the long turns that motivated the split.
+    """
+    from mindbridge.benchmarks.eval_adapters import _TEXT_BLOCK_CHARACTERS, load_task
+
+    long_answer = "\n\n".join(["Juno is a beagle." * 40] * 15)
+    assert len(long_answer) > _TEXT_BLOCK_CHARACTERS
+    _write(
+        tmp_path / "longmemeval" / "longmemeval_s",
+        [
+            _longmemeval_question(
+                question_id="turn-level",
+                haystack_dates=["2023/05/20 (Sat) 02:21", "2023/05/21 (Sun) 02:21"],
+                haystack_session_ids=["s1", "s2"],
+                haystack_sessions=[
+                    [
+                        {"role": "user", "content": "Anything new?"},
+                        {"role": "assistant", "content": "Not really."},
+                    ],
+                    [
+                        {"role": "user", "content": "Tell me about the dog."},
+                        {
+                            "role": "assistant",
+                            "content": long_answer,
+                            "has_answer": True,
+                        },
+                        # Skipped at ingest, so it can never be gold.
+                        {"role": "user", "content": "   ", "has_answer": True},
+                    ],
+                ],
+                answer_session_ids=["s2"],
+            )
+        ],
+    )
+
+    unit = load_task(TASKS["longmemeval-s"], root=tmp_path, verify_digest=False).units[0]
+    (question,) = unit.questions
+    stored = tuple(item.source_id for item in unit.memories)
+    gold = question.metadata["evidence_ids"]
+
+    assert stored == (
+        "S0000_s1_T0000",
+        "S0000_s1_T0001",
+        "S0001_s2_T0000",
+        "S0001_s2_T0001_B0000",
+        "S0001_s2_T0001_B0001",
+    )
+    assert gold == ("S0001_s2_T0001_B0000", "S0001_s2_T0001_B0001")
+    assert set(gold) <= set(stored)
+    # The coarser session label the release also publishes stays available and stays
+    # separate: it is not a source-level ID and must not be read as one.
+    assert question.metadata["answer_session_ids"] == ("s2",)
+
+
+def test_longmemeval_reports_no_gold_evidence_when_the_release_marks_no_turn(
+    tmp_path: Path,
+) -> None:
+    """`has_answer` is absent from a release file, not merely false.
+
+    The loader defaults it to false, so an unmarked release yields an empty label and
+    `MISSING recall_at_20` -- the honest state -- rather than a gold set of every turn
+    in the answer session.
+    """
+    from mindbridge.benchmarks.eval_adapters import load_task
+
+    _write(
+        tmp_path / "longmemeval" / "longmemeval_s",
+        [_longmemeval_question(question_id="unmarked")],
+    )
+
+    unit = load_task(TASKS["longmemeval-s"], root=tmp_path, verify_digest=False).units[0]
+    (question,) = unit.questions
+
+    assert question.metadata["evidence_ids"] == ()
+    assert question.metadata["answer_session_ids"] == ("s1",)

@@ -106,8 +106,9 @@ uvicorn my_application:app --host 127.0.0.1 --port 8000 --workers 1
 
 `create_app()` does not own or close either resource. It also adds no authentication,
 authorization, TLS, rate limiting, quota, or audit log. Bind to a trusted interface or put the app
-behind the deployment's existing gateway or middleware. Keep `/healthz` protected consistently
-even though it returns only liveness.
+behind the deployment's existing gateway or middleware. Keep `/healthz` protected consistently; it
+reports liveness and the live composition's capability declaration, not model or retrieval
+readiness. The app publishes nine product routes under `/v1`.
 
 Do not retry a timed-out request blindly. Adds are content-idempotent, but the SQLite commit can
 precede a transport timeout or index failure; preserve or recover the stable returned ID.
@@ -133,11 +134,12 @@ with Memory.from_config(
     build_mcp_server(memory).run("stdio")
 ```
 
-`build_mcp_server()` does not close `memory`. It reads `memory.capabilities()` once while building
+`build_mcp_server()` does not close `memory`. It reads `memory.capabilities` once while building
 the server and publishes it as the server instructions, so build the server after the composition
-is final. A stdio server inherits the host user's filesystem, environment, and model credentials. If the host chooses SSE or streamable HTTP, it must add
-authentication, authorization, TLS, request limits, and rate limiting. MCP error subjects may
-contain owner-local paths.
+is final. A stdio server inherits the host user's filesystem, environment, and model credentials.
+If the host chooses SSE or streamable HTTP, it must add authentication, authorization, TLS, request
+limits, and rate limiting. The server publishes fifteen tools; MCP error subjects may contain
+owner-local paths.
 
 ## Media and model placement
 

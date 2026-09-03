@@ -512,24 +512,23 @@ def test_a_hidden_inferred_trait_never_reaches_a_bundle(tmp_path: Path) -> None:
 
 def test_capabilities_reflect_the_injected_backends(tmp_path: Path) -> None:
     with _memory(tmp_path / "lean") as memory:
-        lean = memory.capabilities()
-    assert lean.modalities == ATOMIC_MODALITIES
-    assert (lean.answer, lean.transcribe, lean.faces, lean.describe_vision) == (
-        False,
-        False,
-        False,
-        False,
-    )
-    assert (lean.form, lean.consolidate, lean.decay) == (True, False, False)
+        lean = memory.capabilities
+    assert lean.embedding == ATOMIC_MODALITIES
+    assert (lean.generation_model, lean.transcription_space, lean.face_model) == (None, None, None)
+    assert lean.formation_model is not None
+    assert lean.consolidation_model is None
 
     with Memory(
         tmp_path / "full",
         embedder=TinyEmbedder(),
         answerer=_Answerer(),
+        consolidator=ScriptedConsolidator(),
         decay_half_life_days=30.0,
     ) as memory:
-        full = memory.capabilities()
-    assert (full.answer, full.decay, full.form) == (True, True, False)
+        full = memory.capabilities
+    assert full.generation_model == "compiler-test-answerer"
+    assert full.formation_model is None
+    assert full.consolidation_model == "consolidator-test"
 
 
 class _Answerer:
@@ -544,7 +543,7 @@ class _Answerer:
 
 
 def test_async_compile_and_capabilities_mirror_the_sync_surface(tmp_path: Path) -> None:
-    async def run() -> tuple[ContextBundle, object]:
+    async def run() -> tuple[ContextBundle, MemoryCapabilities]:
         async with AsyncMemory(
             tmp_path,
             embedder=TinyEmbedder(),
@@ -557,25 +556,17 @@ def test_async_compile_and_capabilities_mirror_the_sync_surface(tmp_path: Path) 
                 "what do you know",
                 budget=ContextBudget(max_items=1),
                 reference_at=REFERENCE,
-            ), await memory.capabilities()
+            ), memory.capabilities
 
     bundle, capabilities = asyncio.run(run())
 
     assert len(bundle.hits) == 1
     assert bundle.reference_at == REFERENCE
-    assert capabilities == MemoryCapabilities(
-        modalities=ATOMIC_MODALITIES,
-        answer=False,
-        transcribe=False,
-        faces=False,
-        describe_vision=False,
-        form=True,
-        consolidate=True,
-        decay=False,
-    )
+    assert capabilities.consolidation_model == "consolidator-test"
+    assert capabilities.embedding == ATOMIC_MODALITIES
 
 
-def test_the_cli_commands_serialize_the_bundle_and_the_capabilities(tmp_path: Path) -> None:
+def test_the_cli_command_serializes_the_bundle(tmp_path: Path) -> None:
     with _memory(tmp_path) as memory:
         memory.add("the spare key is in the blue toolbox")
         arguments = _parser().parse_args(
@@ -593,7 +584,6 @@ def test_the_cli_commands_serialize_the_bundle_and_the_capabilities(tmp_path: Pa
             ]
         )
         document = _LOCAL["compile"](memory, arguments)
-        capabilities = _LOCAL["capabilities"](memory, arguments)
 
     assert json.loads(json.dumps(document))["budget"] == {
         "max_chars": 6000,
@@ -604,9 +594,3 @@ def test_the_cli_commands_serialize_the_bundle_and_the_capabilities(tmp_path: Pa
     }
     assert len(document["facts"]) == 1  # type: ignore[arg-type]
     assert "Budget: " in str(document["rendered"])
-    assert json.loads(json.dumps(capabilities))["modalities"] == [
-        "audio",
-        "image",
-        "text",
-        "video",
-    ]

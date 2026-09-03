@@ -8,7 +8,7 @@ or isolation scope.
 | --- | --- |
 | `memory_type` | Hard exact-role filter when supplied |
 | `occurred_from` / `occurred_until` | Hard event-overlap filter |
-| `RetrievalScope` | Hard valid-time, known-time, and same-frame spatial filters |
+| `RetrievalScope` | Hard valid-time, known-time, symbolic-place, and same-frame metric filters |
 | Temporal phrases in query text | Soft event-time ranking signal |
 | Reinforcement and decay | Soft ranking signals; content is never rewritten or deleted |
 
@@ -89,7 +89,7 @@ boosted, nearby events decay smoothly with distance, and records without event t
 ## Typed context and formation
 
 `ObservationContext` is caller input. It attaches provenance, confidence, optional world validity,
-and optional spatial pose to a source observation:
+and optional metric pose or symbolic `place_id` to a source observation:
 
 ```python
 from mindbridge import EvidenceBasis, ObservationContext
@@ -104,8 +104,9 @@ source = memory.add(
 )
 ```
 
-The returned record exposes the persisted `MemoryContext`. A source context has
-`MemoryKind.OBSERVATION`. An optional former may propose these derived kinds:
+The returned record exposes the persisted `MemoryContext` and keeps a symbolic place separately as
+`MemoryRecord.place_id`. A source context has `MemoryKind.OBSERVATION`. An optional former may
+propose these derived kinds:
 
 | Derived kind | Memory type | Meaning |
 | --- | --- | --- |
@@ -138,14 +139,23 @@ Occurrence time and typed assertion time answer different questions:
 
 | Field | Question answered |
 | --- | --- |
-| `occurred_at` / `occurred_end` | When did the captured episode happen? |
-| `MemoryContext.valid_from` / `valid_until` | When was this assertion true in the represented world? |
-| `MemoryContext.recorded_at` / `retired_at` | When did MindBridge know this assertion version? |
+| `occurred_at` / `occurred_end` | When the captured episode happened |
+| `MemoryContext.valid_from` / `valid_until` | When the assertion is true in the represented world |
+| `MemoryContext.recorded_at` / `retired_at` | When MindBridge knew that assertion version |
 
-`RetrievalScope(valid_at=..., known_at=...)` combines the last two axes. `valid_at` selects a typed
-assertion whose half-open world interval contains that instant. `known_at` selects the transaction
-version active then and excludes raw records created later. Evidence links use the same transaction
-bounds, so historical retrieval does not expose support added later.
+Both validity columns and both transaction columns are stored on every typed version, so this is
+full bitemporal invalidation rather than a single timestamp. A formation backend is not required to
+reach them: `add(..., context=ObservationContext(valid_from=..., valid_until=...))` writes the same
+validity axis directly, and correcting an assertion later sets `retired_at` on the version it
+replaces instead of rewriting it.
+
+`RetrievalScope(valid_at=..., known_at=...)` combines the last two axes. `valid_at` selects an
+assertion whose half-open world interval contains that instant; `known_at` selects the transaction
+version active then. Supplying either excludes records without the corresponding typed semantic
+version, and excludes raw records created after `known_at`. Evidence links carry the same
+recorded/retired bounds, so a historical result never exposes support added later. Each evidence
+change and its semantic projection share one monotonically allocated transaction instant even when
+the device wall clock repeats.
 
 ### Spatial scope
 
@@ -172,9 +182,44 @@ hits = memory.search("Where was the red toolbox?", scope=scope)
 frames and anchors; position uncertainty expands the conservative intersection test. MindBridge
 does not infer coordinate transforms.
 
-**Contract:** Supplying `valid_at` excludes records without typed validity. `get()` and `list()` can
-still expose the latest retired or hidden context for audit, while ordinary search returns only
-active visible versions.
+`ObservationContext(place_id="kitchen")` stores a trimmed symbolic label when metric localization is
+not available. `RetrievalScope(place_id="kitchen")` applies indexed equality in SQLite and excludes
+unlabelled records. Symbolic and metric scopes are independent and both must match when combined.
+
+`get` and `list` expose the latest typed context even when it is retired or hidden, while default
+search uses only active visible versions. Forgetting is evidence-aware: deleting evidence
+recalculates derived confidence and visibility, and removing the last evidence removes the
+unsupported derived record. Removing a superseding source, or deleting a derived assertion, rebuilds
+current validity segments from the remaining supported assertions. Source records are deleted only
+by an explicit caller action.
+
+### Expiring a memory without deleting it
+
+Because default retrieval considers only active validity, an explicit `valid_until` is a soft
+forget. Give the observation a validity interval that ends, and after that instant the record stops
+appearing in default `search` and `ask` while `get` and `list` still return it and its context:
+
+```python
+from datetime import datetime, timedelta, timezone
+
+from mindbridge import ObservationContext
+
+now = datetime.now(timezone.utc)
+expiring = memory.add(
+    "The guest wifi password is swordfish.",
+    context=ObservationContext(valid_from=now, valid_until=now + timedelta(days=1)),
+)
+```
+
+`valid_until` requires `valid_from`; supplying an end alone raises `ValidationError`, because a
+world interval with no beginning cannot be placed on the validity axis. The end is exclusive and
+must be later than the start.
+
+This is the right tool when a fact was true and stopped being true — a temporary access code, a
+guest who has left, a plan that has been superseded. It is not a privacy control: the content,
+assets, embedding, and typed context all remain on disk and remain readable, and a
+`RetrievalScope(valid_at=...)` inside the expired window still retrieves the record, which is the
+point of keeping it. Use `delete` when the bytes must go.
 
 ## Memory management loop
 
@@ -201,33 +246,35 @@ the backend may cite only IDs it was shown.
 | `CORRECT` | Retire the current version of a bad derived inference. History is preserved, not overwritten. |
 | `FORGET` | Set `forgotten_at`. Recall skips the record; audit keeps it. |
 
-**Contract:** The backend proposes, never writes. Each proposal is validated against the shown
-evidence set and its intent's rules, then committed in its own transaction together with an
-append-only log row. A refused proposal is reported with a reason instead of raising, so one bad
-proposal does not discard the pass. Every operation is identified by
-`sha256(canonical operation JSON + recipe)`, so re-proposing the same operation is rejected as
-`"duplicate"` rather than applied twice. `rollback(operation_id)` reverses one operation and
-`operations()` lists the log newest first. Deletion is not an intent.
+The backend proposes and never writes. Each proposal is validated against the shown evidence set
+and its intent's rules, then committed in its own transaction together with an append-only log
+row. A refused proposal is reported with a reason instead of raising, so one bad proposal does not
+discard the pass. Every operation is identified by `sha256(canonical operation JSON + recipe)`, so
+re-proposing the same operation is rejected as `"duplicate"` rather than applied twice.
+`rollback(operation_id)` reverses one operation and `operations()` lists the log newest first.
+Deletion is not an intent.
 
-**Guidance:** Trigger the loop on durable evidence: new independent support, explicit feedback, a
-contradiction, repeated query failure, memory pressure, or an approved idle window. A periodic
-timer alone is not evidence that the work is useful. See the
-[Python SDK reference](api/python-sdk.md#memory-management-operations) for signatures, effects,
-and rollback behavior.
+Trigger the loop on durable evidence: new independent support, explicit feedback, a contradiction,
+repeated query failure, memory pressure, or an approved idle window. A periodic timer alone is not
+evidence that the work is useful. See the
+[Python SDK reference](api/python-sdk.md#memory-management-operations) for signatures, effects, and
+rollback behavior.
 
 ## Decay and reinforcement
 
-MindBridge separates three forms of forgetting, and it never conflates them:
+MindBridge separates four forms of forgetting and never conflates them:
 
 | Form | Call | Effect |
 | --- | --- | --- |
+| Expiring validity | `valid_until` | Leaves default retrieval when the interval ends; a `valid_at` scope inside the window still retrieves it. |
 | Ranking decay | `decay_half_life_days` | Downranks stale records at query time. Nothing is removed or rewritten. |
 | Cognitive forgetting | `forget()` | Excludes a record from recall while `get()`, `list()`, and `MemoryRecord.forgotten_at` retain it. Reversible through `rollback()`. |
 | Physical deletion | `delete()` | Removes the record and any media no other record references. Not recoverable, and never something a model proposes. |
 
 `forget()` is cognitive only. It is the host entry point for the `FORGET` intent, so it takes the
 same log row and the same rollback path as a proposed operation. It returns `None` when nothing
-changed, which makes an unknown or already-forgotten ID a no-op rather than an error.
+changed, which makes an unknown or already-forgotten ID a no-op rather than an error. Unlike an
+expiring validity interval, it is a policy state a host sets rather than a property of the world.
 
 Decay is disabled by default. Enable it with a positive `decay_half_life_days` setting. Decay
 changes query-time ranking only; it does not delete or rewrite records, assets, embeddings, or
@@ -248,11 +295,6 @@ if used and user_confirmed_helpful:
 `reinforce()` de-duplicates IDs, ignores missing records, and caps each record's confirmation count
 at 20. A confirmation later than the query's ranking reference is ignored for that query, which
 prevents future feedback from leaking into historical evaluation.
-
-`reinforce()` and the `REINFORCE` intent are different mechanisms with similar names. `reinforce()`
-records host feedback that slows ranking decay; it changes no evidence and no confidence. The
-`REINFORCE` intent links a second independent source to a derived record, which recomputes that
-record's confidence and visibility.
 
 **Guidance:** Reinforce only observed positive use or feedback. Use `search_with_trace()` when one
 query needs its temporal, reinforcement, retention, or rejection factors explained.

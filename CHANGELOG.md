@@ -11,28 +11,64 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 ### Added
 
 - `capture()`, `settle()`, and `pending_captures()` on `Memory` and `AsyncMemory`, plus the
-  matching `capture`, `settle`, and `pending-captures` CLI commands. `capture()` commits a record,
-  its media, its observation context, and one durable enrichment queue row in one SQLite
-  transaction and returns before any model call; `settle()` runs the deferred transcription,
-  embedding, indexing, and formation stages. `add()` and `add_many()` settle a queued record they
-  encounter, so their searchable-on-return contract is unchanged.
-- `Memory.compile()`, a context compiler that runs the existing retrieval kernel once and returns
-  a `ContextBundle`: actors, facts, episodes, procedures, affect cues, and traits selected within a
-  `ContextBudget`, plus lineage conflicts it reports without resolving, temporal and spatial
-  bounds, an omitted count, and a deterministic `render()`. `ask()` is unchanged.
-- `Memory.capabilities()` and `MemoryCapabilities`, so an agent surface can advertise the
-  modalities and memory capabilities one instance is configured for instead of discovering a
-  missing backend by failing on first use.
-- `mindbridge compile` and `mindbridge capabilities` on the command line, in local and `--url`
-  mode.
-- `POST /v1/context` (`compileContext`) and `GET /v1/capabilities` (`capabilities`) on REST, plus a
-  seventh MCP tool `compile_context`. Both transports return the whole `ContextBundle` — every
-  section, the conflicts, the temporal and spatial bounds, the budget it filled, and `rendered` —
-  and never serialize a local asset path. `build_mcp_server` now reads `memory.capabilities()` once
-  and publishes it as the MCP server instructions, so a connecting agent learns the configured
-  modalities and capabilities without a tool call; there is no capabilities tool. Compiling context
-  is a read-only view: identity naming, cognitive forgetting, and operation rollback still have no
-  REST route or MCP tool.
+  `capture`, `settle`, and `pending-captures` CLI commands. `capture()` commits a record, its
+  media, its observation context, and one durable enrichment queue row in a single SQLite
+  transaction and returns before any model call; `settle()` runs the deferred speech identity,
+  transcription, embedding, indexing, and formation stages in enqueue order. Every write path
+  previously blocked on the complete model chain, so a host with a burst of observations had to
+  choose between dropping them and stalling its own loop. `add()` and `add_many()` settle a queued
+  record they encounter, so their searchable-on-return contract is unchanged, and `search()`,
+  `ask()`, and `compile()` never settle: time to searchable stays under host control.
+- `Memory.compile()` and `AsyncMemory.compile()`, a context compiler that runs the existing
+  retrieval kernel once and returns a `ContextBundle`: actors, episodes, facts, procedures, affect
+  cues, and traits selected within a `ContextBudget`, plus the lineage conflicts it reports without
+  resolving, temporal and spatial bounds, an omitted count, and a deterministic `render()`.
+  Grounding selection existed only inside `ask()` and returned a flat hit list, so an agent
+  building its own prompt had to re-derive structure and budget from unranked hits. `ask()` is
+  unchanged. `mindbridge compile` reaches it locally and over `--url`, `POST /v1/context`
+  (`compileContext`) serves it over REST, and `compile_context` is the fifteenth MCP tool.
+- `consolidate()`, `forget()`, `rollback()`, and `operations()` on `Memory` and `AsyncMemory`, with
+  the `MemoryIntent`, `MemoryTrigger`, `MemoryOperation`, `MemoryOperationRecord`, and
+  `ConsolidationReport` vocabulary and the `ConsolidationBackend` protocol injected through
+  `MemoryPlugins.consolidator`. A model proposes reinforcement, consolidation, correction, and
+  forgetting over a bounded evidence set; the kernel validates every citation, applies each
+  accepted operation in its own transaction with an append-only log row, rejects a duplicate
+  `operation_key`, and can reverse any of them by `operation_id`. Derived memory could previously
+  only be produced one source at a time by formation, and nothing could retire or forget it under
+  policy. `MemoryCapabilities.consolidation_model` reports the injected backend. The four
+  operations are reachable from the SDK and the `consolidate`, `forget`, `rollback`, and
+  `operations` CLI commands only; neither REST nor MCP exposes them.
+- `MemoryRecord.forgotten_at`, cognitive forgetting as a policy state a host can set and clear.
+  A forgotten record leaves `search()`, `ask()`, and `compile()` but stays readable through `get()`
+  and `list()` with the state visible, so forgetting is auditable and reversible. Physical erasure
+  remains `delete()`.
+- `build_mcp_server` publishes the composition's capability view as the MCP server instructions, so
+  a connecting agent learns the configured modalities, models, and capabilities without a tool
+  call. There is no capabilities tool and no capabilities route: `GET /healthz` already reports the
+  same view over REST.
+
+- A `formation` slot on the declarative configuration surface, plus `recipes.former` and a
+  `--former` command-line flag, so a `FormationBackend` is reachable from `Memory.from_config()`
+  and from the product CLI. `FormationBackend` was implemented, accepted by `MemoryPlugins`, and
+  called by `Memory` on every write, but nothing built one: no declarative deployment and no CLI
+  composition had ever produced a typed memory, and therefore none had ever revised a belief,
+  because the supersession rules fire only on the `STATE` and user-stated `TRAIT` kinds that only
+  formation emits. Formation stays absent by default: it adds a model round-trip per write.
+- `explain` on the search tool and the REST query, routing to `search_with_trace` and returning
+  the per-candidate trace beside unchanged hits. An empty result over a transport was previously
+  indistinguishable between nothing stored, everything below `minimum_relevance`, a `memory_type`
+  filter, and an unresolved top-two tie; the trace already named all four and only the SDK and CLI
+  could see it.
+- `reinforce` on MCP and REST, as `reinforce_memories` and `POST /v1/memories/reinforce`. The
+  ranking signals read `access_count`, but no transport could write it, so an agent driving
+  MindBridge over MCP or REST held the reinforcement factor at exactly 1.0 for the life of the
+  store while age-based decay, when enabled, still applied.
+- A `context` parameter on the audio and vision stream adapters, accepting a fixed
+  `ObservationContext` or a zero-argument callable sampled at each closed observation. `StreamInput`
+  has always carried a context, but neither adapter passed one, so every memory written through the
+  microphone and camera paths had a null spatial pose. The callable form exists because a capture
+  stream outlives the observations it commits: a moving robot's pose is not a property of the
+  stream.
 
 - Face and speaker writes now record `mindbridge.identity.observations` and
   `mindbridge.identity.matched_existing` on their storage span, so a recognizer that cannot tell
@@ -41,6 +77,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   all in 76 EgoLife frames, and a recognizer whose similarities do not separate the footage created
   4 026 identities from 4 731 observations, 84.1% of them seen exactly once.
 
+- A `formation` slot on the declarative configuration surface, selecting the bundled OpenAI former
+  so that entity, event, state, relation, affect, trait, and response-policy memories, their
+  validity intervals, spatial pose, and valence/arousal are reachable from `Memory.from_config()`
+  and from the benchmark harness. `FormationBackend` was implemented, composed by `MemoryPlugins`,
+  and used by `Memory`, but no declarative slot built one, so no `from_config` deployment and no
+  benchmark run had ever produced a derived memory. The slot stays absent by default because
+  formation adds an LLM round-trip to the write path.
 - `embedding.modalities` and `embedding.request_format` on the declarative OpenAI embedding slot,
   so a self-hosted multimodal embedding server can be composed from configuration instead of only
   from constructor injection. Defaults stay text-only and `input`-shaped.
@@ -83,7 +126,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - Per-record event-time and metadata sequences on `add_many`, retaining one embedding batch and one
   SQLite transaction.
 - Crash-recoverable index replay and rebuild from SQLite without re-embedding stored content.
-- An optional resource-oriented REST API under `/v1` and six typed MCP tools over a caller-supplied
+- An optional resource-oriented REST API under `/v1` and fifteen typed MCP tools over a
+  caller-supplied
   `Memory`; the documented MCP invocation uses stdio.
 - One ordered multimodal contract across Python, REST, and MCP; response assets expose stable
   metadata without leaking local paths over wire protocols.
@@ -188,6 +232,69 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- The local schema is version 10. Version 9 directories upgrade in place, adding
+  `memory_records.forgotten_at`, the `capture_queue` table that makes deferred enrichment durable
+  across a crash, and the append-only `memory_operations` log that makes a control-plane operation
+  replayable and reversible.
+
+- **Breaking:** `minimum_relevance` now gates evidence relevance — the cosine the dense route
+  reports, or the demoted full-text contribution when only the lexical route matched, times the
+  observation's own confidence — and its default moves from `0.55` to `0.10`. It previously gated
+  a rescaled `(1 + cosine) / 2`
+  confidence, so `0.55` admitted cosine 0.10 and rejected 0.05, and any full-text match was handed
+  a flat gate value of `0.6` regardless of its dense similarity or rank. A document at cosine -1.0
+  to the query was therefore returned at the default floor and reported as `score 0.825`, and any
+  floor above `0.6` silently deleted the entire lexical recall route — which is why the knob was
+  never tunable. `0.10` reproduces the previous effective floor exactly, so retrieval behaviour is
+  preserved rather than quietly tightened.
+
+  The gate takes the signals the query asked about — retrieval relevance and temporal proximity —
+  and leaves out reinforcement and `decay_half_life_days` retention, which the query never
+  mentioned. Those still shape `SearchHit.score`, so **an admitted hit can report a score below
+  the floor**. Both factors are bounded below by `0.3`, so with retention inside the gate a
+  perfectly relevant memory decayed to `0.30`, and to `0.09` once a dated question's window also
+  missed it, under the `0.10` default: "prefer recent" silently became "hide old" for the
+  deployment that enabled decay and then asked about last year. `search_with_trace` reports the
+  gated quantity as `gate_relevance` beside the factors that moved the score off it.
+
+- **Breaking:** `RetrievalCandidateTrace.gate_confidence` is renamed `gate_relevance`. The field
+  carries the value the gate compared against `minimum_relevance` — a `final_score` for a ranked
+  candidate, a relevance-space estimate for one rejected before ranking — and no longer carries a
+  confidence.
+
+- `index_speech` now defaults to `True`. A configured `SpeechBackend` has already produced its
+  analysis by the time `add` reaches the index, so reusing that text costs no extra model call and
+  no extra token; with the flag off, a video memory's lexical index document could be as short as
+  29 characters. The flag remains a no-op unless a `SpeechBackend` is configured, and
+  `--no-index-speech` is the CLI opt-out.
+
+- `add` and `add_many` now run a configured `vision_describer` for any visual asset that has no
+  description yet, and union its text into the stored and indexed document for every embedder. The
+  describer previously ran only from `AsyncVisionStream`, and only when the embedder lacked native
+  image support, so an image-only write stored an empty lexical document — including, and
+  especially, under the recommended omni composition. A composition with no describer configured
+  produces a byte-identical write.
+
+- `speaker_similarity` keeps its `0.78` default, now documented rather than unexplained, with a
+  calibration plan. Upstream's own `yesOrno_thr = 0.31` for the pinned CAM++ recipe was evaluated
+  and rejected: it is calibrated for a single pair, while `_accepted_identity` accepts on a `max`
+  over up to 20 exemplars, where mutually orthogonal random 192-d impostors already reach 0.28. The
+  threshold is knowingly wrong in the safe direction, because splitting one speaker costs recall
+  while merging two people discloses one person's memories to another.
+
+- `ambiguity_margin` is now compared on the score scale in both branches of the ambiguity check,
+  which previously used score differences with a time window and gate-confidence differences
+  without one. Differences on the single scale are roughly twice as large, so the same margin
+  triggers less often. The default is unchanged and unretuned.
+
+- Grounded answer prompts no longer carry each hit's `memory_id`. The answer system prompt already
+  forbids answering with it, and a 64-hex identifier costs about 41 tokens per hit -- more than
+  that record's metadata and timestamps combined. Measured with `o200k_base` over four real
+  benchmark stores at the default `--recall-limit 20`, the user message drops 808-826 tokens per
+  question: 2 943 to 2 117 on locomo-refined, 4 692 to 3 871 on atm-hard, 7 414 to 6 594 on
+  m3-bench, 3 497 to 2 689 on mem-gallery. Hit content, occurrence times, memory type, and the
+  full application metadata are unchanged: metadata is the source-identity channel the system
+  prompt points at, and it costs only 8-12% of the prompt.
 - The benchmark harness request timeout now defaults to 300 seconds instead of 3 600. An hour
   bounds nothing a run cares about: a request the server never answers held its task for the full
   hour while the remaining workers idled, and the run reported the stall as elapsed time. The
@@ -217,6 +324,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   behaviour bound the wearer's voice to whoever was visible. The undocumented shortcut that let an
   asset's lone face adopt its lone voice inside the store write has been removed, leaving exactly
   one cross-modal entrance. Set `identity_link_min_assets=1` for the previous behaviour.
+  Counting assets bounds that mistake rather than removing it, because a wearer talks to the same
+  person across many clips and the wrong pair accumulates as fast as a genuine speaker's, so the
+  merge is also contained: only a voice-only and a face-only identity fuse on this path, and an
+  identity already holding both modalities absorbs nothing further. On synthetic egocentric
+  traffic with one off-camera wearer and three interlocutors, allowing the wider merge collapsed
+  all four people into a single identity under every ingestion order tried, while containing it
+  held the damage to the first bind and raised correct merges from 0 of 3 to 2 of 3.
 - The local schema is version 9. Version 8 directories upgrade in place, adding identity link
   evidence, an identity `relationship`, and the merge record that makes `unlink_identity` possible.
   Merges recorded before the upgrade have no such record and are therefore not reversible.
@@ -300,6 +414,75 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- Abstention is now detected structurally instead of by exact equality against one English
+  sentence, so a refusal is still reported when the model re-punctuates it, wraps it in emphasis,
+  appends an explanation, or answers in another language. The grounded prompt requests an opaque
+  marker built from `AbstentionReason.INSUFFICIENT_EVIDENCE`, so the prompt and the detector cannot
+  drift apart. The marker is an instrument, not a sentence: a refusal still reports
+  `UNKNOWN_ANSWER` as `AnswerResult.answer`, so a caller that shows or speaks the answer is
+  unaffected, and only the bracketed form counts as a refusal anywhere in an answer — evidence
+  that merely quotes the word `insufficient_evidence` is not one. Streaming yields raw deltas, so
+  a consumer that streams should render on `abstained`. Note that `benchmarks/prompts.py` supplies
+  its own abstention sentinel for memlens, so abstention counts from a memlens run remain
+  unusable.
+
+- The formation prompt now states the range of every bounded field — `confidence` 0 to 1,
+  `valence` -1 to 1, `arousal` 0 to 1 — and a test asserts it does. One out-of-range value fails
+  the whole `add`, and the same omission previously led models to emit a 1-5 scale.
+
+- `--index-speech` derives its default from the SDK instead of hardcoding it, and gains
+  `--no-index-speech`. With a literal default, `_reject_embedder_only_options` compared an
+  always-`False` argument against the SDK default and rejected every `--app` and `--url`
+  invocation with `option_not_applicable` as soon as that default changed.
+
+- `docs/design-principles.md` and `docs/plugin-architecture.md` are restored after being deleted,
+  corrected against the code: the extension surface is eight protocols plus one optional rather
+  than five, MCP's tools covered the common path but no embodied or identity operation, and a
+  dead `architecture.md` anchor is repointed. Caller-asserted validity via
+  `ObservationContext(valid_from=..., valid_until=...)` is documented for the first time, including
+  that `valid_from` is mandatory.
+
+- The benchmark harness dropped the `former` and `vision_describer` plugins when building each
+  isolated store, so a configured formation backend was silently absent from every measured run.
+  Both are forwarded now, and a guard test derives the expected keywords from
+  `dataclasses.fields(MemoryPlugins)` so the next added slot fails instead of being dropped.
+- A cross-modal identity bind no longer cascades. The product link path passed
+  `allow_shared_modality=True`, so a fragment could rejoin an identity that already held its
+  modality; once a wearer's voice owned one face that identity held both, and every later fragment
+  rejoined it. Measured on synthetic egocentric traffic with one off-camera wearer and three
+  interlocutors, all four people collapsed into a single identity under every ingestion order
+  tried, 0 correct binds and 3 wrong. Refusing the wider merge caps the damage at the unavoidable
+  first bind: 2 correct, 1 wrong, 4 identities. `LocalStore` keeps the wider merge for a caller
+  that has established the claim another way. The representation, not the rule, remains the
+  binding constraint: on real M3-Bench voice exemplars, within-identity cosine 0.7385 against
+  nearest-other 0.7301.
+- A `scope.valid_at` search no longer discards every memory that carries no declared validity
+  interval. The predicate admitted such a record only when neither `valid_at` nor `near` was
+  given, so asking what held at any past or present instant returned nothing at all rather than
+  nothing relevant, for any corpus written through `add()` without a context. A record with no
+  interval is unbounded in both directions and now passes at every instant, matching how the
+  semantic path already treats a NULL interval. The spatial `near` filter still excludes records
+  with no pose, which is correct: they are not at any location.
+- Chinese, Japanese and Korean lexical retrieval. Term extraction matched an entire unsegmented
+  run as one token, so a multi-character Chinese query carried a highest-weight term that could
+  never match and could never reach full lexical coverage -- the one signal that performs
+  cross-route fusion. Runs are now removed before word splitting and re-emitted as characters and
+  adjacent bigrams, and 47 Chinese function characters join the noise set that previously held
+  only English stopwords. Separately, the index routed Japanese kanji to a Chinese word segmenter,
+  which returned nothing for them, and routed Korean to an English stemmer, which cannot match an
+  agglutinated eojeol; the full-text field for these scripts is now character bigrams, which
+  measured correct for all three languages with no cross-language false positives.
+- `ask()` now reinforces the evidence its answer cited, closing the loop the ranking signals were
+  written for. Reinforcement failures are suppressed: bookkeeping must not discard an answer that
+  has already been paid for. The new `reinforce_on_answer` setting turns it off, and the benchmark
+  harness composes every store with it off: reinforcing during a run makes one question's
+  retrieval depend on which earlier questions answered, and under concurrency on the order their
+  updates committed, so an evaluation would stop being reproducible from its seed.
+- Every MCP error now arrives as a bare JSON envelope. Errors raised inside a tool body were
+  prefixed by the runtime while errors raised by the middleware were not, so a client parsing the
+  text succeeded on argument rejections and failed on `memory_not_found`, `model_error` and
+  `storage_error` -- the recoverable ones.
+
 - Remote product CLI requests now default to a finite 30-second timeout, configurable with the
   positive `--timeout SECONDS` option. Timeouts use the existing retryable `storage_error` envelope
   with `reason="timeout"` and `stage="request"` instead of leaving an agent blocked indefinitely.
@@ -371,9 +554,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - `Memory.list` is documented as defaulting to `limit=100`, not 50.
 - The three enforced Python input limits are recorded: 128 content parts, 65,536 characters per text
   value, and `limit` between 1 and 100 for `search`, `search_with_trace`, `ask`, and `list`.
-- `occurred_end` is in the `MemoryRecord` field table in the concepts guide, `reinforce` is recorded
-  as having no REST route and no MCP tool, and a full-text match is documented as scoring 0.6
-  confidence and so clearing the default `minimum_relevance` regardless of vector distance.
+- `occurred_end` is in the `MemoryRecord` field table in the concepts guide.
 - `docs/api/cli.md` is now a reference for a shipped command rather than a contract for a pending
   one, and the remaining documentation no longer describes the product CLI as missing. The old
   "one CLI with two command families" design is corrected to two console scripts forming one
@@ -421,7 +602,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - No built-in user authentication, rate limiting, quotas, or secure-erasure guarantee.
 - The CLI has no `--format` flag, configuration file, `MINDBRIDGE_*` composition variable, plugin
   registry, backend registration by name, streaming output, interactive prompt, `serve` command, or
-  named `SentenceTransformersEmbedder` recipe. `--url` mode covers the seven routed operations plus
-  `doctor`; the other nine CLI commands exit 10 and name the surfaces that do support them.
+  named `SentenceTransformersEmbedder` recipe. `--url` mode covers eight of the routed operations plus
+  `doctor`; the other nineteen CLI commands exit 10 and name the surfaces that do support them.
   `add-stream` reads finite JSONL lazily but collects return records until EOF to preserve the
   one-document stdout contract; unbounded sources use the Python SDK.

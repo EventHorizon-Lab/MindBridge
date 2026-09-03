@@ -125,7 +125,7 @@ def test_retrieval_trace_values_are_immutable_and_bounded() -> None:
         dense_confidence=0.8,
         lexical_relevance=0.6,
         lexical_rerank_bonus=0.2,
-        gate_confidence=0.8,
+        gate_relevance=0.8,
         base_relevance=0.9,
         reinforcement_factor=1.0,
         final_score=hit.score,
