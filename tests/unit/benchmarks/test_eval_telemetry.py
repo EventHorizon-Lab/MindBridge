@@ -12,6 +12,7 @@ from mindbridge._telemetry import (
     MODEL_MODULE,
     MODEL_TTFT,
     SPAN_KIND,
+    VISION_BATCHES_FAILED,
     mark_model_requests,
     record_model_usage,
 )
@@ -101,3 +102,54 @@ def test_evaluation_telemetry_does_not_turn_missing_usage_into_zero() -> None:
     assert usage["reported_total_tokens"] == 0
     assert usage["input_tokens"] == 5
     assert usage["input_by_modality"] == {"text": 5}
+
+
+def test_evaluation_telemetry_sums_failed_description_batches_per_task() -> None:
+    """A write-path caption loss has to reach the artifact, because tokens cannot show it.
+
+    A batch whose reply could not be used reports no usage at all, so it is invisible in
+    `token_usage`; what it leaves behind is a media memory with an empty full-text document.
+    """
+    telemetry = EvaluationTelemetry()
+    try:
+        with telemetry.tracer.start_as_current_span(
+            BENCHMARK_TASK_SPAN,
+            attributes={BENCHMARK_TASK: "fixture", SPAN_KIND: "benchmark"},
+        ):
+            for failures in (1, 1):
+                with (
+                    telemetry.tracer.start_as_current_span(
+                        "mindbridge.add",
+                        attributes={SPAN_KIND: "operation"},
+                    ),
+                    telemetry.tracer.start_as_current_span(
+                        "mindbridge.model.vision",
+                        attributes={SPAN_KIND: "model", MODEL_MODULE: "vision"},
+                    ) as span,
+                ):
+                    span.set_attribute(VISION_BATCHES_FAILED, failures)
+            # One batch that succeeded records no counter and must not be counted as a loss.
+            with (
+                telemetry.tracer.start_as_current_span(
+                    "mindbridge.add",
+                    attributes={SPAN_KIND: "operation"},
+                ),
+                telemetry.tracer.start_as_current_span(
+                    "mindbridge.model.vision",
+                    attributes={SPAN_KIND: "model", MODEL_MODULE: "vision"},
+                ),
+            ):
+                pass
+            # Counted from model spans only. An enclosing span carrying the same attribute must
+            # not add to the total: that is what would silently double-count every failure if the
+            # counter were ever published one level up.
+            with telemetry.tracer.start_as_current_span(
+                "mindbridge.add",
+                attributes={SPAN_KIND: "operation", VISION_BATCHES_FAILED: 7},
+            ):
+                pass
+        performance = telemetry.result("fixture", question_count=1)
+    finally:
+        telemetry.close()
+
+    assert performance["vision"] == {"failed_batches": 2}
