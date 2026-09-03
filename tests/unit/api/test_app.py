@@ -1256,6 +1256,32 @@ def test_identity_routes_dispatch_to_the_sdk_when_enabled() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("name", "relationship"),
+    [
+        ("Alice Smith", "close friend"),
+        ("\u674e\u96f7", "\u670b\u53cb"),
+    ],
+)
+def test_register_identity_accepts_names_with_spaces_and_non_ascii_characters(
+    name: str,
+    relationship: str,
+) -> None:
+    """A person's name is plain text, not a memory-id-shaped token; REST must not reject either."""
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory, identity_operations=True)) as client:
+        response = client.post(
+            "/v1/identities",
+            json={"identity_id": "identity_1", "name": name, "relationship": relationship},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"registered": True}
+    # The SDK receives the name and relationship exactly as sent, unmodified.
+    assert memory.calls == [("register_identity", "identity_1", name, relationship)]
+
+
 def test_get_identity_reports_no_registered_profile_without_failing() -> None:
     memory = FakeMemory()
     memory.profile = None

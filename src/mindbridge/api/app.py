@@ -62,6 +62,11 @@ _MemoryId = Annotated[str, PathParameter(min_length=1)]
 # The same identifier inside a request body, where `PathParameter` does not apply. Constrained
 # here rather than only in the SDK so a malformed ID fails validation on every route alike.
 _BodyMemoryId = Annotated[str, StringConstraints(min_length=1, pattern=r"^\S(?:.*\S)?$")]
+# A bounded plain string for person-facing text -- a name or relationship label -- the same shape
+# the MCP `register_identity` tool's `name`/`relationship` arguments use. Named separately from
+# `_BodyMemoryId` so a future ID-specific tightening of that type cannot silently start rejecting
+# names too.
+_PersonText = _BodyMemoryId
 _Chars = Annotated[int, Field(strict=True, ge=1, le=MAX_TEXT_CHARACTERS)]
 _Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 _Seconds = Annotated[float, Field(gt=0.0)]
@@ -151,8 +156,8 @@ class AnalyzeRequest(StrictModel):
 
 class IdentityRegisterRequest(StrictModel):
     identity_id: _BodyMemoryId
-    name: _BodyMemoryId
-    relationship: _BodyMemoryId | None = None
+    name: _PersonText
+    relationship: _PersonText | None = None
 
 
 class _ResponseModel(BaseModel):
