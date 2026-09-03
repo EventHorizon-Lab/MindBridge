@@ -576,6 +576,10 @@ class MemoryOperationRecord:
     # forgetting; on a CONSOLIDATE row it is consolidation forgetting, the sources the derived
     # record replaced. `rollback()` clears exactly these.
     forgotten_ids: tuple[str, ...] = ()
+    # `(memory_id, version)` pairs the kernel's own lineage rule superseded while applying this
+    # operation: the records a new `STATE` or user-stated `TRAIT` replaced in its lineage, which
+    # the backend never named and may never have been shown. `rollback()` restores exactly these.
+    superseded: tuple[tuple[str, int], ...] = ()
     rolled_back_at: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -600,6 +604,12 @@ class MemoryOperationRecord:
         object.__setattr__(self, "created_ids", _memory_ids(self.created_ids, "created_ids"))
         object.__setattr__(self, "changed_ids", _memory_ids(self.changed_ids, "changed_ids"))
         object.__setattr__(self, "forgotten_ids", _memory_ids(self.forgotten_ids, "forgotten_ids"))
+        superseded = tuple(self.superseded)
+        for memory_id, version in superseded:
+            _memory_ids((memory_id,), "superseded")
+            if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+                raise ValidationError("superseded version must be a positive integer")
+        object.__setattr__(self, "superseded", superseded)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -446,17 +446,22 @@ back is rejected as `"duplicate"`.
 
 | Intent | Kernel checks | Effect | `rollback` |
 | --- | --- | --- | --- |
-| `REINFORCE` | One derived target in the window; every evidence ID shown, existing, not the target, not already linked | Adds independent evidence; confidence and visibility recompute | Retires those evidence rows |
-| `CONSOLIDATE` | Valid proposal; at least one shown evidence ID; every `target_ids` entry among this proposal's own evidence; affect cue modality and spatial frame present in some source | New derived record citing every source, and `forgotten_at` set on any named target | Deletes the created records and un-forgets the targets |
+| `REINFORCE` | One derived target in the window whose current version is not retired; every evidence ID shown, existing, not the target, not already linked | Adds independent evidence; confidence and visibility recompute | Retires those evidence rows |
+| `CONSOLIDATE` | Valid proposal; at least one shown evidence ID, each still standing; every `target_ids` entry among this proposal's own evidence; affect cue modality and spatial frame present in some source | New derived record citing every source, `forgotten_at` set on any named target, and the lineage supersession the kernel's own rule implies | Deletes the created records, un-forgets the targets, and restores the `superseded` versions |
 | `CORRECT` | Every target in the window, existing, and derived (`kind != OBSERVATION`) | Retires current versions at transaction time | Carries a new version with the same interval |
 | `FORGET` | Every target in the window, existing, and not already forgotten | Sets `forgotten_at` | Clears `forgotten_at` |
 
-A backend may act only inside the window the kernel gathered for it, and every intent that names
-targets is bounded: a proposal naming a target outside it is rejected as `"target_not_shown"`
-before any write. The window is the shown set plus, when the host supplied `evidence_ids`, the IDs
-it named -- a hidden derived record is exactly what `REINFORCE` and `CORRECT` exist for and can
-never appear in the shown set, so naming it stays the host's decision. A `query` or the default
-window never widens it.
+Named targets and cited evidence are bounded by the window the kernel gathered: a proposal naming
+a target outside it is rejected as `"target_not_shown"` before any write. The window is the shown
+set plus, when the host supplied `evidence_ids`, the IDs it named -- a hidden derived record is
+exactly what `REINFORCE` and `CORRECT` exist for and can never appear in the shown set, so naming
+it stays the host's decision. A `query` or the default window never widens it.
+
+Lineage supersession is the one effect that reaches outside the window, and it is the kernel's
+own deterministic rule rather than a backend choice: a new `STATE` or user-stated `TRAIT` retires
+the current version of every other record in the same lineage whose validity it overlaps,
+including records nobody showed the backend. The log row names those `(memory_id, version)` pairs
+in `MemoryOperationRecord.superseded` and `rollback()` restores exactly them.
 
 Multi-target operations are all or nothing. A proposal whose targets are not all eligible is
 rejected whole -- `"unknown_target"`, `"not_derived"`, or `"already_forgotten"` -- so an applied
@@ -483,7 +488,10 @@ raises `MemoryNotFoundError` the way `get` and `delete` do, and an empty sequenc
 which any record is already forgotten returns `None` having changed nothing.
 
 `rollback` reverses one applied operation and returns `False` for an unknown or already-reversed
-`operation_id`. `operations` lists the log newest first. Physical deletion is not an intent, and
+`operation_id`, and for one a later standing operation has built on. Operations that touched one
+lineage reverse newest first: while a second consolidation's derived record supersedes the first
+one's, rolling the first one back would leave two current versions in the lineage, so it is
+refused and its log row stays standing until the newer one is reversed. `operations` lists the log newest first. Physical deletion is not an intent, and
 none of these five operations is exposed on REST or MCP.
 
 The log is sufficient to replay a sequence against a fresh store holding the same sources:
@@ -689,7 +697,7 @@ The principal immutable values are:
 | `ContextUnknown` | `kind` (a `ContextUnknownKind`), `detail` |
 | `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`; `hits` property and `render()` |
 | `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `rationale` |
-| `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `rolled_back_at` |
+| `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `superseded`, `rolled_back_at` |
 | `ConsolidationCandidate` | `trigger`, `memory_ids`, `evidence_count` |
 | `ConsolidationReport` | `operations`, `rejected` as `(MemoryOperation, reason)` pairs |
 | `StreamEvent` | `phase`, `item`, `stream_id` |

@@ -26,7 +26,11 @@ from mindbridge.types import (
     Blob,
     ContextUnknown,
     ContextUnknownKind,
+    MemoryIntent,
+    MemoryOperation,
+    MemoryOperationRecord,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
     Page,
@@ -337,6 +341,44 @@ def test_a_pending_capture_refuses_a_naive_clock_and_a_nonsense_attempt_count() 
     assert embedded.awaiting == "formation"
     with pytest.raises(ValidationError, match="awaiting must be enrichment or formation"):
         PendingCapture(memory_id="a", enqueued_at=NOW, awaiting="indexing")  # type: ignore[arg-type]
+
+
+def test_operation_record_superseded_names_a_version_per_memory() -> None:
+    operation = MemoryOperation(intent=MemoryIntent.FORGET, target_ids=("a",))
+    record = MemoryOperationRecord(
+        operation_id=1,
+        operation=operation,
+        trigger=MemoryTrigger.MANUAL,
+        applied_at=NOW,
+        superseded=[("a", 1)],  # type: ignore[arg-type]
+    )
+
+    # The version is what makes the supersession reversible: a lineage rule may have split the
+    # record's remaining validity, so restoring "whatever is newest" would restore the wrong one.
+    assert record.superseded == (("a", 1),)
+    assert (
+        MemoryOperationRecord(
+            operation_id=1, operation=operation, trigger=MemoryTrigger.MANUAL, applied_at=NOW
+        ).superseded
+        == ()
+    )
+    for version in (0, -1, True, 1.0):
+        with pytest.raises(ValidationError, match="superseded version"):
+            MemoryOperationRecord(
+                operation_id=1,
+                operation=operation,
+                trigger=MemoryTrigger.MANUAL,
+                applied_at=NOW,
+                superseded=(("a", version),),  # type: ignore[arg-type]
+            )
+    with pytest.raises(ValidationError, match="superseded"):
+        MemoryOperationRecord(
+            operation_id=1,
+            operation=operation,
+            trigger=MemoryTrigger.MANUAL,
+            applied_at=NOW,
+            superseded=((" ", 1),),
+        )
 
 
 def _asset(

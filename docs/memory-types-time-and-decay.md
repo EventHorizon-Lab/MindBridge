@@ -243,6 +243,14 @@ inside the window the kernel gathered, which is the shown set plus whatever the 
 `CORRECT` exist — stays reachable, without letting a backend act on records nobody put in front
 of it.
 
+Named targets and cited evidence are what the window bounds. Lineage supersession is not a
+backend choice at all: a new `STATE` or user-stated `TRAIT` retires the current version of every
+other record in its lineage whose validity it overlaps, by the kernel's own deterministic rule,
+including records the backend never saw. Those versions are recorded on the log row as
+`MemoryOperationRecord.superseded` and `rollback()` restores exactly them. Because a later
+consolidation can supersede an earlier one's record, operations on one lineage reverse newest
+first: `rollback()` returns `False` for an operation a standing later one has built on.
+
 | Intent | Kernel semantics |
 | --- | --- |
 | `REINFORCE` | Link an independent source to an existing derived record. Confidence recombines by noisy-OR over independent sources, and a hidden inferred `TRAIT` can become visible. |
@@ -312,7 +320,7 @@ MindBridge separates five forms of forgetting and never conflates them:
 | Expiring validity | `valid_until` | Leaves default retrieval when the interval ends; a `valid_at` scope inside the window still retrieves it. |
 | Ranking decay | `decay_half_life_days` | Downranks stale records at query time. Nothing is removed or rewritten. |
 | Cognitive forgetting | `forget()` | Excludes a record from recall while `get()`, `list()`, and `MemoryRecord.forgotten_at` retain it. Reversible through `rollback()`. |
-| Consolidation forgetting | `CONSOLIDATE` naming `target_ids` | Retires the detail a new derived record replaces, in that record's own transaction and under its lineage. Logged on the `CONSOLIDATE` row as `forgotten_ids`, and reversed with it. |
+| Consolidation forgetting | `CONSOLIDATE` naming `target_ids` | Retires the detail a new derived record replaces, in that record's own transaction and under its lineage. Logged on the `CONSOLIDATE` row as `forgotten_ids`, and reversed with it. The lineage versions the same write superseded are logged beside them as `superseded`. |
 | Physical deletion | `delete()` | Removes the record and any media no other record references. Not recoverable, and never something a model proposes. |
 
 `forget()` is cognitive only. It is the host entry point for the `FORGET` intent, so it takes the

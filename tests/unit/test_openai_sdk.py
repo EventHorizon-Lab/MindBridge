@@ -641,6 +641,40 @@ def test_consolidation_leaves_out_media_the_model_does_not_declare(tmp_path: Pat
         assert model.consolidate(evidence, trigger=MemoryTrigger.EVIDENCE) == ()
 
 
+def test_consolidation_sizes_the_request_by_emitted_part(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One asset cited by two evidence items is carried twice, so it is charged twice."""
+    image = _asset(tmp_path, "image-1", Modality.IMAGE, "image/png", b"png-bytes" * 4)
+    evidence = tuple(
+        MemoryRecord(
+            id=memory_id,
+            content="",
+            created_at=NOW,
+            assets=(image,),
+            modality=Modality.IMAGE,
+        )
+        for memory_id in ("first-memory", "second-memory")
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        parts = json.loads(request.content)["messages"][1]["content"]
+        assert [part["type"] for part in parts].count("image_url") == 2
+        return _completion({"operations": []})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client))
+        assert model.consolidate(evidence, trigger=MemoryTrigger.EVIDENCE) == ()
+        # 48 encoded bytes each: one copy fits under the ceiling and two do not. Sizing by
+        # asset ID reported 48 for a request that carries 96.
+        monkeypatch.setattr(openai_backend, "_MAX_INLINE_MODEL_BYTES", 60)
+        with pytest.raises(ModelError) as failure:
+            model.consolidate(evidence, trigger=MemoryTrigger.EVIDENCE)
+
+    assert failure.value.reason == "payload_too_large"
+
+
 def test_consolidation_recipe_identifies_every_generation_control() -> None:
     baseline = OpenAIModels().consolidation_recipe
     variants = {

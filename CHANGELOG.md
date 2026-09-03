@@ -87,6 +87,18 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   call. There is no capabilities tool and no capabilities route: `GET /healthz` already reports the
   same view over REST.
 
+- A `consolidation` slot on the declarative configuration surface, plus `recipes.consolidator`
+  and a `--consolidator` command-line flag, so a `ConsolidationBackend` is reachable from
+  `Memory.from_config()` and from the product CLI. `ConsolidationBackend` was implemented and
+  accepted by `MemoryPlugins`, but nothing built one: the memory-management loop existed and no
+  declarative deployment or CLI composition could run it. Consolidation stays absent by default:
+  it is a paid reasoning call over an evidence set.
+- `MemoryOperationRecord.superseded`, the `(memory_id, version)` pairs the kernel's own lineage
+  rule retired while applying a `CONSOLIDATE` — the records a new `STATE` or user-stated `TRAIT`
+  replaced in its lineage, which the backend never named and may never have been shown. They are
+  on the log row, in `mindbridge operations`, and `rollback()` restores exactly them. The
+  supersession previously happened outside the evidence window and could not be reversed.
+
 - A `formation` slot on the declarative configuration surface, plus `recipes.former` and a
   `--former` command-line flag, so a `FormationBackend` is reachable from `Memory.from_config()`
   and from the product CLI. `FormationBackend` was implemented, accepted by `MemoryPlugins`, and
@@ -271,6 +283,20 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   one that was never configured.
 
 ### Changed
+
+- **Breaking for existing stores:** the bundled OpenAI consolidation recipe is
+  `mindbridge-consolidation-v2`. Its system prompt now describes the media parts attached to each
+  evidence item, and the recipe is a digest of that prompt. The recipe salts `operation_key` and
+  the content address of every derived record, so against a store written before this change the
+  duplicate guard no longer fires and an identical proposal mints a new derived record instead of
+  being rejected as `"duplicate"`. Rolled-back and re-proposed operations from such a store are
+  not recognized either. Re-consolidating a store written with `v1` is the intended migration;
+  there is no automatic rewrite, because the `v1` records remain the honest record of what the
+  `v1` recipe proposed.
+
+- `Memory.rollback()` and `AsyncMemory.rollback()` return `False` for an operation a later
+  standing operation has built on. Operations that touched one lineage reverse newest first;
+  reversing an older one out of order would restore a superseded version beside the current one.
 
 - The local schema is version 10. Version 9 directories upgrade in place, adding
   `memory_records.forgotten_at`, the `capture_queue` table that makes deferred enrichment durable

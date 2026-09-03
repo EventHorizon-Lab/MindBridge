@@ -1851,8 +1851,9 @@ class Memory:
                 return ConsolidationReport()
             applied: builtins.list[MemoryOperationRecord] = []
             rejected: builtins.list[tuple[MemoryOperation, str]] = []
-            # One pass must not contradict itself: an operation may not build on evidence an
-            # earlier accepted operation retired, nor retire evidence an earlier one built on.
+            # One pass must not contradict itself: an operation may not name -- as evidence or as
+            # a target -- a record an earlier accepted operation retired, nor retire evidence an
+            # earlier one built on.
             # There is no way to submit a proposal built in some other pass, so this is the only
             # reachable form of the staleness the kernel is required to reject.
             consumed: set[str] = set()
@@ -1863,7 +1864,8 @@ class Memory:
                     trigger=trigger,
                 ):
                     targets = _retiring_targets(operation)
-                    if targets & consumed or set(operation.evidence_ids) & retired:
+                    named = set(operation.evidence_ids) | set(operation.target_ids)
+                    if targets & consumed or named & retired:
                         rejected.append((operation, "inconsistent_batch"))
                         continue
                     try:
@@ -1927,7 +1929,13 @@ class Memory:
                 return None
 
     def rollback(self, operation_id: int) -> bool:
-        """Reverse one applied operation; an unknown or already-reversed one reports `False`."""
+        """Reverse one applied operation, newest first on a lineage.
+
+        Reports `False` for an unknown or already-reversed `operation_id`, and for one a later
+        standing operation has built on: when a second consolidation superseded the record this
+        one put in force, reversing this one first would leave two current versions in the
+        lineage, so the newer operation must be rolled back first.
+        """
         with (
             self._trace("mindbridge.rollback", kind="operation"),
             self._operation(),
@@ -1958,8 +1966,16 @@ class Memory:
                     # `linked` is the evidence this operation actually inserted, so a link that
                     # predated it survives the reversal. Records deleted above take their own.
                     retire_evidence=row.linked,
+                    # A CORRECT retired the versions it named. A CONSOLIDATE may also have
+                    # superseded records in the derived record's lineage that no backend ever
+                    # saw; the log row names those exactly, so both halves reverse here.
                     restore_versions=(
-                        row.changed_ids if operation.intent is MemoryIntent.CORRECT else ()
+                        row.changed_ids
+                        if operation.intent is MemoryIntent.CORRECT
+                        else row.superseded
+                    ),
+                    require_in_force=(
+                        (*row.created_ids, *row.changed_ids) if row.superseded else ()
                     ),
                     # Recorded per operation, so cognitive forgetting and the consolidation
                     # forgetting a CONSOLIDATE carried both reverse through one field. A FORGET
@@ -2166,8 +2182,13 @@ class Memory:
                     correct_ids=correct_ids,
                     forget_ids=forget_ids,
                     # Re-checked inside the apply transaction, because everything above was read
-                    # before it opened.
+                    # before it opened. A REINFORCE target must additionally still stand: a
+                    # CORRECT between validation and here makes the proposal stale. `forget()`
+                    # deliberately gets no such check -- forgetting a corrected record is legal.
                     require_active=(*operation.target_ids, *operation.evidence_ids),
+                    require_unretired=(
+                        operation.target_ids if operation.intent is MemoryIntent.REINFORCE else ()
+                    ),
                 )
             if logged is None:
                 raise _RejectedOperation("duplicate")
@@ -2183,7 +2204,12 @@ class Memory:
     ) -> tuple[tuple[str, str], ...]:
         target = operation.target_ids[0]
         record = targets[target]
-        if not _is_derived(targets, target):
+        # A retired claim is not a standing derived claim: reinforcing one would attach fresh
+        # independent support to a version a CORRECT already withdrew, in this pass or an
+        # earlier one. `_control_records` reads the current version, so both cases land here.
+        if not _is_derived(targets, target) or (
+            record.context is not None and record.context.retired_at is not None
+        ):
             raise _RejectedOperation("not_derived")
         # Self-citation first: a record that is its own evidence is malformed whatever set it
         # came from, and a hidden target is never in the shown set anyway.
@@ -2260,8 +2286,10 @@ class Memory:
             operation=pending,
             forget_ids=operation.target_ids,
             # `shown` was read before this transaction opened; re-check inside it that every
-            # cited source still exists and is still active.
+            # cited source still exists, is still active, and -- when it carries typed semantics
+            # -- still stands, so a source corrected in between makes the proposal stale.
             require_active=operation.evidence_ids,
+            require_unretired=operation.evidence_ids,
         )
         if logged is None:
             raise _RejectedOperation("duplicate")
@@ -2969,6 +2997,7 @@ class Memory:
         operation: StoredOperation | None = None,
         forget_ids: Sequence[str] = (),
         require_active: Sequence[str] = (),
+        require_unretired: Sequence[str] = (),
     ) -> StoredOperation | None:
         """Embed and commit derived records; return the log row when one was requested."""
         recipe = self._formation_space if recipe is None else recipe
@@ -3051,6 +3080,7 @@ class Memory:
                     operation=operation,
                     forget_ids=forget_ids,
                     require_active=require_active,
+                    require_unretired=require_unretired,
                 )
             self._drain_outbox()
         if operation is None:
@@ -6622,6 +6652,7 @@ def _operation_record(logged: StoredOperation) -> MemoryOperationRecord:
         created_ids=logged.created_ids,
         changed_ids=logged.changed_ids,
         forgotten_ids=logged.forgotten_ids,
+        superseded=logged.superseded,
         rolled_back_at=logged.rolled_back_at,
     )
 

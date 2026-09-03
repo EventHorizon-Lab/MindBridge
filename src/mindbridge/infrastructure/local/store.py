@@ -841,6 +841,10 @@ class StoredOperation:
     # Evidence rows this operation actually inserted. Rollback retires exactly these, so a link
     # that predated the operation survives it.
     linked: tuple[tuple[str, str], ...] = ()
+    # `(memory_id, version)` pairs this operation's own lineage rule superseded: the current
+    # versions of the other records in the derived record's lineage whose validity it overlapped.
+    # Rollback restores exactly these, so a supersession the backend never named is reversible.
+    superseded: tuple[tuple[str, int], ...] = ()
     rolled_back_at: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -860,6 +864,10 @@ class StoredOperation:
         for memory_id, source_memory_id in self.linked:
             _require_identifier(memory_id, "memory_id")
             _require_identifier(source_memory_id, "source_memory_id")
+        for memory_id, version in self.superseded:
+            _require_identifier(memory_id, "memory_id")
+            if version <= 0:
+                raise ValueError("superseded version must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1282,6 +1290,7 @@ class LocalStore:
         operation: StoredOperation | None = None,
         forget_ids: Sequence[str] = (),
         require_active: Sequence[str] = (),
+        require_unretired: Sequence[str] = (),
     ) -> bool:
         """Commit derived records, evidence, and source completion in one transaction.
 
@@ -1292,7 +1301,15 @@ class LocalStore:
         recall, retired in this same commit and cleared again by rolling the operation back.
         `require_active` names memories that must still exist and still be un-forgotten inside
         this transaction; if any moved since the caller validated it, nothing is written and
-        `StaleOperationError` is raised.
+        `StaleOperationError` is raised. `require_unretired` names memories whose current version
+        must additionally still stand, which is what a cited derived source needs and what
+        `require_active` deliberately does not check.
+
+        The lineage rule the kernel applies to a `STATE` or user-stated `TRAIT` supersedes the
+        current version of every other record in the same lineage with overlapping validity,
+        including records nobody showed the backend. Those `(memory_id, version)` pairs are
+        recorded on the operation row as `superseded` so `rollback_operation` can restore exactly
+        them.
         """
         supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
             memories,
@@ -1312,6 +1329,7 @@ class LocalStore:
             ):
                 return False
             _require_active(connection, require_active)
+            _require_unretired(connection, require_unretired)
             if any(
                 connection.execute(
                     """
@@ -1325,12 +1343,14 @@ class LocalStore:
             ):
                 return False
             transaction_memory_ids: set[str] = set()
+            superseded: list[tuple[str, int]] = []
             for memory in supplied_memories:
                 self._write_memory(
                     connection,
                     memory,
                     supplied_embedding_ids=supplied_by_memory[memory.memory_id],
                     transaction_memory_ids=transaction_memory_ids,
+                    superseded=superseded,
                 )
                 transaction_memory_ids.add(memory.memory_id)
             for embedding in supplied_embeddings:
@@ -1364,7 +1384,12 @@ class LocalStore:
                 forgotten = _set_forgotten(connection, forget_ids, forgotten_at=completed_at)
                 _insert_operation(
                     connection,
-                    replace(operation, forgotten_ids=forgotten, linked=tuple(linked)),
+                    replace(
+                        operation,
+                        forgotten_ids=forgotten,
+                        linked=tuple(linked),
+                        superseded=tuple(dict.fromkeys(superseded)),
+                    ),
                 )
         return True
 
@@ -1455,6 +1480,7 @@ class LocalStore:
         correct_ids: Sequence[str] = (),
         forget_ids: Sequence[str] = (),
         require_active: Sequence[str] = (),
+        require_unretired: Sequence[str] = (),
     ) -> StoredOperation | None:
         """Apply one already-validated operation and its log row in one transaction.
 
@@ -1465,7 +1491,10 @@ class LocalStore:
         be un-forgotten here. That check and the all-or-nothing effect check below are what make
         the gap between validation and this transaction safe: a target or source that moved in
         between raises `StaleOperationError` with nothing written, so the log never claims an
-        effect that did not happen.
+        effect that did not happen. `require_unretired` is the stricter half of that check, for
+        the callers that need the current version of a record to still stand -- a `REINFORCE`
+        target must not have been corrected in between -- which `require_active` must not check
+        globally, because the host's own `forget()` may forget an already-corrected record.
         """
         for memory_id, source_memory_id in reinforce:
             _require_identifier(memory_id, "memory_id")
@@ -1476,6 +1505,7 @@ class LocalStore:
             if _active_operation_id(connection, operation.operation_key) is not None:
                 return None
             _require_active(connection, require_active)
+            _require_unretired(connection, require_unretired)
             changed: list[str] = []
             linked: list[tuple[str, str]] = []
             for memory_id, source_memory_id in reinforce:
@@ -1511,15 +1541,22 @@ class LocalStore:
         *,
         rolled_back_at: datetime,
         retire_evidence: Sequence[tuple[str, str]] = (),
-        restore_versions: Sequence[str] = (),
+        restore_versions: Sequence[str | tuple[str, int]] = (),
         clear_forgotten: Sequence[str] = (),
         delete_memory_ids: Sequence[str] = (),
+        require_in_force: Sequence[str] = (),
     ) -> tuple[bool, tuple[StoredAsset, ...]]:
         """Apply the caller's reversal and mark one operation rolled back, atomically.
 
-        Returns `(False, ())` when the operation is unknown or already rolled back, in which case
-        no reversal is applied. Otherwise the second value lists the assets that the deleted
-        records were the last to reference; index cleanup follows through the durable outbox.
+        Returns `(False, ())` when the operation is unknown, already rolled back, or no longer
+        reversible, in which case no reversal is applied. Otherwise the second value lists the
+        assets that the deleted records were the last to reference; index cleanup follows through
+        the durable outbox.
+
+        `require_in_force` names the records this operation put in force. If a later standing
+        operation has since superseded one of them, reversing this one would restore a version
+        beside a newer one and delete a record that newer one supersedes, so the reversal is
+        refused instead: operations on one lineage reverse newest first.
         """
         _require_aware(rolled_back_at, "rolled_back_at")
         for memory_id in delete_memory_ids:
@@ -1534,6 +1571,8 @@ class LocalStore:
                 (operation_id,),
             ).fetchone()
             if row is None:
+                return False, ()
+            if any(_version_retired(connection, memory_id) for memory_id in require_in_force):
                 return False, ()
             reverted_at = max(rolled_back_at, _parse_datetime(_row_text(row, "applied_at")))
             for memory_id in dict.fromkeys(delete_memory_ids):
@@ -3500,6 +3539,7 @@ class LocalStore:
         *,
         supplied_embedding_ids: set[str],
         transaction_memory_ids: set[str] | None = None,
+        superseded: list[tuple[str, int]] | None = None,
     ) -> bool:
         existing = connection.execute(
             """
@@ -3592,6 +3632,7 @@ class LocalStore:
                 memory.memory_id,
                 memory.context,
                 transaction_memory_ids=transaction_memory_ids,
+                superseded=superseded,
             )
         return existing is None
 
@@ -4295,6 +4336,7 @@ def _write_memory_context(
     context: MemoryContext,
     *,
     transaction_memory_ids: set[str] | None = None,
+    superseded: list[tuple[str, int]] | None = None,
 ) -> None:
     existing = connection.execute(
         "SELECT 1 FROM memory_semantics WHERE memory_id = ?",
@@ -4418,6 +4460,8 @@ def _write_memory_context(
                     int(old["version"]),
                 ),
             )
+            if superseded is not None:
+                superseded.append((_row_text(old, "memory_id"), int(old["version"])))
             if valid_from is not None and (old_from is None or old_from < valid_from):
                 _carry_memory_version(
                     connection,
@@ -4657,6 +4701,31 @@ def _require_active(connection: sqlite3.Connection, memory_ids: Sequence[str]) -
             raise StaleOperationError(f"{memory_id} is no longer active")
 
 
+def _version_retired(connection: sqlite3.Connection, memory_id: str) -> bool:
+    """Return whether a typed record exists whose every version has been retired."""
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS total, COUNT(retired_at) AS retired
+        FROM memory_versions WHERE memory_id = ?
+        """,
+        (memory_id,),
+    ).fetchone()
+    return row is not None and bool(int(row["total"])) and int(row["total"]) == int(row["retired"])
+
+
+def _require_unretired(connection: sqlite3.Connection, memory_ids: Sequence[str]) -> None:
+    """Fail the transaction unless every named memory's current version still stands.
+
+    Deliberately narrower than `_require_active`: it says nothing about `forgotten_at`, and it
+    never looks at `visible`, because a hidden inferred `TRAIT` is a legitimate `REINFORCE`
+    target. A record with no typed version at all -- a plain observation -- passes.
+    """
+    for memory_id in dict.fromkeys(memory_ids):
+        _require_identifier(memory_id, "memory_id")
+        if _version_retired(connection, memory_id):
+            raise StaleOperationError(f"{memory_id} has no current version")
+
+
 def _require_every(changed: Sequence[str], requested: Sequence[str], effect: str) -> None:
     """Fail the transaction unless every requested target actually took the effect."""
     if set(changed) != set(requested):
@@ -4743,19 +4812,27 @@ def _retire_memory_versions(
 
 def _restore_memory_versions(
     connection: sqlite3.Connection,
-    memory_ids: Sequence[str],
+    memory_ids: Sequence[str | tuple[str, int]],
     *,
     recorded_at: datetime,
 ) -> None:
-    for memory_id in dict.fromkeys(memory_ids):
+    """Carry a retired version forward again, by memory ID or by exact `(id, version)` pair.
+
+    A `CORRECT` retires whatever version was current, so naming the record is enough. A lineage
+    supersession may also have split the record's remaining validity into carried versions, so
+    the operation row names the exact version it retired and that one is restored.
+    """
+    for entry in dict.fromkeys(memory_ids):
+        memory_id, version = (entry, None) if isinstance(entry, str) else entry
         row = connection.execute(
-            """
+            f"""
             SELECT memory_id, version, confidence, valid_from, valid_until,
                    recorded_at, visible, supersedes_id
-            FROM memory_versions WHERE memory_id = ?
+            FROM memory_versions
+            WHERE memory_id = ?{"" if version is None else " AND version = ?"}
             ORDER BY version DESC LIMIT 1
             """,
-            (memory_id,),
+            (memory_id,) if version is None else (memory_id, version),
         ).fetchone()
         if row is None:
             continue
@@ -5028,6 +5105,7 @@ def _insert_operation(connection: sqlite3.Connection, operation: StoredOperation
                     "changed_ids": list(operation.changed_ids),
                     "forgotten_ids": list(operation.forgotten_ids),
                     "linked": [list(pair) for pair in operation.linked],
+                    "superseded": [list(pair) for pair in operation.superseded],
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -5057,6 +5135,7 @@ def _operation_from_row(row: sqlite3.Row) -> StoredOperation:
         changed_ids=tuple(effects.get("changed_ids") or ()),
         forgotten_ids=tuple(effects.get("forgotten_ids") or ()),
         linked=tuple((pair[0], pair[1]) for pair in effects.get("linked") or ()),
+        superseded=tuple((pair[0], int(pair[1])) for pair in effects.get("superseded") or ()),
         applied_at=_parse_datetime(_row_text(row, "applied_at")),
         rolled_back_at=_optional_datetime_from_row(row, "rolled_back_at"),
     )

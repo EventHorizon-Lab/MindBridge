@@ -880,6 +880,7 @@ def _operation_document(record: MemoryOperationRecord) -> _Document:
         "created_ids": list(record.created_ids),
         "changed_ids": list(record.changed_ids),
         "forgotten_ids": list(record.forgotten_ids),
+        "superseded": [[memory_id, version] for memory_id, version in record.superseded],
         "applied_at": record.applied_at.isoformat(),
         "rolled_back_at": (
             None if record.rolled_back_at is None else record.rolled_back_at.isoformat()
