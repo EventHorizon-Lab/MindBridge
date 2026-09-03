@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import base64
 import binascii
-from collections.abc import Mapping, Sequence
-from datetime import datetime
-from typing import Annotated, Literal, Protocol, TypeAlias, cast
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timedelta
+from typing import Annotated, Any, Literal, Protocol, TypeAlias, cast
 
 from fastapi import APIRouter, FastAPI, Query, Response, status
 from fastapi import Path as PathParameter
@@ -28,6 +28,9 @@ from mindbridge.types import (
     AssetRef,
     Blob,
     ContentInput,
+    ContextBudget,
+    ContextBundle,
+    MemoryCapabilities,
     MemoryContext,
     MemoryRecord,
     MemoryType,
@@ -69,6 +72,11 @@ _Filename = Annotated[
     ),
 ]
 _Source = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8_192)]
+_Chars = Annotated[int, Field(strict=True, ge=1, le=_MAX_TEXT_CHARACTERS)]
+_Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
+_Seconds = Annotated[float, Field(gt=0.0)]
+# Transport defaults are read from the SDK value so the documented budget cannot drift.
+_BUDGET = ContextBudget()
 
 
 class _RequestModel(BaseModel):
@@ -183,6 +191,21 @@ class AnswerRequest(_RequestModel):
     scope: RetrievalScope | None = None
 
 
+class ContextBudgetRequest(_RequestModel):
+    max_chars: _Chars = _BUDGET.max_chars
+    max_items: _Limit = _BUDGET.max_items
+    memory_types: Annotated[list[MemoryType], Field(min_length=1)] | None = None
+    min_confidence: _Confidence = _BUDGET.min_confidence
+    freshness_seconds: _Seconds | None = None
+
+
+class ContextRequest(_RequestModel):
+    goal: _Content
+    budget: ContextBudgetRequest | None = None
+    reference_at: AwareDatetime | None = None
+    scope: RetrievalScope | None = None
+
+
 class _ResponseModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -227,6 +250,52 @@ class AnswerResponse(_ResponseModel):
     hits: tuple[SearchHitResponse, ...]
     abstained: bool
     abstention_reason: AbstentionReason | None
+
+
+class ContextBudgetResponse(_ResponseModel):
+    max_chars: int
+    max_items: int
+    memory_types: tuple[MemoryType, ...] | None
+    min_confidence: float
+    freshness_seconds: float | None
+
+
+class ContextConflictResponse(_ResponseModel):
+    lineage_id: str
+    subject: str | None
+    predicate: str | None
+    values: tuple[str, ...]
+    memory_ids: tuple[str, ...]
+
+
+class ContextBundleResponse(_ResponseModel):
+    goal: str
+    reference_at: AwareDatetime
+    budget: ContextBudgetResponse
+    actors: tuple[SearchHitResponse, ...]
+    episodes: tuple[SearchHitResponse, ...]
+    facts: tuple[SearchHitResponse, ...]
+    procedures: tuple[SearchHitResponse, ...]
+    affect: tuple[SearchHitResponse, ...]
+    traits: tuple[SearchHitResponse, ...]
+    conflicts: tuple[ContextConflictResponse, ...]
+    occurred_from: AwareDatetime | None
+    occurred_until: AwareDatetime | None
+    frames: tuple[str, ...]
+    omitted: int
+    chars: int
+    rendered: str
+
+
+class CapabilitiesResponse(_ResponseModel):
+    modalities: tuple[Modality, ...]
+    answer: bool
+    transcribe: bool
+    faces: bool
+    describe_vision: bool
+    form: bool
+    consolidate: bool
+    decay: bool
 
 
 class DeleteResponse(_ResponseModel):
@@ -286,6 +355,17 @@ class _Memory(Protocol):
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
     ) -> AnswerResult: ...
+
+    def compile(
+        self,
+        goal: ContentInput,
+        *,
+        budget: ContextBudget | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> ContextBundle: ...
+
+    def capabilities(self) -> MemoryCapabilities: ...
 
     def get(self, memory_id: str) -> MemoryRecord: ...
 
@@ -480,8 +560,112 @@ def create_app(
             )
         )
 
+    _add_context_routes(
+        router,
+        current_service,
+        model_errors=model_errors,
+        standard_errors=standard_errors,
+    )
     app.include_router(router)
     return app
+
+
+def _add_context_routes(
+    router: APIRouter,
+    current_service: Callable[[], _Memory],
+    *,
+    model_errors: dict[int | str, dict[str, Any]],
+    standard_errors: dict[int | str, dict[str, Any]],
+) -> None:
+    """Register the agent-facing compiler routes on the `/v1` router."""
+
+    @router.post(
+        "/context",
+        response_model=ContextBundleResponse,
+        operation_id="compileContext",
+        responses=model_errors,
+    )
+    def compile_context(request: ContextRequest) -> ContextBundleResponse:
+        return _bundle_response(
+            current_service().compile(
+                _content_input(request.goal),
+                budget=_context_budget(request.budget),
+                reference_at=request.reference_at,
+                scope=request.scope,
+            )
+        )
+
+    @router.get(
+        "/capabilities",
+        response_model=CapabilitiesResponse,
+        operation_id="capabilities",
+        responses=standard_errors,
+    )
+    def capabilities() -> CapabilitiesResponse:
+        reported = current_service().capabilities()
+        return CapabilitiesResponse(
+            modalities=tuple(sorted(reported.modalities)),
+            answer=reported.answer,
+            transcribe=reported.transcribe,
+            faces=reported.faces,
+            describe_vision=reported.describe_vision,
+            form=reported.form,
+            consolidate=reported.consolidate,
+            decay=reported.decay,
+        )
+
+
+def _context_budget(request: ContextBudgetRequest | None) -> ContextBudget | None:
+    if request is None:
+        return None
+    return ContextBudget(
+        max_chars=request.max_chars,
+        max_items=request.max_items,
+        memory_types=None if request.memory_types is None else frozenset(request.memory_types),
+        min_confidence=request.min_confidence,
+        freshness=(
+            None
+            if request.freshness_seconds is None
+            else timedelta(seconds=request.freshness_seconds)
+        ),
+    )
+
+
+def _bundle_response(bundle: ContextBundle) -> ContextBundleResponse:
+    return ContextBundleResponse.model_validate(
+        {
+            "goal": bundle.goal,
+            "reference_at": bundle.reference_at,
+            "budget": {
+                "max_chars": bundle.budget.max_chars,
+                "max_items": bundle.budget.max_items,
+                "memory_types": (
+                    None
+                    if bundle.budget.memory_types is None
+                    else tuple(sorted(bundle.budget.memory_types))
+                ),
+                "min_confidence": bundle.budget.min_confidence,
+                "freshness_seconds": (
+                    None
+                    if bundle.budget.freshness is None
+                    else bundle.budget.freshness.total_seconds()
+                ),
+            },
+            "actors": bundle.actors,
+            "episodes": bundle.episodes,
+            "facts": bundle.facts,
+            "procedures": bundle.procedures,
+            "affect": bundle.affect,
+            "traits": bundle.traits,
+            "conflicts": bundle.conflicts,
+            "occurred_from": bundle.occurred_from,
+            "occurred_until": bundle.occurred_until,
+            "frames": bundle.frames,
+            "omitted": bundle.omitted,
+            "chars": bundle.chars,
+            "rendered": bundle.render(),
+        }
+    )
 
 
 def _content_input(content: _Content) -> ContentInput:

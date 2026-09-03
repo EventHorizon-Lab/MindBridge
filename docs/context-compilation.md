@@ -136,4 +136,9 @@ if capabilities.answer:
 ```
 
 `AsyncMemory` mirrors both methods. The command line exposes them as `mindbridge compile` and
-`mindbridge capabilities`; see [the CLI reference](api/cli.md).
+`mindbridge capabilities`, locally and against `--url`; see [the CLI reference](api/cli.md).
+
+Both operations reach agents over the transports as well: `POST /v1/context` with
+`GET /v1/capabilities` on [REST](api/rest.md#endpoints), and the `compile_context` tool with the
+capability view in the server instructions on [MCP](api/mcp.md#tools). Both are read-only views of
+existing evidence.

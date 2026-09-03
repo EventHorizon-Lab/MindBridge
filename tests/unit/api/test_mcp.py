@@ -1,9 +1,9 @@
-"""Focused checks for the six local-memory MCP tools."""
+"""Focused checks for the seven local-memory MCP tools."""
 
 import base64
 import json
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 
@@ -28,6 +28,10 @@ from mindbridge.types import (
     AssetRef,
     Blob,
     ContentInput,
+    ContextBudget,
+    ContextBundle,
+    ContextConflict,
+    MemoryCapabilities,
     MemoryRecord,
     MemoryType,
     Modality,
@@ -58,6 +62,23 @@ ASSET = AssetRef(
     sha256="a" * 64,
     name="frame.png",
     path=Path("/private/mindbridge/assets/frame.png"),
+)
+CAPABILITIES = MemoryCapabilities(
+    modalities=frozenset({Modality.TEXT, Modality.IMAGE, Modality.AUDIO}),
+    answer=True,
+    transcribe=True,
+    faces=False,
+    describe_vision=False,
+    form=True,
+    consolidate=False,
+    decay=True,
+)
+CONFLICT = ContextConflict(
+    lineage_id="lineage_1",
+    subject="ana",
+    predicate="location",
+    values=("berlin", "paris"),
+    memory_ids=("memory_1", "memory_2"),
 )
 
 
@@ -129,6 +150,21 @@ class FakeMemory:
         self.calls.append(("ask", question, limit, memory_type, reference_at))
         return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
 
+    def compile(
+        self,
+        goal: ContentInput,
+        *,
+        budget: ContextBudget | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> ContextBundle:
+        self._fail()
+        self.calls.append(("compile", goal, budget, reference_at, scope))
+        return _bundle(budget or ContextBudget(), reference_at or NOW)
+
+    def capabilities(self) -> MemoryCapabilities:
+        return CAPABILITIES
+
     def get(self, memory_id: str) -> MemoryRecord:
         self._fail()
         self.calls.append(("get", memory_id))
@@ -152,7 +188,7 @@ class FakeMemory:
             raise self.failure
 
 
-async def test_mcp_publishes_only_the_six_flat_local_tools() -> None:
+async def test_mcp_publishes_only_the_seven_flat_local_tools() -> None:
     server = build_mcp_server(cast(Memory, FakeMemory()))
 
     async with Client(server) as client:
@@ -162,6 +198,7 @@ async def test_mcp_publishes_only_the_six_flat_local_tools() -> None:
         "add_memory",
         "search_memories",
         "ask_memory",
+        "compile_context",
         "get_memory",
         "list_memories",
         "delete_memory",
@@ -185,6 +222,7 @@ async def test_mcp_publishes_only_the_six_flat_local_tools() -> None:
             "scope",
         },
         "ask_memory": {"question", "limit", "memory_type", "reference_at", "scope"},
+        "compile_context": {"goal", "budget", "reference_at", "scope"},
         "get_memory": {"memory_id"},
         "list_memories": {"limit", "cursor"},
         "delete_memory": {"memory_id"},
@@ -199,6 +237,11 @@ async def test_mcp_publishes_only_the_six_flat_local_tools() -> None:
     assert tools["ask_memory"].annotations.read_only_hint is False
     assert tools["delete_memory"].annotations is not None
     assert tools["delete_memory"].annotations.destructive_hint is True
+    assert tools["compile_context"].annotations is not None
+    assert tools["compile_context"].annotations.read_only_hint is False
+    description = tools["compile_context"].description or ""
+    assert "Prefer this tool" in description
+    assert "`ask_memory` remains a convenience" in description
     published = json.dumps({name: tool.input_schema for name, tool in tools.items()})
     assert all(field not in published for field in ("tenant_id", "user_id", "run_id"))
 
@@ -214,6 +257,102 @@ async def test_mcp_serializes_the_cognitive_forgetting_state_of_a_record() -> No
 
     assert found.structured_content is not None
     assert found.structured_content["forgotten_at"] == "2026-09-03T09:00:00Z"
+
+
+async def test_mcp_instructions_advertise_the_configured_capability_view() -> None:
+    async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
+        instructions = client.instructions
+
+    assert instructions is not None
+    assert "Modalities: audio, image, text." in instructions
+    assert "Capabilities: answer, decay, form, transcribe." in instructions
+    assert "Unavailable: consolidate, describe_vision, faces." in instructions
+    assert "Prefer compile_context for task-ready context" in instructions
+    assert "cognitive forgetting" in instructions
+
+
+async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_paths() -> None:
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        compiled = await client.call_tool(
+            "compile_context",
+            {
+                "goal": "  What should I bring?  ",
+                "budget": {
+                    "max_chars": 2_000,
+                    "max_items": 8,
+                    "memory_types": ["episodic", "semantic"],
+                    "min_confidence": 0.5,
+                    "freshness_seconds": 3_600,
+                },
+                "reference_at": NOW.isoformat(),
+            },
+        )
+        defaulted = await client.call_tool("compile_context", {"goal": "What should I bring?"})
+
+    assert compiled.is_error is False
+    assert memory.calls == [
+        (
+            "compile",
+            "What should I bring?",
+            ContextBudget(
+                max_chars=2_000,
+                max_items=8,
+                memory_types=frozenset({MemoryType.EPISODIC, MemoryType.SEMANTIC}),
+                min_confidence=0.5,
+                freshness=timedelta(hours=1),
+            ),
+            NOW,
+            None,
+        ),
+        ("compile", "What should I bring?", None, None, None),
+    ]
+    bundle = compiled.structured_content
+    assert bundle is not None
+    assert bundle["goal"] == "What should I bring?"
+    assert bundle["budget"] == {
+        "max_chars": 2_000,
+        "max_items": 8,
+        "memory_types": ["episodic", "semantic"],
+        "min_confidence": 0.5,
+        "freshness_seconds": 3_600.0,
+    }
+    assert [hit["id"] for hit in bundle["facts"]] == ["memory_1"]
+    assert [hit["id"] for hit in bundle["episodes"]] == ["memory_2"]
+    assert bundle["actors"] == []
+    assert bundle["conflicts"] == [
+        {
+            "lineage_id": "lineage_1",
+            "subject": "ana",
+            "predicate": "location",
+            "values": ["berlin", "paris"],
+            "memory_ids": ["memory_1", "memory_2"],
+        }
+    ]
+    assert bundle["frames"] == ["home/map"]
+    assert bundle["omitted"] == 3
+    assert bundle["chars"] == 42
+    assert bundle["rendered"].startswith("# Context: What should I bring?")
+    assert bundle["episodes"][0]["assets"] == [
+        {
+            "id": "asset_image",
+            "modality": "image",
+            "media_type": "image/png",
+            "size_bytes": 3,
+            "sha256": "a" * 64,
+            "name": "frame.png",
+        }
+    ]
+    assert "/private/mindbridge/assets" not in json.dumps(bundle)
+    assert defaulted.structured_content is not None
+    assert defaulted.structured_content["budget"] == {
+        "max_chars": 6_000,
+        "max_items": 24,
+        "memory_types": None,
+        "min_confidence": 0.0,
+        "freshness_seconds": None,
+    }
 
 
 async def test_mcp_returns_structured_results_and_does_not_close_injected_memory() -> None:
@@ -574,13 +713,41 @@ def _record(
     )
 
 
-def _hit() -> SearchHit:
+def _hit(
+    memory_id: str = "memory_1",
+    *,
+    score: float = 0.9,
+    assets: tuple[AssetRef, ...] = (),
+    memory_type: MemoryType = MemoryType.SEMANTIC,
+) -> SearchHit:
     return SearchHit(
-        id="memory_1",
+        id=memory_id,
         content="The toolbox is blue.",
-        score=0.9,
-        modality=Modality.TEXT,
+        score=score,
+        modality=Modality.IMAGE if assets else Modality.TEXT,
+        memory_type=memory_type,
+        assets=assets,
         created_at=NOW,
+    )
+
+
+def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
+    return ContextBundle(
+        goal="What should I bring?",
+        reference_at=reference_at,
+        budget=budget,
+        actors=(),
+        episodes=(_hit("memory_2", score=0.7, assets=(ASSET,), memory_type=MemoryType.EPISODIC),),
+        facts=(_hit(),),
+        procedures=(),
+        affect=(),
+        traits=(),
+        conflicts=(CONFLICT,),
+        occurred_from=OCCURRED_FROM,
+        occurred_until=OCCURRED_UNTIL,
+        frames=("home/map",),
+        omitted=3,
+        chars=42,
     )
 
 

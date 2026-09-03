@@ -152,7 +152,7 @@ part shapes and limits in the [REST reference](api/rest.md#input-limits).
 
 Separate Python, REST, and MCP processes cannot open the same `data_dir`. Put the required
 adapters around one constructed `Memory`, call the running REST owner, or allocate deliberately
-separate memory domains. The supported REST surface is under `/v1`; MCP has exactly six tools.
+separate memory domains. The supported REST surface is under `/v1`; MCP has exactly seven tools.
 
 Neither network adapter adds authentication. Apply the controls in
 [deployment](deployment.md#choose-a-topology).

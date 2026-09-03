@@ -33,7 +33,7 @@ have one place to stay current.
 
 - [Python SDK](api/python-sdk.md) — complete `mindbridge` root-import contract.
 - [REST API](api/rest.md) — `/v1` requests, responses, errors, and limits.
-- [MCP tools](api/mcp.md) — the six tool schemas and transport boundary.
+- [MCP tools](api/mcp.md) — the seven tool schemas and transport boundary.
 - [Command line](api/cli.md) — commands, input forms, JSON output, and exit codes.
 
 ## Deploy and operate

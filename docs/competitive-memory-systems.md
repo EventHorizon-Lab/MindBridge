@@ -229,7 +229,7 @@ and tests establish these boundaries:
 | Temporal and spatial retrieval | `RetrievalScope` supports world-valid `valid_at`, knowledge-time `known_at`, and exact same-frame `near`/`radius_m` filtering. | [Memory operations](api/python-sdk.md#memory-operations) |
 | Stream finality | `UPDATE` is speculative, `FINAL` persists once, and `CANCEL` or unfinished EOF writes nothing. Audio and vision adapters normalize provider events into the same boundary. | [Async capture streams](api/python-sdk.md#async-capture-streams) |
 | Affect and traits | Affect keeps cue modality and evidence. A model-inferred trait needs two independent source groups; a trusted explicit user statement is visible immediately. | [Write consistency](architecture.md#write-consistency), [public values](api/python-sdk.md#public-values) |
-| Public surfaces | Supported Python values are imported from `mindbridge`; REST is under `/v1`; MCP remains exactly six tools: add, search, ask, get, list, and delete. Optional context does not introduce account, user, request, or benchmark scope. | [Python SDK](api/python-sdk.md), [REST](api/rest.md), [MCP](api/mcp.md) |
+| Public surfaces | Supported Python values are imported from `mindbridge`; REST is under `/v1`; MCP remains exactly seven tools: add, search, ask, compile, get, list, and delete, with the capability view in the server instructions rather than a tool. Optional context does not introduce account, user, request, or benchmark scope. | [Python SDK](api/python-sdk.md), [REST](api/rest.md), [MCP](api/mcp.md) |
 
 ## Deferred work and evidence gates
 

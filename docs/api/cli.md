@@ -91,8 +91,8 @@ credential behavior live in [configuration](../configuration.md).
 | `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
 | `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | no |
 | `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope` | answer object | yes |
-| `compile` | content; `--max-chars`; `--max-items`; repeatable `--memory-type`; `--min-confidence`; `--freshness-seconds`; `--reference-at`; `--scope` | context bundle plus `rendered` | no |
-| `capabilities` | none | `{"modalities":[...],"answer":bool,...}` | no |
+| `compile` | content; `--max-chars`; `--max-items`; repeatable `--memory-type`; `--min-confidence`; `--freshness-seconds`; `--reference-at`; `--scope` | context bundle plus `rendered` | yes |
+| `capabilities` | none | `{"modalities":[...],"answer":bool,...}` | yes |
 | `get` | `MEMORY_ID` | memory object | yes |
 | `speech` | `MEMORY_ID` | `{"segments":[...]}` | no |
 | `faces` | `MEMORY_ID` | `{"observations":[...]}` | no |
@@ -222,8 +222,8 @@ exit 130 use their conventional plain stderr diagnostics.
 
 ### Operations without a remote route
 
-With `--url`, only `add`, `add-many`, `search`, `ask`, `get`, `list`, `delete`, and `doctor` are
-available. Other commands exit 10 with `unsupported_in_remote_mode`; their SDK operations have no
+With `--url`, only `add`, `add-many`, `search`, `ask`, `compile`, `capabilities`, `get`, `list`,
+`delete`, and `doctor` are available. Other commands exit 10 with `unsupported_in_remote_mode`; their SDK operations have no
 REST route. The complete route boundary is listed in
 [REST operations without a route](rest.md#operations-without-a-route).
 

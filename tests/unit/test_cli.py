@@ -793,6 +793,44 @@ def test_remote_mode_serializes_typed_observation_context(
     }
 
 
+def test_remote_mode_compiles_and_reads_capabilities_over_v1(
+    calls: list[tuple[str, str, object]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _run(
+        capsys,
+        "--url",
+        "http://owner:8000",
+        "-q",
+        "compile",
+        "what should I bring",
+        "--max-items",
+        "8",
+        "--memory-type",
+        "episodic",
+        "--freshness-seconds",
+        "3600",
+    )
+    _run(capsys, "--url", "http://owner:8000", "-q", "capabilities")
+
+    assert calls == [
+        (
+            "POST",
+            "http://owner:8000/v1/context",
+            {
+                "goal": "what should I bring",
+                "budget": {
+                    "max_chars": 6000,
+                    "max_items": 8,
+                    "memory_types": ["episodic"],
+                    "min_confidence": 0.0,
+                    "freshness_seconds": 3600.0,
+                },
+            },
+        ),
+        ("GET", "http://owner:8000/v1/capabilities", None),
+    ]
+
+
 def test_remote_mode_passes_the_cursor_through_unparsed(
     calls: list[tuple[str, str, object]], capsys: pytest.CaptureFixture[str]
 ) -> None:
