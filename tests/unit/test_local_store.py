@@ -286,7 +286,7 @@ def test_schema_is_local_and_enforces_foreign_keys(tmp_path: Path) -> None:
                     "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
                 )
             )
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
             assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert "tenant" not in schema.casefold()
@@ -353,7 +353,7 @@ def test_schema_v1_is_migrated_atomically_with_text_modality(tmp_path: Path) -> 
         assert legacy.access_count == 0
         assert legacy.assets == ()
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -377,7 +377,7 @@ def test_schema_v2_is_migrated_without_losing_memories(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         assert store.read_memory("preserved") is not None
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -396,7 +396,7 @@ def test_schema_v3_adds_optional_speaker_names(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         with closing(sqlite3.connect(store.database_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(identities)")}
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         assert "name" in columns
 
 
@@ -416,7 +416,7 @@ def test_schema_v5_adds_optional_event_end(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         with closing(sqlite3.connect(store.database_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(memory_records)")}
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         assert "occurred_end" in columns
 
 
@@ -507,7 +507,7 @@ def test_schema_v7_adds_transactional_evidence_without_losing_records(tmp_path: 
 
     assert preserved is not None and preserved.content == "A red tool is in drawer two"
     assert {"source_group_id", "recorded_at", "retired_at"} <= columns
-    assert version == 9
+    assert version == 10
 
 
 @pytest.mark.skipif(sqlite3.sqlite_version_info < (3, 35), reason="DROP COLUMN needs SQLite 3.35")
@@ -543,7 +543,7 @@ def test_schema_v8_adds_identity_profiles_and_link_evidence(tmp_path: Path) -> N
     assert recorded == 1
     assert named == IdentityProfile(identity_id=face_id, name="Alice", relationship="neighbour")
     assert "contributed_modality" in alias_columns
-    assert version == 9
+    assert version == 10
 
 
 def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
@@ -1613,3 +1613,56 @@ def test_evidence_and_projection_share_one_transaction_time(tmp_path: Path) -> N
     assert before_retraction.confidence == pytest.approx(0.96)
     assert retracted.context.evidence_ids == (first.memory_id,)
     assert retracted.context.confidence == pytest.approx(0.8)
+
+
+def test_schema_v9_adds_forgetting_and_control_plane_state(tmp_path: Path) -> None:
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory(),), (_embedding(),))
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.executescript(
+            """
+            DROP TABLE capture_queue;
+            DROP TABLE memory_operations;
+            ALTER TABLE memory_records DROP COLUMN forgotten_at;
+            PRAGMA user_version = 9;
+            """
+        )
+
+    with LocalStore(tmp_path) as store:
+        memory = store.read_memory("memory-1")
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert memory is not None and memory.forgotten_at is None
+    assert {"capture_queue", "memory_operations"} <= tables
+    assert version == 10
+
+
+def test_forgotten_memories_leave_active_reads_but_stay_auditable(tmp_path: Path) -> None:
+    forgotten_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        store.write_memories(
+            (_memory("memory-1"), _memory("memory-2")),
+            (_embedding("e-1", "memory-1"), _embedding("e-2", "memory-2")),
+        )
+
+        assert store.set_forgotten(("memory-1", "memory-1"), forgotten_at=forgotten_at) == (
+            "memory-1",
+        )
+        assert store.set_forgotten(("memory-1",), forgotten_at=forgotten_at) == ()
+
+        active = store.read_memories(("memory-1", "memory-2"), active_only=True)
+        audit = store.read_memories(("memory-1", "memory-2"))
+        listed = store.list_memories(limit=10)
+
+        assert [memory.memory_id for memory in active] == ["memory-2"]
+        assert [memory.forgotten_at for memory in audit] == [forgotten_at, None]
+        assert {memory.memory_id for memory in listed} == {"memory-1", "memory-2"}
+
+        assert store.set_forgotten(("memory-1", "memory-2"), forgotten_at=None) == ("memory-1",)
+        restored = store.read_memories(("memory-1", "memory-2"), active_only=True)
+        assert [memory.memory_id for memory in restored] == ["memory-1", "memory-2"]

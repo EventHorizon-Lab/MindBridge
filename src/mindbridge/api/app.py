@@ -207,6 +207,7 @@ class MemoryResponse(_ResponseModel):
     occurred_end: AwareDatetime | None = None
     metadata: dict[str, JsonValue]
     context: MemoryContext | None = None
+    forgotten_at: AwareDatetime | None = None
 
 
 class SearchHitResponse(MemoryResponse):

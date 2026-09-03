@@ -960,11 +960,13 @@ class MemoryRecord:
     modality: Modality = Modality.TEXT
     memory_type: MemoryType = MemoryType.SEMANTIC
     context: MemoryContext | None = None
+    forgotten_at: datetime | None = None
 
     def __post_init__(self) -> None:
         _text(self.id, "id")
         _require_aware(self.created_at, "created_at")
         _require_interval(self.occurred_at, self.occurred_end)
+        _require_aware(self.forgotten_at, "forgotten_at")
         if not isinstance(self.modality, Modality):
             raise ValidationError("memory modality is invalid")
         if not isinstance(self.memory_type, MemoryType):
@@ -993,11 +995,13 @@ class SearchHit:
     modality: Modality = Modality.TEXT
     memory_type: MemoryType = MemoryType.SEMANTIC
     context: MemoryContext | None = None
+    forgotten_at: datetime | None = None
 
     def __post_init__(self) -> None:
         _text(self.id, "id")
         _require_aware(self.created_at, "created_at")
         _require_interval(self.occurred_at, self.occurred_end)
+        _require_aware(self.forgotten_at, "forgotten_at")
         if not math.isfinite(self.score) or not 0.0 <= self.score <= 1.0:
             raise ValidationError("score must be between zero and one")
         if not isinstance(self.modality, Modality):

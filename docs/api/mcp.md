@@ -92,7 +92,7 @@ Successful calls populate MCP `structuredContent`:
 | Object | Fields |
 | --- | --- |
 | `AssetResult` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name` |
-| `MemoryResult` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context` |
+| `MemoryResult` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context`, `forgotten_at` |
 | `SearchHitResult` | all memory fields plus `score` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResult` | `items`, `next_cursor` |

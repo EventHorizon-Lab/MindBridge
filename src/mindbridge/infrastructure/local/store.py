@@ -30,7 +30,7 @@ from mindbridge.types import (
     SpeakerSegment,
 )
 
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 _SQLITE_PARAMETER_BATCH = 900
 _FACE_EXEMPLAR_LIMIT = 10
 _VOICE_EXEMPLAR_LIMIT = 20
@@ -62,6 +62,8 @@ _REQUIRED_TABLES = frozenset(
         "memory_evidence",
         "memory_semantics",
         "memory_versions",
+        "capture_queue",
+        "memory_operations",
     }
 )
 _ASSET_SCHEMA = """
@@ -353,7 +355,33 @@ CREATE TABLE formation_runs (
 );
 """
 
-_SCHEMA_V9 = f"""
+_CONTROL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS capture_queue (
+    memory_id TEXT PRIMARY KEY REFERENCES memory_records (memory_id) ON DELETE CASCADE,
+    enqueued_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    last_error TEXT CHECK (last_error IS NULL OR length(trim(last_error)) > 0)
+);
+
+CREATE TABLE IF NOT EXISTS memory_operations (
+    operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
+    intent TEXT NOT NULL CHECK (intent IN ('reinforce', 'consolidate', 'correct', 'forget')),
+    trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
+    model_id TEXT,
+    recipe TEXT,
+    operation_json TEXT NOT NULL,
+    effects_json TEXT NOT NULL,
+    applied_at TEXT NOT NULL,
+    rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS memory_operations_active_key_idx
+    ON memory_operations (operation_key)
+    WHERE rolled_back_at IS NULL;
+"""
+
+_SCHEMA_V10 = f"""
 BEGIN IMMEDIATE;
 
 CREATE TABLE memory_records (
@@ -370,7 +398,8 @@ CREATE TABLE memory_records (
     last_accessed_at TEXT,
     access_count INTEGER NOT NULL DEFAULT 0 CHECK (access_count BETWEEN 0 AND 20),
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL CHECK (updated_at >= created_at)
+    updated_at TEXT NOT NULL CHECK (updated_at >= created_at),
+    forgotten_at TEXT
 );
 
 CREATE INDEX memory_records_created_idx
@@ -395,6 +424,7 @@ CREATE INDEX embeddings_memory_idx ON embeddings (memory_id);
 {_ASSET_SCHEMA}
 {_IDENTITY_SCHEMA}
 {_SEMANTIC_SCHEMA}
+{_CONTROL_SCHEMA}
 
 CREATE TABLE store_metadata (
     key TEXT PRIMARY KEY CHECK (length(trim(key)) > 0),
@@ -414,7 +444,7 @@ CREATE INDEX search_index_queue_order_idx
 
 {_INDEX_TRIGGERS}
 
-PRAGMA user_version = 9;
+PRAGMA user_version = 10;
 COMMIT;
 """
 
@@ -674,6 +704,7 @@ class StoredMemory:
     assets: tuple[StoredAsset, ...] = ()
     last_accessed_at: datetime | None = None
     access_count: int = 0
+    forgotten_at: datetime | None = None
     context: MemoryContext | None = None
 
     def __post_init__(self) -> None:
@@ -1041,7 +1072,7 @@ class LocalStore:
                 """
                 SELECT memory_id, content, modality, memory_type, metadata_json,
                        occurred_at, occurred_end, last_accessed_at, access_count,
-                       created_at, updated_at
+                       created_at, updated_at, forgotten_at
                 FROM memory_records
                 WHERE memory_id = ?
                 """,
@@ -1082,7 +1113,7 @@ class LocalStore:
                         f"""
                         SELECT memory_id, content, modality, memory_type, metadata_json,
                                occurred_at, occurred_end, last_accessed_at, access_count,
-                               created_at, updated_at
+                               created_at, updated_at, forgotten_at
                         FROM memory_records
                         WHERE memory_id IN ({placeholders})
                         """,
@@ -1108,12 +1139,20 @@ class LocalStore:
             for row in rows
             if not active_only
             or (
-                valid_at is None
-                and near is None
-                and _row_text(row, "memory_id") not in semantic_ids
-                and (known_at is None or _parse_datetime(_row_text(row, "created_at")) <= known_at)
+                row["forgotten_at"] is None
+                and (
+                    (
+                        valid_at is None
+                        and near is None
+                        and _row_text(row, "memory_id") not in semantic_ids
+                        and (
+                            known_at is None
+                            or _parse_datetime(_row_text(row, "created_at")) <= known_at
+                        )
+                    )
+                    or _row_text(row, "memory_id") in contexts
+                )
             )
-            or _row_text(row, "memory_id") in contexts
         }
         return tuple(by_id[memory_id] for memory_id in memory_ids if memory_id in by_id)
 
@@ -1198,7 +1237,7 @@ class LocalStore:
                 f"""
                 SELECT memory_id, content, modality, memory_type, metadata_json,
                        occurred_at, occurred_end, last_accessed_at, access_count,
-                       created_at, updated_at
+                       created_at, updated_at, forgotten_at
                 FROM memory_records
                 {where}
                 ORDER BY created_at DESC, memory_id DESC
@@ -1246,6 +1285,39 @@ class LocalStore:
                 )
                 changed += cursor.rowcount
         return changed
+
+    def set_forgotten(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        forgotten_at: datetime | None,
+    ) -> tuple[str, ...]:
+        """Set or clear cognitive forgetting and return the ids whose state changed."""
+        ids = tuple(dict.fromkeys(memory_ids))
+        for memory_id in ids:
+            _require_identifier(memory_id, "memory_id")
+        if forgotten_at is not None:
+            _require_aware(forgotten_at, "forgotten_at")
+        if not ids:
+            return ()
+        changed: list[str] = []
+        with self._transaction() as connection:
+            for memory_id in ids:
+                cursor = connection.execute(
+                    """
+                    UPDATE memory_records
+                    SET forgotten_at = ?
+                    WHERE memory_id = ? AND (forgotten_at IS NULL) != (? IS NULL)
+                    """,
+                    (
+                        None if forgotten_at is None else _datetime_text(forgotten_at),
+                        memory_id,
+                        None if forgotten_at is None else 1,
+                    ),
+                )
+                if cursor.rowcount:
+                    changed.append(memory_id)
+        return tuple(changed)
 
     def delete_memory(self, memory_id: str) -> bool:
         """Delete a memory; cascading embedding triggers enqueue index deletions."""
@@ -2554,6 +2626,9 @@ class LocalStore:
             if version == 8:
                 _migrate_v8(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 9:
+                _migrate_v9(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
                 raise UnsupportedSchemaError(
@@ -3198,7 +3273,7 @@ def _create_schema(
     if existing_tables:
         raise UnsupportedSchemaError("local data directory contains an unversioned SQLite schema")
     try:
-        connection.executescript(_SCHEMA_V9)
+        connection.executescript(_SCHEMA_V10)
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -3353,6 +3428,23 @@ def _migrate_v8(connection: sqlite3.Connection) -> None:
             for statement in _IDENTITY_LINK_EVIDENCE_DDL:
                 connection.execute(statement)
         connection.execute("PRAGMA user_version = 9")
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def _migrate_v9(connection: sqlite3.Connection) -> None:
+    try:
+        record_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(memory_records)")
+        }
+        connection.execute("BEGIN IMMEDIATE")
+        if "forgotten_at" not in record_columns:
+            connection.execute("ALTER TABLE memory_records ADD COLUMN forgotten_at TEXT")
+        connection.executescript(_CONTROL_SCHEMA)
+        connection.execute("PRAGMA user_version = 10")
         connection.commit()
     except BaseException:
         if connection.in_transaction:
@@ -3991,6 +4083,7 @@ def _memory_from_row(
         access_count=int(row["access_count"]),
         created_at=_parse_datetime(_row_text(row, "created_at")),
         updated_at=_parse_datetime(_row_text(row, "updated_at")),
+        forgotten_at=_optional_datetime_from_row(row, "forgotten_at"),
         context=context,
     )
 

@@ -250,6 +250,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
         "occurred_end": None,
         "metadata": {"room": "workshop"},
         "context": None,
+        "forgotten_at": None,
     }
     assert searched.structured_content is not None
     assert searched.structured_content["hits"][0]["score"] == 0.9

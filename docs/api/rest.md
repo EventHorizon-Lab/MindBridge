@@ -175,7 +175,7 @@ the injected memory.
 | Object | Fields |
 | --- | --- |
 | `AssetResponse` | `id`, `modality`, `media_type`, `size_bytes`, `sha256`, `name` |
-| `MemoryResponse` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context` |
+| `MemoryResponse` | `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`, `occurred_at`, `occurred_end`, `metadata`, `context`, `forgotten_at` |
 | `SearchHitResponse` | all memory fields plus `score` from 0 through 1 |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResponse` | `items`, `next_cursor` |

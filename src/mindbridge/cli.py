@@ -1228,6 +1228,7 @@ def _memory_document(record: MemoryRecord | SearchHit) -> _Document:
         "occurred_end": _encode_optional_time(record.occurred_end),
         "metadata": dict(record.metadata),
         "context": _context_document(record.context),
+        "forgotten_at": _encode_optional_time(record.forgotten_at),
     }
     if isinstance(record, SearchHit):
         document["score"] = record.score

@@ -25,7 +25,7 @@ data, not an account, authorization, request, or isolation boundary.
 
 | Path | Authority | Recovery role |
 | --- | --- | --- |
-| `state.sqlite3` | Authoritative | Records, FP32 embeddings, model and index compatibility markers, cached analyses, identities, typed semantics, and pending index operations. |
+| `state.sqlite3` | Authoritative | Records, FP32 embeddings, model and index compatibility markers, cached analyses, identities, typed semantics, forgetting state, deferred capture work, the memory-operation log, and pending index operations. |
 | `assets/` | Authoritative | Original media bytes. SQLite cannot recreate a missing asset. |
 | `zvec/` | Derived | Disposable search projection rebuilt from SQLite without re-embedding stored content. |
 | `.mindbridge.lock` | Coordination only | Operating-system lock target; the file normally remains after shutdown. |

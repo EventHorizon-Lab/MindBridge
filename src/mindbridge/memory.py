@@ -3378,6 +3378,7 @@ class Memory:
             modality=Modality(memory.modality),
             memory_type=MemoryType(memory.memory_type),
             context=memory.context,
+            forgotten_at=memory.forgotten_at,
         )
 
     def _search_hit(self, memory: StoredMemory, relevance: float) -> SearchHit:
@@ -3393,6 +3394,7 @@ class Memory:
             modality=Modality(memory.modality),
             memory_type=MemoryType(memory.memory_type),
             context=memory.context,
+            forgotten_at=memory.forgotten_at,
         )
 
     def _asset_ref(self, asset: StoredAsset) -> AssetRef:

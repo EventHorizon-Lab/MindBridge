@@ -224,6 +224,7 @@ class MemoryResult(BaseModel):
     occurred_end: AwareDatetime | None
     metadata: dict[str, JsonValue]
     context: MemoryContext | None = None
+    forgotten_at: AwareDatetime | None = None
 
 
 class SearchHitResult(MemoryResult):
@@ -417,6 +418,7 @@ def _memory_result(record: MemoryRecord) -> MemoryResult:
         occurred_end=record.occurred_end,
         metadata=cast(dict[str, JsonValue], dict(record.metadata)),
         context=record.context,
+        forgotten_at=record.forgotten_at,
     )
 
 
@@ -433,6 +435,7 @@ def _search_hit_result(hit: SearchHit) -> SearchHitResult:
         occurred_end=hit.occurred_end,
         metadata=cast(dict[str, JsonValue], dict(hit.metadata)),
         context=hit.context,
+        forgotten_at=hit.forgotten_at,
     )
 
 
