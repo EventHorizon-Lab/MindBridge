@@ -3,6 +3,7 @@
 import base64
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -41,6 +42,7 @@ from mindbridge.types import (
     MemoryRecord,
     MemoryType,
     Modality,
+    NamedActor,
     ObservationContext,
     Page,
     ProvisionalActor,
@@ -119,6 +121,12 @@ CAPABILITIES = MemoryCapabilities(
     speaker_recognition=True,
 )
 PROVISIONAL = ProvisionalActor(identity_id="identity_2", memory_ids=("memory_2",))
+NAMED = NamedActor(
+    identity_id="identity_3",
+    name="Alice",
+    memory_ids=("memory_2",),
+    naming_assertion_id="memory_3",
+)
 CONFLICT = ContextConflict(
     lineage_id="lineage_1",
     subject="ana",
@@ -1061,6 +1069,45 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
         "freshness_seconds": None,
         "max_latency_ms": None,
     }
+
+
+async def test_the_compile_tool_reports_a_named_actor_too() -> None:
+    """Mirrors the provisional-actor case above for a person a naming assertion already names.
+
+    `actors` carries a `SearchHit`, a `NamedActor`, or a `ProvisionalActor`; only the
+    provisional shape was exercised through this tool. A named actor's structured content
+    carries `name` and `naming_assertion_id`, which is what discriminates it from the
+    provisional one.
+    """
+    memory = FakeMemory()
+    original_compile = memory.compile
+
+    def compile_with_named_actor(
+        goal: ContentInput,
+        *,
+        budget: ContextBudget | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> ContextBundle:
+        bundle = original_compile(goal, budget=budget, reference_at=reference_at, scope=scope)
+        return replace(bundle, actors=(NAMED,))
+
+    memory.compile = compile_with_named_actor  # type: ignore[method-assign]
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        compiled = await client.call_tool("compile_context", {"goal": "Who was there?"})
+
+    assert compiled.is_error is False
+    bundle = compiled.structured_content
+    assert bundle is not None
+    assert bundle["actors"] == [
+        {
+            "identity_id": "identity_3",
+            "name": "Alice",
+            "memory_ids": ["memory_2"],
+            "naming_assertion_id": "memory_3",
+        }
+    ]
 
 
 async def test_the_server_greeting_advertises_the_configured_composition() -> None:

@@ -4,6 +4,7 @@ import base64
 import inspect
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from mindbridge.types import (
     MemoryRecord,
     MemoryType,
     Modality,
+    NamedActor,
     ObservationContext,
     Page,
     PendingCapture,
@@ -90,6 +92,12 @@ CAPABILITIES = MemoryCapabilities(
 
 
 PROVISIONAL = ProvisionalActor(identity_id="identity_2", memory_ids=("memory_2",))
+NAMED = NamedActor(
+    identity_id="identity_3",
+    name="Alice",
+    memory_ids=("memory_2",),
+    naming_assertion_id="memory_3",
+)
 CONFLICT = ContextConflict(
     lineage_id="lineage_1",
     subject="ana",
@@ -1004,6 +1012,42 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
         }
     ]
     assert "/private/mindbridge/assets" not in response.text
+
+
+def test_the_context_route_reports_a_named_actor_too() -> None:
+    """Mirrors the provisional-actor case above for a person a naming assertion already names.
+
+    `actors` is `SearchHitResponse | NamedActorResponse | ProvisionalActorResponse`; only the
+    provisional shape was exercised through this route. A `NamedActorResponse` carries `name`
+    and `naming_assertion_id`, which is what discriminates it from the provisional one.
+    """
+    memory = FakeMemory()
+    original_compile = memory.compile
+
+    def compile_with_named_actor(
+        goal: ContentInput,
+        *,
+        budget: ContextBudget | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> ContextBundle:
+        bundle = original_compile(goal, budget=budget, reference_at=reference_at, scope=scope)
+        return replace(bundle, actors=(NAMED,))
+
+    memory.compile = compile_with_named_actor  # type: ignore[method-assign]
+
+    with TestClient(create_app(memory=memory)) as client:
+        response = client.post("/v1/context", json={"goal": "Who was there?"})
+
+    assert response.status_code == 200
+    assert response.json()["actors"] == [
+        {
+            "identity_id": "identity_3",
+            "name": "Alice",
+            "memory_ids": ["memory_2"],
+            "naming_assertion_id": "memory_3",
+        }
+    ]
 
 
 def test_the_context_route_defaults_to_the_sdk_budget() -> None:
