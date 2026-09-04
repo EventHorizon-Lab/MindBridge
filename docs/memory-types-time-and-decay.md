@@ -169,7 +169,9 @@ only by an explicit caller action.
 `register_speaker` and `register_identity` write an `ENTITY` assertion whose
 `MemoryContext.identity_id` binds it to the recognized person, whose `subject` is the name, and
 whose `value` is the recorded relationship. Its basis is `USER_STATEMENT`, so it is visible at
-once, and it needs no former: naming rests on the host's authority, not on a model.
+once, and it needs no former: naming rests on the host's authority, not on a model. It inherits
+neither place nor metadata from the evidence an agent cites for it, whoever asserts it: who
+somebody is does not stop being true in another room.
 
 Every naming assertion about one identity shares a lineage keyed on that identity rather than on
 the spelling of the name, so renaming the person supersedes the previous assertion, exactly as a

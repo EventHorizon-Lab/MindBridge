@@ -1901,3 +1901,44 @@ def test_a_consolidation_inherits_what_all_of_its_evidence_agrees_on(tmp_path: P
             hit.id
             for hit in memory.search("patient", limit=10, scope=RetrievalScope(place_id="kitchen"))
         }
+
+
+def test_an_asserted_name_is_not_scoped_to_where_the_person_was_seen(tmp_path: Path) -> None:
+    """Who somebody is does not stop being true in the next room.
+
+    A naming assertion cites evidence but claims nothing about a place, so inheriting the place
+    of the clips it was recognized in would hide the name from every question asked anywhere
+    else -- and `register_identity`, which asserts the same thing with no evidence at all, files
+    it nowhere.
+    """
+    consolidator = ScriptedConsolidator()
+    with _identity_memory(tmp_path, consolidator) as memory:
+        kitchen = ObservationContext(place_id="kitchen")
+        first = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"), context=kitchen)
+        second = memory.add(
+            Blob(b"stranger speaks again", "video/mp4", "two.mp4"),
+            context=kitchen,
+            metadata={"household": "flat-2"},
+        )
+        identity_id = memory.faces(first.id)[0].identity_id
+        for cited in (first.id, second.id):
+            consolidator._scripts.append(
+                (
+                    MemoryOperation(
+                        intent=MemoryIntent.IDENTIFY,
+                        claim=IdentityClaim(identity_id=identity_id, name="Li"),
+                        evidence_ids=(cited,),
+                        rationale="the stranger said so",
+                    ),
+                )
+            )
+            assert not memory.consolidate(evidence_ids=(first.id, second.id)).rejected
+
+        (asserted,) = [
+            record
+            for record in memory.list(limit=100).items
+            if record.context is not None and record.context.identity_id == identity_id
+        ]
+        assert asserted.place_id is None
+        assert asserted.metadata == {}
+        assert asserted.id in {hit.id for hit in memory.search("recognized person", limit=10)}

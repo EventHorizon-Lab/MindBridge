@@ -580,7 +580,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   question the symbolic axis exists for. A captured record lost its place permanently, because
   `settle()` leaves the committed row alone. A consolidation rests on several sources, so it
   inherits the place and the metadata only when every cited source agrees, and inherits neither
-  when they disagree: a hard retrieval filter must not be guessed. Derived records still carry no
+  when they disagree: a hard retrieval filter must not be guessed. A naming assertion inherits
+  neither in any case, because who somebody is does not stop being true in another room. Derived
+  records still carry no
   media assets of their own: their evidence link points at the observation that holds them.
 - Forgetting, retracting, or correcting a naming assertion with a timestamp older than the identity
   row raised `sqlite3.IntegrityError` (`CHECK constraint failed: updated_at >= created_at`) out of

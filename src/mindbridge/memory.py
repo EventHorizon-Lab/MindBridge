@@ -2660,13 +2660,15 @@ class Memory:
             ),
             evidence_ids=tuple(sorted(source.id for source in sources)),
         )
-        place_id, metadata = _agreed_inheritance(sources)
         prepared = replace(
             _prepare_memory(
                 self._prepare_content(proposal.content, assets),
                 occurred_at=None,
                 occurred_end=None,
-                metadata=metadata,
+                # A name is not observed anywhere: who somebody is stays true in the next room,
+                # so the assertion inherits neither the place nor the tags of the clips they were
+                # recognized in, exactly as `register_identity` asserts it from no evidence.
+                metadata=None,
                 memory_type=_formation_memory_type(proposal.kind),
             ),
             memory_id=_formation_memory_id(
@@ -2676,7 +2678,6 @@ class Memory:
                 context=context,
             ),
             context=context,
-            place_id=place_id,
         )
         logged = self._commit_formation(
             tuple((prepared, source.id, proposal.confidence) for source in sources),
