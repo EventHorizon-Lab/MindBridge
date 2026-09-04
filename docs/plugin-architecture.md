@@ -106,14 +106,9 @@ admitted ahead of its implementation spent releases as exported surface with no 
 Criterion 2 no longer applies to it either. The describer used to be reachable only from the
 asynchronous vision capture stream; `add` and `add_many` now call a configured one for every
 embedder whenever a visual asset has no description yet, so the capability reaches the path a user
-actually invokes.
-
-The absence of a `vision_describer` key in declarative configuration is **deliberate, not the same
-gap**. Adding configuration for a protocol with no bundled implementation would deepen this
-violation rather than fix it: there would be nothing for a closed provider catalog to name. The key
-becomes appropriate when an implementation exists, and not before. Object injection remains the
-route in the meantime, which is the correct shape for a capability whose only implementations are
-the caller's own.
+actually invokes. Declarative configuration closed the remaining gap: the `vision` key builds the
+bundled OpenAI-compatible describer, omitted by default like `formation` and `consolidation`, and
+object injection remains available for a caller's own implementation.
 
 ## Embodied integration boundary
 

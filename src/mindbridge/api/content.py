@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+from datetime import timedelta
 from typing import Annotated, Literal, TypeAlias, cast
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from mindbridge.types import AssetRef, Blob, ContentInput, Modality
+from mindbridge.types import AssetRef, Blob, ContentInput, ContextBudget, MemoryType, Modality
 
 MAX_TEXT_CHARACTERS = 65_536
 # Bounds one decoded inline media value before any model or storage work. REST additionally caps
@@ -52,6 +53,15 @@ Filename = Annotated[
     ),
 ]
 Source = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8_192)]
+# The numeric bounds the request and tool models share. `strict=True` keeps a float out of an
+# integer field, which JSON would otherwise round into a silently different request.
+Limit = Annotated[int, Field(strict=True, ge=1, le=100)]
+Chars = Annotated[int, Field(strict=True, ge=1, le=MAX_TEXT_CHARACTERS)]
+Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
+Seconds = Annotated[float, Field(gt=0.0)]
+Milliseconds = Annotated[int, Field(strict=True, ge=1)]
+# The published compilation defaults are the SDK value's, never a second copy of the numbers.
+_BUDGET = ContextBudget()
 
 
 class StrictModel(BaseModel):
@@ -154,6 +164,38 @@ def content_input(content: Content) -> ContentInput:
                 )
             )
     return tuple(atoms)
+
+
+# The compilation bounds both transports accept. REST publishes it as `ContextBudgetRequest` and
+# MCP under this name, so REST subclasses rather than reuses the class: each SDK names its schema
+# component after the class, and renaming one is a published contract change. No docstring, for
+# the same reason -- it would become a schema `description` neither surface publishes today.
+class ContextBudgetInput(StrictModel):
+    max_chars: Chars = _BUDGET.max_chars
+    max_items: Limit = _BUDGET.max_items
+    memory_types: Annotated[list[MemoryType], Field(min_length=1)] | None = None
+    min_confidence: Confidence = _BUDGET.min_confidence
+    # `ContextBudget.freshness` is a timedelta; JSON carries the same bound as seconds.
+    freshness_seconds: Seconds | None = None
+    max_latency_ms: Milliseconds | None = None
+
+
+def context_budget(request: ContextBudgetInput | None) -> ContextBudget | None:
+    """Translate the transport budget into the SDK value, which validates every bound."""
+    if request is None:
+        return None
+    return ContextBudget(
+        max_chars=request.max_chars,
+        max_items=request.max_items,
+        memory_types=None if request.memory_types is None else frozenset(request.memory_types),
+        min_confidence=request.min_confidence,
+        freshness=(
+            None
+            if request.freshness_seconds is None
+            else timedelta(seconds=request.freshness_seconds)
+        ),
+        max_latency_ms=request.max_latency_ms,
+    )
 
 
 def decode_base64(value: str) -> bytes:

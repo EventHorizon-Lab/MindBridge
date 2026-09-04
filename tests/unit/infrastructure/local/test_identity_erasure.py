@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from mindbridge import EvidenceBasis, MemoryContext, MemoryKind
 from mindbridge.infrastructure.local import (
     LocalStore,
     StoredAsset,
@@ -169,9 +170,10 @@ def test_forgetting_an_identity_removes_the_whole_cluster_and_keeps_the_memories
         assert aliases is not None and len(aliases) == 3 and aliases[0] == forgotten
         before = _counts(store)
 
-        erasure = store.forget_identity(forgotten)
+        erased = store.forget_identity(forgotten)
 
-        assert erasure is not None
+        assert erased is not None
+        erasure, _unreferenced = erased
         assert erasure.identity_id == forgotten
         assert erasure.alias_ids == aliases[1:]
         assert erasure.face_exemplars == 1
@@ -293,13 +295,13 @@ def test_forgetting_replaces_the_indexed_memories_in_the_same_commit(tmp_path: P
             assets=(_asset("alice-first"),),
         )
 
-        erasure = store.forget_identity(
+        erased = store.forget_identity(
             forgotten,
             memories=(scrubbed,),
             embeddings=(embedding,),
         )
 
-        assert erasure is not None
+        assert erased is not None
         stored = store.read_memory("alice-first")
         assert stored is not None and "Alice" not in stored.content
         document = store.read_index_document("alice-first:0")
@@ -394,3 +396,95 @@ def test_asset_retention_candidates_are_oldest_first_and_filter_by_age(tmp_path:
             store.asset_retention_candidates(limit=0)
         with pytest.raises(ValueError, match="created_before"):
             store.asset_retention_candidates(created_before=_NOW.replace(tzinfo=None))
+
+
+def _semantic_memory(
+    memory_id: str,
+    content: str,
+    context: MemoryContext,
+) -> StoredMemory:
+    return StoredMemory(
+        memory_id=memory_id,
+        content=content,
+        metadata_json="{}",
+        created_at=_NOW,
+        updated_at=_NOW,
+        context=context,
+    )
+
+
+def test_erasing_a_person_reconciles_the_claims_that_cited_their_naming_assertion(
+    tmp_path: Path,
+) -> None:
+    """Erasure removes records, so it owes them the same reconciliation an ordinary delete does.
+
+    The assertions went out through a raw `DELETE`, which skipped the evidence projection: a
+    claim that rested on two independent groups, one of them the assertion, kept reporting two
+    and stayed visible on the single group it had left.
+    """
+    with LocalStore(tmp_path) as store:
+        forgotten, _assets = _person(store, "alice", 6)
+        store.write_memories(
+            (
+                _semantic_memory(
+                    "naming-1",
+                    "Alice is a recognized person",
+                    MemoryContext(
+                        kind=MemoryKind.ENTITY,
+                        basis=EvidenceBasis.USER_STATEMENT,
+                        confidence=1.0,
+                        valid_from=None,
+                        valid_until=None,
+                        recorded_at=_NOW,
+                        lineage_id=f"naming:{forgotten}",
+                        subject="Alice",
+                        predicate="identity",
+                        identity_id=forgotten,
+                    ),
+                ),
+            )
+        )
+        store.write_memories(
+            (
+                _semantic_memory(
+                    "trait-1",
+                    "Alice prefers tea",
+                    MemoryContext(
+                        kind=MemoryKind.TRAIT,
+                        basis=EvidenceBasis.MODEL_INFERENCE,
+                        confidence=0.9,
+                        valid_from=None,
+                        valid_until=None,
+                        recorded_at=_NOW + timedelta(minutes=1),
+                        lineage_id="trait:alice-drink",
+                        subject="Alice",
+                        predicate="preferred_drink",
+                        value="tea",
+                        evidence_ids=("naming-1", "alice-second"),
+                    ),
+                ),
+            )
+        )
+
+        def _projection() -> tuple[int, int]:
+            with closing(sqlite3.connect(store.database_path)) as reader:
+                groups = reader.execute(
+                    """
+                    SELECT COUNT(DISTINCT source_group_id) FROM memory_evidence
+                    WHERE memory_id = 'trait-1' AND retired_at IS NULL
+                    """
+                ).fetchone()[0]
+                visible = reader.execute(
+                    """
+                    SELECT visible FROM memory_versions
+                    WHERE memory_id = 'trait-1' AND retired_at IS NULL
+                    """
+                ).fetchone()[0]
+            return int(groups), int(visible)
+
+        # Two independent groups is what makes an inferred trait visible in the first place.
+        assert _projection() == (2, 1)
+
+        assert store.forget_identity(forgotten) is not None
+
+        assert _projection() == (1, 0)

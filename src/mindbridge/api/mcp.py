@@ -6,7 +6,6 @@ import inspect
 import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
-from datetime import timedelta
 from functools import wraps
 from typing import Annotated, Any, ParamSpec, TypeVar, cast
 from uuid import uuid4
@@ -18,7 +17,13 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import AwareDatetime, BaseModel, Field, JsonValue, StringConstraints
 
 from mindbridge import Memory
-from mindbridge.api.content import MAX_TEXT_CHARACTERS, Content, StrictModel, content_input
+from mindbridge.api.content import (
+    Content,
+    ContextBudgetInput,
+    Limit,
+    content_input,
+    context_budget,
+)
 from mindbridge.api.messages import error_message
 from mindbridge.exceptions import MindBridgeError, ValidationError
 from mindbridge.types import (
@@ -27,6 +32,7 @@ from mindbridge.types import (
     ContextBudget,
     ContextBundle,
     ContextConflict,
+    ContextUnknown,
     ContextUnknownKind,
     FaceObservation,
     IdentityErasure,
@@ -46,14 +52,9 @@ from mindbridge.types import (
 
 _LOGGER = logging.getLogger(__name__)
 _Identifier = Annotated[str, StringConstraints(min_length=1, pattern=r"^\S(?:.*\S)?$")]
-_Limit = Annotated[int, Field(strict=True, ge=1, le=100)]
 _Cursor = Annotated[str, StringConstraints(min_length=1)]
-_Chars = Annotated[int, Field(strict=True, ge=1, le=MAX_TEXT_CHARACTERS)]
-_Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
-_Seconds = Annotated[float, Field(gt=0.0)]
-_Milliseconds = Annotated[int, Field(strict=True, ge=1)]
-# Budget defaults are read from the SDK value, so the advertised tool default cannot drift from
-# `ContextBudget`.
+# The advertised tool defaults are read from the SDK value, so the prose and the schema cannot
+# drift from `ContextBudget`.
 _BUDGET = ContextBudget()
 _READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 _NON_IDEMPOTENT_WRITE = ToolAnnotations(
@@ -161,7 +162,8 @@ _BUDGET_DESCRIPTION = (
     " `freshness_seconds` keeps only memories anchored within that many seconds of the reference"
     " clock; `max_latency_ms` is a deadline after which optional work is skipped rather than a"
     " timeout that aborts, and the bundle reports `elapsed_ms` and `deadline_exceeded`. Null uses"
-    " the defaults, which are 6,000 characters and 24 items with no deadline."
+    f" the defaults, which are {_BUDGET.max_chars:,} characters and {_BUDGET.max_items} items"
+    " with no deadline."
 )
 _MEMORY_ID_DESCRIPTION = (
     "The `id` a previous `add_memory`, `search_memories`, or `list_memories` result returned."
@@ -285,15 +287,6 @@ class ForgetResult(BaseModel):
 
 class ReinforceResult(BaseModel):
     reinforced: int
-
-
-class ContextBudgetInput(StrictModel):
-    max_chars: _Chars = _BUDGET.max_chars
-    max_items: _Limit = _BUDGET.max_items
-    memory_types: Annotated[list[MemoryType], Field(min_length=1)] | None = None
-    min_confidence: _Confidence = _BUDGET.min_confidence
-    freshness_seconds: _Seconds | None = None
-    max_latency_ms: _Milliseconds | None = None
 
 
 class ContextBudgetResult(BaseModel):
@@ -458,7 +451,7 @@ def build_mcp_server(
     def search_memories(
         query: Annotated[Content, Field(description=_QUERY_DESCRIPTION)],
         limit: Annotated[
-            _Limit,
+            Limit,
             Field(
                 description=(
                     "Maximum hits to return, 1 through 100. It caps the result; it cannot raise a"
@@ -554,7 +547,7 @@ def build_mcp_server(
             ),
         ],
         limit: Annotated[
-            _Limit,
+            Limit,
             Field(
                 description=(
                     "Maximum memories read as evidence, 1 through 100. More evidence costs more"
@@ -627,7 +620,7 @@ def build_mcp_server(
         return _bundle_result(
             memory.compile(
                 content_input(goal),
-                budget=_context_budget(budget),
+                budget=context_budget(budget),
                 reference_at=reference_at,
                 scope=scope,
             )
@@ -650,7 +643,7 @@ def build_mcp_server(
     @_stable_errors
     def list_memories(
         limit: Annotated[
-            _Limit,
+            Limit,
             Field(description="Maximum records in this page, 1 through 100."),
         ] = 100,
         cursor: Annotated[
@@ -990,81 +983,38 @@ def _search_hit_result(hit: SearchHit) -> SearchHitResult:
     )
 
 
-def _context_budget(budget: ContextBudgetInput | None) -> ContextBudget | None:
-    """Translate the tool budget into the SDK value, which validates every bound."""
-    if budget is None:
-        return None
-    return ContextBudget(
-        max_chars=budget.max_chars,
-        max_items=budget.max_items,
-        memory_types=None if budget.memory_types is None else frozenset(budget.memory_types),
-        min_confidence=budget.min_confidence,
-        freshness=(
-            None
-            if budget.freshness_seconds is None
-            else timedelta(seconds=budget.freshness_seconds)
-        ),
-        max_latency_ms=budget.max_latency_ms,
-    )
-
-
 def _bundle_result(bundle: ContextBundle) -> ContextBundleResult:
-    return ContextBundleResult(
-        goal=bundle.goal,
-        reference_at=bundle.reference_at,
-        budget=_budget_result(bundle.budget),
-        actors=tuple(_actor_result(entry) for entry in bundle.actors),
-        relationships=tuple(_search_hit_result(hit) for hit in bundle.relationships),
-        scene=tuple(_search_hit_result(hit) for hit in bundle.scene),
-        episodes=tuple(_search_hit_result(hit) for hit in bundle.episodes),
-        facts=tuple(_search_hit_result(hit) for hit in bundle.facts),
-        procedures=tuple(_search_hit_result(hit) for hit in bundle.procedures),
-        affect=tuple(_search_hit_result(hit) for hit in bundle.affect),
-        traits=tuple(_search_hit_result(hit) for hit in bundle.traits),
-        conflicts=tuple(_conflict_result(conflict) for conflict in bundle.conflicts),
-        unknowns=tuple(
-            ContextUnknownResult(kind=item.kind, detail=item.detail) for item in bundle.unknowns
-        ),
-        occurred_from=bundle.occurred_from,
-        occurred_until=bundle.occurred_until,
-        frames=bundle.frames,
-        places=bundle.places,
-        omitted=bundle.omitted,
-        chars=bundle.chars,
-        elapsed_ms=bundle.elapsed_ms,
-        deadline_exceeded=bundle.deadline_exceeded,
-        rendered=bundle.render(),
-    )
+    """Publish `ContextBundle.document()`, the same projection REST and the CLI publish.
+
+    Only the sections need translating -- every other value is already what the tool schema
+    declares -- so a section added to the bundle reaches this tool without being named here.
+    """
+    document = bundle.document()
+    for name, value in document.items():
+        if isinstance(value, tuple):
+            document[name] = tuple(_bundle_entry(entry) for entry in value)
+    return ContextBundleResult.model_validate(document)
 
 
-def _actor_result(entry: SearchHit | ProvisionalActor) -> SearchHitResult | ProvisionalActorResult:
+def _bundle_entry(entry: object) -> object:
+    """Translate one entry of one bundle section; `frames` and `places` carry plain strings."""
+    if isinstance(entry, SearchHit):
+        return _search_hit_result(entry)
+    # A recognized person in the evidence whom no visible naming assertion names travels in
+    # `actors` beside the ranked hits.
     if isinstance(entry, ProvisionalActor):
-        return ProvisionalActorResult(
-            identity_id=entry.identity_id,
+        return ProvisionalActorResult(identity_id=entry.identity_id, memory_ids=entry.memory_ids)
+    if isinstance(entry, ContextConflict):
+        return ContextConflictResult(
+            lineage_id=entry.lineage_id,
+            subject=entry.subject,
+            predicate=entry.predicate,
+            values=entry.values,
             memory_ids=entry.memory_ids,
         )
-    return _search_hit_result(entry)
-
-
-def _budget_result(budget: ContextBudget) -> ContextBudgetResult:
-    return ContextBudgetResult(
-        max_chars=budget.max_chars,
-        max_items=budget.max_items,
-        memory_types=None if budget.memory_types is None else tuple(sorted(budget.memory_types)),
-        min_confidence=budget.min_confidence,
-        freshness_seconds=(None if budget.freshness is None else budget.freshness.total_seconds()),
-        max_latency_ms=budget.max_latency_ms,
-    )
-
-
-def _conflict_result(conflict: ContextConflict) -> ContextConflictResult:
-    return ContextConflictResult(
-        lineage_id=conflict.lineage_id,
-        subject=conflict.subject,
-        predicate=conflict.predicate,
-        values=conflict.values,
-        memory_ids=conflict.memory_ids,
-    )
+    if isinstance(entry, ContextUnknown):
+        return ContextUnknownResult(kind=entry.kind, detail=entry.detail)
+    return entry
 
 
 def _instructions(

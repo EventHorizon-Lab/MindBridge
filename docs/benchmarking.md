@@ -43,12 +43,15 @@ license that forbids training, fine-tuning or distilling on the corpus. MindBrid
 not replace those terms; see the
 [scorer notices](../src/mindbridge/benchmarks/_official/NOTICE.md).
 
-## Run an evaluation
-
-Set credentials for the OpenAI-compatible generation endpoint, then select a task or group:
+If inputs are already present, validate their schema and digests without creating a run directory,
+loading a model, or contacting a provider:
 
 ```bash
-export OPENAI_API_KEY="..."
+uv run --frozen mindbridge-bench eval \
+  --tasks locomo-refined \
+  --check-integrity \
+  --no-download
+```
 
 The JSON response reports `unit_count`, `question_count`, `dataset_sha256`, and
 `evaluation_sha256` for each selected task.
@@ -575,8 +578,12 @@ complete. The console table prints those with a trailing `*` when the run total 
 judge omitted usage on some requests; the cost axis needs the product number and it is measured.
 Recall scores the retriever's own ranked list, recorded per sample as
 `ranked_source_ids` from a `search` at `RETRIEVAL_CANDIDATE_LIMIT`, never the evidence the
-generator cited; a labelled question whose run recorded no ranked list (a cached answer) is counted
-in `retrieval.unranked_labelled_question_count` instead of being scored as zero.
+generator cited; a labelled question whose run recorded no ranked list (a replay from a response
+cache written before the ranked list was stored) is counted in
+`retrieval.unranked_labelled_question_count` instead of being scored as zero, and carries no
+per-sample `retrieval_*` metric either, so both surfaces report over the same denominator.
+`retrieval.ranked_candidate_limit` is the bound recall was measured under; `recall_limit` bounds
+what `memory.ask` reads and is reported in the run metadata.
 
 ## Gold evidence per benchmark family
 
@@ -681,8 +688,9 @@ Three result fields carry a caveat that decides whether they can be quoted:
   a miss there is a retrieval failure. What the answer actually grounded on is separate:
   `evidence` is the answer's hits, and `dropped_hits` counts what the answerer's inline context
   budget removed. A gold that is in the candidate list but not in `evidence` is budget loss, not
-  retrieval loss. A replayed answer from `--use-cache` carries no retrieval metrics: the cache
-  stores answers, not candidate lists. `ref_at_300` stays a property of the answer's evidence.
+  retrieval loss. A replayed answer from `--use-cache` carries the ranked list the original run
+  recorded; one replayed from a cache written before that list was stored carries no retrieval
+  metrics at all. `ref_at_300` stays a property of the answer's evidence.
 
 `performance` is aggregated per task across every arm of that task, not per arm.
 
@@ -716,7 +724,7 @@ measured latency and resource cost. `results.json` records each of those:
 | Official split and evaluator | `tasks[].evaluation_sha256`, `primary_metric`, `official_metric`, `scorer_protocol`, `official_judge_model`, `judge_model_official` |
 | Input route | `tasks[].input_modalities` and `performance.token_usage.calls_by_input_modality` |
 | Model and runtime revisions | `model.*`, `environment.mindbridge_version`, `zvec_version`, `runtime_versions`, `python_version`, `platform` |
-| Retrieval settings | `recall_limit`, `tasks[].retrieval.recall_limit`, and the full `model.memory_config` dump |
+| Retrieval settings | `recall_limit`, `tasks[].retrieval.ranked_candidate_limit`, and the full `model.memory_config` dump |
 | Hardware | `environment.hardware` and the `resources` block |
 | Latency and resource cost | `tasks[].performance`, `tasks[].answer_latency_ms`, and `resources` |
 | Replay inputs | `run_id`, `seed`, `seeds`, `bootstrap_samples`, `limit`, `offset`, `batch_size`, `blind`, `blind_baseline` |

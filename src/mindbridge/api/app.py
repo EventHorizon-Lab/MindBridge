@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Annotated, Any, Literal, Protocol
 
 from fastapi import APIRouter, FastAPI, Query, Response, status
@@ -20,10 +20,12 @@ from pydantic import (
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mindbridge.api.content import (
-    MAX_TEXT_CHARACTERS,
     Content,
+    ContextBudgetInput,
+    Limit,
     StrictModel,
     content_input,
+    context_budget,
 )
 from mindbridge.api.errors import (
     REASON_STATUS,
@@ -52,18 +54,10 @@ from mindbridge.types import (
 )
 
 _MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
-_Limit = Annotated[int, Field(strict=True, ge=1, le=100)]
 _MemoryId = Annotated[str, PathParameter(min_length=1)]
 # The same identifier inside a request body, where `PathParameter` does not apply. Constrained
 # here rather than only in the SDK so a malformed ID fails validation on every route alike.
 _BodyMemoryId = Annotated[str, StringConstraints(min_length=1, pattern=r"^\S(?:.*\S)?$")]
-_Chars = Annotated[int, Field(strict=True, ge=1, le=MAX_TEXT_CHARACTERS)]
-_Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
-_Seconds = Annotated[float, Field(gt=0.0)]
-_Milliseconds = Annotated[int, Field(strict=True, ge=1)]
-# Budget defaults are read from the SDK value, so the published transport default cannot drift
-# from `ContextBudget`.
-_BUDGET = ContextBudget()
 
 
 class MemoryCreate(StrictModel):
@@ -86,7 +80,7 @@ class MemoryBatchCreate(StrictModel):
 
 class QueryRequest(StrictModel):
     query: Content
-    limit: _Limit = 10
+    limit: Limit = 10
     memory_type: MemoryType | None = None
     reference_at: AwareDatetime | None = None
     occurred_from: AwareDatetime | None = None
@@ -111,20 +105,16 @@ class ReinforceRequest(StrictModel):
 
 class AnswerRequest(StrictModel):
     question: Content
-    limit: _Limit = 5
+    limit: Limit = 5
     memory_type: MemoryType | None = None
     reference_at: AwareDatetime | None = None
     scope: RetrievalScope | None = None
 
 
-class ContextBudgetRequest(StrictModel):
-    max_chars: _Chars = _BUDGET.max_chars
-    max_items: _Limit = _BUDGET.max_items
-    memory_types: Annotated[list[MemoryType], Field(min_length=1)] | None = None
-    min_confidence: _Confidence = _BUDGET.min_confidence
-    # `ContextBudget.freshness` is a timedelta; JSON carries the same bound as seconds.
-    freshness_seconds: _Seconds | None = None
-    max_latency_ms: _Milliseconds | None = None
+# The shared bounds under the name FastAPI publishes as the OpenAPI component; no fields and no
+# docstring of its own, so the schema stays what it was.
+class ContextBudgetRequest(ContextBudgetInput):
+    pass
 
 
 class ContextRequest(StrictModel):
@@ -573,73 +563,16 @@ def _add_context_route(
         return _bundle_response(
             current_service().compile(
                 content_input(request.goal),
-                budget=_context_budget(request.budget),
+                budget=context_budget(request.budget),
                 reference_at=request.reference_at,
                 scope=request.scope,
             )
         )
 
 
-def _context_budget(request: ContextBudgetRequest | None) -> ContextBudget | None:
-    """Translate the transport budget into the SDK value, which validates every bound."""
-    if request is None:
-        return None
-    return ContextBudget(
-        max_chars=request.max_chars,
-        max_items=request.max_items,
-        memory_types=None if request.memory_types is None else frozenset(request.memory_types),
-        min_confidence=request.min_confidence,
-        freshness=(
-            None
-            if request.freshness_seconds is None
-            else timedelta(seconds=request.freshness_seconds)
-        ),
-        max_latency_ms=request.max_latency_ms,
-    )
-
-
 def _bundle_response(bundle: ContextBundle) -> ContextBundleResponse:
-    return ContextBundleResponse.model_validate(
-        {
-            "goal": bundle.goal,
-            "reference_at": bundle.reference_at,
-            "budget": {
-                "max_chars": bundle.budget.max_chars,
-                "max_items": bundle.budget.max_items,
-                "memory_types": (
-                    None
-                    if bundle.budget.memory_types is None
-                    else tuple(sorted(bundle.budget.memory_types))
-                ),
-                "min_confidence": bundle.budget.min_confidence,
-                "freshness_seconds": (
-                    None
-                    if bundle.budget.freshness is None
-                    else bundle.budget.freshness.total_seconds()
-                ),
-                "max_latency_ms": bundle.budget.max_latency_ms,
-            },
-            "actors": bundle.actors,
-            "relationships": bundle.relationships,
-            "scene": bundle.scene,
-            "episodes": bundle.episodes,
-            "facts": bundle.facts,
-            "procedures": bundle.procedures,
-            "affect": bundle.affect,
-            "traits": bundle.traits,
-            "conflicts": bundle.conflicts,
-            "unknowns": bundle.unknowns,
-            "occurred_from": bundle.occurred_from,
-            "occurred_until": bundle.occurred_until,
-            "frames": bundle.frames,
-            "places": bundle.places,
-            "omitted": bundle.omitted,
-            "chars": bundle.chars,
-            "elapsed_ms": bundle.elapsed_ms,
-            "deadline_exceeded": bundle.deadline_exceeded,
-            "rendered": bundle.render(),
-        }
-    )
+    """Publish `ContextBundle.document()`, the same projection MCP and the CLI publish."""
+    return ContextBundleResponse.model_validate(bundle.document())
 
 
 def _search(service: _Memory, request: QueryRequest) -> SearchResponse:

@@ -518,8 +518,11 @@ pass built on, or that builds on evidence an earlier one retired, is rejected as
 IDs and is the authority, so no window bounds it. It is cognitive forgetting only: recall skips
 the record while `get()`, `list()`, and `MemoryRecord.forgotten_at` keep it for audit. Use
 `delete` to remove a record and its media. It is all or nothing like a proposal: an unknown ID
-raises `MemoryNotFoundError` the way `get` and `delete` do, and an empty sequence or a set in
-which any record is already forgotten returns `None` having changed nothing.
+raises `MemoryNotFoundError` the way `get` and `delete` do. `None` means nothing changed and
+nothing was logged -- no IDs were named, a record was already forgotten, the set named a bound
+naming assertion, a target moved under the proposal, or the log already holds an identical
+operation. Only `rollback` restores recall: re-adding the same content returns the record that
+already exists, `forgotten_at` and all.
 
 `rollback` reverses one applied operation and returns `False` for an unknown or already-reversed
 `operation_id`, and for one a later standing operation has built on. Operations that touched one
@@ -596,6 +599,8 @@ listed operation except `forget_identity`; identity erasure currently requires s
 ```text
 add_stream(
     contents: AsyncIterable[ContentInput | StreamInput],
+    *,
+    capture: bool = False,
 ) -> AsyncIterator[MemoryRecord]
 ```
 
@@ -732,7 +737,6 @@ The principal immutable values are:
 | `ContextBudget` | `max_chars`, `max_items`, `memory_types`, `min_confidence`, `freshness`, `max_latency_ms` |
 | `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknown` | `kind` (a `ContextUnknownKind`), `detail` |
-| `ProvisionalActor` | `identity_id`, `memory_ids` |
 | `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`; `hits` property and `render()` |
 | `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `rationale` |
 | `IdentityClaim` | `identity_id`, `name`, `relationship` |
@@ -748,7 +752,6 @@ The principal immutable values are:
 | `VisionFrame` | `image`, `stream_id`, `occurred_at` |
 | `VisionPartial` | `text`, `stream_id`, `occurred_at` |
 | `SceneBoundary` | `boundary`, `stream_id`, `occurred_at` |
-| `PendingCapture` | `memory_id`, `enqueued_at`, `attempts`, `last_error` |
 | `PrefetchResult` | positive `revision`, `hits` |
 | `TracedSearchResult` | `hits`, `trace` |
 | `RetrievalTrace` | `candidates`, `candidate_limit`, `exhaustive`, `ambiguous` |
@@ -1019,6 +1022,7 @@ recipes.describe(name: str) -> dict[str, object]
 recipes.embedder(name: str, *, load: bool = False) -> EmbeddingBackend
 recipes.answerer(name: str, *, load: bool = False) -> GenerationBackend
 recipes.former(name: str, *, load: bool = False) -> FormationBackend
+recipes.consolidator(name: str, *, load: bool = False) -> ConsolidationBackend
 recipes.transcriber(
     name: str,
     *,

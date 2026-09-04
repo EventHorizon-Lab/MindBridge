@@ -1832,3 +1832,208 @@ def test_a_query_gathered_window_is_never_widened(tmp_path: Path) -> None:
         assert [reason for _operation, reason in report.rejected] == ["target_not_shown"]
         assert memory.get(outside).forgotten_at is None
         assert memory.operations() == ()
+
+
+def test_consolidation_forgetting_refuses_a_bound_naming_assertion(tmp_path: Path) -> None:
+    """The naming guard covers CONSOLIDATE too, whose own forgetting names targets of its own."""
+    consolidator = ScriptedConsolidator()
+    with _identity_memory(tmp_path / "consolidated", consolidator) as memory:
+        record = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+        memory.register_identity(identity_id, "Li", relationship="neighbour")
+        assertion = next(
+            item.id
+            for item in memory.list(limit=100).items
+            if item.context is not None and item.context.identity_id == identity_id
+        )
+
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(record.id, assertion),
+                    target_ids=(assertion,),
+                    proposal=_trait("Li", "patient"),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(record.id, assertion))
+
+        assert report.operations == ()
+        assert [reason for _operation, reason in report.rejected] == ["naming_assertion"]
+        assert memory.identity(identity_id).name == "Li"  # type: ignore[union-attr]
+        assert _asserted_name(memory, identity_id) == "Li"
+        assert [item.operation.intent for item in memory.operations()] == [MemoryIntent.IDENTIFY]
+
+
+def test_every_operation_payload_field_is_derived_from_the_dataclass() -> None:
+    """A new proposal field must reach the idempotency key, or two proposals hash alike."""
+    import dataclasses
+
+    from mindbridge import SpatialAnchor, SpatialContext
+    from mindbridge.control import _proposal_payload, _spatial_payload
+
+    spatial = SpatialContext(frame_id="home", anchor=SpatialAnchor.OBSERVER, x=1.0, y=2.0)
+    proposal = replace(_trait("Li", "patient"), spatial=spatial)
+
+    assert {field.name for field in dataclasses.fields(proposal)} == set(
+        _proposal_payload(proposal)
+    )
+    assert {field.name for field in dataclasses.fields(spatial)} == set(_spatial_payload(spatial))
+
+
+def test_renaming_a_person_back_restores_the_name_they_had(tmp_path: Path) -> None:
+    """A name is a claim, and re-asserting one the host retracted has to land.
+
+    The claim's memory ID is a function of the claim, so renaming back reaches a record that
+    already exists with every version retired. Treating that as "already stored" made the
+    rename a silent no-op: the registry kept the name the host had just replaced.
+    """
+    consolidator = ScriptedConsolidator()
+    with _identity_memory(tmp_path / "rename-back", consolidator) as memory:
+        record = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+
+        memory.register_identity(identity_id, "Li")
+        memory.register_identity(identity_id, "Li Hua")
+        assert _asserted_name(memory, identity_id) == "Li Hua"
+
+        memory.register_identity(identity_id, "Li")
+        assert _asserted_name(memory, identity_id) == "Li"
+        assert memory.identity(identity_id).name == "Li"  # type: ignore[union-attr]
+
+
+def test_registering_a_name_again_after_rolling_it_back_names_the_person(tmp_path: Path) -> None:
+    """Rolling a registration back retracts the claim; making it again must re-assert it.
+
+    The rollback leaves the record in place with its only version retired, and the log row
+    marked rolled back. The repeat registration is therefore a fresh operation and has to
+    produce a fresh version, not log an `identify` row over an identity that stays unnamed.
+    """
+    consolidator = ScriptedConsolidator()
+    with _identity_memory(tmp_path / "re-register", consolidator) as memory:
+        record = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+
+        memory.register_identity(identity_id, "Li")
+        assert memory.rollback(memory.operations()[0].operation_id) is True
+        assert _asserted_name(memory, identity_id) is None
+
+        memory.register_identity(identity_id, "Li")
+        assert _asserted_name(memory, identity_id) == "Li"
+        assert memory.identity(identity_id).name == "Li"  # type: ignore[union-attr]
+        # Both attempts are auditable, and exactly one of them still stands.
+        rows = memory.operations()
+        assert [row.operation.intent for row in rows] == [
+            MemoryIntent.IDENTIFY,
+            MemoryIntent.IDENTIFY,
+        ]
+        assert [row.rolled_back_at is None for row in rows].count(True) == 1
+
+
+def test_an_unconfirmed_agent_name_does_not_erase_the_one_the_host_registered(
+    tmp_path: Path,
+) -> None:
+    """A claim nobody can see must not be what displaces the standing one.
+
+    The agent's single-evidence IDENTIFY is hidden until a second group corroborates it, so it
+    accumulates beside the host's assertion the way a hidden inferred trait does. Retiring the
+    predecessor before deciding visibility left the person nameless on one guess.
+    """
+    consolidator = ScriptedConsolidator()
+    with _identity_memory(tmp_path / "unconfirmed", consolidator) as memory:
+        record = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+        memory.register_identity(identity_id, "Alice")
+
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.IDENTIFY,
+                    claim=IdentityClaim(identity_id=identity_id, name="Ana"),
+                    evidence_ids=(record.id,),
+                    rationale="the stranger said so",
+                ),
+            )
+        )
+        assert not memory.consolidate(evidence_ids=(record.id,)).rejected
+
+        assert _asserted_name(memory, identity_id) == "Alice"
+        assert memory.identity(identity_id).name == "Alice"  # type: ignore[union-attr]
+
+
+def test_a_corroborated_agent_name_still_loses_to_the_one_the_host_stated(tmp_path: Path) -> None:
+    """What the host said outranks what a model worked out, for names as for traits.
+
+    Two independent evidence groups clear the corroboration bar, but the suppression rule that
+    keeps an inference from contradicting an explicit user statement was written for TRAIT only
+    and never fired for the ENTITY assertions it now also gates.
+    """
+    consolidator = ScriptedConsolidator()
+    with _identity_memory(tmp_path / "outranked", consolidator) as memory:
+        first = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        second = memory.add(Blob(b"stranger speaks again", "video/mp4", "two.mp4"))
+        identity_id = memory.faces(first.id)[0].identity_id
+        memory.register_identity(identity_id, "Alice")
+
+        for cited in (first.id, second.id):
+            consolidator._scripts.append(
+                (
+                    MemoryOperation(
+                        intent=MemoryIntent.IDENTIFY,
+                        claim=IdentityClaim(identity_id=identity_id, name="Ana"),
+                        evidence_ids=(cited,),
+                        rationale="the stranger said so",
+                    ),
+                )
+            )
+            assert not memory.consolidate(evidence_ids=(first.id, second.id)).rejected
+
+        assert _asserted_name(memory, identity_id) == "Alice"
+        assert memory.identity(identity_id).name == "Alice"  # type: ignore[union-attr]
+
+
+def test_deleting_one_source_of_an_agent_asserted_name_takes_it_out_of_indexed_speech(
+    tmp_path: Path,
+) -> None:
+    """Un-projecting a name has to repaint the transcripts that quoted it, not just the registry.
+
+    Deleting a memory an assertion cites is not deleting the assertion, so the delete path saw no
+    naming record and skipped the reindex: `identity()` reported nobody while the stored text and
+    its vectors still answered to the name.
+    """
+    consolidator = ScriptedConsolidator()
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        transcriber=OnePersonSpeech(),
+        face_analyzer=OnePersonFace(),
+        consolidator=consolidator,
+        identity_link_min_assets=1,
+        index_speech=True,
+        minimum_relevance=0,
+    ) as memory:
+        first = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        second = memory.add(Blob(b"stranger speaks again", "video/mp4", "two.mp4"))
+        identity_id = memory.faces(first.id)[0].identity_id
+
+        def identify(*evidence: str) -> MemoryOperation:
+            return MemoryOperation(
+                intent=MemoryIntent.IDENTIFY,
+                claim=IdentityClaim(identity_id=identity_id, name="Li"),
+                evidence_ids=evidence,
+                rationale="the stranger said so",
+            )
+
+        for cited in (first.id, second.id):
+            consolidator._scripts.append((identify(cited),))
+            assert not memory.consolidate(evidence_ids=(first.id, second.id)).rejected
+        assert '"speaker_name":"Li"' in memory.get(second.id).content
+
+        # One group left is below the threshold for an inferred name, so it stops being projected
+        # and the surviving transcript has to stop carrying it in the same commit.
+        assert memory.delete(first.id) is True
+
+        profile = memory.identity(identity_id)
+        assert profile is not None and profile.name is None
+        assert '"speaker_name":"Li"' not in memory.get(second.id).content

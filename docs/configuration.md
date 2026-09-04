@@ -223,8 +223,9 @@ Three things bound what it costs and what it can do:
 - The caption is derived text, so the request carries pixels and an ordinal only -- no memory ID,
   file name, or store path -- and a reply that does not return exactly one non-empty caption per
   visual is rejected whole rather than mislabelling a memory with another's contents. One
-  malformed reply is retried once, because an endpoint can answer `200 OK` with invalid JSON and
-  an SDK retry policy never sees that; a second failure, or any other failure, leaves the memory
+  malformed reply is retried once -- as it is for formation and consolidation, which parse JSON
+  from the same endpoint -- because an endpoint can answer `200 OK` with invalid JSON and an SDK
+  retry policy never sees that; a second failure, or any other failure, leaves the memory
   stored **without** a caption rather than failing the write. Losing derived text must never lose
   an observation the caller handed over. Those batches are counted on the vision span as
   `mindbridge.vision.failed_batches`, so the loss is measurable rather than silent.

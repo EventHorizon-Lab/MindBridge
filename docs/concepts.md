@@ -89,7 +89,7 @@ Every memory requires an `EmbeddingBackend`. Other capabilities are optional:
 | `GenerationBackend` | Grounded `ask()` answers |
 | `TranscriptionBackend` or `SpeechBackend` | Audio/video text fallback and optional speech analysis |
 | `FaceBackend` | Local face observations and identity evidence |
-| `VisionDescriptionBackend` | Final-frame text fallback for `AsyncVisionStream` |
+| `VisionDescriptionBackend` | Captions not-yet-described visual assets on every write (`add`/`add_many`/`settle`) |
 | `FormationBackend` | Typed records derived from committed observations |
 
 Routing follows each backend's declared atomic modalities. Unsupported media fails explicitly

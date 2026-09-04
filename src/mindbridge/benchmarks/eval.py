@@ -153,7 +153,7 @@ _GOLD_EVIDENCE_KEYS = ("evidence_ids", "clue_ids")
 _UNRESOLVED_EVIDENCE_KEY = "unresolved_evidence_ids"
 _RECALL_CUTOFFS = (1, 5, 10, 20)
 _MANDATORY_CONTROLS = ("random_ranker", "blind", "recall_at_20")
-EVAL_SCHEMA_VERSION = 10
+EVAL_SCHEMA_VERSION = 11
 EVAL_RUNNER_VERSION = "mindbridge_eval_official_v10"
 DEFAULT_ARM = "mindbridge"
 BASELINE_ARMS = ("blind", "full-context", "random")
@@ -570,7 +570,7 @@ class _BorrowedBackend:
 
 
 class _CachedVisionDescriber:
-    """Describe only the visuals no earlier run has described at this model.
+    """Describe only the visuals no earlier run has described in this vision space.
 
     The endpoint returns a different caption for the same image on every call, so without this
     two ingests of one corpus build different full-text documents and a paired arm cannot be
@@ -602,14 +602,18 @@ class _CachedVisionDescriber:
         # One call for the whole miss set, so a partially cached batch still costs one request.
         fresh = iter(() if not pending else self._backend.describe(pending))
         described: list[str] = []
+        written: list[tuple[str, str]] = []
         for key, found in zip(keys, known, strict=True):
             if found is not None:
                 described.append(found)
                 continue
             value = next(fresh)
             if key is not None:
-                self._cache.put(key, value)
+                written.append((key, value))
             described.append(value)
+        # One commit for the batch: the cache is `synchronous=FULL`, so a per-caption write cost
+        # an fsync each.
+        self._cache.put_many(written)
         return tuple(described)
 
     def close(self) -> None:
@@ -777,7 +781,7 @@ class _BackendPool:
                 # cache file at all and behaves exactly as it does today.
                 if description_cache is not None:
                     self._description_cache = DescriptionCache(
-                        description_cache, plugins.vision_describer.vision_model
+                        description_cache, plugins.vision_describer.vision_space
                     )
                     borrowed = cast(
                         VisionDescriptionBackend,
@@ -1662,6 +1666,7 @@ def _cached_results(
                 abstained=answer.abstained,
                 abstention_reason=answer.abstention_reason,
                 cached=True,
+                ranked_source_ids=answer.ranked_source_ids,
             )
             results[(arm.name, question.question_id)] = _sample(
                 task,
@@ -1725,6 +1730,7 @@ def _cache_outcome(
             outcome.evidence,
             outcome.abstained,
             outcome.abstention_reason,
+            outcome.ranked_source_ids,
         ),
     )
 
@@ -2053,9 +2059,12 @@ def _sample(
         ranked_source_ids,
         predict_only=predict_only,
         arm=arm,
-        # The response cache stores answers, not candidate lists, so a replayed answer cannot
-        # carry a retrieval score. Reporting the empty list as recall zero would invent one.
-        retrieval_available=arm.retrieves and not cached,
+        # A question whose run recorded no ranked list -- a replay from a cache written before
+        # the list was stored, or a harness that never issued the ranked query -- carries no
+        # retrieval score. Reporting the empty list as recall zero would invent one, and the
+        # task's `retrieval` block excludes exactly the same samples, so both surfaces report
+        # over one denominator.
+        retrieval_available=arm.retrieves and bool(ranked_source_ids),
         # A provider failure produced no answer. Scoring the empty prediction turned every 500
         # into a confident zero, and because the arms fail at different rates the deflation was
         # asymmetric: on one run the blind arm errored 3.4x more often than the product arm,
@@ -2129,11 +2138,11 @@ def _score(
     metrics = _arm_metrics(metrics, arm, retrieval_available=retrieval_available)
     if answer_failed:
         # Keep what the run did measure -- the retriever ranked before the generator failed --
-        # and leave the answer unscored so it lands in `error_count`, not in the mean.
+        # and leave the answer unscored so it lands in `error_count`, not in the mean. The
+        # `joint_*` metrics go with it: they are accuracy times recall, so scoring the empty
+        # prediction would put a confident zero back in under another name.
         diagnostic = {
-            name: value
-            for name, value in metrics.items()
-            if name.startswith(("retrieval_", "joint_"))
+            name: value for name, value in metrics.items() if name.startswith("retrieval_")
         }
         return diagnostic, None, None
     score = metrics.get(sample_primary_metric(task_name), metrics.get("token_f1"))
@@ -2859,10 +2868,7 @@ def _metrics(
         }
     latencies = sorted(sample.latency_ms for sample in samples if sample.latency_ms > 0)
     retrieval = _retrieval_quality(
-        samples,
-        seed=seed,
-        bootstrap_samples=arguments.bootstrap_samples,
-        recall_limit=arguments.recall_limit,
+        samples, seed=seed, bootstrap_samples=arguments.bootstrap_samples
     )
     error_count = sum(sample.error_code is not None for sample in samples)
     ingest_failure_count = sum(
@@ -2995,7 +3001,6 @@ def _retrieval_quality(
     *,
     seed: int,
     bootstrap_samples: int,
-    recall_limit: int,
 ) -> dict[str, object]:
     """Report recall at every cutoff next to the random-ranker expectation.
 
@@ -3022,8 +3027,9 @@ def _retrieval_quality(
     if key is None:
         return {
             "gold_evidence_key": None,
-            "recall_limit": recall_limit,
+            "ranked_candidate_limit": RETRIEVAL_CANDIDATE_LIMIT,
             "labelled_question_count": 0,
+            "unranked_labelled_question_count": 0,
             "recall_at_k": {},
             "random_ranker_recall_at_k": {},
             "unresolved_gold_evidence_ids": unresolved,
@@ -3040,7 +3046,7 @@ def _retrieval_quality(
     if not labelled:
         return {
             "gold_evidence_key": key,
-            "recall_limit": recall_limit,
+            "ranked_candidate_limit": RETRIEVAL_CANDIDATE_LIMIT,
             "labelled_question_count": 0,
             "unranked_labelled_question_count": unranked,
             "recall_at_k": {},
@@ -3086,7 +3092,10 @@ def _retrieval_quality(
 
     return {
         "gold_evidence_key": key,
-        "recall_limit": recall_limit,
+        # The bound recall is measured under: `search(limit=RETRIEVAL_CANDIDATE_LIMIT)` fills the
+        # ranked list. `--recall-limit` bounds what `memory.ask` reads and is reported in the run
+        # metadata; it does not truncate these cutoffs.
+        "ranked_candidate_limit": RETRIEVAL_CANDIDATE_LIMIT,
         "labelled_question_count": len(labelled),
         "unranked_labelled_question_count": unranked,
         "unresolved_gold_evidence_ids": unresolved,
@@ -3100,7 +3109,9 @@ def _retrieval_quality(
             "max": max(pool_sizes, default=None),
             "mean": statistics.fmean(pool_sizes) if pool_sizes else None,
         },
-        "truncated_cutoffs": [cutoff for cutoff in _RECALL_CUTOFFS if cutoff > recall_limit],
+        "truncated_cutoffs": [
+            cutoff for cutoff in _RECALL_CUTOFFS if cutoff > RETRIEVAL_CANDIDATE_LIMIT
+        ],
     }
 
 

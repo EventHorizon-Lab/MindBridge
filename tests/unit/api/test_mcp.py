@@ -1241,3 +1241,12 @@ def _error_text(result: CallToolResult) -> str:
 def _error_envelope(result: CallToolResult) -> dict[str, object]:
     # A bare `json.loads` is the contract: no prefix to strip on any failure shape.
     return cast(dict[str, object], json.loads(_error_text(result)))
+
+
+def test_the_budget_tool_description_states_the_live_defaults() -> None:
+    """The prose an agent sizes its window against is interpolated, so it cannot drift."""
+    budget = ContextBudget()
+    description = mcp_adapter._BUDGET_DESCRIPTION
+
+    assert f"which are {budget.max_chars:,} characters and {budget.max_items} items" in description
+    assert "which are 6,000" not in description

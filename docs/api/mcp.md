@@ -47,7 +47,7 @@ with Memory.from_config(
 ```
 
 ```text
-build_mcp_server(memory: Memory) -> MCPServer[None]
+build_mcp_server(memory: Memory, *, identity_operations: bool = True) -> MCPServer[None]
 ```
 
 `build_mcp_server` reads `memory.capabilities` once and publishes it as the server `instructions`,

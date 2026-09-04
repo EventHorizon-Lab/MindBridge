@@ -33,6 +33,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from mindbridge import recipes
+from mindbridge.control import dump_operation
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -52,6 +53,8 @@ from mindbridge.types import (
     ContentAtom,
     ContentInput,
     ContextBudget,
+    ContextConflict,
+    ContextUnknown,
     EvidenceBasis,
     FaceObservation,
     MemoryContext,
@@ -61,6 +64,7 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     ObservationContext,
+    ProvisionalActor,
     RetrievalScope,
     SearchHit,
     SpatialAnchor,
@@ -676,58 +680,31 @@ def _compile(memory: Memory, arguments: argparse.Namespace) -> _Document:
         reference_at=_optional_time(arguments.reference_at, "reference_at"),
         scope=_retrieval_scope(_json_source(arguments.scope)),
     )
-    document: _Document = {
-        "goal": bundle.goal,
-        "reference_at": _encode_time(bundle.reference_at),
-        "budget": _budget_document(bundle.budget),
-        "conflicts": [asdict(conflict) for conflict in bundle.conflicts],
-        "unknowns": [
-            {"kind": unknown.kind.value, "detail": unknown.detail} for unknown in bundle.unknowns
-        ],
-        "occurred_from": _encode_optional_time(bundle.occurred_from),
-        "occurred_until": _encode_optional_time(bundle.occurred_until),
-        "frames": list(bundle.frames),
-        "places": list(bundle.places),
-        "omitted": bundle.omitted,
-        "chars": bundle.chars,
-        "elapsed_ms": bundle.elapsed_ms,
-        "deadline_exceeded": bundle.deadline_exceeded,
-        "rendered": bundle.render(),
-    }
-    for name in (
-        "actors",
-        "relationships",
-        "scene",
-        "episodes",
-        "facts",
-        "procedures",
-        "affect",
-        "traits",
-    ):
-        # `actors` may carry a provisional identity beside the ranked hits: a person the
-        # evidence observed whom no visible naming assertion names.
-        document[name] = [
-            _memory_document(entry) if isinstance(entry, SearchHit) else asdict(entry)
-            for entry in getattr(bundle, name)
-        ]
-    return document
+    # `ContextBundle.document()` is the projection REST and MCP publish too, so a section added
+    # to the bundle reaches this document without being spelled here a third time.
+    return {name: _bundle_value(value) for name, value in bundle.document().items()}
 
 
-def _budget_document(budget: ContextBudget) -> _Document:
-    return {
-        "max_chars": budget.max_chars,
-        "max_items": budget.max_items,
-        "memory_types": (
-            None
-            if budget.memory_types is None
-            else sorted(value.value for value in budget.memory_types)
-        ),
-        "min_confidence": budget.min_confidence,
-        "freshness_seconds": (
-            None if budget.freshness is None else budget.freshness.total_seconds()
-        ),
-        "max_latency_ms": budget.max_latency_ms,
-    }
+def _bundle_value(value: object) -> object:
+    """Encode one bundle field as JSON; the budget already arrives as a document."""
+    if isinstance(value, datetime):
+        return _encode_time(value)
+    if isinstance(value, tuple):
+        return [_bundle_entry(entry) for entry in value]
+    return value
+
+
+def _bundle_entry(entry: object) -> object:
+    """Encode one entry of one section; `frames` and `places` carry plain strings."""
+    if isinstance(entry, SearchHit):
+        return _memory_document(entry)
+    if isinstance(entry, ContextUnknown):
+        return {"kind": entry.kind.value, "detail": entry.detail}
+    # `actors` may carry a provisional identity beside the ranked hits: a person the evidence
+    # observed whom no visible naming assertion names. Conflicts carry only strings.
+    if isinstance(entry, ContextConflict | ProvisionalActor):
+        return asdict(entry)
+    return entry
 
 
 def _get(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -873,12 +850,18 @@ def _operations(memory: Memory, arguments: argparse.Namespace) -> _Document:
 
 
 def _operation_document(record: MemoryOperationRecord) -> _Document:
+    # `claim` and `proposal` are read back from the canonical payload the operation log stores,
+    # so the only audit surface for an operation prints exactly what was logged: an `identify`
+    # row carries no evidence or targets, and its claim is the whole of what it did.
+    logged = json.loads(dump_operation(record.operation))
     return {
         "operation_id": record.operation_id,
         "intent": record.operation.intent.value,
         "trigger": record.trigger.value,
         "evidence_ids": list(record.operation.evidence_ids),
         "target_ids": list(record.operation.target_ids),
+        "proposal": logged["proposal"],
+        "claim": logged["claim"],
         "rationale": record.operation.rationale,
         "model_id": record.model_id,
         "recipe": record.recipe,
@@ -1033,7 +1016,7 @@ def _remote_query(field: str, arguments: argparse.Namespace) -> _Document:
 def _remote_compile(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
     body: _Document = {
         "goal": _content_value(arguments),
-        "budget": _budget_document(_budget(arguments)),
+        "budget": _budget(arguments).document(),
     }
     _put(body, "reference_at", _remote_time(arguments.reference_at, "reference_at"))
     _put(

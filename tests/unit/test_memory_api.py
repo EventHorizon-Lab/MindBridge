@@ -5694,3 +5694,63 @@ def test_compiled_context_reports_a_person_who_is_present_but_unnamed(tmp_path: 
     assert [entry.identity_id for entry in named.actors if isinstance(entry, ProvisionalActor)] == [
         speaker_id
     ]
+
+
+def test_a_name_registered_before_naming_became_a_claim_survives_the_upgrade(
+    tmp_path: Path,
+) -> None:
+    """Opening a pre-#151 store must not demote everyone it already knew to a stranger.
+
+    `identities.name` used to be a column somebody wrote. Once every read derived the name from
+    a visible assertion instead, a store carrying only the column reported the person
+    unconfirmed and compiled them as an unnamed provisional actor -- a silent regression on
+    upgrade, visible to the household as forgetting who lives there.
+    """
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        minimum_relevance=0,
+    ) as memory:
+        record = memory.add(Blob(b"red stranger video", "video/mp4", "stranger.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+
+    database = tmp_path / "state.sqlite3"
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute(
+            "UPDATE identities SET name = 'Li' WHERE identity_id = ?", (identity_id,)
+        )
+        connection.execute("PRAGMA user_version = 13")
+        connection.commit()
+
+    with Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        minimum_relevance=0,
+    ) as memory:
+        profile = memory.identity(identity_id)
+        assert profile is not None
+        assert profile.name == "Li"
+        assert profile.confirmed is True
+
+        bundle = memory.compile("red", budget=ContextBudget(max_chars=40_000))
+        assert identity_id not in {
+            entry.identity_id for entry in bundle.actors if isinstance(entry, ProvisionalActor)
+        }
+
+        # The backfilled assertion is the one the kernel derives, so re-registering the same
+        # name changes nothing rather than stacking a second assertion on the person.
+        memory.register_identity(identity_id, "Li")
+        assert (
+            len(
+                [
+                    item
+                    for item in memory.list(limit=50).items
+                    if item.context is not None and item.context.identity_id == identity_id
+                ]
+            )
+            == 1
+        )

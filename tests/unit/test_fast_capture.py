@@ -703,3 +703,30 @@ def test_two_concurrent_settles_never_run_the_models_over_one_record_twice(
         assert embedder.calls == 1
         assert memory.pending_captures() == ()
         assert {hit.id for hit in memory.search("spare key")} == {record.id}
+
+
+def test_a_captured_place_survives_settlement(tmp_path: Path) -> None:
+    """`capture()` persists the observation's place, or scoped search loses the record."""
+    from mindbridge import ObservationContext, RetrievalScope
+
+    with Memory(tmp_path, embedder=CountingEmbedder(), minimum_relevance=0) as memory:
+        captured = memory.capture(
+            "the kettle boiled dry again",
+            context=ObservationContext(place_id="kitchen"),
+        )
+
+        assert memory.settle() == 1
+        scoped = memory.search("kettle", limit=10, scope=RetrievalScope(place_id="kitchen"))
+        assert [hit.id for hit in scoped] == [captured.id]
+
+
+def test_settle_counts_only_the_rows_it_actually_settled(tmp_path: Path) -> None:
+    """A row another writer settled first is not this pass's work, so it is not counted."""
+    with Memory(tmp_path, embedder=CountingEmbedder(), minimum_relevance=0) as memory:
+        memory.capture("the spare key is in the blue toolbox")
+        # What losing the race looks like from inside: the row is gone by the time this pass
+        # claims it, so `_enrich_row` returns None and nothing was embedded or completed.
+        memory._store.settle_capture = lambda *args, **kwargs: False  # type: ignore[method-assign]
+
+        assert memory.settle() == 0
+        assert len(memory.pending_captures()) == 1

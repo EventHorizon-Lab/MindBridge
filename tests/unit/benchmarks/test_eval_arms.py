@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan
 
 import mindbridge.benchmarks.eval as eval_module
-from mindbridge import AnswerResult, AsyncMemory, SearchHit
+from mindbridge import AnswerResult, AsyncMemory, ModelError, SearchHit
 from mindbridge.benchmarks.eval import (
     DEFAULT_ARM,
     PRODUCT_ARM,
@@ -30,6 +31,7 @@ from mindbridge.benchmarks.eval import (
     run_loaded_task,
 )
 from mindbridge.benchmarks.eval_adapters import EvalQuestion, EvalUnit, LoadedTask, MemoryItem
+from mindbridge.benchmarks.eval_cache import ResponseCache
 from mindbridge.benchmarks.eval_telemetry import (
     BENCHMARK_SAMPLE,
     BENCHMARK_TASK,
@@ -602,3 +604,100 @@ def test_baseline_generator_uses_the_configured_generation_model(
     stuffed_messages = cast(list[dict[str, str]], requests[2]["messages"])
     assert stuffed_messages[0]["content"] == eval_module._FULL_CONTEXT_SYSTEM_PROMPT
     assert "Ada signed the contract" in stuffed_messages[1]["content"]
+
+
+def test_a_failed_answer_keeps_retrieval_but_drops_the_joint_metrics() -> None:
+    """`joint_*` is accuracy times recall, so it scores the answer the run never got.
+
+    Leaving it behind put the empty prediction back into the mean under another name, and
+    because the arms fail at different rates the deflation was asymmetric.
+    """
+    ranked = (_hit("gold-1", 0.9),)
+    memory = _RankedMemory(ranked, ranked)
+    task, unit, question = _task()
+    # `joint_*` exists only where the family scores an answer deterministically beside recall.
+    question = replace(question, metadata={**question.metadata, "qtype": "list_recall"})
+    outcome = replace(_outcome(memory, question, arm=PRODUCT_ARM), error=ModelError("boom"))
+
+    sample = _sample(
+        task,
+        unit,
+        question,
+        outcome,
+        ingest_failures=0,
+        predict_only=False,
+        log_samples=False,
+        arm=PRODUCT_ARM,
+    )
+
+    assert sample.error_code is not None
+    assert sample.score is None
+    assert sample.metrics["retrieval_recall@5"] == 1.0
+    assert not [name for name in sample.metrics if name.startswith("joint_")]
+
+
+def test_a_sample_with_no_ranked_list_carries_no_retrieval_metrics() -> None:
+    """The per-sample metrics and the task's `retrieval` block must share one denominator.
+
+    `_retrieval_quality` excludes a labelled question that recorded no ranked list; a sample
+    that still carried `retrieval_recall@10 = 0` made the same task publish two recalls.
+    """
+    task, unit, question = _task()
+    outcome = replace(
+        _outcome(_RankedMemory((), (_hit("gold-1", 0.9),)), question, arm=PRODUCT_ARM),
+        ranked_source_ids=(),
+    )
+
+    sample = _sample(
+        task,
+        unit,
+        question,
+        outcome,
+        ingest_failures=0,
+        predict_only=False,
+        log_samples=False,
+        arm=PRODUCT_ARM,
+    )
+
+    assert sample.ranked_source_ids == ()
+    assert not [name for name in sample.metrics if name.startswith(("retrieval_", "joint_"))]
+    assert (
+        eval_module._retrieval_quality((sample,), seed=7, bootstrap_samples=8)[
+            "unranked_labelled_question_count"
+        ]
+        == 1
+    )
+
+
+def test_a_replayed_answer_still_carries_the_ranked_list_it_was_scored_from(
+    tmp_path: Path,
+) -> None:
+    """`--use-cache` must not silently delete a run's retrieval numbers.
+
+    Recall is measured over the ranked list, so a cache that stored only the answer replayed as
+    a labelled question with no ranked list and the whole run reported `recall_at_k = {}`.
+    """
+    ranked = (_hit("noise", 0.9), _hit("gold-1", 0.5))
+    memory = _RankedMemory(ranked, (_hit("gold-1", 0.5),))
+    task, unit, question = _task()
+    outcome = _outcome(memory, question, arm=PRODUCT_ARM)
+
+    cache = ResponseCache(tmp_path / "responses", "run-a", "namespace")
+    try:
+        eval_module._cache_outcome(cache, task, unit, question, outcome, 0)
+        replayed = eval_module._cached_results(
+            cache, task, unit, predict_only=False, log_samples=False
+        )
+    finally:
+        cache.close()
+
+    sample = replayed[(PRODUCT_ARM.name, question.question_id)]
+    assert sample.cached is True
+    assert sample.ranked_source_ids == ("noise", "gold-1")
+    assert sample.metrics["retrieval_recall@5"] == 1.0
+    retrieval = eval_module._retrieval_quality((sample,), seed=7, bootstrap_samples=8)
+    recall = cast(dict[str, dict[str, float]], retrieval["recall_at_k"])
+    assert recall["5"]["mean"] == pytest.approx(1.0)
+    assert retrieval["unranked_labelled_question_count"] == 0
+    # The bound recall was measured under, not the `--recall-limit` that bounds `ask`.
+    assert retrieval["ranked_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT

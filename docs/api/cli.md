@@ -2,7 +2,7 @@
 
 ## Surface
 
-`mindbridge` provides 27 SDK operation commands plus `doctor`; each invocation runs one command in
+`mindbridge` provides 28 SDK operation commands plus `doctor`; each invocation runs one command in
 one process and emits one JSON result. Local commands dispatch to the corresponding `Memory`
 method, except for the diagnostic `doctor`; remote commands forward to a running owner's `/v1`
 route. The CLI owns argument decoding, composition selection, JSON projection, and exit-code
@@ -111,7 +111,7 @@ credential behavior live in [configuration](../configuration.md).
 | `consolidate` | optional goal content; `--evidence-id`; `--limit`; `--trigger` | `{"operations":[...],"rejected":[...]}` | no |
 | `forget` | one or more `MEMORY_ID` values | `{"operation":{...}}` or `{"operation":null}` | no |
 | `rollback` | `OPERATION_ID` | `{"rolled_back":bool}` | no |
-| `operations` | `--limit` | `{"operations":[...]}` | no |
+| `operations` | `--limit` | `{"operations":[...]}`, each row carrying the `claim` an `identify` applied and the `proposal` a `consolidate` wrote, or `null` | no |
 | `list` | `--limit`; `--cursor` | `{"items":[...],"next_cursor":...}` | yes |
 | `delete` | `MEMORY_ID` | `{"deleted":bool}` | yes |
 | `reindex` | none | `{"memories":int}` | no |

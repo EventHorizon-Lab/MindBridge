@@ -18,12 +18,16 @@ import pytest
 
 from mindbridge import (
     EvidenceBasis,
+    IdentityClaim,
     IdentityProfile,
     MemoryContext,
+    MemoryIntent,
     MemoryKind,
+    MemoryOperation,
     SpatialAnchor,
     SpatialContext,
 )
+from mindbridge.control import dump_operation, operation_key
 from mindbridge.infrastructure.local import (
     DataDirectoryInUseError,
     LocalStore,
@@ -34,6 +38,7 @@ from mindbridge.infrastructure.local import (
     StoredOperation,
     UnsupportedSchemaError,
 )
+from mindbridge.infrastructure.local import store as store_module
 from mindbridge.infrastructure.local.store import (
     _PRE_VISUAL_DESCRIPTION_VERSION,
     _SCHEMA_VERSION,
@@ -2568,3 +2573,320 @@ def test_rolling_back_an_operation_deletes_its_records_in_the_same_transaction(
             delete_memory_ids=("kept",),
         ) == (False, ())
         assert store.read_memory("kept") is not None
+
+
+def test_a_failed_control_schema_step_leaves_the_v10_store_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_migrate_v10` runs inside one transaction, so a failure rolls the whole rung back.
+
+    `executescript` used to be how the control tables were created, and it issues an implicit
+    COMMIT: the `forgotten_at` column landed before the tables did, and a failure there left a
+    store at `user_version = 10` with half the rung applied and no way to open it again.
+    """
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory(),), (_embedding(),))
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.executescript(
+            """
+            DROP TABLE capture_queue;
+            DROP TABLE memory_operations;
+            ALTER TABLE memory_records DROP COLUMN forgotten_at;
+            PRAGMA user_version = 10;
+            """
+        )
+    monkeypatch.setattr(
+        store_module,
+        "_CONTROL_SCHEMA",
+        (store_module._CONTROL_SCHEMA[0], "CREATE TABLE memory_records (broken TEXT)"),
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        LocalStore(tmp_path)
+
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(memory_records)")}
+        tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert version == 10
+    assert "forgotten_at" not in columns
+    assert "capture_queue" not in tables
+
+
+def test_pending_captures_are_globally_oldest_first_across_id_chunks(tmp_path: Path) -> None:
+    """More than 900 ids are queried in chunks; the oldest rows may all be in the last one."""
+    enqueued_at = datetime(2026, 9, 4, 9, tzinfo=timezone.utc)
+    recent = tuple(f"recent-{index:04d}" for index in range(900))
+    oldest = tuple(f"oldest-{index}" for index in range(10))
+    with LocalStore(tmp_path) as store:
+        store.write_captures(
+            (_memory(memory_id) for memory_id in oldest),
+            enqueued_at=enqueued_at,
+        )
+        store.write_captures(
+            (_memory(memory_id) for memory_id in recent),
+            enqueued_at=enqueued_at + timedelta(hours=1),
+        )
+        # The recent ids fill the first chunk, so the oldest are only visible in the second.
+        pending = store.pending_captures(limit=5, memory_ids=(*recent, *oldest))
+
+    assert [row.memory_id for row in pending] == list(oldest[:5])
+
+
+def test_the_current_schema_indexes_recalled_records(tmp_path: Path) -> None:
+    """`_feedback_candidates` polls `last_accessed_at DESC, memory_id` on every candidate sweep."""
+    with LocalStore(tmp_path) as store:
+        database_path = store.database_path
+    with closing(sqlite3.connect(database_path)) as connection:
+        plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT memory_id, last_accessed_at, access_count
+            FROM memory_records
+            WHERE last_accessed_at IS NOT NULL AND forgotten_at IS NULL
+            ORDER BY last_accessed_at DESC, memory_id
+            LIMIT 4
+            """
+        ).fetchall()
+
+    assert any("memory_records_accessed_idx" in str(row[3]) for row in plan)
+
+
+def test_the_last_rung_indexes_recalled_records_and_rekeys_the_operation_log(
+    tmp_path: Path,
+) -> None:
+    """A store one step behind gains the index and has its stale operation keys recomputed.
+
+    `operation_key` gained a `claim` field without re-keying what was already logged, so every
+    stored key stopped matching what the kernel recomputes and deduplication silently stopped.
+    """
+    applied_at = datetime(2026, 9, 4, 10, tzinfo=timezone.utc)
+    operation = MemoryOperation(
+        intent=MemoryIntent.IDENTIFY,
+        claim=IdentityClaim(identity_id="identity-1", name="Li"),
+        rationale="the host said so",
+    )
+    logged = StoredOperation(
+        operation_key="a-key-the-old-algorithm-produced",
+        intent="identify",
+        trigger="manual",
+        recipe="test-recipe",
+        operation_json=dump_operation(operation),
+        applied_at=applied_at,
+    )
+    with LocalStore(tmp_path) as store:
+        assert store.apply_control_operation(logged) is not None
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.executescript(
+            """
+            DROP INDEX memory_records_accessed_idx;
+            PRAGMA user_version = 13;
+            """
+        )
+
+    expected_key = operation_key(operation, recipe="test-recipe")
+    with LocalStore(tmp_path) as store:
+        (rekeyed,) = store.read_operations(limit=10)
+        # Deduplication works again: the same proposal is refused rather than applied twice.
+        replayed = store.apply_control_operation(replace(logged, operation_key=expected_key))
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            indexes = {
+                str(row[1]) for row in connection.execute("PRAGMA index_list(memory_records)")
+            }
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert rekeyed.operation_key == expected_key
+    assert replayed is None
+    assert "memory_records_accessed_idx" in indexes
+    assert version == _SCHEMA_VERSION
+
+
+def test_deleting_the_current_naming_assertion_restores_the_name_it_displaced(
+    tmp_path: Path,
+) -> None:
+    """A rename is a supersession, so undoing it by deleting the record leaves the old name.
+
+    Deleting the assertion that renamed somebody used to leave the predecessor retired for good,
+    so the person ended up nameless -- the registry reporting nobody where the audit trail plainly
+    still held one standing assertion.
+    """
+    recorded_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        voice_id = _voice_identity(store, clip, (1.0, 0.0))
+        # Two writes, not one batch: assertions made in one storage batch stay conflicting
+        # rather than superseding, and superseding is what this is about.
+        store.write_memories(
+            (_naming_assertion("naming-1", voice_id, "Li", recorded_at=recorded_at),),
+            (_embedding("e-naming-1", "naming-1"),),
+        )
+        store.write_memories(
+            (
+                _naming_assertion(
+                    "naming-2",
+                    voice_id,
+                    "Li Hua",
+                    recorded_at=recorded_at + timedelta(minutes=1),
+                ),
+            ),
+            (_embedding("e-naming-2", "naming-2"),),
+        )
+        assert store.projected_identity_name(voice_id) == ("Li Hua", None)
+
+        assert store.delete_memory("naming-2") is True
+
+        assert store.projected_identity_name(voice_id) == ("Li", None)
+        # Deleting the one that was already superseded restores nothing: it displaced nothing.
+        assert store.delete_memory("naming-1") is True
+        assert store.projected_identity_name(voice_id) == (None, None)
+
+
+def test_consolidation_forgetting_a_naming_assertion_unprojects_it_in_the_same_commit(
+    tmp_path: Path,
+) -> None:
+    """The projection is computed after the forget, not against the row about to be forgotten."""
+    recorded_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        clip = _video_asset(store, "clip")
+        voice_id = _voice_identity(store, clip, (1.0, 0.0))
+        store.write_memories(
+            (_naming_assertion("naming-1", voice_id, "Li", recorded_at=recorded_at),),
+            (_embedding("e-naming-1", "naming-1"),),
+        )
+        assert store.projected_identity_name(voice_id) == ("Li", None)
+
+        assert (
+            store.apply_formation(
+                (_memory("derived", "the neighbour is called Li"),),
+                (_embedding("e-derived", "derived"),),
+                evidence=(),
+                source_memory_ids=(),
+                recipe="test-consolidator",
+                completed_at=recorded_at + timedelta(minutes=1),
+                operation=StoredOperation(
+                    operation_key="forget-naming-1",
+                    intent="forget",
+                    trigger="manual",
+                    operation_json="{}",
+                    applied_at=recorded_at + timedelta(minutes=1),
+                ),
+                forget_ids=("naming-1",),
+            )
+            is True
+        )
+
+        assert store.projected_identity_name(voice_id) == (None, None)
+        assert store.identity_profile(voice_id) == IdentityProfile(identity_id=voice_id)
+
+
+def test_provisional_identities_only_asks_about_the_people_the_memories_observed(
+    tmp_path: Path,
+) -> None:
+    """Named strangers elsewhere in the store never enter the answer, or the scan."""
+    recorded_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        seen = _video_asset(store, "seen")
+        elsewhere = _video_asset(store, "elsewhere")
+        unnamed_id = _voice_identity(store, seen, (1.0, 0.0))
+        named_id = _voice_identity(store, elsewhere, (0.0, 1.0))
+        store.write_memories(
+            (
+                replace(_memory("observed"), modality="video", assets=(seen,)),
+                _naming_assertion("naming-1", named_id, "Li", recorded_at=recorded_at),
+            ),
+            (_embedding("e-naming-1", "naming-1"),),
+        )
+
+        assert store.provisional_identities(("observed",)) == {"observed": (unnamed_id,)}
+        # Naming the observed person is what empties the answer, not naming anybody at all.
+        store.write_memories(
+            (
+                _naming_assertion(
+                    "naming-2",
+                    unnamed_id,
+                    "Ana",
+                    recorded_at=recorded_at + timedelta(minutes=1),
+                ),
+            ),
+            (_embedding("e-naming-2", "naming-2"),),
+        )
+        assert store.provisional_identities(("observed",)) == {}
+
+
+def test_schema_v14_backfills_a_naming_assertion_for_a_name_registered_before_it(
+    tmp_path: Path,
+) -> None:
+    """A name written before naming became a claim has to gain the claim its reads now need.
+
+    Every projection derives `identities.name` from a visible ENTITY assertion, so a legacy row
+    with nothing behind it reported unconfirmed and never answered `identity_for_subject`.
+    """
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory(),), (_embedding(),))
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.executescript(
+            """
+            INSERT INTO identities (identity_id, name, relationship, created_at, updated_at)
+            VALUES ('identity-legacy', 'Alice', 'sister', '2026-01-01T00:00:00+00:00',
+                    '2026-01-01T00:00:00+00:00');
+            PRAGMA user_version = 13;
+            """
+        )
+
+    with LocalStore(tmp_path) as store:
+        profile = store.identity_profile("identity-legacy")
+        assert profile == IdentityProfile(
+            identity_id="identity-legacy", name="Alice", relationship="sister", confirmed=True
+        )
+        assert store.identity_for_subject("Alice") == "identity-legacy"
+
+        # Re-running the rung must not mint a second assertion beside the first.
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            store_module._v14_backfill_naming_assertions(connection)
+            connection.commit()
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM memory_semantics WHERE identity_id = 'identity-legacy'"
+                ).fetchone()[0]
+                == 1
+            )
+
+
+def test_the_backfilled_naming_assertion_carries_the_id_the_kernel_would_mint(
+    tmp_path: Path,
+) -> None:
+    """The migration restates two hashes `memory.py` owns; this is the pin that keeps them equal.
+
+    If they drift, a legacy store re-registered under the same name grows a second assertion
+    instead of treating the repeat as the no-op it is documented to be.
+    """
+    import mindbridge.memory as memory_module
+
+    identity_id = "identity-legacy"
+    proposal = memory_module._naming_proposal("Alice", "sister", basis=EvidenceBasis.USER_STATEMENT)
+    context = memory_module._formation_context(
+        None,
+        proposal,
+        model_id=None,
+        recipe=memory_module._NAMING_RECIPE,
+        recorded_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        identity_id=identity_id,
+    )
+    kernel_memory_id = memory_module._formation_memory_id(
+        identity_id,
+        proposal,
+        recipe=memory_module._NAMING_RECIPE,
+        context=context,
+    )
+
+    assert store_module._naming_assertion_ids(identity_id, "Alice", "sister") == (
+        kernel_memory_id,
+        context.lineage_id,
+    )
+    assert store_module._NAMING_RECIPE == memory_module._NAMING_RECIPE
+    assert store_module._NAMING_PREDICATE == memory_module._NAMING_PREDICATE

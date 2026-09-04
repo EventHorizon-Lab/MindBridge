@@ -40,7 +40,12 @@ from mindbridge.types import (
     AbstentionReason,
     AnswerResult,
     AssetRef,
+    IdentityClaim,
+    MemoryIntent,
+    MemoryOperation,
+    MemoryOperationRecord,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
     Page,
@@ -934,6 +939,8 @@ def test_remote_mode_passes_the_cursor_through_unparsed(
         ("register-speaker", ("speaker-1", "Ana")),
         ("register-identity", ("identity-1", "Ana")),
         ("reinforce", ("memory-1",)),
+        ("settle", ()),
+        ("pending-captures", ()),
         ("consolidate", ("why",)),
         ("forget", ("memory-1",)),
         ("rollback", ("1",)),
@@ -1113,3 +1120,63 @@ def test_remote_timeout_must_be_positive_and_finite(
         main(("--url", "http://owner:8000", "--timeout", value, "list"))
     assert raised.value.code == 2
     assert "--timeout" in capsys.readouterr().err
+
+
+def test_capture_settle_and_pending_captures_round_trip(
+    app: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The three capture-plane commands are one loop: what `capture` queues, `settle` drains."""
+    status, captured, _ = _run(capsys, "--app", app, "-q", "capture", "a red wrench on the bench")
+    assert status == 0
+    memory_id = cast(dict[str, object], captured)["id"]
+
+    status, waiting, _ = _run(capsys, "--app", app, "-q", "pending-captures")
+    assert status == 0
+    pending = cast(dict[str, list[dict[str, object]]], waiting)["pending"]
+    assert len(pending) == 1
+    assert {key: value for key, value in pending[0].items() if key != "enqueued_at"} == {
+        "memory_id": memory_id,
+        "attempts": 0,
+        "last_error": None,
+        "awaiting": "enrichment",
+    }
+    assert datetime.fromisoformat(cast(str, pending[0]["enqueued_at"])).tzinfo is not None
+
+    status, settled, _ = _run(capsys, "--app", app, "-q", "settle")
+    assert status == 0 and settled == {"settled": 1}
+
+    status, drained, _ = _run(capsys, "--app", app, "-q", "pending-captures")
+    assert status == 0 and drained == {"pending": []}
+    # Settling is what makes a captured memory searchable.
+    _status, found, _ = _run(capsys, "--app", app, "-q", "search", "red wrench")
+    assert [hit["id"] for hit in cast(dict[str, list[dict[str, object]]], found)["hits"]] == [
+        memory_id
+    ]
+
+
+def test_the_operation_document_carries_the_identity_claim_it_applied() -> None:
+    """`operations` is the only audit surface for a rename, so it must show who was named."""
+    from mindbridge.cli import _operation_document
+
+    record = MemoryOperationRecord(
+        operation_id=1,
+        operation=MemoryOperation(
+            intent=MemoryIntent.IDENTIFY,
+            claim=IdentityClaim(identity_id="identity-1", name="Ana", relationship="colleague"),
+        ),
+        trigger=MemoryTrigger.MANUAL,
+        applied_at=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        created_ids=("memory-1",),
+    )
+
+    document = _operation_document(record)
+
+    assert document["claim"] == {
+        "identity_id": "identity-1",
+        "name": "Ana",
+        "relationship": "colleague",
+    }
+    assert document["proposal"] is None
+    # An identify row names no evidence and no target, so the claim is the whole of what it did.
+    assert (document["evidence_ids"], document["target_ids"]) == ([], [])
+    assert json.loads(json.dumps(document))["claim"]["name"] == "Ana"

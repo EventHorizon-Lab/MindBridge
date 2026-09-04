@@ -94,6 +94,9 @@ from mindbridge.infrastructure.local.store import (
     StoredMemory,
     StoredOperation,
     UnsupportedSchemaError,
+    # The one normalization subjects are compared under. Importing the store's own is what keeps
+    # the writer and the comparer from disagreeing about when two subjects are the same.
+    _canonical_subject,
 )
 from mindbridge.infrastructure.local.zvec_index import (
     IndexHit,
@@ -573,9 +576,10 @@ class Memory:
         self._owner_pid = os.getpid()
         self._write_lock = RLock()
         self._formation_lock = RLock()
-        # The thread currently inside an `add_stream` group, if any. Deferral is scoped to that
-        # thread so a concurrent `add` on another thread keeps flushing before it returns.
-        self._deferred_index_thread: int | None = None
+        # The threads currently inside an `add_stream` group. Deferral is scoped per thread so a
+        # concurrent `add` on another thread keeps flushing before it returns; a single slot let
+        # one stream's exit clear a second stream's deferral and strand its outbox rows.
+        self._deferred_index_threads: set[int] = set()
         # Settlement is the one path that runs the expensive model stages over rows another
         # caller can already see queued, so two threads would otherwise embed the same record
         # twice and discover it only at the commit. Blocking, like the other two: a second
@@ -840,6 +844,7 @@ class Memory:
                     prepared_content = _with_stream_transcript(prepared_content, transcript)
                 if description is not None:
                     prepared_content = _with_stream_description(prepared_content, description)
+                    self._stage_stream_description(prepared_content, description, assets)
             prepared = _prepare_memory(
                 prepared_content,
                 occurred_at=occurred_at,
@@ -1007,6 +1012,7 @@ class Memory:
                     prepared_content = _with_stream_transcript(prepared_content, transcript)
                 if description is not None:
                     prepared_content = _with_stream_description(prepared_content, description)
+                    self._stage_stream_description(prepared_content, description, assets)
             prepared = _prepare_memory(
                 prepared_content,
                 occurred_at=occurred_at,
@@ -1047,6 +1053,15 @@ class Memory:
                             occurred_end=prepared.occurred_end,
                             created_at=now,
                             updated_at=now,
+                            # Same source as `_add_prepared`: the place belongs to the
+                            # `ObservationContext` the caller supplied, and dropping it here
+                            # would make a captured memory unreachable by scoped search once
+                            # `settle()` rewrote it from the stored row.
+                            place_id=(
+                                prepared.context.place_id
+                                if isinstance(prepared.context, ObservationContext)
+                                else None
+                            ),
                             context=_stored_memory_context(prepared, recorded_at=now),
                         ),
                     ),
@@ -1060,6 +1075,10 @@ class Memory:
             if not authoritative:
                 raise StorageError("captured memory could not be read from SQLite")
             assets.persisted.update(asset.asset_id for asset in authoritative[0].assets)
+            # A stream's caption arrives with the capture and its asset now exists, so the cache
+            # row is written here rather than waiting for a `settle()` that will see the marker
+            # and skip the asset entirely. A no-op for every capture that carries no caption.
+            self._persist_descriptions(assets)
             return self._memory_record(authoritative[0])
 
     def settle(
@@ -1179,9 +1198,9 @@ class Memory:
         # outbox work, so there is nothing for a group to batch. Deferring index commits for it
         # would only postpone work some other caller left pending, and the empty forced drain at
         # each boundary would put a Zvec lock back on the path capture exists to keep clear.
-        outer_deferral = self._deferred_index_thread
+        thread = get_ident()
         if not capture:
-            self._deferred_index_thread = get_ident()
+            self._deferred_index_threads.add(thread)
         try:
             while True:
                 try:
@@ -1200,7 +1219,11 @@ class Memory:
             if grouped:
                 self._flush_stream_group()
         finally:
-            self._deferred_index_thread = outer_deferral
+            # ponytail: one flag per thread, so a group nested inside another on the same thread
+            # lifts the outer group's deferral when it exits -- the outer one then flushes per
+            # item instead of per group, which costs batching and nothing else. Count the depth
+            # if nested groups ever become a real pattern.
+            self._deferred_index_threads.discard(thread)
 
     def _add_stream_item(
         self,
@@ -1758,20 +1781,26 @@ class Memory:
         extraordinary record. The name it projected has to stop answering to search in the same
         commit that removes the assertion, so the text is rebuilt from the assertion that will
         still be visible afterwards -- usually none, which reindexes the speaker as nameless.
+        Deleting a memory an assertion cites as its only evidence takes the assertion with it,
+        so the store answers for those too rather than only for the assertion itself.
         """
         with _translate_storage_errors("read identity naming assertion"):
-            identity_id = self._store.naming_assertion_identity(memory_id)
-            if identity_id is None:
-                return (), ()
-            projected, _relationship = self._store.projected_identity_name(
+            removed, projection = self._store.naming_projection_after_delete(memory_id)
+        memories: tuple[StoredMemory, ...] = ()
+        embeddings: tuple[StoredEmbedding, ...] = ()
+        for identity_id, projected in projection:
+            reindexed, revectored = self._reindex_identity_speech(
                 identity_id,
-                excluding=(memory_id,),
+                speaker_name=projected,
+                operation=operation,
             )
-        return self._reindex_identity_speech(
-            identity_id,
-            speaker_name=projected,
-            operation=operation,
-        )
+            # The deleted record can be one of the speaker's own memories. Handing it back as a
+            # replacement would ask the same transaction to reindex a row it is removing.
+            memories += tuple(memory for memory in reindexed if memory.memory_id not in removed)
+            embeddings += tuple(
+                embedding for embedding in revectored if embedding.memory_id not in removed
+            )
+        return memories, embeddings
 
     def _projected_identity(self, identity_id: str) -> tuple[str | None, str | None]:
         with _translate_storage_errors("read identity naming assertion"):
@@ -2016,13 +2045,15 @@ class Memory:
                 operation=operation,
             )
             with _translate_storage_errors("forget identity"):
-                erasure = self._store.forget_identity(
+                erased = self._store.forget_identity(
                     normalized_id,
                     memories=memories,
                     embeddings=embeddings,
                 )
-            if erasure is None:
+            if erased is None:
                 raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
+            erasure, orphaned = erased
+            self._queue_asset_cleanup(orphaned)
             self._drain_outbox()
             return erasure
 
@@ -2152,12 +2183,18 @@ class Memory:
         """Cognitively forget memories: recall skips them, `get()` and `list()` keep them.
 
         This is not deletion. `MemoryRecord.forgotten_at` stays readable for audit and
-        `rollback()` restores recall. Use `delete()` to remove a record and its media.
+        `rollback()` of the returned operation is what restores recall -- re-adding the same
+        content does not, because content addressing returns the record that already exists and
+        leaves its `forgotten_at` standing. Use `delete()` to remove a record and its media.
 
         All or nothing: an unknown ID raises `MemoryNotFoundError` the way `get()` and `delete()`
-        do, and a set in which any record is already forgotten changes nothing and returns
-        `None`. The host names the IDs here, so partially applying them and logging the rest
-        would make the operation log claim an effect that never happened.
+        do. The host names the IDs here, so partially applying them and logging the rest would
+        make the operation log claim an effect that never happened.
+
+        `None` means nothing changed and nothing was logged: no IDs were named, a record was
+        already forgotten, the set named a bound naming assertion (only `rollback()` of the
+        operation that asserted a name may retire it), a target moved under the proposal, or an
+        identical operation is already in the log.
         """
         with (
             self._trace("mindbridge.forget", kind="operation"),
@@ -2402,6 +2439,15 @@ class Memory:
             duplicate = bool(self._store.read_operations(operation_key=key))
         if duplicate:
             raise _RejectedOperation("duplicate")
+        # A name is not an inference to be corrected, reinforced, or quietly forgotten: the
+        # registry and the indexed speech text both project it, and only `rollback()` of the
+        # operation that asserted it recomputes those. Retiring the assertion behind their back
+        # leaves `identity()` and the stored transcripts answering to a name nothing asserts.
+        # Checked for every intent here rather than per intent, because consolidation forgetting
+        # names targets of its own and would otherwise walk straight past this.
+        targets = self._control_records(operation.target_ids)
+        if any(_is_bound_naming_assertion(targets, target) for target in operation.target_ids):
+            raise _RejectedOperation("naming_assertion")
         pending = StoredOperation(
             operation_key=key,
             intent=operation.intent.value,
@@ -2421,7 +2467,13 @@ class Memory:
                     self._apply_identification(operation, pending, shown=shown, assets=assets)
                 )
             return _operation_record(
-                self._apply_operation_effects(operation, pending, shown=shown, window=window)
+                self._apply_operation_effects(
+                    operation,
+                    pending,
+                    targets=targets,
+                    shown=shown,
+                    window=window,
+                )
             )
         except StaleOperationError:
             # The proposal was built on records the apply transaction found had moved. Nothing
@@ -2434,6 +2486,7 @@ class Memory:
         operation: MemoryOperation,
         pending: StoredOperation,
         *,
+        targets: Mapping[str, StoredMemory],
         shown: Mapping[str, MemoryRecord] | None,
         window: frozenset[str] | None,
     ) -> StoredOperation:
@@ -2443,7 +2496,6 @@ class Memory:
         to execute the eligible subset while its log row still listed the rest, so the log
         claimed effects that never happened; the whole proposal is now refused instead.
         """
-        targets = self._control_records(operation.target_ids)
         if set(targets) != set(operation.target_ids):
             raise _RejectedOperation("unknown_target")
         # A backend may only act inside the window the kernel gathered for it. Consolidation
@@ -2453,12 +2505,6 @@ class Memory:
         # where the host names the IDs and is the authority.
         if window is not None and not set(operation.target_ids) <= window:
             raise _RejectedOperation("target_not_shown")
-        # A name is not an inference to be corrected, reinforced, or quietly forgotten: the
-        # registry and the indexed speech text both project it, and only `rollback()` of the
-        # operation that asserted it recomputes those. Retiring the assertion behind their back
-        # leaves `identity()` and the stored transcripts answering to a name nothing asserts.
-        if any(_is_bound_naming_assertion(targets, target) for target in operation.target_ids):
-            raise _RejectedOperation("naming_assertion")
         reinforce: tuple[tuple[str, str], ...] = ()
         correct_ids: tuple[str, ...] = ()
         forget_ids: tuple[str, ...] = ()
@@ -2668,21 +2714,25 @@ class Memory:
             ),
             context=context,
         )
-        logged = self._commit_formation(
-            tuple((prepared, source.id, proposal.confidence) for source in sources),
-            (),
-            completed_at=now,
-            recipe=self._consolidation_recipe,
-            operation=pending,
-            # Re-checked inside the apply transaction, because everything above was read before
-            # it opened: cited evidence a CORRECT retired in between makes the naming stale, and
-            # the dispatch turns that into a `stale` rejection.
-            require_active=operation.evidence_ids,
-            require_unretired=operation.evidence_ids,
-        )
-        if logged is None:
-            raise _RejectedOperation("duplicate")
-        self._reproject_identity(identity_id)
+        # One write lock over both halves: the assertion and the projection it implies are one
+        # change to what `identity()` and the indexed speech text say, and `rollback()` holds the
+        # same lock across the same pair. Reentrant, so `_commit_formation` still takes it.
+        with self._write_lock:
+            logged = self._commit_formation(
+                tuple((prepared, source.id, proposal.confidence) for source in sources),
+                (),
+                completed_at=now,
+                recipe=self._consolidation_recipe,
+                operation=pending,
+                # Re-checked inside the apply transaction, because everything above was read
+                # before it opened: cited evidence a CORRECT retired in between makes the naming
+                # stale, and the dispatch turns that into a `stale` rejection.
+                require_active=operation.evidence_ids,
+                require_unretired=operation.evidence_ids,
+            )
+            if logged is None:
+                raise _RejectedOperation("duplicate")
+            self._reproject_identity(identity_id)
         return logged
 
     def _control_records(self, memory_ids: Sequence[str]) -> dict[str, StoredMemory]:
@@ -3165,7 +3215,7 @@ class Memory:
         for row in rows:
             try:
                 with self._settle_lock:
-                    self._settle_row(row, operation=operation)
+                    completed = self._settle_row(row, operation=operation)
             except MindBridgeError as error:
                 with _translate_storage_errors("record a failed settlement"):
                     self._store.record_capture_failure(row.memory_id, str(error))
@@ -3173,10 +3223,12 @@ class Memory:
                     error.subject = row.memory_id
                 failures.append(error)
                 continue
-            settled.append(row.memory_id)
+            if completed:
+                settled.append(row.memory_id)
         return tuple(settled), tuple(failures)
 
-    def _settle_row(self, row: StoredMemory, *, operation: _OperationAssets) -> None:
+    def _settle_row(self, row: StoredMemory, *, operation: _OperationAssets) -> bool:
+        """Settle one captured row, or report `False` if another writer settled it first."""
         # An `add()` that crashed between its commit and formation leaves a queue row over a
         # record that is already enriched, embedded, and indexed. Its vectors are final, so
         # settling it owes formation only; re-running the model stages would buy the same
@@ -3187,11 +3239,12 @@ class Memory:
         if not embedded:
             enriched = self._enrich_row(row, operation=operation)
             if enriched is None:
-                return
+                return False
             settled = enriched
         self._form_sources((self._memory_record(settled),), operation=operation)
         with _translate_storage_errors("complete captured memory"):
             self._store.complete_captures((row.memory_id,))
+        return True
 
     def _enrich_row(
         self,
@@ -3444,7 +3497,11 @@ class Memory:
                 updated_at=completed_at,
                 context=cast(MemoryContext, memory.context),
             )
-            for memory in missing
+            # Existing records travel too: what they skip is the embedding, not the write. The
+            # store decides whether restating a claim it already holds is a no-op or a new
+            # version, which is how re-asserting a retired one -- a name changed back, a
+            # registration repeated after `rollback` -- reaches the lineage at all.
+            for memory in unique
         )
         embeddings = tuple(
             StoredEmbedding(
@@ -3574,6 +3631,26 @@ class Memory:
         fresh = dict(zip((asset.asset_id for asset in pending), descriptions, strict=True))
         operation.descriptions.update(fresh)
         return {**cached, **fresh}
+
+    def _stage_stream_description(
+        self,
+        prepared: _PreparedContent,
+        description: str,
+        operation: _OperationAssets,
+    ) -> None:
+        """Cache a stream's caption for its frame, the way a described write caches one.
+
+        The inlined marker makes `_pending_visual_descriptions` skip the asset -- the caption is
+        already in this document, so re-deriving it would buy the same text twice -- and the row
+        it would otherwise have written is exactly what stops the *next* memory citing this frame
+        from paying for a differently worded one. Staged like any other derived caption, because
+        the row's foreign key is the asset and the asset is not stored yet.
+        """
+        if self._vision_describer is None:
+            return
+        for asset in prepared.assets:
+            if Modality(asset.modality) in self._vision_capabilities:
+                operation.descriptions.setdefault(asset.asset_id, description)
 
     def _with_visual_descriptions(
         self,
@@ -5154,6 +5231,14 @@ class Memory:
         return tuple(vectors), tuple(kept)
 
     def _describe_vision(self, images: Sequence[Blob]) -> tuple[str, ...]:
+        """Caption live frames through the cache the write path fills, not around it.
+
+        A scene the stream describes and a later `add()` of the same frame must not pay two
+        calls: the endpoint returns a different caption for the same image on every call, so the
+        second would also change what the memory's document says. The caption this derives is
+        cached when the memory carrying the frame is written -- the row's foreign key is the
+        asset, which does not exist until then.
+        """
         if self._vision_describer is None:
             raise ModelError(
                 "vision description backend is not configured",
@@ -5163,9 +5248,27 @@ class Memory:
             raise ValidationError("vision description requires at least one image")
         with self._operation() as operation:
             prepared = tuple(self._prepare_content(image, operation) for image in images)
-            return self._vision_descriptions(
-                tuple(self._resolved_model_input(value) for value in prepared)
+            # One blob in, one asset out, so the cached captions line up with the inputs.
+            asset_ids = tuple(content.assets[0].asset_id for content in prepared)
+            with _translate_storage_errors("read cached visual descriptions"):
+                described = dict(
+                    self._store.read_visual_descriptions(asset_ids, space_id=self._vision_space)
+                )
+            pending = tuple(
+                {
+                    asset_id: index
+                    for index, asset_id in enumerate(asset_ids)
+                    if asset_id not in described
+                }.items()
             )
+            if pending:
+                fresh = self._vision_descriptions(
+                    tuple(self._resolved_model_input(prepared[index]) for _id, index in pending)
+                )
+                described.update(
+                    zip((asset_id for asset_id, _index in pending), fresh, strict=True)
+                )
+            return tuple(described[asset_id] for asset_id in asset_ids)
 
     def _vision_descriptions(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
         if self._vision_describer is None:
@@ -5483,7 +5586,7 @@ class Memory:
         Skipped inside an `add_stream` group, whose own bounds force it. Skipping only leaves
         rows pending: they are still durable in SQLite and the next drain applies them.
         """
-        if not force and self._deferred_index_thread == get_ident():
+        if not force and get_ident() in self._deferred_index_threads:
             return
         with self._trace("mindbridge.index.sync", kind="stage"):
             self._apply_outbox()
@@ -7284,14 +7387,14 @@ def _formation_lineage_id(
     # than forks. An unbound claim keeps the original payload byte for byte, so lineage IDs
     # already on disk stay valid.
     binding: dict[str, object] = (
-        {"subject": _semantic_text(proposal.subject)}
+        {"subject": _canonical_subject(proposal.subject)}
         if identity_id is None
         else {"subject": None, "identity_id": identity_id}
     )
     payload = json.dumps(
         {
             "kind": proposal.kind.value,
-            "predicate": _semantic_text(proposal.predicate),
+            "predicate": _canonical_subject(proposal.predicate),
             "frame_id": frame_id,
             "anchor": anchor,
             **binding,
@@ -7328,9 +7431,9 @@ def _formation_memory_id(
             # Only present once something is bound, so two identities that share a name stay two
             # records while every ID minted before the binding existed keeps its value.
             **({} if context.identity_id is None else {"identity_id": context.identity_id}),
-            "subject": _semantic_text(proposal.subject),
-            "predicate": _semantic_text(proposal.predicate),
-            "value": _semantic_text(proposal.value),
+            "subject": _canonical_subject(proposal.subject),
+            "predicate": _canonical_subject(proposal.predicate),
+            "value": _canonical_subject(proposal.value),
             "assertion_basis": (
                 proposal.basis.value
                 if proposal.basis is not EvidenceBasis.MODEL_INFERENCE
@@ -7368,10 +7471,6 @@ def _formation_memory_id(
         separators=(",", ":"),
     )
     return hashlib.sha256(f"mindbridge-formation-v1:{payload}".encode()).hexdigest()
-
-
-def _semantic_text(value: str | None) -> str | None:
-    return None if value is None else unicodedata.normalize("NFKC", value).casefold().strip()
 
 
 def _media_hint(name: str | None, media_type: str | None) -> tuple[Modality, str]:
@@ -8240,6 +8339,11 @@ def _grounding_hits(
     at 0.8127). The intent it served -- one modality must not shut the others out -- is a floor,
     not a rotation, so a modality that would otherwise be absent is promoted into the last
     slots instead of displacing a third of the window.
+
+    A promotion takes the seat of the lowest-ranked hit whose modality survives without it, so
+    the top hit is never evicted and no promotion costs the window a modality it already had.
+    When more modalities exist than `limit` has slots, the ranking's own order decides which of
+    them the window carries.
     """
     best_by_modality: dict[Modality, SearchHit] = {}
     for hit in hits:
@@ -8247,8 +8351,21 @@ def _grounding_hits(
     selected = list(hits[:limit])
     represented = {hit.modality for hit in selected}
     promoted = [hit for modality, hit in best_by_modality.items() if modality not in represented]
-    if promoted:
-        selected = [*selected[: max(limit - len(promoted), 0)], *promoted[:limit]]
+    for hit in promoted[: max(limit - 1, 0)]:
+        if len(selected) >= limit:
+            counts = Counter(chosen.modality for chosen in selected)
+            spare = next(
+                (
+                    index
+                    for index in range(len(selected) - 1, 0, -1)
+                    if counts[selected[index].modality] > 1
+                ),
+                None,
+            )
+            if spare is None:
+                break
+            del selected[spare]
+        selected.append(hit)
     if budget_chars is None:
         return tuple(selected)
     return (*selected, *_budgeted_hits(hits, selected, budget_chars))

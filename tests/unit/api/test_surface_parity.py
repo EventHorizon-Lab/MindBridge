@@ -9,6 +9,7 @@ import inspect
 import json
 import re
 from dataclasses import fields as dataclass_fields
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast, get_type_hints
 
@@ -41,6 +42,7 @@ from mindbridge.types import (
     ContextBundle,
     ContextConflict,
     ContextUnknown,
+    ContextUnknownKind,
     FaceObservation,
     IdentityErasure,
     IdentityProfile,
@@ -551,7 +553,8 @@ def test_the_context_budget_transport_defaults_come_from_the_sdk_value() -> None
         "max_latency_ms": budget.max_latency_ms,
     }
 
-    for model in (rest.ContextBudgetRequest, mcp_adapter.ContextBudgetInput):
+    # One declaration, published under two component names; both must default from the SDK.
+    for model in (rest.ContextBudgetRequest, content.ContextBudgetInput):
         assert {
             name: field.get_default(call_default_factory=True)
             for name, field in model.model_fields.items()
@@ -604,3 +607,86 @@ def test_both_transports_decode_content_parts_with_one_implementation() -> None:
 def test_delete_reports_the_same_state_on_both_transports() -> None:
     assert set(rest.DeleteResponse.model_fields) == set(mcp_adapter.DeleteResult.model_fields)
     assert get_type_hints(rest.DeleteResponse) == get_type_hints(mcp_adapter.DeleteResult)
+
+
+def _sample_bundle() -> ContextBundle:
+    """One bundle with something in every kind of section, for the projection checks below."""
+    moment = datetime(2026, 8, 27, tzinfo=timezone.utc)
+    hit = SearchHit(
+        id="memory_1",
+        content="the spare key is in the blue toolbox",
+        modality=Modality.TEXT,
+        created_at=moment,
+        score=0.5,
+    )
+    return ContextBundle(
+        goal="what should I bring?",
+        reference_at=moment,
+        budget=ContextBudget(),
+        actors=(hit, ProvisionalActor(identity_id="identity_1", memory_ids=("memory_1",))),
+        relationships=(),
+        scene=(),
+        episodes=(hit,),
+        facts=(),
+        procedures=(),
+        affect=(),
+        traits=(),
+        conflicts=(
+            ContextConflict(
+                lineage_id="lineage_1",
+                subject="ana",
+                predicate="location",
+                values=("berlin", "paris"),
+                memory_ids=("memory_1", "memory_2"),
+            ),
+        ),
+        unknowns=(ContextUnknown(kind=ContextUnknownKind.SECTION_EMPTY, detail="no traits"),),
+        occurred_from=moment,
+        occurred_until=moment,
+        frames=("home/map",),
+        places=("kitchen",),
+        omitted=3,
+        chars=42,
+        elapsed_ms=7,
+        deadline_exceeded=False,
+    )
+
+
+def test_every_surface_publishes_one_context_bundle_document() -> None:
+    """REST, MCP, and the CLI project `ContextBundle.document()`, not three field lists."""
+    bundle = _sample_bundle()
+    document = bundle.document()
+    expected = {field.name for field in dataclass_fields(ContextBundle)} | {"rendered"}
+
+    assert set(document) == expected
+    assert set(rest.ContextBundleResponse.model_fields) == expected
+    assert set(mcp_adapter.ContextBundleResult.model_fields) == expected
+    # The CLI encodes the same document rather than assembling its own, so its keys are these.
+    rendered = {name: cli._bundle_value(value) for name, value in document.items()}
+    assert set(rendered) == expected
+    assert json.loads(json.dumps(rendered))["budget"] == bundle.budget.document()
+    episodes = cast(list[dict[str, object]], rendered["episodes"])
+    actors = cast(list[object], rendered["actors"])
+    assert [entry["id"] for entry in episodes] == ["memory_1"]
+    assert actors[1] == {"identity_id": "identity_1", "memory_ids": ("memory_1",)}
+
+
+def test_render_covers_every_section_the_bundle_declares() -> None:
+    """A section added to `ContextBundle` must be rendered, not silently dropped from the text."""
+    bundle = _sample_bundle()
+    headings = {heading.casefold() for heading, _section in bundle._sections()}
+
+    assert headings <= {field.name for field in dataclass_fields(ContextBundle)}
+    assert "## Actors" in bundle.render()
+
+
+def test_the_two_budget_projections_agree_on_every_bound() -> None:
+    """`ContextBudget.document()` is what all three surfaces publish and the CLI sends."""
+    budget = ContextBudget(max_chars=2_000, max_items=8, min_confidence=0.5)
+    document = budget.document()
+
+    assert set(document) == set(rest.ContextBudgetResponse.model_fields)
+    assert set(document) == set(mcp_adapter.ContextBudgetResult.model_fields)
+    assert set(document) == set(content.ContextBudgetInput.model_fields)
+    # Round-tripping the document back through the shared translator returns the same value.
+    assert content.context_budget(content.ContextBudgetInput.model_validate(document)) == budget
