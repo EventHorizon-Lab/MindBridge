@@ -56,6 +56,7 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     Page,
+    PendingCapture,
     SearchHit,
 )
 
@@ -1294,6 +1295,40 @@ def test_an_operation_row_names_the_people_a_merge_moved() -> None:
     }
     assert document["target_ids"] == []
     assert cli_module._operation_document(replace(record, operation=_A_FORGET))["identity"] is None
+
+
+def test_every_cli_timestamp_spells_utc_the_same_way() -> None:
+    """One instant has one spelling: `pending-captures` and `operations` render `Z` like `capture`.
+
+    `_memory_document` already went through `_encode_time`, while these two rows called
+    `datetime.isoformat()` directly and printed the same instant as `+00:00`. Both are valid ISO
+    8601, but a consumer comparing `created_at` to `enqueued_at` as strings saw two encodings.
+    """
+    instant = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
+
+    class _Pending:
+        def pending_captures(self, **_: object) -> list[PendingCapture]:
+            return [PendingCapture(memory_id="memory-1", enqueued_at=instant)]
+
+    arguments = argparse.Namespace(limit=100, memory_ids=[])
+    pending = cli_module._pending_captures(cast(Memory, _Pending()), arguments)
+    row = cast(list[dict[str, object]], pending["pending"])[0]
+    assert row["enqueued_at"] == "2026-03-01T12:00:00Z"
+
+    record = MemoryOperationRecord(
+        operation_id=7,
+        operation=_A_FORGET,
+        trigger=MemoryTrigger.EVIDENCE,
+        applied_at=instant,
+        rolled_back_at=instant + timedelta(hours=1),
+    )
+    document = cli_module._operation_document(record)
+    assert document["applied_at"] == "2026-03-01T12:00:00Z"
+    assert document["rolled_back_at"] == "2026-03-01T13:00:00Z"
+    assert (
+        cli_module._operation_document(replace(record, rolled_back_at=None))["rolled_back_at"]
+        is None
+    )
 
 
 def test_the_idle_window_declared_on_the_command_line_reaches_candidate_selection() -> None:

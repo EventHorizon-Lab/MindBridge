@@ -879,7 +879,7 @@ def _pending_captures(memory: Memory, arguments: argparse.Namespace) -> _Documen
         "pending": [
             {
                 "memory_id": pending.memory_id,
-                "enqueued_at": pending.enqueued_at.isoformat(),
+                "enqueued_at": _encode_time(pending.enqueued_at),
                 "attempts": pending.attempts,
                 "last_error": pending.last_error,
                 "awaiting": pending.awaiting,
@@ -1037,10 +1037,8 @@ def _operation_document(record: MemoryOperationRecord) -> _Document:
         "changed_ids": list(record.changed_ids),
         "forgotten_ids": list(record.forgotten_ids),
         "superseded": [[memory_id, version] for memory_id, version in record.superseded],
-        "applied_at": record.applied_at.isoformat(),
-        "rolled_back_at": (
-            None if record.rolled_back_at is None else record.rolled_back_at.isoformat()
-        ),
+        "applied_at": _encode_time(record.applied_at),
+        "rolled_back_at": _encode_optional_time(record.rolled_back_at),
         "outcome": None if record.outcome is None else record.outcome.value,
         "outcome_note": record.outcome_note,
     }

@@ -255,7 +255,9 @@ memory, hit, answer, page, and deletion field vocabulary as [REST response objec
 `search-with-trace` serializes the [Python retrieval trace](python-sdk.md#public-values).
 `SpeakerSegment` and `FaceObservation` use their public Python fields. Memory and hit documents
 carry `context` when typed semantics exist, identically in local and `--url` mode, with enum
-values as JSON strings and datetimes as ISO 8601.
+values as JSON strings and datetimes as ISO 8601. Every timestamp the CLI prints -- including
+`enqueued_at`, `applied_at`, and `rolled_back_at` -- renders a UTC instant with a trailing `Z`,
+never `+00:00`, so one instant has one spelling across commands.
 
 `forget-identity` returns `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`,
 `face_observations`, and `speech_segments`, matching the fields of `IdentityErasure`.
