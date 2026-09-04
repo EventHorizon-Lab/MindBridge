@@ -8,7 +8,8 @@ Authoritative visibility and scope were applied by the retrieval path that produ
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import fields
 from datetime import datetime
 from time import perf_counter
 from types import MappingProxyType
@@ -16,7 +17,10 @@ from typing import TypeAlias
 
 from mindbridge.exceptions import ValidationError
 from mindbridge.types import (
+    _MAX_CUE_IDS,
+    CONTEXT_READING_GUIDE,
     KIND_MEMORY_TYPES,
+    AffectCue,
     ContextBudget,
     ContextBundle,
     ContextConflict,
@@ -108,6 +112,9 @@ _EXCLUSIONS: Mapping[str, str] = MappingProxyType(
 )
 # One asserted value: the value, the memory asserting it, and that memory's subject and predicate.
 _Claim: TypeAlias = tuple[str, str, str | None, str | None]
+# Resolves affect memory IDs to the event IDs their own observations also formed. The compiler
+# calls it once, for the affect entries the budget actually bought, and never past the deadline.
+_CoDerivedEvents: TypeAlias = Callable[[Sequence[str]], Mapping[str, Sequence[str]]]
 
 
 def evidence_cost(hit: SearchHit) -> int:
@@ -161,7 +168,7 @@ def _frame_cost(goal: str, reference_at: datetime, budget: ContextBudget) -> int
     """Return an upper bound on the fixed header `render()` writes above the first section."""
     return (
         len(f"# Context: {goal}")
-        + len("Each line is one memory: [id] content (confidence; validity).")
+        + len(CONTEXT_READING_GUIDE)
         + len(f"Reference time: {reference_at.isoformat()}")
         # `chars` cannot have more digits than `max_chars`, nor `included` than `max_items`.
         + len(
@@ -188,6 +195,7 @@ def compile_context(
     candidate_limit: int | None = None,
     provisional: Mapping[str, Sequence[str]] = MappingProxyType({}),
     named: Mapping[str, Sequence[NamedActorLink]] = MappingProxyType({}),
+    co_derived_events: _CoDerivedEvents | None = None,
 ) -> ContextBundle:
     """Partition, filter, and budget ranked hits into one bundle.
 
@@ -209,6 +217,12 @@ def compile_context(
     provisional actor render a line, and that line is priced and fit into whatever `max_chars`
     has left after the ranked hits: it is included when it fits and dropped, not appended for
     free, when it does not.
+
+    `co_derived_events` resolves affect memory IDs to the event IDs formed from the same
+    observations, under the same visibility the hits were hydrated with. It is called once, with
+    the affect entries the budget actually bought, and not at all once the deadline has passed:
+    the hop is optional enrichment, like conflict detection. The edge is co-occurrence inside
+    one capture, not causation, and the events themselves are neither fetched nor charged.
     """
     started_at = perf_counter() if started_at is None else started_at
     excluded: dict[str, int] = {}
@@ -231,6 +245,20 @@ def compile_context(
             subject="budget",
         )
     sections = _select(candidates, budget, overhead)
+    # The deadline is checked here, between section assembly and the optional enrichment that
+    # follows it. Nothing already computed is discarded and no stage is cut in half, so a bundle
+    # under a deadline is a prefix of the one without it, never a different one.
+    skipped = _past_deadline(budget, started_at)
+    # An affect entry becomes an `AffectCue`: the same hit, plus the events its evidence also
+    # formed. Substituted before anything reads the sections, so `hits`, `chars`, and the
+    # conflict pass all see one instance per included memory. The hop is resolved only for the
+    # entries that were bought, so the read it costs is bounded by the budget rather than by
+    # how deep retrieval ranked.
+    hops: Mapping[str, Sequence[str]] = MappingProxyType({})
+    if co_derived_events is not None and not skipped and sections["affect"]:
+        hops = co_derived_events(tuple(hit.id for hit in sections["affect"]))
+    affect = tuple(_affect_cue(hit, hops.get(hit.id, ())) for hit in sections["affect"])
+    sections["affect"] = affect
     # Rank order, not section order: `_lineage_conflict` pairs each value with the highest-ranked
     # memory asserting it, so a lineage whose claims land in different sections must still be read
     # by score. `ContextBundle.hits` sorts the same way.
@@ -241,10 +269,6 @@ def compile_context(
         )
     )
     omitted = len(candidates) - len(included)
-    # The deadline is checked here, between section assembly and the optional enrichment that
-    # follows it. Nothing already computed is discarded and no stage is cut in half, so a bundle
-    # under a deadline is a prefix of the one without it, never a different one.
-    skipped = _past_deadline(budget, started_at)
     # Conflict detection reads every candidate the filters kept, not only what the budget bought,
     # so dropping one side of a disagreement for want of a slot cannot make it disappear.
     conflicts = (
@@ -295,7 +319,7 @@ def compile_context(
         episodes=sections["episodes"],
         facts=sections["facts"],
         procedures=sections["procedures"],
-        affect=sections["affect"],
+        affect=affect,
         traits=sections["traits"],
         conflicts=conflicts,
         unknowns=_unknowns(
@@ -399,6 +423,20 @@ def _select(
     return {name: tuple(section) for name, section in sections.items()}
 
 
+def _affect_cue(hit: SearchHit, event_ids: Sequence[str]) -> AffectCue:
+    """Return one affect hit as the evidence-first entry the bundle publishes.
+
+    The cue's own evidence stays where retrieval hydrated it, on `context.evidence_ids`, so the
+    entry cannot disagree with itself. The resolver returns `event_ids` already deduplicated and
+    ordered; at most `_MAX_CUE_IDS` are kept, so one capture that formed many events cannot
+    grow a line the budget never charged for.
+    """
+    return AffectCue(
+        **{field.name: getattr(hit, field.name) for field in fields(SearchHit)},
+        event_ids=tuple(event_ids)[:_MAX_CUE_IDS],
+    )
+
+
 def _bundle_chars(overhead: int, sections: Mapping[str, tuple[SearchHit, ...]]) -> int:
     """Return what this bundle charged against `max_chars`, priced exactly as `_select` did."""
     return overhead + sum(
@@ -470,7 +508,7 @@ def _unknowns(
             ContextUnknown(
                 kind=ContextUnknownKind.STAGE_SKIPPED,
                 detail=(
-                    "conflict detection was skipped after the"
+                    "conflict detection and the affect evidence hop were skipped after the"
                     f" {budget.max_latency_ms} ms deadline passed"
                 ),
             )

@@ -279,9 +279,11 @@ optional, is selected by a structural check rather than a provider name, and lea
 Face analysis demonstrates the admission rule: its public contract arrived with a concrete local
 OpenCV implementation and end-to-end identity use case. A future public capability such as emotion
 analysis must likewise declare accepted modalities, typed output, provenance, configuration,
-resource lifecycle, concurrency behavior, privacy boundary, and failure mapping. It must not create
-provider branches inside `Memory` or treat metadata as an execution or isolation mechanism. The
-rule, and the one protocol currently in breach of it, are stated in
+resource lifecycle, concurrency behavior, privacy boundary, and failure mapping; the phased plan
+for that one, and the reason it starts inside the existing formation contract, is in
+[affective memory](affective-memory.md). It must not create provider branches inside `Memory` or
+treat metadata as an execution or isolation mechanism. The rule, and the one protocol currently in
+breach of it, are stated in
 [plugin architecture](plugin-architecture.md#admission-rule).
 
 ### Preserve evidence, privacy, and durability

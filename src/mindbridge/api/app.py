@@ -213,6 +213,17 @@ class SearchHitResponse(MemoryResponse):
     score: Annotated[float, Field(ge=0.0, le=1.0)]
 
 
+class AffectCueResponse(SearchHitResponse):
+    """One affect entry of a compiled bundle, with the evidence hop the cue hangs on.
+
+    The observations the cue cites are its own `context.evidence_ids`. `event_ids` are the
+    events formed from those same observations: co-occurrence inside one capture, never an
+    attributed cause.
+    """
+
+    event_ids: tuple[str, ...] = ()
+
+
 class MemoryBatchResponse(_ResponseModel):
     memories: tuple[MemoryResponse, ...]
 
@@ -443,7 +454,7 @@ class ContextBundleResponse(_ResponseModel):
     episodes: tuple[SearchHitResponse, ...]
     facts: tuple[SearchHitResponse, ...]
     procedures: tuple[SearchHitResponse, ...]
-    affect: tuple[SearchHitResponse, ...]
+    affect: tuple[AffectCueResponse, ...]
     traits: tuple[SearchHitResponse, ...]
     conflicts: tuple[ContextConflictResponse, ...]
     unknowns: tuple[ContextUnknownResponse, ...]

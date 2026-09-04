@@ -25,6 +25,19 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   the operation the answer holds is released before the terminal chunk, so reading a result and
   stopping there needs no cleanup. REST, MCP, and the CLI have no equivalent: each would have to
   choose a streaming wire format, and all three gaps are documented on their own pages.
+- `AffectCue`, the entry type of the compiled `affect` section on `ContextBundle`, exported from
+  `mindbridge`: every `SearchHit` field plus `event_ids`, the active events formed from the same
+  observations the cue already cites in `context.evidence_ids` -- co-occurrence inside one capture,
+  never an attributed cause. `render()` prints `basis`, `confidence`, cue modality, valence, and
+  arousal on every affect line, so an agent can tell a model inference from a user statement
+  without a second call. The hop is resolved after selection, only for the affect entries the
+  budget bought, in one batched store read under the same visibility and scope rules that hydrated
+  the hits, and is skipped once `max_latency_ms` has passed (the `stage_skipped` unknown names it
+  alongside conflict detection). A cue carries at most eight co-derived events and `render()`
+  truncates every ID list to eight with a `+N more` count, so marks that `max_chars` does not
+  charge for cannot grow without limit. REST `POST /v1/context`, the MCP `compile_context` tool,
+  and `mindbridge compile` publish the same field, and a `ContextBundle` refuses an affect entry
+  that is not an `AffectCue`.
 - `capture()`, `settle()`, and `pending_captures()` on `Memory` and `AsyncMemory`, plus the
   `capture`, `settle`, and `pending-captures` CLI commands. `capture()` commits a record, its
   media, its observation context, and one durable enrichment queue row in a single SQLite
@@ -613,6 +626,17 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   for a run while units ingest on worker threads, and SQLite's per-thread binding made every
   worker-side describe fail; the write path counted each as a failed batch and fell open, so a
   vision arm could build caption-less libraries while every other counter read as healthy.
+- The MCP `compile_context` tool's `budget` description told clients the default `max_chars` was
+  6,000 when `ContextBudget` has defaulted to 16,000.
+- Evidence independence is counted per capture. A derived record cited as evidence inherits the
+  evidence groups of its own sources, so several cues formed from one capture (a text and an audio
+  `AFFECT` from one turn, say) are one independent source and can no longer corroborate each other
+  into a visible model-inferred `TRAIT`. Previously a derived source had no observation row and so
+  became its own group, which let one emotional event satisfy the two-source rule. The inherited
+  group is re-resolved on every record that cites one whose own evidence changed, so reinforcing,
+  rolling back, or deleting a source updates the confidence and visibility of the whole citation
+  chain instead of only the record directly touched. Rows written before this change keep their
+  stored group until the record they cite next changes; fresh stores are correct.
 - Forgetting, retracting, or correcting a naming assertion with a timestamp older than the identity
   row raised `sqlite3.IntegrityError` (`CHECK constraint failed: updated_at >= created_at`) out of
   the store instead of applying. The name projection is rewritten in the same transaction and was
@@ -752,6 +776,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Documentation
 
+- `docs/affective-memory.md` states the affective-memory direction: affect is preserved as a
+  sourced, timed, confidence-bearing hypothesis with a perspective rather than recognized as fact,
+  with the four affect layers, the behaviour that exists at this release, the phased roadmap
+  against the plugin admission rule, the required measurements, and the safety and prohibited-use
+  boundary. `docs/README.md`, `docs/context-os.md`, `docs/design-principles.md`, and
+  `docs/plugin-architecture.md` point at it where each already named affect cues or a future
+  emotion-analysis capability.
 - The quickstart and README no longer index into a `search` result. `search` returns an empty tuple
   whenever no candidate clears `minimum_relevance` or the top two dense confidences tie within
   `ambiguity_margin`, so the published first example could raise `IndexError` on a correct install.

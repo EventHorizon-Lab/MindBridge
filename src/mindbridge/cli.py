@@ -48,6 +48,7 @@ from mindbridge.exceptions import (
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
 from mindbridge.memory import Memory, declared_capabilities
 from mindbridge.types import (
+    AffectCue,
     AssetRef,
     Blob,
     ConsentState,
@@ -1692,6 +1693,10 @@ def _memory_document(record: MemoryRecord | SearchHit) -> _Document:
     }
     if isinstance(record, SearchHit):
         document["score"] = record.score
+    if isinstance(record, AffectCue):
+        # The compiled affect entry's evidence hop, on the same line the transports publish it.
+        # The observations it cites are already inside `context`.
+        document["event_ids"] = list(record.event_ids)
     return document
 
 
