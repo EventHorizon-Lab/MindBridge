@@ -549,6 +549,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `forget_identity`, `reindex`, or `optimize` on that thread returned without flushing. The records
   stayed durable in SQLite but were not searchable until some other caller forced a drain. Deferral
   is now thread-local, so it cannot outlive the stream that opened it.
+- The `compile_context` MCP tool schema advertised the wrong default evidence ceiling. Its prose
+  said 6,000 characters while the field default it publishes beside it, and `ContextBudget`, have
+  been 16,000 since the per-modality cost function landed — enough of a gap for an agent that
+  budgets against the sentence to leave every video record out on purpose. The sentence now reads
+  the numbers off `ContextBudget`, so it cannot drift from them again.
 - The benchmark description cache accepts calls from every unit worker thread. It is opened once
   for a run while units ingest on worker threads, and SQLite's per-thread binding made every
   worker-side describe fail; the write path counted each as a failed batch and fell open, so a
