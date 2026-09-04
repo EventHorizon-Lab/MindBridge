@@ -92,17 +92,19 @@ cue is a report about one channel at one time, not a standing assertion about th
 them apart is what preserves the disagreement the EACL result says is informative.
 
 **Traits need independent evidence.** A model-inferred `TRAIT` stays hidden from active retrieval
-until two independent observation-level groups support the same normalized claim; a trusted user
-statement is visible at once. This round tightens what independence means: several cues extracted
-from one observation are one group, not two, so a single talkative turn cannot promote a
-disposition on its own. [Memory types, time, and decay](memory-types-time-and-decay.md) owns that
+until two independent evidence groups support the same normalized claim; a trusted user
+statement is visible at once. A group is a capture (the observation context's `source_id`),
+falling back to the observation record when no capture was named, and a derived record inherits
+the groups of its own sources. So several cues extracted from one capture are one group, not
+two, and a single talkative turn cannot promote a disposition on its own. [Memory types, time, and decay](memory-types-time-and-decay.md) owns that
 rule.
 
 **Affect is associated with events through existing evidence links.** There is no affect-specific
 edge. An `EVENT` and an `AFFECT` formed from the same committed observation share that source, and
 the `memory_evidence` rows record it. This round exposes that association in the compiled bundle:
-an affect entry reports `event_ids` and `source_ids`, and renders its basis, confidence, cue
-modality, valence, and arousal so a reader can judge the estimate instead of reading a bare label.
+an affect entry reports `event_ids` beside its own `context.evidence_ids`, and renders its basis,
+confidence, cue modality, valence, and arousal so a reader can judge the estimate instead of
+reading a bare label.
 [Context compilation](context-compilation.md) owns the bundle contract.
 
 That association is co-occurrence within one capture. It is not an attributed cause. A cue and an
@@ -185,7 +187,7 @@ provenance and privacy and failure behavior, and product-path tests.
 No public-contract widening beyond exposing fields that are already stored. Affect entries in the
 compiled bundle report their basis, confidence, cue modality, valence, arousal, and the event and
 source identifiers that already exist as evidence rows. The independence rule for inferred traits
-is tightened so cues from one observation count once.
+is tightened so cues from one capture count once.
 
 **Exit:** contract tests pin the exposed fields and the independence rule, and a companion-dialogue
 evaluation shows the bundle changes downstream answers.
@@ -294,8 +296,9 @@ absence looks like a model that found nothing.
 **A badly grounded affect proposal is expensive.** The kernel refuses an `AFFECT` proposal whose
 cue modality is not present in its source, and that refusal currently fails the whole formation
 pass rather than dropping the one proposal. A model that occasionally claims a vocal cue on a
-text-only observation therefore costs the other proposals in that batch too. A fix exists on a
-sibling branch and is not in this tree; it is tracked separately.
+text-only observation therefore costs the other proposals in that batch too. Dropping the one
+proposal and counting the drop is the intended behaviour; until it lands, keep formation prompts
+conservative about cue modality.
 
 **Affect never becomes a standing assertion by accident.** Because `AFFECT` is outside the conflict
 kinds, an adapter cannot rely on supersession to clean up its own history. Two disagreeing cues stay

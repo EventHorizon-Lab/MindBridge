@@ -1577,26 +1577,23 @@ class Memory:
                 unknowns=self._request_unknowns(prepared, scope, outcome.hits),
                 candidate_limit=candidate_limit,
                 provisional=self._provisional_identities(outcome.hits),
-                co_derived_events=self._co_derived_events(outcome.hits, scope),
+                co_derived_events=partial(self._co_derived_events, scope=scope),
             )
 
     def _co_derived_events(
         self,
-        hits: Sequence[SearchHit],
+        cues: Sequence[str],
+        *,
         scope: RetrievalScope | None,
     ) -> dict[str, tuple[str, ...]]:
-        """Resolve, for every affect candidate, the events its own observations also formed.
+        """Resolve, for the selected affect entries, the events their observations also formed.
 
-        One batched read for the whole compilation, under the same bitemporal and spatial scope
-        the hits were hydrated with, so the hop cannot surface an event the search itself would
-        have dropped. The edge is shared evidence -- co-occurrence inside one capture -- and
-        never a cause.
+        One batched read per compilation, under the same bitemporal and spatial scope the hits
+        were hydrated with, so the hop cannot surface an event the search itself would have
+        dropped. The compiler calls this after selection, so the read is bounded by the budget
+        rather than by the candidate window. The edge is shared evidence -- co-occurrence inside
+        one capture -- and never a cause.
         """
-        cues = tuple(
-            hit.id
-            for hit in hits
-            if hit.context is not None and hit.context.kind is MemoryKind.AFFECT
-        )
         if not cues:
             return {}
         with _translate_storage_errors("read co-derived events"):

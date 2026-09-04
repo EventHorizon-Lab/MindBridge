@@ -400,10 +400,10 @@ does not carry. `ask` is unchanged. [Context compilation](../context-compilation
 contract.
 
 `bundle.affect` carries `AffectCue` rather than `SearchHit`: the same hit fields plus
-`source_ids`, the observations the cue cites, and `event_ids`, the active events formed from
-those same observations. That edge is co-occurrence inside one capture and never an attributed
-cause. Resolving it costs one extra batched store read per `compile` and no budget, because only
-the IDs are carried.
+`event_ids`, the active events formed from the same observations the cue cites in its own
+`context.evidence_ids`. That edge is co-occurrence inside one capture and never an attributed
+cause. Resolving it costs one extra batched store read per `compile`, over the affect entries the
+budget bought and skipped past the deadline, and no budget, because only the IDs are carried.
 
 ```text
 capabilities -> MemoryCapabilities  # property
@@ -782,7 +782,7 @@ The principal immutable values are:
 | `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknown` | `kind` (a `ContextUnknownKind`), `detail` |
 | `ProvisionalActor` | `identity_id`, `memory_ids` |
-| `AffectCue` | every `SearchHit` field plus `source_ids`, `event_ids`: one affect entry of a compiled bundle, carrying the observations the cue cites and the events formed from those same observations |
+| `AffectCue` | every `SearchHit` field plus `event_ids`: one affect entry of a compiled bundle, carrying the events formed from the same observations the cue cites in its own `context.evidence_ids` |
 | `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`; `hits` property and `render()` |
 | `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `rationale` |
 | `IdentityClaim` | `identity_id`, `name`, `relationship` |

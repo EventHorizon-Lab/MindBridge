@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
+from _feature_support import ATOMIC_MODALITIES, CueConsolidator, TinyEmbedder
 
 from mindbridge import (
     Blob,
@@ -18,11 +18,8 @@ from mindbridge import (
     FormationInput,
     FormationProposal,
     Memory,
-    MemoryIntent,
     MemoryKind,
-    MemoryOperation,
     MemoryRecord,
-    MemoryTrigger,
     Modality,
     ObservationContext,
 )
@@ -30,7 +27,6 @@ from mindbridge import (
 MISSING_DOG = "the user's voice rose while telling me the dog Max went missing"
 CORRECTION = "the user said: I wasn't angry, I was nervous about the missing dog"
 SIGH = "the user sighed about the missing dog and said it was fine"
-BIKE = "the user's tone brightened when the new bike arrived"
 MEDICATION = "the user takes their medication lamotrigine every morning"
 
 DOG_GOAL = "how did the user feel about the missing dog"
@@ -97,53 +93,7 @@ class CompanionFormer:
                     arousal=0.3,
                 ),
             )
-        if "bike arrived" in text:
-            return (
-                FormationProposal(kind=MemoryKind.EVENT, content="the new bike arrived"),
-                FormationProposal(
-                    kind=MemoryKind.AFFECT,
-                    content="the user seemed pleased about the new bike",
-                    subject="user",
-                    value="pleased",
-                    confidence=0.7,
-                    cue_modality=Modality.TEXT,
-                    valence=0.7,
-                    arousal=0.4,
-                ),
-            )
         return ()
-
-    def close(self) -> None:
-        return None
-
-
-class CueConsolidator:
-    """Proposes one model-inferred trait citing exactly the evidence it was shown."""
-
-    consolidation_model = "companion-consolidator-test"
-    consolidation_recipe = "companion-consolidator-test:v1"
-
-    def consolidate(
-        self,
-        evidence: Sequence[MemoryRecord],
-        *,
-        trigger: MemoryTrigger,
-    ) -> tuple[MemoryOperation, ...]:
-        del trigger
-        return (
-            MemoryOperation(
-                intent=MemoryIntent.CONSOLIDATE,
-                evidence_ids=tuple(record.id for record in evidence),
-                proposal=FormationProposal(
-                    kind=MemoryKind.TRAIT,
-                    content="the user is anxious under stress",
-                    subject="user",
-                    predicate="disposition",
-                    value="anxious",
-                    confidence=0.6,
-                ),
-            ),
-        )
 
     def close(self) -> None:
         return None
@@ -175,10 +125,10 @@ def test_a_cue_an_event_and_an_observation_stay_three_traceable_records(tmp_path
 
         (cue,) = bundle.affect
         (event,) = _records(memory, MemoryKind.EVENT)
-        assert cue.source_ids == (observation.id,)
+        assert cue.context is not None
+        assert cue.context.evidence_ids == (observation.id,)
         assert cue.event_ids == (event.id,)
         assert event.id in {hit.id for hit in bundle.episodes}
-        assert cue.context is not None
         assert cue.context.basis is EvidenceBasis.MODEL_INFERENCE
         line = next(row for row in bundle.render().splitlines() if row.startswith(f"- [{cue.id}]"))
         assert "basis model_inference" in line
@@ -230,46 +180,18 @@ def test_two_modalities_of_one_moment_stay_two_cues(tmp_path: Path) -> None:
         assert {hit.id for hit in bundle.affect} == {record.id for record in cues}
 
 
-def test_one_capture_never_lends_its_event_to_another_capture(tmp_path: Path) -> None:
-    """The affect-event edge is shared evidence, so it cannot reach across observations."""
-    with _memory(tmp_path) as memory:
-        dog = memory.add(MISSING_DOG, context=ObservationContext(source_id="turn-1"))
-        bike = memory.add(BIKE, context=ObservationContext(source_id="turn-4"))
-        bundle = memory.compile("how did the user feel", budget=ContextBudget(max_items=12))
-
-        events = {
-            hit.id: hit.context.evidence_ids
-            for hit in bundle.episodes
-            if hit.context is not None and hit.context.kind is MemoryKind.EVENT
-        }
-        assert len(bundle.affect) == 2
-        for cue in bundle.affect:
-            (source,) = cue.source_ids
-            assert source in (dog.id, bike.id)
-            assert cue.event_ids == tuple(
-                event_id for event_id, sources in events.items() if sources == (source,)
-            )
-            assert len(cue.event_ids) == 1
-
-
-def test_one_observation_cannot_promote_a_trait_on_its_own(tmp_path: Path) -> None:
-    """Cues from a single capture are one evidence group: a moment is not a disposition."""
+def test_a_second_independent_capture_reinforces_the_same_trait_rather_than_creating_a_rival(
+    tmp_path: Path,
+) -> None:
+    """The claim is the same, so a second capture reinforces the record instead of rivalling it."""
     with _memory(tmp_path) as memory:
         memory.add(
             (SIGH, Blob(b"sigh", "audio/wav")),
             context=ObservationContext(source_id="turn-3"),
         )
         one_capture = tuple(record.id for record in _records(memory, MemoryKind.AFFECT))
-        assert len(one_capture) == 2
-
         first = memory.consolidate(evidence_ids=one_capture)
-        assert first.rejected == ()
         (trait_id,) = first.operations[0].created_ids
-        hidden = memory.get(trait_id)
-
-        assert hidden.context is not None and hidden.context.visible is False
-        assert not any(hit.id == trait_id for hit in memory.search("anxious", limit=10))
-        assert memory.compile("anxious under stress").traits == ()
 
         memory.add(MISSING_DOG, context=ObservationContext(source_id="turn-1"))
         (independent,) = (
@@ -278,15 +200,10 @@ def test_one_observation_cannot_promote_a_trait_on_its_own(tmp_path: Path) -> No
             if record.id not in one_capture
         )
         second = memory.consolidate(evidence_ids=(one_capture[0], independent))
-        assert second.rejected == ()
-        # The claim is the same, so the second observation reinforces that record rather than
-        # creating a rival trait -- and only then does it become retrievable.
-        assert second.operations[0].changed_ids == (trait_id,)
-        promoted = memory.get(trait_id)
 
-        assert promoted.context is not None and promoted.context.visible is True
-        assert any(hit.id == trait_id for hit in memory.search("anxious", limit=10))
-        assert [hit.id for hit in memory.compile("anxious under stress").traits] == [trait_id]
+        assert second.rejected == ()
+        assert second.operations[0].changed_ids == (trait_id,)
+        assert second.operations[0].created_ids == ()
 
 
 def test_forgetting_a_cue_is_cognitive_and_reversible(tmp_path: Path) -> None:

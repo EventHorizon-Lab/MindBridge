@@ -1536,7 +1536,7 @@ def _memory_document(record: MemoryRecord | SearchHit) -> _Document:
         document["score"] = record.score
     if isinstance(record, AffectCue):
         # The compiled affect entry's evidence hop, on the same line the transports publish it.
-        document["source_ids"] = list(record.source_ids)
+        # The observations it cites are already inside `context`.
         document["event_ids"] = list(record.event_ids)
     return document
 

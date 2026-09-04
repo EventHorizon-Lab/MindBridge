@@ -1031,11 +1031,11 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
     assert [hit["id"] for hit in bundle["facts"]] == ["memory_1"]
     assert [hit["id"] for hit in bundle["episodes"]] == ["memory_2"]
     assert bundle["actors"] == [{"identity_id": "identity_2", "memory_ids": ["memory_2"]}]
-    # An affect entry is a hit plus its evidence hop: the observations it cites and the events
-    # formed from those same observations.
-    assert [(cue["id"], cue["source_ids"], cue["event_ids"]) for cue in bundle["affect"]] == [
-        ("memory_3", ["memory_2"], ["memory_9"])
-    ]
+    # An affect entry is a hit plus its evidence hop: the events formed from the same
+    # observations the cue itself cites, which travel inside `context`.
+    assert [
+        (cue["id"], cue["context"]["evidence_ids"], cue["event_ids"]) for cue in bundle["affect"]
+    ] == [("memory_3", ["memory_2"], ["memory_9"])]
     assert bundle["affect"][0]["context"]["basis"] == "model_inference"
     assert bundle["conflicts"] == [
         {
@@ -1222,7 +1222,6 @@ def _affect_cue() -> AffectCue:
         memory_type=MemoryType.EPISODIC,
         created_at=NOW,
         context=AFFECT_CONTEXT,
-        source_ids=("memory_2",),
         event_ids=("memory_9",),
     )
 

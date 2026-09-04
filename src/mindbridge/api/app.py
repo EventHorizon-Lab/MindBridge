@@ -167,13 +167,13 @@ class SearchHitResponse(MemoryResponse):
 
 
 class AffectCueResponse(SearchHitResponse):
-    """One affect entry of a compiled bundle, with the evidence the cue hangs on.
+    """One affect entry of a compiled bundle, with the evidence hop the cue hangs on.
 
-    `source_ids` are the observations the cue cites. `event_ids` are the events formed from
-    those same observations: co-occurrence inside one capture, never an attributed cause.
+    The observations the cue cites are its own `context.evidence_ids`. `event_ids` are the
+    events formed from those same observations: co-occurrence inside one capture, never an
+    attributed cause.
     """
 
-    source_ids: tuple[str, ...] = ()
     event_ids: tuple[str, ...] = ()
 
 

@@ -204,7 +204,7 @@ Successful calls populate MCP `structuredContent`:
 | `ContextUnknownResult` | `kind`, `detail` |
 | `ContextBundleResult` | `goal`, `reference_at`, `budget`, the `SearchHitResult` arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `traits`, the `AffectCueResult` array `affect`, the mixed `actors` array of `SearchHitResult` and `ProvisionalActorResult`, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
 | `ProvisionalActorResult` | `identity_id`, `memory_ids` |
-| `AffectCueResult` | every `SearchHitResult` field plus `source_ids` and `event_ids`: the observations one affect cue cites and the events formed from those same observations, which is co-occurrence inside one capture and not an attributed cause |
+| `AffectCueResult` | every `SearchHitResult` field plus `event_ids`: the events formed from the same observations the cue cites in its own `context.evidence_ids`, which is co-occurrence inside one capture and not an attributed cause |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
 | `FaceObservation` | `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
 | `IdentityProfile` | `identity_id`, `name`, `relationship`, `confirmed`, `evidence_ids` |

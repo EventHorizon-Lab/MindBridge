@@ -162,7 +162,9 @@ _BUDGET_DESCRIPTION = (
     " `freshness_seconds` keeps only memories anchored within that many seconds of the reference"
     " clock; `max_latency_ms` is a deadline after which optional work is skipped rather than a"
     " timeout that aborts, and the bundle reports `elapsed_ms` and `deadline_exceeded`. Null uses"
-    " the defaults, which are 16,000 characters and 24 items with no deadline."
+    " the defaults, which are"
+    f" {_BUDGET.max_chars:,} characters and {_BUDGET.max_items} items with no"
+    " deadline."
 )
 _MEMORY_ID_DESCRIPTION = (
     "The `id` a previous `add_memory`, `search_memories`, or `list_memories` result returned."
@@ -234,13 +236,13 @@ class SearchHitResult(MemoryResult):
 
 
 class AffectCueResult(SearchHitResult):
-    """One affect entry of a compiled bundle, with the evidence the cue hangs on.
+    """One affect entry of a compiled bundle, with the evidence hop the cue hangs on.
 
-    `source_ids` are the observations the cue cites. `event_ids` are the events formed from
-    those same observations: co-occurrence inside one capture, never an attributed cause.
+    The observations the cue cites are its own `context.evidence_ids`. `event_ids` are the
+    events formed from those same observations: co-occurrence inside one capture, never an
+    attributed cause.
     """
 
-    source_ids: tuple[str, ...] = ()
     event_ids: tuple[str, ...] = ()
 
 
@@ -1007,7 +1009,6 @@ def _affect_cue_result(cue: AffectCue) -> AffectCueResult:
     # across rather than dumped and revalidated.
     return AffectCueResult(
         **dict(_search_hit_result(cue)),
-        source_ids=cue.source_ids,
         event_ids=cue.event_ids,
     )
 

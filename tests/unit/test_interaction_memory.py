@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
+from _feature_support import ATOMIC_MODALITIES, CueConsolidator, TinyEmbedder
 
 from mindbridge import (
     Blob,
@@ -82,11 +82,14 @@ class InteractionFormer:
         pass
 
 
-class CueConsolidator:
-    """Proposes one model-inferred trait citing exactly the evidence it was shown."""
+class CueReinforcer:
+    """Attaches whatever it is shown to one named record as an extra independent source."""
 
-    consolidation_model = "interaction-consolidator-test"
-    consolidation_recipe = "interaction-consolidator-test:v1"
+    consolidation_model = "interaction-reinforcer-test"
+    consolidation_recipe = "interaction-reinforcer-test:v1"
+
+    def __init__(self, target_id: str) -> None:
+        self._target_id = target_id
 
     def consolidate(
         self,
@@ -97,15 +100,10 @@ class CueConsolidator:
         del trigger
         return (
             MemoryOperation(
-                intent=MemoryIntent.CONSOLIDATE,
-                evidence_ids=tuple(record.id for record in evidence),
-                proposal=FormationProposal(
-                    kind=MemoryKind.TRAIT,
-                    content="The user is anxious under stress",
-                    subject="user",
-                    predicate="disposition",
-                    value="anxious",
-                    confidence=0.6,
+                intent=MemoryIntent.REINFORCE,
+                target_ids=(self._target_id,),
+                evidence_ids=tuple(
+                    record.id for record in evidence if record.id != self._target_id
                 ),
             ),
         )
@@ -140,6 +138,13 @@ def _observe_cues(memory: Memory, text: str, source_id: str) -> tuple[str, ...]:
         context=ObservationContext(source_id=source_id),
     )
     return tuple(value for value in _affect_ids(memory) if value not in known)
+
+
+def _visible(memory: Memory, memory_id: str) -> bool:
+    """Return whether the record's current version is visible to active retrieval."""
+    context = memory.get(memory_id).context
+    assert context is not None
+    return context.visible
 
 
 def _trait_over(memory: Memory, evidence_ids: Sequence[str]) -> MemoryRecord:
@@ -376,3 +381,90 @@ def test_a_derived_cue_and_an_unrelated_observation_are_two_sources(tmp_path: Pa
         assert derived.context.visible is True
         assert derived.context.confidence == pytest.approx(1 - 0.4 * 0.4)
         assert any(hit.id == derived.id for hit in memory.search("anxious", limit=10))
+
+
+def test_cues_from_two_observations_of_one_capture_are_one_independent_source(
+    tmp_path: Path,
+) -> None:
+    with _cue_memory(tmp_path) as memory:
+        first = _observe_cues(memory, "I am fine", "session-1")
+        second = _observe_cues(memory, "I am okay", "session-1")
+
+        derived = _trait_over(memory, (first[0], second[0]))
+
+        # Independence is counted per capture, not per observation: both captures declared the
+        # same `source_id`, so two observations and every cue under them are one group.
+        assert _visible(memory, derived.id) is False
+
+        third = _observe_cues(memory, "I am well", "session-2")
+        memory.consolidate(evidence_ids=(third[0],))
+
+        assert _visible(memory, derived.id) is True
+
+
+def test_rolling_back_a_reinforcement_hides_the_trait_that_cited_it(tmp_path: Path) -> None:
+    with _cue_memory(tmp_path) as memory:
+        first = _observe_cues(memory, "I am fine", "session-1")
+        second = _observe_cues(memory, "I am okay", "session-2")
+
+        cited = _trait_over(memory, (first[0],))
+        assert _visible(memory, cited.id) is False
+        reinforcement = memory.consolidate(evidence_ids=(second[0],))
+        assert _visible(memory, cited.id) is True
+
+        dependent = _trait_over(memory, (cited.id, first[0]))
+        assert _visible(memory, dependent.id) is True
+
+        assert memory.rollback(reinforcement.operations[0].operation_id) is True
+
+        # The reinforcement was what made the cited trait a group of its own. Rolling it back
+        # puts the cited trait back on `session-1`, which is the only group the dependent has.
+        assert _visible(memory, cited.id) is False
+        assert _visible(memory, dependent.id) is False
+        assert not any(hit.id == dependent.id for hit in memory.search("reassurance", limit=10))
+
+
+def test_reinforcing_a_cited_cue_makes_the_trait_that_cited_it_visible(tmp_path: Path) -> None:
+    with _cue_memory(tmp_path) as memory:
+        cues = _observe_cues(memory, "I am fine", "session-1")
+        dependent_id = _trait_over(memory, cues).id
+        assert _visible(memory, dependent_id) is False
+
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=InteractionFormer(),
+        consolidator=CueReinforcer(cues[0]),
+        minimum_relevance=0,
+    ) as memory:
+        raw = memory.add(
+            ("the user paused", Blob(b"pause", "audio/wav")),
+            context=ObservationContext(source_id="session-2"),
+        )
+        # The target has to be shown to the consolidator for it to reinforce it.
+        memory.consolidate(evidence_ids=(cues[0], raw.id))
+
+        # The reinforced cue now spans two captures, so it stops inheriting `session-1` and
+        # counts as a group of its own -- a second group for the trait that cites it.
+        assert _visible(memory, dependent_id) is True
+        assert any(hit.id == dependent_id for hit in memory.search("reassurance", limit=10))
+
+
+def test_deleting_an_observation_hides_the_trait_that_cited_the_dependent(tmp_path: Path) -> None:
+    with _cue_memory(tmp_path) as memory:
+        cues = _observe_cues(memory, "I am fine", "session-1")
+        raw = memory.add(
+            ("the user paused", Blob(b"pause", "audio/wav")),
+            context=ObservationContext(source_id="session-2"),
+        )
+
+        cited = _trait_over(memory, (cues[0], raw.id))
+        dependent = _trait_over(memory, (cited.id, cues[0]))
+        assert _visible(memory, cited.id) is True
+        assert _visible(memory, dependent.id) is True
+
+        assert memory.delete(raw.id) is True
+
+        assert _visible(memory, cited.id) is False
+        assert _visible(memory, dependent.id) is False
+        assert not any(hit.id == dependent.id for hit in memory.search("reassurance", limit=10))

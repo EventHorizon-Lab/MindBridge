@@ -181,7 +181,7 @@ prints one plainly labelled line per entry, after the ranked actors.
 
 An affect entry asserts how somebody felt, which is the one section where the difference between
 a model's guess and a person's own words changes what an agent may say. So `affect` carries
-`AffectCue`: every `SearchHit` field, plus two ID tuples, and `render()` prints the provenance on
+`AffectCue`: every `SearchHit` field, plus `event_ids`, and `render()` prints the provenance on
 the line instead of leaving it in `context` for a caller who may never look.
 
 | On the line | Read from | Meaning |
@@ -191,11 +191,13 @@ the line instead of leaving it in `context` for a caller who may never look.
 | `cue` | `context.cue_modality` | Which modality the cue was read from; formation must name a modality the source actually carries |
 | `valence` | `context.valence` | -1 through 1 |
 | `arousal` | `context.arousal` | 0 through 1 |
-| `from` | `AffectCue.source_ids` | The observations this cue cites, the same IDs as `context.evidence_ids` |
+| `from` | `context.evidence_ids` | The observations this cue cites |
 | `co-occurring events` | `AffectCue.event_ids` | Events formed from at least one of those same observations |
 
-`cue`, `valence`, `arousal`, and either ID tuple are omitted from the line when the record does
-not carry them. Non-affect sections keep the plain `[id] content (confidence; validity)` line.
+`cue`, `valence`, `arousal`, and either ID list are omitted from the line when the record does
+not carry them. Each list names at most eight IDs and then a `+N more` count, so an affect
+line stays bounded by a constant even though these marks are not charged against
+`max_chars`. Non-affect sections keep the plain `[id] content (confidence; validity)` line.
 
 ```text
 ## Affect
@@ -208,10 +210,13 @@ Nothing in the bundle claims the event caused the feeling, or even that the cue 
 event, and the compiler asserts no such edge across two different observations. That is why the
 field is named for what it is rather than `about` or `triggered_by`.
 
-The hop is one batched store read per `compile`, never one per cue, and it is subject to the same
-rules retrieval hydrated the hits under: a retired version, a hidden assertion, a forgotten
-record, and anything outside the requested `valid_at`/`known_at` window are all excluded, and
-`event_ids` is sorted so two compilations of one store render the same line. Only IDs are
+The hop is one batched store read per `compile`, never one per cue. It runs after selection, for
+the affect entries the budget actually bought rather than every candidate retrieval ranked, and
+it is skipped entirely once `max_latency_ms` has passed -- optional work, like conflict
+detection, and the same `stage_skipped` unknown reports both. It is subject to the same rules
+retrieval hydrated the hits under: a retired version, a hidden assertion, a forgotten record, and
+anything outside the requested `valid_at`/`known_at` window are all excluded, and `event_ids` is
+sorted so two compilations of one store render the same line. Only IDs are
 carried: the events are not fetched, they cost no characters and no item slot, and they are not
 added to `episodes`. A co-derived event that appears in `episodes` earned that slot from its own
 score. Read an event's text with `get()`.
@@ -245,7 +250,7 @@ appears without the `## Unknowns` block above it.
 
 ```text
 # Context: what should I bring to the workshop?
-Each line is one memory: [id] content (confidence; validity).
+Each line is one memory: [id] content (confidence; validity; for affect also basis, cue, valence, arousal, source and co-occurring event ids).
 Reference time: 2026-09-03T12:00:00+00:00
 Budget: 132/16000 chars, 3/24 items
 
