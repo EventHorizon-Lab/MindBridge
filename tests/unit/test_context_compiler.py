@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -14,6 +15,7 @@ from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
 from test_memory_control_plane import ScriptedConsolidator
 
 from mindbridge import (
+    AffectCue,
     AnswerResult,
     AssetRef,
     AsyncMemory,
@@ -63,6 +65,11 @@ def _hit(
     memory_type: MemoryType = MemoryType.SEMANTIC,
     kind: MemoryKind | None = None,
     confidence: float = 0.9,
+    basis: EvidenceBasis = EvidenceBasis.OBSERVATION,
+    cue_modality: Modality | None = None,
+    valence: float | None = None,
+    arousal: float | None = None,
+    evidence_ids: tuple[str, ...] = (),
     occurred_at: datetime | None = None,
     occurred_end: datetime | None = None,
     created_at: datetime = REFERENCE,
@@ -80,12 +87,16 @@ def _hit(
         if kind is None
         else MemoryContext(
             kind=kind,
-            basis=EvidenceBasis.OBSERVATION,
+            basis=basis,
             confidence=confidence,
             valid_from=valid_from,
             valid_until=valid_until,
             recorded_at=created_at,
             lineage_id=lineage_id,
+            evidence_ids=evidence_ids,
+            cue_modality=cue_modality,
+            valence=valence,
+            arousal=arousal,
             subject="ana" if value is not None else None,
             predicate="location" if value is not None else None,
             value=value,
@@ -289,10 +300,10 @@ def test_item_and_character_budgets_are_never_exceeded() -> None:
 
     # `max_chars` prices the rendered evidence: the header, the section heading, and each
     # memory's whole `- [id] ... (confidence 1.00)` line, not `len(content)` alone.
-    chars = _compile(hits, max_chars=500)
+    chars = _compile(hits, max_chars=600)
     assert len(chars.hits) == 2
     assert chars.omitted == 8
-    assert chars.chars <= 500
+    assert chars.chars <= 600
 
 
 def test_max_chars_bounds_the_rendered_evidence_and_not_only_the_record_text() -> None:
@@ -306,7 +317,7 @@ def test_max_chars_bounds_the_rendered_evidence_and_not_only_the_record_text() -
         _hit(f"fact-{index}", score=0.9 - index / 100, content="x" * 60) for index in range(40)
     )
 
-    for ceiling in (200, 400, 1000, 4000):
+    for ceiling in (300, 400, 1000, 4000):
         bundle = _compile(hits, max_chars=ceiling)
         # `omitted` puts an unknown and a trailer below the evidence; measure the evidence.
         rendered = bundle.render().split("\n\n## Unknowns")[0]
@@ -725,7 +736,11 @@ def test_the_deadline_skips_optional_enrichment_and_says_so(
     assert bundle.deadline_exceeded is True
     assert bundle.elapsed_ms == 750
     assert [(item.kind.value, item.detail) for item in bundle.unknowns] == [
-        ("stage_skipped", "conflict detection was skipped after the 100 ms deadline passed")
+        (
+            "stage_skipped",
+            "conflict detection and the affect evidence hop were skipped after the"
+            " 100 ms deadline passed",
+        )
     ]
 
 
@@ -856,7 +871,8 @@ def test_render_is_deterministic_and_names_every_included_id() -> None:
     assert "fact-3" not in rendered
     assert rendered.splitlines()[:4] == [
         "# Context: what is going on",
-        "Each line is one memory: [id] content (confidence; validity).",
+        "Each line is one memory: [id] content (confidence; validity; for affect also basis,"
+        " cue, valence, arousal, source and co-occurring event ids).",
         f"Reference time: {REFERENCE.isoformat()}",
         f"Budget: {bundle.chars}/16000 chars, 4/4 items",
     ]
@@ -1192,7 +1208,7 @@ def test_a_provisional_actor_of_omitted_evidence_is_not_reported() -> None:
         "who is in the room",
         (_hit("expensive", content="x" * 500),),
         # Over the header floor, so the budget is spendable, and far under the 500-character hit.
-        budget=ContextBudget(max_chars=200),
+        budget=ContextBudget(max_chars=300),
         reference_at=REFERENCE,
         provisional={"expensive": ("identity_1",)},
     )
@@ -1298,6 +1314,344 @@ def test_rendering_labels_a_provisional_actor_plainly() -> None:
 
 
 # ---------------------------------------------------------------------------------------------
+# Affect cues
+
+
+def _affect_hit(identifier: str = "cue-1", **overrides: object) -> SearchHit:
+    fields: dict[str, object] = {
+        "kind": MemoryKind.AFFECT,
+        "memory_type": MemoryType.EPISODIC,
+        "confidence": 0.72,
+        "basis": EvidenceBasis.MODEL_INFERENCE,
+        "cue_modality": Modality.AUDIO,
+        "valence": -0.2,
+        "arousal": 0.8,
+        "evidence_ids": ("obs-1",),
+    }
+    fields.update(overrides)
+    return _hit(identifier, **fields)  # type: ignore[arg-type]
+
+
+def test_an_affect_entry_renders_its_provenance_and_its_evidence_hop() -> None:
+    """An agent reading the line can tell an inference from a statement without a second call."""
+    bundle = compile_context(
+        "how did that land",
+        (_affect_hit(),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        co_derived_events=lambda cues: {"cue-1": ("event-1",)},
+    )
+
+    cue = bundle.affect[0]
+    assert (cue.context is not None and cue.context.evidence_ids, cue.event_ids) == (
+        ("obs-1",),
+        ("event-1",),
+    )
+    assert bundle.render().splitlines()[-1] == (
+        "- [cue-1] evidence cue-1 (confidence 0.72; basis model_inference; cue audio;"
+        " valence -0.20; arousal 0.80; from [obs-1]; co-occurring events [event-1])"
+    )
+
+
+def test_an_affect_entry_names_the_basis_that_makes_it_a_statement() -> None:
+    bundle = compile_context(
+        "how did that land",
+        (_affect_hit(basis=EvidenceBasis.USER_STATEMENT, confidence=1.0),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+    )
+
+    assert "(confidence 1.00; basis user_statement; cue audio;" in bundle.render()
+    # No hop resolved is an empty hop, not an invented one.
+    assert bundle.affect[0].event_ids == ()
+
+
+def test_the_affect_hop_takes_no_item_slot_and_charges_only_what_it_prints() -> None:
+    """The events are never fetched, and the IDs the line does print are paid for.
+
+    `bundle_cost` prices `render_hit_line`, so the hop marks are charged like every other
+    rendered character and `chars` keeps bounding `render()`. What the hop costs nothing of is
+    item slots, `episodes` entries, and the event text it never read.
+    """
+    hits = (_affect_hit(), _hit("fact-1"))
+    plain = compile_context(
+        "how did that land",
+        hits,
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+    )
+    hopped = compile_context(
+        "how did that land",
+        hits,
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        co_derived_events=lambda cues: {"cue-1": ("event-1", "event-2")},
+    )
+
+    assert (len(hopped.hits), hopped.omitted) == (2, 0)
+    assert hopped.affect[0].event_ids == ("event-1", "event-2")
+    # Exactly the marks the line gained, so the price and the text cannot drift.
+    assert hopped.chars - plain.chars == len("; co-occurring events [event-1], [event-2]")
+    assert len(hopped.render()) <= hopped.chars
+    # The linked events were never fetched, so they are not smuggled into `episodes`.
+    assert [hit.id for hit in hopped.episodes] == []
+
+
+def _hop_spy() -> tuple[list[Sequence[str]], Callable[[Sequence[str]], dict[str, tuple[str, ...]]]]:
+    """A hop resolver that records which affect IDs it was asked to resolve."""
+    asked: list[Sequence[str]] = []
+
+    def resolve(cues: Sequence[str]) -> dict[str, tuple[str, ...]]:
+        asked.append(cues)
+        return {"cue-1": ("event-1",)}
+
+    return asked, resolve
+
+
+def test_the_affect_hop_and_its_provenance_stay_bounded_by_a_constant() -> None:
+    """The marks are not charged against `max_chars`, so they are capped instead."""
+    sources = tuple(f"obs-{index:02d}" for index in range(12))
+    bundle = compile_context(
+        "how did that land",
+        (_affect_hit(evidence_ids=sources),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        co_derived_events=lambda cues: {
+            "cue-1": tuple(f"event-{index:02d}" for index in range(12))
+        },
+    )
+
+    cue = bundle.affect[0]
+    line = bundle.render().splitlines()[-1]
+
+    assert len(cue.event_ids) == 8
+    assert cue.event_ids == tuple(f"event-{index:02d}" for index in range(8))
+    assert "from [obs-00], [obs-01], [obs-02], [obs-03], [obs-04], [obs-05], [obs-06]," in line
+    assert "[obs-07], +4 more" in line
+    # The events were capped when the cue was built, so the line names eight and stops: there is
+    # no ninth ID to count. The cue's own evidence is not the compiler's to truncate, so that
+    # list is cut at render time and says how many it dropped.
+    assert line.endswith(
+        "co-occurring events [event-00], [event-01], [event-02], [event-03],"
+        " [event-04], [event-05], [event-06], [event-07])"
+    )
+    assert "event-08" not in line
+
+
+def test_the_hop_is_skipped_once_the_deadline_has_passed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Optional work, like conflict detection: not started rather than started and dropped."""
+    asked, resolver = _hop_spy()
+    clock = iter((0.5, 0.75))
+    monkeypatch.setattr("mindbridge.context.perf_counter", lambda: next(clock))
+
+    bundle = compile_context(
+        "how did that land",
+        (_affect_hit(),),
+        budget=ContextBudget(max_latency_ms=100),
+        reference_at=REFERENCE,
+        started_at=0.0,
+        co_derived_events=resolver,
+    )
+
+    assert asked == []
+    assert bundle.affect[0].event_ids == ()
+    assert bundle.deadline_exceeded is True
+    assert [item.detail for item in bundle.unknowns] == [
+        "conflict detection and the affect evidence hop were skipped after the"
+        " 100 ms deadline passed"
+    ]
+
+
+def test_the_hop_is_resolved_only_for_the_affect_entries_the_budget_bought() -> None:
+    """The read is bounded by the budget, not by how deep retrieval ranked."""
+    asked, resolver = _hop_spy()
+    bundle = compile_context(
+        "how did that land",
+        (
+            _affect_hit("cue-1", score=0.9),
+            _affect_hit("cue-2", score=0.8),
+            _affect_hit("cue-3", score=0.7),
+        ),
+        budget=ContextBudget(max_items=2),
+        reference_at=REFERENCE,
+        co_derived_events=resolver,
+    )
+
+    assert [cue.id for cue in bundle.affect] == ["cue-1", "cue-2"]
+    # The third ranked below the budget, so the hop was never asked about it.
+    assert asked == [("cue-1", "cue-2")]
+
+
+def test_a_bundle_refuses_a_plain_hit_in_the_affect_section() -> None:
+    """Every transport reads the hop off an affect entry, so the section is typed, not hoped."""
+    bundle = compile_context(
+        "how did that land",
+        (_affect_hit(),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+    )
+
+    with pytest.raises(ValidationError):
+        replace(bundle, affect=(_affect_hit(),))  # type: ignore[arg-type]
+
+
+class _AffectFormer:
+    """One text observation forms one event and one affect cue, from the same evidence."""
+
+    formation_capabilities = ATOMIC_MODALITIES
+    formation_model = "affect-test"
+    formation_space = "affect-test:v1"
+
+    def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+        return tuple(
+            (
+                FormationProposal(
+                    kind=MemoryKind.EVENT,
+                    content=f"the review call happened: {item.content.text}",
+                ),
+                FormationProposal(
+                    kind=MemoryKind.AFFECT,
+                    content=f"the user sounded tense about it: {item.content.text}",
+                    subject="user",
+                    value="tense",
+                    confidence=0.72,
+                    cue_modality=Modality.TEXT,
+                    valence=-0.2,
+                    arousal=0.8,
+                ),
+            )
+            if "cue" in item.content.text
+            else ()
+            for item in inputs
+        )
+
+    def close(self) -> None:
+        return None
+
+
+def _affect_memory(data_dir: Path) -> Memory:
+    return Memory(
+        data_dir,
+        embedder=TinyEmbedder(),
+        former=_AffectFormer(),
+        minimum_relevance=0,
+    )
+
+
+def _cue(bundle: ContextBundle) -> AffectCue:
+    assert len(bundle.affect) == 1
+    return bundle.affect[0]
+
+
+def _event_ids(bundle: ContextBundle) -> list[str]:
+    return [
+        hit.id
+        for hit in bundle.episodes
+        if hit.context is not None and hit.context.kind is MemoryKind.EVENT
+    ]
+
+
+def test_an_affect_cue_carries_its_observation_and_the_event_it_co_occurred_with(
+    tmp_path: Path,
+) -> None:
+    with _affect_memory(tmp_path) as memory:
+        observation = memory.add("cue: the review call about the harbour")
+        bundle = memory.compile("the review call about the harbour", reference_at=REFERENCE)
+
+    assert _cue(bundle).context is not None
+    assert _cue(bundle).context.evidence_ids == (observation.id,)  # type: ignore[union-attr]
+    assert _cue(bundle).event_ids == tuple(_event_ids(bundle))
+    assert len(_event_ids(bundle)) == 1
+
+
+def test_two_observations_do_not_cross_link_their_cues_and_events(tmp_path: Path) -> None:
+    """The edge is shared evidence, so one capture's event never reaches another's cue."""
+    with _affect_memory(tmp_path) as memory:
+        first = memory.add("cue: the review call about the harbour")
+        second = memory.add("cue: the review call about the workshop")
+        bundle = memory.compile(
+            "the review call",
+            budget=ContextBudget(max_items=8),
+            reference_at=REFERENCE,
+        )
+
+    events = {
+        hit.id: hit.context.evidence_ids
+        for hit in bundle.episodes
+        if hit.context is not None and hit.context.kind is MemoryKind.EVENT
+    }
+    cues = {
+        (() if cue.context is None else cue.context.evidence_ids): cue.event_ids
+        for cue in bundle.affect
+    }
+    assert len(events) == 2
+    assert cues == {
+        (first.id,): tuple(
+            event_id for event_id, sources in events.items() if sources == (first.id,)
+        ),
+        (second.id,): tuple(
+            event_id for event_id, sources in events.items() if sources == (second.id,)
+        ),
+    }
+    assert all(len(event_ids) == 1 for event_ids in cues.values())
+
+
+def test_a_forgotten_co_derived_event_leaves_the_hop_and_returns_on_rollback(
+    tmp_path: Path,
+) -> None:
+    with _affect_memory(tmp_path) as memory:
+        memory.add("cue: the review call about the harbour")
+        bundle = memory.compile("the review call about the harbour", reference_at=REFERENCE)
+        (event_id,) = _cue(bundle).event_ids
+
+        operation = memory.forget((event_id,))
+        assert operation is not None
+        forgotten = memory.compile("the review call about the harbour", reference_at=REFERENCE)
+        assert _cue(forgotten).event_ids == ()
+        # The event lost its own line too, so the bundle never names an ID it cannot show.
+        assert _event_ids(forgotten) == []
+
+        assert memory.rollback(operation.operation_id) is True
+        restored = memory.compile("the review call about the harbour", reference_at=REFERENCE)
+
+    assert _cue(restored).event_ids == (event_id,)
+
+
+def test_the_cli_command_serializes_the_affect_hop(tmp_path: Path) -> None:
+    with _affect_memory(tmp_path) as memory:
+        memory.add("cue: the review call about the harbour")
+        arguments = _parser().parse_args(
+            [
+                "compile",
+                "the review call about the harbour",
+                "--reference-at",
+                REFERENCE.isoformat(),
+            ]
+        )
+        document = _LOCAL["compile"](memory, arguments)
+
+    (cue,) = json.loads(json.dumps(document))["affect"]
+    assert cue["context"]["evidence_ids"] and cue["event_ids"]
+    assert "co-occurring events" in str(document["rendered"])
+
+
+def test_the_affect_hop_reads_the_transaction_time_the_scope_asked_for(tmp_path: Path) -> None:
+    """`known_at` reaches the hop, so it cannot report a version the hits were not hydrated at."""
+    later = datetime.now(timezone.utc) + timedelta(days=1)
+    with _affect_memory(tmp_path) as memory:
+        memory.add("cue: the review call about the harbour")
+        bundle = memory.compile(
+            "the review call about the harbour",
+            reference_at=REFERENCE,
+            scope=RetrievalScope(known_at=later, valid_at=later),
+        )
+
+    assert _cue(bundle).event_ids == tuple(_event_ids(bundle))
+    assert len(_event_ids(bundle)) == 1
+
+
 # Named actors
 
 
@@ -1394,7 +1748,7 @@ def test_a_named_actor_of_omitted_evidence_is_not_reported() -> None:
         "who is in the room",
         (_hit("expensive", content="x" * 500),),
         # Over the header floor, so the budget is spendable, and far under the 500-character hit.
-        budget=ContextBudget(max_chars=200),
+        budget=ContextBudget(max_chars=300),
         reference_at=REFERENCE,
         named={"expensive": (("identity_1", "Li", "naming"),)},
     )

@@ -128,8 +128,9 @@ benchmark score is not by itself a reason to replace the flat durable representa
 
 Interaction memory uses the existing semantic, episodic, and procedural roles. Any
 emotion, trait, or response-policy inference stays outside the kernel or behind a future concrete
-typed analysis plugin. Derived records retain evidence provenance and use ordinary `Memory` writes;
-plugins may not write around durability or reinterpret metadata as routing, isolation, or trust.
+typed analysis plugin, on the phased path in [affective memory](affective-memory.md). Derived
+records retain evidence provenance and use ordinary `Memory` writes; plugins may not write around
+durability or reinterpret metadata as routing, isolation, or trust.
 
 ## Trade-offs and revisit triggers
 

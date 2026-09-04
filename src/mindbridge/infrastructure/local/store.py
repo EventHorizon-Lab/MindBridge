@@ -2574,11 +2574,13 @@ class LocalStore:
             """,
             (_datetime_text(changed_at), memory_id),
         )
+        surviving_dependents: list[str] = []
         for dependent in dependent_rows:
             dependent_id = _row_text(dependent, "memory_id")
             evidence_count, _confidence = _evidence_summary(connection, dependent_id)
             if evidence_count:
                 _refresh_evidence_projection(connection, dependent_id, changed_at)
+                surviving_dependents.append(dependent_id)
                 continue
             linked_ids.extend(
                 _row_text(row, "asset_id")
@@ -2594,6 +2596,7 @@ class LocalStore:
                 "DELETE FROM memory_records WHERE memory_id = ?",
                 (dependent_id,),
             )
+        _restamp_dependent_evidence(connection, surviving_dependents, changed_at)
         cursor = connection.execute(
             "DELETE FROM memory_records WHERE memory_id = ?",
             (memory_id,),
@@ -3425,6 +3428,93 @@ class LocalStore:
                 batch = ids[offset : offset + _SQLITE_PARAMETER_BATCH // 3]
                 _merge_named_identity_links(connection, batch, named, links)
         return {memory_id: tuple(sorted(entries)) for memory_id, entries in sorted(links.items())}
+
+    def co_derived_events(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        valid_at: datetime | None = None,
+        known_at: datetime | None = None,
+        near: SpatialContext | None = None,
+        radius_m: float | None = None,
+        place_id: str | None = None,
+    ) -> dict[str, tuple[str, ...]]:
+        """Return, per memory, the active event records formed from the same observations.
+
+        The edge is shared evidence: an event is reported for a memory exactly when both cite
+        one `memory_evidence.source_memory_id`. That is co-occurrence inside one capture and
+        not a cause, and the memory itself is never its own co-derived event. The candidates are
+        then read through `read_memories(active_only=True)` under every scope axis a search
+        hydration applies, so a retired version, a hidden assertion, a forgotten record, and
+        anything outside the asked-for validity, pose, or place are all left out. That second
+        read is its own transaction: a `known_at` pins what both see, and without one a write
+        landing between them can only remove an event from the hop, never add one the join did
+        not already hold. Empty entries are dropped, so a missing key means no event shares this
+        memory's observations.
+        """
+        ids = tuple(dict.fromkeys(memory_ids))
+        for memory_id in ids:
+            _require_identifier(memory_id, "memory_id")
+        # Eagerly, because the hydration that would otherwise validate these is skipped whenever
+        # the join finds nothing.
+        _require_scope_axes(valid_at=valid_at, known_at=known_at, near=near, radius_m=radius_m)
+        _require_optional_identifier(place_id, "place_id")
+        if not ids:
+            return {}
+        # Both evidence sides are read as of the same transaction time the versions are, so a
+        # link retired after `known_at` still joins the pair it joined then.
+        current = "{alias}.retired_at IS NULL"
+        as_of = (
+            "{alias}.recorded_at <= ? AND ({alias}.retired_at IS NULL OR {alias}.retired_at > ?)"
+        )
+        clause = current if known_at is None else as_of
+        known_parameters: tuple[object, ...] = (
+            () if known_at is None else (_datetime_text(known_at), _datetime_text(known_at))
+        )
+        derived: dict[str, list[str]] = {}
+        # Half a batch: each statement binds the cue IDs once and the time bounds twice.
+        with self._read_transaction() as connection:
+            for offset in range(0, len(ids), _SQLITE_PARAMETER_BATCH // 2):
+                batch = ids[offset : offset + _SQLITE_PARAMETER_BATCH // 2]
+                placeholders = ", ".join("?" for _memory_id in batch)
+                for row in connection.execute(
+                    f"""
+                    SELECT DISTINCT cue.memory_id AS memory_id, ev.memory_id AS event_id
+                    FROM memory_evidence AS cue
+                    JOIN memory_evidence AS ev
+                        ON ev.source_memory_id = cue.source_memory_id
+                        AND ev.memory_id <> cue.memory_id
+                    JOIN memory_semantics AS s ON s.memory_id = ev.memory_id
+                    WHERE cue.memory_id IN ({placeholders}) AND s.kind = ?
+                      AND {clause.format(alias="cue")} AND {clause.format(alias="ev")}
+                    """,
+                    (*batch, MemoryKind.EVENT.value, *known_parameters, *known_parameters),
+                ).fetchall():
+                    derived.setdefault(_row_text(row, "memory_id"), []).append(
+                        _row_text(row, "event_id")
+                    )
+        if not derived:
+            return {}
+        candidates = tuple(
+            dict.fromkeys(event_id for events in derived.values() for event_id in events)
+        )
+        active = {
+            memory.memory_id
+            for memory in self.read_memories(
+                candidates,
+                valid_at=valid_at,
+                known_at=known_at,
+                near=near,
+                radius_m=radius_m,
+                place_id=place_id,
+                active_only=True,
+            )
+        }
+        return {
+            memory_id: standing
+            for memory_id, events in sorted(derived.items())
+            if (standing := tuple(sorted(event for event in events if event in active)))
+        }
 
     def identity_profile(self, identity_id: str) -> IdentityProfile | None:
         """Return one identity's profile, or None when it does not exist.
@@ -5872,6 +5962,105 @@ def _next_lineage_transaction_time(
     return _next_semantic_transaction_time(connection, proposed, memory_ids)
 
 
+# Independence is counted per capture: a raw observation resolves to the `source_id` its
+# `ObservationContext` carried, falling back to the observation record itself when the caller
+# supplied none. A derived source (an affect cue, say) inherits the group its own evidence
+# already resolves to, so two observations of one capture -- and every cue formed from them --
+# stay one group and cannot corroborate each other into a visible trait. A source resolving to
+# several groups keeps its own identity: nothing that traces back to a single capture can then
+# reach two groups. `MIN = MAX` says "exactly one distinct group" without the temp B-tree a
+# `COUNT(DISTINCT ...)` would build, and holds because `source_group_id` is `TEXT NOT NULL`.
+_SOURCE_GROUP_QUERY = """
+    SELECT COALESCE(
+        (
+            SELECT MIN(d.source_group_id)
+            FROM memory_evidence AS d
+            WHERE d.memory_id = r.memory_id AND d.retired_at IS NULL
+            HAVING MIN(d.source_group_id) = MAX(d.source_group_id)
+        ),
+        s.source_id,
+        r.memory_id
+    ) AS source_group_id
+    FROM memory_records AS r
+    LEFT JOIN memory_semantics AS s
+      ON s.memory_id = r.memory_id AND s.kind = 'observation'
+    WHERE r.memory_id = ?
+"""
+
+
+def _restamp_dependent_evidence(
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+    changed_at: datetime,
+) -> None:
+    """Re-resolve the inherited group on every row citing a record whose own evidence moved.
+
+    `source_group_id` is copied from the cited source when the citing row is written, so
+    reinforcing, rolling back, or cascading a delete through that source later leaves the rows
+    that cite it stamped with a group the source no longer resolves to -- and a dependent trait
+    keeps counting corroboration that is gone. Restamp the whole reachable citation subgraph in
+    the same transaction and reproject what changed.
+    """
+    closure: dict[str, None] = {}
+    frontier = list(dict.fromkeys(memory_ids))
+    while frontier:
+        source_memory_id = frontier.pop()
+        if source_memory_id in closure:
+            continue
+        closure[source_memory_id] = None
+        frontier.extend(
+            _row_text(row, "memory_id")
+            for row in connection.execute(
+                """
+                SELECT memory_id FROM memory_evidence
+                WHERE source_memory_id = ? AND retired_at IS NULL
+                """,
+                (source_memory_id,),
+            ).fetchall()
+        )
+    # A sweep in arbitrary order can restamp a record before one of its own sources settles, so
+    # sweep until nothing moves. The citation graph is acyclic, so each sweep settles at least
+    # one more record and the bound is only there to stop a corrupted cycle from spinning.
+    for _sweep in range(len(closure)):
+        moved = False
+        for source_memory_id in closure:
+            row = connection.execute(_SOURCE_GROUP_QUERY, (source_memory_id,)).fetchone()
+            if row is None:
+                continue
+            group = _row_text(row, "source_group_id")
+            dependent_ids = tuple(
+                dict.fromkeys(
+                    _row_text(dependent, "memory_id")
+                    for dependent in connection.execute(
+                        """
+                        SELECT memory_id FROM memory_evidence
+                        WHERE source_memory_id = ?
+                          AND retired_at IS NULL AND source_group_id <> ?
+                        """,
+                        (source_memory_id, group),
+                    ).fetchall()
+                )
+            )
+            if not dependent_ids:
+                continue
+            moved = True
+            connection.execute(
+                """
+                UPDATE memory_evidence SET source_group_id = ?
+                WHERE source_memory_id = ? AND retired_at IS NULL
+                """,
+                (group, source_memory_id),
+            )
+            for dependent_id in dependent_ids:
+                _refresh_evidence_projection(
+                    connection,
+                    dependent_id,
+                    _next_semantic_transaction_time(connection, changed_at, (dependent_id,)),
+                )
+        if not moved:
+            break
+
+
 def _insert_memory_evidence(
     connection: sqlite3.Connection,
     memory_id: str,
@@ -5891,16 +6080,7 @@ def _insert_memory_evidence(
         is not None
     ):
         return False
-    source = connection.execute(
-        """
-        SELECT COALESCE(s.source_id, r.memory_id) AS source_group_id
-        FROM memory_records AS r
-        LEFT JOIN memory_semantics AS s
-          ON s.memory_id = r.memory_id AND s.kind = 'observation'
-        WHERE r.memory_id = ?
-        """,
-        (source_memory_id,),
-    ).fetchone()
+    source = connection.execute(_SOURCE_GROUP_QUERY, (source_memory_id,)).fetchone()
     if source is None:
         raise sqlite3.IntegrityError("evidence source memory does not exist")
     position_row = connection.execute(
@@ -5929,6 +6109,9 @@ def _insert_memory_evidence(
             _datetime_text(recorded_at),
         ),
     )
+    # This record's own active evidence just changed, so whatever cites it may now inherit a
+    # different group.
+    _restamp_dependent_evidence(connection, (memory_id,), recorded_at)
     return True
 
 
@@ -6500,6 +6683,7 @@ def _retire_memory_evidence(
             memory_id,
             _next_semantic_transaction_time(connection, retired_at, (memory_id,)),
         )
+    _restamp_dependent_evidence(connection, tuple(dict.fromkeys(changed)), retired_at)
     return tuple(dict.fromkeys(changed))
 
 
@@ -7238,6 +7422,31 @@ def _memory_from_row(
     )
 
 
+def _require_scope_axes(
+    *,
+    valid_at: datetime | None,
+    known_at: datetime | None,
+    near: SpatialContext | None,
+    radius_m: float | None,
+) -> None:
+    """Validate the scope axes a hydration reads under, for callers that may not reach one."""
+    if (near is None) != (radius_m is None):
+        raise ValueError("near and radius_m must be supplied together")
+    if near is not None and not isinstance(near, SpatialContext):
+        raise ValueError("near must be a SpatialContext")
+    if radius_m is not None and (
+        isinstance(radius_m, bool)
+        or not isinstance(radius_m, int | float)
+        or not math.isfinite(float(radius_m))
+        or radius_m < 0
+    ):
+        raise ValueError("radius_m must be a non-negative finite number")
+    if valid_at is not None:
+        _require_aware(valid_at, "valid_at")
+    if known_at is not None:
+        _require_aware(known_at, "known_at")
+
+
 def _memory_in_scope(
     row: sqlite3.Row,
     *,
@@ -7290,21 +7499,7 @@ def _select_memory_contexts(  # noqa: C901 - one authoritative bitemporal select
     """
     if not memory_ids:
         return {}, frozenset()
-    if (near is None) != (radius_m is None):
-        raise ValueError("near and radius_m must be supplied together")
-    if near is not None and not isinstance(near, SpatialContext):
-        raise ValueError("near must be a SpatialContext")
-    if radius_m is not None and (
-        isinstance(radius_m, bool)
-        or not isinstance(radius_m, int | float)
-        or not math.isfinite(float(radius_m))
-        or radius_m < 0
-    ):
-        raise ValueError("radius_m must be a non-negative finite number")
-    if valid_at is not None:
-        _require_aware(valid_at, "valid_at")
-    if known_at is not None:
-        _require_aware(known_at, "known_at")
+    _require_scope_axes(valid_at=valid_at, known_at=known_at, near=near, radius_m=radius_m)
     query_valid_at = valid_at or datetime.now(timezone.utc)
     query_known_at = known_at or datetime.now(timezone.utc)
 

@@ -1964,6 +1964,16 @@ class Page:
             _text(self.next_cursor, "next_cursor")
 
 
+# The one-line reading guide `ContextBundle.render()` writes under the goal. A module constant
+# because `context._frame_cost` charges its length against `max_chars`: a second copy of the
+# sentence drifted from this one the moment the affect marks were added to it, and the header was
+# then priced 78 characters short of what it rendered.
+CONTEXT_READING_GUIDE = (
+    "Each line is one memory: [id] content (confidence; validity; for affect also basis,"
+    " cue, valence, arousal, source and co-occurring event ids)."
+)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ContextBudget:
     """The size, type, confidence, and freshness bounds one context compilation may spend.
@@ -2132,6 +2142,47 @@ class ContextUnknown:
         object.__setattr__(self, "detail", _text(self.detail, "unknown detail"))
 
 
+# How many IDs one rendered line may name, and how many co-derived events one cue carries. The
+# marks are charged, because `bundle_cost` prices `render_hit_line` and they are part of it, but
+# they are bounded by a constant too so one capture's fan-out cannot dominate a line: two lists
+# of at most this many IDs, plus a short `+N more` when truncated.
+_MAX_CUE_IDS = 8
+
+
+@dataclass(frozen=True, slots=True)
+class AffectCue(SearchHit):
+    """One affect hit in a compiled bundle, carrying the evidence the cue hangs on.
+
+    An affect entry asserts something about how somebody felt, so a reader has to be able to
+    tell a model's inference from a person's own statement. `context.basis`, `confidence`,
+    `cue_modality`, `valence`, and `arousal` already carry that, and `render()` prints all five
+    on the line rather than leaving them to a caller who may never look.
+
+    The observations the cue cites are its own `context.evidence_ids`, which every transport
+    already carries. `event_ids` are the active `EVENT` records formed from at least one of
+    those same observations: **co-occurrence inside one capture, never an attributed cause**.
+    Nothing here says the event caused the feeling, or even that the cue is about the event;
+    both were derived from the same thing somebody observed. Only the IDs are carried, so the
+    hop grounds nothing and buys no item slot: no event is fetched, `get()` reads an event's text
+    when a caller decides it wants it, and an event the ranking already bought appears in
+    `episodes` on its own merit. The IDs the line does print are charged like any other rendered
+    characters, so `ContextBundle.chars` still bounds `render()`. At most eight events are
+    carried, so one cue's hop is bounded however many events one capture formed.
+    """
+
+    event_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # `slots=True` rebuilds the class, so the zero-argument `super()` cell would name the
+        # pre-rebuild class. The base validation is called explicitly for that reason.
+        SearchHit.__post_init__(self)
+        object.__setattr__(
+            self,
+            "event_ids",
+            tuple(dict.fromkeys(_text(value, "affect cue event_ids") for value in self.event_ids)),
+        )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ContextBundle:
     """One bounded, structured context view compiled for a goal."""
@@ -2145,7 +2196,8 @@ class ContextBundle:
     episodes: tuple[SearchHit, ...]
     facts: tuple[SearchHit, ...]
     procedures: tuple[SearchHit, ...]
-    affect: tuple[SearchHit, ...]
+    # Evidence-first: an affect entry carries its provenance and its one co-occurrence hop.
+    affect: tuple[AffectCue, ...]
     traits: tuple[SearchHit, ...]
     conflicts: tuple[ContextConflict, ...]
     unknowns: tuple[ContextUnknown, ...]
@@ -2157,6 +2209,13 @@ class ContextBundle:
     chars: int
     elapsed_ms: int
     deadline_exceeded: bool
+
+    def __post_init__(self) -> None:
+        # The affect section is the one whose entries carry more than a hit does, and every
+        # transport reads that extra without asking. A plain hit here would serialize as an
+        # affect cue with an empty hop, so the type is enforced rather than defaulted.
+        if any(not isinstance(cue, AffectCue) for cue in self.affect):
+            raise ValidationError("affect entries must be AffectCue")
 
     @property
     def hits(self) -> tuple[SearchHit, ...]:
@@ -2177,7 +2236,7 @@ class ContextBundle:
         included = len(self.hits)
         lines = [
             f"# Context: {self.goal}",
-            "Each line is one memory: [id] content (confidence; validity).",
+            CONTEXT_READING_GUIDE,
             f"Reference time: {self.reference_at.isoformat()}",
             f"Budget: {self.chars}/{self.budget.max_chars} chars, "
             f"{included}/{self.budget.max_items} items",
@@ -2250,9 +2309,51 @@ def render_hit_line(hit: SearchHit) -> str:
     come from the same function and cannot drift.
     """
     confidence = 1.0 if hit.context is None else hit.context.confidence
-    marks = f"confidence {confidence:.2f}{_validity(hit)}"
+    marks = f"confidence {confidence:.2f}{_affect_marks(hit)}{_validity(hit)}{_affect_hop(hit)}"
     # One hit is one line, so stored newlines collapse rather than break the section shape.
     return f"- [{hit.id}] {' '.join(hit.content.split())} ({marks})"
+
+
+def _affect_marks(hit: SearchHit) -> str:
+    """Render an affect cue's provenance inline, so an inference never reads as a statement."""
+    context = hit.context
+    if not isinstance(hit, AffectCue) or context is None:
+        return ""
+    marks = f"; basis {context.basis.value}"
+    if context.cue_modality is not None:
+        marks += f"; cue {context.cue_modality.value}"
+    if context.valence is not None:
+        marks += f"; valence {context.valence:.2f}"
+    if context.arousal is not None:
+        marks += f"; arousal {context.arousal:.2f}"
+    return marks
+
+
+def _affect_hop(hit: SearchHit) -> str:
+    """Render the cue's own evidence and the events it co-occurs with, as IDs only."""
+    if not isinstance(hit, AffectCue):
+        return ""
+    marks = ""
+    evidence_ids = () if hit.context is None else hit.context.evidence_ids
+    if evidence_ids:
+        marks += f"; from {_id_list(evidence_ids)}"
+    if hit.event_ids:
+        # Named for what the edge is: both records were formed from one observation. It is not
+        # a claim that the event caused the feeling.
+        marks += f"; co-occurring events {_id_list(hit.event_ids)}"
+    return marks
+
+
+def _id_list(memory_ids: Sequence[str]) -> str:
+    """Render an ID list, truncated, so one line's marks stay bounded by a constant.
+
+    A capture with a hundred observations must not turn one memory into a paragraph the budget
+    never charged for. The count of what was dropped is kept, so a truncated line still says
+    that more exists.
+    """
+    shown = ", ".join(f"[{memory_id}]" for memory_id in memory_ids[:_MAX_CUE_IDS])
+    remaining = len(memory_ids) - _MAX_CUE_IDS
+    return shown if remaining <= 0 else f"{shown}, +{remaining} more"
 
 
 def _validity(hit: SearchHit) -> str:

@@ -152,6 +152,9 @@ A typed `MemoryKind` decides the section first; an untyped or generic record fal
 | `affect` | Kind `affect` |
 | `traits` | Kind `trait` |
 
+The `affect` section carries `AffectCue`, not a plain hit; [affect cues](#affect-cues) below is
+its contract. Every other section carries `SearchHit`.
+
 `actors`, `relationships`, `scene`, `affect`, and `traits` are keyed on `MemoryKind`. A stored
 record is kind `observation` unless a validated `FormationProposal` typed it, so all five sections
 stay empty in a composition with neither a `FormationBackend` nor a `ConsolidationBackend`.
@@ -243,6 +246,58 @@ has left after the ranked hits, in identity order, named actors before provision
 dropped -- not appended for free -- when it does not fit. `render()` prints one plainly labelled
 line per entry, after the ranked actors.
 
+## Affect cues
+
+An affect entry asserts how somebody felt, which is the one section where the difference between
+a model's guess and a person's own words changes what an agent may say. So `affect` carries
+`AffectCue`: every `SearchHit` field, plus `event_ids`, and `render()` prints the provenance on
+the line instead of leaving it in `context` for a caller who may never look.
+
+| On the line | Read from | Meaning |
+| --- | --- | --- |
+| `basis` | `context.basis` | `user_statement` when somebody said it, `model_inference` when a model concluded it |
+| `confidence` | `context.confidence` | The typed confidence, the same number `min_confidence` filters on |
+| `cue` | `context.cue_modality` | Which modality the cue was read from; formation must name a modality the source actually carries |
+| `valence` | `context.valence` | -1 through 1 |
+| `arousal` | `context.arousal` | 0 through 1 |
+| `from` | `context.evidence_ids` | The observations this cue cites |
+| `co-occurring events` | `AffectCue.event_ids` | Events formed from at least one of those same observations |
+
+`cue`, `valence`, `arousal`, and either ID list are omitted from the line when the record does
+not carry them. Both lists name at most eight IDs, so an affect line stays bounded by a constant
+however many events one capture formed. The marks are charged against `max_chars` like the rest of
+the line -- `bundle_cost` prices what `render_hit_line` writes -- while the events themselves are
+never fetched or grounded. The two lists are bounded in different places,
+and the line reads differently as a result. `from` is the cue's own `context.evidence_ids`, which
+the compiler does not truncate, so the list is cut at render time and ends in a `+N more` count.
+`co-occurring events` is capped when the cue is built, so the hop the compiler resolves is bounded
+and not merely its rendering: the line names up to eight events and stops, without a count of the
+rest. A cue that names eight events therefore does not say whether the capture formed only those
+eight; read the cue's evidence with `get()` when the full co-occurrence set matters. Non-affect
+sections keep the plain `[id] content (confidence; validity)` line.
+
+```text
+## Affect
+- [i9j0] the user sounded tense about the deadline (confidence 0.72; basis model_inference; cue audio; valence -0.20; arousal 0.80; from [e5f6]; co-occurring events [k1l2])
+```
+
+**`event_ids` is co-occurrence, not cause.** An event is reported for a cue exactly when the two
+records share a `memory_evidence` source: both were derived from one thing that was observed.
+Nothing in the bundle claims the event caused the feeling, or even that the cue is about the
+event, and the compiler asserts no such edge across two different observations. That is why the
+field is named for what it is rather than `about` or `triggered_by`.
+
+The hop is one batched store read per `compile`, never one per cue. It runs after selection, for
+the affect entries the budget actually bought rather than every candidate retrieval ranked, and
+it is skipped entirely once `max_latency_ms` has passed -- optional work, like conflict
+detection, and the same `stage_skipped` unknown reports both. It is subject to the same rules
+retrieval hydrated the hits under: a retired version, a hidden assertion, a forgotten record, and
+anything outside the requested `valid_at`/`known_at` window are all excluded, and `event_ids` is
+sorted so two compilations of one store render the same line. Only IDs are
+carried: the events are not fetched, they cost no characters and no item slot, and they are not
+added to `episodes`. A co-derived event that appears in `episodes` earned that slot from its own
+score. Read an event's text with `get()`.
+
 ## Conflicts
 
 Candidates that share a `lineage_id`, carry kind `state`, `relation`, or `trait`, and disagree on
@@ -272,7 +327,7 @@ appears without the `## Unknowns` block above it.
 
 ```text
 # Context: what should I bring to the workshop?
-Each line is one memory: [id] content (confidence; validity).
+Each line is one memory: [id] content (confidence; validity; for affect also basis, cue, valence, arousal, source and co-occurring event ids).
 Reference time: 2026-09-03T12:00:00+00:00
 Budget: 132/16000 chars, 3/24 items
 

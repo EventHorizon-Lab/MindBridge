@@ -53,6 +53,7 @@ from mindbridge.plugins import MemoryConfig, MemoryPlugins, MemorySettings
 from mindbridge.types import (
     AbstentionReason,
     AcousticBoundary,
+    AffectCue,
     AnswerChunk,
     AnswerResult,
     ASRPartial,
@@ -128,6 +129,7 @@ __all__ = [
     "ASRPartial",
     "AbstentionReason",
     "AcousticBoundary",
+    "AffectCue",
     "AnswerChunk",
     "AnswerResult",
     "AssetRef",
