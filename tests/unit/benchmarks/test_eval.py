@@ -665,7 +665,16 @@ def test_response_cache_namespace_changes_with_runner_recipe(
     assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v10"
     arguments = cast(
         eval_module._Arguments,
-        SimpleNamespace(device=None, seed=7, gen_kwargs="{}", recall_limit=8, blind=False),
+        SimpleNamespace(
+            device=None,
+            seed=7,
+            gen_kwargs="{}",
+            recall_limit=8,
+            blind=False,
+            ingest="add",
+            compile_max_items=24,
+            compile_max_chars=16000,
+        ),
     )
     before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
 
@@ -951,6 +960,9 @@ def test_eval_config_reuses_the_declarative_memory_schema(tmp_path: Path) -> Non
             recall_limit=20,
             model="mindbridge",
             blind=False,
+            ingest="add",
+            compile_max_items=24,
+            compile_max_chars=16000,
         ),
     )
     effective = eval_module._evaluation_memory_config(loaded, model, arguments)

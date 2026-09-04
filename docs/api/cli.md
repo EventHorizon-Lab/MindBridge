@@ -2,7 +2,7 @@
 
 ## Surface
 
-`mindbridge` provides 27 SDK operation commands plus `doctor`; each invocation runs one command in
+`mindbridge` provides 35 SDK operation commands plus `doctor`; each invocation runs one command in
 one process and emits one JSON result. Local commands dispatch to the corresponding `Memory`
 method, except for the diagnostic `doctor`; remote commands forward to a running owner's `/v1`
 route. The CLI owns argument decoding, composition selection, JSON projection, and exit-code
@@ -96,22 +96,29 @@ credential behavior live in [configuration](../configuration.md).
 | `pending-captures` | optional `MEMORY_ID...`; `--limit` | `{"pending":[...]}` | no |
 | `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
 | `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | no |
-| `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope` | answer object | yes |
-| `compile` | content; `--max-chars`; `--max-items`; repeatable `--memory-type`; `--min-confidence`; `--freshness-seconds`; `--max-latency-ms`; `--reference-at`; `--scope` | context bundle plus `rendered` | yes |
+| `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--link-identities`/`--no-link-identities` | answer object | yes (`--link-identities` is local-only) |
+| `compile` | content; `--max-chars`; `--max-items`; `--max-media-items`; repeatable `--memory-type`; `--min-confidence`; `--freshness-seconds`; `--max-latency-ms`; `--reference-at`; `--scope` | context bundle plus `rendered` | yes |
 | `get` | `MEMORY_ID` | memory object | yes |
 | `speech` | `MEMORY_ID` | `{"segments":[...]}` | no |
 | `faces` | `MEMORY_ID` | `{"observations":[...]}` | no |
 | `register-speaker` | `SPEAKER_ID NAME`; `--relationship` | `{}` | no |
 | `register-identity` | `IDENTITY_ID NAME`; `--relationship` | `{}` | no |
 | `identity` | `IDENTITY_ID` | `{"identity":{...}}` or `{"identity":null}` | no |
+| `record-consent` | `IDENTITY_ID STATE`; `--note` | `{"operation":{...}}` or `{"operation":null}` | no |
+| `consent` | `IDENTITY_ID` | `{"consent":"granted"}` or `{"consent":null}` | no |
 | `forget-identity` | `IDENTITY_ID` | erasure counts | no |
 | `unlink-identity` | `ALIAS_ID` | `{"restored_identity_id":...}` | no |
 | `reinforce` | one or more `MEMORY_ID` values | `{"reinforced":int}` | no |
-| `consolidation-candidates` | `--limit` | `{"candidates":[{"trigger":...,"memory_ids":[...],"evidence_count":int}]}` | no |
-| `consolidate` | optional goal content; `--evidence-id`; `--limit`; `--trigger` | `{"operations":[...],"rejected":[...]}` | no |
+| `consolidation-candidates` | `--limit`; `--idle` | `{"candidates":[{"trigger":...,"memory_ids":[...],"evidence_count":int}]}` | no |
+| `consolidate` | optional goal content; `--evidence-id`; `--limit`; `--trigger` | `{"operations":[...],"rejected":[...],"weighed":int}` | no |
+| `deliberate` | `--limit`; `--max-rounds`; `--idle` | `{"rounds":int,"weighed":int,"skipped":int,"applied":int,"rejected":int,"model_calls":int}` | no |
+| `apply` | `--operation` | `{"operation":{...}}` | no |
+| `record-outcome` | `OPERATION_ID OUTCOME`; `--note` | `{"recorded":bool}` | no |
 | `forget` | one or more `MEMORY_ID` values | `{"operation":{...}}` or `{"operation":null}` | no |
 | `rollback` | `OPERATION_ID` | `{"rolled_back":bool}` | no |
 | `operations` | `--limit` | `{"operations":[...]}` | no |
+| `export` | exactly one of `--identity-id` or repeatable `--memory-id` | export bundle | no |
+| `apply-retention` | `--dry-run` | retention report | no |
 | `list` | `--limit`; `--cursor` | `{"items":[...],"next_cursor":...}` | yes |
 | `delete` | `MEMORY_ID` | `{"deleted":bool}` | yes |
 | `reindex` | none | `{"memories":int}` | no |
@@ -121,8 +128,8 @@ credential behavior live in [configuration](../configuration.md).
 Defaults match the SDK: `add`, `add-many`, `add-stream`, and `capture` use
 `memory_type=semantic`; search uses `limit=10`; ask uses `limit=5`; list, `settle`,
 `pending-captures`, and `operations` use `limit=100`; `settle` also uses `max-attempts=3`;
-`consolidate` and `consolidation-candidates` use `limit=32`,
-and `consolidate` defaults to `trigger=manual`; optional
+`consolidate`, `consolidation-candidates`, and `deliberate` use `limit=32`, `consolidate` defaults
+to `trigger=manual`, and `deliberate` also defaults to `max-rounds=4`; optional
 retrieval roles and timestamps are unset. Timestamps must be timezone-aware ISO 8601 values.
 Cursors are opaque and passed through unchanged. `ask` requires the selected composition to supply an answerer. `speech` and `faces`
 return an empty result without a model call when the record has no corresponding media; otherwise
@@ -130,9 +137,61 @@ they require the matching capability. `compile` mirrors the
 [`ContextBudget` defaults](../context-compilation.md#budget) and repeats `--memory-type` to keep
 more than one type; `--max-latency-ms` is a deadline the compiler checks between stages, and the
 printed bundle carries `elapsed_ms`, `deadline_exceeded`, and `unknowns` alongside its sections.
+Each row `operations` prints carries `operation_id`, `intent`, `trigger`, `evidence_ids`,
+`target_ids`, `claim`, `consent`, `identity`, `rationale`, `model_id`, `recipe`, `created_ids`,
+`changed_ids`, `forgotten_ids`, `superseded`, `applied_at`, `rolled_back_at`, `outcome`, and
+`outcome_note` -- the same fields `apply` and `record-outcome` print back for the one operation
+each names. `identity` is
+set on the three rows that name a person instead of records -- the cross-modal `merge` the kernel
+commits, the `correct` that `unlink-identity` logs, and the irreversible `forget` that
+`forget-identity` logs -- and is `null` on every other row. `claim` carries the name an `identify`
+row asserted and `consent` the state a `consent` row recorded, so a row about a person always says
+what it said about them. `outcome` and `outcome_note` are `null` until `record-outcome` names the
+operation, are post-hoc and never fed back into a decision, and a later `record-outcome` call
+replaces an earlier judgement the same way `rollback` replaces a standing operation.
+
+`consolidation-candidates`'s `--idle` declares an approved idle window, admitting lineages
+nothing has ever weighed; the CLI never infers idleness from a clock. `deliberate` runs
+`consolidation-candidates` and `consolidate` in a loop, each round consolidating every row
+`consolidation-candidates` returns with that row's own trigger, until a round yields no
+candidates or `--max-rounds` is reached; the counters it prints are summed across every round,
+and its own `--idle` passes the same declaration through to `consolidation-candidates` on every
+round. `apply` applies one host-supplied operation -- read from `--operation` in the same JSON
+shape `operations` logs a row in -- through the same kernel validation a proposal gets, which is
+the public replay path: reproducing a logged sequence against a fresh store configured with the
+recipe that produced it reproduces the same derived IDs. A refused operation exits
+`validation_error` naming the kernel's rejection reason.
+
+`record-consent` takes `granted`, `withheld`, or `withdrawn`, and prints the logged operation, or
+`null` when that statement already stands. `consent` reads back the standing state, where `null`
+means nobody has recorded one. What the two restrained states change is listed under
+[consent](python-sdk.md#consent).
+
+`export` prints `exported_at`, `identity_id`, `identities`, `records`, and `operations` -- every
+version of every record the subject appears in or is named by, and every log row that moved any of
+it. Media is named by asset identity and digest; no bytes are printed, so a document stays safe to
+pipe. `apply-retention` prints `dry_run`, `media_memory_ids`, `forgotten_memory_ids`, `asset_ids`,
+`capture_memory_ids`, and `deleted`; it deletes through the same path as `delete`, so
+[what `delete` removes](python-sdk.md#what-delete-removes) applies unchanged. Start with
+`--dry-run`.
+
+`apply-retention` acts on the policy the composition declares. An `--embedder` composition
+declares none, so it deletes nothing and reports empty lists; use `--app` with a memory built from
+a configuration that has a [`retention` section](../configuration.md#retention-policy). The CLI
+deliberately has no flag for the ages: a policy that deletes should be reviewable in a file, not
+retyped on each invocation.
+
 `forget` is cognitive forgetting, reversible with `rollback`; `delete` is erasure. With the
 default `reinforce_on_answer=True`, `ask` also reinforces the hits the answerer cites; use
 `--app` to construct a memory with that policy disabled.
+
+`ask` may run face recognition on a retrieved photo or video before answering. With the default
+`--link-identities` (true), a voice-and-face pair corroborated across enough assets is fused into
+one identity and logged as a `merge` row, the same as `analyze_faces`; `--no-link-identities`
+still runs recognition to answer the question but never commits that bind. `--url` compositions
+send no such request to REST: `POST /v1/answers` decides the same question from `create_app`'s own
+`embodied_operations` switch instead, so `--link-identities` has no effect there and the remote
+answerer links identities only when the host has opted in to embodied operations.
 
 ### Content and JSONL input
 
@@ -269,9 +328,12 @@ exit 130 use their conventional plain stderr diagnostics.
 ### Operations without a remote route
 
 With `--url`, only `add`, `add-many`, `search`, `ask`, `compile`, `get`, `list`, `delete`, and
-`doctor` are available. Other commands exit 10 with `unsupported_in_remote_mode`. Their SDK
-operations have no REST route except `reinforce`: REST exposes `POST /v1/memories/reinforce`, but
-the CLI does not currently wire that route into remote mode. The complete route boundary is listed in
+`doctor` are available. Other commands exit 10 with `unsupported_in_remote_mode`, whether or not
+their operation has a REST route: `reinforce`, `capture`, `settle`, and `pending-captures` always
+have one, and `speech`, `faces`, `register-identity`, `identity`, `unlink-identity`,
+`forget-identity`, `record-consent`, `consent`, `export`, and `apply-retention` have one when the
+owner enables the matching switch, but the CLI does not
+currently wire any of those routes into remote mode. The complete route boundary is listed in
 [REST operations without a route](rest.md#operations-without-a-route).
 
 ### Input limits

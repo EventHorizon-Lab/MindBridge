@@ -18,12 +18,15 @@ from mindbridge.models.base import (
     TranscriptionBackend,
     VisionDescriptionBackend,
 )
-from mindbridge.types import IndexQuantization
+from mindbridge.types import IndexQuantization, RetentionPolicy
 
 _StrictBool = Annotated[bool, Field(strict=True)]
 _UnitInterval = Annotated[float, Field(strict=True, ge=0, le=1)]
 _PositiveFloat = Annotated[float, Field(strict=True, gt=0)]
 _PositiveInt = Annotated[int, Field(strict=True, gt=0)]
+# One shared immutable "no age is declared" value, so the constructor default and the settings
+# default are the same object rather than two that have to be kept equal.
+_NO_RETENTION = RetentionPolicy()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -154,6 +157,26 @@ class MemoryConfig:
     face_similarity: _UnitInterval = 0.363
     face_margin: _UnitInterval = 0.05
     identity_link_min_assets: _PositiveInt = 2
+    # The PRESSURE trigger's whole definition: how many active records this instance is meant to
+    # hold. `None` -- the default -- means the host has declared no budget, and no amount of
+    # growth is evidence that consolidating or forgetting anything is useful, so the trigger
+    # derives nothing. A count rather than bytes on disk because that is the quantity the
+    # deliberation acts on (records to consolidate or forget) and the one a host can reason about
+    # without knowing how media is stored.
+    memory_budget_records: _PositiveInt | None = None
+    # How far back `consolidation_candidates` looks for repeated recall failures. Two or more
+    # near-equal queries that returned nothing inside this window are one QUERY_FAILURE
+    # candidate; one failure is not a signal, and a failure from last month is not this week's
+    # gap. One hour matches an interactive session.
+    query_failure_window_seconds: _PositiveFloat = 3600.0
+    # How many recall failures the store keeps at all. The table is a bounded signal buffer, not
+    # a query log: the oldest rows falling out is the retention policy.
+    query_failure_history: _PositiveInt = 512
+    # What `apply_retention()` is allowed to delete. Declarative configuration spells it as its
+    # own `retention` section rather than a field in here, because every other setting shapes
+    # what recall returns and can be changed back, and this one deletes. Empty by default: no
+    # age is declared, so nothing ages out.
+    retention: RetentionPolicy = _NO_RETENTION
 
 
 # Clearer name for new code; keep the original public value intact for compatibility.

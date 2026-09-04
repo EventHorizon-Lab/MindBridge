@@ -360,25 +360,32 @@ the replacement is built from.
 
 ### What needs deliberation
 
-`consolidation_candidates()` derives due work from committed state rather than from a clock, so a
-host loop has a durable trigger instead of a timer:
+`consolidation_candidates()` derives due work from committed state rather than from a clock, so
+the loop has a durable trigger instead of a timer, and `deliberate()` is that loop:
 
 ```python
-for candidate in memory.consolidation_candidates():
-    memory.consolidate(evidence_ids=candidate.memory_ids, trigger=candidate.trigger)
+report = memory.deliberate(idle=is_charging_and_idle)
 ```
 
-`EVIDENCE` rows are derived records that gained independent evidence no standing operation has
-weighed — what the formation path leaves behind. `CONTRADICTION` rows are lineages whose current
-visible claims disagree, and clear when a `CORRECT` retires one side. `FEEDBACK` rows are records
-confirmed through `reinforce()`, or cited by an `ask()` answer under the default
-`reinforce_on_answer`, since an operation last saw them. `QUERY_FAILURE`, `PRESSURE`, and
-`IDLE` stay labels a caller may pass: nothing durable records them today, and adding bookkeeping
-for a trigger no host asks for would be a scheduler by another name.
+One round asks what is due, consolidates each row under the row's own trigger, and repeats
+because applying operations can make further work due. It ends when nothing is due, which the
+report distinguishes from hitting `max_rounds`. The two primitives stay available for a host that
+wants to schedule the halves itself.
 
-A periodic timer alone is not evidence that the work is useful. See the
-[Python SDK reference](api/python-sdk.md#memory-management-operations) for signatures, effects, and
-rollback behavior.
+`EVIDENCE` rows are derived records that gained independent evidence nothing has weighed — what
+the formation path leaves behind. `CONTRADICTION` rows are lineages whose current visible claims
+disagree. `FEEDBACK` rows are records confirmed through `reinforce()`, or cited by an `ask()`
+answer under the default `reinforce_on_answer`. `QUERY_FAILURE` rows are near-equal recalls that
+came back empty at least twice inside the configured window, named against the nearest records
+the store does hold. `PRESSURE` rows appear only over a declared `memory_budget_records`, because
+growth alone is not evidence that forgetting is useful. `IDLE` rows appear only when the operator
+passes `idle=True`, because whether the device is idle or charging is the host's knowledge.
+
+A periodic timer alone is not evidence that the work is useful — and neither is a candidate that
+always comes back, so each pass records that it weighed its evidence set whatever it yielded, and
+a candidate is not derived again until its own signal moves. See the
+[Python SDK reference](api/python-sdk.md#memory-management-operations) for signatures, effects,
+outcome recording, and rollback behavior.
 
 ## Decay and reinforcement
 

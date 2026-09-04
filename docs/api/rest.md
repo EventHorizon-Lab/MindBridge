@@ -2,9 +2,25 @@
 
 ## Surface
 
-The optional FastAPI adapter exposes nine `Memory` operations under `/v1`. It validates transport
-input, calls the injected synchronous memory, and serializes the public SDK values; it is not a
-separate storage or retrieval implementation.
+The optional FastAPI adapter exposes twelve `Memory` operations under `/v1`, or twenty-two when
+the host builds it with `identity_operations=True` and `embodied_operations=True`. It validates
+transport input, calls the injected synchronous memory, and serializes the public SDK values; it
+is not a separate storage or retrieval implementation.
+
+The fast-capture plane -- `capture`, `settle`, and `pending_captures` -- is always on: it is an
+ordinary application operation on the caller's own records, not administrative authority over a
+person, so it needs no opt-in switch. Naming, reading, splitting, or erasing an identity, and
+running face or speech analysis, are different: both switches default to off, mirroring
+`build_mcp_server`'s own `identity_operations`, because REST is a network surface and the
+[interfaces model](../context-os.md#interfaces) keeps that authority host-side unless the host
+opts in. A switched-off route is never registered, so a caller gets 404 rather than 403 and cannot
+discover through the error what an enabled deployment would offer:
+
+```python
+from mindbridge.api import create_app
+
+app = create_app(memory=memory, identity_operations=True, embodied_operations=True)
+```
 
 REST accepts finalized media. Live audio packets, vision frames, partials, and scene boundaries
 have no client-streaming route; run `AsyncAudioStream`, `AsyncVisionStream`, or
@@ -110,6 +126,24 @@ SDK validator and error contract.
 | `DELETE /v1/memories/{memory_id}` | `deleteMemory` | non-empty path value | `200 {"deleted":bool}` |
 | `POST /v1/answers` | `answer` | `AnswerRequest` | `200 AnswerResponse` |
 | `POST /v1/context` | `compileContext` | `ContextRequest` | `200 ContextBundleResponse` |
+| `POST /v1/capture` | `captureMemory` | `MemoryCreate` | `201 MemoryResponse` |
+| `POST /v1/settle` | `settleCaptures` | `SettleRequest` | `200 {"settled":int}` |
+| `GET /v1/pending_captures` | `pendingCaptures` | `limit`, `memory_ids` query parameters | `200 {"items":[PendingCaptureResponse,...]}` |
+
+The next ten exist only when the host enables the matching switch:
+
+| Method and path | Operation ID | Input | Success | Switch |
+| --- | --- | --- | --- | --- |
+| `POST /v1/speech` | `analyzeSpeech` | `AnalyzeRequest` | `200 {"segments":[...]}` | `embodied_operations` |
+| `POST /v1/faces` | `analyzeFaces` | `AnalyzeRequest` | `200 {"observations":[...]}` | `embodied_operations` |
+| `POST /v1/identities` | `registerIdentity` | `IdentityRegisterRequest` | `200 {"registered":true}` | `identity_operations` |
+| `GET /v1/identities/{identity_id}` | `getIdentity` | non-empty path value | `200 {"identity":IdentityProfile\|null}` | `identity_operations` |
+| `POST /v1/identities/{alias_id}/unlink` | `unlinkIdentity` | non-empty path value | `200 {"restored_identity_id":str\|null}` | `identity_operations` |
+| `DELETE /v1/identities/{identity_id}` | `forgetIdentity` | non-empty path value | `200 {"erasure":IdentityErasure}` | `identity_operations` |
+| `POST /v1/identities/{identity_id}/consent` | `recordConsent` | `ConsentRequest` | `200 {"operation":MemoryOperationResponse\|null}` | `identity_operations` |
+| `GET /v1/identities/{identity_id}/consent` | `getConsent` | non-empty path value | `200 {"consent":ConsentState\|null}` | `identity_operations` |
+| `GET /v1/export` | `exportSubject` | `identity_id` or `memory_ids` query parameters | `200 ExportResponse` | `identity_operations` |
+| `POST /v1/retention` | `applyRetention` | `RetentionRequest` | `200 RetentionResponse` | `identity_operations` |
 
 Request fields and defaults are:
 
@@ -120,8 +154,13 @@ Request fields and defaults are:
 | `QueryRequest` | required `query`; `limit=10`; `explain=false`; optional `memory_type`, `reference_at`, `occurred_from`, `occurred_until`, `scope` |
 | `ReinforceRequest` | required `memory_ids` with 1–100 IDs |
 | `AnswerRequest` | required `question`; `limit=5`; optional `memory_type`, `reference_at`, `scope` |
+| `ConsentRequest` | required `state` (`granted`, `withheld`, or `withdrawn`); optional `note` |
+| `RetentionRequest` | `dry_run=false` |
 | `ContextRequest` | required `goal`; optional `budget`, `reference_at`, `scope` |
-| `ContextBudgetRequest` | `max_chars=16000`; `max_items=24`; `min_confidence=0.0`; optional `memory_types` with at least one value; optional `freshness_seconds`; optional `max_latency_ms` |
+| `ContextBudgetRequest` | `max_chars=16000`; `max_items=24`; `min_confidence=0.0`; optional `max_media_items` (`0` for a text-only bundle); optional `memory_types` with at least one value; optional `freshness_seconds`; optional `max_latency_ms` |
+| `SettleRequest` | `limit=100`; `max_attempts=3`; optional `memory_ids` with 1–100 IDs |
+| `AnalyzeRequest` | required `memory_id` |
+| `IdentityRegisterRequest` | required `identity_id`, `name`; optional `relationship` |
 | List query | `limit=100`; optional opaque `cursor` |
 
 All timestamps must include a timezone. An event end requires a start and must be later than it.
@@ -199,16 +238,48 @@ Explicit reinforcement is not idempotent: every call raises `access_count` for t
 and moves the ranker's reinforcement factor, so a lost response must not be retried blindly.
 Unknown IDs are skipped, and `reinforced` counts the ones that existed.
 
+`answer` may run face recognition on a retrieved photo or video to identify who appears in it, the
+same as `analyzeFaces`, and that recognition can corroborate and commit a cross-modal identity
+merge. `POST /v1/answers` passes `Memory.ask(..., link_identities=embodied_operations)`, so a
+caller with recall access alone cannot acquire that merge authority through an answer unless the
+host has also opted `create_app` into `embodied_operations`: with the switch off, an answer may
+still identify who appears in the evidence, but the bind is never committed.
+
 `compileContext` selects and structures existing evidence, reports conflicts without resolving
 them, calls no generation model, and stores no memory. It is not a pure read: it runs the same
 retrieval path `searchMemories` runs and can make the same one write, caching a transcript for
-spoken query media, which is a cache of the caller's own input rather than a new memory. Its
-request `budget` is the transport form of `ContextBudget`, with the `freshness` timedelta
-expressed as `freshness_seconds` and `max_latency_ms` a deadline the compiler checks between
-stages rather than a timeout that aborts. The bundle reports `elapsed_ms`, `deadline_exceeded`,
-and an `unknowns` array naming what the request implied and the bundle does not carry. The
+spoken query media, which is a cache of the caller's own input rather than a new memory. A
+compilation that finds nothing does record that, as the bounded signal the control plane's
+`QUERY_FAILURE` trigger reads, which changes no evidence and no memory. Its request `budget` is
+the transport form of `ContextBudget`, with the `freshness` timedelta expressed as
+`freshness_seconds` and `max_latency_ms` a deadline the compiler checks between stages rather than
+a timeout that aborts. The bundle reports `elapsed_ms`, `deadline_exceeded`, and an `unknowns`
+array naming what the request implied and the bundle does not carry. The
 [compiler reference](../context-compilation.md) owns section, selection, unknown, and conflict
 semantics.
+
+`captureMemory` commits without calling any model; the returned `MemoryResponse` is the same
+content-addressed record `createMemory` would return for identical input. It is durable and
+readable through `getMemory` immediately and invisible to `searchMemories` until settled.
+`settleCaptures` enriches, embeds, indexes, and forms up to `limit` queued records in enqueue
+order and returns how many settled; a record that has already failed `max_attempts` times is
+skipped rather than retried, so one poisoned capture cannot block the queue, and naming it in
+`memory_ids` bypasses that ceiling. `pendingCaptures` answers per-record readiness: an ID absent
+from `items` is not pending, and `getMemory` tells whether it is settled or was never stored.
+
+The identity and embodied routes follow the SDK operation they dispatch to, exactly as the
+[MCP tools](mcp.md#tools) do, because both adapters call the same injected `Memory`.
+`analyzeSpeech` and `analyzeFaces` read one stored memory's assets and return an empty result
+rather than failing when no matching asset exists; both fail with `model_error` when the
+required backend is unavailable. `registerIdentity` asserts a name on the host's behalf as a
+versioned, reversible memory record and fails with `identity_not_found` for an unregistered ID;
+omitting `relationship` leaves any recorded relationship intact, and there is deliberately no way
+to clear one. `getIdentity` follows merge aliases and never fails for an unknown ID, returning
+`identity: null` instead. `unlinkIdentity` reverses one face-and-voice merge and returns
+`restored_identity_id: null`, changing nothing, when the merge cannot be reversed. `forgetIdentity`
+erases a person's biometric templates, aliases, and indexed name -- memories and media survive --
+and cannot be undone; a second call reports `identity_not_found` because the person is already
+gone.
 
 ### Retrieval trace
 
@@ -241,11 +312,26 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 | `ReinforceResponse` | `reinforced` |
 | `AnswerResponse` | `answer`, `hits`, `abstained`, `abstention_reason` |
 | `PageResponse` | `items`, `next_cursor` |
-| `ContextBudgetResponse` | `max_chars`, `max_items`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
+| `SettleResponse` | `settled` |
+| `PendingCaptureResponse` | `memory_id`, `enqueued_at`, `attempts`, `last_error`, `awaiting` (`"enrichment"` or `"formation"`) |
+| `PendingCapturesResponse` | `items` |
+| `SpeechResponse` | `segments`: `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
+| `FacesResponse` | `observations`: `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
+| `IdentityResponse` | `identity`: `identity_id`, `name`, `relationship`, `confirmed`, `evidence_ids`, or `null` |
+| `RegisterResponse` | `registered` |
+| `UnlinkResponse` | `restored_identity_id` |
+| `ForgetResponse` | `erasure`: `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`, `face_observations`, `speech_segments` |
+| `ConsentResponse` | `consent`: `granted`, `withheld`, `withdrawn`, or `null` when nobody has recorded a statement |
+| `MemoryOperationResponse` | `operation_id`, `intent`, `trigger`, `evidence_ids`, `target_ids`, `claim`, `consent`, `identity`, `rationale`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `superseded`, `applied_at`, `rolled_back_at`, `outcome`, `outcome_note` |
+| `RecordConsentResponse` | `operation`, or `null` when the same statement already stands |
+| `ExportResponse` | `exported_at`, `identity_id`, `identities`, `records`, `operations` |
+| `RetentionResponse` | `dry_run`, `media_memory_ids`, `forgotten_memory_ids`, `asset_ids`, `capture_memory_ids`, `deleted` |
+| `ContextBudgetResponse` | `max_chars`, `max_items`, `max_media_items` or `null`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
 | `ContextConflictResponse` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknownResponse` | `kind`, `detail` |
-| `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `traits`, the `AffectCueResponse` array `affect`, the mixed `actors` array of hits and `ProvisionalActorResponse` objects, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
+| `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `traits`, the `AffectCueResponse` array `affect`, the mixed `actors` array of hits, `NamedActorResponse`, and `ProvisionalActorResponse` objects, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
 | `ProvisionalActorResponse` | `identity_id`, `memory_ids`: one recognized person in the included evidence whom no visible naming assertion names |
+| `NamedActorResponse` | `identity_id`, `name`, `memory_ids`, `naming_assertion_id`: one person a naming assertion names, reached through other evidence |
 | `AffectCueResponse` | every hit field plus `event_ids`: the events formed from the same observations the cue cites in its own `context.evidence_ids`, which is co-occurrence inside one capture and not an attributed cause |
 | `CapabilitiesResponse` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `consolidation_model`, `speaker_recognition`, `streaming_generation`, `operations` |
 | `HealthResponse` | `status`, `capabilities` |
@@ -393,12 +479,33 @@ REST has no route for these Python operations:
 | `add_stream` | Send each completed observation to `POST /v1/memories` |
 | `ask_stream` | Send `POST /v1/answers`, which returns the same grounded answer once it is complete |
 | `search_with_trace` | Send `POST /v1/memories/search` with `"explain": true` |
-| `speech`, `faces` | No route; both have an [MCP tool](mcp.md#tools) |
-| `register_speaker`, `register_identity` | No route; both have an MCP tool |
-| `identity`, `unlink_identity`, `forget_identity` | No route; all three have an MCP tool |
+| `register_speaker` | No route; has an [MCP tool](mcp.md#tools). REST names an identity, not a voice-only speaker |
 | `reindex`, `optimize` | Index maintenance an operator schedules |
-| `capture`, `settle`, `pending_captures` | No route; deferred enrichment is the owning process's loop |
-| `consolidation_candidates`, `consolidate`, `forget`, `rollback`, `operations` | No route and no MCP tool; the memory control plane stays under host authority |
+| `consolidation_candidates`, `consolidate`, `deliberate`, `apply`, `record_outcome`, `forget`, `rollback`, `operations` | No route and no MCP tool; the memory control plane stays under host authority |
+
+`exportSubject` is the one place a control-plane value reaches a transport: an export carries the
+operation-log rows that moved the subject's records, because the right of access covers how the
+data was processed and not only what is held. It is read-only and gated on `identity_operations`,
+so nothing about the control plane's authority changes -- no route proposes, applies, or reverses
+an operation.
+
+A record containing two recognized people is returned for both of their exports, with the other
+person's observations embedded in it, for the reasons the
+[SDK contract](python-sdk.md#data-subject-rights) states. Over a network that matters more than it
+does in-process: a host serving this route decides who receives the response, and the response
+may contain a second person's data.
+
+`applyRetention` deletes irrecoverably. It is behind `identity_operations` rather than always on
+like `deleteMemory`, because it acts on a declared policy over the whole store rather than on one
+record the caller named. Send `{"dry_run": true}` first: it reports the same identifiers and
+deletes nothing.
+
+`speech`, `faces`, `register_identity`, `identity`, `unlink_identity`, `forget_identity`,
+`record_consent`, `consent`, `export`, and `apply_retention` do
+have routes, listed in [Endpoints](#endpoints) -- but only when the host enables
+`embodied_operations` or `identity_operations`. A host that leaves a switch off gets no route for
+the operations it gates, exactly as the table above describes for the operations no switch can
+turn on.
 
 Use the [Python SDK](python-sdk.md) in the owning process, or the MCP adapter where the table
 names a tool. Only `ask_stream` needs more than a route: incremental delivery needs a streaming
@@ -418,9 +525,12 @@ unwritten work rather than an impossibility.
 | Search, answer, or page `limit` | 1 through 100 |
 | Context `budget.max_chars` | 1 through 65,536 |
 | Context `budget.max_items` | 1 through 100 |
+| Context `budget.max_media_items` | 0 or more, or `null` |
 | Context `budget.max_latency_ms` | 1 or greater |
 | Serialized metadata for one memory | 262,144 UTF-8 bytes |
 | `file_id` or `filename` | 255 characters |
+| `settleCaptures` or `pendingCaptures` `memory_ids` | 1 through 100 IDs |
+| `settleCaptures` `max_attempts` | 1 or greater |
 
 `file_data` is bounded by the complete HTTP body. A data URL is also bounded by the
 8,192-character source field. The transport has no local-path input, remote fetch, upload endpoint,

@@ -33,6 +33,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from mindbridge import recipes
+from mindbridge.control import load_operation, proposal_payload
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -50,18 +51,23 @@ from mindbridge.types import (
     AffectCue,
     AssetRef,
     Blob,
+    ConsentState,
     ContentAtom,
     ContentInput,
     ContextBudget,
     EvidenceBasis,
+    ExportBundle,
     FaceObservation,
     MemoryContext,
+    MemoryOperation,
     MemoryOperationRecord,
+    MemoryOutcome,
     MemoryRecord,
     MemoryTrigger,
     MemoryType,
     Modality,
     ObservationContext,
+    RetentionReport,
     RetrievalScope,
     SearchHit,
     SpatialAnchor,
@@ -108,14 +114,21 @@ OPERATIONS: tuple[str, ...] = (
     "register_speaker",
     "register_identity",
     "identity",
+    "record_consent",
+    "consent",
     "forget_identity",
     "unlink_identity",
     "reinforce",
     "consolidation_candidates",
     "consolidate",
+    "deliberate",
+    "apply",
+    "record_outcome",
     "forget",
     "rollback",
     "operations",
+    "export",
+    "apply_retention",
     "list",
     "delete",
     "reindex",
@@ -640,6 +653,7 @@ def _ask(memory: Memory, arguments: argparse.Namespace) -> _Document:
         memory_type=_optional_memory_type(arguments),
         reference_at=_optional_time(arguments.reference_at, "reference_at"),
         scope=_retrieval_scope(_json_source(getattr(arguments, "scope", None))),
+        link_identities=getattr(arguments, "link_identities", True),
     )
     return {
         "answer": result.answer,
@@ -655,6 +669,7 @@ def _budget(arguments: argparse.Namespace) -> ContextBudget:
     return ContextBudget(
         max_chars=arguments.max_chars,
         max_items=arguments.max_items,
+        max_media_items=arguments.max_media_items,
         memory_types=(
             None
             if arguments.memory_type is None
@@ -718,6 +733,7 @@ def _budget_document(budget: ContextBudget) -> _Document:
     return {
         "max_chars": budget.max_chars,
         "max_items": budget.max_items,
+        "max_media_items": budget.max_media_items,
         "memory_types": (
             None
             if budget.memory_types is None
@@ -791,6 +807,63 @@ def _unlink_identity(memory: Memory, arguments: argparse.Namespace) -> _Document
     return {"restored_identity_id": memory.unlink_identity(arguments.alias_id)}
 
 
+def _record_consent(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    record = memory.record_consent(
+        arguments.identity_id,
+        ConsentState(arguments.state),
+        note=arguments.note,
+    )
+    return {"operation": None if record is None else _operation_document(record)}
+
+
+def _consent(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    state = memory.consent(arguments.identity_id)
+    return {"consent": None if state is None else state.value}
+
+
+def _export(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return _export_document(
+        memory.export(
+            identity_id=arguments.identity_id,
+            memory_ids=arguments.memory_ids or None,
+        )
+    )
+
+
+def _export_document(bundle: ExportBundle) -> _Document:
+    return {
+        "exported_at": _encode_time(bundle.exported_at),
+        "identity_id": bundle.identity_id,
+        "identities": [
+            {
+                "identity_id": profile.identity_id,
+                "name": profile.name,
+                "relationship": profile.relationship,
+                "confirmed": profile.confirmed,
+                "evidence_ids": list(profile.evidence_ids),
+            }
+            for profile in bundle.identities
+        ],
+        "records": [_memory_document(record) for record in bundle.records],
+        "operations": [_operation_document(record) for record in bundle.operations],
+    }
+
+
+def _apply_retention(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return _retention_document(memory.apply_retention(dry_run=arguments.dry_run))
+
+
+def _retention_document(report: RetentionReport) -> _Document:
+    return {
+        "dry_run": report.dry_run,
+        "media_memory_ids": list(report.media_memory_ids),
+        "forgotten_memory_ids": list(report.forgotten_memory_ids),
+        "asset_ids": list(report.asset_ids),
+        "capture_memory_ids": list(report.capture_memory_ids),
+        "deleted": report.deleted,
+    }
+
+
 def _settle(memory: Memory, arguments: argparse.Namespace) -> _Document:
     return {
         "settled": memory.settle(
@@ -831,7 +904,10 @@ def _consolidation_candidates(memory: Memory, arguments: argparse.Namespace) -> 
                 "memory_ids": list(candidate.memory_ids),
                 "evidence_count": candidate.evidence_count,
             }
-            for candidate in memory.consolidation_candidates(limit=arguments.limit)
+            for candidate in memory.consolidation_candidates(
+                limit=arguments.limit,
+                idle=arguments.idle,
+            )
         ]
     }
 
@@ -853,6 +929,42 @@ def _consolidate(memory: Memory, arguments: argparse.Namespace) -> _Document:
             {"intent": operation.intent.value, "reason": reason}
             for operation, reason in report.rejected
         ],
+        "weighed": report.weighed,
+    }
+
+
+def _deliberate(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    report = memory.deliberate(
+        limit=arguments.limit,
+        max_rounds=arguments.max_rounds,
+        idle=arguments.idle,
+    )
+    return {
+        "rounds": report.rounds,
+        "weighed": report.weighed,
+        "skipped": report.skipped,
+        "applied": report.applied,
+        "rejected": report.rejected,
+        "model_calls": report.model_calls,
+    }
+
+
+def _apply(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {"operation": _operation_document(memory.apply(_operation_input(arguments.operation)))}
+
+
+def _operation_input(source: str) -> MemoryOperation:
+    """Read one operation from the same JSON the log stores, so a log row replays verbatim."""
+    return load_operation(_read_source(source))
+
+
+def _record_outcome(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {
+        "recorded": memory.record_outcome(
+            arguments.operation_id,
+            MemoryOutcome(arguments.outcome),
+            note=arguments.note,
+        )
     }
 
 
@@ -880,6 +992,44 @@ def _operation_document(record: MemoryOperationRecord) -> _Document:
         "trigger": record.trigger.value,
         "evidence_ids": list(record.operation.evidence_ids),
         "target_ids": list(record.operation.target_ids),
+        # A consolidation's subject is what it proposed, so without this its row would report an
+        # intent and no statement -- and `apply --operation` takes a row as `operations` prints
+        # it, which the kernel refuses for a consolidation carrying no proposal.
+        "proposal": (
+            None
+            if record.operation.proposal is None
+            else proposal_payload(record.operation.proposal)
+        ),
+        # A merge, split, or identity erasure names people rather than records, so without this
+        # its row would report an intent and no subject at all.
+        "identity": (
+            None
+            if record.operation.identity is None
+            else {
+                "identity_id": record.operation.identity.identity_id,
+                "moved_ids": list(record.operation.identity.moved_ids),
+            }
+        ),
+        # A naming or consent row asserts something about a person, so without these two its
+        # row would report an intent and no statement at all.
+        "claim": (
+            None
+            if record.operation.claim is None
+            else {
+                "identity_id": record.operation.claim.identity_id,
+                "name": record.operation.claim.name,
+                "relationship": record.operation.claim.relationship,
+            }
+        ),
+        "consent": (
+            None
+            if record.operation.consent is None
+            else {
+                "identity_id": record.operation.consent.identity_id,
+                "state": record.operation.consent.state.value,
+                "note": record.operation.consent.note,
+            }
+        ),
         "rationale": record.operation.rationale,
         "model_id": record.model_id,
         "recipe": record.recipe,
@@ -891,6 +1041,8 @@ def _operation_document(record: MemoryOperationRecord) -> _Document:
         "rolled_back_at": (
             None if record.rolled_back_at is None else record.rolled_back_at.isoformat()
         ),
+        "outcome": None if record.outcome is None else record.outcome.value,
+        "outcome_note": record.outcome_note,
     }
 
 
@@ -932,14 +1084,21 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "register-speaker": _register_speaker,
     "register-identity": _register_identity,
     "identity": _identity_profile,
+    "record-consent": _record_consent,
+    "consent": _consent,
     "forget-identity": _forget_identity,
     "unlink-identity": _unlink_identity,
     "reinforce": _reinforce,
     "consolidation-candidates": _consolidation_candidates,
     "consolidate": _consolidate,
+    "deliberate": _deliberate,
+    "apply": _apply,
+    "record-outcome": _record_outcome,
     "forget": _forget,
     "rollback": _rollback,
     "operations": _operations,
+    "export": _export,
+    "apply-retention": _apply_retention,
     "list": _list,
     "delete": _delete,
     "reindex": _reindex,
@@ -1810,6 +1969,16 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         if operation != "ask":
             command.add_argument("--occurred-from", metavar="TIME", help="event overlap start")
             command.add_argument("--occurred-until", metavar="TIME", help="event overlap end")
+        else:
+            command.add_argument(
+                "--link-identities",
+                action=argparse.BooleanOptionalAction,
+                default=_default(operation, "link_identities"),
+                help=(
+                    "commit a corroborated cross-modal identity merge while answering "
+                    "(default: %(default)s)"
+                ),
+            )
     _compile_command(commands)
     for name, help_text in (
         ("get", "read one memory"),
@@ -1835,6 +2004,37 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     forget.add_argument("identity_id", metavar="IDENTITY_ID")
     unlink = commands.add_parser("unlink-identity", help="reverse one face/voice merge")
     unlink.add_argument("alias_id", metavar="ALIAS_ID")
+    consent = commands.add_parser(
+        "record-consent",
+        help="record what one person said about being processed as a recognized person",
+    )
+    consent.add_argument("identity_id", metavar="IDENTITY_ID")
+    consent.add_argument("state", choices=[item.value for item in ConsentState])
+    consent.add_argument("--note", help="the subject's own words about their decision")
+    stated = commands.add_parser("consent", help="read one identity's standing consent state")
+    stated.add_argument("identity_id", metavar="IDENTITY_ID")
+    export = commands.add_parser(
+        "export",
+        help="export everything held about one data subject, media by reference",
+    )
+    subject = export.add_mutually_exclusive_group(required=True)
+    subject.add_argument("--identity-id", metavar="IDENTITY_ID", help="one recognized person")
+    subject.add_argument(
+        "--memory-id",
+        dest="memory_ids",
+        action="append",
+        metavar="MEMORY_ID",
+        help="repeatable; export these records instead of one person",
+    )
+    retention = commands.add_parser(
+        "apply-retention",
+        help="delete what the declared retention policy says has outlived its purpose",
+    )
+    retention.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be deleted and delete nothing",
+    )
     reinforce = commands.add_parser("reinforce", help="record positive feedback")
     reinforce.add_argument("memory_ids", nargs="+", metavar="MEMORY_ID")
     candidates = commands.add_parser(
@@ -1846,6 +2046,11 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         type=int,
         default=_default("consolidation_candidates", "limit"),
         help="candidate rows (default: %(default)s)",
+    )
+    candidates.add_argument(
+        "--idle",
+        action="store_true",
+        help="declare an approved idle window, admitting never-weighed lineages",
     )
     consolidate = _content_command(
         commands, "consolidate", "deliberate over evidence and apply memory operations"
@@ -1864,6 +2069,44 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         choices=[item.value for item in MemoryTrigger],
         default=MemoryTrigger(_default("consolidate", "trigger")).value,
     )
+    deliberate = commands.add_parser(
+        "deliberate",
+        help="run the memory-management loop over due candidates until nothing is due",
+    )
+    deliberate.add_argument(
+        "--limit",
+        type=int,
+        default=_default("deliberate", "limit"),
+        help="candidate rows and evidence set size per round (default: %(default)s)",
+    )
+    deliberate.add_argument(
+        "--max-rounds",
+        type=int,
+        default=_default("deliberate", "max_rounds"),
+        help="candidate passes ceiling (default: %(default)s)",
+    )
+    deliberate.add_argument(
+        "--idle",
+        action="store_true",
+        help="declare an approved idle window, admitting never-weighed lineages",
+    )
+    applying = commands.add_parser(
+        "apply",
+        help="apply one host-supplied memory operation through the kernel, as replay does",
+    )
+    applying.add_argument(
+        "--operation",
+        required=True,
+        metavar="JSON",
+        help="one operation object as `operations` logs it, @PATH, or -",
+    )
+    outcome = commands.add_parser(
+        "record-outcome",
+        help="record what later evidence said about one logged operation",
+    )
+    outcome.add_argument("operation_id", type=int, metavar="OPERATION_ID")
+    outcome.add_argument("outcome", choices=[item.value for item in MemoryOutcome])
+    outcome.add_argument("--note", help="why later evidence confirmed or refuted it")
     forget = commands.add_parser("forget", help="cognitively forget memories without deleting")
     forget.add_argument("memory_ids", nargs="+", metavar="MEMORY_ID")
     rollback = commands.add_parser("rollback", help="reverse one logged memory operation")
@@ -1943,6 +2186,11 @@ def _compile_command(
         type=int,
         default=budget.max_items,
         help="maximum included memories (default: %(default)s)",
+    )
+    command.add_argument(
+        "--max-media-items",
+        type=int,
+        help="maximum grounded media parts; 0 compiles a text-only bundle",
     )
     command.add_argument(
         "--memory-type",
