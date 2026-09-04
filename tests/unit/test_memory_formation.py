@@ -451,6 +451,43 @@ def test_a_shared_formed_record_keeps_only_what_its_sources_agree_on(tmp_path: P
         assert memory.get(entity.id).metadata == {"household": "flat-2"}
 
 
+def test_deleting_the_disagreeing_source_gives_a_shared_record_its_place_back(
+    tmp_path: Path,
+) -> None:
+    """Cleared inherited columns follow the live evidence, not the moment the record was written.
+
+    Deleting a source retires its evidence, so the survivors may now agree on the place and the
+    tag the disagreement cleared. Leaving the record unscoped would keep it out of every
+    place-filtered read for evidence that no longer exists.
+    """
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=PreferenceFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        memory.add(
+            "I prefer tea",
+            context=ObservationContext(place_id="kitchen"),
+            metadata={"household": "flat-2"},
+        )
+        garage = memory.add(
+            "I still prefer tea",
+            context=ObservationContext(place_id="garage"),
+            metadata={"household": "flat-9"},
+        )
+        (entity,) = _entities(memory)
+        assert memory.get(entity.id).place_id is None
+
+        assert memory.delete(garage.id) is True
+
+        assert memory.get(entity.id).place_id == "kitchen"
+        assert memory.get(entity.id).metadata == {"household": "flat-2"}
+        assert [hit.id for hit in _entities(memory, scope=RetrievalScope(place_id="kitchen"))] == [
+            entity.id
+        ]
+
+
 def test_two_contradictory_states_from_one_source_cost_only_the_later_one(
     tmp_path: Path,
 ) -> None:

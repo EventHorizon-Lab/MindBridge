@@ -2529,6 +2529,66 @@ def test_provisional_identities_name_the_people_no_assertion_names(tmp_path: Pat
         }
 
 
+def test_retiring_evidence_re_derives_the_columns_the_survivors_agree_on(tmp_path: Path) -> None:
+    """The evidence projection owns the inherited columns, not only confidence and visibility.
+
+    A reinforcement from another room clears the shared record's place and tag; rolling it back
+    retires that evidence, so what remains agrees again and the record has to be scoped again.
+    """
+    applied_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    kitchen = replace(_memory("source-kitchen", "first witness", created_at=applied_at))
+    garage = replace(
+        _memory("source-garage", "second witness", created_at=applied_at),
+        place_id="garage",
+        metadata_json='{"room": "garage"}',
+    )
+    entity = replace(
+        _memory("entity", "the user", created_at=applied_at),
+        place_id=None,
+        metadata_json="{}",
+        context=MemoryContext(
+            kind=MemoryKind.ENTITY,
+            basis=EvidenceBasis.MODEL_INFERENCE,
+            confidence=0.8,
+            valid_from=None,
+            valid_until=None,
+            recorded_at=applied_at,
+            lineage_id="user",
+            subject="user",
+            evidence_ids=(kitchen.memory_id,),
+        ),
+    )
+
+    with LocalStore(tmp_path) as store:
+        store.write_memories((replace(kitchen, place_id="kitchen"), garage, entity))
+        logged = store.apply_control_operation(
+            StoredOperation(
+                operation_key="op-reinforce",
+                intent="reinforce",
+                trigger="manual",
+                operation_json="{}",
+                applied_at=applied_at,
+            ),
+            reinforce=((entity.memory_id, garage.memory_id),),
+        )
+        assert logged is not None
+        reinforced = store.read_memory(entity.memory_id)
+
+        reverted, _orphaned = store.rollback_operation(
+            logged.operation_id,
+            rolled_back_at=applied_at + timedelta(minutes=1),
+            retire_evidence=((entity.memory_id, garage.memory_id),),
+        )
+        restored = store.read_memory(entity.memory_id)
+
+    assert reinforced is not None
+    assert reinforced.place_id is None and reinforced.metadata_json == "{}"
+    assert reverted is True
+    assert restored is not None
+    assert restored.place_id == "kitchen"
+    assert restored.metadata_json == kitchen.metadata_json
+
+
 def test_rolling_back_an_operation_deletes_its_records_in_the_same_transaction(
     tmp_path: Path,
 ) -> None:

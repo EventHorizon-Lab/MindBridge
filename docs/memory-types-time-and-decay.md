@@ -162,8 +162,10 @@ formed in a room and not only the raw observation it came from. Agreement is the
 too, because an `ENTITY`, `RELATION`, inferred `TRAIT`, or `RESPONSE_POLICY` is written once and
 later sources only add evidence to it: when a second source disagrees, the shared record keeps
 neither place nor metadata rather than the first source's, since a hard retrieval filter must not
-be guessed. A derived record carries no media assets of its own: it is text, and its evidence link
-points at the observation that holds the media.
+be guessed. Both columns follow the live evidence rather than the moment the record was written:
+deleting a source or rolling an operation back recomputes them over the sources that remain, so a
+record the survivors agree on is scoped again. A derived record carries no media assets of its own:
+it is text, and its evidence link points at the observation that holds the media.
 
 ### Naming a person is a typed assertion
 
