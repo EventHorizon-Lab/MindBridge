@@ -574,7 +574,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   that had finished first; nothing cleared it again, and every later `add`, `delete`,
   `forget_identity`, `reindex`, or `optimize` on that thread returned without flushing. The records
   stayed durable in SQLite but were not searchable until some other caller forced a drain. Deferral
-  is now thread-local, so it cannot outlive the stream that opened it.
+  is now thread-local and scoped to the item write, so it cannot outlive the stream that opened it.
+  Scoping it to the write also covers a stream pumped across workers: `add_stream` is a generator,
+  so its body runs on whichever thread calls `next`, and a group opened on one thread and left on
+  another used to strand the opener the same way. A consumer's own writes between two yields now
+  flush as they would outside the stream.
 - The `compile_context` MCP tool schema advertised the wrong default evidence ceiling. Its prose
   said 6,000 characters while the field default it publishes beside it, and `ContextBudget`, have
   been 16,000 since the per-modality cost function landed — enough of a gap for an agent that
