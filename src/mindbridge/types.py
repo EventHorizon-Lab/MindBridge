@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, TypeAlias
 
 from mindbridge.exceptions import ValidationError
@@ -57,6 +58,19 @@ class MemoryKind(str, Enum):
     RESPONSE_POLICY = "response_policy"
 
 
+# The `MemoryType` a validated formation proposal of each kind is stored as. Kernel policy, kept
+# beside the two enums because two readers depend on it and must not drift: `memory.py` applies it
+# when it writes a formed record, and the context compiler reads it back to know which bundle
+# sections a `memory_types` filter can empty. A kind absent here is stored as `SEMANTIC`.
+KIND_MEMORY_TYPES: Mapping[MemoryKind, MemoryType] = MappingProxyType(
+    {
+        MemoryKind.EVENT: MemoryType.EPISODIC,
+        MemoryKind.AFFECT: MemoryType.EPISODIC,
+        MemoryKind.RESPONSE_POLICY: MemoryType.PROCEDURAL,
+    }
+)
+
+
 class ContextUnknownKind(str, Enum):
     """Why a compiled bundle is missing something the request implied it might contain."""
 
@@ -66,6 +80,7 @@ class ContextUnknownKind(str, Enum):
     CANDIDATES_EXHAUSTED = "candidates_exhausted"
     MODALITY_UNSUPPORTED = "modality_unsupported"
     STAGE_SKIPPED = "stage_skipped"
+    CONSENT_WITHHELD = "consent_withheld"
 
 
 class SpatialAnchor(str, Enum):
@@ -521,6 +536,67 @@ class IdentityClaim:
             object.__setattr__(self, label, text)
 
 
+class ConsentState(str, Enum):
+    """Whether a recognized person has agreed to be processed as a recognized person.
+
+    Three states rather than a flag, because "nobody has asked" is not "they said no": an
+    identity with no recorded consent is unstated, `WITHHELD` is a refusal that was actually
+    given, and `WITHDRAWN` is a permission that was given and taken back. Only the last two
+    restrain the kernel, and they restrain it identically; the distinction is audit history.
+    """
+
+    GRANTED = "granted"
+    WITHHELD = "withheld"
+    WITHDRAWN = "withdrawn"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ConsentClaim:
+    """One person's own statement about how they may be processed.
+
+    Carried on a `CONSENT` operation the way `IdentityClaim` is carried on an `IDENTIFY` one:
+    the kernel, not a backend, turns it into the typed STATE assertion `consent()` projects.
+    A model may never propose one -- the kernel refuses a proposed `CONSENT` as `unauthorized`,
+    the way it refuses a proposed `MERGE` -- so the recorded basis is always `USER_STATEMENT`.
+    """
+
+    identity_id: str
+    state: ConsentState
+    note: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        if not isinstance(self.state, ConsentState):
+            try:
+                object.__setattr__(self, "state", ConsentState(self.state))
+            except (TypeError, ValueError):
+                raise ValidationError("consent state is invalid") from None
+        object.__setattr__(self, "note", _optional_text(self.note, "consent note"))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class IdentityChange:
+    """Which recognized people one identity-lifecycle operation moved.
+
+    `identity_id` is the person who stands after the operation: the survivor of a cross-modal
+    merge, the identity a split was taken back out of, the person an erasure destroyed.
+    `moved_ids` are the other identities the operation names -- the absorbed identity of a
+    `MERGE`, the identity a `CORRECT` split restored, the aliases an erasure destroyed with the
+    person. An identity ID is not a memory ID, which is why it travels here rather than in
+    `target_ids`.
+    """
+
+    identity_id: str
+    moved_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        moved = _memory_ids(self.moved_ids, "moved_ids")
+        if self.identity_id in moved:
+            raise ValidationError("an identity change must not move the identity it keeps")
+        object.__setattr__(self, "moved_ids", moved)
+
+
 class MemoryIntent(str, Enum):
     """One memory-management operation the agentic control plane may propose."""
 
@@ -529,6 +605,18 @@ class MemoryIntent(str, Enum):
     CORRECT = "correct"
     FORGET = "forget"
     IDENTIFY = "identify"
+    # Host-initiated only, for the same reason MERGE is kernel-initiated only: consent is a
+    # statement the data subject makes, so a model that could propose one could manufacture it.
+    CONSENT = "consent"
+    # Kernel-initiated only. A cross-modal identity merge is committed from corroborated
+    # co-occurrence evidence the kernel counted, not from a backend's vocabulary: the kernel
+    # rejects a proposed MERGE as `"unauthorized"`.
+    MERGE = "merge"
+
+
+_IDENTITY_INTENTS = frozenset(
+    {MemoryIntent.MERGE, MemoryIntent.CORRECT, MemoryIntent.FORGET},
+)
 
 
 class MemoryTrigger(str, Enum):
@@ -543,6 +631,19 @@ class MemoryTrigger(str, Enum):
     IDLE = "idle"
 
 
+class MemoryOutcome(str, Enum):
+    """What later evidence said about one already-applied control-plane operation.
+
+    Recorded after the fact by `record_outcome()`, which is what makes the slow loop's quality
+    measurable: consolidation precision and contradiction recovery are `CONFIRMED` rates over
+    `CONSOLIDATE` and `CORRECT` rows, and false retirement is the `REFUTED` rate over rows that
+    forgot something. The kernel never sets it and never reads it back into a decision.
+    """
+
+    CONFIRMED = "confirmed"
+    REFUTED = "refuted"
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class MemoryOperation:
     """One proposed memory operation whose required fields follow from its intent."""
@@ -552,6 +653,12 @@ class MemoryOperation:
     target_ids: tuple[str, ...] = ()
     proposal: FormationProposal | None = None
     claim: IdentityClaim | None = None
+    # Set exactly by `CONSENT`, which asserts how one person may be processed rather than
+    # moving any person or any memory.
+    consent: ConsentClaim | None = None
+    # Set exactly by the three identity-lifecycle intents: a `MERGE`, and a `CORRECT` or
+    # `FORGET` that names a person instead of memories.
+    identity: IdentityChange | None = None
     rationale: str | None = None
 
     def __post_init__(self) -> None:  # noqa: C901 - intent-specific boundary validation
@@ -571,6 +678,42 @@ class MemoryOperation:
             raise ValidationError("memory operation proposal is invalid")
         if self.claim is not None and not isinstance(self.claim, IdentityClaim):
             raise ValidationError("memory operation claim is invalid")
+        if self.consent is not None and not isinstance(self.consent, ConsentClaim):
+            raise ValidationError("memory operation consent is invalid")
+        if self.intent is MemoryIntent.CONSENT:
+            # A consent statement names its subject and nothing else: no memory is evidence for
+            # it, no memory is its target, and it moves no identity.
+            if (
+                self.consent is None
+                or self.claim is not None
+                or self.identity is not None
+                or self.target_ids
+                or self.evidence_ids
+                or self.proposal is not None
+            ):
+                raise ValidationError("consent names one identity and one state, and nothing else")
+            return
+        if self.consent is not None:
+            raise ValidationError(f"{self.intent.value} must not carry consent")
+        if self.identity is not None:
+            if not isinstance(self.identity, IdentityChange):
+                raise ValidationError("memory operation identity is invalid")
+            if self.intent not in _IDENTITY_INTENTS:
+                raise ValidationError(f"{self.intent.value} must not carry an identity")
+        if self.intent is MemoryIntent.MERGE:
+            # One absorbed identity, no memory: which naming assertions and exemplars moved is
+            # an effect the log row records, not something a proposal states.
+            if (
+                self.identity is None
+                or len(self.identity.moved_ids) != 1
+                or self.target_ids
+                or self.evidence_ids
+                or self.proposal is not None
+            ):
+                raise ValidationError(
+                    "merge names one surviving and one absorbed identity, and no memory"
+                )
+            return
         if self.intent is MemoryIntent.IDENTIFY:
             # A host naming somebody cites nothing, so an empty evidence set is well formed here
             # and it is the kernel that requires cited evidence of an agent's proposal.
@@ -593,6 +736,13 @@ class MemoryOperation:
         elif self.intent is MemoryIntent.REINFORCE:
             if len(self.target_ids) != 1 or not self.evidence_ids:
                 raise ValidationError("reinforce requires exactly one target and cited evidence")
+        elif self.identity is not None:
+            # A split or an erasure names the person, not a record. Naming both would leave the
+            # log row claiming two unrelated effects for one operation.
+            if self.target_ids or self.evidence_ids:
+                raise ValidationError(
+                    f"{self.intent.value} names either memories or one identity, not both"
+                )
         elif not self.target_ids or self.evidence_ids:
             raise ValidationError(
                 f"{self.intent.value} requires at least one target and cites no evidence"
@@ -620,6 +770,11 @@ class MemoryOperationRecord:
     # the backend never named and may never have been shown. `rollback()` restores exactly these.
     superseded: tuple[tuple[str, int], ...] = ()
     rolled_back_at: datetime | None = None
+    # Post-hoc, written by `record_outcome()` and never by the kernel: what later evidence said
+    # about this operation. `None` means nobody has judged it yet, which is not the same as
+    # unrefuted.
+    outcome: MemoryOutcome | None = None
+    outcome_note: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -649,6 +804,15 @@ class MemoryOperationRecord:
             if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
                 raise ValidationError("superseded version must be a positive integer")
         object.__setattr__(self, "superseded", superseded)
+        if self.outcome is not None and not isinstance(self.outcome, MemoryOutcome):
+            raise ValidationError("operation outcome is invalid")
+        object.__setattr__(
+            self,
+            "outcome_note",
+            _optional_text(self.outcome_note, "operation outcome_note"),
+        )
+        if self.outcome is None and self.outcome_note is not None:
+            raise ValidationError("an outcome note requires an outcome")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -657,7 +821,9 @@ class ConsolidationCandidate:
 
     `memory_ids` is the set to hand straight to `consolidate(evidence_ids=...)`. `evidence_count`
     is what the trigger counted: new evidence links for `EVIDENCE`, distinct conflicting values
-    for `CONTRADICTION`, and recorded confirmations for `FEEDBACK`.
+    for `CONTRADICTION`, recorded confirmations for `FEEDBACK`, recorded recall failures for
+    `QUERY_FAILURE`, and the record count over budget for `PRESSURE`. An `IDLE` row counts one:
+    the operator opened the window, so the count is the lineage, not a measured signal.
     """
 
     trigger: MemoryTrigger
@@ -680,12 +846,21 @@ class ConsolidationCandidate:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ConsolidationReport:
-    """What one consolidation pass applied and which proposals the kernel refused."""
+    """What one consolidation pass applied and which proposals the kernel refused.
+
+    `weighed` is how many evidence records the backend was actually shown. Zero means the pass
+    reached no backend at all -- every named record had been forgotten, corrected, or deleted by
+    the time the pass opened -- which is a different thing from a backend that was shown evidence
+    and proposed nothing.
+    """
 
     operations: tuple[MemoryOperationRecord, ...] = ()
     rejected: tuple[tuple[MemoryOperation, str], ...] = ()
+    weighed: int = 0
 
     def __post_init__(self) -> None:
+        if isinstance(self.weighed, bool) or not isinstance(self.weighed, int) or self.weighed < 0:
+            raise ValidationError("consolidation weighed must be a non-negative integer")
         operations = tuple(self.operations)
         if any(not isinstance(value, MemoryOperationRecord) for value in operations):
             raise ValidationError("consolidation operations are invalid")
@@ -702,6 +877,32 @@ class ConsolidationReport:
             raise ValidationError("consolidation rejections are invalid")
         object.__setattr__(self, "operations", operations)
         object.__setattr__(self, "rejected", rejected)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DeliberationReport:
+    """What one bounded run of the memory-management loop did.
+
+    `rounds` counts candidate passes actually run, so a loop that stopped because nothing was due
+    reports the rounds it did rather than the ceiling it was given. `weighed` counts candidates
+    handed to the backend and `skipped` counts candidates whose evidence had all become inactive
+    by the time the pass opened, so `weighed + skipped` is the candidate total. `model_calls` is
+    the loop's cost proxy: the `ConsolidationBackend` protocol reports no token or currency cost,
+    so this counts backend round trips instead of inventing one.
+    """
+
+    rounds: int = 0
+    weighed: int = 0
+    skipped: int = 0
+    applied: int = 0
+    rejected: int = 0
+    model_calls: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("rounds", "weighed", "skipped", "applied", "rejected", "model_calls"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValidationError(f"deliberation {name} must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1428,6 +1629,104 @@ class IdentityErasure:
                 raise ValidationError(f"{name} must be a non-negative integer")
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ExportBundle:
+    """Everything one physical memory holds about one data subject, in transferable form.
+
+    The right of access, answered from the same authoritative rows every other read uses.
+    `records` carries every version, including the retired and the cognitively forgotten ones,
+    because a subject asking what is held about them is owed the history rather than the
+    projection; each record's `context.evidence_ids` is the evidence link that record stands on
+    and each record's `assets` are its media by identity, size, and digest. No media bytes are
+    ever inlined: an export names the assets, and copying them is the host's decision.
+    """
+
+    exported_at: datetime
+    identity_id: str | None
+    identities: tuple[IdentityProfile, ...]
+    records: tuple[MemoryRecord, ...]
+    operations: tuple[MemoryOperationRecord, ...]
+
+    def __post_init__(self) -> None:
+        _require_aware(self.exported_at, "exported_at")
+        object.__setattr__(
+            self,
+            "identity_id",
+            _optional_text(self.identity_id, "identity_id"),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RetentionPolicy:
+    """Declarative maximum ages after which stored material is physically deleted.
+
+    Every field is `None` by default, and `None` means "no policy", not "keep for zero days":
+    physical deletion is the one lifecycle step MindBridge never takes because a clock ticked
+    and nobody said so. Ages are in days and are measured from the material's own recorded
+    time, not from the last time it was read, so a policy cannot be reset by traffic.
+    """
+
+    # Media assets older than this, and every memory that still references them, are deleted.
+    # Media dominates storage growth, so this is the cost knob as well as the privacy one.
+    media_days: float | None = None
+    # Records cognitively forgotten longer ago than this are physically deleted. Cognitive
+    # forgetting is reversible by design; this is what eventually makes it final.
+    forgotten_days: float | None = None
+    # Capture-queue rows enqueued longer ago than this that have failed at least once are
+    # abandoned. The memory itself survives -- only the promise to keep retrying is dropped.
+    capture_failure_days: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("media_days", "forgotten_days", "capture_failure_days"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value <= 0
+            ):
+                raise ValidationError(f"retention {name} must be a positive number of days")
+            object.__setattr__(self, name, float(value))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RetentionReport:
+    """What one retention pass deleted, or would have deleted under `dry_run`.
+
+    Identifiers rather than content: `delete()` leaves no operation-log row, so this report is
+    the only account of a physical deletion, and it has to be safe to keep after the content it
+    names is unrecoverable.
+    """
+
+    dry_run: bool
+    # Memories deleted because they referenced media older than `media_days`.
+    media_memory_ids: tuple[str, ...] = ()
+    # Memories deleted because they had been cognitively forgotten longer than `forgotten_days`.
+    forgotten_memory_ids: tuple[str, ...] = ()
+    # Media descriptors and their bytes removed because no memory referenced them any more.
+    asset_ids: tuple[str, ...] = ()
+    # Capture-queue rows abandoned; the memories themselves stay.
+    capture_memory_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dry_run, bool):
+            raise ValidationError("dry_run must be a boolean")
+        for name in (
+            "media_memory_ids",
+            "forgotten_memory_ids",
+            "asset_ids",
+            "capture_memory_ids",
+        ):
+            object.__setattr__(self, name, _memory_ids(getattr(self, name), name))
+
+    @property
+    def deleted(self) -> int:
+        """How many memories this pass removed, which is what a policy is judged on."""
+        return len(self.media_memory_ids) + len(self.forgotten_memory_ids)
+
+
 @dataclass(frozen=True, slots=True)
 class MemoryCapabilities:
     """What one composition can actually do, declared by its backends rather than inferred.
@@ -1669,21 +1968,31 @@ class Page:
 class ContextBudget:
     """The size, type, confidence, and freshness bounds one context compilation may spend.
 
-    `max_chars` bounds *evidence*, the same quantity `ContextBundle.chars` reports: record text
-    plus a text-equivalent price per grounded media part. It does not bound `render()`, which
-    adds a fixed four-line header (the goal, a one-line reading guide, the reference time, and
-    the budget line -- about 150 characters plus the goal), a blank line and a `## ` heading per
-    non-empty section, and per included memory a frame of `- [`, `] `, and ` (confidence 0.00)`,
-    which is 23 characters plus the id, plus any validity suffix. A caller shipping `render()`
-    should size against `len(bundle.render())`.
+    `max_chars` bounds the rendered evidence, the same quantity `ContextBundle.chars` reports:
+    the four-line header, each section heading, each memory's rendered line with its `- [id]`
+    frame and confidence suffix, a text-equivalent price per grounded media part, and each
+    `NamedActor` or `ProvisionalActor` line. A bundle that carries no compilation diagnostics
+    therefore satisfies `len(bundle.render()) <= max_chars`; only the `## Conflicts`,
+    `## Unknowns`, and `Omitted:` blocks are appended outside it, because they explain the
+    bundle rather than ground it and suppressing them to fit a budget would make a thin bundle
+    look like an empty store. An actor line is priced and fit in after the ranked hits it
+    depends on, the same as any other line the compiler grounds -- dropped, not given away for
+    free, when what is left of `max_chars` cannot buy it. Because the header is inside the bound
+    and is written whether or not anything else fits, a `max_chars` the header alone overruns has
+    no bundle that satisfies it: compilation refuses it with `ValidationError` naming the floor,
+    rather than returning a bundle over the limit it was given. The floor moves with the goal,
+    which the header repeats.
 
-    The default `max_chars` buys the most expensive single grounded part -- a video part is
-    priced at 12 000 characters -- and still leaves room for its record text and a cheaper
-    second part, so a default compilation can reach a media memory at all.
+    `max_media_items` bounds grounded media parts instead of their price: `0` compiles a
+    text-only bundle, and `None` lets `max_chars` alone decide. The default `max_chars` buys the
+    most expensive single grounded part -- a video part is priced at 12 000 characters -- and
+    still leaves room for its record text and a cheaper second part, so a default compilation
+    can reach a media memory at all.
     """
 
     max_chars: int = 16000
     max_items: int = 24
+    max_media_items: int | None = None
     memory_types: frozenset[MemoryType] | None = None
     min_confidence: float = 0.0
     freshness: timedelta | None = None
@@ -1695,6 +2004,11 @@ class ContextBudget:
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_chars", _positive_int(self.max_chars, "budget max_chars"))
         object.__setattr__(self, "max_items", _positive_int(self.max_items, "budget max_items"))
+        if self.max_media_items is not None:
+            if isinstance(self.max_media_items, bool) or not isinstance(self.max_media_items, int):
+                raise ValidationError("budget max_media_items must be a non-negative integer")
+            if self.max_media_items < 0:
+                raise ValidationError("budget max_media_items must be a non-negative integer")
         if self.max_latency_ms is not None:
             object.__setattr__(
                 self,
@@ -1743,7 +2057,8 @@ class ProvisionalActor:
 
     A stranger in the room is not a stranger missing from context. This carries the identity
     and the included memories that observed them, and nothing else: there is no name to carry,
-    which is the whole point. It is not a hit, so it costs no budget and occupies no item slot.
+    which is the whole point. It is not a hit and occupies no item slot, but its rendered line
+    is charged against `ContextBudget.max_chars` like every other line the compiler grounds.
     """
 
     identity_id: str
@@ -1757,6 +2072,44 @@ class ProvisionalActor:
             self,
             "memory_ids",
             tuple(_text(value, "memory id") for value in self.memory_ids),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class NamedActor:
+    """One person a currently visible naming assertion names, reached through evidence other
+    than the assertion itself.
+
+    A memory carries an identity edge two ways -- its own semantic assertion may be bound to
+    an identity, or its media asset may have recognized one -- and either can point to
+    somebody already named without that naming assertion ranking into the bundle. This
+    reports the name anyway. `memory_ids` are the included evidence memories whose identity
+    edge resolved here, never the naming assertion's own memory: that memory renders as its
+    own actors hit when it is itself included, so reporting it again here would list the same
+    person twice. `naming_assertion_id` is that assertion's memory id, kept for provenance
+    even though it may not be in the bundle. Like a `ProvisionalActor`, its rendered line is
+    charged against `ContextBudget.max_chars`.
+    """
+
+    identity_id: str
+    name: str
+    memory_ids: tuple[str, ...]
+    naming_assertion_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        object.__setattr__(self, "name", _text(self.name, "name"))
+        if not self.memory_ids:
+            raise ValidationError("a named actor names at least one observing memory")
+        object.__setattr__(
+            self,
+            "memory_ids",
+            tuple(_text(value, "memory id") for value in self.memory_ids),
+        )
+        object.__setattr__(
+            self,
+            "naming_assertion_id",
+            _optional_text(self.naming_assertion_id, "naming_assertion_id"),
         )
 
 
@@ -1786,7 +2139,7 @@ class ContextBundle:
     goal: str
     reference_at: datetime
     budget: ContextBudget
-    actors: tuple[SearchHit | ProvisionalActor, ...]
+    actors: tuple[SearchHit | NamedActor | ProvisionalActor, ...]
     relationships: tuple[SearchHit, ...]
     scene: tuple[SearchHit, ...]
     episodes: tuple[SearchHit, ...]
@@ -1845,7 +2198,9 @@ class ContextBundle:
             lines.extend(("", f"Omitted: {self.omitted} lower-ranked candidates"))
         return "\n".join(lines)
 
-    def _sections(self) -> tuple[tuple[str, tuple[SearchHit | ProvisionalActor, ...]], ...]:
+    def _sections(
+        self,
+    ) -> tuple[tuple[str, tuple[SearchHit | NamedActor | ProvisionalActor, ...]], ...]:
         """Return the sections in their fixed rendering order."""
         return (
             ("Actors", self.actors),
@@ -1859,14 +2214,41 @@ class ContextBundle:
         )
 
 
-def _section_line(entry: SearchHit | ProvisionalActor) -> str:
+def _section_line(entry: SearchHit | NamedActor | ProvisionalActor) -> str:
     if isinstance(entry, SearchHit):
-        return _hit_line(entry)
-    seen = ", ".join(f"[{memory_id}]" for memory_id in entry.memory_ids)
-    return f"- [{entry.identity_id}] unnamed person present (provisional identity; seen in {seen})"
+        return render_hit_line(entry)
+    if isinstance(entry, NamedActor):
+        return render_named_actor_line(entry)
+    return render_provisional_actor_line(entry)
 
 
-def _hit_line(hit: SearchHit) -> str:
+def render_named_actor_line(actor: NamedActor) -> str:
+    """Return the one line `render()` writes for this named actor.
+
+    The compiler charges its length against `ContextBudget.max_chars`, same as
+    `render_hit_line`, so the price and the text come from the same function and cannot drift.
+    """
+    seen = ", ".join(f"[{memory_id}]" for memory_id in actor.memory_ids)
+    provenance = f"; named by [{actor.naming_assertion_id}]" if actor.naming_assertion_id else ""
+    return f"- [{actor.identity_id}] {actor.name} present (seen in {seen}{provenance})"
+
+
+def render_provisional_actor_line(actor: ProvisionalActor) -> str:
+    """Return the one line `render()` writes for this provisional actor.
+
+    The compiler charges its length against `ContextBudget.max_chars`, same as
+    `render_hit_line`, so the price and the text come from the same function and cannot drift.
+    """
+    seen = ", ".join(f"[{memory_id}]" for memory_id in actor.memory_ids)
+    return f"- [{actor.identity_id}] unnamed person present (provisional identity; seen in {seen})"
+
+
+def render_hit_line(hit: SearchHit) -> str:
+    """Return the one line `render()` writes for this hit.
+
+    The compiler charges its length against `ContextBudget.max_chars`, so the price and the text
+    come from the same function and cannot drift.
+    """
     confidence = 1.0 if hit.context is None else hit.context.confidence
     marks = f"confidence {confidence:.2f}{_validity(hit)}"
     # One hit is one line, so stored newlines collapse rather than break the section shape.

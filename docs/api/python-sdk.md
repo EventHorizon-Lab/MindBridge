@@ -319,6 +319,7 @@ ask(
     memory_type: MemoryType | None = None,
     reference_at: datetime | None = None,
     scope: RetrievalScope | None = None,
+    link_identities: bool = True,
 ) -> AnswerResult
 
 ask_stream(
@@ -328,6 +329,7 @@ ask_stream(
     memory_type: MemoryType | None = None,
     reference_at: datetime | None = None,
     scope: RetrievalScope | None = None,
+    link_identities: bool = True,
 ) -> Iterator[AnswerChunk]
 ```
 
@@ -347,10 +349,19 @@ contains identifiers, score components, ranks, and rejection reasons, but no que
 metadata, media, vectors, paths, or model output. `ask` requires an answerer and returns only the
 retrieved hits the answerer actually used.
 
+`ask` may run face recognition on a retrieved photo or video to identify who appears in it before
+answering. With the default `link_identities=True`, a voice-and-face pair corroborated across
+enough assets is fused into one identity the same way `analyze_faces` fuses it: a `MERGE` row in
+the operation log, reversible by `rollback()`. `link_identities=False` still runs face
+recognition to answer the question, but that bind is never committed -- no `MERGE` row, no new
+identity link -- so a caller with recall access alone cannot acquire merge authority through
+`ask`.
+
 `ask_stream` runs the same path and yields the answer while the model is still producing it.
 Retrieval, grounding, and reinforcement are unchanged; only delivery of the generated text is
 incremental. Each `AnswerChunk` carries either `text` or `result`, never both: the deltas join to
-the answer, and the single terminal chunk holds the same `AnswerResult` `ask` returns.
+the answer, and the single terminal chunk holds the same `AnswerResult` `ask` returns, and
+`link_identities` means what it means on `ask`, which is this method drained.
 
 ```python
 answer = None
@@ -391,8 +402,9 @@ compile(
 ```
 
 `compile` runs the same retrieval path once with a candidate limit of
-`max(100, 3 * budget.max_items)`, then partitions, filters, and budgets the result into a
-`ContextBundle`. It calls no generation model, stores no memory, and never resolves a conflict;
+`max(100, 3 * budget.max_items)` -- tripled when `budget.min_confidence` or `budget.freshness` is
+set, because only the compiler can apply those -- pushing `budget.memory_types` into the index as
+one route per type, then partitions, filters, and budgets the result into a `ContextBundle`. It calls no generation model, stores no memory, and never resolves a conflict;
 like `search`, and through the same helper, it may cache a transcript for spoken query media.
 `budget.max_latency_ms` is a deadline checked between stages, never a cancellation, and the bundle
 reports `elapsed_ms`, `deadline_exceeded`, and the `unknowns` the request implied but the bundle
@@ -407,9 +419,22 @@ faces(memory_id: str) -> tuple[FaceObservation, ...]
 register_speaker(speaker_id: str, name: str, *, relationship: str | None = None) -> None
 register_identity(identity_id: str, name: str, *, relationship: str | None = None) -> None
 identity(identity_id: str) -> IdentityProfile | None
+record_consent(
+    identity_id: str,
+    state: ConsentState,
+    *,
+    note: str | None = None,
+) -> MemoryOperationRecord | None
+consent(identity_id: str) -> ConsentState | None
 forget_identity(identity_id: str) -> IdentityErasure
 unlink_identity(alias_id: str) -> str | None
 reinforce(memory_ids: Sequence[str]) -> int
+export(
+    *,
+    identity_id: str | None = None,
+    memory_ids: Sequence[str] | None = None,
+) -> ExportBundle
+apply_retention(*, dry_run: bool = False) -> RetentionReport
 list(*, limit: int = 100, cursor: str | None = None) -> Page
 delete(memory_id: str) -> bool
 reindex() -> int
@@ -430,17 +455,96 @@ also adds a searchable memory record, appears in `operations()`, and is reversib
 `rollback()`; see
 [typed assertions](../memory-types-time-and-decay.md#naming-a-person-is-a-typed-assertion).
 `identity` resolves an ID through any merge alias and returns what has been registered,
-so an observation captured before a merge still reaches the surviving person. `unlink_identity`
+so an observation captured before a merge still reaches the surviving person. The merge itself is
+`faces()`'s side effect and is logged: a corroborated cross-modal bind commits a `MERGE` row whose
+`model_id` is the face recognizer and whose `recipe` is the corroboration rule, so `operations()`
+shows what fused two people and `rollback()` splits them apart again. `unlink_identity`
 reverses one face-and-voice merge, returning the restored ID or `None` when the merge is not
 reversible; it resets the pair's accumulated evidence rather than suppressing the pair, so a voice
 and face that keep co-occurring are corroborated and merged again. Restoring a voice also rewrites
 the indexed transcript projection in the same commit, so search stops answering to the name the
 reversed merge had attributed to it. `reinforce`
 records explicit positive feedback and returns the number of existing distinct memories updated.
+`export` and `apply_retention` are the two remaining data-subject rights and have
+[their own section](#data-subject-rights) below.
 `list` uses an opaque keyset cursor. `delete` is idempotent and reports whether the record existed;
 what it removes is spelled out below. `reindex` rebuilds Zvec from authoritative SQLite embeddings
 without calling the embedder and returns the number of memories rebuilt. `optimize` merges and
 flushes staged index vectors. Repeated `close()` calls are harmless.
+
+#### Consent
+
+`record_consent` records what one recognized person said about being processed as a recognized
+person: `ConsentState.GRANTED`, `WITHHELD`, or `WITHDRAWN`, with an optional `note` in their own
+words. It raises `IdentityNotFoundError` for an unknown ID and returns `None` when the same
+statement already stands.
+
+A consent statement is an assertion in the same family as a name: an identity-bound, versioned
+`STATE` claim recorded with `EvidenceBasis.USER_STATEMENT`, so it is a searchable record, it
+appears in `operations()` as a `CONSENT` row carrying the claim, and `rollback()` of that row
+restores whatever was recorded before it. `consent` reads back the state the standing assertion
+projects, and `None` there means nobody has recorded a statement -- which is neither consent nor a
+refusal.
+
+Only a host may record one. A `ConsentBackend` does not exist and a `ConsolidationBackend` that
+proposes a `CONSENT` operation is refused as `unauthorized`, exactly as a proposed `MERGE` is: a
+model that could infer consent could manufacture permission to process a person. The control plane
+also may not `CORRECT`, `FORGET`, or `REINFORCE` a consent record; those are refused as
+`consent_assertion`.
+
+`consent` is therefore a **reserved predicate**. Ordinary formation does not pass through the
+control plane, so a `FormationBackend` or a consolidation proposal returning
+`FormationProposal(kind=STATE, predicate="consent", ...)` would otherwise have written the very
+row `consent()` reads. Such a proposal is never bound to an identity: it is stored as an ordinary
+`STATE` about its subject with `context.identity_id` unset, so it is searchable and auditable as
+what it is -- a model's inference -- and restrains nothing. Only `record_consent()` writes a bound
+consent assertion, and both consent reads additionally require `USER_STATEMENT` basis.
+
+`WITHHELD` and `WITHDRAWN` restrain the kernel identically from the next observation on. The
+difference between them is audit history, not policy:
+
+| Restrained | Untouched |
+| --- | --- |
+| `faces()`, `speech()`, and `ask(link_identities=True)` stop adding new face and voice exemplars to this person's template | Recognition against the exemplars already held, so an existing memory still answers questions about them |
+| The corroborated cross-modal `MERGE` that binds one voice to one face, on either side of the pair | Their memories, media, and transcripts, which record an event rather than a person |
+| `compile()` leaves them out of the bundle's `actors` and reports a `CONSENT_WITHHELD` unknown | Every other bundle section, so evidence they appear in is still selectable |
+
+Recognition is deliberately not restrained. Answering a question from media the host already holds
+is not new processing of a person, and destroying what is held is `forget_identity`, which
+consent is not: a person who wants the template gone asks for erasure, and a person who wants to
+stop being learned records a refusal.
+
+#### Data-subject rights
+
+`export` answers the right of access. Name exactly one subject -- `identity_id` for a recognized
+person or `memory_ids` for records a caller already knows -- and it returns an `ExportBundle`
+holding every version of every record involved, including retired and cognitively forgotten ones,
+the identity registry row, and every operation-log row that moved any of it. Media travels as
+asset identity, size, and digest on each record; no bytes are inlined, so copying the files stays
+the host's decision. It reads only, and an unknown identity raises `IdentityNotFoundError`.
+
+**A record two people share is exported to both of them.** One recording containing two
+recognized people is held about each of them, so it appears in each subject's export -- with the
+other person's speech segments, face observations, and transcript attribution embedded in it.
+Trimming it would answer an access request with less than is held, and redacting the other person
+out of shared evidence is not something the kernel can do without rewriting the observation, which
+is the one thing it never does. A host that must hand an export to one subject alone therefore
+owes the second person's interest its own review; MindBridge tells the truth about what is stored
+and does not decide that question. Only shared records cross over: each subject's solo recordings,
+naming assertions, consent statements, and registry row stay theirs.
+
+`apply_retention` is deterministic physical forgetting under the declared
+[`retention` policy](../configuration.md#retention-policy): media older than `media_days` and
+every memory that still references it, records cognitively forgotten longer ago than
+`forgotten_days`, and capture-queue rows whose repeated failures are older than
+`capture_failure_days`. Every deletion runs through `delete`, so the table below applies
+unchanged. An unset field is not a zero-day policy -- it does nothing -- so an instance that
+declares no policy makes this a no-op. `dry_run=True` reports the same identifiers and deletes
+nothing. One pass is bounded at a thousand records of each kind; run it again until it reports
+nothing.
+
+`RetentionReport` holds identifiers rather than counts of content, because `delete` leaves no
+operation-log row and this report is the only account of what a policy removed.
 
 #### What `delete` removes
 
@@ -468,7 +572,11 @@ injected. `GET /healthz` and the MCP server instructions publish the same view.
 ### Memory management operations
 
 ```text
-consolidation_candidates(*, limit: int = 32) -> tuple[ConsolidationCandidate, ...]
+consolidation_candidates(
+    *,
+    limit: int = 32,
+    idle: bool = False,
+) -> tuple[ConsolidationCandidate, ...]
 
 consolidate(
     *,
@@ -478,6 +586,11 @@ consolidate(
     trigger: MemoryTrigger = MemoryTrigger.MANUAL,
 ) -> ConsolidationReport
 
+deliberate(*, limit: int = 32, max_rounds: int = 4, idle: bool = False) -> DeliberationReport
+
+apply(operation: MemoryOperation) -> MemoryOperationRecord
+record_outcome(operation_id: int, outcome: MemoryOutcome, *, note: str | None = None) -> bool
+
 forget(memory_ids: Sequence[str]) -> MemoryOperationRecord | None
 rollback(operation_id: int) -> bool
 operations(*, limit: int = 100) -> tuple[MemoryOperationRecord, ...]
@@ -485,27 +598,65 @@ operations(*, limit: int = 100) -> tuple[MemoryOperationRecord, ...]
 
 `consolidation_candidates` is the durable trigger: it answers "what needs deliberation?" from
 state the store already committed, with no queue, timer, or scheduler behind it. Hand a row's
-`memory_ids` straight to `consolidate(evidence_ids=..., trigger=...)`. It needs no backend and
-takes no lock, so a host loop may poll it cheaply.
+`memory_ids` straight to `consolidate(evidence_ids=..., trigger=...)`, or let `deliberate` do it.
+Rows are interleaved across triggers so a busy trigger cannot starve the others out of the
+window. It needs no consolidation backend and holds no lock, but it is not free: a `QUERY_FAILURE`
+row costs one query embedding and one ranking pass to name the records nearest the failed query,
+so a host that polls this in a tight loop should say so with `memory_budget_records` and
+`query_failure_window_seconds` rather than with the poll interval.
 
 | `trigger` | Row means | `evidence_count` |
 | --- | --- | --- |
-| `EVIDENCE` | A derived record gained independent evidence no standing operation has weighed. `memory_ids` is that record followed by the new sources. | New evidence links |
-| `CONTRADICTION` | One lineage carries two or more current visible claims with different values, the same disagreement `compile()` reports as a `ContextConflict`. It stays listed until a `CORRECT` retires one side. | Distinct conflicting values |
-| `FEEDBACK` | A record was confirmed through `reinforce()`, or cited by an `ask()` answer under the default `reinforce_on_answer`, since a standing operation last saw it. | Recorded confirmations |
+| `EVIDENCE` | A derived record gained independent evidence nothing has weighed yet. `memory_ids` is that record followed by the new sources. | New evidence links |
+| `CONTRADICTION` | One lineage carries two or more current visible claims with different values, the same disagreement `compile()` reports as a `ContextConflict`. | Distinct conflicting values |
+| `FEEDBACK` | A record was confirmed through `reinforce()`, or cited by an `ask()` answer under the default `reinforce_on_answer`, since anything last weighed it. | Recorded confirmations |
+| `QUERY_FAILURE` | Two or more near-equal recalls returned nothing inside `query_failure_window_seconds`. A failed query cites no evidence of its own, so `memory_ids` is the nearest active records to it, resolved through the ordinary retrieval kernel. | Recorded failures |
+| `PRESSURE` | The store holds more active records than `memory_budget_records`, so the least recently useful of them are offered for `CONSOLIDATE` or `FORGET`. Without a configured budget this derives nothing: growth alone is not evidence that forgetting is useful. | Records over budget |
+| `IDLE` | Only with `idle=True`: a derived lineage nothing has ever weighed, oldest first. The operator declares the window; the kernel never infers idleness from a clock, because whether now is a good time to spend the device's battery is the host's knowledge. | Always `1` |
 
-`QUERY_FAILURE`, `PRESSURE`, and `IDLE` remain labels a caller may pass to `consolidate`: nothing
-in the store records a failed query, memory pressure, or an approved idle window, and inventing
-bookkeeping for a trigger no host asks for would be a scheduler by another name. A rolled-back
-operation weighed nothing, so its evidence becomes due again.
+An empty recall is recorded by `search`, by an abstaining `ask`, and by a `compile` whose bundle
+holds no evidence. The stored query is the owner's own words in their own memory domain, capped
+at `query_failure_history` rows so the table stays a signal buffer rather than a growing query
+log, and compared after case, accent, punctuation, and whitespace normalization -- deliberately
+lexical, so "did the user ask this again" does not change meaning when the embedder is replaced.
+
+Every persistent-signal trigger honours an already-weighed marker: `consolidate` records that it
+weighed its evidence set whatever the pass yielded, and a candidate weighed since its own newest
+signal is not derived again. A zero-yield pass -- the backend proposed nothing, or the kernel
+refused everything -- therefore stops the candidate coming back, and new evidence, a further
+confirmation, a further failure, or a further claim in the lineage makes it due again. Without
+that marker a candidate the model could not resolve would be re-listed and re-paid for every
+round, which is the same disease as a periodic timer. `PRESSURE` and `IDLE` have no signal time
+of their own -- a level and an operator's declaration are not events -- so for those the marker
+means weighed at all. A rolled-back operation weighed nothing, so its evidence becomes due again.
+
+`deliberate` is the memory-management loop itself: one round asks `consolidation_candidates` what
+is due and runs `consolidate` over each row with the row's own trigger, and the loop repeats
+because applying operations can make further work due. It ends when nothing is due or after
+`max_rounds`; `DeliberationReport.rounds` says which, and `weighed`, `skipped`, `applied`,
+`rejected`, and `model_calls` say what the run cost and yielded. A backend that proposes nothing
+terminates the loop rather than spinning, and reports `rounds` and `weighed` non-zero with
+`applied` zero. With work due and no `consolidator` configured it raises the same
+`ModelError(reason="backend_not_configured")` `consolidate` does; with nothing due it is a no-op
+that reaches no backend. `mindbridge deliberate` is the same loop from the CLI.
 
 `consolidate` requires a `consolidator` and gathers the evidence set from `evidence_ids`, else the
 active search result for `query`, else the newest `limit` active records. Forgotten and hidden
-records never reach the backend. The backend proposes `MemoryOperation` values; the kernel
+records never reach the backend. The evidence gather and the applies hold the formation lock; the
+backend round trip deliberately does not, so slow reasoning over media evidence does not stall a
+concurrent `add()`. Correctness does not rest on that lock: every proposal is re-checked inside
+its own apply transaction and refused as `"stale"` if a target moved while the backend was
+thinking. Kernel-committed identity operations -- the corroborated cross-modal merge, its
+`unlink_identity` split, `forget_identity`'s erasure, and `register_identity`/`register_speaker`'s
+naming assertion -- take the same formation lock around their own commit, so none of them lands
+while an apply pass is in progress either. The backend proposes `MemoryOperation` values; the kernel
 validates each one, applies only the effect its intent allows, and commits it in its own
 transaction with its own log row. A pass is therefore not atomic: `ConsolidationReport.operations`
 lists exactly what committed and `.rejected` exactly what the kernel refused, and a proposal
-refused after an earlier one committed does not undo it. Rejected proposals are returned with a
+refused after an earlier one committed does not undo it. `.weighed` is how many evidence records
+the backend was shown, so a zero there means the pass reached no backend at all -- every named
+record had become inactive -- which is a different thing from a backend that saw evidence and
+proposed nothing. Rejected proposals are returned with a
 reason instead of raising, so one bad proposal does not discard the pass. Every operation carries
 `operation_key = sha256(canonical operation JSON + recipe)`; a key already applied and not rolled
 back is rejected as `"duplicate"`.
@@ -517,8 +668,28 @@ back is rejected as `"duplicate"`.
 | `CORRECT` | Every target in the window, existing, and derived (`kind != OBSERVATION`) | Retires current versions at transaction time | Carries a new version with the same interval |
 | `FORGET` | Every target in the window, existing, and not already forgotten | Sets `forgotten_at` | Clears `forgotten_at` |
 | `IDENTIFY` | Identity exists; every evidence ID shown and existing, each still standing; at least one cited memory contains that identity through a speech or face observation | Commits the `ENTITY` naming assertion the kernel builds from `claim`, recomputes `identities.name` and the indexed speech text | Retracts the assertion, restores the `superseded` version, and repaints both |
+| `MERGE` | Never accepted from a backend: rejected as `"unauthorized"` | Kernel-initiated only. `faces()` commits one under the corroboration rule below | Splits the absorbed identity back out and repaints both projections |
+| `CONSENT` | Never accepted from a backend: rejected as `"unauthorized"` | Host-initiated only. `record_consent()` commits the `STATE` assertion the kernel builds from `consent` | Retracts the assertion and restores the `superseded` statement |
 
-`REINFORCE`, `CORRECT`, and `FORGET` refuse a bound naming assertion with `"naming_assertion"`.
+`MERGE` is the one intent the kernel initiates and never accepts: a cross-modal identity merge
+is committed from corroboration evidence the kernel counted itself, so a proposed `MERGE` is
+rejected as `"unauthorized"` before anything is read. `MemoryOperation.identity` is an
+`IdentityChange` naming the identity that stands after the operation and the identities it
+moved, because identity IDs are not memory IDs and must not travel in `target_ids`. Three
+operations carry one: a `MERGE`, the `CORRECT` that `unlink_identity` logs, and the `FORGET` that
+`forget_identity` logs. Each names either memories or one identity, never both.
+
+`unlink_identity` is the split half of "correct or split": it logs a `CORRECT` over the pair, and
+`rollback()` of that row re-merges them under the identity that survived. `forget_identity` is
+physical forgetting of a person: it logs a `FORGET` over the identity, carrying the identity, its
+aliases, and the naming assertions the erasure deleted in `changed_ids` -- IDs and counts only,
+never the name or the template -- and `rollback()` returns `False` for it, because nothing it
+destroyed can be restored. Which of the two a `FORGET` row names is the marker that separates
+cognitive forgetting from erasing a person: a row with `target_ids` is reversible, a row with an
+`identity` is not.
+
+`REINFORCE`, `CORRECT`, and `FORGET` refuse a bound naming assertion with `"naming_assertion"`
+and a standing consent statement with `"consent_assertion"`.
 A name is not an inference to be corrected: reverse it with `rollback` of the `IDENTIFY` that
 asserted it, which is what recomputes the projection. `IDENTIFY` adds `"unknown_identity"` and
 `"identity_not_in_evidence"` to the rejection vocabulary. An `IDENTIFY` proposed by a backend
@@ -526,6 +697,11 @@ carries basis `MODEL_INFERENCE`, so it stays hidden, and out of `identities.name
 independent evidence groups support it, exactly like an inferred `TRAIT`. `register_identity` and
 `register_speaker` are the host entry points for the same intent: they assert the name on the
 host's authority with basis `USER_STATEMENT`, cite no evidence, and are visible immediately.
+
+`CONSENT` is the mirror of `MERGE`: the one intent only a host initiates, refused as
+`"unauthorized"` from a backend for the same reason -- a model that could state consent could
+manufacture it. `MemoryOperation.consent` is a `ConsentClaim` naming the subject and their state,
+and [consent](#consent) owns what the two restrained states change.
 
 Named targets and cited evidence are bounded by the window the kernel gathered: a proposal naming
 a target outside it is rejected as `"target_not_shown"` before any write. The window is the shown
@@ -564,21 +740,44 @@ raises `MemoryNotFoundError` the way `get` and `delete` do, and an empty sequenc
 which any record is already forgotten returns `None` having changed nothing.
 
 `rollback` reverses one applied operation and returns `False` for an unknown or already-reversed
-`operation_id`, and for one a later standing operation has built on. Operations that touched one
+`operation_id`, for the erasure of a person, and for one a later standing operation has built on. Operations that touched one
 lineage reverse newest first: while a second consolidation's derived record supersedes the first
 one's, rolling the first one back would leave two current versions in the lineage, so it is
 refused and its log row stays standing until the newer one is reversed. The same rule orders a
 sequence of namings: reversing a naming a later one displaced is refused rather than reported
 as success. `operations` lists the log newest first. Physical deletion is not an intent, and
-none of these five operations is exposed on REST or MCP.
+none of these operations is exposed on REST or MCP.
 
-The log is sufficient to replay a sequence against a fresh store holding the same sources:
-`operation_key` is a pure function of the operation and its recipe, derived record IDs are
-content-addressed, and both are reproduced exactly on replay. Two values are not reproduced and
-are not meant to be: `applied_at` is re-stamped at replay, and any ID derived from event time
-reproduces only if the fresh store's sources carry the same `occurred_at`. There is no public
-`apply(operation)`; replay means driving a `ConsolidationBackend` that returns the logged
-proposals, which is what `tests/unit/test_memory_control_plane.py` does.
+`apply` applies one operation the host supplies, through the same kernel validation a proposal
+gets: the same eligibility checks, the same all-or-nothing rule for multiple targets, and the
+same in-transaction re-check that refuses a target which moved as `"stale"`. It needs no backend
+and calls none. The window is the operation's own cited evidence and named targets, because the
+host names them and is the authority here as it is for `forget`; every other rejection applies,
+including `"duplicate"`. A refusal raises `ValidationError` whose `reason` is the kernel's own
+rejection reason, because one operation the caller chose has nowhere else to report it.
+
+`apply` is what makes replay a public path. The log is sufficient to replay a sequence against a
+fresh store holding the same sources: `operation_key` is a pure function of the operation and its
+recipe, derived record IDs are content-addressed, and both are reproduced exactly on replay onto
+a store configured with the recipe that produced them -- a derived representation belongs to a
+recipe, so a store configured with a different one mints different IDs by design. Two values are
+not reproduced and are not meant to be: `applied_at` is re-stamped at replay, and any ID derived
+from event time reproduces only if the fresh store's sources carry the same `occurred_at`.
+
+`record_outcome` records what later evidence said about one applied operation, as
+`MemoryOperationRecord.outcome` and `.outcome_note`. It is post-hoc and purely for measurement:
+the kernel never reads it back into a decision, recording `REFUTED` reverses nothing --
+`rollback` does that -- and `None` means nobody has judged the operation yet, which is not the
+same as unrefuted. A later call replaces an earlier judgement. It reports `False` for an unknown
+`operation_id`. Its purpose is the slow-loop measurements
+[Context OS](../context-os.md#product-measurements) names: consolidation precision and
+contradiction recovery are `CONFIRMED` rates over `CONSOLIDATE` and `CORRECT` rows, and false
+retirement is the `REFUTED` rate over rows that forgot something.
+
+| `MemoryOutcome` | Means |
+| --- | --- |
+| `CONFIRMED` | Later evidence bore the operation out |
+| `REFUTED` | Later evidence contradicted it |
 
 ### Cross-modal identity binding
 
@@ -726,15 +925,15 @@ semantics and complete examples.
 
 ### Root import inventory
 
-These are the 105 supported names exported by `mindbridge`:
+These are the 115 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `AnswerChunk`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `ProvisionalActor`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `AnswerChunk`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `NamedActor`, `ProvisionalActor`, `IdentityChange`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate`, `DeliberationReport`, `ConsentClaim`, `ExportBundle`, `RetentionPolicy`, `RetentionReport` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
-| Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
+| Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask`, `MemoryOutcome`, `ConsentState` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
 | Bundled adapters | `JinaOmniEmbedder`, `SentenceTransformersEmbedder`, `OpenAIModels`, `OpenCVFaceAnalyzer`, `FunASRTranscriber`, `FunASRRecipe`, `DEFAULT_FUNASR_MODEL_ID`, `DEFAULT_FUNASR_RECIPE` |
 | Exceptions | `MindBridgeError`, `ValidationError`, `MemoryNotFoundError`, `SpeakerNotFoundError`, `IdentityNotFoundError`, `ModelError`, `ModelOutputTruncatedError`, `StorageError`, `IndexUnavailableError` |
@@ -767,21 +966,28 @@ The principal immutable values are:
 | `IdentityProfile` | `identity_id`, `name`, `relationship`, `confirmed`, `evidence_ids`; the last two are derived from the current visible naming assertion, never stored |
 | `ProvisionalActor` | `identity_id`, `memory_ids`: a recognized person in a compiled bundle's `actors` whom no visible naming assertion names |
 | `IdentityErasure` | `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`, `face_observations`, `speech_segments` |
+| `ConsentClaim` | `identity_id`, `state`, `note`: one person's own statement, carried on the `CONSENT` operation that records it |
+| `ExportBundle` | `exported_at`, `identity_id`, `identities`, `records`, `operations` |
+| `RetentionPolicy` | `media_days`, `forgotten_days`, `capture_failure_days`; every field optional, and unset means no policy rather than zero days |
+| `RetentionReport` | `dry_run`, `media_memory_ids`, `forgotten_memory_ids`, `asset_ids`, `capture_memory_ids`; `deleted` property |
 | `FaceObservation` | `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
 | `SpatialContext` | `frame_id`, `anchor`, `x`, `y`, `z`, `orientation_xyzw`, `position_uncertainty_m` |
 | `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial`, `place_id` |
 | `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `identity_id`, `spatial`, `cue_modality`, `valence`, `arousal` |
 | `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m`, `place_id` |
-| `ContextBudget` | `max_chars`, `max_items`, `memory_types`, `min_confidence`, `freshness`, `max_latency_ms` |
+| `ContextBudget` | `max_chars`, `max_items`, `max_media_items`, `memory_types`, `min_confidence`, `freshness`, `max_latency_ms` |
 | `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknown` | `kind` (a `ContextUnknownKind`), `detail` |
+| `NamedActor` | `identity_id`, `name`, `memory_ids`, `naming_assertion_id`: an identity a currently visible naming assertion names, reached through a compiled bundle's `actors` evidence rather than the assertion itself |
 | `ProvisionalActor` | `identity_id`, `memory_ids` |
 | `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`; `hits` property and `render()` |
-| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `rationale` |
+| `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `identity`, `rationale` |
 | `IdentityClaim` | `identity_id`, `name`, `relationship` |
-| `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `superseded`, `rolled_back_at` |
+| `IdentityChange` | `identity_id`, `moved_ids` |
+| `MemoryOperationRecord` | `operation_id`, `operation`, `trigger`, `applied_at`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `superseded`, `rolled_back_at`, `outcome`, `outcome_note` |
 | `ConsolidationCandidate` | `trigger`, `memory_ids`, `evidence_count` |
-| `ConsolidationReport` | `operations`, `rejected` as `(MemoryOperation, reason)` pairs |
+| `ConsolidationReport` | `operations`, `rejected` as `(MemoryOperation, reason)` pairs, `weighed` |
+| `DeliberationReport` | `rounds`, `weighed`, `skipped`, `applied`, `rejected`, `model_calls` |
 | `StreamEvent` | `phase`, `item`, `stream_id` |
 | `StreamCommit` | `record`, `prefetch`, `retrieval_error`, `stream_id`, `pending_settlement` |
 | `PCMChunk` | `data`, `sample_rate_hz`, `channels`, `sample_width_bytes`, `stream_id`, `occurred_at` |
@@ -818,7 +1024,7 @@ Enum values are:
 | `RetrievalRejection` | `stale_index`, `occurrence_range`, `missing_memory`, `memory_type`, `minimum_relevance`, `ambiguity`, `limit` |
 | `EmbedTask` | `retrieval.query`, `retrieval.document` |
 | `MemoryKind` | `observation`, `entity`, `event`, `state`, `relation`, `affect`, `trait`, `response_policy` |
-| `MemoryIntent` | `reinforce`, `consolidate`, `correct`, `forget`, `identify` |
+| `MemoryIntent` | `reinforce`, `consolidate`, `correct`, `forget`, `identify`, `merge` |
 | `MemoryTrigger` | `manual`, `evidence`, `feedback`, `contradiction`, `query_failure`, `pressure`, `idle` |
 | `EvidenceBasis` | `observation`, `user_statement`, `model_inference`, `response_feedback` |
 | `SpatialAnchor` | `observer`, `subject` |

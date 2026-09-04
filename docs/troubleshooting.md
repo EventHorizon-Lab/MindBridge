@@ -178,7 +178,8 @@ from the client machine.
 
 Separate Python, REST, and MCP processes cannot open the same `data_dir`. Put the required
 adapters around one constructed `Memory`, call the running REST owner, or allocate deliberately
-separate memory domains. REST has nine product routes under `/v1`; MCP has fifteen tools.
+separate memory domains. REST has twelve product routes under `/v1`, or twenty-two with both
+opt-in switches enabled; MCP has fifteen tools.
 
 Neither network adapter adds MindBridge authentication, and stdio MCP inherits the host process
 principal. Apply the controls in [deployment](deployment.md#choose-a-topology).

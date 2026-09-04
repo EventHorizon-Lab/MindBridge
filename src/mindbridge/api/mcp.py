@@ -36,6 +36,7 @@ from mindbridge.types import (
     MemoryRecord,
     MemoryType,
     Modality,
+    NamedActor,
     ObservationContext,
     ProvisionalActor,
     RetrievalScope,
@@ -52,6 +53,8 @@ _Chars = Annotated[int, Field(strict=True, ge=1, le=MAX_TEXT_CHARACTERS)]
 _Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 _Seconds = Annotated[float, Field(gt=0.0)]
 _Milliseconds = Annotated[int, Field(strict=True, ge=1)]
+# Zero is a real budget here -- a text-only bundle -- so this floor is not one.
+_MediaItems = Annotated[int, Field(strict=True, ge=0)]
 # Budget defaults are read from the SDK value, so the advertised tool default cannot drift from
 # `ContextBudget`.
 _BUDGET = ContextBudget()
@@ -293,6 +296,9 @@ class ReinforceResult(BaseModel):
 class ContextBudgetInput(StrictModel):
     max_chars: _Chars = _BUDGET.max_chars
     max_items: _Limit = _BUDGET.max_items
+    # Grounded media parts, not their price: 0 compiles a text-only bundle, null lets
+    # `max_chars` alone decide.
+    max_media_items: _MediaItems | None = None
     memory_types: Annotated[list[MemoryType], Field(min_length=1)] | None = None
     min_confidence: _Confidence = _BUDGET.min_confidence
     freshness_seconds: _Seconds | None = None
@@ -302,6 +308,7 @@ class ContextBudgetInput(StrictModel):
 class ContextBudgetResult(BaseModel):
     max_chars: int
     max_items: int
+    max_media_items: int | None
     memory_types: tuple[MemoryType, ...] | None
     min_confidence: float
     freshness_seconds: float | None
@@ -323,6 +330,15 @@ class ProvisionalActorResult(BaseModel):
     memory_ids: tuple[str, ...]
 
 
+class NamedActorResult(BaseModel):
+    """A person a currently visible naming assertion names, reached through other evidence."""
+
+    identity_id: str
+    name: str
+    memory_ids: tuple[str, ...]
+    naming_assertion_id: str | None
+
+
 class ContextUnknownResult(BaseModel):
     kind: ContextUnknownKind
     detail: str
@@ -332,10 +348,10 @@ class ContextBundleResult(BaseModel):
     goal: str
     reference_at: AwareDatetime
     budget: ContextBudgetResult
-    # An unnamed person present in the evidence is reported here beside the ranked entity
-    # hits, labelled, rather than omitted: what an agent may say depends on knowing they are
-    # there and that nobody has named them.
-    actors: tuple[SearchHitResult | ProvisionalActorResult, ...]
+    # Beside the ranked entity hits: a person a naming assertion names, reached through
+    # other evidence, and an unnamed person present in the evidence -- what an agent may say
+    # depends on knowing who is there, named or not.
+    actors: tuple[SearchHitResult | NamedActorResult | ProvisionalActorResult, ...]
     relationships: tuple[SearchHitResult, ...]
     scene: tuple[SearchHitResult, ...]
     episodes: tuple[SearchHitResult, ...]
@@ -360,6 +376,8 @@ def build_mcp_server(
     memory: Memory,
     *,
     identity_operations: bool = True,
+    embodied_operations: bool = True,
+    write_operations: bool = True,
 ) -> MCPServer[None]:
     """Expose the typed agent tool surface without taking ownership of ``memory``.
 
@@ -367,11 +385,23 @@ def build_mcp_server(
     reachable here for the same reason the common-path tools are, because this server runs in the
     process that holds it.
 
-    ``identity_operations`` is the host's choice about naming and erasing people. It defaults to
-    True, which is the published fifteen-tool surface. Pass False and the five identity tools are
-    not registered at all -- naming, reading, unlinking and erasing a person stay with the
-    process that owns the memory -- and the server instructions say so, because a tool an agent
-    cannot see is better than one it must be trusted not to call.
+    The three switches are the host's choice about which authority an agent holds. All default to
+    True, which is the published fifteen-tool surface; each False withholds its group by never
+    registering it, because a tool an agent cannot see is better than one it must be trusted not
+    to call, and the server instructions say which groups are missing.
+
+    - ``identity_operations``: naming, reading, unlinking and erasing a person.
+    - ``embodied_operations``: ``analyze_speech`` and ``analyze_faces``. Withholding these also
+      withholds the cross-modal identity merge, which ``analyze_faces`` commits -- and which
+      ``ask_memory`` can otherwise reach on its own, through the same face recognition it runs to
+      answer a question over a photo or video. ``build_mcp_server`` passes
+      ``link_identities=embodied_operations`` into every ``ask_memory`` call, so recall access
+      alone never carries merge authority.
+    - ``write_operations``: ``add_memory``, ``delete_memory`` and ``reinforce_memories``.
+
+    With all three False the surface is exactly the five read tools -- ``search_memories``,
+    ``ask_memory``, ``compile_context``, ``get_memory`` and ``list_memories`` -- which is
+    recall and compile alone.
     """
     server: MCPServer[None] = MCPServer(
         "mindbridge",
@@ -381,80 +411,15 @@ def build_mcp_server(
         # configured composition when it connects instead of spending a tool call or discovering
         # a missing backend by failing. `/healthz` reports the same view per request, so a
         # composition swapped behind a long-lived server stays visible there.
-        instructions=_instructions(memory.capabilities, identity_operations=identity_operations),
+        instructions=_instructions(
+            memory.capabilities,
+            identity_operations=identity_operations,
+            embodied_operations=embodied_operations,
+            write_operations=write_operations,
+        ),
         version="0.2.0",
         middleware=[cast(ServerMiddleware[Any], _strict_tool_arguments)],
     )
-
-    @server.tool(annotations=_IDEMPOTENT_WRITE)
-    @_stable_errors
-    def add_memory(
-        content: Annotated[Content, Field(description=_CONTENT_DESCRIPTION)],
-        occurred_at: Annotated[
-            AwareDatetime | None,
-            Field(
-                description=(
-                    "When the remembered event happened, as a timezone-aware timestamp. Omit for a"
-                    " timeless fact; without it the memory never matches a search occurrence"
-                    " window."
-                )
-            ),
-        ] = None,
-        occurred_end: Annotated[
-            AwareDatetime | None,
-            Field(
-                description=(
-                    "End of the remembered interval, timezone-aware. Requires `occurred_at` and"
-                    " must be later than it."
-                )
-            ),
-        ] = None,
-        metadata: Annotated[
-            dict[str, JsonValue] | None,
-            Field(
-                description=(
-                    "Application-owned JSON stored verbatim with the record, at most 262,144 UTF-8"
-                    " bytes serialized. It is not searched, and it is not an access-control or"
-                    " isolation boundary."
-                )
-            ),
-        ] = None,
-        memory_type: Annotated[
-            MemoryType,
-            Field(
-                description=(
-                    "`semantic` for a standing fact, `episodic` for something that happened,"
-                    " `procedural` for how to do something. Search can filter on it."
-                )
-            ),
-        ] = MemoryType.SEMANTIC,
-        context: Annotated[
-            ObservationContext | None,
-            Field(
-                description=(
-                    "Typed provenance for this observation: basis, source ID, confidence, validity"
-                    " window, and optional spatial pose. Omit it unless the caller actually knows"
-                    " these; `scope` filters at search time only match memories that carry them."
-                )
-            ),
-        ] = None,
-    ) -> MemoryResult:
-        """Store one memory and return its stable record.
-
-        Call this to persist something the agent should be able to recall in a later session.
-        Writes durable local state and may call the configured embedding backend. Storage is
-        content-addressed, so re-adding identical content returns the existing record instead of a
-        duplicate and retrying a call whose response was lost is safe.
-        """
-        record = memory.add(
-            content_input(content),
-            occurred_at=occurred_at,
-            occurred_end=occurred_end,
-            metadata=metadata,
-            memory_type=memory_type,
-            context=context,
-        )
-        return _memory_result(record)
 
     @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
     @_stable_errors
@@ -580,7 +545,10 @@ def build_mcp_server(
         configured. Returns the answer with the hits it used; `abstained` is true when the answerer
         reported no usable evidence, and the answer is then a fixed sentence rather than a guess.
         Stores no memory, but each call spends another generation, so retry only on a retryable
-        error.
+        error. When this server was built with `embodied_operations=False`, answering over a
+        photo or video may still identify who appears in it, but a corroborated voice-and-face
+        pair is never fused into one identity: that merge authority stays withheld along with
+        `analyze_faces`.
         """
         result = memory.ask(
             content_input(question),
@@ -588,6 +556,7 @@ def build_mcp_server(
             memory_type=memory_type,
             reference_at=reference_at,
             scope=scope,
+            link_identities=embodied_operations,
         )
         return AnswerResponse(
             answer=result.answer,
@@ -614,8 +583,9 @@ def build_mcp_server(
         Prefer this tool whenever you need context to act on: it returns the actors, facts,
         episodes, procedures, affect cues and traits that matter, each with its provenance, inside
         a budget you declare, plus `rendered` text you can read straight into your own reasoning.
-        Every non-empty section gets a slot before any section gets a second one, so a small
-        budget still describes the whole scene, and `omitted` counts what did not fit. Lineage
+        Rank fills the top half of `max_items`; the bottom half gives a slot to each section the
+        top half missed, so a generous budget describes the whole scene while a small one stays
+        readable strictly by score. `omitted` counts what did not fit. Lineage
         disagreements are reported in `conflicts` and never resolved for you. `ask_memory` remains
         a convenience for when you want one grounded sentence instead of the evidence.
 
@@ -678,6 +648,94 @@ def build_mcp_server(
             next_cursor=page.next_cursor,
         )
 
+    _register_write_tools(server, memory, enabled=write_operations)
+    _register_embodied_tools(server, memory, enabled=embodied_operations)
+    _register_identity_tools(server, memory, enabled=identity_operations)
+    return server
+
+
+def _register_write_tools(server: MCPServer[None], memory: Memory, *, enabled: bool) -> None:
+    """Register the tools that mutate stored memory, unless the host withheld them.
+
+    Adding a record, deleting one, and moving the ranker are the three tools whose purpose is a
+    durable change. A host that wants an agent to consume context and nothing else builds the
+    server with `write_operations=False`. `ask_memory` stays: it is a recall surface, and the
+    reinforcement it records for the memories its answer cited is the owner's
+    `reinforce_on_answer` setting rather than a capability this switch grants.
+    """
+    if not enabled:
+        return
+
+    @server.tool(annotations=_IDEMPOTENT_WRITE)
+    @_stable_errors
+    def add_memory(
+        content: Annotated[Content, Field(description=_CONTENT_DESCRIPTION)],
+        occurred_at: Annotated[
+            AwareDatetime | None,
+            Field(
+                description=(
+                    "When the remembered event happened, as a timezone-aware timestamp. Omit for a"
+                    " timeless fact; without it the memory never matches a search occurrence"
+                    " window."
+                )
+            ),
+        ] = None,
+        occurred_end: Annotated[
+            AwareDatetime | None,
+            Field(
+                description=(
+                    "End of the remembered interval, timezone-aware. Requires `occurred_at` and"
+                    " must be later than it."
+                )
+            ),
+        ] = None,
+        metadata: Annotated[
+            dict[str, JsonValue] | None,
+            Field(
+                description=(
+                    "Application-owned JSON stored verbatim with the record, at most 262,144 UTF-8"
+                    " bytes serialized. It is not searched, and it is not an access-control or"
+                    " isolation boundary."
+                )
+            ),
+        ] = None,
+        memory_type: Annotated[
+            MemoryType,
+            Field(
+                description=(
+                    "`semantic` for a standing fact, `episodic` for something that happened,"
+                    " `procedural` for how to do something. Search can filter on it."
+                )
+            ),
+        ] = MemoryType.SEMANTIC,
+        context: Annotated[
+            ObservationContext | None,
+            Field(
+                description=(
+                    "Typed provenance for this observation: basis, source ID, confidence, validity"
+                    " window, and optional spatial pose. Omit it unless the caller actually knows"
+                    " these; `scope` filters at search time only match memories that carry them."
+                )
+            ),
+        ] = None,
+    ) -> MemoryResult:
+        """Store one memory and return its stable record.
+
+        Call this to persist something the agent should be able to recall in a later session.
+        Writes durable local state and may call the configured embedding backend. Storage is
+        content-addressed, so re-adding identical content returns the existing record instead of a
+        duplicate and retrying a call whose response was lost is safe.
+        """
+        record = memory.add(
+            content_input(content),
+            occurred_at=occurred_at,
+            occurred_end=occurred_end,
+            metadata=metadata,
+            memory_type=memory_type,
+            context=context,
+        )
+        return _memory_result(record)
+
     @server.tool(annotations=_DELETE)
     @_stable_errors
     def delete_memory(
@@ -716,17 +774,18 @@ def build_mcp_server(
         """
         return ReinforceResult(reinforced=memory.reinforce(memory_ids))
 
-    _register_embodied_tools(server, memory)
-    _register_identity_tools(server, memory, enabled=identity_operations)
-    return server
 
+def _register_embodied_tools(server: MCPServer[None], memory: Memory, *, enabled: bool) -> None:
+    """Register the embodied tools, unless the host withheld them.
 
-def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
-    """Register the embodied tools on an existing server.
-
-    Split from `build_mcp_server` only to keep each registration function readable; every set
-    dispatches to the same injected memory.
+    Asking who spoke and who was seen is where recognition enters the store: `analyze_faces`
+    also commits the corroborated cross-modal merge, which is identity authority reached
+    through an analysis call. A host that withholds the identity tools but leaves these
+    registered has withheld naming and kept binding, so both switches exist and both default
+    to True.
     """
+    if not enabled:
+        return
 
     @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
     @_stable_errors
@@ -761,7 +820,8 @@ def _register_embodied_tools(server: MCPServer[None], memory: Memory) -> None:
 
         Side effects: records the face as identity evidence and may bind it to a voice already
         seen with it, so an identical retry is safe but may resolve an identity an earlier call
-        left unnamed; `unlink_identity` reverses a binding. `identity_id` is stable and accepted
+        left unnamed. That binding is a merge the owner's operation log records and can reverse,
+        and `unlink_identity` reverses it from here. `identity_id` is stable and accepted
         by `register_identity` and `get_identity`. Fails with `model_error` when no face backend
         is configured or when it does not support the stored modality.
         """
@@ -776,11 +836,13 @@ def _register_identity_tools(
 ) -> None:
     """Register the identity tools, unless the host withheld them.
 
-    Naming a person, reading who they are, splitting a wrong merge and erasing them are host
-    authority: every one of them is recorded in the operation log and, apart from erasure,
-    reversible. A host that does not want an agent holding that authority builds the server
-    with `identity_operations=False`, and then these five tools are never registered at all --
-    an agent cannot call a tool it cannot see, which is stronger than trusting it not to.
+    Naming a person, splitting a wrong merge and erasing them are host authority, and every one
+    of them is recorded in the operation log: naming and splitting are reversible through
+    `rollback()`, and erasure leaves an irreversible row so the request stays auditable.
+    Reading who somebody is changes nothing and logs nothing. A host that does not want an agent
+    holding that authority builds the server with `identity_operations=False`, and then these
+    five tools are never registered at all -- an agent cannot call a tool it cannot see, which
+    is stronger than trusting it not to.
     """
     if not enabled:
         return
@@ -867,7 +929,8 @@ def _register_identity_tools(
         Call this when a person says the system has confused them with someone else. Returns the
         restored identity ID, or `restored_identity_id: null` when the merge cannot be reversed
         because no record names which modality was contributed, and repeating the call is safe
-        because a reversed merge stays reversed.
+        because a reversed merge stays reversed. The split is written to the operation log and
+        the owner can reverse it, which re-merges the pair.
 
         Side effects: the restored identity keeps no name or relationship and the pair's
         accumulated evidence is reset. This does not suppress the pair: if the same voice and face
@@ -889,9 +952,10 @@ def _register_identity_tools(
 
         Side effects: this destroys the face and voice templates and cannot be undone, so a later
         encounter mints a fresh unnamed identity for the same person rather than recognizing them
-        as forgotten. Retrying is not safe in the sense that matters here: the second call fails
-        with `identity_not_found` because the person is already gone, which is not evidence that
-        the first call failed.
+        as forgotten. The operation log records that the erasure happened, over which IDs, and
+        nothing that could reconstruct the person. Retrying is not safe in the sense that matters
+        here: the second call fails with `identity_not_found` because the person is already gone,
+        which is not evidence that the first call failed.
         """
         return ForgetResult(erasure=memory.forget_identity(identity_id))
 
@@ -1040,7 +1104,16 @@ def _bundle_result(bundle: ContextBundle) -> ContextBundleResult:
     )
 
 
-def _actor_result(entry: SearchHit | ProvisionalActor) -> SearchHitResult | ProvisionalActorResult:
+def _actor_result(
+    entry: SearchHit | NamedActor | ProvisionalActor,
+) -> SearchHitResult | NamedActorResult | ProvisionalActorResult:
+    if isinstance(entry, NamedActor):
+        return NamedActorResult(
+            identity_id=entry.identity_id,
+            name=entry.name,
+            memory_ids=entry.memory_ids,
+            naming_assertion_id=entry.naming_assertion_id,
+        )
     if isinstance(entry, ProvisionalActor):
         return ProvisionalActorResult(
             identity_id=entry.identity_id,
@@ -1053,6 +1126,7 @@ def _budget_result(budget: ContextBudget) -> ContextBudgetResult:
     return ContextBudgetResult(
         max_chars=budget.max_chars,
         max_items=budget.max_items,
+        max_media_items=budget.max_media_items,
         memory_types=None if budget.memory_types is None else tuple(sorted(budget.memory_types)),
         min_confidence=budget.min_confidence,
         freshness_seconds=(None if budget.freshness is None else budget.freshness.total_seconds()),
@@ -1074,6 +1148,8 @@ def _instructions(
     capabilities: MemoryCapabilities,
     *,
     identity_operations: bool = True,
+    embodied_operations: bool = True,
+    write_operations: bool = True,
 ) -> str:
     """Render the declared capability view an agent reads when it connects.
 
@@ -1096,6 +1172,25 @@ def _instructions(
                 if identity_operations
                 else "Identity operations are not exposed here: naming, reading, unlinking and"
                 " erasing a person stay with the process that owns this memory."
+            ),
+            (
+                "Embodied operations are not exposed here: transcribing who spoke, detecting who"
+                " was seen, and the cross-modal identity merge that follows stay with the process"
+                " that owns this memory. ask_memory may still identify who is in a retrieved"
+                " photo or video to answer a question, but it will not fuse a voice and a face"
+                " into one identity while this is withheld."
+                if not embodied_operations
+                else "analyze_speech and analyze_faces resolve who was heard and seen;"
+                " analyze_faces may also bind one voice to one face, which is logged and"
+                " reversible by the owner. ask_memory can reach the same bind when it answers"
+                " over a photo or video."
+            ),
+            (
+                "This memory is read-only to you: adding, deleting and reinforcing stay with the"
+                " process that owns it."
+                if not write_operations
+                else "add_memory, delete_memory and reinforce_memories change durable state;"
+                " reinforce only what actually helped you answer."
             ),
             "Declared capabilities of this composition, the same JSON document GET /healthz"
             " serves. `operations` names the optional operations these backends can serve:",

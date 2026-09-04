@@ -47,6 +47,7 @@ from mindbridge.types import (
     MemoryCapabilities,
     MemoryRecord,
     Modality,
+    NamedActor,
     Page,
     ProvisionalActor,
     SearchHit,
@@ -65,13 +66,29 @@ SHARED_OPERATIONS: dict[str, tuple[str | None, str | None]] = {
     "list": ("listMemories", "list_memories"),
     "delete": ("deleteMemory", "delete_memory"),
     "reinforce": ("reinforceMemories", "reinforce_memories"),
-    "speech": (None, "analyze_speech"),
-    "faces": (None, "analyze_faces"),
+    # The fast plane is an ordinary application operation on the caller's own records, so it is
+    # always on REST rather than gated; MCP still has no tool for it (a host owns the settle loop).
+    "capture": ("captureMemory", None),
+    "settle": ("settleCaptures", None),
+    "pending_captures": ("pendingCaptures", None),
+    # Embodied and identity operations are gated behind REST's `identity_operations` and
+    # `embodied_operations`, mirroring MCP's own switches; `_rest_route` below builds the app
+    # with both on so the shared checks below see every gated route.
+    "speech": ("analyzeSpeech", "analyze_speech"),
+    "faces": ("analyzeFaces", "analyze_faces"),
     "register_speaker": (None, "register_speaker"),
-    "register_identity": (None, "register_identity"),
-    "identity": (None, "get_identity"),
-    "unlink_identity": (None, "unlink_identity"),
-    "forget_identity": (None, "forget_identity"),
+    "register_identity": ("registerIdentity", "register_identity"),
+    "identity": ("getIdentity", "get_identity"),
+    "unlink_identity": ("unlinkIdentity", "unlink_identity"),
+    "forget_identity": ("forgetIdentity", "forget_identity"),
+    # The three data-subject rights REST serves behind the same `identity_operations` switch and
+    # MCP deliberately does not serve at all. Consent is a statement its subject makes, so an
+    # agent must not be able to record one; export and retention are the host's own account of,
+    # and authority over, what is held.
+    "record_consent": ("recordConsent", None),
+    "consent": ("getConsent", None),
+    "export": ("exportSubject", None),
+    "apply_retention": ("applyRetention", None),
 }
 # Operations no transport exposes, each with the reason. `docs/design-principles.md` requires a
 # transport gap to be documented rather than silently left out, and the union of this and
@@ -83,15 +100,13 @@ UNEXPOSED_OPERATIONS: dict[str, str] = {
     "search_with_trace": "candidate-level retrieval diagnostics with no agent or client action",
     "reindex": "unbounded index maintenance an operator schedules, not a caller",
     "optimize": "index maintenance an operator schedules, not a caller",
-    # Fast capture is a two-call contract whose second half the host schedules; a transport
-    # caller cannot be handed the first half without also owning the settle loop.
-    "capture": "acknowledges before enrichment, so the host must own the matching settle loop",
-    "settle": "deferred-enrichment work an owner schedules, not a caller",
-    "pending_captures": "queue depth for the process that runs settle",
     # The control plane rewrites derived memory under policy. `docs/context-os.md` keeps that
     # authority with the host: an agent must not gain it by holding ordinary recall access.
     "consolidation_candidates": "the control plane's own due-work queue, read by the host loop",
     "consolidate": "derives and retires memory under host authority, not agent authority",
+    "deliberate": "schedules the loop itself, so it spends the owner's model budget",
+    "apply": "applies an operation with no proposal behind it, which is host authority itself",
+    "record_outcome": "annotates the audit log for measurement, written by the owner",
     "forget": "cognitive forgetting is a policy decision the host owns",
     "rollback": "reverses a committed operation, so it stays with the host that authorized it",
     "operations": "the control-plane audit log, read by an operator rather than a caller",
@@ -110,6 +125,12 @@ _COUNT_WORDS = {
     13: "Thirteen",
     14: "Fourteen",
     15: "Fifteen",
+    16: "Sixteen",
+    17: "Seventeen",
+    18: "Eighteen",
+    19: "Nineteen",
+    20: "Twenty",
+    21: "Twenty-one",
 }
 # `search_with_trace` has no route or tool of its own; the search surfaces reach it through
 # `explain`, so the adapter protocol must still declare it exactly as the SDK does. The MCP-only
@@ -138,6 +159,13 @@ REST_REQUEST_MODELS: dict[str, type[BaseModel]] = {
     "answer": rest.AnswerRequest,
     "reinforceMemories": rest.ReinforceRequest,
     "compileContext": rest.ContextRequest,
+    "captureMemory": rest.MemoryCreate,
+    "settleCaptures": rest.SettleRequest,
+    "analyzeSpeech": rest.AnalyzeRequest,
+    "analyzeFaces": rest.AnalyzeRequest,
+    "registerIdentity": rest.IdentityRegisterRequest,
+    "recordConsent": rest.ConsentRequest,
+    "applyRetention": rest.RetentionRequest,
 }
 
 
@@ -156,7 +184,11 @@ def _sdk_parameters(operation: str) -> set[str]:
 
 
 def _rest_route(operation_id: str) -> APIRoute:
-    app = rest.create_app(memory=cast(rest._Memory, _UnusedMemory()))
+    app = rest.create_app(
+        memory=cast(rest._Memory, _UnusedMemory()),
+        identity_operations=True,
+        embodied_operations=True,
+    )
     routes = [
         route
         for route in app.routes
@@ -239,7 +271,11 @@ def test_transport_fields_name_sdk_arguments(operation: str) -> None:
 
 
 def test_every_transport_operation_is_covered() -> None:
-    app = rest.create_app(memory=cast(rest._Memory, _UnusedMemory()))
+    app = rest.create_app(
+        memory=cast(rest._Memory, _UnusedMemory()),
+        identity_operations=True,
+        embodied_operations=True,
+    )
     routes = {
         route.operation_id
         for route in app.routes
@@ -527,6 +563,12 @@ def test_the_compiled_bundle_mirrors_the_sdk_value_on_both_transports() -> None:
             {},
         ),
         (
+            NamedActor,
+            rest.NamedActorResponse,
+            mcp_adapter.NamedActorResult,
+            {},
+        ),
+        (
             ContextBudget,
             rest.ContextBudgetResponse,
             mcp_adapter.ContextBudgetResult,
@@ -547,6 +589,7 @@ def test_the_context_budget_transport_defaults_come_from_the_sdk_value() -> None
     expected = {
         "max_chars": budget.max_chars,
         "max_items": budget.max_items,
+        "max_media_items": budget.max_media_items,
         "memory_types": budget.memory_types,
         "min_confidence": budget.min_confidence,
         "freshness_seconds": budget.freshness,
@@ -582,6 +625,25 @@ def test_the_documented_count_of_operations_without_a_tool_is_the_real_one() -> 
     )
 
     assert f"{_COUNT_WORDS[without_a_tool]} Python operations have no MCP tool." in page
+
+
+def test_the_documented_root_import_count_and_inventory_are_the_real_ones() -> None:
+    """`docs/api/python-sdk.md` states `len(mindbridge.__all__)` in prose and lists every name.
+
+    This drift has recurred for several rounds: a new public value lands in `__all__` without
+    the reference page's count or grouped tables following it. Parsing the sentence and scanning
+    the whole page for each name in backticks catches both, rather than one hand-picked table.
+    """
+    page = (Path(mindbridge.__file__).parents[2] / "docs" / "api" / "python-sdk.md").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"These are the (\d+) supported names exported by `mindbridge`:", page)
+
+    assert match is not None
+    assert int(match.group(1)) == len(mindbridge.__all__)
+    backticked = set(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", page))
+    missing = [name for name in mindbridge.__all__ if name not in backticked]
+    assert missing == []
 
 
 def test_both_transports_decode_content_parts_with_one_implementation() -> None:

@@ -27,6 +27,16 @@ compile(
 behave exactly as they do for `search()`, and SQLite reapplies authoritative visibility: a
 forgotten record and a hidden inferred trait never reach a bundle.
 
+`memory_types` is pushed into that retrieval rather than applied to its result. The index filter
+takes one type, so a set of them opens one route per type and each gets the full candidate depth:
+a `memory_types={procedural}` request finds procedural records however many episodes outrank them,
+instead of coming back empty because the common types filled a shared window. A request naming
+every type is the unfiltered request written out and opens one route, not three.
+
+`min_confidence` and `freshness` the index cannot answer, so they are still applied to the window
+after it comes back -- and the window is tripled when either is set, so that what they will remove
+was ranked rather than crowded out.
+
 There is one retrieval round and no second one. Everything the bundle counts -- `omitted`, and
 each `budget_excluded` tally -- is therefore a statement about that window, not about the store:
 `omitted == 0` means nothing inside the window was dropped, not that nothing else exists. When the
@@ -37,26 +47,32 @@ window came back full and the bundle still lost evidence, `unknowns` carries a
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `max_chars` | `16000` | Evidence character ceiling, charged with the same cost function `ask()` uses: record text plus a per-modality text equivalent for each media asset. One image part is charged 2000, one audio part 4000, and one video part 12000, so a ceiling below 12000 omits every video record it ranks |
+| `max_chars` | `16000` | Rendered-evidence character ceiling: the header, each section heading, each memory's whole rendered line, and a per-modality text equivalent for each media asset. One image part is charged 2000, one audio part 4000, and one video part 12000, so a ceiling below 12000 omits every video record it ranks |
 | `max_items` | `24` | Maximum included memories |
-| `memory_types` | `None` | Keep only these `MemoryType` values; `None` keeps every type |
+| `max_media_items` | `None` | Maximum grounded media parts; `0` compiles a text-only bundle and `None` lets `max_chars` alone decide |
+| `memory_types` | `None` | Keep only these `MemoryType` values, pushed into the index as one route per type; `None` keeps every type |
 | `min_confidence` | `0.0` | Minimum typed confidence; a record with no typed context counts as `1.0` |
 | `freshness` | `None` | Keep only memories anchored within this `timedelta` of `reference_at` |
 | `max_latency_ms` | `None` | Deadline in milliseconds; optional stages are skipped once it passes |
 
 The freshness anchor is event end, then event start, then creation time. Every field is validated
-on construction: the two maxima and `max_latency_ms` are positive integers, `min_confidence` is in
-`[0, 1]`, and `freshness` is a positive `timedelta`.
+on construction: `max_chars`, `max_items` and `max_latency_ms` are positive integers,
+`max_media_items` is a non-negative one, `min_confidence` is in `[0, 1]`, and `freshness` is a
+positive `timedelta`.
 
 ### What a character costs
 
-There is one budget, not a text budget and a media budget. `max_chars` prices both against the
-same scale, because what a bundle spends is what the downstream model is charged for, and one
-grounded media part costs far more than the record text beside it. The prices are fixed:
+`max_chars` prices text and media against the same scale, because what a bundle spends is what
+the downstream model is charged for, and one grounded media part costs far more than the record
+text beside it. `max_media_items` is the second knob for the cases a shared scale cannot express:
+"at most two images" and "no media at all" are statements about parts, not about characters, and a
+character ceiling can only approximate them. The prices are fixed:
 
 | Charged | Characters |
 | --- | --- |
-| Record text | `len(hit.content)` |
+| One memory's rendered line | `len(render_hit_line(hit)) + 1` -- the `- [id]` frame, the squeezed record text, and the confidence and validity suffix |
+| The header | its four rendered lines, about 150 characters plus the goal |
+| One section heading | its blank line, `##` marker plus space, and the name |
 | One `image` asset | 2000 |
 | One `audio` asset | 4000 |
 | One `video` asset | 12000 |
@@ -80,20 +96,32 @@ inference to discount -- it is a raw observation, evidence in its own right -- s
 so the filter and the rendered line never disagree. Raising `min_confidence` is therefore a way to
 demand better inferences, not a way to exclude observations; filter those by `memory_types`.
 
-### What `max_chars` does not bound
+### What `max_chars` does and does not bound
 
-`max_chars` bounds evidence, the quantity `ContextBundle.chars` reports. It does not bound
-`len(bundle.render())`, which adds a bounded frame around that evidence:
+`max_chars` bounds the *rendered* evidence, the quantity `ContextBundle.chars` reports and the
+quantity the selection charges: the header, every section heading, every memory line with its
+frame, and every `NamedActor` or `ProvisionalActor` line. A bundle that reports no compilation
+diagnostics therefore satisfies `len(bundle.render()) <= bundle.chars <= max_chars`, and a caller
+shipping `render()` no longer has to size against it themselves.
 
-- a four-line header -- the goal, a 61-character reading guide, the reference time, and the
-  budget line -- which is roughly 150 characters plus the goal text;
-- a blank line and a two-character `##` heading, plus a space, for each non-empty section;
-- per included memory, the `- [id]` prefix and the `(confidence 0.00)` suffix, with their
-  separating spaces: 23 characters plus the id, plus a validity suffix when it carries one;
-- the optional `## Conflicts`, `## Unknowns`, and `Omitted:` blocks.
+`chars` is an upper bound rather than an exact length -- media parts are charged their text
+equivalent, which is far above the zero characters they render as, and the budget line is priced
+at its widest -- so the inequality can be slack, never violated.
 
-A caller who ships `render()` should size against `len(bundle.render())`; the bundle does not
-publish a second number for it.
+The header is inside the ceiling and is written whether or not anything else fits, so a
+`max_chars` the header alone overruns has no bundle that satisfies the inequality. Compilation
+refuses such a budget with `ValidationError` naming the floor it would need, rather than returning
+a bundle over the limit it was handed. The floor moves with the goal, because the header repeats
+it, and it is a few hundred characters for a short goal -- far below any budget that could buy a
+memory line as well.
+
+Three things `render()` appends are outside the ceiling, all of them explanations rather than
+grounding: the `## Conflicts` block, the `## Unknowns` block, and the `Omitted:` trailer.
+Suppressing any of them to fit a budget would make a thin bundle look like an empty store, which
+is the failure the unknowns exist to prevent. An actor line is different: it is priced and fit in
+after the ranked hits, the same as any other line the compiler grounds, and dropped -- reported as
+a `budget_excluded` unknown, never given away for free -- when what is left of `max_chars` cannot
+buy it.
 
 ### The deadline
 
@@ -115,7 +143,7 @@ A typed `MemoryKind` decides the section first; an untyped or generic record fal
 
 | Section | Contents |
 | --- | --- |
-| `actors` | Kind `entity`, plus one `ProvisionalActor` per unnamed person in the included evidence |
+| `actors` | Kind `entity`, plus one `NamedActor` per named identity and one `ProvisionalActor` per unnamed person the included evidence's identity edge reaches |
 | `relationships` | Kind `relation` |
 | `scene` | Kind `state` |
 | `facts` | Type `semantic`, except `entity`, `relation`, `state`, `affect`, and `trait` |
@@ -130,16 +158,40 @@ stay empty in a composition with neither a `FormationBackend` nor a `Consolidati
 `episodes`, `facts`, and `procedures` are keyed on `MemoryType`, which every record carries, and
 populate without either.
 
-The bundle also carries no person link. Identity lives asset-keyed in the speech and face tables,
-reachable through `speech()` and `faces()`, and no `identity_id` exists on a memory, a hit, or a
-`MemoryContext`. Cross-modal person linkage in a bundle needs that edge; it is a known gap rather
-than a configuration mistake.
+`memory_types` filters the record's own `MemoryType`, and a kind is stored as a type: kind `event`
+and `affect` as `episodic`, `response_policy` as `procedural`, everything else as `semantic`. A
+section is therefore reachable only for the types its kinds are stored as, so a `{semantic}`
+request cannot fill `affect`, `episodes`, or `procedures` however well their records rank. Each
+such section is named in `unknowns` as a `section_empty` entry saying which filter emptied it,
+rather than leaving the reader to map a dropped type back to the section they lost.
 
-Selection gives every non-empty section one slot in rank order before any section receives a
-second, so a small budget still describes the whole scene instead of spending everything on the
-top-ranked section. Remaining slots are filled by score. One oversized hit does not close the
-bundle: a cheaper lower-ranked candidate can still fit. `omitted` counts every candidate that
-passed the filters but did not fit, and `chars` is what the included hits cost.
+The bundle carries the person link. A memory's identity edge -- its own semantic assertion
+bound to an identity (`MemoryContext.identity_id`), or the asset-keyed speech speaker or face
+observation its media carries -- resolves to a `NamedActor` when a currently visible naming
+assertion names that identity, and to a `ProvisionalActor` when none does. Neither requires the
+naming assertion itself to rank into the bundle: the edge is resolved for every included memory
+independently of what else made the cut.
+
+### How slots are shared
+
+**Rank decides the top half of `max_items`; the bottom half gives one slot to each section the
+top half missed, and only when it is large enough to seat every section the candidates span --
+otherwise rank decides the whole bundle.**
+
+Diversity is worth having, but not at the price of rank readability. Reserving a floor slot per
+section at a small budget lets a rank-fifty trait evict a rank-two episode, and a bundle that no
+longer reads by score is worse than one missing a section. So with eight sections spanned and
+`max_items=3` the selection is exactly the top three by rank; the default `max_items=24` leaves
+twelve slots for the floor round and every spanned section still gets one.
+
+Remaining slots are filled by score. One oversized hit does not close the bundle: a cheaper
+lower-ranked candidate can still fit. `omitted` counts every candidate that passed the filters
+but did not fit, and `chars` is what the included hits cost.
+
+This split is a default, not a measured optimum. Gate 4 of [the Context OS plan](context-os.md)
+still owes a downstream-utility measurement against the no-memory, full-context, and
+retrieval-only baselines; that measurement decides whether the halving point is right or whether
+the floor round should go entirely.
 
 `ContextBundle` also reports `occurred_from` and `occurred_until` over the included hits, `frames`
 (the distinct metric spatial frame IDs, sorted), `places` (the distinct symbolic `place_id`s,
@@ -153,25 +205,43 @@ a thin bundle explains itself instead of looking like an empty store.
 
 | `kind` | When it appears |
 | --- | --- |
-| `budget_excluded` | Counted candidates a bound removed, or that did not fit the budget |
-| `section_empty` | A `memory_types` value the request asked for that no included hit carries |
+| `budget_excluded` | Counted candidates a bound removed, or that did not fit the budget, or actor lines that did not fit `max_chars` |
+| `section_empty` | A bundle section a `memory_types` request left empty, naming the section and either that the filter excluded every type it carries, or that the request admitted the type and no record of it reached the bundle at all -- a kind-keyed section (`actors`, `scene`, `affect`, `traits`) empty while another section already carries a record of its type is silent, since flagging it would be noise in most bundles |
 | `scope_empty` | A `scope` was supplied and retrieval matched nothing; the entry names the bounds |
 | `modality_unsupported` | The goal carries media this composition's embedder cannot search |
 | `stage_skipped` | An optional stage the `max_latency_ms` deadline skipped |
 | `candidates_exhausted` | Retrieval filled its candidate window and the bundle still lost evidence, so the counts bound the window and not the store |
 
-## Provisional actors
+## Named and provisional actors
 
-A recognized person whom no visible naming assertion names is reported in `actors` as a
-`ProvisionalActor` carrying `identity_id` and the `memory_ids` of the included evidence that
-observed them, sorted by identity. An unnamed person present in the room is not a person missing
-from context: what an agent may say depends on knowing they are there and that nobody has named
-them.
+A memory's identity edge -- `MemoryContext.identity_id` when its own semantic assertion is bound
+to an identity, or the asset-keyed speech speaker or face observation its media carries -- names
+somebody a currently visible naming assertion names, or nobody. The compiler resolves that edge
+for every included memory and reports the identity either way, without requiring the naming
+assertion itself to rank into the bundle:
 
-A provisional actor is not a hit. It never appears in `hits`, it takes no item slot, it costs no
-characters, and it is dropped when the evidence that observed the person did not make it into the
-bundle -- the bundle never reports somebody the reader cannot see the evidence for. `render()`
-prints one plainly labelled line per entry, after the ranked actors.
+- **`NamedActor`** carries `identity_id`, `name`, the `memory_ids` of the included evidence whose
+  identity edge resolved to them, and `naming_assertion_id`, the memory id of the naming assertion
+  that names them -- kept for provenance even when that assertion is not itself in the bundle. The
+  naming assertion's own memory is never reported back to itself here: when it is included it
+  already renders as its own ranked `actors` hit, so reporting it again would list the same person
+  twice.
+- **`ProvisionalActor`** carries `identity_id` and `memory_ids` and nothing else: there is no name
+  to carry, which is the whole point. An unnamed person present in the room is not a person
+  missing from context -- what an agent may say depends on knowing they are there and that nobody
+  has named them.
+
+An identity is never reported both ways: `named_actors` and `provisional_identities` are resolved
+from the same naming projection, so an identity `NamedActor` reports never also produces a
+`ProvisionalActor`.
+
+Neither is a hit. Neither appears in `hits` or takes an item slot, and each is dropped when the
+evidence that carried its identity edge did not make it into the bundle -- the bundle never
+reports somebody the reader cannot see the evidence for. Unlike everything else charged against
+`max_chars`, though, an actor line is not selected for rank: it is fit into whatever `max_chars`
+has left after the ranked hits, in identity order, named actors before provisional ones, and
+dropped -- not appended for free -- when it does not fit. `render()` prints one plainly labelled
+line per entry, after the ranked actors.
 
 ## Conflicts
 

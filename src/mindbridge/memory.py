@@ -32,6 +32,7 @@ from contextvars import copy_context
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from functools import partial
+from itertools import zip_longest
 from pathlib import Path
 from threading import Condition, RLock, local
 from time import perf_counter
@@ -66,7 +67,7 @@ from mindbridge._telemetry import (
     traced_span,
 )
 from mindbridge.configuration import MindBridgeConfig, resolve_memory_config
-from mindbridge.context import compile_context, evidence_cost
+from mindbridge.context import NamedActorLink, compile_context, evidence_cost
 from mindbridge.control import dump_operation, load_operation, operation_key
 from mindbridge.exceptions import (
     IdentityNotFoundError,
@@ -85,6 +86,7 @@ from mindbridge.infrastructure.local.assets import (
     AssetTooLargeError,
 )
 from mindbridge.infrastructure.local.store import (
+    CONSENT_PREDICATE,
     IdentityLink,
     IndexCandidate,
     IndexDocument,
@@ -121,6 +123,7 @@ from mindbridge.models.base import (
 )
 from mindbridge.plugins import MemoryConfig, MemoryPlugins
 from mindbridge.types import (
+    KIND_MEMORY_TYPES,
     AbstentionReason,
     AcousticBoundary,
     AnswerChunk,
@@ -130,6 +133,8 @@ from mindbridge.types import (
     AudioBoundary,
     AudioStreamPacket,
     Blob,
+    ConsentClaim,
+    ConsentState,
     ConsolidationCandidate,
     ConsolidationReport,
     ContentAtom,
@@ -138,9 +143,12 @@ from mindbridge.types import (
     ContextBundle,
     ContextUnknown,
     ContextUnknownKind,
+    DeliberationReport,
     EvidenceBasis,
+    ExportBundle,
     FaceObservation,
     FormationProposal,
+    IdentityChange,
     IdentityClaim,
     IdentityErasure,
     IdentityProfile,
@@ -151,6 +159,7 @@ from mindbridge.types import (
     MemoryKind,
     MemoryOperation,
     MemoryOperationRecord,
+    MemoryOutcome,
     MemoryRecord,
     MemoryTrigger,
     MemoryType,
@@ -160,6 +169,8 @@ from mindbridge.types import (
     PCMChunk,
     PendingCapture,
     PrefetchResult,
+    RetentionPolicy,
+    RetentionReport,
     RetrievalCandidateTrace,
     RetrievalRejection,
     RetrievalScope,
@@ -185,6 +196,19 @@ _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
 # consolidator configured.
 _NAMING_RECIPE = "mindbridge-identity-naming-v1"
 _NAMING_PREDICATE = "identity"
+# Recording consent rests on the same authority as naming -- somebody said so -- so it is the
+# same kind of assertion under its own recipe and its own predicate, which keeps the two in
+# separate lineages: consenting never renames anybody and renaming never re-opens consent.
+_CONSENT_RECIPE = "mindbridge-identity-consent-v1"
+# Binding one voice to one face is the kernel's own corroboration rule over co-occurrence
+# evidence it counted, not a model's proposal, so the recipe names that rule. It is what makes
+# the MERGE row's lineage honest: the recognizer models produced the templates, this rule
+# decided the bind, and `rollback()` reverses it.
+_IDENTITY_LINK_RECIPE = "mindbridge-identity-link-v1"
+# How much one retention pass may delete. Physical deletion is unrecoverable, so a pass is
+# bounded and repeatable rather than unbounded: an operator runs it again until it reports
+# nothing, and can stop after any pass.
+_RETENTION_PAGE_SIZE = 1_000
 _INDEX_RECIPE_PREFIX = (
     "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:context-keys-v10"
 )
@@ -226,6 +250,16 @@ _STREAM_GROUP_SECONDS = 0.25
 _REINDEX_PAGE_SIZE = 256
 _REEMBED_PAGE_SIZE = 32
 _RERANK_CANDIDATES = 100
+# One empty recall is a question nobody had asked before; two near-equal ones inside the
+# configured window is a gap. Not configurable: below two there is no repetition to speak of, and
+# a host that wants a stricter threshold narrows the window instead.
+_REPEATED_FAILURES = 2
+# Everything a recall query's normalization drops before two of them are called near-equal:
+# case, accents, punctuation, and whitespace runs. Deliberately lexical -- an embedding-based
+# near-duplicate check would make the trigger depend on the model, so "did the user ask this
+# again" would change meaning when the embedder was replaced.
+_QUERY_NOISE = re.compile(r"[^\w\s]+", re.UNICODE)
+_QUERY_SPACE = re.compile(r"\s+")
 # Depth of every index route, deliberately not a function of the requested `limit`. Each route
 # is truncated to it and a memory's dense relevance is the maximum over the routes that reached
 # it, so a `limit`-derived depth made the score -- and the lexical term weights computed over the
@@ -359,6 +393,11 @@ _MAX_RETRIEVAL_KEYS = 128
 _PAYLOAD_TOO_LARGE = "payload_too_large"
 _MAX_QUERY_RETRIEVAL_KEYS = 7
 _MAX_INDEX_SEARCH_WORKERS = 4
+# How much deeper `compile()` ranks when the budget carries a bound only the compiler can
+# apply -- `min_confidence` or `freshness`. Those remove candidates after retrieval, so the
+# window has to hold what they will remove for `candidates_exhausted` to mean the store ran
+# out rather than the window did.
+_POST_FILTER_WINDOW = 3
 _TODAY_ISO_DATE = re.compile(r"\btoday\s+is\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
 _MONTH_NAME = (
     r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
@@ -571,6 +610,10 @@ class Memory:
         face_similarity: float = _DEFAULT_CONFIG.face_similarity,
         face_margin: float = _DEFAULT_CONFIG.face_margin,
         identity_link_min_assets: int = _DEFAULT_CONFIG.identity_link_min_assets,
+        memory_budget_records: int | None = _DEFAULT_CONFIG.memory_budget_records,
+        query_failure_window_seconds: float = _DEFAULT_CONFIG.query_failure_window_seconds,
+        query_failure_history: int = _DEFAULT_CONFIG.query_failure_history,
+        retention: RetentionPolicy = _DEFAULT_CONFIG.retention,
         tracer: Tracer | None = None,
     ) -> None:
         self.data_dir = Path(data_dir).expanduser().resolve()
@@ -613,6 +656,18 @@ class Memory:
         if not isinstance(reinforce_on_answer, bool):
             raise ValidationError("reinforce_on_answer must be a boolean")
         self._reinforce_on_answer = reinforce_on_answer
+        self._memory_budget_records = (
+            None
+            if memory_budget_records is None
+            else _positive_int(memory_budget_records, "memory_budget_records")
+        )
+        self._query_failure_window = _positive_seconds(
+            query_failure_window_seconds, "query_failure_window_seconds"
+        )
+        self._query_failure_history = _positive_int(query_failure_history, "query_failure_history")
+        if not isinstance(retention, RetentionPolicy):
+            raise ValidationError("retention must be a RetentionPolicy value")
+        self._retention = retention
 
         self._store = _open_store(self.data_dir)
         self._embedder = embedder
@@ -736,6 +791,10 @@ class Memory:
             face_similarity=config.face_similarity,
             face_margin=config.face_margin,
             identity_link_min_assets=config.identity_link_min_assets,
+            memory_budget_records=config.memory_budget_records,
+            query_failure_window_seconds=config.query_failure_window_seconds,
+            query_failure_history=config.query_failure_history,
+            retention=config.retention,
             tracer=tracer,
         )
 
@@ -1339,7 +1398,7 @@ class Memory:
                 prepared,
                 limit=limit,
                 operation=assets,
-                memory_type=_optional_memory_type(memory_type),
+                memory_types=_pushed_memory_types(_optional_memory_type(memory_type)),
                 reference_at=reference,
                 temporal_range=_temporal_range(temporal_text, reference),
                 occurred_from=occurred_from,
@@ -1349,6 +1408,7 @@ class Memory:
                 capture_trace=capture_trace,
             )
             self._persist_transcripts(assets)
+            self._note_query_failure(prepared.text, failed=not outcome.hits)
             return outcome
 
     def ask(
@@ -1359,8 +1419,17 @@ class Memory:
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        link_identities: bool = True,
     ) -> AnswerResult:
-        """Answer a native or mixed-modal question only from retrieved memories."""
+        """Answer a native or mixed-modal question only from retrieved memories.
+
+        `link_identities` gates the one write `ask` can otherwise reach: when a retrieved image
+        or video corroborates a voice-and-face pair, face recognition still runs to identify who
+        answers the question, but with `link_identities=False` the corroborated bind is never
+        committed -- no MERGE row, no new identity link. A host that withholds embodied MCP
+        tools passes `link_identities=False` here too, so recall access alone never carries
+        merge authority.
+        """
         # Draining `ask_stream()` keeps one implementation of the whole path, so a buffered and
         # a streamed answer cannot drift apart in grounding, abstention, or reinforcement.
         stream = self.ask_stream(
@@ -1369,6 +1438,7 @@ class Memory:
             memory_type=memory_type,
             reference_at=reference_at,
             scope=scope,
+            link_identities=link_identities,
         )
         while True:
             try:
@@ -1384,12 +1454,14 @@ class Memory:
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        link_identities: bool = True,
     ) -> Generator[AnswerChunk, None, AnswerResult]:
         """Answer as `ask()` does, but yield the answer while the model is still producing it.
 
         Retrieval runs to completion before the first chunk; only generation is incremental. The
         terminal chunk carries the same `AnswerResult` `ask()` returns, and a backend without
-        `stream_answer` still yields its whole answer as one delta.
+        `stream_answer` still yields its whole answer as one delta. `link_identities` means what
+        it means on `ask()`, which is this method drained.
 
         Reading to the terminal chunk releases everything the answer held, so stopping there
         needs no cleanup. Abandoning the stream mid-answer leaves one operation open until the
@@ -1403,6 +1475,7 @@ class Memory:
             memory_type=memory_type,
             reference_at=reference_at,
             scope=scope,
+            link_identities=link_identities,
         )
 
     def _require_answerer(self) -> None:
@@ -1421,6 +1494,7 @@ class Memory:
         memory_type: MemoryType | None,
         reference_at: datetime | None,
         scope: RetrievalScope | None,
+        link_identities: bool,
     ) -> Generator[AnswerChunk, None, AnswerResult]:
         answer = yield from self._ask_operation(
             question,
@@ -1428,6 +1502,7 @@ class Memory:
             memory_type=memory_type,
             reference_at=reference_at,
             scope=scope,
+            link_identities=link_identities,
         )
         # The operation and its span close before the result is handed over. A generator stays
         # suspended at whichever yield the caller stops on, so a terminal chunk yielded inside
@@ -1444,6 +1519,7 @@ class Memory:
         memory_type: MemoryType | None,
         reference_at: datetime | None,
         scope: RetrievalScope | None,
+        link_identities: bool,
     ) -> Generator[AnswerChunk, None, AnswerResult]:
         with self._trace("mindbridge.ask", kind="operation"), self._operation() as assets:
             _limit(limit, maximum=100)
@@ -1468,7 +1544,7 @@ class Memory:
                     _RERANK_CANDIDATES if self._evidence_budget is not None else min(100, limit * 3)
                 ),
                 operation=assets,
-                memory_type=_optional_memory_type(memory_type),
+                memory_types=_pushed_memory_types(_optional_memory_type(memory_type)),
                 reference_at=reference,
                 temporal_range=temporal_range,
                 occurred_from=None,
@@ -1517,7 +1593,11 @@ class Memory:
                 ),
                 assets,
             )
-            routed_hits = self._route_generation_hits(hits, assets) if hits else ()
+            routed_hits = (
+                self._route_generation_hits(hits, assets, link_identities=link_identities)
+                if hits
+                else ()
+            )
             self._persist_transcripts(assets)
             # `closing` rather than plain iteration: an abandoned stream throws `GeneratorExit`
             # at the yield below, and without this the inner generator would only be closed
@@ -1537,6 +1617,10 @@ class Memory:
             # Reinforcement is part of answering, so it stays inside the operation and runs
             # before the terminal chunk: a caller that sees the result sees a settled store.
             self._reinforce_answered(grounding)
+            # An abstention is the answering plane reporting that the evidence did not support
+            # an answer, which is the same durable signal as an empty search: the memory the
+            # question needed is missing or unreachable.
+            self._note_query_failure(prepared.text, failed=result.abstained)
             return AnswerResult(
                 answer=result.answer,
                 hits=grounding,
@@ -1572,15 +1656,22 @@ class Memory:
             # `_limit` bounds what a caller may ask a public search to return, not how deep the
             # kernel ranks, so `_search_prepared` has no ceiling of its own and a bundle may rank
             # past one hundred. Three candidates per slot is the same headroom `ask()` gives its
-            # modality round robin.
-            candidate_limit = max(_RERANK_CANDIDATES, budget.max_items * 3)
+            # modality round robin -- widened when the budget carries a bound the index cannot
+            # answer, because those are applied to the window after it comes back and a window
+            # sized for the bundle alone would report exhaustion the store does not have.
+            candidate_limit = max(_RERANK_CANDIDATES, budget.max_items * 3) * (
+                _POST_FILTER_WINDOW
+                if budget.min_confidence > 0.0 or budget.freshness is not None
+                else 1
+            )
             outcome = self._search_prepared(
                 prepared,
                 limit=candidate_limit,
                 operation=assets,
-                # The budget filters memory types itself, because it selects a set rather than
-                # the one type the retrieval plane can push into the index.
-                memory_type=None,
+                # `memory_types` is index-pushable one type at a time, so the kernel opens one
+                # route per type. Without that a request for a rare type competes for the same
+                # window as every common one and comes back empty while the store holds records.
+                memory_types=_pushed_memory_types(budget.memory_types),
                 reference_at=reference,
                 temporal_range=_temporal_range(temporal_text, reference),
                 occurred_from=None,
@@ -1592,16 +1683,93 @@ class Memory:
             # The same transcript cache `search()` writes for a spoken query. It is a cache of
             # the query's own audio, not a memory: `compile()` stores nothing it retrieved.
             self._persist_transcripts(assets)
-            return compile_context(
-                prepared.text,
+            hits, named, withheld = self._consented_actors(
                 outcome.hits,
+                self._named_actors(outcome.hits),
+            )
+            bundle = compile_context(
+                prepared.text,
+                hits,
                 budget=budget,
                 reference_at=reference,
                 started_at=started_at,
-                unknowns=self._request_unknowns(prepared, scope, outcome.hits),
+                unknowns=(
+                    *self._request_unknowns(prepared, scope, hits),
+                    *withheld,
+                ),
                 candidate_limit=candidate_limit,
-                provisional=self._provisional_identities(outcome.hits),
+                provisional=self._provisional_identities(hits),
+                named=named,
             )
+            # QUERY_FAILURE hook: a bundle with no evidence in it is the compiler reporting that
+            # the goal found nothing, which is the same signal as an empty search.
+            self._note_query_failure(prepared.text, failed=not bundle.hits)
+            return bundle
+
+    def _consented_actors(
+        self,
+        hits: Sequence[SearchHit],
+        named: Mapping[str, tuple[NamedActorLink, ...]],
+    ) -> tuple[
+        tuple[SearchHit, ...],
+        dict[str, tuple[NamedActorLink, ...]],
+        tuple[ContextUnknown, ...],
+    ]:
+        """Drop the named actors whose subject withheld or withdrew consent, and say so.
+
+        Only the naming assertion is dropped, not the person's memories: consent governs being
+        treated as a recognized person, not whether the evening happened. The bundle then says
+        a person is missing from `actors` rather than silently compiling a scene with a hole in
+        it, which is what makes the omission auditable instead of a retrieval mystery.
+
+        Both routes to an actor are filtered, because both publish the same person. A bound
+        `ENTITY` hit renders as its own line, and a resolved identity edge on any other memory
+        -- the face in a photo, the speaker in a clip -- becomes a `NamedActor` whether or not
+        the assertion that names them ranked at all.
+        """
+        bound = {
+            hit.context.identity_id
+            for hit in hits
+            if hit.context is not None
+            and hit.context.identity_id is not None
+            and hit.context.kind is MemoryKind.ENTITY
+        }
+        # Every identity the enrichment could name, not only the ones a retrieved `ENTITY` hit
+        # carried: a bundle that reached a person's clip but not their naming assertion used to
+        # find nothing bound here, consult no consent at all, and then name them from the clip.
+        bound.update(link[0] for links in named.values() for link in links)
+        if not bound:
+            return tuple(hits), dict(named), ()
+        with _translate_storage_errors("read identity consent"):
+            restrained = self._store.restrained_identities() & bound
+        if not restrained:
+            return tuple(hits), dict(named), ()
+        kept = tuple(
+            hit
+            for hit in hits
+            if hit.context is None
+            or hit.context.kind is not MemoryKind.ENTITY
+            or hit.context.identity_id not in restrained
+        )
+        permitted = {
+            memory_id: kept_links
+            for memory_id, links in named.items()
+            if (kept_links := tuple(link for link in links if link[0] not in restrained))
+        }
+        return (
+            kept,
+            permitted,
+            (
+                ContextUnknown(
+                    kind=ContextUnknownKind.CONSENT_WITHHELD,
+                    detail=(
+                        f"{len(restrained)} recognized "
+                        f"{'person is' if len(restrained) == 1 else 'people are'} withheld from"
+                        " the actors section by their own recorded consent"
+                    ),
+                ),
+            ),
+        )
 
     def _provisional_identities(self, hits: Sequence[SearchHit]) -> dict[str, tuple[str, ...]]:
         """Resolve which people the candidate evidence observed but nobody has named.
@@ -1613,6 +1781,18 @@ class Memory:
             return {}
         with _translate_storage_errors("read provisional identities"):
             return self._store.provisional_identities(tuple(hit.id for hit in hits))
+
+    def _named_actors(self, hits: Sequence[SearchHit]) -> dict[str, tuple[NamedActorLink, ...]]:
+        """Resolve which people the candidate evidence's identity edge already names.
+
+        Deterministic kernel policy, the positive counterpart of `_provisional_identities`: a
+        person is named exactly while a visible naming assertion names them, whether or not
+        that assertion itself ranked into the bundle.
+        """
+        if not hits:
+            return {}
+        with _translate_storage_errors("read named actors"):
+            return self._store.named_actors(tuple(hit.id for hit in hits))
 
     def _request_unknowns(
         self,
@@ -1812,6 +1992,146 @@ class Memory:
             with _translate_storage_errors("read identity profile"):
                 return self._store.identity_profile(requested_id)
 
+    def record_consent(
+        self,
+        identity_id: str,
+        state: ConsentState,
+        *,
+        note: str | None = None,
+    ) -> MemoryOperationRecord | None:
+        """Record what one recognized person said about being processed as a recognized person.
+
+        Consent is an assertion in the same family as naming: an identity-bound, evidence-bearing
+        claim that stands until a later one supersedes it, recorded as `USER_STATEMENT` because
+        only a person can give it. A model may not propose one -- the kernel refuses a proposed
+        `CONSENT` operation as `unauthorized` the way it refuses a proposed `MERGE` -- so this is
+        the only path that writes one.
+
+        `WITHHELD` and `WITHDRAWN` restrain the kernel identically from the next observation on:
+        `faces()`, `speech()`, and `ask(link_identities=True)` stop enrolling new face and voice
+        exemplars for this person and stop merging their voice and face identities, and
+        `compile()` leaves them out of the actors section and says so with a `CONSENT_WITHHELD`
+        unknown. Recognition against exemplars already held is deliberately untouched: a
+        question about a photo the host already has is not new processing of a person, and
+        destroying what is already held is `forget_identity`, which this is not.
+
+        Returns the logged operation, or `None` when the same statement already stands, so the
+        decision is auditable through `operations()` and reversible through `rollback()`, which
+        restores whatever was recorded before it.
+        """
+        requested_id = _identifier(identity_id, "identity_id")
+        if not isinstance(state, ConsentState):
+            raise ValidationError("state must be a ConsentState")
+        claim = ConsentClaim(identity_id=requested_id, state=state, note=note)
+        with (
+            self._trace("mindbridge.record_consent", kind="operation"),
+            self._operation() as operation,
+            # `_formation_lock` before `_write_lock`, the same order `consolidate()`'s apply
+            # phase and `add()`'s formation use: `_assert_consent` commits through the same
+            # `_commit_formation` path as naming, so a consent statement must not land while a
+            # consolidate apply pass is in progress either.
+            self._formation_lock,
+            self._write_lock,
+        ):
+            with _translate_storage_errors("read identity memories"):
+                normalized_id = self._store.resolve_identity_id(requested_id)
+                known = normalized_id is not None and (
+                    self._store.identity_memory_ids(normalized_id) is not None
+                )
+            if normalized_id is None or not known:
+                raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
+            return self._assert_consent(
+                replace(claim, identity_id=normalized_id),
+                operation=operation,
+            )
+
+    def consent(self, identity_id: str) -> ConsentState | None:
+        """Return the consent state one identity's standing assertion projects, or None.
+
+        `None` means nobody has recorded a statement, which is neither consent nor a refusal:
+        the kernel restrains itself only on a statement that was actually made.
+        """
+        with (
+            self._trace("mindbridge.consent", kind="operation"),
+            self._operation(),
+            self._write_lock,
+        ):
+            requested_id = _identifier(identity_id, "identity_id")
+            with _translate_storage_errors("read identity consent"):
+                return self._store.identity_consent(requested_id)
+
+    def _assert_consent(
+        self,
+        claim: ConsentClaim,
+        *,
+        operation: _OperationAssets,
+    ) -> MemoryOperationRecord | None:
+        """Commit one consent statement as a bound STATE assertion with its own log row.
+
+        Structurally the twin of `_assert_identity_name`: the assertion is the record, the
+        projection reads it, and the log row is what makes it auditable and reversible. A STATE
+        rather than an ENTITY kind because that is what it is -- how this person may be
+        processed, right now -- and because it keeps consent out of the naming lineage the
+        registry projects.
+        """
+        proposal = _consent_proposal(claim)
+        now = datetime.now(timezone.utc)
+        context = replace(
+            _formation_context(
+                None,
+                proposal,
+                model_id=None,
+                recipe=_CONSENT_RECIPE,
+                recorded_at=now,
+                identity_id=claim.identity_id,
+            ),
+            # No validity interval, unlike an ordinary STATE. A state of the world holds over a
+            # period and a later one splits it; a consent statement simply stands until the
+            # subject makes another, so the lineage rule retires the old one outright instead of
+            # carrying a past-covering version that would go on projecting beside the new one.
+            valid_from=None,
+        )
+        prepared = replace(
+            _prepare_memory(
+                self._prepare_content(proposal.content, operation),
+                occurred_at=None,
+                occurred_end=None,
+                metadata=None,
+                memory_type=_formation_memory_type(proposal.kind),
+            ),
+            memory_id=_formation_memory_id(
+                claim.identity_id,
+                proposal,
+                recipe=_CONSENT_RECIPE,
+                context=context,
+            ),
+            context=context,
+        )
+        proposed = MemoryOperation(
+            intent=MemoryIntent.CONSENT,
+            consent=claim,
+            rationale="the data subject stated how they may be processed",
+        )
+        key = operation_key(proposed, recipe=_CONSENT_RECIPE)
+        with _translate_storage_errors("check a consent operation"):
+            if self._store.read_operations(operation_key=key):
+                return None
+        logged = self._commit_formation(
+            ((prepared, None, proposal.confidence),),
+            (),
+            completed_at=now,
+            recipe=_CONSENT_RECIPE,
+            operation=StoredOperation(
+                operation_key=key,
+                intent=proposed.intent.value,
+                trigger=MemoryTrigger.MANUAL.value,
+                recipe=_CONSENT_RECIPE,
+                operation_json=dump_operation(proposed),
+                applied_at=now,
+            ),
+        )
+        return None if logged is None else _operation_record(logged)
+
     def unlink_identity(self, alias_id: str) -> str | None:
         """Reverse one recorded face-and-voice merge, restoring ``alias_id`` as its own identity.
 
@@ -1823,10 +2143,19 @@ class Memory:
 
         This resets the pair's accumulated evidence; it does not suppress the pair. If the same
         voice and face keep co-occurring, they will be corroborated and merged again.
+
+        A split is the `CORRECT` half of the control plane's "correct or split" intent, so it
+        commits with its own log row: it shows up in `operations()` and `rollback()` of that row
+        re-merges the pair under the identity that survived.
         """
         with (
             self._trace("mindbridge.unlink_identity", kind="operation"),
             self._operation() as operation,
+            # `_formation_lock` before `_write_lock`, the same order `consolidate()`'s apply
+            # phase and `add()`'s formation use: a split must not land while a consolidate apply
+            # pass is in progress, and taking the two locks in a different order here would
+            # deadlock against that path.
+            self._formation_lock,
             self._write_lock,
         ):
             requested_id = _identifier(alias_id, "alias_id")
@@ -1836,9 +2165,34 @@ class Memory:
                     requested_id,
                     memories=memories,
                     embeddings=embeddings,
+                    operation=self._identity_split_operation(requested_id),
                 )
             self._drain_outbox()
             return restored
+
+    def _identity_split_operation(self, alias_id: str) -> StoredOperation | None:
+        """Build the CORRECT log row one split commits with, or None when there is no merge.
+
+        An ID that is not a merge alias resolves to itself, and the store refuses the split
+        anyway, so there is nothing to log and no row is built.
+        """
+        with _translate_storage_errors("read identity alias"):
+            survivor = self._store.resolve_identity_id(alias_id)
+        if survivor is None or survivor == alias_id:
+            return None
+        proposed = MemoryOperation(
+            intent=MemoryIntent.CORRECT,
+            identity=IdentityChange(identity_id=survivor, moved_ids=(alias_id,)),
+            rationale="the host split this face-and-voice merge",
+        )
+        return StoredOperation(
+            operation_key=operation_key(proposed, recipe=_IDENTITY_LINK_RECIPE),
+            intent=proposed.intent.value,
+            trigger=MemoryTrigger.MANUAL.value,
+            recipe=_IDENTITY_LINK_RECIPE,
+            operation_json=dump_operation(proposed),
+            applied_at=datetime.now(timezone.utc),
+        )
 
     def _unlinked_speaker_index(
         self,
@@ -1947,6 +2301,11 @@ class Memory:
         with (
             self._trace(f"mindbridge.{operation_name}", kind="operation"),
             self._operation() as operation,
+            # `_formation_lock` before `_write_lock`, the same order `consolidate()`'s apply
+            # phase and `add()`'s formation use: the IDENTIFY naming commit below must not land
+            # while a consolidate apply pass is in progress, and taking the two locks in a
+            # different order here would deadlock against that path.
+            self._formation_lock,
             self._write_lock,
         ):
             with _translate_storage_errors("read identity memories"):
@@ -2009,8 +2368,20 @@ class Memory:
         An ENTITY proposal is deliberately never bound. A bound ENTITY row *is* a naming
         assertion, so binding one here would let a model's proposal rename a person; naming
         stays with the host and with the identify path.
+
+        `consent` is a reserved predicate for the same reason and by the same route. A bound
+        STATE row carrying it *is* a consent statement -- it is what `consent()` reads and what
+        restrains enrolment and merging -- so binding one here would let a model manufacture or
+        retract permission to process a person without ever reaching the control plane, which
+        refuses a proposed `CONSENT` operation. The claim itself is kept, unbound: a model
+        inferring that somebody withdrew consent is evidence of what the model thought, and it
+        is recorded as an ordinary STATE about that subject with no identity attached.
         """
-        if proposal.kind is MemoryKind.ENTITY or proposal.subject is None:
+        if (
+            proposal.kind is MemoryKind.ENTITY
+            or proposal.subject is None
+            or proposal.predicate == CONSENT_PREDICATE
+        ):
             return None
         with _translate_storage_errors("resolve a claim's subject"):
             return self._store.identity_for_subject(proposal.subject)
@@ -2077,6 +2448,10 @@ class Memory:
         key = operation_key(proposed, recipe=_NAMING_RECIPE)
         with _translate_storage_errors("check a naming operation"):
             already_logged = bool(self._store.read_operations(operation_key=key))
+        # `_register_identity` holds `_formation_lock` for this whole call (the same lock
+        # `add()`'s automatic formation holds across its own `_commit_formation`, see
+        # `_form_sources`), so this IDENTIFY commit cannot land while a consolidate apply pass
+        # is in progress either.
         self._commit_formation(
             ((prepared, None, proposal.confidence),),
             (),
@@ -2119,6 +2494,11 @@ class Memory:
         with (
             self._trace("mindbridge.forget_identity", kind="operation"),
             self._operation() as operation,
+            # `_formation_lock` before `_write_lock`, the same order `consolidate()`'s apply
+            # phase and `add()`'s formation use: an irreversible erasure must not land while a
+            # consolidate apply pass is in progress, and taking the two locks in a different
+            # order here would deadlock against that path.
+            self._formation_lock,
             self._write_lock,
         ):
             with _translate_storage_errors("read identity memories"):
@@ -2142,11 +2522,39 @@ class Memory:
                     normalized_id,
                     memories=memories,
                     embeddings=embeddings,
+                    operation=self._identity_erasure_operation(normalized_id),
                 )
             if erasure is None:
                 raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
             self._drain_outbox()
             return erasure
+
+    def _identity_erasure_operation(self, identity_id: str) -> StoredOperation:
+        """Build the irreversible log row one identity erasure commits with.
+
+        Erasure is physical forgetting of a person, so the row is audit history and nothing
+        else: it carries the identity, its aliases, and the naming assertions the erasure
+        deleted -- ids and counts, never content -- and `rollback()` refuses it. That is the
+        marker that separates this from the cognitive `FORGET` a row with `target_ids` records.
+        """
+        with _translate_storage_errors("read identity aliases"):
+            members = self._store.identity_equivalence_class(identity_id)
+        proposed = MemoryOperation(
+            intent=MemoryIntent.FORGET,
+            identity=IdentityChange(
+                identity_id=identity_id,
+                moved_ids=() if members is None else members[1:],
+            ),
+            rationale="the data subject asked to be erased",
+        )
+        return StoredOperation(
+            operation_key=operation_key(proposed, recipe=_IDENTITY_LINK_RECIPE),
+            intent=proposed.intent.value,
+            trigger=MemoryTrigger.MANUAL.value,
+            recipe=_IDENTITY_LINK_RECIPE,
+            operation_json=dump_operation(proposed),
+            applied_at=datetime.now(timezone.utc),
+        )
 
     def reinforce(self, memory_ids: Sequence[str]) -> int:
         """Record explicit positive feedback for existing memories."""
@@ -2178,28 +2586,161 @@ class Memory:
     # deletion is not an intent: it stays on `delete()` under host authority. None of these
     # methods is exposed on REST or MCP.
 
-    def consolidation_candidates(self, *, limit: int = 32) -> tuple[ConsolidationCandidate, ...]:
+    def consolidation_candidates(
+        self,
+        *,
+        limit: int = 32,
+        idle: bool = False,
+    ) -> tuple[ConsolidationCandidate, ...]:
         """Ask what needs deliberation, at most `limit` rows, interleaved across triggers.
 
         This is the durable trigger the slow loop runs on: every row is derived from state
-        already committed -- evidence links, lineage disagreement, recorded confirmations --
-        rather than from a clock. Hand a row's `memory_ids` straight to
-        `consolidate(evidence_ids=...)` with the row's `trigger`.
+        already committed -- evidence links, lineage disagreement, recorded confirmations,
+        recorded recall failures, the configured record budget -- rather than from a clock. Hand
+        a row's `memory_ids` straight to `consolidate(evidence_ids=...)` with the row's
+        `trigger`, or let `deliberate()` do it.
+
+        `idle` is the operator declaring an approved idle or charging window. The kernel does not
+        guess it from a clock: whether now is a good time to spend the device's battery on
+        reasoning is the host's knowledge.
         """
         with (
             self._trace("mindbridge.consolidation_candidates", kind="operation"),
-            self._operation(),
+            self._operation() as assets,
         ):
             _limit(limit, maximum=100)
+            if not isinstance(idle, bool):
+                raise ValidationError("idle must be a boolean")
             with _translate_storage_errors("list consolidation candidates"):
-                rows = self._store.read_consolidation_candidates(limit=limit)
-            return tuple(
+                rows = self._store.read_consolidation_candidates(
+                    limit=limit,
+                    idle=idle,
+                    record_budget=self._memory_budget_records,
+                )
+            derived = tuple(
                 ConsolidationCandidate(
                     trigger=MemoryTrigger(row.trigger),
                     memory_ids=row.memory_ids,
                     evidence_count=row.evidence_count,
                 )
                 for row in rows
+            )
+            failures = self._query_failure_candidates(limit=limit, assets=assets)
+            # Round robin rather than concatenation, so a store with many repeated failures
+            # cannot push every evidence and contradiction row out of the window.
+            return tuple(
+                candidate
+                for pair in zip_longest(derived, failures)
+                for candidate in pair
+                if candidate is not None
+            )[:limit]
+
+    def _query_failure_candidates(
+        self,
+        *,
+        limit: int,
+        assets: _OperationAssets,
+    ) -> tuple[ConsolidationCandidate, ...]:
+        """Turn repeated empty recalls into candidates naming what the store does hold.
+
+        A failed query has no evidence of its own -- that is what failing means -- so the
+        candidate names the nearest active records to it. Those are what a backend can act on:
+        the memory that should have matched and did not, or the gap it should record. Resolved
+        through the ordinary retrieval kernel, and bounded by `limit`.
+        """
+        reference = datetime.now(timezone.utc)
+        with _translate_storage_errors("list repeated query failures"):
+            failures = self._store.read_repeated_query_failures(
+                limit=limit,
+                since=reference - self._query_failure_window,
+                minimum=_REPEATED_FAILURES,
+            )
+        if not failures:
+            return ()
+        candidates: builtins.list[ConsolidationCandidate] = []
+        for failure in failures:
+            prepared = self._prepare_content(failure.query, assets)
+            outcome = self._search_prepared(
+                prepared,
+                limit=min(100, max(2, limit // 4)),
+                operation=assets,
+                memory_types=None,
+                reference_at=reference,
+                temporal_range=None,
+                occurred_from=None,
+                occurred_until=None,
+                scope=None,
+                require_unambiguous=False,
+                capture_trace=False,
+            )
+            memory_ids = tuple(hit.id for hit in outcome.hits)
+            if not memory_ids:
+                # Nothing to weigh: the store holds no evidence anywhere near this query, so
+                # there is no bounded evidence set a proposal could cite.
+                continue
+            with _translate_storage_errors("read deliberation marks"):
+                weighed = self._store.read_weighed_at(memory_ids)
+            if weighed and failure.failed_at <= max(weighed.values()):
+                continue
+            candidates.append(
+                ConsolidationCandidate(
+                    trigger=MemoryTrigger.QUERY_FAILURE,
+                    memory_ids=memory_ids,
+                    evidence_count=failure.failures,
+                )
+            )
+        return tuple(candidates)
+
+    def deliberate(
+        self,
+        *,
+        limit: int = 32,
+        max_rounds: int = 4,
+        idle: bool = False,
+    ) -> DeliberationReport:
+        """Run the memory-management loop to a fixed point, or to `max_rounds`.
+
+        One round asks `consolidation_candidates()` what is due and runs `consolidate()` over
+        each row with the row's own trigger. Applying operations can make further work due --
+        a derived record gains evidence, a corrected lineage stops disagreeing -- so the loop
+        repeats until nothing is due or the ceiling is reached.
+
+        It terminates on a backend that proposes nothing, because a pass records that it weighed
+        its evidence set whatever it yielded, and candidate derivation excludes a candidate
+        weighed since its own signal. The report then says so: rounds and `weighed` non-zero,
+        `applied` zero.
+        """
+        with self._trace("mindbridge.deliberate", kind="operation"):
+            _limit(limit, maximum=100)
+            _limit(max_rounds, maximum=100)
+            if not isinstance(idle, bool):
+                raise ValidationError("idle must be a boolean")
+            rounds = weighed = skipped = applied = rejected = calls = 0
+            for _round in range(max_rounds):
+                candidates = self.consolidation_candidates(limit=limit, idle=idle)
+                if not candidates:
+                    break
+                rounds += 1
+                for candidate in candidates:
+                    report = self.consolidate(
+                        evidence_ids=candidate.memory_ids,
+                        limit=limit,
+                        trigger=candidate.trigger,
+                    )
+                    if report.weighed:
+                        weighed += 1
+                        calls += 1
+                    else:
+                        skipped += 1
+                    applied += len(report.operations)
+                    rejected += len(report.rejected)
+            return DeliberationReport(
+                rounds=rounds,
+                weighed=weighed,
+                skipped=skipped,
+                applied=applied,
+                rejected=rejected,
+                model_calls=calls,
             )
 
     def consolidate(
@@ -2241,11 +2782,18 @@ class Memory:
             # reachable form of the staleness the kernel is required to reject.
             consumed: set[str] = set()
             retired: set[str] = set()
+            # Deliberately outside `_formation_lock`: the backend round trip is the slow part of
+            # this call, and holding the formation lock across it makes a consolidation over
+            # media evidence stall every concurrent `add()`. Scheduling between latency-sensitive
+            # work and slow reasoning is the point of the plane, so the lock covers the apply
+            # transactions only. Correctness does not rest on the lock: every proposal is
+            # re-checked inside its own apply transaction (`require_active` and
+            # `require_unretired`) and refused as stale if a target moved while the backend was
+            # thinking. A model call that raised weighed nothing, so no marker is recorded and
+            # the candidate stays due.
+            proposals = self._propose_operations(tuple(shown.values()), trigger=trigger)
             with self._formation_lock:
-                for operation in self._propose_operations(
-                    tuple(shown.values()),
-                    trigger=trigger,
-                ):
+                for operation in proposals:
                     targets = _retiring_targets(operation)
                     named = set(operation.evidence_ids) | set(operation.target_ids)
                     if targets & consumed or named & retired:
@@ -2268,7 +2816,151 @@ class Memory:
                     else:
                         consumed.update(set(operation.evidence_ids) - targets)
                         retired.update(targets)
-            return ConsolidationReport(operations=tuple(applied), rejected=tuple(rejected))
+            # Recorded whatever the pass yielded, including nothing. Without this a candidate the
+            # backend could not resolve -- or whose every proposal the kernel refused -- leaves no
+            # trace and is derived again, and paid for again, every round.
+            self._record_deliberation(
+                trigger,
+                tuple(shown),
+                proposed=len(proposals),
+                applied=len(applied),
+                rejected=len(rejected),
+            )
+            return ConsolidationReport(
+                operations=tuple(applied),
+                rejected=tuple(rejected),
+                weighed=len(shown),
+            )
+
+    def _record_deliberation(
+        self,
+        trigger: MemoryTrigger,
+        memory_ids: Sequence[str],
+        *,
+        proposed: int,
+        applied: int,
+        rejected: int,
+    ) -> None:
+        """Mark one evidence set weighed so candidate derivation stops re-listing it."""
+        with self._write_lock, _translate_storage_errors("record a deliberation"):
+            self._store.record_deliberation(
+                trigger.value,
+                memory_ids,
+                weighed_at=datetime.now(timezone.utc),
+                proposed=proposed,
+                applied=applied,
+                rejected=rejected,
+            )
+
+    def _note_query_failure(self, text: str, *, failed: bool) -> None:
+        """Record one empty recall, which is the whole of the QUERY_FAILURE signal.
+
+        The stored query is the owner's own words about their own memory, in their own memory
+        domain, and the table is capped on write so it stays a signal buffer rather than a
+        growing query log. A non-text query records nothing: there is nothing to compare two of
+        them by.
+        """
+        if not failed:
+            return
+        folded = unicodedata.normalize("NFKC", text).casefold()
+        normalized = _QUERY_SPACE.sub(" ", _QUERY_NOISE.sub(" ", folded)).strip()
+        if not normalized:
+            return
+        with self._write_lock, _translate_storage_errors("record a query failure"):
+            self._store.record_query_failure(
+                text,
+                normalized,
+                failed_at=datetime.now(timezone.utc),
+                keep=self._query_failure_history,
+            )
+
+    def apply(self, operation: MemoryOperation) -> MemoryOperationRecord:
+        """Apply one operation the host supplies, through the same kernel validation.
+
+        This is the public replay surface: a logged `MemoryOperation` re-applied against a fresh
+        store reproduces the derived state, without a `ConsolidationBackend` and without a model.
+        Nothing is trusted because the host supplied it. The window is the operation's own cited
+        evidence and named targets, eligibility is checked exactly as it is for a proposal, and
+        the apply transaction re-checks every target so one that moved meanwhile is refused as
+        stale rather than half-applied.
+
+        Raises `ValidationError` naming the kernel's own rejection reason when the operation is
+        refused, because a single operation the caller chose has nowhere else to report it.
+        """
+        with (
+            self._trace("mindbridge.apply", kind="operation"),
+            self._operation() as assets,
+        ):
+            if not isinstance(operation, MemoryOperation):
+                raise ValidationError("operation must be a MemoryOperation")
+            shown, _window = self._consolidation_evidence(
+                operation.evidence_ids,
+                None,
+                limit=100,
+                operation=assets,
+            )
+            try:
+                with self._formation_lock:
+                    return self._apply_memory_operation(
+                        operation,
+                        trigger=MemoryTrigger.MANUAL,
+                        # The configured consolidation recipe and model, not the caller's word
+                        # for them. A derived record's representation belongs to a recipe -- it
+                        # is part of its identity and of the operation key -- so replaying a
+                        # logged sequence reproduces the same derived IDs exactly when the
+                        # store is configured with the recipe that produced them, and mints
+                        # different ones when it is not. No backend is called either way.
+                        model_id=self._consolidation_model,
+                        recipe=self._consolidation_recipe,
+                        shown=shown,
+                        # The host names these IDs, the way it does for `forget()`, so the
+                        # not-shown rule that bounds a backend to the window the kernel gathered
+                        # does not apply. Every other rejection does.
+                        window=None,
+                        assets=assets,
+                    )
+            except _RejectedOperation as rejection:
+                raise ValidationError(
+                    f"memory operation refused: {rejection.reason}",
+                    reason=rejection.reason,
+                ) from None
+
+    def record_outcome(
+        self,
+        operation_id: int,
+        outcome: MemoryOutcome,
+        *,
+        note: str | None = None,
+    ) -> bool:
+        """Record what later evidence said about one applied operation.
+
+        Post-hoc and purely for measurement: the kernel never reads it back into a decision, and
+        recording `REFUTED` does not reverse anything -- `rollback()` does that. It exists so the
+        slow loop's quality is derivable from the log rather than only its rollback success:
+        consolidation precision and contradiction recovery are `CONFIRMED` rates over
+        `CONSOLIDATE` and `CORRECT` rows, and false retirement is the `REFUTED` rate over rows
+        that forgot something.
+
+        Reports `False` for an unknown `operation_id`. A later call replaces an earlier
+        judgement, because later evidence supersedes earlier evidence here as everywhere.
+        """
+        with self._trace("mindbridge.record_outcome", kind="operation"), self._operation():
+            if (
+                isinstance(operation_id, bool)
+                or not isinstance(operation_id, int)
+                or operation_id <= 0
+            ):
+                raise ValidationError("operation_id must be a positive integer")
+            if not isinstance(outcome, MemoryOutcome):
+                raise ValidationError("outcome must be a MemoryOutcome")
+            if note is not None and (not isinstance(note, str) or not note.strip()):
+                raise ValidationError("note must be a non-empty string or None")
+            with self._write_lock, _translate_storage_errors("record an operation outcome"):
+                return self._store.record_operation_outcome(
+                    operation_id,
+                    outcome=outcome.value,
+                    note=None if note is None else note.strip(),
+                )
 
     def forget(self, memory_ids: Sequence[str]) -> MemoryOperationRecord | None:
         """Cognitively forget memories: recall skips them, `get()` and `list()` keep them.
@@ -2318,6 +3010,11 @@ class Memory:
         standing operation has built on: when a second consolidation superseded the record this
         one put in force, reversing this one first would leave two current versions in the
         lineage, so the newer operation must be rolled back first.
+
+        Also reports `False`, without reversing anything, for the one operation that is not
+        reversible: the erasure of a person. A `FORGET` row carrying an identity is physical
+        forgetting, and its log row is the audit trail that it happened rather than a copy of
+        what it destroyed.
         """
         with (
             self._trace("mindbridge.rollback", kind="operation"),
@@ -2336,10 +3033,16 @@ class Memory:
                 return False
             row = logged[0]
             operation = load_operation(row.operation_json)
+            if operation.identity is not None:
+                return self._rollback_identity(row, operation, operation.identity)
             # A naming assertion is retracted, not deleted: the version it superseded has to
             # come back, and the record itself stays in the log so the audit trail shows both
-            # names. That reversal rides the general `superseded` mechanism below.
+            # names. That reversal rides the general `superseded` mechanism below. A consent
+            # statement retracts the same way and for the same reason -- both are assertions a
+            # host made about a person, and the history of what was asserted is the audit
+            # trail -- but only naming feeds a projection that has to be repainted afterwards.
             naming = operation.intent is MemoryIntent.IDENTIFY
+            assertion = naming or operation.intent is MemoryIntent.CONSENT
             with _translate_storage_errors("roll back a memory operation"):
                 # One transaction: the created records disappear in the same commit that marks
                 # the operation rolled back, so a crash between the two cannot leave an active
@@ -2361,9 +3064,9 @@ class Memory:
                         if operation.intent is MemoryIntent.CORRECT
                         else row.superseded
                     ),
-                    # A naming assertion is retracted rather than deleted: its own version is
-                    # retired here and `restore_versions` brings back the one it displaced.
-                    retire_versions=row.created_ids if naming else (),
+                    # An identity assertion is retracted rather than deleted: its own version
+                    # is retired here and `restore_versions` brings back the one it displaced.
+                    retire_versions=row.created_ids if assertion else (),
                     require_in_force=(
                         (*row.created_ids, *row.changed_ids) if row.superseded else ()
                     ),
@@ -2380,6 +3083,39 @@ class Memory:
                 assert operation.claim is not None
                 self._reproject_identity(operation.claim.identity_id)
             return reverted
+
+    def _rollback_identity(
+        self,
+        row: StoredOperation,
+        operation: MemoryOperation,
+        change: IdentityChange,
+    ) -> bool:
+        """Reverse one identity-lifecycle operation: split a merge, or re-merge a split.
+
+        The store refuses a reversal the identity graph no longer admits, which is what orders
+        identity operations on one person newest first: a later split already removed the alias
+        a merge would restore, and an erasure removed the person entirely.
+        """
+        if operation.intent is MemoryIntent.FORGET:
+            # Physical forgetting. Nothing here can be restored, and reporting success would
+            # claim a recovery that did not happen.
+            return False
+        absorbed = change.moved_ids[0]
+        merging = operation.intent is MemoryIntent.CORRECT
+        with _translate_storage_errors("roll back an identity operation"):
+            reverted, _orphaned = self._store.rollback_operation(
+                row.operation_id,
+                rolled_back_at=datetime.now(timezone.utc),
+                split_identity=None if merging else absorbed,
+                merge_identities=(change.identity_id, absorbed) if merging else None,
+            )
+        if reverted:
+            # Repaint from the assertions that stand now, exactly as reversing a naming does.
+            # A restored identity holds no assertion, so it projects as a nameless speaker.
+            self._reproject_identity(change.identity_id)
+            if not merging:
+                self._reproject_identity(absorbed)
+        return reverted
 
     def _reproject_identity(self, identity_id: str) -> None:
         """Repaint one identity's name and its indexed text from the assertion now current."""
@@ -2443,7 +3179,7 @@ class Memory:
                 prepared,
                 limit=limit,
                 operation=operation,
-                memory_type=None,
+                memory_types=None,
                 reference_at=reference,
                 temporal_range=None,
                 occurred_from=None,
@@ -2517,6 +3253,17 @@ class Memory:
         window: frozenset[str] | None,
         assets: _OperationAssets,
     ) -> MemoryOperationRecord:
+        if operation.intent is MemoryIntent.MERGE:
+            # A cross-modal merge is committed by the kernel from corroboration evidence it
+            # counted itself, never from a proposal: an agent-facing model must not be able to
+            # fuse two people by asking. Refused here rather than in the value type, so a
+            # backend that proposes one is reported instead of raising through the pass.
+            raise _RejectedOperation("unauthorized")
+        if operation.intent is MemoryIntent.CONSENT:
+            # The mirror of the rule above, for the same reason and by the same route: consent
+            # is a statement its subject makes, so a model that could propose one could
+            # manufacture permission to process a person. `record_consent()` is the only path.
+            raise _RejectedOperation("unauthorized")
         key = operation_key(operation, recipe=recipe)
         with _translate_storage_errors("check a memory operation"):
             # Raise the rejection outside this block: `_RejectedOperation` is not a
@@ -2581,6 +3328,11 @@ class Memory:
         # leaves `identity()` and the stored transcripts answering to a name nothing asserts.
         if any(_is_bound_naming_assertion(targets, target) for target in operation.target_ids):
             raise _RejectedOperation("naming_assertion")
+        # A consent statement is somebody's own word about how they may be processed. Letting
+        # the control plane retire, forget, or reinforce one would let a model change what a
+        # person permitted; only `record_consent()` supersedes it and only `rollback()` retracts.
+        if any(_is_consent_assertion(targets, target) for target in operation.target_ids):
+            raise _RejectedOperation("consent_assertion")
         reinforce: tuple[tuple[str, str], ...] = ()
         correct_ids: tuple[str, ...] = ()
         forget_ids: tuple[str, ...] = ()
@@ -2860,6 +3612,188 @@ class Memory:
             self._queue_asset_cleanup(orphaned)
             self._drain_outbox()
             return deleted
+
+    def export(
+        self,
+        *,
+        identity_id: str | None = None,
+        memory_ids: Sequence[str] | None = None,
+    ) -> ExportBundle:
+        """Return everything this memory holds about one data subject, in transferable form.
+
+        Name exactly one subject: `identity_id` for a recognized person -- every memory they
+        occur in, every name and consent statement asserted about them, their registry row, and
+        every logged operation that moved any of it -- or `memory_ids` for a set of records a
+        caller already knows, with the log rows that touched them.
+
+        Records come back in every version, including retired ones and ones cognitively
+        forgotten, because the question this answers is what is held rather than what is
+        current. Media travels as asset identity, size, and digest on each record; the bytes
+        stay on disk, so copying them is the host's decision and not an accident of asking.
+
+        This reads only. Nothing here forgets, deletes, or acknowledges anything, and a merged
+        alias resolves to its canonical identity exactly as every other identity read does.
+        """
+        if (identity_id is None) == (memory_ids is None):
+            raise ValidationError("export names exactly one of identity_id or memory_ids")
+        with (
+            self._trace("mindbridge.export", kind="operation"),
+            self._operation(),
+            self._write_lock,
+        ):
+            profiles: tuple[IdentityProfile, ...] = ()
+            resolved_id: str | None = None
+            if identity_id is not None:
+                requested_id = _identifier(identity_id, "identity_id")
+                with _translate_storage_errors("read identity memories"):
+                    resolved_id = self._store.resolve_identity_id(requested_id)
+                    occurrences = (
+                        None
+                        if resolved_id is None
+                        else self._store.identity_memory_ids(resolved_id)
+                    )
+                    if resolved_id is None or occurrences is None:
+                        raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
+                    asserted = self._store.identity_assertion_memory_ids(resolved_id)
+                    profile = self._store.identity_profile(resolved_id)
+                    aliases = self._store.identity_equivalence_class(resolved_id) or (resolved_id,)
+                selected = tuple(dict.fromkeys((*occurrences, *asserted)))
+                profiles = () if profile is None else (profile,)
+            else:
+                assert memory_ids is not None
+                if isinstance(memory_ids, (str, bytes)):
+                    raise ValidationError("memory_ids must be a sequence of memory IDs")
+                selected = tuple(
+                    dict.fromkeys(_identifier(value, "memory_id") for value in memory_ids)
+                )
+                aliases = ()
+            with _translate_storage_errors("read exported memories"):
+                stored = self._store.read_memories(selected)
+            records = tuple(
+                sorted(
+                    (self._memory_record(memory) for memory in stored),
+                    key=lambda record: (record.created_at, record.id),
+                )
+            )
+            return ExportBundle(
+                exported_at=datetime.now(timezone.utc),
+                identity_id=resolved_id,
+                identities=profiles,
+                records=records,
+                operations=self._exported_operations(
+                    frozenset(record.id for record in records),
+                    frozenset(aliases),
+                ),
+            )
+
+    def _exported_operations(
+        self,
+        memory_ids: frozenset[str],
+        identity_ids: frozenset[str],
+    ) -> tuple[MemoryOperationRecord, ...]:
+        """Return every logged operation that moved one of these records or people, oldest first.
+
+        The whole log is scanned in pages rather than read with a limit: an export that
+        silently stopped at the hundredth row would answer the wrong question.
+        """
+        found: list[MemoryOperationRecord] = []
+        before: int | None = None
+        while True:
+            with _translate_storage_errors("read exported operations"):
+                page = self._store.read_operations(limit=1_000, before_operation_id=before)
+            if not page:
+                break
+            for row in page:
+                record = _operation_record(row)
+                if _operation_touches(record, memory_ids, identity_ids):
+                    found.append(record)
+            before = page[-1].operation_id
+        return tuple(sorted(found, key=lambda record: record.operation_id))
+
+    def apply_retention(self, *, dry_run: bool = False) -> RetentionReport:
+        """Delete what the declared retention policy says has outlived its purpose.
+
+        Physical forgetting under a deterministic policy: aged media and every memory that
+        still references it, records cognitively forgotten longer ago than the policy allows,
+        and capture-queue rows whose repeated failures have aged out. Deletion runs through
+        `delete()`, so media is garbage-collected and the naming projection is rebuilt exactly
+        as they are for a hand-deleted record.
+
+        An unset field in `RetentionPolicy` is not a zero-day policy: it does nothing at all.
+        A policy that names no age therefore makes this a no-op, which is the right default for
+        an operation whose effect cannot be undone.
+
+        `dry_run=True` reports the same identifiers and deletes nothing, so a policy can be
+        read back against a real store before it is allowed to run.
+        """
+        if not isinstance(dry_run, bool):
+            raise ValidationError("dry_run must be a boolean")
+        policy = self._retention
+        now = datetime.now(timezone.utc)
+        with (
+            self._trace("mindbridge.apply_retention", kind="operation"),
+            self._operation(),
+        ):
+            media_ids: tuple[str, ...] = ()
+            aged_assets: tuple[str, ...] = ()
+            if policy.media_days is not None:
+                with _translate_storage_errors("list retention candidates"):
+                    candidates = self._store.asset_retention_candidates(
+                        created_before=now - timedelta(days=policy.media_days),
+                        limit=_RETENTION_PAGE_SIZE,
+                    )
+                    aged_assets = tuple(asset.asset_id for asset in candidates)
+                    media_ids = self._store.asset_memory_ids(aged_assets)
+            forgotten_ids: tuple[str, ...] = ()
+            if policy.forgotten_days is not None:
+                with _translate_storage_errors("list forgotten memories"):
+                    forgotten_ids = tuple(
+                        memory_id
+                        for memory_id in self._store.forgotten_memory_ids(
+                            forgotten_before=now - timedelta(days=policy.forgotten_days),
+                            limit=_RETENTION_PAGE_SIZE,
+                        )
+                        if memory_id not in set(media_ids)
+                    )
+            capture_ids: tuple[str, ...] = ()
+            if policy.capture_failure_days is not None:
+                cutoff = now - timedelta(days=policy.capture_failure_days)
+                with _translate_storage_errors("list pending captures"):
+                    capture_ids = tuple(
+                        capture.memory_id
+                        for capture in self._store.pending_captures(limit=_RETENTION_PAGE_SIZE)
+                        if capture.attempts > 0 and capture.enqueued_at < cutoff
+                    )
+            if dry_run:
+                return RetentionReport(
+                    dry_run=True,
+                    media_memory_ids=media_ids,
+                    forgotten_memory_ids=forgotten_ids,
+                    asset_ids=aged_assets,
+                    capture_memory_ids=capture_ids,
+                )
+            for memory_id in (*media_ids, *forgotten_ids):
+                self.delete(memory_id)
+            removed: list[str] = []
+            with self._write_lock, _translate_storage_errors("delete retained media"):
+                # Whatever the deletions above orphaned is already gone; what is left here is
+                # media no memory referenced in the first place, which nothing else collects
+                # until the next open.
+                self._cleanup_pending_assets()
+                for asset_id in aged_assets:
+                    if self._store.read_asset(asset_id) is None or (
+                        self._store.delete_asset_if_unreferenced(asset_id)
+                    ):
+                        removed.append(asset_id)
+                if capture_ids:
+                    self._store.complete_captures(capture_ids)
+            return RetentionReport(
+                dry_run=False,
+                media_memory_ids=media_ids,
+                forgotten_memory_ids=forgotten_ids,
+                asset_ids=tuple(removed),
+                capture_memory_ids=capture_ids,
+            )
 
     def reindex(self) -> int:
         """Rebuild the disposable Zvec collection from authoritative SQLite rows."""
@@ -3910,7 +4844,7 @@ class Memory:
         *,
         limit: int,
         operation: _OperationAssets,
-        memory_type: MemoryType | None,
+        memory_types: frozenset[MemoryType] | None,
         reference_at: datetime,
         temporal_range: tuple[datetime, datetime] | None,
         occurred_from: datetime | None,
@@ -3961,7 +4895,7 @@ class Memory:
                         vectors,
                         lexical_query=lexical_query,
                         limit=candidate_limit,
-                        memory_type=memory_type,
+                        memory_types=memory_types,
                         occurred_from=occurred_from,
                         occurred_until=occurred_until,
                     )
@@ -3980,7 +4914,7 @@ class Memory:
                             vectors,
                             lexical_query="",
                             limit=candidate_limit,
-                            memory_type=memory_type,
+                            memory_types=memory_types,
                             occurred_from=preferred_range[0],
                             occurred_until=preferred_range[1],
                         )
@@ -3989,7 +4923,7 @@ class Memory:
                         vectors,
                         lexical_query=lexical_query,
                         limit=candidate_limit,
-                        memory_type=memory_type,
+                        memory_types=memory_types,
                         occurred_from=occurred_from,
                         occurred_until=occurred_until,
                     )
@@ -4019,7 +4953,7 @@ class Memory:
                     hydrated_documents,
                     lexical_query=lexical_query,
                     temporal_range=temporal_range,
-                    memory_type=memory_type,
+                    memory_types=memory_types,
                     route_limit=candidate_limit,
                     result_limit=limit,
                 )
@@ -4131,20 +5065,19 @@ class Memory:
                     lexical_relevance_by_rank,
                     lexical_matches,
                 )
-                if memory_type is not None:
+                if memory_types is not None:
+                    kept = frozenset(memory_type.value for memory_type in memory_types)
                     _extend_memory_type_traces(
                         trace_candidates,
                         memories,
-                        memory_type,
+                        kept,
                         index_ids_by_memory,
                         dense_relevance,
                         dense_confidence,
                         lexical_relevance_by_rank,
                         lexical_matches,
                     )
-                    memories = tuple(
-                        memory for memory in memories if memory.memory_type == memory_type.value
-                    )
+                    memories = tuple(memory for memory in memories if memory.memory_type in kept)
                 lexical_relevance = _lexical_relevance(lexical_query, memories)
                 ranked = []
                 ranked_traces: dict[str, RetrievalCandidateTrace] | None = (
@@ -4285,7 +5218,7 @@ class Memory:
         *,
         lexical_query: str,
         temporal_range: tuple[datetime, datetime] | None,
-        memory_type: MemoryType | None,
+        memory_types: frozenset[MemoryType] | None,
         route_limit: int,
         result_limit: int,
     ) -> tuple[_IndexCandidates, tuple[IndexCandidate, ...]]:
@@ -4322,7 +5255,14 @@ class Memory:
                 *temporal_range,
                 space_id=self._space_id,
                 task=_DOCUMENT_TASK,
-                memory_type=None if memory_type is None else memory_type.value,
+                # The whitelist only narrows what the deepening loop will consider, and the
+                # ranking stage applies the full set afterwards, so one pushed type is a
+                # sharpening and several are correctly left to it.
+                memory_type=(
+                    next(iter(memory_types)).value
+                    if memory_types is not None and len(memory_types) == 1
+                    else None
+                ),
             )
         if not in_range:
             return candidates, documents
@@ -4341,7 +5281,7 @@ class Memory:
                 (),
                 lexical_query=lexical_query,
                 limit=search_limit,
-                memory_type=memory_type,
+                memory_types=memory_types,
             ).lexical
             qualified = tuple(
                 hit
@@ -4371,11 +5311,18 @@ class Memory:
         *,
         lexical_query: str,
         limit: int,
-        memory_type: MemoryType | None,
+        memory_types: frozenset[MemoryType] | None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
     ) -> _IndexCandidates:
-        memory_type_value = None if memory_type is None else memory_type.value
+        # The index filter takes one type, so a set becomes one route per type rather than a
+        # post-filter over a shared window. Each type then gets the full `limit` of depth, which
+        # is what lets a request for a rare type reach records a common type outranks.
+        type_values: tuple[str | None, ...] = (
+            (None,)
+            if memory_types is None
+            else tuple(sorted(memory_type.value for memory_type in memory_types))
+        )
         dense_calls = tuple(
             partial(
                 self._index.search,
@@ -4383,23 +5330,31 @@ class Memory:
                 limit=limit,
                 space_id=self._space_id,
                 task=_DOCUMENT_TASK,
-                memory_type=memory_type_value,
+                memory_type=value,
                 occurred_from=occurred_from,
                 occurred_until=occurred_until,
             )
+            for value in type_values
             for vector in vectors
         )
-        lexical_call = partial(
-            self._index.lexical_search,
-            lexical_query,
-            limit=limit,
-            space_id=self._space_id,
-            task=_DOCUMENT_TASK,
-            memory_type=memory_type_value,
-            occurred_from=occurred_from,
-            occurred_until=occurred_until,
+        lexical_calls = (
+            tuple(
+                partial(
+                    self._index.lexical_search,
+                    lexical_query,
+                    limit=limit,
+                    space_id=self._space_id,
+                    task=_DOCUMENT_TASK,
+                    memory_type=value,
+                    occurred_from=occurred_from,
+                    occurred_until=occurred_until,
+                )
+                for value in type_values
+            )
+            if lexical_query
+            else ()
         )
-        calls = (*dense_calls, lexical_call) if lexical_query else dense_calls
+        calls = (*dense_calls, *lexical_calls)
         routes: tuple[tuple[IndexHit, ...], ...]
         with self._trace("mindbridge.index.search", kind="stage") as span:
             span.set_attribute("mindbridge.index.route_count", len(calls))
@@ -4412,10 +5367,13 @@ class Memory:
                     futures = tuple(executor.submit(copy_context().run, call) for call in calls)
                     routes = tuple(future.result() for future in futures)
         dense_routes = routes[: len(dense_calls)]
-        lexical = routes[-1] if lexical_query else ()
+        lexical_routes = routes[len(dense_calls) :]
         return _IndexCandidates(
             dense=_merge_index_hits(*dense_routes),
-            lexical=lexical,
+            # One route keeps the index's own order, which `lexical_relevance_by_rank` reads as a
+            # reciprocal rank. Several have to be re-ordered by relevance or that rank would
+            # record the interleaving of the routes instead of the ranking of the candidates.
+            lexical=_merge_lexical_routes(lexical_routes),
             exhausted=all(len(route) < limit for route in routes),
         )
 
@@ -4541,6 +5499,8 @@ class Memory:
         self,
         hits: Sequence[SearchHit],
         operation: _OperationAssets,
+        *,
+        link_identities: bool = True,
     ) -> tuple[SearchHit, ...]:
         asset_ids = tuple(asset.id for hit in hits for asset in hit.assets)
         with (
@@ -4593,11 +5553,13 @@ class Memory:
             tuple(asset for prepared in prepared_hits for asset in prepared.assets)
         )
         if face_assets:
-            self._recognize_faces(face_assets, operation)
+            self._recognize_faces(face_assets, operation, link_identities=link_identities)
         routed = []
         for hit, prepared in zip(hits, prepared_hits, strict=True):
             if self._answer_face_assets(prepared.assets):
-                prepared = self._with_face_identities(prepared, operation)
+                prepared = self._with_face_identities(
+                    prepared, operation, link_identities=link_identities
+                )
             model_input = self._route_generation(prepared, operation)
             routed.append(
                 replace(
@@ -4628,9 +5590,11 @@ class Memory:
         self,
         prepared: _PreparedContent,
         operation: _OperationAssets,
+        *,
+        link_identities: bool = True,
     ) -> _PreparedContent:
         face_assets = self._answer_face_assets(prepared.assets)
-        self._recognize_faces(face_assets, operation)
+        self._recognize_faces(face_assets, operation, link_identities=link_identities)
         text = _face_identity_text(prepared.text, face_assets, operation.face_observations)
         if len(text) > _MAX_TEXT_CHARACTERS:
             raise ModelError(
@@ -4643,6 +5607,8 @@ class Memory:
         self,
         assets: Sequence[StoredAsset],
         operation: _OperationAssets,
+        *,
+        link_identities: bool = True,
     ) -> None:
         if not isinstance(self._face_analyzer, FaceBackend):
             raise ModelError("no face backend is configured", reason="backend_not_configured")
@@ -4697,9 +5663,18 @@ class Memory:
                         minimum_margin=self._face_margin,
                     )
         analyzed = {asset.asset_id for asset in missing}
-        with self._write_lock, _translate_storage_errors("link face and voice identities"):
-            for asset in face_assets:
-                self._link_asset_identity(asset.asset_id, operation)
+        if link_identities:
+            # `_formation_lock` before `_write_lock`, the same order `consolidate()`'s apply
+            # phase and `add()`'s formation use: a corroborated MERGE must not land while a
+            # consolidate apply pass is in progress, and taking the two locks in a different
+            # order here would deadlock against that path.
+            with (
+                self._formation_lock,
+                self._write_lock,
+                _translate_storage_errors("link face and voice identities"),
+            ):
+                for asset in face_assets:
+                    self._link_asset_identity(asset.asset_id, operation)
         # Linking re-points these observations to the surviving identity, but every counted
         # value here is merge-invariant: one face identity maps to one surviving identity, and
         # `identity_score` is carried through unchanged, so the counts do not depend on whether
@@ -4771,6 +5746,31 @@ class Memory:
             operation=operation,
         )
 
+    def _identity_link_operation(self, plan: IdentityLink) -> StoredOperation:
+        """Build the MERGE log row one corroborated cross-modal bind commits with."""
+        proposed = MemoryOperation(
+            intent=MemoryIntent.MERGE,
+            identity=IdentityChange(
+                identity_id=plan.target_id,
+                moved_ids=(plan.source_id,),
+            ),
+            rationale=(
+                f"one voice and one face co-occurred in at least "
+                f"{self._identity_link_min_assets} assets"
+            ),
+        )
+        return StoredOperation(
+            operation_key=operation_key(proposed, recipe=_IDENTITY_LINK_RECIPE),
+            intent=proposed.intent.value,
+            # Independent evidence accumulated until it corroborated the pair, which is exactly
+            # what this trigger names -- no clock and no host request is involved.
+            trigger=MemoryTrigger.EVIDENCE.value,
+            model_id=self._face_model,
+            recipe=_IDENTITY_LINK_RECIPE,
+            operation_json=dump_operation(proposed),
+            applied_at=datetime.now(timezone.utc),
+        )
+
     def _link_asset_identity(self, asset_id: str, operation: _OperationAssets) -> None:
         speaker_ids = {
             segment.speaker_id
@@ -4783,6 +5783,14 @@ class Memory:
         if len(speaker_ids) != 1 or len(face_ids) != 1:
             return
         speaker_id, face_id = next(iter(speaker_ids)), next(iter(face_ids))
+        # Withheld or withdrawn consent stops the merge on either side. Fusing a voice and a
+        # face is a new claim about a person -- that these two templates are one human -- so it
+        # is exactly the processing a refusal refuses, and unlike enrolment it is not something
+        # answering a question needs.
+        with _translate_storage_errors("read identity consent"):
+            restrained = self._store.restrained_identities()
+        if {speaker_id, face_id} & restrained:
+            return
         if speaker_id == face_id:
             # Already one identity. Recording this would store an identity co-occurring with
             # itself, once per asset forever, and no such pair can ever yield a plan.
@@ -4810,6 +5818,12 @@ class Memory:
                 expected=plan,
                 memories=memories,
                 embeddings=embeddings,
+                # Model reasoning proposes; the kernel authorizes and commits. The recognizers
+                # produced the templates and the corroboration rule above authorized the bind,
+                # so the bind commits with its own log row in the same transaction: it is
+                # visible through `operations()` and reversible through `rollback()`, which
+                # splits the two identities apart again.
+                operation=self._identity_link_operation(plan),
             )
             is None
         ):
@@ -5936,6 +6950,10 @@ class AsyncMemory:
         face_similarity: float = _DEFAULT_CONFIG.face_similarity,
         face_margin: float = _DEFAULT_CONFIG.face_margin,
         identity_link_min_assets: int = _DEFAULT_CONFIG.identity_link_min_assets,
+        memory_budget_records: int | None = _DEFAULT_CONFIG.memory_budget_records,
+        query_failure_window_seconds: float = _DEFAULT_CONFIG.query_failure_window_seconds,
+        query_failure_history: int = _DEFAULT_CONFIG.query_failure_history,
+        retention: RetentionPolicy = _DEFAULT_CONFIG.retention,
         tracer: Tracer | None = None,
     ) -> None:
         self._memory = Memory(
@@ -5959,6 +6977,10 @@ class AsyncMemory:
             face_similarity=face_similarity,
             face_margin=face_margin,
             identity_link_min_assets=identity_link_min_assets,
+            memory_budget_records=memory_budget_records,
+            query_failure_window_seconds=query_failure_window_seconds,
+            query_failure_history=query_failure_history,
+            retention=retention,
             tracer=tracer,
         )
 
@@ -5999,6 +7021,10 @@ class AsyncMemory:
             face_similarity=config.face_similarity,
             face_margin=config.face_margin,
             identity_link_min_assets=config.identity_link_min_assets,
+            memory_budget_records=config.memory_budget_records,
+            query_failure_window_seconds=config.query_failure_window_seconds,
+            query_failure_history=config.query_failure_history,
+            retention=config.retention,
             tracer=tracer,
         )
 
@@ -6212,6 +7238,7 @@ class AsyncMemory:
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        link_identities: bool = True,
     ) -> AnswerResult:
         return await asyncio.to_thread(
             self._memory.ask,
@@ -6220,6 +7247,7 @@ class AsyncMemory:
             memory_type=memory_type,
             reference_at=reference_at,
             scope=scope,
+            link_identities=link_identities,
         )
 
     def ask_stream(
@@ -6230,6 +7258,7 @@ class AsyncMemory:
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        link_identities: bool = True,
     ) -> AsyncGenerator[AnswerChunk, None]:
         """Answer as `ask()` does, yielding chunks as the model produces them.
 
@@ -6248,6 +7277,7 @@ class AsyncMemory:
             memory_type=memory_type,
             reference_at=reference_at,
             scope=scope,
+            link_identities=link_identities,
         )
         return self._pump(stream)
 
@@ -6349,6 +7379,33 @@ class AsyncMemory:
     async def unlink_identity(self, alias_id: str) -> str | None:
         return await asyncio.to_thread(self._memory.unlink_identity, alias_id)
 
+    async def record_consent(
+        self,
+        identity_id: str,
+        state: ConsentState,
+        *,
+        note: str | None = None,
+    ) -> MemoryOperationRecord | None:
+        return await asyncio.to_thread(
+            partial(self._memory.record_consent, identity_id, state, note=note)
+        )
+
+    async def consent(self, identity_id: str) -> ConsentState | None:
+        return await asyncio.to_thread(self._memory.consent, identity_id)
+
+    async def export(
+        self,
+        *,
+        identity_id: str | None = None,
+        memory_ids: Sequence[str] | None = None,
+    ) -> ExportBundle:
+        return await asyncio.to_thread(
+            partial(self._memory.export, identity_id=identity_id, memory_ids=memory_ids)
+        )
+
+    async def apply_retention(self, *, dry_run: bool = False) -> RetentionReport:
+        return await asyncio.to_thread(partial(self._memory.apply_retention, dry_run=dry_run))
+
     async def reinforce(self, memory_ids: Sequence[str]) -> int:
         return await asyncio.to_thread(self._memory.reinforce, memory_ids)
 
@@ -6356,8 +7413,41 @@ class AsyncMemory:
         self,
         *,
         limit: int = 32,
+        idle: bool = False,
     ) -> tuple[ConsolidationCandidate, ...]:
-        return await asyncio.to_thread(partial(self._memory.consolidation_candidates, limit=limit))
+        return await asyncio.to_thread(
+            partial(self._memory.consolidation_candidates, limit=limit, idle=idle)
+        )
+
+    async def deliberate(
+        self,
+        *,
+        limit: int = 32,
+        max_rounds: int = 4,
+        idle: bool = False,
+    ) -> DeliberationReport:
+        return await asyncio.to_thread(
+            partial(
+                self._memory.deliberate,
+                limit=limit,
+                max_rounds=max_rounds,
+                idle=idle,
+            )
+        )
+
+    async def apply(self, operation: MemoryOperation) -> MemoryOperationRecord:
+        return await asyncio.to_thread(self._memory.apply, operation)
+
+    async def record_outcome(
+        self,
+        operation_id: int,
+        outcome: MemoryOutcome,
+        *,
+        note: str | None = None,
+    ) -> bool:
+        return await asyncio.to_thread(
+            partial(self._memory.record_outcome, operation_id, outcome, note=note)
+        )
 
     async def consolidate(
         self,
@@ -7228,11 +8318,7 @@ def _observation_from_record(record: MemoryRecord) -> ObservationContext:
 
 
 def _formation_memory_type(kind: MemoryKind) -> MemoryType:
-    if kind in {MemoryKind.EVENT, MemoryKind.AFFECT}:
-        return MemoryType.EPISODIC
-    if kind is MemoryKind.RESPONSE_POLICY:
-        return MemoryType.PROCEDURAL
-    return MemoryType.SEMANTIC
+    return KIND_MEMORY_TYPES.get(kind, MemoryType.SEMANTIC)
 
 
 def _validate_formation_proposal(
@@ -7289,6 +8375,65 @@ def _naming_proposal(
         value=relationship,
         confidence=1.0,
     )
+
+
+def _consent_proposal(claim: ConsentClaim) -> FormationProposal:
+    """Build the STATE proposal one consent statement asserts."""
+    stated = f"Processing consent for {claim.identity_id} is {claim.state.value}."
+    return FormationProposal(
+        kind=MemoryKind.STATE,
+        content=stated if claim.note is None else f"{stated} {claim.note}",
+        # The one basis a consent statement can have. Nothing was observed and no model may
+        # infer it: the person said so.
+        basis=EvidenceBasis.USER_STATEMENT,
+        # The identity itself, not the name it currently projects: a person may be unnamed, and
+        # renaming one must not fork their consent history into a second subject.
+        subject=claim.identity_id,
+        predicate=CONSENT_PREDICATE,
+        value=claim.state.value,
+        confidence=1.0,
+    )
+
+
+def _is_consent_assertion(
+    memories: Mapping[str, StoredMemory],
+    memory_id: str,
+) -> bool:
+    """Report whether one record is a standing consent statement about a person."""
+    memory = memories.get(memory_id)
+    context = None if memory is None else memory.context
+    return (
+        context is not None
+        and context.identity_id is not None
+        and context.predicate == CONSENT_PREDICATE
+    )
+
+
+def _operation_touches(
+    record: MemoryOperationRecord,
+    memory_ids: frozenset[str],
+    identity_ids: frozenset[str],
+) -> bool:
+    """Report whether one logged operation moved any of these records or any of these people."""
+    operation = record.operation
+    named = {
+        *operation.evidence_ids,
+        *operation.target_ids,
+        *record.created_ids,
+        *record.changed_ids,
+        *record.forgotten_ids,
+        *(memory_id for memory_id, _version in record.superseded),
+    }
+    if named & memory_ids:
+        return True
+    people: set[str] = set()
+    if operation.identity is not None:
+        people.update((operation.identity.identity_id, *operation.identity.moved_ids))
+    if operation.claim is not None:
+        people.add(operation.claim.identity_id)
+    if operation.consent is not None:
+        people.add(operation.consent.identity_id)
+    return bool(people & identity_ids)
 
 
 def _is_bound_naming_assertion(
@@ -7372,7 +8517,16 @@ def _operation_record(logged: StoredOperation) -> MemoryOperationRecord:
         forgotten_ids=logged.forgotten_ids,
         superseded=logged.superseded,
         rolled_back_at=logged.rolled_back_at,
+        outcome=None if logged.outcome is None else _memory_outcome(logged.outcome),
+        outcome_note=logged.outcome_note,
     )
+
+
+def _memory_outcome(value: str) -> MemoryOutcome:
+    try:
+        return MemoryOutcome(value)
+    except ValueError:
+        raise StorageError("a logged memory operation has an unknown outcome") from None
 
 
 def _validate_formation_pairs(
@@ -8109,6 +9263,17 @@ def _positive_dimension(value: object, name: str) -> int:
     return value
 
 
+def _positive_seconds(value: object, name: str) -> timedelta:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(float(value))
+        or value <= 0
+    ):
+        raise ValidationError(f"{name} must be a positive finite number")
+    return timedelta(seconds=float(value))
+
+
 def _positive_int(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValidationError(f"{name} must be a positive integer")
@@ -8346,6 +9511,20 @@ def _optional_memory_type(value: object) -> MemoryType | None:
     return None if value is None else _memory_type(value)
 
 
+def _pushed_memory_types(
+    requested: MemoryType | frozenset[MemoryType] | None,
+) -> frozenset[MemoryType] | None:
+    """Return the type filter to push into the index, or `None` when it would filter nothing.
+
+    A request naming every type is the unfiltered request written out, and pushing it would buy
+    one index route per type for a filter that removes nothing.
+    """
+    if requested is None:
+        return None
+    pushed = frozenset({requested}) if isinstance(requested, MemoryType) else requested
+    return None if pushed >= frozenset(MemoryType) else pushed
+
+
 def _index_quantization(value: object) -> IndexQuantization:
     if not isinstance(value, IndexQuantization):
         raise ValidationError("index_quantization must be an IndexQuantization value")
@@ -8488,6 +9667,14 @@ def _budgeted_hits(
         used += cost
         extra.append(hit)
     return tuple(extra)
+
+
+def _merge_lexical_routes(routes: Sequence[Sequence[IndexHit]]) -> tuple[IndexHit, ...]:
+    if not routes:
+        return ()
+    if len(routes) == 1:
+        return tuple(routes[0])
+    return tuple(sorted(_merge_index_hits(*routes), key=lambda hit: -hit.relevance))
 
 
 def _merge_index_hits(*groups: Sequence[IndexHit]) -> tuple[IndexHit, ...]:
@@ -8662,7 +9849,7 @@ def _extend_missing_memory_traces(
 def _extend_memory_type_traces(
     target: builtins.list[RetrievalCandidateTrace] | None,
     memories: Sequence[StoredMemory],
-    memory_type: MemoryType,
+    kept: frozenset[str],
     index_ids_by_memory: Mapping[str, tuple[str, ...]],
     dense_relevance: Mapping[str, float],
     dense_confidence: Mapping[str, float],
@@ -8672,7 +9859,7 @@ def _extend_memory_type_traces(
     if target is None:
         return
     for memory in memories:
-        if memory.memory_type != memory_type.value:
+        if memory.memory_type not in kept:
             target.append(
                 _early_candidate_trace(
                     memory.memory_id,
