@@ -5748,6 +5748,53 @@ def test_add_stream_flushes_a_slow_source_on_the_time_bound(
         assert index.flush_calls == 4
 
 
+def test_a_stream_that_ended_stops_deferring_even_if_another_outlives_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Deferral belongs to the streaming thread, so an ended stream cannot silence its flushes.
+
+    While it was one shared slot, each stream saved the value it found and restored it on the way
+    out, so the second to finish handed the *first* thread's id back. Nothing ever cleared it
+    again: every later `add`, `delete` or `optimize` on that thread returned without flushing the
+    index, and the rows stayed durable but unsearchable.
+    """
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        both_open = Barrier(2, timeout=30)
+        first_closed = Event()
+        second_closed = Event()
+        after_both: list[int] = []
+
+        def first() -> None:
+            for _record in memory.add_stream(("clip from the first stream",)):
+                both_open.wait()
+            first_closed.set()
+            assert second_closed.wait(timeout=30)
+            before = index.flush_calls
+            memory.add("a note added once both streams had ended")
+            after_both.append(index.flush_calls - before)
+
+        def second() -> None:
+            # Opens inside the first stream's group and closes after it, which is the order that
+            # made the restore hand back an ident belonging to a thread no longer streaming.
+            for _record in memory.add_stream(("clip from the second stream",)):
+                both_open.wait()
+                assert first_closed.wait(timeout=30)
+            second_closed.set()
+
+        threads = [Thread(target=first), Thread(target=second)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert not any(thread.is_alive() for thread in threads)
+
+    assert after_both == [1]
+
+
 def test_search_during_a_stream_sees_the_committed_items(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
