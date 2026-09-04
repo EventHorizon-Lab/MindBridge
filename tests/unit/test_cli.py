@@ -145,6 +145,27 @@ def test_commands_are_the_sdk_operations_kebab_cased() -> None:
     assert set(COMMANDS) == {name.replace("_", "-") for name in published} | {"doctor"}
 
 
+def test_the_documented_commands_table_and_count_are_the_real_ones() -> None:
+    """`docs/api/cli.md` states a command count in prose and lists every command in a table.
+
+    Both have drifted before: `deliberate`, `apply`, and `record-outcome` landed on the parser
+    without a documentation update in the same commit. Parsing the table and the count sentence
+    catches a command added to `COMMANDS` without a row, a row naming a command that does not
+    exist, and a stale count, rather than trusting either by inspection.
+    """
+    page = (Path(cli_module.__file__).parents[2] / "docs" / "api" / "cli.md").read_text(
+        encoding="utf-8"
+    )
+    section = page[page.index("### Commands") : page.index("### Content and JSONL input")]
+    documented = set(re.findall(r"^\| `([a-z][a-z-]*)` \|", section, re.MULTILINE))
+
+    assert documented == set(COMMANDS)
+
+    match = re.search(r"provides (\d+) SDK operation commands plus `doctor`", page)
+    assert match is not None
+    assert int(match.group(1)) == len(COMMANDS) - 1
+
+
 def test_every_public_error_code_has_a_stable_exit_status() -> None:
     def codes(root: type[MindBridgeError]) -> set[str]:
         found = {root.code}

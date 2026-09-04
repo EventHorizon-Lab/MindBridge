@@ -2,7 +2,7 @@
 
 ## Surface
 
-`mindbridge` provides 27 SDK operation commands plus `doctor`; each invocation runs one command in
+`mindbridge` provides 35 SDK operation commands plus `doctor`; each invocation runs one command in
 one process and emits one JSON result. Local commands dispatch to the corresponding `Memory`
 method, except for the diagnostic `doctor`; remote commands forward to a running owner's `/v1`
 route. The CLI owns argument decoding, composition selection, JSON projection, and exit-code
@@ -110,7 +110,10 @@ credential behavior live in [configuration](../configuration.md).
 | `unlink-identity` | `ALIAS_ID` | `{"restored_identity_id":...}` | no |
 | `reinforce` | one or more `MEMORY_ID` values | `{"reinforced":int}` | no |
 | `consolidation-candidates` | `--limit` | `{"candidates":[{"trigger":...,"memory_ids":[...],"evidence_count":int}]}` | no |
-| `consolidate` | optional goal content; `--evidence-id`; `--limit`; `--trigger` | `{"operations":[...],"rejected":[...]}` | no |
+| `consolidate` | optional goal content; `--evidence-id`; `--limit`; `--trigger` | `{"operations":[...],"rejected":[...],"weighed":int}` | no |
+| `deliberate` | `--limit`; `--max-rounds`; `--idle` | `{"rounds":int,"weighed":int,"skipped":int,"applied":int,"rejected":int,"model_calls":int}` | no |
+| `apply` | `--operation` | `{"operation":{...}}` | no |
+| `record-outcome` | `OPERATION_ID OUTCOME`; `--note` | `{"recorded":bool}` | no |
 | `forget` | one or more `MEMORY_ID` values | `{"operation":{...}}` or `{"operation":null}` | no |
 | `rollback` | `OPERATION_ID` | `{"rolled_back":bool}` | no |
 | `operations` | `--limit` | `{"operations":[...]}` | no |
@@ -125,8 +128,8 @@ credential behavior live in [configuration](../configuration.md).
 Defaults match the SDK: `add`, `add-many`, `add-stream`, and `capture` use
 `memory_type=semantic`; search uses `limit=10`; ask uses `limit=5`; list, `settle`,
 `pending-captures`, and `operations` use `limit=100`; `settle` also uses `max-attempts=3`;
-`consolidate` and `consolidation-candidates` use `limit=32`,
-and `consolidate` defaults to `trigger=manual`; optional
+`consolidate`, `consolidation-candidates`, and `deliberate` use `limit=32`, `consolidate` defaults
+to `trigger=manual`, and `deliberate` also defaults to `max-rounds=4`; optional
 retrieval roles and timestamps are unset. Timestamps must be timezone-aware ISO 8601 values.
 Cursors are opaque and passed through unchanged. `ask` requires the selected composition to supply an answerer. `speech` and `faces`
 return an empty result without a model call when the record has no corresponding media; otherwise
@@ -136,12 +139,27 @@ more than one type; `--max-latency-ms` is a deadline the compiler checks between
 printed bundle carries `elapsed_ms`, `deadline_exceeded`, and `unknowns` alongside its sections.
 Each row `operations` prints carries `operation_id`, `intent`, `trigger`, `evidence_ids`,
 `target_ids`, `claim`, `consent`, `identity`, `rationale`, `model_id`, `recipe`, `created_ids`,
-`changed_ids`, `forgotten_ids`, `superseded`, `applied_at`, and `rolled_back_at`. `identity` is
+`changed_ids`, `forgotten_ids`, `superseded`, `applied_at`, `rolled_back_at`, `outcome`, and
+`outcome_note` -- the same fields `apply` and `record-outcome` print back for the one operation
+each names. `identity` is
 set on the three rows that name a person instead of records -- the cross-modal `merge` the kernel
 commits, the `correct` that `unlink-identity` logs, and the irreversible `forget` that
 `forget-identity` logs -- and is `null` on every other row. `claim` carries the name an `identify`
 row asserted and `consent` the state a `consent` row recorded, so a row about a person always says
-what it said about them.
+what it said about them. `outcome` and `outcome_note` are `null` until `record-outcome` names the
+operation, are post-hoc and never fed back into a decision, and a later `record-outcome` call
+replaces an earlier judgement the same way `rollback` replaces a standing operation.
+
+`deliberate` runs `consolidation-candidates` and `consolidate` in a loop, each round consolidating
+every row `consolidation-candidates` returns with that row's own trigger, until a round yields no
+candidates or `--max-rounds` is reached; the counters it prints are summed across every round.
+`--idle` is passed through to `consolidation-candidates` on every round, declaring an approved
+idle window that admits lineages nothing has ever weighed; the CLI never infers idleness from a
+clock. `apply` applies one host-supplied operation -- read from `--operation` in the same JSON
+shape `operations` logs a row in -- through the same kernel validation a proposal gets, which is
+the public replay path: reproducing a logged sequence against a fresh store configured with the
+recipe that produced it reproduces the same derived IDs. A refused operation exits
+`validation_error` naming the kernel's rejection reason.
 
 `record-consent` takes `granted`, `withheld`, or `withdrawn`, and prints the logged operation, or
 `null` when that statement already stands. `consent` reads back the standing state, where `null`
