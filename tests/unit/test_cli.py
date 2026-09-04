@@ -15,7 +15,7 @@ import inspect
 import json
 import re
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from email.message import Message
@@ -33,7 +33,8 @@ from mindbridge import Memory, recipes
 from mindbridge.api import app as rest
 from mindbridge.api import content as rest_content
 from mindbridge.api.errors import ErrorEnvelope
-from mindbridge.cli import COMMANDS, EXIT_CODES, OPERATIONS, main
+from mindbridge.cli import COMMANDS, EXIT_CODES, OPERATIONS, _parser, main
+from mindbridge.control import load_operation
 from mindbridge.exceptions import MindBridgeError, ValidationError
 from mindbridge.memory import declared_capabilities
 from mindbridge.models.base import EmbedTask, ModelInput
@@ -43,8 +44,11 @@ from mindbridge.types import (
     AbstentionReason,
     AnswerResult,
     AssetRef,
+    EvidenceBasis,
+    FormationProposal,
     IdentityChange,
     MemoryIntent,
+    MemoryKind,
     MemoryOperation,
     MemoryOperationRecord,
     MemoryRecord,
@@ -1290,6 +1294,66 @@ def test_an_operation_row_names_the_people_a_merge_moved() -> None:
     }
     assert document["target_ids"] == []
     assert cli_module._operation_document(replace(record, operation=_A_FORGET))["identity"] is None
+
+
+def test_the_idle_window_declared_on_the_command_line_reaches_candidate_selection() -> None:
+    """`--idle` is the operator declaring a window, so the handler has to forward it.
+
+    The flag was parsed and then dropped, so `consolidation-candidates --idle` asked for exactly
+    what the default asks for and never admitted the never-weighed lineages it advertises. Driven
+    against the handler because the declaration is what regressed, not the row it prints.
+    """
+    asked: list[Mapping[str, object]] = []
+
+    class Spy:
+        def consolidation_candidates(self, **keywords: object) -> tuple[object, ...]:
+            asked.append(keywords)
+            return ()
+
+    parser = _parser()
+    declared = parser.parse_args(["consolidation-candidates", "--idle", "--limit", "5"])
+    default = parser.parse_args(["consolidation-candidates", "--limit", "5"])
+
+    for arguments in (declared, default):
+        cli_module._consolidation_candidates(cast(Memory, Spy()), arguments)
+
+    assert asked == [{"limit": 5, "idle": True}, {"limit": 5, "idle": False}]
+
+
+def test_a_consolidation_row_carries_the_proposal_it_would_replay_from() -> None:
+    """`--operation` takes a row as `operations` prints it, so the row has to be replayable.
+
+    A consolidation's subject is what it proposed, and the kernel refuses one carrying no
+    proposal. Without this field the advertised pipe -- an `operations` row into `apply` --
+    failed validation before replay, for exactly the intent the slow loop produces most.
+    """
+    operation = MemoryOperation(
+        intent=MemoryIntent.CONSOLIDATE,
+        evidence_ids=("memory-1", "memory-2"),
+        proposal=FormationProposal(
+            kind=MemoryKind.STATE,
+            content="the bench is in the garage",
+            basis=EvidenceBasis.MODEL_INFERENCE,
+            confidence=0.8,
+            subject="bench",
+            predicate="location",
+            value="garage",
+        ),
+    )
+    record = MemoryOperationRecord(
+        operation_id=9,
+        operation=operation,
+        trigger=MemoryTrigger.EVIDENCE,
+        applied_at=datetime(2026, 3, 1, 12, tzinfo=timezone.utc),
+    )
+
+    document = cli_module._operation_document(record)
+
+    proposal = cast(dict[str, object], document["proposal"])
+    assert proposal["content"] == "the bench is in the garage"
+    assert proposal["kind"] == "state"
+    # The row round-trips: what `operations` prints is what `apply` accepts.
+    assert load_operation(json.dumps(document)) == operation
 
 
 _A_FORGET = MemoryOperation(intent=MemoryIntent.FORGET, target_ids=("memory-1",))

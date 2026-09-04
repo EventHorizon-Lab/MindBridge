@@ -1968,7 +1968,11 @@ def _compile_span(tracer: Tracer | None, bundle: ContextBundle) -> Iterator[None
             SPAN_KIND: "stage",
             BENCHMARK_COMPILE_CHARS: bundle.chars,
             BENCHMARK_COMPILE_ITEMS: len(bundle.hits),
-            BENCHMARK_COMPILE_MEDIA_ITEMS: sum(1 for hit in bundle.hits if hit.assets),
+            # Grounded parts, not memories carrying them, because that is the quantity
+            # `ContextBudget.max_media_items` bounds: an omni memory with a still and a clip is
+            # two parts against the budget and has to be two here, or a multi-asset bundle
+            # reports as thrifty as a single-asset one.
+            BENCHMARK_COMPILE_MEDIA_ITEMS: sum(len(hit.assets) for hit in bundle.hits),
         },
     ):
         yield

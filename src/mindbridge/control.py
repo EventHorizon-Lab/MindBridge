@@ -70,7 +70,7 @@ def _identity(operation: MemoryOperation) -> dict[str, object]:
         "intent": operation.intent.value,
         "evidence_ids": sorted(operation.evidence_ids),
         "target_ids": sorted(operation.target_ids),
-        "proposal": None if proposal is None else _proposal_payload(proposal),
+        "proposal": None if proposal is None else proposal_payload(proposal),
         # Part of the idempotency identity: renaming the same person supersedes rather than
         # replays, so two claims that differ only in the name must be two operations.
         "claim": None if claim is None else _claim_payload(claim),
@@ -135,7 +135,11 @@ def _claim(value: object) -> IdentityClaim:
     )
 
 
-def _proposal_payload(proposal: FormationProposal) -> dict[str, object]:
+def proposal_payload(proposal: FormationProposal) -> dict[str, object]:
+    """Return the JSON one formation proposal is logged as, which `_proposal` reads back.
+
+    Shared with the CLI so an operation row it prints stays the shape `load_operation` accepts.
+    """
     spatial = proposal.spatial
     return {
         "kind": proposal.kind.value,

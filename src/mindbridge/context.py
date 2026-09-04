@@ -14,6 +14,7 @@ from time import perf_counter
 from types import MappingProxyType
 from typing import TypeAlias
 
+from mindbridge.exceptions import ValidationError
 from mindbridge.types import (
     KIND_MEMORY_TYPES,
     ContextBudget,
@@ -219,6 +220,16 @@ def compile_context(
         else:
             excluded[reason] = excluded.get(reason, 0) + 1
     overhead = _frame_cost(goal, reference_at, budget)
+    if overhead > budget.max_chars:
+        # `max_chars` bounds the header too, so a budget it alone overruns has no bundle that
+        # satisfies it: `_select` would buy nothing and the four framing lines would still be
+        # rendered over the limit. Refused rather than returned oversized, because a caller
+        # sizing a model window is better served by being told the floor than by a bundle that
+        # quietly breaks it. The floor moves with the goal, which the header repeats.
+        raise ValidationError(
+            f"budget max_chars must be at least {overhead} to fit this goal's context header",
+            subject="budget",
+        )
     sections = _select(candidates, budget, overhead)
     # Rank order, not section order: `_lineage_conflict` pairs each value with the highest-ranked
     # memory asserting it, so a lineage whose claims land in different sections must still be read
@@ -257,10 +268,23 @@ def compile_context(
         provisional,
         exclude=frozenset(actor.identity_id for actor in named_actors),
     )
-    fitted_actors, actor_chars, actor_excluded = _fit_actors(
-        (*named_actors, *provisional_actors),
-        budget.max_chars - base_chars,
+    actor_candidates: tuple[NamedActor | ProvisionalActor, ...] = (
+        *named_actors,
+        *provisional_actors,
     )
+    # `render()` writes `## Actors` as soon as the section holds anything, so a bundle whose
+    # typed `ENTITY` hits left it empty owes that heading the moment a synthesized actor fills
+    # it. `_bundle_chars` prices only the sections `_select` filled, so it is charged here or
+    # nowhere -- and reserved before the fit, so the heading cannot push the total past
+    # `max_chars` either.
+    actors_heading = _heading_cost("actors") if actor_candidates and not sections["actors"] else 0
+    fitted_actors, actor_chars, actor_excluded = _fit_actors(
+        actor_candidates,
+        budget.max_chars - base_chars - actors_heading,
+    )
+    if not fitted_actors:
+        # Nothing fit, so no heading is written and none is owed.
+        actors_heading = 0
     return ContextBundle(
         goal=goal,
         reference_at=reference_at,
@@ -294,7 +318,7 @@ def compile_context(
         frames=_frames(included),
         places=tuple(sorted({hit.place_id for hit in included if hit.place_id})),
         omitted=omitted,
-        chars=base_chars + actor_chars,
+        chars=base_chars + actors_heading + actor_chars,
         elapsed_ms=elapsed_ms,
         deadline_exceeded=(
             budget.max_latency_ms is not None and elapsed_ms > budget.max_latency_ms

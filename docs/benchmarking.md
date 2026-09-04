@@ -601,6 +601,12 @@ process-scope, and the GPU figure is a rectangle-rule estimate over periodic sam
 absent with a `reason` (never a fabricated number) when their source cannot be read: no
 `intel-rapl` packages, no permission, or no GPU visible to `nvidia-smi`.
 
+Each RAPL package is differenced against its own counter, because `energy_uj` wraps at that
+package's `max_energy_range_uj` -- tens of minutes on a busy package, well inside the length of a
+sweep. A package that wrapped is corrected by its published range; one that wrapped without
+publishing a range makes `cpu_package_joules` absent with that as its `reason`, rather than a
+number nothing can correct.
+
 ## Mandatory controls
 
 A score is not interpretable on its own, so `results.json` reports three controls per task in a

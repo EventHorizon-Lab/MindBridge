@@ -1977,7 +1977,11 @@ class ContextBudget:
     bundle rather than ground it and suppressing them to fit a budget would make a thin bundle
     look like an empty store. An actor line is priced and fit in after the ranked hits it
     depends on, the same as any other line the compiler grounds -- dropped, not given away for
-    free, when what is left of `max_chars` cannot buy it.
+    free, when what is left of `max_chars` cannot buy it. Because the header is inside the bound
+    and is written whether or not anything else fits, a `max_chars` the header alone overruns has
+    no bundle that satisfies it: compilation refuses it with `ValidationError` naming the floor,
+    rather than returning a bundle over the limit it was given. The floor moves with the goal,
+    which the header repeats.
 
     `max_media_items` bounds grounded media parts instead of their price: `0` compiles a
     text-only bundle, and `None` lets `max_chars` alone decide. The default `max_chars` buys the

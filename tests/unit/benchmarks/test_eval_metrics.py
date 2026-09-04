@@ -11,13 +11,17 @@ import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from mindbridge import AssetRef, ContextBudget, MemoryType, Modality, SearchHit
 from mindbridge._telemetry import (
     CAPTURE_TIME_TO_SEARCHABLE,
     MODEL_MODULE,
@@ -50,6 +54,7 @@ from mindbridge.benchmarks.eval_telemetry import (
     ResourceSampler,
     storage_bytes,
 )
+from mindbridge.context import compile_context
 
 
 def _span(
@@ -403,17 +408,90 @@ def test_resource_sampler_reports_unavailable_energy_with_a_reason(
     }
 
 
-def test_rapl_energy_sums_package_counters(tmp_path: Path) -> None:
+def _rapl_tree(tmp_path: Path, packages: Sequence[tuple[int, int | None]]) -> Path:
+    """Write a fake powercap tree, one package per `(energy_uj, max_energy_range_uj)` pair."""
     root = tmp_path / "powercap"
-    for index, value in enumerate((1_000_000, 2_500_000)):
+    for index, (energy, max_range) in enumerate(packages):
         package = root / f"intel-rapl:{index}"
         package.mkdir(parents=True)
-        (package / "energy_uj").write_text(str(value))
+        (package / "energy_uj").write_text(str(energy))
+        if max_range is not None:
+            (package / "max_energy_range_uj").write_text(str(max_range))
+    return root
 
-    total, reason = eval_telemetry_module._rapl_energy_uj(root)
 
-    assert total == 3_500_000
+def test_rapl_energy_reads_each_package_with_the_range_it_wraps_at(tmp_path: Path) -> None:
+    root = _rapl_tree(tmp_path, ((1_000_000, 262_143_328_850), (2_500_000, None)))
+
+    readings, reason = eval_telemetry_module._rapl_energy_uj(root)
+
+    assert readings == {
+        "intel-rapl:0": (1_000_000, 262_143_328_850),
+        "intel-rapl:1": (2_500_000, None),
+    }
     assert reason is None
+
+
+def test_rapl_deltas_are_summed_per_package(tmp_path: Path) -> None:
+    start = {"intel-rapl:0": (1_000_000, 100_000_000), "intel-rapl:1": (500_000, 100_000_000)}
+    end = {"intel-rapl:0": (3_000_000, 100_000_000), "intel-rapl:1": (900_000, 100_000_000)}
+
+    total, reason = eval_telemetry_module._rapl_delta_uj(start, end)
+
+    assert total == 2_400_000
+    assert reason is None
+
+
+def test_a_wrapped_rapl_counter_is_corrected_against_its_own_range() -> None:
+    """A run longer than a package's wrap period reported 0 J for real energy.
+
+    `energy_uj` wraps at `max_energy_range_uj` -- tens of minutes on a busy package -- so a
+    sweep that crossed one subtracted to a negative delta, which was clamped to zero. Worse,
+    the packages were summed before subtracting, so one package's wrap could hide inside
+    another's rise and publish a plausible, wrong number.
+    """
+    max_range = 100_000_000
+    # The first package wrapped 2 000 000 uj past its range; the second rose normally.
+    start = {"intel-rapl:0": (99_000_000, max_range), "intel-rapl:1": (1_000_000, max_range)}
+    end = {"intel-rapl:0": (1_000_000, max_range), "intel-rapl:1": (4_000_000, max_range)}
+
+    total, reason = eval_telemetry_module._rapl_delta_uj(start, end)
+
+    assert total == 2_000_000 + 3_000_000
+    assert reason is None
+
+
+def test_a_wrap_with_no_published_range_is_refused_rather_than_guessed(tmp_path: Path) -> None:
+    start = {"intel-rapl:0": (99_000_000, None)}
+    end = {"intel-rapl:0": (1_000_000, None)}
+
+    total, reason = eval_telemetry_module._rapl_delta_uj(start, end)
+
+    assert total is None
+    assert reason is not None and "max_energy_range_uj" in reason
+
+
+def test_a_sampler_whose_counter_wrapped_reports_the_corrected_energy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mindbridge.benchmarks.eval_telemetry._nvidia_utilization", lambda: ())
+    readings = iter(
+        (
+            ({"intel-rapl:0": (99_000_000, 100_000_000)}, None),
+            ({"intel-rapl:0": (1_000_000, 100_000_000)}, None),
+        )
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.eval_telemetry._rapl_energy_uj",
+        lambda root=None: next(readings),
+    )
+
+    with ResourceSampler(interval_seconds=0.05) as sampler:
+        pass
+
+    energy = cast(Mapping[str, object], sampler.json(wall_seconds=1.0)["energy"])
+    # 2 000 000 uj across the wrap, not the 0.0 the clamp used to publish.
+    assert energy["cpu_package_joules"] == pytest.approx(2.0)
 
 
 def test_rapl_energy_reports_why_it_could_not_read_anything(tmp_path: Path) -> None:
@@ -436,6 +514,58 @@ def test_rapl_energy_reports_the_unreadable_file(tmp_path: Path) -> None:
 
 
 # --- family 6: fast-plane and compiler telemetry (capture, settle, compile) -----------------
+
+
+def _asset(asset_id: str) -> AssetRef:
+    """A resolved image asset, which is what a record's assets must be."""
+    return AssetRef(
+        id=asset_id,
+        modality=Modality.IMAGE,
+        media_type="image/png",
+        size_bytes=1,
+        sha256="a" * 64,
+        path=Path(f"{asset_id}.png"),
+    )
+
+
+def test_compile_telemetry_counts_every_grounded_media_part() -> None:
+    """One omni memory with two assets is two media parts, the quantity the budget bounds.
+
+    The count was of hits carrying any asset, so a bundle grounding a still and a clip from one
+    observation reported the same single part as a bundle grounding only the still, and
+    multi-asset artifacts undercounted the compiler's real media spend.
+    """
+    reference = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    hit = SearchHit(
+        id="omni",
+        content="a still and a clip from one observation",
+        score=0.9,
+        created_at=reference,
+        memory_type=MemoryType.EPISODIC,
+        modality=Modality.IMAGE,
+        assets=(
+            _asset("asset-still"),
+            _asset("asset-second-still"),
+        ),
+    )
+    bundle = compile_context(
+        "what happened",
+        (hit,),
+        budget=ContextBudget(),
+        reference_at=reference,
+    )
+    assert len(bundle.hits) == 1
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with eval_module._compile_span(provider.get_tracer("test"), bundle):
+        pass
+
+    attributes = exporter.get_finished_spans()[-1].attributes
+    assert attributes is not None
+    assert attributes[BENCHMARK_COMPILE_ITEMS] == 1
+    assert attributes[BENCHMARK_COMPILE_MEDIA_ITEMS] == 2
 
 
 def test_capture_settle_and_compile_spans_are_aggregated_separately() -> None:

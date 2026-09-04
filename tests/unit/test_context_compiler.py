@@ -7,6 +7,7 @@ import json
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import cast
 
 import pytest
 from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
@@ -1190,13 +1191,93 @@ def test_a_provisional_actor_of_omitted_evidence_is_not_reported() -> None:
     bundle = compile_context(
         "who is in the room",
         (_hit("expensive", content="x" * 500),),
-        budget=ContextBudget(max_chars=10),
+        # Over the header floor, so the budget is spendable, and far under the 500-character hit.
+        budget=ContextBudget(max_chars=200),
         reference_at=REFERENCE,
         provisional={"expensive": ("identity_1",)},
     )
 
     assert bundle.actors == ()
     assert bundle.omitted == 1
+
+
+def test_a_synthesized_actor_pays_for_the_heading_it_makes_render_write() -> None:
+    """`chars` counts the `## Actors` heading no typed hit paid for, so it cannot underreport.
+
+    `_bundle_chars` prices the sections `_select` filled, and an episode that only carries an
+    identity edge leaves that section empty. The actor line was charged and the heading `render()
+    writes above it was not, so `chars` came in a heading short of the text and a bundle sized to
+    a tight `max_chars` rendered past it.
+    """
+    hit = _hit("clip", kind=MemoryKind.EVENT, memory_type=MemoryType.EPISODIC)
+    plain = compile_context(
+        "who was in the kitchen",
+        (hit,),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+    )
+    with_actor = compile_context(
+        "who was in the kitchen",
+        (hit,),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        named={"clip": (("identity_1", "Li", "naming"),)},
+    )
+
+    assert plain.actors == ()
+    assert "## Actors" not in plain.render()
+    assert "## Actors" in with_actor.render()
+    # The actor cost the line *and* the heading, so the price moved exactly as the text did.
+    assert len(with_actor.render()) - len(plain.render()) == with_actor.chars - plain.chars
+    assert with_actor.chars - plain.chars == named_actor_cost(
+        cast(NamedActor, with_actor.actors[0])
+    ) + _heading_cost("actors")
+
+
+def test_a_typed_actor_section_pays_for_its_heading_once() -> None:
+    """A synthesized actor joining a section `_select` already filled owes no second heading."""
+    bundle = compile_context(
+        "who was in the kitchen",
+        (_hit("face", kind=MemoryKind.ENTITY),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        named={"face": (("identity_1", "Li", "naming"),)},
+    )
+
+    assert [type(entry).__name__ for entry in bundle.actors] == ["SearchHit", "NamedActor"]
+    assert bundle.chars == sum(bundle_cost(hit) for hit in bundle.hits) + named_actor_cost(
+        cast(NamedActor, bundle.actors[1])
+    ) + _frame_and_headings(bundle, ("actors",))
+
+
+def test_a_budget_the_context_header_alone_overruns_is_refused() -> None:
+    """`max_chars` bounds the header too, so a budget under it has no bundle that satisfies it.
+
+    `_select` buys nothing and the four framing lines are written anyway, so the bundle used to
+    come back over the limit it was given -- and report that oversized total as `chars`. The
+    floor moves with the goal, because the header repeats it.
+    """
+    goal = "how did the sprint go"
+    budget = ContextBudget(max_chars=10)
+    floor = _frame_cost(goal, REFERENCE, budget)
+
+    with pytest.raises(ValidationError) as raised:
+        compile_context(
+            goal,
+            (_hit("m1"),),
+            budget=budget,
+            reference_at=REFERENCE,
+        )
+
+    assert raised.value.subject == "budget"
+    assert str(floor) in str(raised.value)
+    # The floor is self-referential -- the header prints `max_chars`, so a budget with more
+    # digits frames slightly wider -- which is why the message states the floor for the budget it
+    # was handed rather than a constant. A budget clear of it spends, and stays inside itself.
+    spendable = ContextBudget(max_chars=floor * 2)
+    fitted = compile_context(goal, (_hit("m1"),), budget=spendable, reference_at=REFERENCE)
+    assert fitted.chars <= spendable.max_chars
+    assert len(fitted.render()) <= spendable.max_chars
 
 
 def test_rendering_labels_a_provisional_actor_plainly() -> None:
@@ -1300,10 +1381,11 @@ def test_a_named_actor_aggregates_every_memory_that_carries_its_edge() -> None:
             naming_assertion_id="naming",
         )
     ]
-    # One actor line however many memories carried its edge, priced once.
+    # One actor line however many memories carried its edge, priced once -- and the `## Actors`
+    # heading it makes `render()` write, which no typed `ENTITY` hit paid for here.
     assert bundle.chars == sum(bundle_cost(hit) for hit in bundle.hits) + named_actor_cost(
         named_actors[0]
-    ) + _frame_and_headings(bundle, ("episodes",))
+    ) + _frame_and_headings(bundle, ("episodes", "actors"))
 
 
 def test_a_named_actor_of_omitted_evidence_is_not_reported() -> None:
@@ -1311,7 +1393,8 @@ def test_a_named_actor_of_omitted_evidence_is_not_reported() -> None:
     bundle = compile_context(
         "who is in the room",
         (_hit("expensive", content="x" * 500),),
-        budget=ContextBudget(max_chars=10),
+        # Over the header floor, so the budget is spendable, and far under the 500-character hit.
+        budget=ContextBudget(max_chars=200),
         reference_at=REFERENCE,
         named={"expensive": (("identity_1", "Li", "naming"),)},
     )

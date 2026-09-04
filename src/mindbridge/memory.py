@@ -1659,7 +1659,10 @@ class Memory:
             # The same transcript cache `search()` writes for a spoken query. It is a cache of
             # the query's own audio, not a memory: `compile()` stores nothing it retrieved.
             self._persist_transcripts(assets)
-            hits, withheld = self._consented_actors(outcome.hits)
+            hits, named, withheld = self._consented_actors(
+                outcome.hits,
+                self._named_actors(outcome.hits),
+            )
             bundle = compile_context(
                 prepared.text,
                 hits,
@@ -1672,7 +1675,7 @@ class Memory:
                 ),
                 candidate_limit=candidate_limit,
                 provisional=self._provisional_identities(hits),
-                named=self._named_actors(hits),
+                named=named,
             )
             # QUERY_FAILURE hook: a bundle with no evidence in it is the compiler reporting that
             # the goal found nothing, which is the same signal as an empty search.
@@ -1682,13 +1685,23 @@ class Memory:
     def _consented_actors(
         self,
         hits: Sequence[SearchHit],
-    ) -> tuple[tuple[SearchHit, ...], tuple[ContextUnknown, ...]]:
+        named: Mapping[str, tuple[NamedActorLink, ...]],
+    ) -> tuple[
+        tuple[SearchHit, ...],
+        dict[str, tuple[NamedActorLink, ...]],
+        tuple[ContextUnknown, ...],
+    ]:
         """Drop the named actors whose subject withheld or withdrew consent, and say so.
 
         Only the naming assertion is dropped, not the person's memories: consent governs being
         treated as a recognized person, not whether the evening happened. The bundle then says
         a person is missing from `actors` rather than silently compiling a scene with a hole in
         it, which is what makes the omission auditable instead of a retrieval mystery.
+
+        Both routes to an actor are filtered, because both publish the same person. A bound
+        `ENTITY` hit renders as its own line, and a resolved identity edge on any other memory
+        -- the face in a photo, the speaker in a clip -- becomes a `NamedActor` whether or not
+        the assertion that names them ranked at all.
         """
         bound = {
             hit.context.identity_id
@@ -1697,12 +1710,16 @@ class Memory:
             and hit.context.identity_id is not None
             and hit.context.kind is MemoryKind.ENTITY
         }
+        # Every identity the enrichment could name, not only the ones a retrieved `ENTITY` hit
+        # carried: a bundle that reached a person's clip but not their naming assertion used to
+        # find nothing bound here, consult no consent at all, and then name them from the clip.
+        bound.update(link[0] for links in named.values() for link in links)
         if not bound:
-            return tuple(hits), ()
+            return tuple(hits), dict(named), ()
         with _translate_storage_errors("read identity consent"):
             restrained = self._store.restrained_identities() & bound
         if not restrained:
-            return tuple(hits), ()
+            return tuple(hits), dict(named), ()
         kept = tuple(
             hit
             for hit in hits
@@ -1710,13 +1727,22 @@ class Memory:
             or hit.context.kind is not MemoryKind.ENTITY
             or hit.context.identity_id not in restrained
         )
-        return kept, (
-            ContextUnknown(
-                kind=ContextUnknownKind.CONSENT_WITHHELD,
-                detail=(
-                    f"{len(restrained)} recognized "
-                    f"{'person is' if len(restrained) == 1 else 'people are'} withheld from"
-                    " the actors section by their own recorded consent"
+        permitted = {
+            memory_id: kept_links
+            for memory_id, links in named.items()
+            if (kept_links := tuple(link for link in links if link[0] not in restrained))
+        }
+        return (
+            kept,
+            permitted,
+            (
+                ContextUnknown(
+                    kind=ContextUnknownKind.CONSENT_WITHHELD,
+                    detail=(
+                        f"{len(restrained)} recognized "
+                        f"{'person is' if len(restrained) == 1 else 'people are'} withheld from"
+                        " the actors section by their own recorded consent"
+                    ),
                 ),
             ),
         )

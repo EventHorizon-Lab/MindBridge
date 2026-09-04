@@ -108,6 +108,13 @@ shipping `render()` no longer has to size against it themselves.
 equivalent, which is far above the zero characters they render as, and the budget line is priced
 at its widest -- so the inequality can be slack, never violated.
 
+The header is inside the ceiling and is written whether or not anything else fits, so a
+`max_chars` the header alone overruns has no bundle that satisfies the inequality. Compilation
+refuses such a budget with `ValidationError` naming the floor it would need, rather than returning
+a bundle over the limit it was handed. The floor moves with the goal, because the header repeats
+it, and it is a few hundred characters for a short goal -- far below any budget that could buy a
+memory line as well.
+
 Three things `render()` appends are outside the ceiling, all of them explanations rather than
 grounding: the `## Conflicts` block, the `## Unknowns` block, and the `Omitted:` trailer.
 Suppressing any of them to fit a budget would make a thin bundle look like an empty store, which

@@ -36,7 +36,9 @@ from mindbridge import (
     MemoryOperation,
     MemoryRecord,
     MemoryTrigger,
+    MemoryType,
     Modality,
+    NamedActor,
     RetentionPolicy,
     RetentionReport,
     SpeakerEmbedding,
@@ -356,6 +358,45 @@ def test_a_withheld_person_leaves_a_compiled_bundle_with_an_unknown(tmp_path: Pa
         assert "consent" in withheld[0].detail
         # Their memories are untouched: consent governs being a recognized person, not the event.
         assert episode.id in {hit.id for hit in bundle.hits}
+
+
+def test_a_withheld_person_is_not_named_by_a_clip_alone(tmp_path: Path) -> None:
+    """Consent is read from every identity edge that can name somebody, not only ENTITY hits.
+
+    The restrained set used to be derived from the bound `ENTITY` hits retrieval returned, so a
+    bundle that reached only a person's clip -- their naming assertion outside the budget's own
+    type bound -- found nothing bound, consulted no consent at all, and then resolved the clip's
+    own face edge into exactly the `NamedActor` that `WITHDRAWN` consent promises to omit.
+    """
+    with _memory(tmp_path) as memory:
+        clip = memory.add(
+            Blob(b"a-1 arrives", "video/mp4", "a-1.mp4"),
+            memory_type=MemoryType.EPISODIC,
+            occurred_at=OCCURRED,
+        )
+        identity_id = memory.faces(clip.id)[0].identity_id
+        memory.register_identity(identity_id, "Ann", relationship="neighbour")
+        # Episodic evidence only, so the naming assertion -- a semantic `ENTITY` -- is never
+        # retrieved, and the clip's face edge is the only thing that can name her.
+        budget = ContextBudget(max_items=10, memory_types=frozenset({MemoryType.EPISODIC}))
+
+        bundle = memory.compile("who arrives", budget=budget)
+        assert clip.id in {hit.id for hit in bundle.hits}
+        assert [actor.name for actor in bundle.actors if isinstance(actor, NamedActor)] == ["Ann"]
+
+        assert memory.record_consent(identity_id, ConsentState.WITHDRAWN) is not None
+        bundle = memory.compile("who arrives", budget=budget)
+
+        # Named nowhere, and not quietly downgraded to a provisional actor either.
+        assert bundle.actors == ()
+        withheld = [
+            unknown
+            for unknown in bundle.unknowns
+            if unknown.kind is ContextUnknownKind.CONSENT_WITHHELD
+        ]
+        assert len(withheld) == 1
+        # The clip itself stays: consent governs recognition, not whether she arrived.
+        assert clip.id in {hit.id for hit in bundle.hits}
 
 
 # ---------------------------------------------------------------------------------------------

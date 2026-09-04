@@ -665,15 +665,15 @@ class ResourceSampler:
         self._stopped_storage: dict[str, int] | None = None
         self._gpu_available = False
         self._gpu_power_reported = False
-        self._rapl_start_uj: int | None = None
-        self._rapl_end_uj: int | None = None
+        self._rapl_start: dict[str, tuple[int, int | None]] | None = None
+        self._rapl_joules: float | None = None
         self._rapl_reason: str | None = None
 
     def __enter__(self) -> ResourceSampler:
         self._started_cpu_seconds = _cpu_seconds()
         if self._storage_root is not None:
             self._started_storage = storage_bytes(self._storage_root)
-        self._rapl_start_uj, self._rapl_reason = _rapl_energy_uj()
+        self._rapl_start, self._rapl_reason = _rapl_energy_uj()
         self._gpu_available = bool(_nvidia_utilization())
         if self._gpu_available:
             self._thread = Thread(target=self._poll, name="mindbridge-bench-resources", daemon=True)
@@ -692,9 +692,16 @@ class ResourceSampler:
             thread.join(timeout=self._interval_seconds + 5.0)
         if self._storage_root is not None:
             self._stopped_storage = storage_bytes(self._storage_root)
-        if self._rapl_start_uj is not None:
-            self._rapl_end_uj, end_reason = _rapl_energy_uj()
-            self._rapl_reason = self._rapl_reason or end_reason
+        if self._rapl_start is not None:
+            end, end_reason = _rapl_energy_uj()
+            if end is None:
+                self._rapl_reason = self._rapl_reason or end_reason
+            else:
+                joules_uj, wrap_reason = _rapl_delta_uj(self._rapl_start, end)
+                if joules_uj is None:
+                    self._rapl_reason = self._rapl_reason or wrap_reason
+                else:
+                    self._rapl_joules = joules_uj / 1_000_000
 
     def json(self, *, wall_seconds: float) -> dict[str, object]:
         """Return one JSON-ready resource record for the completed evaluation."""
@@ -730,11 +737,7 @@ class ResourceSampler:
         package, ``nvidia-smi --query-gpu=power.draw`` integrated over the poll interval for the
         GPU) actually answered.
         """
-        cpu_joules = (
-            None
-            if self._rapl_start_uj is None or self._rapl_end_uj is None
-            else max(0, self._rapl_end_uj - self._rapl_start_uj) / 1_000_000
-        )
+        cpu_joules = self._rapl_joules
         with self._lock:
             gpu_joules = (
                 {str(index): peak.energy_joules for index, peak in sorted(self._gpu.items())}
@@ -857,13 +860,15 @@ def _nvidia_utilization() -> tuple[tuple[int, float, int, float | None], ...]:
 _RAPL_ROOT = Path("/sys/class/powercap")
 
 
-def _rapl_energy_uj(root: Path | None = None) -> tuple[int | None, str | None]:
-    """Sum Intel RAPL package energy counters, or report exactly why none could be read.
+def _rapl_energy_uj(
+    root: Path | None = None,
+) -> tuple[dict[str, tuple[int, int | None]] | None, str | None]:
+    """Read each Intel RAPL package's energy counter and the range it wraps at.
 
-    ``energy_uj`` wraps at each package's ``max_energy_range_uj``; one evaluation run is assumed
-    short enough not to wrap, so a summed delta is reported as-is rather than detected and
-    corrected. ``root`` resolves ``_RAPL_ROOT`` at call time (not as a bound default) so a test
-    can point at a fake sysfs tree by monkeypatching the module attribute.
+    Per package rather than one sum, because ``energy_uj`` wraps at that package's own
+    ``max_energy_range_uj`` and a delta can only be corrected against the counter it came from.
+    ``root`` resolves ``_RAPL_ROOT`` at call time (not as a bound default) so a test can point
+    at a fake sysfs tree by monkeypatching the module attribute.
     """
     if root is None:
         root = _RAPL_ROOT
@@ -873,10 +878,49 @@ def _rapl_energy_uj(root: Path | None = None) -> tuple[int | None, str | None]:
         return None, f"cannot list {root}: {error}"
     if not packages:
         return None, f"no intel-rapl packages under {root}"
-    total = 0
+    readings: dict[str, tuple[int, int | None]] = {}
     for path in packages:
         try:
-            total += int(path.read_text().strip())
+            energy = int(path.read_text().strip())
         except (OSError, ValueError) as error:
             return None, f"cannot read {path}: {error}"
+        readings[path.parent.name] = (energy, _rapl_max_range_uj(path.parent))
+    return readings, None
+
+
+def _rapl_max_range_uj(package: Path) -> int | None:
+    """Return what this package's counter wraps at, or `None` when it does not publish it."""
+    try:
+        return int((package / "max_energy_range_uj").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _rapl_delta_uj(
+    start: Mapping[str, tuple[int, int | None]],
+    end: Mapping[str, tuple[int, int | None]],
+) -> tuple[int | None, str | None]:
+    """Sum each package's own delta, correcting the wrap ``energy_uj`` may have made.
+
+    A counter reading lower at the end than at the start wrapped at its
+    ``max_energy_range_uj``, which is tens of minutes on a busy package rather than the hours a
+    sweep can run for. Clamping that to zero published 0 J for a run that burned energy, and
+    summing the packages before subtracting could hide one package's wrap inside another's
+    rise. Corrected per package instead, and refused outright when a package that wrapped does
+    not publish its range, because a wrap nothing can correct is not a measurement.
+
+    ponytail: two samples cannot tell one wrap from two, so a package that wrapped more than
+    once still undercounts by whole ranges. Accumulate in the poll loop instead if a run ever
+    needs to be that long; at a 2 s interval no wrap is missed.
+    """
+    total = 0
+    for name, (start_uj, max_range) in sorted(start.items()):
+        if name not in end:
+            return None, f"{name} stopped reporting energy_uj mid-run"
+        delta = end[name][0] - start_uj
+        if delta < 0:
+            if max_range is None:
+                return None, f"{name} wrapped and publishes no max_energy_range_uj"
+            delta += max_range
+        total += delta
     return total, None

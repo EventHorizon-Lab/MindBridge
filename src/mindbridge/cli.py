@@ -33,7 +33,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from mindbridge import recipes
-from mindbridge.control import load_operation
+from mindbridge.control import load_operation, proposal_payload
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -903,7 +903,10 @@ def _consolidation_candidates(memory: Memory, arguments: argparse.Namespace) -> 
                 "memory_ids": list(candidate.memory_ids),
                 "evidence_count": candidate.evidence_count,
             }
-            for candidate in memory.consolidation_candidates(limit=arguments.limit)
+            for candidate in memory.consolidation_candidates(
+                limit=arguments.limit,
+                idle=arguments.idle,
+            )
         ]
     }
 
@@ -988,6 +991,14 @@ def _operation_document(record: MemoryOperationRecord) -> _Document:
         "trigger": record.trigger.value,
         "evidence_ids": list(record.operation.evidence_ids),
         "target_ids": list(record.operation.target_ids),
+        # A consolidation's subject is what it proposed, so without this its row would report an
+        # intent and no statement -- and `apply --operation` takes a row as `operations` prints
+        # it, which the kernel refuses for a consolidation carrying no proposal.
+        "proposal": (
+            None
+            if record.operation.proposal is None
+            else proposal_payload(record.operation.proposal)
+        ),
         # A merge, split, or identity erasure names people rather than records, so without this
         # its row would report an intent and no subject at all.
         "identity": (
