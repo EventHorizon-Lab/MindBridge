@@ -80,6 +80,14 @@ SHARED_OPERATIONS: dict[str, tuple[str | None, str | None]] = {
     "identity": ("getIdentity", "get_identity"),
     "unlink_identity": ("unlinkIdentity", "unlink_identity"),
     "forget_identity": ("forgetIdentity", "forget_identity"),
+    # The three data-subject rights REST serves behind the same `identity_operations` switch and
+    # MCP deliberately does not serve at all. Consent is a statement its subject makes, so an
+    # agent must not be able to record one; export and retention are the host's own account of,
+    # and authority over, what is held.
+    "record_consent": ("recordConsent", None),
+    "consent": ("getConsent", None),
+    "export": ("exportSubject", None),
+    "apply_retention": ("applyRetention", None),
 }
 # Operations no transport exposes, each with the reason. `docs/design-principles.md` requires a
 # transport gap to be documented rather than silently left out, and the union of this and
@@ -116,6 +124,10 @@ _COUNT_WORDS = {
     14: "Fourteen",
     15: "Fifteen",
     16: "Sixteen",
+    17: "Seventeen",
+    18: "Eighteen",
+    19: "Nineteen",
+    20: "Twenty",
 }
 # `search_with_trace` has no route or tool of its own; the search surfaces reach it through
 # `explain`, so the adapter protocol must still declare it exactly as the SDK does. The MCP-only
@@ -149,6 +161,8 @@ REST_REQUEST_MODELS: dict[str, type[BaseModel]] = {
     "analyzeSpeech": rest.AnalyzeRequest,
     "analyzeFaces": rest.AnalyzeRequest,
     "registerIdentity": rest.IdentityRegisterRequest,
+    "recordConsent": rest.ConsentRequest,
+    "applyRetention": rest.RetentionRequest,
 }
 
 

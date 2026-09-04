@@ -34,21 +34,28 @@ from mindbridge.api.errors import (
 from mindbridge.types import (
     AbstentionReason,
     AnswerResult,
+    ConsentState,
     ContentInput,
     ContextBudget,
     ContextBundle,
     ContextUnknownKind,
+    ExportBundle,
     FaceObservation,
     IdentityErasure,
     IdentityProfile,
     MemoryCapabilities,
     MemoryContext,
+    MemoryIntent,
+    MemoryOperationRecord,
+    MemoryOutcome,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
     ObservationContext,
     Page,
     PendingCapture,
+    RetentionReport,
     RetrievalScope,
     RetrievalTrace,
     SearchHit,
@@ -160,6 +167,15 @@ class IdentityRegisterRequest(StrictModel):
     relationship: _PersonText | None = None
 
 
+class ConsentRequest(StrictModel):
+    state: ConsentState
+    note: _PersonText | None = None
+
+
+class RetentionRequest(StrictModel):
+    dry_run: bool = False
+
+
 class _ResponseModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -255,6 +271,123 @@ class UnlinkResponse(_ResponseModel):
 
 class ForgetResponse(_ResponseModel):
     erasure: IdentityErasure
+
+
+class ConsentResponse(_ResponseModel):
+    consent: ConsentState | None
+
+
+class IdentityClaimResponse(_ResponseModel):
+    identity_id: str
+    name: str
+    relationship: str | None
+
+
+class ConsentClaimResponse(_ResponseModel):
+    identity_id: str
+    state: ConsentState
+    note: str | None
+
+
+class IdentityChangeResponse(_ResponseModel):
+    identity_id: str
+    moved_ids: tuple[str, ...]
+
+
+class MemoryOperationResponse(_ResponseModel):
+    """One control-plane log row, flattened exactly as `mindbridge operations` prints it.
+
+    The operation's own fields are lifted beside the log row's because a reader wants one
+    record of what was proposed and what it did, not two nested objects to join.
+    """
+
+    operation_id: int
+    intent: MemoryIntent
+    trigger: MemoryTrigger
+    evidence_ids: tuple[str, ...]
+    target_ids: tuple[str, ...]
+    claim: IdentityClaimResponse | None
+    consent: ConsentClaimResponse | None
+    identity: IdentityChangeResponse | None
+    rationale: str | None
+    model_id: str | None
+    recipe: str | None
+    created_ids: tuple[str, ...]
+    changed_ids: tuple[str, ...]
+    forgotten_ids: tuple[str, ...]
+    superseded: tuple[tuple[str, int], ...]
+    applied_at: datetime
+    rolled_back_at: datetime | None
+    outcome: MemoryOutcome | None
+    outcome_note: str | None
+
+
+class RecordConsentResponse(_ResponseModel):
+    operation: MemoryOperationResponse | None
+
+
+class ExportResponse(_ResponseModel):
+    exported_at: datetime
+    identity_id: str | None
+    identities: tuple[IdentityProfile, ...]
+    records: tuple[MemoryResponse, ...]
+    operations: tuple[MemoryOperationResponse, ...]
+
+
+class RetentionResponse(_ResponseModel):
+    dry_run: bool
+    media_memory_ids: tuple[str, ...]
+    forgotten_memory_ids: tuple[str, ...]
+    asset_ids: tuple[str, ...]
+    capture_memory_ids: tuple[str, ...]
+    deleted: int
+
+
+def _operation_response(record: MemoryOperationRecord) -> MemoryOperationResponse:
+    operation = record.operation
+    return MemoryOperationResponse(
+        operation_id=record.operation_id,
+        intent=operation.intent,
+        trigger=record.trigger,
+        evidence_ids=operation.evidence_ids,
+        target_ids=operation.target_ids,
+        claim=(
+            None
+            if operation.claim is None
+            else IdentityClaimResponse.model_validate(operation.claim)
+        ),
+        consent=(
+            None
+            if operation.consent is None
+            else ConsentClaimResponse.model_validate(operation.consent)
+        ),
+        identity=(
+            None
+            if operation.identity is None
+            else IdentityChangeResponse.model_validate(operation.identity)
+        ),
+        rationale=operation.rationale,
+        model_id=record.model_id,
+        recipe=record.recipe,
+        created_ids=record.created_ids,
+        changed_ids=record.changed_ids,
+        forgotten_ids=record.forgotten_ids,
+        superseded=record.superseded,
+        applied_at=record.applied_at,
+        rolled_back_at=record.rolled_back_at,
+        outcome=record.outcome,
+        outcome_note=record.outcome_note,
+    )
+
+
+def _export_response(bundle: ExportBundle) -> ExportResponse:
+    return ExportResponse(
+        exported_at=bundle.exported_at,
+        identity_id=bundle.identity_id,
+        identities=bundle.identities,
+        records=tuple(MemoryResponse.model_validate(record) for record in bundle.records),
+        operations=tuple(_operation_response(record) for record in bundle.operations),
+    )
 
 
 class ContextBudgetResponse(_ResponseModel):
@@ -468,6 +601,25 @@ class _Memory(Protocol):
     def unlink_identity(self, alias_id: str) -> str | None: ...
 
     def forget_identity(self, identity_id: str) -> IdentityErasure: ...
+
+    def record_consent(
+        self,
+        identity_id: str,
+        state: ConsentState,
+        *,
+        note: str | None = None,
+    ) -> MemoryOperationRecord | None: ...
+
+    def consent(self, identity_id: str) -> ConsentState | None: ...
+
+    def export(
+        self,
+        *,
+        identity_id: str | None = None,
+        memory_ids: Sequence[str] | None = None,
+    ) -> ExportBundle: ...
+
+    def apply_retention(self, *, dry_run: bool = False) -> RetentionReport: ...
 
 
 class _RequestBodyLimit:
@@ -881,6 +1033,56 @@ def _add_identity_routes(
     )
     def forget_identity(identity_id: _MemoryId) -> ForgetResponse:
         return ForgetResponse(erasure=current_service().forget_identity(identity_id))
+
+    @router.post(
+        "/identities/{identity_id}/consent",
+        response_model=RecordConsentResponse,
+        operation_id="recordConsent",
+        responses=not_found_errors,
+    )
+    def record_consent(identity_id: _MemoryId, request: ConsentRequest) -> RecordConsentResponse:
+        record = current_service().record_consent(
+            identity_id,
+            request.state,
+            note=request.note,
+        )
+        return RecordConsentResponse(
+            operation=None if record is None else _operation_response(record)
+        )
+
+    @router.get(
+        "/identities/{identity_id}/consent",
+        response_model=ConsentResponse,
+        operation_id="getConsent",
+        responses=standard_errors,
+    )
+    def get_consent(identity_id: _MemoryId) -> ConsentResponse:
+        return ConsentResponse(consent=current_service().consent(identity_id))
+
+    @router.get(
+        "/export",
+        response_model=ExportResponse,
+        operation_id="exportSubject",
+        responses=not_found_errors,
+    )
+    def export_subject(
+        identity_id: Annotated[str | None, Query(min_length=1)] = None,
+        memory_ids: Annotated[list[str] | None, Query(min_length=1, max_length=100)] = None,
+    ) -> ExportResponse:
+        return _export_response(
+            current_service().export(identity_id=identity_id, memory_ids=memory_ids)
+        )
+
+    @router.post(
+        "/retention",
+        response_model=RetentionResponse,
+        operation_id="applyRetention",
+        responses=standard_errors,
+    )
+    def apply_retention(request: RetentionRequest) -> RetentionResponse:
+        return RetentionResponse.model_validate(
+            current_service().apply_retention(dry_run=request.dry_run)
+        )
 
 
 def _add_context_route(

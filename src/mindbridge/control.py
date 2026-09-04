@@ -17,6 +17,7 @@ from typing import Any, cast
 
 from mindbridge.exceptions import StorageError
 from mindbridge.types import (
+    ConsentClaim,
     FormationProposal,
     IdentityChange,
     IdentityClaim,
@@ -38,6 +39,7 @@ def load_operation(payload: str) -> MemoryOperation:
             raise ValueError
         proposal = value.get("proposal")
         claim = value.get("claim")
+        consent = value.get("consent")
         identity = value.get("identity")
         return MemoryOperation(
             intent=cast(Any, value["intent"]),
@@ -45,6 +47,7 @@ def load_operation(payload: str) -> MemoryOperation:
             target_ids=tuple(value.get("target_ids") or ()),
             proposal=None if proposal is None else _proposal(proposal),
             claim=None if claim is None else _claim(claim),
+            consent=None if consent is None else _consent(consent),
             identity=None if identity is None else _identity_change(identity),
             rationale=cast(Any, value.get("rationale")),
         )
@@ -61,6 +64,7 @@ def operation_key(operation: MemoryOperation, *, recipe: str | None) -> str:
 def _identity(operation: MemoryOperation) -> dict[str, object]:
     proposal = operation.proposal
     claim = operation.claim
+    consent = operation.consent
     change = operation.identity
     return {
         "intent": operation.intent.value,
@@ -70,6 +74,9 @@ def _identity(operation: MemoryOperation) -> dict[str, object]:
         # Part of the idempotency identity: renaming the same person supersedes rather than
         # replays, so two claims that differ only in the name must be two operations.
         "claim": None if claim is None else _claim_payload(claim),
+        # Part of the idempotency identity: re-stating the state that already stands is the same
+        # operation and logs nothing, while moving to a different state is a different one.
+        "consent": None if consent is None else _consent_payload(consent),
         # Part of the idempotency identity: merging or splitting a different pair of people is a
         # different operation, so two merges of one pair stay one row and two pairs stay two.
         "identity": None if change is None else _identity_change_payload(change),
@@ -86,6 +93,27 @@ def _identity_change(value: object) -> IdentityChange:
     return IdentityChange(
         identity_id=cast(Any, value["identity_id"]),
         moved_ids=cast(Any, tuple(value.get("moved_ids") or ())),
+    )
+
+
+def _consent_payload(consent: ConsentClaim) -> dict[str, object]:
+    return {
+        "identity_id": consent.identity_id,
+        "state": consent.state.value,
+        # Part of the identity too, unlike `rationale`: the note is the subject's own words
+        # about their own decision, so restating a standing state with different words is a
+        # second statement worth its own row rather than a duplicate the log drops.
+        "note": consent.note,
+    }
+
+
+def _consent(value: object) -> ConsentClaim:
+    if not isinstance(value, dict):
+        raise ValueError
+    return ConsentClaim(
+        identity_id=cast(Any, value["identity_id"]),
+        state=cast(Any, value["state"]),
+        note=cast(Any, value.get("note")),
     )
 
 

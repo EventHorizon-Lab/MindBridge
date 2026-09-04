@@ -302,7 +302,7 @@ details are still never serialized.
 
 ### Operations without a tool
 
-Sixteen Python operations have no MCP tool. One is a transport limitation and the rest are
+Twenty Python operations have no MCP tool. One is a transport limitation and the rest are
 decisions; none is withheld because it touches owner-process state, since every tool already
 does.
 
@@ -314,6 +314,8 @@ does.
 | `reindex` | Rebuilds the whole search projection from SQLite. The duration grows with the store and has no upper bound, so it does not belong behind a client that expects one timely response. It is also an operator decision, not a caller's. |
 | `optimize` | Merges staged vectors into the index. An agent has no basis for deciding when that is worth doing, and the operator scheduling it has the CLI. |
 | `capture`, `settle`, `pending_captures` | Deferred enrichment is the owning process's scheduling decision: how long a record may stay unsearchable is a property of that host's loop, not of a caller's request. Use `add_memory`, which returns searchable. |
+| `record_consent`, `consent` | Consent is a statement its subject makes, relayed by the host. An agent that could record one could manufacture permission to process a person, which is the same reason a `CONSENT` operation proposed by a model is refused as `unauthorized`. A host application collects the statement and calls the SDK, or `POST /v1/identities/{identity_id}/consent` behind its own `identity_operations` switch. |
+| `export`, `apply_retention` | The two remaining data-subject rights, and both are host authority over a person's whole record: an export is everything held about somebody, and retention physically deletes. They stay with the process that owns the `data_dir`, and reach a network only through REST's `identity_operations` switch. |
 | `consolidation_candidates`, `consolidate`, `deliberate`, `apply`, `record_outcome`, `forget`, `rollback`, `operations` | The memory control plane rewrites and retires derived memory and is deliberately not reachable from a client. It stays with the process that owns the `Memory`, which is also the process that can audit and reverse it through the operation log. `deliberate` additionally spends that owner's model budget on its own schedule, and `apply` applies an operation with no proposal behind it, which is host authority itself. |
 
 `Memory.capabilities` has no tool either: it is a property rather than an operation, published

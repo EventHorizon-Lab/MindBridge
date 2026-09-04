@@ -83,6 +83,7 @@ from mindbridge.infrastructure.local.assets import (
     AssetTooLargeError,
 )
 from mindbridge.infrastructure.local.store import (
+    CONSENT_PREDICATE,
     IdentityLink,
     IndexCandidate,
     IndexDocument,
@@ -127,6 +128,8 @@ from mindbridge.types import (
     AudioBoundary,
     AudioStreamPacket,
     Blob,
+    ConsentClaim,
+    ConsentState,
     ConsolidationCandidate,
     ConsolidationReport,
     ContentAtom,
@@ -137,6 +140,7 @@ from mindbridge.types import (
     ContextUnknownKind,
     DeliberationReport,
     EvidenceBasis,
+    ExportBundle,
     FaceObservation,
     FormationProposal,
     IdentityChange,
@@ -160,6 +164,8 @@ from mindbridge.types import (
     PCMChunk,
     PendingCapture,
     PrefetchResult,
+    RetentionPolicy,
+    RetentionReport,
     RetrievalCandidateTrace,
     RetrievalRejection,
     RetrievalScope,
@@ -185,11 +191,19 @@ _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
 # consolidator configured.
 _NAMING_RECIPE = "mindbridge-identity-naming-v1"
 _NAMING_PREDICATE = "identity"
+# Recording consent rests on the same authority as naming -- somebody said so -- so it is the
+# same kind of assertion under its own recipe and its own predicate, which keeps the two in
+# separate lineages: consenting never renames anybody and renaming never re-opens consent.
+_CONSENT_RECIPE = "mindbridge-identity-consent-v1"
 # Binding one voice to one face is the kernel's own corroboration rule over co-occurrence
 # evidence it counted, not a model's proposal, so the recipe names that rule. It is what makes
 # the MERGE row's lineage honest: the recognizer models produced the templates, this rule
 # decided the bind, and `rollback()` reverses it.
 _IDENTITY_LINK_RECIPE = "mindbridge-identity-link-v1"
+# How much one retention pass may delete. Physical deletion is unrecoverable, so a pass is
+# bounded and repeatable rather than unbounded: an operator runs it again until it reports
+# nothing, and can stop after any pass.
+_RETENTION_PAGE_SIZE = 1_000
 _INDEX_RECIPE_PREFIX = (
     "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:context-keys-v10"
 )
@@ -566,6 +580,7 @@ class Memory:
         memory_budget_records: int | None = _DEFAULT_CONFIG.memory_budget_records,
         query_failure_window_seconds: float = _DEFAULT_CONFIG.query_failure_window_seconds,
         query_failure_history: int = _DEFAULT_CONFIG.query_failure_history,
+        retention: RetentionPolicy = _DEFAULT_CONFIG.retention,
         tracer: Tracer | None = None,
     ) -> None:
         self.data_dir = Path(data_dir).expanduser().resolve()
@@ -611,6 +626,9 @@ class Memory:
             query_failure_window_seconds, "query_failure_window_seconds"
         )
         self._query_failure_history = _positive_int(query_failure_history, "query_failure_history")
+        if not isinstance(retention, RetentionPolicy):
+            raise ValidationError("retention must be a RetentionPolicy value")
+        self._retention = retention
 
         self._store = _open_store(self.data_dir)
         self._embedder = embedder
@@ -736,6 +754,7 @@ class Memory:
             memory_budget_records=config.memory_budget_records,
             query_failure_window_seconds=config.query_failure_window_seconds,
             query_failure_history=config.query_failure_history,
+            retention=config.retention,
             tracer=tracer,
         )
 
@@ -1452,20 +1471,66 @@ class Memory:
             # The same transcript cache `search()` writes for a spoken query. It is a cache of
             # the query's own audio, not a memory: `compile()` stores nothing it retrieved.
             self._persist_transcripts(assets)
+            hits, withheld = self._consented_actors(outcome.hits)
             bundle = compile_context(
                 prepared.text,
-                outcome.hits,
+                hits,
                 budget=budget,
                 reference_at=reference,
                 started_at=started_at,
-                unknowns=self._request_unknowns(prepared, scope, outcome.hits),
+                unknowns=(
+                    *self._request_unknowns(prepared, scope, hits),
+                    *withheld,
+                ),
                 candidate_limit=candidate_limit,
-                provisional=self._provisional_identities(outcome.hits),
+                provisional=self._provisional_identities(hits),
             )
             # QUERY_FAILURE hook: a bundle with no evidence in it is the compiler reporting that
             # the goal found nothing, which is the same signal as an empty search.
             self._note_query_failure(prepared.text, failed=not bundle.hits)
             return bundle
+
+    def _consented_actors(
+        self,
+        hits: Sequence[SearchHit],
+    ) -> tuple[tuple[SearchHit, ...], tuple[ContextUnknown, ...]]:
+        """Drop the named actors whose subject withheld or withdrew consent, and say so.
+
+        Only the naming assertion is dropped, not the person's memories: consent governs being
+        treated as a recognized person, not whether the evening happened. The bundle then says
+        a person is missing from `actors` rather than silently compiling a scene with a hole in
+        it, which is what makes the omission auditable instead of a retrieval mystery.
+        """
+        bound = {
+            hit.context.identity_id
+            for hit in hits
+            if hit.context is not None
+            and hit.context.identity_id is not None
+            and hit.context.kind is MemoryKind.ENTITY
+        }
+        if not bound:
+            return tuple(hits), ()
+        with _translate_storage_errors("read identity consent"):
+            restrained = self._store.restrained_identities() & bound
+        if not restrained:
+            return tuple(hits), ()
+        kept = tuple(
+            hit
+            for hit in hits
+            if hit.context is None
+            or hit.context.kind is not MemoryKind.ENTITY
+            or hit.context.identity_id not in restrained
+        )
+        return kept, (
+            ContextUnknown(
+                kind=ContextUnknownKind.CONSENT_WITHHELD,
+                detail=(
+                    f"{len(restrained)} recognized "
+                    f"{'person is' if len(restrained) == 1 else 'people are'} withheld from"
+                    " the actors section by their own recorded consent"
+                ),
+            ),
+        )
 
     def _provisional_identities(self, hits: Sequence[SearchHit]) -> dict[str, tuple[str, ...]]:
         """Resolve which people the candidate evidence observed but nobody has named.
@@ -1675,6 +1740,141 @@ class Memory:
             requested_id = _identifier(identity_id, "identity_id")
             with _translate_storage_errors("read identity profile"):
                 return self._store.identity_profile(requested_id)
+
+    def record_consent(
+        self,
+        identity_id: str,
+        state: ConsentState,
+        *,
+        note: str | None = None,
+    ) -> MemoryOperationRecord | None:
+        """Record what one recognized person said about being processed as a recognized person.
+
+        Consent is an assertion in the same family as naming: an identity-bound, evidence-bearing
+        claim that stands until a later one supersedes it, recorded as `USER_STATEMENT` because
+        only a person can give it. A model may not propose one -- the kernel refuses a proposed
+        `CONSENT` operation as `unauthorized` the way it refuses a proposed `MERGE` -- so this is
+        the only path that writes one.
+
+        `WITHHELD` and `WITHDRAWN` restrain the kernel identically from the next observation on:
+        `faces()`, `speech()`, and `ask(link_identities=True)` stop enrolling new face and voice
+        exemplars for this person and stop merging their voice and face identities, and
+        `compile()` leaves them out of the actors section and says so with a `CONSENT_WITHHELD`
+        unknown. Recognition against exemplars already held is deliberately untouched: a
+        question about a photo the host already has is not new processing of a person, and
+        destroying what is already held is `forget_identity`, which this is not.
+
+        Returns the logged operation, or `None` when the same statement already stands, so the
+        decision is auditable through `operations()` and reversible through `rollback()`, which
+        restores whatever was recorded before it.
+        """
+        requested_id = _identifier(identity_id, "identity_id")
+        if not isinstance(state, ConsentState):
+            raise ValidationError("state must be a ConsentState")
+        claim = ConsentClaim(identity_id=requested_id, state=state, note=note)
+        with (
+            self._trace("mindbridge.record_consent", kind="operation"),
+            self._operation() as operation,
+            self._write_lock,
+        ):
+            with _translate_storage_errors("read identity memories"):
+                normalized_id = self._store.resolve_identity_id(requested_id)
+                known = normalized_id is not None and (
+                    self._store.identity_memory_ids(normalized_id) is not None
+                )
+            if normalized_id is None or not known:
+                raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
+            return self._assert_consent(
+                replace(claim, identity_id=normalized_id),
+                operation=operation,
+            )
+
+    def consent(self, identity_id: str) -> ConsentState | None:
+        """Return the consent state one identity's standing assertion projects, or None.
+
+        `None` means nobody has recorded a statement, which is neither consent nor a refusal:
+        the kernel restrains itself only on a statement that was actually made.
+        """
+        with (
+            self._trace("mindbridge.consent", kind="operation"),
+            self._operation(),
+            self._write_lock,
+        ):
+            requested_id = _identifier(identity_id, "identity_id")
+            with _translate_storage_errors("read identity consent"):
+                return self._store.identity_consent(requested_id)
+
+    def _assert_consent(
+        self,
+        claim: ConsentClaim,
+        *,
+        operation: _OperationAssets,
+    ) -> MemoryOperationRecord | None:
+        """Commit one consent statement as a bound STATE assertion with its own log row.
+
+        Structurally the twin of `_assert_identity_name`: the assertion is the record, the
+        projection reads it, and the log row is what makes it auditable and reversible. A STATE
+        rather than an ENTITY kind because that is what it is -- how this person may be
+        processed, right now -- and because it keeps consent out of the naming lineage the
+        registry projects.
+        """
+        proposal = _consent_proposal(claim)
+        now = datetime.now(timezone.utc)
+        context = replace(
+            _formation_context(
+                None,
+                proposal,
+                model_id=None,
+                recipe=_CONSENT_RECIPE,
+                recorded_at=now,
+                identity_id=claim.identity_id,
+            ),
+            # No validity interval, unlike an ordinary STATE. A state of the world holds over a
+            # period and a later one splits it; a consent statement simply stands until the
+            # subject makes another, so the lineage rule retires the old one outright instead of
+            # carrying a past-covering version that would go on projecting beside the new one.
+            valid_from=None,
+        )
+        prepared = replace(
+            _prepare_memory(
+                self._prepare_content(proposal.content, operation),
+                occurred_at=None,
+                occurred_end=None,
+                metadata=None,
+                memory_type=_formation_memory_type(proposal.kind),
+            ),
+            memory_id=_formation_memory_id(
+                claim.identity_id,
+                proposal,
+                recipe=_CONSENT_RECIPE,
+                context=context,
+            ),
+            context=context,
+        )
+        proposed = MemoryOperation(
+            intent=MemoryIntent.CONSENT,
+            consent=claim,
+            rationale="the data subject stated how they may be processed",
+        )
+        key = operation_key(proposed, recipe=_CONSENT_RECIPE)
+        with _translate_storage_errors("check a consent operation"):
+            if self._store.read_operations(operation_key=key):
+                return None
+        logged = self._commit_formation(
+            ((prepared, None, proposal.confidence),),
+            (),
+            completed_at=now,
+            recipe=_CONSENT_RECIPE,
+            operation=StoredOperation(
+                operation_key=key,
+                intent=proposed.intent.value,
+                trigger=MemoryTrigger.MANUAL.value,
+                recipe=_CONSENT_RECIPE,
+                operation_json=dump_operation(proposed),
+                applied_at=now,
+            ),
+        )
+        return None if logged is None else _operation_record(logged)
 
     def unlink_identity(self, alias_id: str) -> str | None:
         """Reverse one recorded face-and-voice merge, restoring ``alias_id`` as its own identity.
@@ -2550,8 +2750,12 @@ class Memory:
                 return self._rollback_identity(row, operation, operation.identity)
             # A naming assertion is retracted, not deleted: the version it superseded has to
             # come back, and the record itself stays in the log so the audit trail shows both
-            # names. That reversal rides the general `superseded` mechanism below.
+            # names. That reversal rides the general `superseded` mechanism below. A consent
+            # statement retracts the same way and for the same reason -- both are assertions a
+            # host made about a person, and the history of what was asserted is the audit
+            # trail -- but only naming feeds a projection that has to be repainted afterwards.
             naming = operation.intent is MemoryIntent.IDENTIFY
+            assertion = naming or operation.intent is MemoryIntent.CONSENT
             with _translate_storage_errors("roll back a memory operation"):
                 # One transaction: the created records disappear in the same commit that marks
                 # the operation rolled back, so a crash between the two cannot leave an active
@@ -2573,9 +2777,9 @@ class Memory:
                         if operation.intent is MemoryIntent.CORRECT
                         else row.superseded
                     ),
-                    # A naming assertion is retracted rather than deleted: its own version is
-                    # retired here and `restore_versions` brings back the one it displaced.
-                    retire_versions=row.created_ids if naming else (),
+                    # An identity assertion is retracted rather than deleted: its own version
+                    # is retired here and `restore_versions` brings back the one it displaced.
+                    retire_versions=row.created_ids if assertion else (),
                     require_in_force=(
                         (*row.created_ids, *row.changed_ids) if row.superseded else ()
                     ),
@@ -2768,6 +2972,11 @@ class Memory:
             # fuse two people by asking. Refused here rather than in the value type, so a
             # backend that proposes one is reported instead of raising through the pass.
             raise _RejectedOperation("unauthorized")
+        if operation.intent is MemoryIntent.CONSENT:
+            # The mirror of the rule above, for the same reason and by the same route: consent
+            # is a statement its subject makes, so a model that could propose one could
+            # manufacture permission to process a person. `record_consent()` is the only path.
+            raise _RejectedOperation("unauthorized")
         key = operation_key(operation, recipe=recipe)
         with _translate_storage_errors("check a memory operation"):
             # Raise the rejection outside this block: `_RejectedOperation` is not a
@@ -2832,6 +3041,11 @@ class Memory:
         # leaves `identity()` and the stored transcripts answering to a name nothing asserts.
         if any(_is_bound_naming_assertion(targets, target) for target in operation.target_ids):
             raise _RejectedOperation("naming_assertion")
+        # A consent statement is somebody's own word about how they may be processed. Letting
+        # the control plane retire, forget, or reinforce one would let a model change what a
+        # person permitted; only `record_consent()` supersedes it and only `rollback()` retracts.
+        if any(_is_consent_assertion(targets, target) for target in operation.target_ids):
+            raise _RejectedOperation("consent_assertion")
         reinforce: tuple[tuple[str, str], ...] = ()
         correct_ids: tuple[str, ...] = ()
         forget_ids: tuple[str, ...] = ()
@@ -3111,6 +3325,188 @@ class Memory:
             self._queue_asset_cleanup(orphaned)
             self._drain_outbox()
             return deleted
+
+    def export(
+        self,
+        *,
+        identity_id: str | None = None,
+        memory_ids: Sequence[str] | None = None,
+    ) -> ExportBundle:
+        """Return everything this memory holds about one data subject, in transferable form.
+
+        Name exactly one subject: `identity_id` for a recognized person -- every memory they
+        occur in, every name and consent statement asserted about them, their registry row, and
+        every logged operation that moved any of it -- or `memory_ids` for a set of records a
+        caller already knows, with the log rows that touched them.
+
+        Records come back in every version, including retired ones and ones cognitively
+        forgotten, because the question this answers is what is held rather than what is
+        current. Media travels as asset identity, size, and digest on each record; the bytes
+        stay on disk, so copying them is the host's decision and not an accident of asking.
+
+        This reads only. Nothing here forgets, deletes, or acknowledges anything, and a merged
+        alias resolves to its canonical identity exactly as every other identity read does.
+        """
+        if (identity_id is None) == (memory_ids is None):
+            raise ValidationError("export names exactly one of identity_id or memory_ids")
+        with (
+            self._trace("mindbridge.export", kind="operation"),
+            self._operation(),
+            self._write_lock,
+        ):
+            profiles: tuple[IdentityProfile, ...] = ()
+            resolved_id: str | None = None
+            if identity_id is not None:
+                requested_id = _identifier(identity_id, "identity_id")
+                with _translate_storage_errors("read identity memories"):
+                    resolved_id = self._store.resolve_identity_id(requested_id)
+                    occurrences = (
+                        None
+                        if resolved_id is None
+                        else self._store.identity_memory_ids(resolved_id)
+                    )
+                    if resolved_id is None or occurrences is None:
+                        raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
+                    asserted = self._store.identity_assertion_memory_ids(resolved_id)
+                    profile = self._store.identity_profile(resolved_id)
+                    aliases = self._store.identity_equivalence_class(resolved_id) or (resolved_id,)
+                selected = tuple(dict.fromkeys((*occurrences, *asserted)))
+                profiles = () if profile is None else (profile,)
+            else:
+                assert memory_ids is not None
+                if isinstance(memory_ids, (str, bytes)):
+                    raise ValidationError("memory_ids must be a sequence of memory IDs")
+                selected = tuple(
+                    dict.fromkeys(_identifier(value, "memory_id") for value in memory_ids)
+                )
+                aliases = ()
+            with _translate_storage_errors("read exported memories"):
+                stored = self._store.read_memories(selected)
+            records = tuple(
+                sorted(
+                    (self._memory_record(memory) for memory in stored),
+                    key=lambda record: (record.created_at, record.id),
+                )
+            )
+            return ExportBundle(
+                exported_at=datetime.now(timezone.utc),
+                identity_id=resolved_id,
+                identities=profiles,
+                records=records,
+                operations=self._exported_operations(
+                    frozenset(record.id for record in records),
+                    frozenset(aliases),
+                ),
+            )
+
+    def _exported_operations(
+        self,
+        memory_ids: frozenset[str],
+        identity_ids: frozenset[str],
+    ) -> tuple[MemoryOperationRecord, ...]:
+        """Return every logged operation that moved one of these records or people, oldest first.
+
+        The whole log is scanned in pages rather than read with a limit: an export that
+        silently stopped at the hundredth row would answer the wrong question.
+        """
+        found: list[MemoryOperationRecord] = []
+        before: int | None = None
+        while True:
+            with _translate_storage_errors("read exported operations"):
+                page = self._store.read_operations(limit=1_000, before_operation_id=before)
+            if not page:
+                break
+            for row in page:
+                record = _operation_record(row)
+                if _operation_touches(record, memory_ids, identity_ids):
+                    found.append(record)
+            before = page[-1].operation_id
+        return tuple(sorted(found, key=lambda record: record.operation_id))
+
+    def apply_retention(self, *, dry_run: bool = False) -> RetentionReport:
+        """Delete what the declared retention policy says has outlived its purpose.
+
+        Physical forgetting under a deterministic policy: aged media and every memory that
+        still references it, records cognitively forgotten longer ago than the policy allows,
+        and capture-queue rows whose repeated failures have aged out. Deletion runs through
+        `delete()`, so media is garbage-collected and the naming projection is rebuilt exactly
+        as they are for a hand-deleted record.
+
+        An unset field in `RetentionPolicy` is not a zero-day policy: it does nothing at all.
+        A policy that names no age therefore makes this a no-op, which is the right default for
+        an operation whose effect cannot be undone.
+
+        `dry_run=True` reports the same identifiers and deletes nothing, so a policy can be
+        read back against a real store before it is allowed to run.
+        """
+        if not isinstance(dry_run, bool):
+            raise ValidationError("dry_run must be a boolean")
+        policy = self._retention
+        now = datetime.now(timezone.utc)
+        with (
+            self._trace("mindbridge.apply_retention", kind="operation"),
+            self._operation(),
+        ):
+            media_ids: tuple[str, ...] = ()
+            aged_assets: tuple[str, ...] = ()
+            if policy.media_days is not None:
+                with _translate_storage_errors("list retention candidates"):
+                    candidates = self._store.asset_retention_candidates(
+                        created_before=now - timedelta(days=policy.media_days),
+                        limit=_RETENTION_PAGE_SIZE,
+                    )
+                    aged_assets = tuple(asset.asset_id for asset in candidates)
+                    media_ids = self._store.asset_memory_ids(aged_assets)
+            forgotten_ids: tuple[str, ...] = ()
+            if policy.forgotten_days is not None:
+                with _translate_storage_errors("list forgotten memories"):
+                    forgotten_ids = tuple(
+                        memory_id
+                        for memory_id in self._store.forgotten_memory_ids(
+                            forgotten_before=now - timedelta(days=policy.forgotten_days),
+                            limit=_RETENTION_PAGE_SIZE,
+                        )
+                        if memory_id not in set(media_ids)
+                    )
+            capture_ids: tuple[str, ...] = ()
+            if policy.capture_failure_days is not None:
+                cutoff = now - timedelta(days=policy.capture_failure_days)
+                with _translate_storage_errors("list pending captures"):
+                    capture_ids = tuple(
+                        capture.memory_id
+                        for capture in self._store.pending_captures(limit=_RETENTION_PAGE_SIZE)
+                        if capture.attempts > 0 and capture.enqueued_at < cutoff
+                    )
+            if dry_run:
+                return RetentionReport(
+                    dry_run=True,
+                    media_memory_ids=media_ids,
+                    forgotten_memory_ids=forgotten_ids,
+                    asset_ids=aged_assets,
+                    capture_memory_ids=capture_ids,
+                )
+            for memory_id in (*media_ids, *forgotten_ids):
+                self.delete(memory_id)
+            removed: list[str] = []
+            with self._write_lock, _translate_storage_errors("delete retained media"):
+                # Whatever the deletions above orphaned is already gone; what is left here is
+                # media no memory referenced in the first place, which nothing else collects
+                # until the next open.
+                self._cleanup_pending_assets()
+                for asset_id in aged_assets:
+                    if self._store.read_asset(asset_id) is None or (
+                        self._store.delete_asset_if_unreferenced(asset_id)
+                    ):
+                        removed.append(asset_id)
+                if capture_ids:
+                    self._store.complete_captures(capture_ids)
+            return RetentionReport(
+                dry_run=False,
+                media_memory_ids=media_ids,
+                forgotten_memory_ids=forgotten_ids,
+                asset_ids=tuple(removed),
+                capture_memory_ids=capture_ids,
+            )
 
     def reindex(self) -> int:
         """Rebuild the disposable Zvec collection from authoritative SQLite rows."""
@@ -5018,6 +5414,14 @@ class Memory:
         if len(speaker_ids) != 1 or len(face_ids) != 1:
             return
         speaker_id, face_id = next(iter(speaker_ids)), next(iter(face_ids))
+        # Withheld or withdrawn consent stops the merge on either side. Fusing a voice and a
+        # face is a new claim about a person -- that these two templates are one human -- so it
+        # is exactly the processing a refusal refuses, and unlike enrolment it is not something
+        # answering a question needs.
+        with _translate_storage_errors("read identity consent"):
+            restrained = self._store.restrained_identities()
+        if {speaker_id, face_id} & restrained:
+            return
         if speaker_id == face_id:
             # Already one identity. Recording this would store an identity co-occurring with
             # itself, once per asset forever, and no such pair can ever yield a plan.
@@ -6130,6 +6534,7 @@ class AsyncMemory:
         memory_budget_records: int | None = _DEFAULT_CONFIG.memory_budget_records,
         query_failure_window_seconds: float = _DEFAULT_CONFIG.query_failure_window_seconds,
         query_failure_history: int = _DEFAULT_CONFIG.query_failure_history,
+        retention: RetentionPolicy = _DEFAULT_CONFIG.retention,
         tracer: Tracer | None = None,
     ) -> None:
         self._memory = Memory(
@@ -6156,6 +6561,7 @@ class AsyncMemory:
             memory_budget_records=memory_budget_records,
             query_failure_window_seconds=query_failure_window_seconds,
             query_failure_history=query_failure_history,
+            retention=retention,
             tracer=tracer,
         )
 
@@ -6199,6 +6605,7 @@ class AsyncMemory:
             memory_budget_records=config.memory_budget_records,
             query_failure_window_seconds=config.query_failure_window_seconds,
             query_failure_history=config.query_failure_history,
+            retention=config.retention,
             tracer=tracer,
         )
 
@@ -6491,6 +6898,33 @@ class AsyncMemory:
 
     async def unlink_identity(self, alias_id: str) -> str | None:
         return await asyncio.to_thread(self._memory.unlink_identity, alias_id)
+
+    async def record_consent(
+        self,
+        identity_id: str,
+        state: ConsentState,
+        *,
+        note: str | None = None,
+    ) -> MemoryOperationRecord | None:
+        return await asyncio.to_thread(
+            partial(self._memory.record_consent, identity_id, state, note=note)
+        )
+
+    async def consent(self, identity_id: str) -> ConsentState | None:
+        return await asyncio.to_thread(self._memory.consent, identity_id)
+
+    async def export(
+        self,
+        *,
+        identity_id: str | None = None,
+        memory_ids: Sequence[str] | None = None,
+    ) -> ExportBundle:
+        return await asyncio.to_thread(
+            partial(self._memory.export, identity_id=identity_id, memory_ids=memory_ids)
+        )
+
+    async def apply_retention(self, *, dry_run: bool = False) -> RetentionReport:
+        return await asyncio.to_thread(partial(self._memory.apply_retention, dry_run=dry_run))
 
     async def reinforce(self, memory_ids: Sequence[str]) -> int:
         return await asyncio.to_thread(self._memory.reinforce, memory_ids)
@@ -7465,6 +7899,65 @@ def _naming_proposal(
         value=relationship,
         confidence=1.0,
     )
+
+
+def _consent_proposal(claim: ConsentClaim) -> FormationProposal:
+    """Build the STATE proposal one consent statement asserts."""
+    stated = f"Processing consent for {claim.identity_id} is {claim.state.value}."
+    return FormationProposal(
+        kind=MemoryKind.STATE,
+        content=stated if claim.note is None else f"{stated} {claim.note}",
+        # The one basis a consent statement can have. Nothing was observed and no model may
+        # infer it: the person said so.
+        basis=EvidenceBasis.USER_STATEMENT,
+        # The identity itself, not the name it currently projects: a person may be unnamed, and
+        # renaming one must not fork their consent history into a second subject.
+        subject=claim.identity_id,
+        predicate=CONSENT_PREDICATE,
+        value=claim.state.value,
+        confidence=1.0,
+    )
+
+
+def _is_consent_assertion(
+    memories: Mapping[str, StoredMemory],
+    memory_id: str,
+) -> bool:
+    """Report whether one record is a standing consent statement about a person."""
+    memory = memories.get(memory_id)
+    context = None if memory is None else memory.context
+    return (
+        context is not None
+        and context.identity_id is not None
+        and context.predicate == CONSENT_PREDICATE
+    )
+
+
+def _operation_touches(
+    record: MemoryOperationRecord,
+    memory_ids: frozenset[str],
+    identity_ids: frozenset[str],
+) -> bool:
+    """Report whether one logged operation moved any of these records or any of these people."""
+    operation = record.operation
+    named = {
+        *operation.evidence_ids,
+        *operation.target_ids,
+        *record.created_ids,
+        *record.changed_ids,
+        *record.forgotten_ids,
+        *(memory_id for memory_id, _version in record.superseded),
+    }
+    if named & memory_ids:
+        return True
+    people: set[str] = set()
+    if operation.identity is not None:
+        people.update((operation.identity.identity_id, *operation.identity.moved_ids))
+    if operation.claim is not None:
+        people.add(operation.claim.identity_id)
+    if operation.consent is not None:
+        people.add(operation.consent.identity_id)
+    return bool(people & identity_ids)
 
 
 def _is_bound_naming_assertion(

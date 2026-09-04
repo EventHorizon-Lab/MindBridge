@@ -66,6 +66,7 @@ class ContextUnknownKind(str, Enum):
     CANDIDATES_EXHAUSTED = "candidates_exhausted"
     MODALITY_UNSUPPORTED = "modality_unsupported"
     STAGE_SKIPPED = "stage_skipped"
+    CONSENT_WITHHELD = "consent_withheld"
 
 
 class SpatialAnchor(str, Enum):
@@ -521,6 +522,44 @@ class IdentityClaim:
             object.__setattr__(self, label, text)
 
 
+class ConsentState(str, Enum):
+    """Whether a recognized person has agreed to be processed as a recognized person.
+
+    Three states rather than a flag, because "nobody has asked" is not "they said no": an
+    identity with no recorded consent is unstated, `WITHHELD` is a refusal that was actually
+    given, and `WITHDRAWN` is a permission that was given and taken back. Only the last two
+    restrain the kernel, and they restrain it identically; the distinction is audit history.
+    """
+
+    GRANTED = "granted"
+    WITHHELD = "withheld"
+    WITHDRAWN = "withdrawn"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ConsentClaim:
+    """One person's own statement about how they may be processed.
+
+    Carried on a `CONSENT` operation the way `IdentityClaim` is carried on an `IDENTIFY` one:
+    the kernel, not a backend, turns it into the typed STATE assertion `consent()` projects.
+    A model may never propose one -- the kernel refuses a proposed `CONSENT` as `unauthorized`,
+    the way it refuses a proposed `MERGE` -- so the recorded basis is always `USER_STATEMENT`.
+    """
+
+    identity_id: str
+    state: ConsentState
+    note: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        if not isinstance(self.state, ConsentState):
+            try:
+                object.__setattr__(self, "state", ConsentState(self.state))
+            except (TypeError, ValueError):
+                raise ValidationError("consent state is invalid") from None
+        object.__setattr__(self, "note", _optional_text(self.note, "consent note"))
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class IdentityChange:
     """Which recognized people one identity-lifecycle operation moved.
@@ -552,6 +591,9 @@ class MemoryIntent(str, Enum):
     CORRECT = "correct"
     FORGET = "forget"
     IDENTIFY = "identify"
+    # Host-initiated only, for the same reason MERGE is kernel-initiated only: consent is a
+    # statement the data subject makes, so a model that could propose one could manufacture it.
+    CONSENT = "consent"
     # Kernel-initiated only. A cross-modal identity merge is committed from corroborated
     # co-occurrence evidence the kernel counted, not from a backend's vocabulary: the kernel
     # rejects a proposed MERGE as `"unauthorized"`.
@@ -597,6 +639,9 @@ class MemoryOperation:
     target_ids: tuple[str, ...] = ()
     proposal: FormationProposal | None = None
     claim: IdentityClaim | None = None
+    # Set exactly by `CONSENT`, which asserts how one person may be processed rather than
+    # moving any person or any memory.
+    consent: ConsentClaim | None = None
     # Set exactly by the three identity-lifecycle intents: a `MERGE`, and a `CORRECT` or
     # `FORGET` that names a person instead of memories.
     identity: IdentityChange | None = None
@@ -619,6 +664,23 @@ class MemoryOperation:
             raise ValidationError("memory operation proposal is invalid")
         if self.claim is not None and not isinstance(self.claim, IdentityClaim):
             raise ValidationError("memory operation claim is invalid")
+        if self.consent is not None and not isinstance(self.consent, ConsentClaim):
+            raise ValidationError("memory operation consent is invalid")
+        if self.intent is MemoryIntent.CONSENT:
+            # A consent statement names its subject and nothing else: no memory is evidence for
+            # it, no memory is its target, and it moves no identity.
+            if (
+                self.consent is None
+                or self.claim is not None
+                or self.identity is not None
+                or self.target_ids
+                or self.evidence_ids
+                or self.proposal is not None
+            ):
+                raise ValidationError("consent names one identity and one state, and nothing else")
+            return
+        if self.consent is not None:
+            raise ValidationError(f"{self.intent.value} must not carry consent")
         if self.identity is not None:
             if not isinstance(self.identity, IdentityChange):
                 raise ValidationError("memory operation identity is invalid")
@@ -1551,6 +1613,104 @@ class IdentityErasure:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValidationError(f"{name} must be a non-negative integer")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ExportBundle:
+    """Everything one physical memory holds about one data subject, in transferable form.
+
+    The right of access, answered from the same authoritative rows every other read uses.
+    `records` carries every version, including the retired and the cognitively forgotten ones,
+    because a subject asking what is held about them is owed the history rather than the
+    projection; each record's `context.evidence_ids` is the evidence link that record stands on
+    and each record's `assets` are its media by identity, size, and digest. No media bytes are
+    ever inlined: an export names the assets, and copying them is the host's decision.
+    """
+
+    exported_at: datetime
+    identity_id: str | None
+    identities: tuple[IdentityProfile, ...]
+    records: tuple[MemoryRecord, ...]
+    operations: tuple[MemoryOperationRecord, ...]
+
+    def __post_init__(self) -> None:
+        _require_aware(self.exported_at, "exported_at")
+        object.__setattr__(
+            self,
+            "identity_id",
+            _optional_text(self.identity_id, "identity_id"),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RetentionPolicy:
+    """Declarative maximum ages after which stored material is physically deleted.
+
+    Every field is `None` by default, and `None` means "no policy", not "keep for zero days":
+    physical deletion is the one lifecycle step MindBridge never takes because a clock ticked
+    and nobody said so. Ages are in days and are measured from the material's own recorded
+    time, not from the last time it was read, so a policy cannot be reset by traffic.
+    """
+
+    # Media assets older than this, and every memory that still references them, are deleted.
+    # Media dominates storage growth, so this is the cost knob as well as the privacy one.
+    media_days: float | None = None
+    # Records cognitively forgotten longer ago than this are physically deleted. Cognitive
+    # forgetting is reversible by design; this is what eventually makes it final.
+    forgotten_days: float | None = None
+    # Capture-queue rows enqueued longer ago than this that have failed at least once are
+    # abandoned. The memory itself survives -- only the promise to keep retrying is dropped.
+    capture_failure_days: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("media_days", "forgotten_days", "capture_failure_days"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value <= 0
+            ):
+                raise ValidationError(f"retention {name} must be a positive number of days")
+            object.__setattr__(self, name, float(value))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RetentionReport:
+    """What one retention pass deleted, or would have deleted under `dry_run`.
+
+    Identifiers rather than content: `delete()` leaves no operation-log row, so this report is
+    the only account of a physical deletion, and it has to be safe to keep after the content it
+    names is unrecoverable.
+    """
+
+    dry_run: bool
+    # Memories deleted because they referenced media older than `media_days`.
+    media_memory_ids: tuple[str, ...] = ()
+    # Memories deleted because they had been cognitively forgotten longer than `forgotten_days`.
+    forgotten_memory_ids: tuple[str, ...] = ()
+    # Media descriptors and their bytes removed because no memory referenced them any more.
+    asset_ids: tuple[str, ...] = ()
+    # Capture-queue rows abandoned; the memories themselves stay.
+    capture_memory_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dry_run, bool):
+            raise ValidationError("dry_run must be a boolean")
+        for name in (
+            "media_memory_ids",
+            "forgotten_memory_ids",
+            "asset_ids",
+            "capture_memory_ids",
+        ):
+            object.__setattr__(self, name, _memory_ids(getattr(self, name), name))
+
+    @property
+    def deleted(self) -> int:
+        """How many memories this pass removed, which is what a policy is judged on."""
+        return len(self.media_memory_ids) + len(self.forgotten_memory_ids)
 
 
 @dataclass(frozen=True, slots=True)

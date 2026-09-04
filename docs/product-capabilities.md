@@ -285,15 +285,19 @@ arguments, schemas, limits, and errors.
 | Read identity | `identity` | `GET /v1/identities/{id}`† | `get_identity` | `identity` |
 | Reverse merge | `unlink_identity` | `POST /v1/identities/{id}/unlink`† | `unlink_identity` | `unlink-identity` |
 | Erase person | `forget_identity` | `DELETE /v1/identities/{id}`† | `forget_identity` | `forget-identity` |
+| Record consent | `record_consent` | `POST /v1/identities/{id}/consent`† | — | `record-consent` |
+| Read consent | `consent` | `GET /v1/identities/{id}/consent`† | — | `consent` |
+| Export a subject | `export` | `GET /v1/export`† | — | `export` |
+| Apply retention | `apply_retention` | `POST /v1/retention`† | — | `apply-retention` |
 | Rebuild index | `reindex` | — | — | `reindex` |
 | Optimize index | `optimize` | — | — | `optimize` |
 | Declare capabilities | `capabilities` property | `GET /healthz` | — | `--explain` resolves composition |
 | Validate loaders | — | — | — | `doctor` |
 
-The synchronous SDK therefore exposes 31 product operations, plus construction, capability
-inspection, and lifecycle. REST exposes twelve `/v1` product routes plus `/healthz`, or eighteen
+The synchronous SDK therefore exposes 35 product operations, plus construction, capability
+inspection, and lifecycle. REST exposes twelve `/v1` product routes plus `/healthz`, or twenty-two
 when the host also enables `create_app`'s `embodied_operations` (\* above) and `identity_operations`
-(† above) switches; MCP exposes fifteen tools; the product CLI exposes all 31 operations plus
+(† above) switches; MCP exposes fifteen tools; the product CLI exposes all 35 operations plus
 `doctor`. `AsyncMemory` mirrors the finite SDK operations except `forget_identity`, which currently
 requires synchronous `Memory`, and adds async stream consumption.
 
