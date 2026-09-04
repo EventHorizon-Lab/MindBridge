@@ -181,8 +181,9 @@ A context compilation request supplies a goal or query plus constraints such as 
 text or media budget, freshness, allowed sensitivity, spatial scope, and minimum evidence quality.
 The resulting bundle may contain:
 
-- current actors, relationships, and scene state, each in its own bundle section (identities
-  still need the asset-keyed identity edge, which no read path traverses yet);
+- current actors, relationships, and scene state, each in its own bundle section, with a named
+  actor's identity edge resolved through the same read path whether or not the naming assertion
+  itself ranked into the bundle;
 - relevant episodic, semantic, and procedural memories;
 - affect cues separated from longer-horizon traits;
 - temporal and spatial bounds, both metric frames and symbolic places;
@@ -297,10 +298,12 @@ defaults or justify superiority claims.
    measurements is derivable; and identity merge and split, which stay outside the operation
    log until the identity-governance round.
 4. Add a context compiler whose output improves downstream tasks within declared budgets. Done
-   for selection, budgeting, the latency deadline, and the explicit unknowns a thin bundle
-   reports: `compile()`. Open: a downstream-task measurement against the no-memory,
-   full-context, and retrieval-only baselines, and the person link, which needs an identity edge
-   the bundle cannot reach today.
+   for selection, budgeting, the latency deadline, the explicit unknowns a thin bundle reports,
+   and the person link: `compile()` resolves a memory's identity edge -- its own bound semantic
+   assertion or its media's asset-keyed speech speaker or face observation -- into a `NamedActor`
+   or `ProvisionalActor`, whether or not the naming assertion itself ranked into the bundle. Open:
+   a downstream-task measurement against the no-memory, full-context, and retrieval-only
+   baselines.
 5. Extend REST or MCP only after the Python contract and authority model are stable. Done for the
    compiler and for one capability document rendered identically by `/healthz`, the MCP server
    instructions, and `mindbridge doctor`; the control-plane intents stay off REST and MCP. Open:

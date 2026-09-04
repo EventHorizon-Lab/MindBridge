@@ -63,7 +63,7 @@ from mindbridge._telemetry import (
     traced_span,
 )
 from mindbridge.configuration import MindBridgeConfig, resolve_memory_config
-from mindbridge.context import compile_context, evidence_cost
+from mindbridge.context import NamedActorLink, compile_context, evidence_cost
 from mindbridge.control import dump_operation, load_operation, operation_key
 from mindbridge.exceptions import (
     IdentityNotFoundError,
@@ -1422,6 +1422,7 @@ class Memory:
                 unknowns=self._request_unknowns(prepared, scope, outcome.hits),
                 candidate_limit=candidate_limit,
                 provisional=self._provisional_identities(outcome.hits),
+                named=self._named_actors(outcome.hits),
             )
 
     def _provisional_identities(self, hits: Sequence[SearchHit]) -> dict[str, tuple[str, ...]]:
@@ -1434,6 +1435,18 @@ class Memory:
             return {}
         with _translate_storage_errors("read provisional identities"):
             return self._store.provisional_identities(tuple(hit.id for hit in hits))
+
+    def _named_actors(self, hits: Sequence[SearchHit]) -> dict[str, tuple[NamedActorLink, ...]]:
+        """Resolve which people the candidate evidence's identity edge already names.
+
+        Deterministic kernel policy, the positive counterpart of `_provisional_identities`: a
+        person is named exactly while a visible naming assertion names them, whether or not
+        that assertion itself ranked into the bundle.
+        """
+        if not hits:
+            return {}
+        with _translate_storage_errors("read named actors"):
+            return self._store.named_actors(tuple(hit.id for hit in hits))
 
     def _request_unknowns(
         self,

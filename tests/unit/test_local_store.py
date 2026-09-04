@@ -2237,6 +2237,41 @@ def test_provisional_identities_name_the_people_no_assertion_names(tmp_path: Pat
         }
 
 
+def test_named_actors_resolve_through_semantics_and_assets_but_never_self(
+    tmp_path: Path,
+) -> None:
+    """A memory's own bound assertion and its asset-keyed identity both surface a name.
+
+    `named_actors` is the positive counterpart of `provisional_identities`: it reads the same
+    asset-keyed edge plus the semantic one `MemoryContext.identity_id` projects, restricted to
+    identities a naming assertion currently names, and it never reports the naming assertion's
+    own memory back to itself.
+    """
+    recorded_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    with LocalStore(tmp_path) as store:
+        seen = _video_asset(store, "seen")
+        heard = _video_asset(store, "heard")
+        person_id = _full_identity(store, seen, (1.0, 0.0))
+        stranger_id = _voice_identity(store, heard, (0.0, 1.0))
+        store.write_memories(
+            (
+                _naming_assertion("naming", person_id, "Li", recorded_at=recorded_at),
+                _bound_claim("claim", person_id, evidence_ids=("naming",), recorded_at=recorded_at),
+            ),
+            (_embedding("e-naming", "naming"), _embedding("e-claim", "claim")),
+        )
+
+        links = store.named_actors(("seen", "claim", "naming", "heard", "missing"))
+
+    assert links == {
+        "claim": ((person_id, "Li", "naming"),),
+        "seen": ((person_id, "Li", "naming"),),
+    }
+    assert stranger_id not in {
+        identity_id for entries in links.values() for identity_id, _, _ in entries
+    }
+
+
 def test_rolling_back_an_operation_deletes_its_records_in_the_same_transaction(
     tmp_path: Path,
 ) -> None:

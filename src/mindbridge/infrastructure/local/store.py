@@ -2858,6 +2858,34 @@ class LocalStore:
             for memory_id, identity_ids in sorted(provisional.items())
         }
 
+    def named_actors(
+        self, memory_ids: Sequence[str]
+    ) -> dict[str, tuple[tuple[str, str, str | None], ...]]:
+        """Return, per memory, the NAMED identities its identity edge resolves to.
+
+        A memory carries an identity edge two ways: its own semantic assertion may be bound to
+        an identity (`memory_semantics.identity_id`, the field `MemoryContext.identity_id`
+        projects), or its media asset may have recognized one -- the same asset-keyed join
+        `provisional_identities` reads for the unnamed case. Each entry is `(identity_id,
+        name, naming_memory_id)`. The naming assertion's own memory is never reported for
+        itself, because it already renders as its own actors hit. Empty entries are dropped,
+        so a caller can treat a missing key as "nobody named here".
+        """
+        ids = tuple(dict.fromkeys(memory_ids))
+        for memory_id in ids:
+            _require_identifier(memory_id, "memory_id")
+        if not ids:
+            return {}
+        with self._connection() as connection:
+            named = _named_identities(connection)
+            if not named:
+                return {}
+            links: dict[str, list[tuple[str, str, str]]] = {}
+            for offset in range(0, len(ids), _SQLITE_PARAMETER_BATCH // 3):
+                batch = ids[offset : offset + _SQLITE_PARAMETER_BATCH // 3]
+                _merge_named_identity_links(connection, batch, named, links)
+        return {memory_id: tuple(sorted(entries)) for memory_id, entries in sorted(links.items())}
+
     def identity_profile(self, identity_id: str) -> IdentityProfile | None:
         """Return one identity's profile, or None when it does not exist.
 
@@ -5321,11 +5349,11 @@ def _current_naming_assertion(
 
 
 def _visible_naming_assertions(connection: sqlite3.Connection) -> tuple[sqlite3.Row, ...]:
-    """Return the identity and subject of every currently visible naming assertion."""
+    """Return the identity, subject, and memory id of every currently visible naming assertion."""
     return tuple(
         connection.execute(
             """
-            SELECT s.identity_id, s.subject
+            SELECT s.identity_id, s.subject, s.memory_id
             FROM memory_semantics AS s
             JOIN memory_versions AS v ON v.memory_id = s.memory_id
             JOIN memory_records AS r ON r.memory_id = s.memory_id
@@ -5335,6 +5363,66 @@ def _visible_naming_assertions(connection: sqlite3.Connection) -> tuple[sqlite3.
             (MemoryKind.ENTITY.value,),
         ).fetchall()
     )
+
+
+def _named_identities(connection: sqlite3.Connection) -> dict[str, tuple[str, str]]:
+    """Return, per identity, the `(name, naming_memory_id)` its visible naming assertion gives.
+
+    An identity with no visible assertion, or one whose subject is somehow unset, is simply
+    absent -- `named_actors` treats a missing key as "not currently named".
+    """
+    named: dict[str, tuple[str, str]] = {}
+    for row in _visible_naming_assertions(connection):
+        name = _optional_row_text(row, "subject")
+        if name is not None:
+            named[_row_text(row, "identity_id")] = (name, _row_text(row, "memory_id"))
+    return named
+
+
+def _merge_named_identity_links(
+    connection: sqlite3.Connection,
+    batch: Sequence[str],
+    named: Mapping[str, tuple[str, str]],
+    links: dict[str, list[tuple[str, str, str]]],
+) -> None:
+    """Resolve one batch of memories' identity edges and add the named ones to `links`.
+
+    The identity edge is read two ways in one query: the asset-keyed speech speaker or face
+    observation `provisional_identities` reads for the unnamed case, and the memory's own
+    bound semantic assertion (`memory_semantics.identity_id`). A memory naming itself -- the
+    naming assertion's own row -- is skipped, because it already renders as its own actors hit.
+    """
+    placeholders = ", ".join("?" for _memory_id in batch)
+    rows = connection.execute(
+        f"""
+        SELECT ma.memory_id AS memory_id, sp.speaker_id AS identity_id
+        FROM memory_assets AS ma
+        JOIN speech_segments AS sp ON sp.asset_id = ma.asset_id
+        WHERE ma.memory_id IN ({placeholders}) AND sp.speaker_id IS NOT NULL
+        UNION
+        SELECT ma.memory_id AS memory_id, f.identity_id AS identity_id
+        FROM memory_assets AS ma
+        JOIN face_observations AS f ON f.asset_id = ma.asset_id
+        WHERE ma.memory_id IN ({placeholders})
+        UNION
+        SELECT s.memory_id AS memory_id, s.identity_id AS identity_id
+        FROM memory_semantics AS s
+        WHERE s.memory_id IN ({placeholders}) AND s.identity_id IS NOT NULL
+        """,
+        (*batch, *batch, *batch),
+    ).fetchall()
+    for row in rows:
+        identity_id = _row_text(row, "identity_id")
+        entry = named.get(identity_id)
+        if entry is None:
+            continue
+        memory_id = _row_text(row, "memory_id")
+        name, naming_memory_id = entry
+        if memory_id == naming_memory_id:
+            continue
+        bucket = links.setdefault(memory_id, [])
+        if not any(identity_id == existing[0] for existing in bucket):
+            bucket.append((identity_id, name, naming_memory_id))
 
 
 def _has_naming_assertion(connection: sqlite3.Connection, identity_id: str) -> bool:

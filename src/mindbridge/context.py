@@ -24,10 +24,17 @@ from mindbridge.types import (
     MemoryKind,
     MemoryType,
     Modality,
+    NamedActor,
     ProvisionalActor,
     SearchHit,
     render_hit_line,
+    render_named_actor_line,
+    render_provisional_actor_line,
 )
+
+# One (identity_id, name, naming_assertion_id) edge a memory carries to a currently named
+# identity. `naming_assertion_id` is `None` only when a caller cannot cite it cheaply.
+NamedActorLink: TypeAlias = tuple[str, str, str | None]
 
 # Text-equivalent cost of one grounded media part, at the usual four characters per token. The
 # modalities are an order of magnitude apart in what a model charges for them: an image part
@@ -129,6 +136,26 @@ def bundle_cost(hit: SearchHit) -> int:
     return len(render_hit_line(hit)) + 1 + _asset_cost(hit)
 
 
+def named_actor_cost(actor: NamedActor) -> int:
+    """Return what one named-actor line costs, priced exactly as `render_named_actor_line`
+    renders it, so the price and the text can never drift apart.
+    """
+    return len(render_named_actor_line(actor)) + 1
+
+
+def provisional_actor_cost(actor: ProvisionalActor) -> int:
+    """Return what one provisional-actor line costs, priced exactly as
+    `render_provisional_actor_line` renders it.
+    """
+    return len(render_provisional_actor_line(actor)) + 1
+
+
+def _actor_cost(entry: NamedActor | ProvisionalActor) -> int:
+    if isinstance(entry, NamedActor):
+        return named_actor_cost(entry)
+    return provisional_actor_cost(entry)
+
+
 def _frame_cost(goal: str, reference_at: datetime, budget: ContextBudget) -> int:
     """Return an upper bound on the fixed header `render()` writes above the first section."""
     return (
@@ -159,6 +186,7 @@ def compile_context(
     unknowns: Sequence[ContextUnknown] = (),
     candidate_limit: int | None = None,
     provisional: Mapping[str, Sequence[str]] = MappingProxyType({}),
+    named: Mapping[str, Sequence[NamedActorLink]] = MappingProxyType({}),
 ) -> ContextBundle:
     """Partition, filter, and budget ranked hits into one bundle.
 
@@ -172,6 +200,14 @@ def compile_context(
     assertion names. The kernel resolves that, deterministically, before calling; the compiler
     only keeps the entries whose evidence actually made it into the bundle, so the bundle never
     reports a person the reader cannot see the evidence for.
+
+    `named` maps a memory ID to the identities its identity edge resolves to that a currently
+    visible naming assertion names -- the positive counterpart of `provisional`, resolved the
+    same way by the kernel before calling. An identity `named` reports is never also reported
+    as provisional, even if a stale `provisional` entry still names it. Both a named and a
+    provisional actor render a line, and that line is priced and fit into whatever `max_chars`
+    has left after the ranked hits: it is included when it fits and dropped, not appended for
+    free, when it does not.
     """
     started_at = perf_counter() if started_at is None else started_at
     excluded: dict[str, int] = {}
@@ -210,11 +246,26 @@ def compile_context(
     )
     occurred_from, occurred_until = _occurred_range(included)
     elapsed_ms = _elapsed_ms(started_at)
+    # Actor lines are priced and fit in after the ranked hits, into whatever `_select` left of
+    # `max_chars`: `_bundle_chars` already bounds that at or below `max_chars`, so this can
+    # never push the total over it. A named identity is never also reported provisional, even
+    # if a stale `provisional` entry still names it.
+    base_chars = _bundle_chars(overhead, sections)
+    named_actors = _named_actors(included, named)
+    provisional_actors = _provisional_actors(
+        included,
+        provisional,
+        exclude=frozenset(actor.identity_id for actor in named_actors),
+    )
+    fitted_actors, actor_chars, actor_excluded = _fit_actors(
+        (*named_actors, *provisional_actors),
+        budget.max_chars - base_chars,
+    )
     return ContextBundle(
         goal=goal,
         reference_at=reference_at,
         budget=budget,
-        actors=(*sections["actors"], *_provisional_actors(included, provisional)),
+        actors=(*sections["actors"], *fitted_actors),
         relationships=sections["relationships"],
         scene=sections["scene"],
         episodes=sections["episodes"],
@@ -236,13 +287,14 @@ def compile_context(
                 and bool(excluded or omitted)
             ),
             candidate_limit=candidate_limit,
+            actor_excluded=actor_excluded,
         ),
         occurred_from=occurred_from,
         occurred_until=occurred_until,
         frames=_frames(included),
         places=tuple(sorted({hit.place_id for hit in included if hit.place_id})),
         omitted=omitted,
-        chars=_bundle_chars(overhead, sections),
+        chars=base_chars + actor_chars,
         elapsed_ms=elapsed_ms,
         deadline_exceeded=(
             budget.max_latency_ms is not None and elapsed_ms > budget.max_latency_ms
@@ -349,6 +401,7 @@ def _unknowns(
     skipped: bool,
     exhausted: bool = False,
     candidate_limit: int | None = None,
+    actor_excluded: int = 0,
 ) -> tuple[ContextUnknown, ...]:
     """Name what the request implied and this bundle does not carry, in one stable order."""
     found = list(supplied)
@@ -368,6 +421,13 @@ def _unknowns(
                     f"{omitted} candidates did not fit {budget.max_items} items"
                     f" and {budget.max_chars} chars"
                 ),
+            )
+        )
+    if actor_excluded:
+        found.append(
+            ContextUnknown(
+                kind=ContextUnknownKind.BUDGET_EXCLUDED,
+                detail=f"{actor_excluded} actor lines did not fit {budget.max_chars} chars",
             )
         )
     if exhausted:
@@ -409,7 +469,6 @@ def _section_empty(
     if requested is None:
         return ()
     present = frozenset(hit.memory_type for section in sections.values() for hit in section)
-    keyed = frozenset(_TYPE_SECTIONS.values())
     found: list[ContextUnknown] = []
     for name in _SECTIONS:
         if sections[name]:
@@ -421,7 +480,7 @@ def _section_empty(
                 f" {_type_names(requested)}, and {name} carries only"
                 f" {_type_names(feeds)} memory"
             )
-        elif name in keyed and feeds <= requested and feeds.isdisjoint(present):
+        elif feeds <= requested and feeds.isdisjoint(present):
             detail = f"the {name} section is empty: no {_type_names(feeds)} memory was included"
         else:
             continue
@@ -499,18 +558,23 @@ def _frames(hits: Sequence[SearchHit]) -> tuple[str, ...]:
 def _provisional_actors(
     hits: Sequence[SearchHit],
     provisional: Mapping[str, Sequence[str]],
+    *,
+    exclude: frozenset[str] = frozenset(),
 ) -> tuple[ProvisionalActor, ...]:
     """Name every unnamed person the included evidence observed, in identity order.
 
-    These are appended to the ranked actors rather than competing with them: an unnamed person
-    earned no hit slot and costs no budget, and dropping them would leave an agent unable to
-    say that somebody it does not recognize is in the room.
+    These are appended to the ranked actors rather than competing with them for an item slot:
+    an unnamed person earned no hit slot, and dropping them would leave an agent unable to say
+    that somebody it does not recognize is in the room. `exclude` drops an identity `named`
+    already reported, so a stale `provisional` entry can never list the same identity twice.
     """
     if not provisional:
         return ()
     observed: dict[str, list[str]] = {}
     for hit in hits:
         for identity_id in provisional.get(hit.id, ()):
+            if identity_id in exclude:
+                continue
             memory_ids = observed.setdefault(identity_id, [])
             if hit.id not in memory_ids:
                 memory_ids.append(hit.id)
@@ -518,3 +582,59 @@ def _provisional_actors(
         ProvisionalActor(identity_id=identity_id, memory_ids=tuple(memory_ids))
         for identity_id, memory_ids in sorted(observed.items())
     )
+
+
+def _named_actors(
+    hits: Sequence[SearchHit],
+    named: Mapping[str, Sequence[NamedActorLink]],
+) -> tuple[NamedActor, ...]:
+    """Name every identity the included evidence's identity edge names, in identity order.
+
+    Aggregated across every included memory that carries the edge, the same way
+    `_provisional_actors` aggregates an unnamed person's observing memories, and dropped
+    entirely when the evidence that carried the edge did not make it into the bundle.
+    """
+    if not named:
+        return ()
+    names: dict[str, str] = {}
+    assertions: dict[str, str | None] = {}
+    observed: dict[str, list[str]] = {}
+    for hit in hits:
+        for identity_id, name, naming_assertion_id in named.get(hit.id, ()):
+            names[identity_id] = name
+            assertions[identity_id] = naming_assertion_id
+            memory_ids = observed.setdefault(identity_id, [])
+            if hit.id not in memory_ids:
+                memory_ids.append(hit.id)
+    return tuple(
+        NamedActor(
+            identity_id=identity_id,
+            name=names[identity_id],
+            memory_ids=tuple(memory_ids),
+            naming_assertion_id=assertions[identity_id],
+        )
+        for identity_id, memory_ids in sorted(observed.items())
+    )
+
+
+def _fit_actors(
+    candidates: Sequence[NamedActor | ProvisionalActor],
+    remaining: int,
+) -> tuple[tuple[NamedActor | ProvisionalActor, ...], int, int]:
+    """Fit actor lines into what is left of `max_chars` after the ranked hits.
+
+    Priced and greedy exactly like `_select` prices a hit: one oversized entry does not close
+    the bundle to the rest, so a cheaper actor can still fit. Returns the entries that fit,
+    what they cost, and how many did not fit.
+    """
+    fitted: list[NamedActor | ProvisionalActor] = []
+    spent = 0
+    excluded = 0
+    for entry in candidates:
+        cost = _actor_cost(entry)
+        if cost <= remaining - spent:
+            fitted.append(entry)
+            spent += cost
+        else:
+            excluded += 1
+    return tuple(fitted), spent, excluded

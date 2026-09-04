@@ -99,20 +99,22 @@ demand better inferences, not a way to exclude observations; filter those by `me
 ### What `max_chars` does and does not bound
 
 `max_chars` bounds the *rendered* evidence, the quantity `ContextBundle.chars` reports and the
-quantity the selection charges: the header, every section heading, and every memory line with its
-frame. A bundle that reports no compilation diagnostics therefore satisfies
-`len(bundle.render()) <= bundle.chars <= max_chars`, and a caller shipping `render()` no longer
-has to size against it themselves.
+quantity the selection charges: the header, every section heading, every memory line with its
+frame, and every `NamedActor` or `ProvisionalActor` line. A bundle that reports no compilation
+diagnostics therefore satisfies `len(bundle.render()) <= bundle.chars <= max_chars`, and a caller
+shipping `render()` no longer has to size against it themselves.
 
 `chars` is an upper bound rather than an exact length -- media parts are charged their text
 equivalent, which is far above the zero characters they render as, and the budget line is priced
 at its widest -- so the inequality can be slack, never violated.
 
-Four things `render()` appends are outside the ceiling, all of them explanations rather than
-grounding: the `## Conflicts` block, the `## Unknowns` block, the `Omitted:` trailer, and the
-provisional-actor lines. Suppressing any of them to fit a budget would make a thin bundle look
-like an empty store, which is the failure the unknowns exist to prevent, and a provisional actor
-is a person the evidence already paid for rather than evidence of its own.
+Three things `render()` appends are outside the ceiling, all of them explanations rather than
+grounding: the `## Conflicts` block, the `## Unknowns` block, and the `Omitted:` trailer.
+Suppressing any of them to fit a budget would make a thin bundle look like an empty store, which
+is the failure the unknowns exist to prevent. An actor line is different: it is priced and fit in
+after the ranked hits, the same as any other line the compiler grounds, and dropped -- reported as
+a `budget_excluded` unknown, never given away for free -- when what is left of `max_chars` cannot
+buy it.
 
 ### The deadline
 
@@ -134,7 +136,7 @@ A typed `MemoryKind` decides the section first; an untyped or generic record fal
 
 | Section | Contents |
 | --- | --- |
-| `actors` | Kind `entity`, plus one `ProvisionalActor` per unnamed person in the included evidence |
+| `actors` | Kind `entity`, plus one `NamedActor` per named identity and one `ProvisionalActor` per unnamed person the included evidence's identity edge reaches |
 | `relationships` | Kind `relation` |
 | `scene` | Kind `state` |
 | `facts` | Type `semantic`, except `entity`, `relation`, `state`, `affect`, and `trait` |
@@ -156,10 +158,12 @@ request cannot fill `affect`, `episodes`, or `procedures` however well their rec
 such section is named in `unknowns` as a `section_empty` entry saying which filter emptied it,
 rather than leaving the reader to map a dropped type back to the section they lost.
 
-The bundle also carries no person link. Identity lives asset-keyed in the speech and face tables,
-reachable through `speech()` and `faces()`, and no `identity_id` exists on a memory, a hit, or a
-`MemoryContext`. Cross-modal person linkage in a bundle needs that edge; it is a known gap rather
-than a configuration mistake.
+The bundle carries the person link. A memory's identity edge -- its own semantic assertion
+bound to an identity (`MemoryContext.identity_id`), or the asset-keyed speech speaker or face
+observation its media carries -- resolves to a `NamedActor` when a currently visible naming
+assertion names that identity, and to a `ProvisionalActor` when none does. Neither requires the
+naming assertion itself to rank into the bundle: the edge is resolved for every included memory
+independently of what else made the cut.
 
 ### How slots are shared
 
@@ -194,25 +198,43 @@ a thin bundle explains itself instead of looking like an empty store.
 
 | `kind` | When it appears |
 | --- | --- |
-| `budget_excluded` | Counted candidates a bound removed, or that did not fit the budget |
+| `budget_excluded` | Counted candidates a bound removed, or that did not fit the budget, or actor lines that did not fit `max_chars` |
 | `section_empty` | A bundle section a `memory_types` request left empty, naming the section and whether the filter excluded every type it carries or the ranking simply reached none |
 | `scope_empty` | A `scope` was supplied and retrieval matched nothing; the entry names the bounds |
 | `modality_unsupported` | The goal carries media this composition's embedder cannot search |
 | `stage_skipped` | An optional stage the `max_latency_ms` deadline skipped |
 | `candidates_exhausted` | Retrieval filled its candidate window and the bundle still lost evidence, so the counts bound the window and not the store |
 
-## Provisional actors
+## Named and provisional actors
 
-A recognized person whom no visible naming assertion names is reported in `actors` as a
-`ProvisionalActor` carrying `identity_id` and the `memory_ids` of the included evidence that
-observed them, sorted by identity. An unnamed person present in the room is not a person missing
-from context: what an agent may say depends on knowing they are there and that nobody has named
-them.
+A memory's identity edge -- `MemoryContext.identity_id` when its own semantic assertion is bound
+to an identity, or the asset-keyed speech speaker or face observation its media carries -- names
+somebody a currently visible naming assertion names, or nobody. The compiler resolves that edge
+for every included memory and reports the identity either way, without requiring the naming
+assertion itself to rank into the bundle:
 
-A provisional actor is not a hit. It never appears in `hits`, it takes no item slot, it costs no
-characters, and it is dropped when the evidence that observed the person did not make it into the
-bundle -- the bundle never reports somebody the reader cannot see the evidence for. `render()`
-prints one plainly labelled line per entry, after the ranked actors.
+- **`NamedActor`** carries `identity_id`, `name`, the `memory_ids` of the included evidence whose
+  identity edge resolved to them, and `naming_assertion_id`, the memory id of the naming assertion
+  that names them -- kept for provenance even when that assertion is not itself in the bundle. The
+  naming assertion's own memory is never reported back to itself here: when it is included it
+  already renders as its own ranked `actors` hit, so reporting it again would list the same person
+  twice.
+- **`ProvisionalActor`** carries `identity_id` and `memory_ids` and nothing else: there is no name
+  to carry, which is the whole point. An unnamed person present in the room is not a person
+  missing from context -- what an agent may say depends on knowing they are there and that nobody
+  has named them.
+
+An identity is never reported both ways: `named_actors` and `provisional_identities` are resolved
+from the same naming projection, so an identity `NamedActor` reports never also produces a
+`ProvisionalActor`.
+
+Neither is a hit. Neither appears in `hits` or takes an item slot, and each is dropped when the
+evidence that carried its identity edge did not make it into the bundle -- the bundle never
+reports somebody the reader cannot see the evidence for. Unlike everything else charged against
+`max_chars`, though, an actor line is not selected for rank: it is fit into whatever `max_chars`
+has left after the ranked hits, in identity order, named actors before provisional ones, and
+dropped -- not appended for free -- when it does not fit. `render()` prints one plainly labelled
+line per entry, after the ranked actors.
 
 ## Conflicts
 

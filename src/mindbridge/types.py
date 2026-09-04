@@ -1663,11 +1663,14 @@ class ContextBudget:
 
     `max_chars` bounds the rendered evidence, the same quantity `ContextBundle.chars` reports:
     the four-line header, each section heading, each memory's rendered line with its `- [id]`
-    frame and confidence suffix, and a text-equivalent price per grounded media part. A bundle
-    that carries no compilation diagnostics therefore satisfies `len(bundle.render()) <=
-    max_chars`; the `## Conflicts`, `## Unknowns`, `Omitted:` and provisional-actor lines are
-    appended outside it, because they explain the bundle rather than ground it and suppressing
-    them to fit a budget would make a thin bundle look like an empty store.
+    frame and confidence suffix, a text-equivalent price per grounded media part, and each
+    `NamedActor` or `ProvisionalActor` line. A bundle that carries no compilation diagnostics
+    therefore satisfies `len(bundle.render()) <= max_chars`; only the `## Conflicts`,
+    `## Unknowns`, and `Omitted:` blocks are appended outside it, because they explain the
+    bundle rather than ground it and suppressing them to fit a budget would make a thin bundle
+    look like an empty store. An actor line is priced and fit in after the ranked hits it
+    depends on, the same as any other line the compiler grounds -- dropped, not given away for
+    free, when what is left of `max_chars` cannot buy it.
 
     `max_media_items` bounds grounded media parts instead of their price: `0` compiles a
     text-only bundle, and `None` lets `max_chars` alone decide. The default `max_chars` buys the
@@ -1743,7 +1746,8 @@ class ProvisionalActor:
 
     A stranger in the room is not a stranger missing from context. This carries the identity
     and the included memories that observed them, and nothing else: there is no name to carry,
-    which is the whole point. It is not a hit, so it costs no budget and occupies no item slot.
+    which is the whole point. It is not a hit and occupies no item slot, but its rendered line
+    is charged against `ContextBudget.max_chars` like every other line the compiler grounds.
     """
 
     identity_id: str
@@ -1757,6 +1761,44 @@ class ProvisionalActor:
             self,
             "memory_ids",
             tuple(_text(value, "memory id") for value in self.memory_ids),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class NamedActor:
+    """One person a currently visible naming assertion names, reached through evidence other
+    than the assertion itself.
+
+    A memory carries an identity edge two ways -- its own semantic assertion may be bound to
+    an identity, or its media asset may have recognized one -- and either can point to
+    somebody already named without that naming assertion ranking into the bundle. This
+    reports the name anyway. `memory_ids` are the included evidence memories whose identity
+    edge resolved here, never the naming assertion's own memory: that memory renders as its
+    own actors hit when it is itself included, so reporting it again here would list the same
+    person twice. `naming_assertion_id` is that assertion's memory id, kept for provenance
+    even though it may not be in the bundle. Like a `ProvisionalActor`, its rendered line is
+    charged against `ContextBudget.max_chars`.
+    """
+
+    identity_id: str
+    name: str
+    memory_ids: tuple[str, ...]
+    naming_assertion_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        object.__setattr__(self, "name", _text(self.name, "name"))
+        if not self.memory_ids:
+            raise ValidationError("a named actor names at least one observing memory")
+        object.__setattr__(
+            self,
+            "memory_ids",
+            tuple(_text(value, "memory id") for value in self.memory_ids),
+        )
+        object.__setattr__(
+            self,
+            "naming_assertion_id",
+            _optional_text(self.naming_assertion_id, "naming_assertion_id"),
         )
 
 
@@ -1786,7 +1828,7 @@ class ContextBundle:
     goal: str
     reference_at: datetime
     budget: ContextBudget
-    actors: tuple[SearchHit | ProvisionalActor, ...]
+    actors: tuple[SearchHit | NamedActor | ProvisionalActor, ...]
     relationships: tuple[SearchHit, ...]
     scene: tuple[SearchHit, ...]
     episodes: tuple[SearchHit, ...]
@@ -1845,7 +1887,9 @@ class ContextBundle:
             lines.extend(("", f"Omitted: {self.omitted} lower-ranked candidates"))
         return "\n".join(lines)
 
-    def _sections(self) -> tuple[tuple[str, tuple[SearchHit | ProvisionalActor, ...]], ...]:
+    def _sections(
+        self,
+    ) -> tuple[tuple[str, tuple[SearchHit | NamedActor | ProvisionalActor, ...]], ...]:
         """Return the sections in their fixed rendering order."""
         return (
             ("Actors", self.actors),
@@ -1859,11 +1903,33 @@ class ContextBundle:
         )
 
 
-def _section_line(entry: SearchHit | ProvisionalActor) -> str:
+def _section_line(entry: SearchHit | NamedActor | ProvisionalActor) -> str:
     if isinstance(entry, SearchHit):
         return render_hit_line(entry)
-    seen = ", ".join(f"[{memory_id}]" for memory_id in entry.memory_ids)
-    return f"- [{entry.identity_id}] unnamed person present (provisional identity; seen in {seen})"
+    if isinstance(entry, NamedActor):
+        return render_named_actor_line(entry)
+    return render_provisional_actor_line(entry)
+
+
+def render_named_actor_line(actor: NamedActor) -> str:
+    """Return the one line `render()` writes for this named actor.
+
+    The compiler charges its length against `ContextBudget.max_chars`, same as
+    `render_hit_line`, so the price and the text come from the same function and cannot drift.
+    """
+    seen = ", ".join(f"[{memory_id}]" for memory_id in actor.memory_ids)
+    provenance = f"; named by [{actor.naming_assertion_id}]" if actor.naming_assertion_id else ""
+    return f"- [{actor.identity_id}] {actor.name} present (seen in {seen}{provenance})"
+
+
+def render_provisional_actor_line(actor: ProvisionalActor) -> str:
+    """Return the one line `render()` writes for this provisional actor.
+
+    The compiler charges its length against `ContextBudget.max_chars`, same as
+    `render_hit_line`, so the price and the text come from the same function and cannot drift.
+    """
+    seen = ", ".join(f"[{memory_id}]" for memory_id in actor.memory_ids)
+    return f"- [{actor.identity_id}] unnamed person present (provisional identity; seen in {seen})"
 
 
 def render_hit_line(hit: SearchHit) -> str:

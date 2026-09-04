@@ -36,6 +36,7 @@ from mindbridge.types import (
     MemoryRecord,
     MemoryType,
     Modality,
+    NamedActor,
     ObservationContext,
     ProvisionalActor,
     RetrievalScope,
@@ -326,6 +327,15 @@ class ProvisionalActorResult(BaseModel):
     memory_ids: tuple[str, ...]
 
 
+class NamedActorResult(BaseModel):
+    """A person a currently visible naming assertion names, reached through other evidence."""
+
+    identity_id: str
+    name: str
+    memory_ids: tuple[str, ...]
+    naming_assertion_id: str | None
+
+
 class ContextUnknownResult(BaseModel):
     kind: ContextUnknownKind
     detail: str
@@ -335,10 +345,10 @@ class ContextBundleResult(BaseModel):
     goal: str
     reference_at: AwareDatetime
     budget: ContextBudgetResult
-    # An unnamed person present in the evidence is reported here beside the ranked entity
-    # hits, labelled, rather than omitted: what an agent may say depends on knowing they are
-    # there and that nobody has named them.
-    actors: tuple[SearchHitResult | ProvisionalActorResult, ...]
+    # Beside the ranked entity hits: a person a naming assertion names, reached through
+    # other evidence, and an unnamed person present in the evidence -- what an agent may say
+    # depends on knowing who is there, named or not.
+    actors: tuple[SearchHitResult | NamedActorResult | ProvisionalActorResult, ...]
     relationships: tuple[SearchHitResult, ...]
     scene: tuple[SearchHitResult, ...]
     episodes: tuple[SearchHitResult, ...]
@@ -1044,7 +1054,16 @@ def _bundle_result(bundle: ContextBundle) -> ContextBundleResult:
     )
 
 
-def _actor_result(entry: SearchHit | ProvisionalActor) -> SearchHitResult | ProvisionalActorResult:
+def _actor_result(
+    entry: SearchHit | NamedActor | ProvisionalActor,
+) -> SearchHitResult | NamedActorResult | ProvisionalActorResult:
+    if isinstance(entry, NamedActor):
+        return NamedActorResult(
+            identity_id=entry.identity_id,
+            name=entry.name,
+            memory_ids=entry.memory_ids,
+            naming_assertion_id=entry.naming_assertion_id,
+        )
     if isinstance(entry, ProvisionalActor):
         return ProvisionalActorResult(
             identity_id=entry.identity_id,

@@ -47,6 +47,7 @@ from mindbridge.types import (
     MemoryCapabilities,
     MemoryRecord,
     Modality,
+    NamedActor,
     Page,
     ProvisionalActor,
     SearchHit,
@@ -522,6 +523,12 @@ def test_the_compiled_bundle_mirrors_the_sdk_value_on_both_transports() -> None:
             ProvisionalActor,
             rest.ProvisionalActorResponse,
             mcp_adapter.ProvisionalActorResult,
+            {},
+        ),
+        (
+            NamedActor,
+            rest.NamedActorResponse,
+            mcp_adapter.NamedActorResult,
             {},
         ),
         (

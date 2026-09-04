@@ -28,6 +28,7 @@ from mindbridge import (
     MemoryType,
     Modality,
     ModelInput,
+    NamedActor,
     ObservationContext,
     ProvisionalActor,
     RetrievalScope,
@@ -43,6 +44,8 @@ from mindbridge.context import (
     bundle_cost,
     compile_context,
     evidence_cost,
+    named_actor_cost,
+    provisional_actor_cost,
 )
 from mindbridge.infrastructure.local.store import StoredAsset
 from mindbridge.memory import _PreparedContent
@@ -1125,7 +1128,7 @@ def test_the_cli_command_serializes_the_bundle(tmp_path: Path) -> None:
 
 
 def test_a_provisional_actor_joins_the_actors_without_taking_a_hit_slot() -> None:
-    """An unnamed person is reported beside the ranked actors, and costs nothing."""
+    """An unnamed person is reported beside the ranked actors, priced like everything else."""
     bundle = compile_context(
         "who is in the room",
         (
@@ -1138,19 +1141,48 @@ def test_a_provisional_actor_joins_the_actors_without_taking_a_hit_slot() -> Non
     )
 
     assert [entry.id for entry in bundle.actors if isinstance(entry, SearchHit)] == ["actor"]
-    assert [
+    actors = [
         (entry.identity_id, entry.memory_ids)
         for entry in bundle.actors
         if isinstance(entry, ProvisionalActor)
-    ] == [("identity_1", ("episode",)), ("identity_2", ("episode",))]
-    # Not a hit, not a budgeted item, and not the reason anything was omitted.
+    ]
+    assert actors == [("identity_1", ("episode",)), ("identity_2", ("episode",))]
+    # Not a hit and not a budgeted item slot, but not the reason anything was omitted either.
     assert [hit.id for hit in bundle.hits] == ["actor", "episode"]
-    # A provisional actor renders a line of its own but is charged nothing for it, so the
-    # bundle's own price stays what the two hits cost.
     assert bundle.omitted == 0
-    assert bundle.chars == sum(bundle_cost(hit) for hit in bundle.hits) + _frame_and_headings(
-        bundle, ("actors", "episodes")
+    provisional_actors = [entry for entry in bundle.actors if isinstance(entry, ProvisionalActor)]
+    assert bundle.chars == (
+        sum(bundle_cost(hit) for hit in bundle.hits)
+        + sum(provisional_actor_cost(actor) for actor in provisional_actors)
+        + _frame_and_headings(bundle, ("actors", "episodes"))
     )
+    assert len(bundle.render()) <= bundle.chars <= bundle.budget.max_chars
+
+
+def test_an_actor_line_is_dropped_rather_than_given_away_free_when_it_does_not_fit() -> None:
+    """A tight budget drops an actor line the same way it drops an oversized hit."""
+    hit = _hit("actor", kind=MemoryKind.ENTITY, content="short")
+    # The exact price of the hit alone, with no room left over for an actor line, which always
+    # costs at least one more character.
+    unnamed = compile_context(
+        "who is in the room", (hit,), budget=ContextBudget(), reference_at=REFERENCE
+    )
+    bundle = compile_context(
+        "who is in the room",
+        (hit,),
+        budget=ContextBudget(max_chars=unnamed.chars),
+        reference_at=REFERENCE,
+        provisional={"actor": ("identity_1",)},
+    )
+
+    assert bundle.actors == (hit,)
+    assert any(
+        unknown.kind.value == "budget_excluded" and "actor line" in unknown.detail
+        for unknown in bundle.unknowns
+    )
+    # The dropped actor never inflates `chars`; only the `## Unknowns` block that explains the
+    # drop sits outside the ceiling, same as it does for a dropped hit.
+    assert bundle.chars <= bundle.budget.max_chars
 
 
 def test_a_provisional_actor_of_omitted_evidence_is_not_reported() -> None:
@@ -1181,4 +1213,123 @@ def test_rendering_labels_a_provisional_actor_plainly() -> None:
         "- [identity_1] unnamed person present (provisional identity; seen in [clip])"
     )
     assert "1/24 items" in bundle.render()
+    assert bundle.render() == bundle.render()
+
+
+# ---------------------------------------------------------------------------------------------
+# Named actors
+
+
+def test_a_named_actor_surfaces_without_its_naming_assertion_in_top_k() -> None:
+    """The identity edge names somebody even when the naming assertion itself lost its slot."""
+    episode = _hit("episode", kind=MemoryKind.EVENT, memory_type=MemoryType.EPISODIC, score=0.9)
+    naming = _hit("naming", kind=MemoryKind.ENTITY, score=0.1)
+    bundle = compile_context(
+        "who is in the room",
+        (episode, naming),
+        budget=ContextBudget(max_items=1),
+        reference_at=REFERENCE,
+        named={"episode": (("identity_1", "Li", "naming"),)},
+    )
+
+    assert [hit.id for hit in bundle.hits] == ["episode"]
+    named_actors = [entry for entry in bundle.actors if isinstance(entry, NamedActor)]
+    assert named_actors == [
+        NamedActor(
+            identity_id="identity_1",
+            name="Li",
+            memory_ids=("episode",),
+            naming_assertion_id="naming",
+        )
+    ]
+    assert not any(isinstance(entry, ProvisionalActor) for entry in bundle.actors)
+
+
+def test_an_unnamed_identity_still_yields_a_provisional_actor_beside_a_named_one() -> None:
+    """A named identity and an unrelated unnamed one coexist without interfering."""
+    bundle = compile_context(
+        "who is in the room",
+        (_hit("episode", kind=MemoryKind.EVENT, memory_type=MemoryType.EPISODIC),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        named={"episode": (("identity_1", "Li", "naming"),)},
+        provisional={"episode": ("identity_2",)},
+    )
+
+    assert [type(entry).__name__ for entry in bundle.actors] == ["NamedActor", "ProvisionalActor"]
+    assert bundle.actors[0].identity_id == "identity_1"  # type: ignore[union-attr]
+    assert bundle.actors[1].identity_id == "identity_2"  # type: ignore[union-attr]
+
+
+def test_a_named_identity_is_never_also_reported_provisional() -> None:
+    """A stale `provisional` entry for an identity `named` already reports is dropped."""
+    bundle = compile_context(
+        "who is in the room",
+        (_hit("episode", kind=MemoryKind.EVENT, memory_type=MemoryType.EPISODIC),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        named={"episode": (("identity_1", "Li", "naming"),)},
+        provisional={"episode": ("identity_1",)},
+    )
+
+    assert [type(entry).__name__ for entry in bundle.actors] == ["NamedActor"]
+
+
+def test_a_named_actor_aggregates_every_memory_that_carries_its_edge() -> None:
+    """The same identity observed by two included memories is one actor, not two."""
+    bundle = compile_context(
+        "who is in the room",
+        (
+            _hit("first", kind=MemoryKind.EVENT, memory_type=MemoryType.EPISODIC, score=0.9),
+            _hit("second", kind=MemoryKind.EVENT, memory_type=MemoryType.EPISODIC, score=0.8),
+        ),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        named={
+            "first": (("identity_1", "Li", "naming"),),
+            "second": (("identity_1", "Li", "naming"),),
+        },
+    )
+
+    named_actors = [entry for entry in bundle.actors if isinstance(entry, NamedActor)]
+    assert named_actors == [
+        NamedActor(
+            identity_id="identity_1",
+            name="Li",
+            memory_ids=("first", "second"),
+            naming_assertion_id="naming",
+        )
+    ]
+    # One actor line however many memories carried its edge, priced once.
+    assert bundle.chars == sum(bundle_cost(hit) for hit in bundle.hits) + named_actor_cost(
+        named_actors[0]
+    ) + _frame_and_headings(bundle, ("episodes",))
+
+
+def test_a_named_actor_of_omitted_evidence_is_not_reported() -> None:
+    """The bundle never claims a name for evidence the reader cannot see."""
+    bundle = compile_context(
+        "who is in the room",
+        (_hit("expensive", content="x" * 500),),
+        budget=ContextBudget(max_chars=10),
+        reference_at=REFERENCE,
+        named={"expensive": (("identity_1", "Li", "naming"),)},
+    )
+
+    assert bundle.actors == ()
+    assert bundle.omitted == 1
+
+
+def test_rendering_labels_a_named_actor_with_its_name_and_provenance() -> None:
+    bundle = compile_context(
+        "who is in the room",
+        (_hit("clip", kind=MemoryKind.ENTITY),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        named={"clip": (("identity_1", "Li", "naming"),)},
+    )
+    rendered = bundle.render().splitlines()
+
+    # The ranked entity hit renders first, the named actor beside it in the same section.
+    assert rendered[-1] == "- [identity_1] Li present (seen in [clip]; named by [naming])"
     assert bundle.render() == bundle.render()
