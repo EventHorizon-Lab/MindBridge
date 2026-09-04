@@ -5369,24 +5369,34 @@ class Memory:
                     parts: builtins.list[str] = []
                     stream = iter(self._answerer.stream_answer(question, hits))
                     used_hits: object = None
-                    while True:
-                        try:
-                            part = next(stream)
-                        except StopIteration as completed:
-                            used_hits = completed.value
-                            break
-                        if not isinstance(part, str):
-                            raise ModelError(
-                                "generation model returned an invalid answer chunk",
-                                reason="response_invalid",
-                            )
-                        if part:
-                            if not parts and current_model_request_count():
-                                trace.get_current_span().set_attribute(
-                                    MODEL_TTFT, perf_counter() - started
+                    try:
+                        while True:
+                            try:
+                                part = next(stream)
+                            except StopIteration as completed:
+                                used_hits = completed.value
+                                break
+                            if not isinstance(part, str):
+                                raise ModelError(
+                                    "generation model returned an invalid answer chunk",
+                                    reason="response_invalid",
                                 )
-                            parts.append(part)
-                            yield part
+                            if part:
+                                if not parts and current_model_request_count():
+                                    trace.get_current_span().set_attribute(
+                                        MODEL_TTFT, perf_counter() - started
+                                    )
+                                parts.append(part)
+                                yield part
+                    finally:
+                        # This iterator owns the provider's streaming response. An abandoned
+                        # `ask_stream()` unwinds to here, and leaving the close to the cleared
+                        # frame's last reference is interpreter-dependent: 3.12 collects it at
+                        # once, 3.10 does not, so the response stayed open there. Closing it
+                        # here makes the release deterministic on every supported version.
+                        release = getattr(stream, "close", None)
+                        if callable(release):
+                            release()
                     answer = "".join(parts)
                     if not answer.strip():
                         raise ModelError(
