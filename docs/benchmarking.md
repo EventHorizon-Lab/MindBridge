@@ -158,13 +158,13 @@ acquisition, and, under `benchmark.run`, run tunables. Model endpoints, credenti
 timeouts, token ceilings, and `extra_body` stay in the product block that owns them. See the
 annotated [example configuration](examples/eval.example.yaml) for every field and its purpose.
 
-`benchmark.run` mirrors these flags: `tasks`, `arms`, `full_context_chars`, `limit`, `offset`,
-`seed`, `bootstrap_samples`, `batch_size`, `max_batch_size`, `unit_concurrency`,
-`request_concurrency`, `judge_concurrency`, `recall_limit`, `device`, `device_lock`, `use_cache`,
-`run_id`, `output_path`, `overwrite`, `log_samples`, `predict_only`, `download`,
-`allow_unverified_data`, `verbosity`, `quiet`, `compare`, `fail_on_regression`,
-`regression_threshold`, `media_manifest`, `task_data`, `media_root`, and `num_fewshot`. Omitted
-keys retain the unset-flag defaults.
+`benchmark.run` mirrors these flags: `tasks`, `arms`, `full_context_chars`, `compile_max_items`,
+`compile_max_chars`, `ingest`, `limit`, `offset`, `seed`, `bootstrap_samples`, `batch_size`,
+`max_batch_size`, `unit_concurrency`, `request_concurrency`, `judge_concurrency`, `recall_limit`,
+`device`, `device_lock`, `use_cache`, `run_id`, `output_path`, `overwrite`, `log_samples`,
+`predict_only`, `download`, `allow_unverified_data`, `verbosity`, `quiet`, `compare`,
+`fail_on_regression`, `regression_threshold`, `media_manifest`, `task_data`, `media_root`, and
+`num_fewshot`. Omitted keys retain the unset-flag defaults.
 
 `--blind` and `--blind-baseline` remain command-line-only because they label or attach a whole
 no-memory control run rather than an arm sweep. `--blind` cannot be combined with an arm selection
@@ -217,6 +217,9 @@ repository rather than the process directory; `--data-root` defaults to
 `<benchmarks-root>/data`. Run `mindbridge-bench eval --help` for the full concurrency, cache,
 generation, and comparison options.
 
+Unless `--quiet` is set, `eval` reports sample and judge progress to stderr after the first
+completion and at roughly ten-percent intervals.
+
 `--limit` accepts `-1`, a fraction between zero and one, or an absolute adapter-unit count. Use an
 integer for a count; a non-integral value above one is truncated to an integer by the current
 loader selection. Its unit is adapter-specific: OpenEQA limits episodes and retains every question
@@ -233,8 +236,9 @@ the product, sharing one ingest per unit:
 ```bash
 mindbridge-bench eval \
   --tasks atm-bench-easy \
-  --arms mindbridge,blind,full-context,random \
-  --full-context-chars 24000
+  --arms mindbridge,blind,full-context,random,compile \
+  --full-context-chars 24000 \
+  --compile-max-items 24 --compile-max-chars 16000
 ```
 
 | Arm | Answers from | Retrieval | Reports |
@@ -243,6 +247,7 @@ mindbridge-bench eval \
 | `blind` | the generator's prior, with no evidence | none | answer metrics only |
 | `full-context` | the corpus stuffed into one prompt, oldest first, under `--full-context-chars` | none | answer metrics only |
 | `random` | nothing; it generates no answer | a seeded uniform shuffle of the same ranked candidates | retrieval metrics only |
+| `compile` | `Memory.compile`'s rendered bundle, under `--compile-max-items`/`--compile-max-chars` | the compiler's own selection | answer metrics, plus `compile_bundle_chars` and `compile_bundle_items` per sample |
 
 The default is `mindbridge` alone. Each arm tags its samples and its task row with `arm`, and
 `results.json` records every selected arm's definition -- prompt version, budget, and random seed
@@ -262,6 +267,29 @@ Three properties of the baselines are load-bearing when quoting them:
   randomizes order, which isolates the ranking. It is not a random draw from the whole corpus: on
   a corpus small enough for the pool to cover it, a random ranker can score near-perfect recall,
   and that is exactly the number worth printing next to the product's.
+
+`compile` measures downstream task success from `Memory.compile()`'s bundle rather than
+`Memory.ask()`: it calls `compile(question, budget=ContextBudget(max_items=..., max_chars=...))`,
+renders the bundle with `bundle.render()`, and feeds that rendered text to the same generator call
+the `full-context` arm uses (`compile()` never generates text itself, so a compiled answer has to
+leave the product path the same way the two text baselines do). Reading it beside `blind`,
+`full-context`, and `mindbridge` is exactly the no-memory/full-context/retrieval-only comparison
+[Context OS gate 4](context-os.md#evolution-gates) asks for. Its per-sample `compile_bundle_chars`
+and `compile_bundle_items` (in `metrics`) are the bundle's own size, the numerator half of "useful
+evidence per token" -- pair them with the question's answer-quality metric to compute it; a run
+does not compute the ratio itself, since only the caller knows which quality metric is the
+numerator.
+
+## Ingest mode
+
+`--ingest add` (the default) ingests through `Memory.add_many`/`Memory.add`, the strong path: a
+memory is searchable the instant ingest returns. `--ingest capture` ingests through
+`Memory.capture()` followed by `Memory.settle()` instead, so a run actually exercises the fast
+plane's acknowledge-then-enrich path end to end -- this is the only way capture acknowledgement and
+time-to-searchable, in [Reported performance and resource metrics](#reported-performance-and-resource-metrics)
+below, come from a real run instead of reading `0` in every task's `performance` block. Every arm
+still answers against the same fully settled store either way; `--ingest` changes how the store got
+there, not what an arm can see once ingest finishes.
 
 ## Supported benchmark categories and primary metrics
 
@@ -512,22 +540,27 @@ number would measure the generator's prior knowledge of the scripts rather than 
 
 ## Reported performance and resource metrics
 
-Every task row in `results.json` carries a `performance` block with the five metric families
+Every task row in `results.json` carries a `performance` block with the metric families
 [the design principles](design-principles.md#end-to-end-memory-and-search-speed) require. Each
 block names the span it was measured from, so a number is never separated from its definition.
 
 | Block | Quantity | Measured from |
 | --- | --- | --- |
-| `ingest` | Accepted input to durable, searchable memory; item and call latency; sustained items per second | `mindbridge.benchmark.ingest`, one span per accepted `add_many` batch |
+| `ingest` | Accepted input to durable, searchable memory; item and call latency; sustained items per second | `mindbridge.benchmark.ingest`, one span per accepted `add_many`/`capture` batch |
 | `search` | Retrieval latency at p50, p95, and p99, plus queries per second | `mindbridge.retrieve`, one span per `ask` over the whole retrieval leg |
 | `answer` | End-to-end answer latency at p50, p95, and p99, and time to first token | `mindbridge.ask` and `mindbridge.model.generation` |
 | `asr` | Audio seconds per wall second and transcription inference latency | `mindbridge.model.transcription` |
+| `capture` | Capture-acknowledgement latency at p50, p95, and p99 | `mindbridge.capture`, one span per record; empty unless `--ingest capture` runs |
+| `time_to_searchable_ms` | Elapsed time from a record's capture commit to the `settle()` call that made it searchable | the `mindbridge.settle` span's batch-maximum wait, one sample per `settle()` call; empty unless `--ingest capture` runs |
+| `formation` | `settle()`'s own latency at p50, p95, and p99 -- the model-dependent enrichment work one call paid | `mindbridge.settle`; empty unless `--ingest capture` runs |
+| `compile` | `Memory.compile` latency at p50, p95, and p99, plus the compiled bundle's `bundle_chars`, `bundle_items`, and `bundle_media_items` (each p50/p95/p99) | `mindbridge.compile` for latency, a harness-owned `mindbridge.benchmark.compile` stage span for bundle size; empty unless the `compile` arm runs |
 | `nodes` | Count, total time, mean, and p50/p95/p99 for every traced stage | every operation, stage, and model span |
 
 `ingest` measures accepted input to durable and searchable memory rather than the time until the
-call returned. That is exact rather than approximate: `add` and `add_many` return only after the
-SQLite commit, the Zvec flush, and the search-index outbox acknowledgement, so the wall clock of
-the traced call already includes index visibility.
+call returned. That is exact rather than approximate: under `--ingest add`, `add`/`add_many` return
+only after the SQLite commit, the Zvec flush, and the search-index outbox acknowledgement; under
+`--ingest capture`, the harness drains `settle()` before the ingest span closes, so the wall clock
+of the traced call already includes index visibility either way.
 
 `answer.latency_ms` and the per-task `answer_latency_ms` are timed after concurrency admission, so
 they are response latency and not queue depth. `answer.time_to_first_token_ms` is `null` unless the
@@ -544,11 +577,41 @@ harness's `search` fallback after a failed `ask`, report nothing under `search`.
 `asr` is omitted when no transcription ran. Its `real_time_factor` is audio seconds divided by
 transcription wall seconds, so values above one mean faster than real time.
 
+`capture`, `time_to_searchable_ms`, and `formation` name what [Context OS](context-os.md#fast-context-plane)
+calls the fast plane's acknowledge-then-enrich contract: `capture()` acknowledges after the SQLite
+commit, so its own span *is* capture-acknowledgement latency; `time_to_searchable_ms` is the delay
+until a `settle()` call actually made a record searchable; `formation` is the model-dependent work
+one `settle()` call paid, distinct from any scheduling delay before it ran. All three report a
+`count` of `0` under the default `--ingest add`, because nothing calls `capture()`/`settle()` on
+that path -- that is the harness telling the truth about what it measured, not a bug. Speculative
+first-hit latency (the fifth quantity Context OS names) has no dedicated span today: the streaming
+prefetch path (`AsyncOmniPrefetch`) issues an ordinary `Memory.search()`, indistinguishable in
+telemetry from any other `search()` call, and this harness does not exercise streaming ingest at
+all, so it is not measurable by `eval` yet.
+
+`compile`'s bundle-size attributes are harness-owned (`compile()` itself carries no such attribute)
+so that adding this measurement never touched product code. Pair `compile_bundle_chars` and
+`compile_bundle_items` (in a sample's `metrics`) with that sample's answer-quality metric to compute
+"useful evidence per token" for one question; the run does not compute the ratio itself.
+
 The run-level `resources` block records CPU seconds and utilization, peak resident bytes, storage
-growth split into media, row, and vector bytes, and per-device peak GPU utilization and memory when
-`nvidia-smi` answers. CPU and memory come from `resource.getrusage`, so they need no sampling; only
-GPU utilization is polled. `storage.media_share` is the fraction of growth that is source media,
-which is the term that dominates long-run storage.
+growth split into media, row, and vector bytes, per-device peak GPU utilization and memory when
+`nvidia-smi` answers, and an `energy` block. CPU and memory come from `resource.getrusage`, so they
+need no sampling; GPU utilization and disk growth are sampled directly (disk from the run's
+`data_dir`, before and after ingest). `storage.media_share` is the fraction of growth that is source
+media, which is the term that dominates long-run storage. `energy.cpu_package_joules` sums Intel
+RAPL package counters (`/sys/class/powercap/intel-rapl:*/energy_uj`) across the run when readable;
+`energy.gpu_joules` integrates `nvidia-smi --query-gpu=power.draw` samples over the poll interval,
+per device, when the card reports power. Neither is a calibrated meter -- RAPL is package-scope, not
+process-scope, and the GPU figure is a rectangle-rule estimate over periodic samples -- and both are
+absent with a `reason` (never a fabricated number) when their source cannot be read: no
+`intel-rapl` packages, no permission, or no GPU visible to `nvidia-smi`.
+
+Each RAPL package is differenced against its own counter, because `energy_uj` wraps at that
+package's `max_energy_range_uj` -- tens of minutes on a busy package, well inside the length of a
+sweep. A package that wrapped is corrected by its published range; one that wrapped without
+publishing a range makes `cpu_package_joules` absent with that as its `reason`, rather than a
+number nothing can correct.
 
 ## Mandatory controls
 
@@ -727,7 +790,7 @@ measured latency and resource cost. `results.json` records each of those:
 | Retrieval settings | `recall_limit`, `tasks[].retrieval.ranked_candidate_limit`, and the full `model.memory_config` dump |
 | Hardware | `environment.hardware` and the `resources` block |
 | Latency and resource cost | `tasks[].performance`, `tasks[].answer_latency_ms`, and `resources` |
-| Replay inputs | `run_id`, `seed`, `seeds`, `bootstrap_samples`, `limit`, `offset`, `batch_size`, `blind`, `blind_baseline` |
+| Replay inputs | `run_id`, `seed`, `seeds`, `bootstrap_samples`, `limit`, `offset`, `batch_size`, `blind`, `blind_baseline`, `arms.ingest`, `arms.definitions.compile` |
 
 Scores are comparable only against runs of this harness at the same runner version, dataset
 revision, and scorer protocol. Every task row therefore carries `cross_harness_comparable: false`

@@ -226,7 +226,7 @@ Continue with the [Quick start](docs/quickstart.md) and
 | Identity | Speech and face analysis, naming, corroborated linking, unlinking, and erasure | [Python SDK](docs/api/python-sdk.md#cross-modal-identity-binding) |
 | Context compilation | Budgeted, partitioned context bundles with conflicts and declared capabilities | [Context compilation](docs/context-compilation.md) |
 | Memory control plane | Deferred capture settlement, model-proposed consolidation, reversible forgetting, and the operation log | [Memory types, time, and decay](docs/memory-types-time-and-decay.md) |
-| Interfaces | Complete SDK; nine REST operations; fifteen MCP tools; twenty-eight CLI operations plus `doctor` | [Python](docs/api/python-sdk.md) · [REST](docs/api/rest.md) · [MCP](docs/api/mcp.md) · [CLI](docs/api/cli.md) |
+| Interfaces | Complete SDK; twelve REST operations; fifteen MCP tools; thirty-five CLI operations plus `doctor` | [Python](docs/api/python-sdk.md) · [REST](docs/api/rest.md) · [MCP](docs/api/mcp.md) · [CLI](docs/api/cli.md) |
 | Deployment and recovery | Ownership, backup, restore, reindex, telemetry, and security boundaries | [Deployment](docs/deployment.md) · [Operations](docs/operations.md) |
 | Extensibility | Narrow typed model protocols with no global plugin registry | [Plugin architecture](docs/plugin-architecture.md) |
 

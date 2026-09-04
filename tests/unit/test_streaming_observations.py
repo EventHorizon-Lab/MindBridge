@@ -927,7 +927,7 @@ def test_a_finished_stream_never_leaves_another_thread_deferring(tmp_path: Path)
             thread.join(30)
 
         assert pending == {"first": 0}
-        assert memory._deferred_index_threads == set()
+        assert memory._deferring is False
 
 
 @pytest.mark.asyncio

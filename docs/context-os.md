@@ -69,6 +69,38 @@ An agent must not gain identity enrollment, irreversible merge, or physical dele
 merely because it can call ordinary recall tools. The host chooses whether to expose sensitive
 operations and when human confirmation is required.
 
+All six of the data subject's authorities are named calls, and each is an act a host performs on
+their behalf rather than a setting a model can reach:
+
+| Authority | Call | Reversible by |
+| --- | --- | --- |
+| Consent | `record_consent(identity_id, state, note=None)`, read back by `consent(identity_id)` | `rollback()` of its `CONSENT` row, or a later statement that supersedes it |
+| Identity naming | `register_identity` / `register_speaker` | `rollback()` of its `IDENTIFY` row |
+| Correction | `rollback(operation_id)`, and `unlink_identity` for a wrong cross-modal merge | Itself: `rollback()` of the split's `CORRECT` row re-merges |
+| Export | `export(identity_id=...)` or `export(memory_ids=...)` | Nothing to reverse; it reads only |
+| Retention | the declarative `retention` policy, applied by `apply_retention(dry_run=False)` | Nothing: it is physical deletion, and `dry_run=True` is the review step |
+| Physical deletion | `delete(memory_id)` and `forget_identity(identity_id)` | Nothing, by definition |
+
+Consent is an assertion in the same family as naming -- an identity-bound, versioned claim
+recorded as `USER_STATEMENT` -- and it is the one claim no backend may propose: a `CONSENT`
+operation reaching the kernel from a model is refused as `unauthorized`, exactly as a proposed
+`MERGE` is, because a model that could infer consent could manufacture permission to process a
+person. `consent` is a reserved predicate for the same reason: ordinary formation never passes
+through the control plane, so a model's typed proposal carrying it is stored unbound -- an
+inference about a subject rather than a statement by a person -- and binds to nobody. Withheld or withdrawn consent restrains the kernel from the next observation on: no new
+face or voice exemplar is enrolled for that person, no cross-modal merge binds their voice to
+their face, and `compile()` leaves them out of the bundle's actors with a `CONSENT_WITHHELD`
+unknown. It does not restrain recognition against exemplars already held, because answering a
+question from media the host already has is not new processing of a person -- destroying what is
+held is `forget_identity`, which is a different request with a different answer.
+
+One authority does not compose cleanly with another person's, and the honest place to say so is
+here: a recording two people share is held about both, so it appears in both their exports, each
+carrying the other's observations. Answering one subject with less than is held would be a false
+answer, and redacting the other person out of shared evidence would mean rewriting an
+observation, which is the invariant this system does not break. Deciding what a host may then do
+with that export is the host's, not the kernel's.
+
 ## Time scale is not memory type
 
 Fast and slow memory describe processing policy. Semantic, episodic, and procedural memory describe
@@ -131,7 +163,7 @@ The reasoning backend may change, but the proposal vocabulary and kernel validat
 | --- | --- |
 | Reinforce | Record independent supporting evidence or observed utility; retrieval alone is not reinforcement, though a hit an answerer cited is observed utility. |
 | Consolidate | Create a higher-level derived memory with explicit evidence links; preserve source observations. |
-| Merge | Unify compatible derived identity or meaning while retaining reversible lineage. |
+| Merge | Unify compatible derived identity or meaning while retaining reversible lineage. Kernel-initiated from corroborated cross-modal evidence, not backend vocabulary: a proposed merge is refused. |
 | Update | Add a new valid and transaction-time version that supersedes prior state; do not overwrite history. Realized as consolidate into an existing lineage. |
 | Correct or split | Reverse a bad inference, identity merge, or consolidation without manufacturing new source evidence. |
 | Forget | Change retrieval visibility or retention state under policy; do not equate it with physical deletion. |
@@ -147,11 +179,20 @@ forgotten, corrected, or deleted since validation is refused as stale rather tha
 observation while the kernel validates and persists it. `ConsolidationBackend` is the plane itself:
 `consolidate()` gathers a bounded, active evidence set, the backend proposes `MemoryOperation`
 values with the four intents reinforce, consolidate, correct, and forget, and the kernel validates
-each one, commits it with its log row, and can `rollback()` it. `consolidation_candidates()` is the
+each one, commits it with its log row, and can `rollback()` it. Merge is the one intent no backend
+may propose: a cross-modal identity merge is committed by the kernel from co-occurrence evidence it
+counted itself, with its own reversible log row, and a proposed `MERGE` is rejected as
+`unauthorized`. `consolidation_candidates()` is the
 durable trigger in front of that loop: it derives due work -- new independent evidence, a lineage
-that contradicts itself, a record confirmed since it was last weighed -- from committed state, so a
-host schedules deliberation on evidence rather than on a clock. The Python SDK reference owns the
-exact contract; the reasoning backend can change without changing that vocabulary.
+that contradicts itself, a record confirmed since it was last weighed, a question recall answered
+with nothing, a store over its declared budget, an operator-approved idle window -- from committed
+state, so deliberation is scheduled on evidence rather than on a clock. `deliberate()` is the loop
+itself, running those two halves to a fixed point and reporting what the run cost and yielded, and
+`apply(operation)` is the same kernel validation for an operation a host supplies, which makes
+replay of a logged sequence a public path. Neither a clock nor a candidate that always comes back
+is evidence that work is useful, so each pass records that it weighed its evidence set even when
+it yielded nothing. The Python SDK reference owns the exact contract; the reasoning backend can
+change without changing that vocabulary.
 
 ## Forgetting is three operations
 
@@ -166,11 +207,21 @@ recall, stays readable through `get()` and `list()` with its `forgotten_at`, and
 `rollback()`. Consolidation forgetting is a control-plane proposal over evidence lineage: a
 `CONSOLIDATE` may name sources of its own to retire, they leave recall in the same transaction that
 creates the derived record, the evidence links stay, and the log row carries them as
-`forgotten_ids` so the two halves reverse together. Physical forgetting remains `delete()` under
-host authority and is not a proposal intent. Retention work must keep these meanings separate in
-APIs, telemetry, and user-facing controls, and the operation log already does: `delete()` leaves no
-row, cognitive forgetting is a `FORGET` row, and consolidation forgetting is a `CONSOLIDATE` row
-carrying `forgotten_ids`.
+`forgotten_ids` so the two halves reverse together. Physical forgetting remains `delete()`,
+`forget_identity()`, and the declared retention policy `apply_retention()` runs under host
+authority, and is not a proposal intent. Retention is the deterministic half of the same
+authority: a policy names maximum ages for raw media, for records cognitive forgetting already
+moved out of recall, and for capture-queue rows whose failures have aged out, and every deletion
+it performs goes through `delete()`, so the completeness rules above hold unchanged. An unset age
+is not a zero-day policy; it does nothing. Retention work must keep
+these meanings separate in APIs, telemetry, and user-facing controls, and the operation log already
+does: `delete()` leaves no row, cognitive forgetting is a `FORGET` row over `target_ids`, and
+consolidation forgetting is a `CONSOLIDATE` row carrying `forgotten_ids`. Erasing a *person* is the
+one physical forgetting that does leave a row, because a data subject's request has to be
+auditable: it is a `FORGET` row over an `IdentityChange` rather than over memory IDs, it carries
+only the identity, its aliases, and the naming assertions it deleted, and `rollback()` refuses it.
+Which of the two a `FORGET` row names is the discriminator: a row over records is reversible, a row
+over a person is not.
 
 ## Context compiler
 
@@ -181,10 +232,13 @@ A context compilation request supplies a goal or query plus constraints such as 
 text or media budget, freshness, allowed sensitivity, spatial scope, and minimum evidence quality.
 The resulting bundle may contain:
 
-- current actors, relationships, and scene state, each in its own bundle section (identities
-  still need the asset-keyed identity edge, which no read path traverses yet);
+- current actors, relationships, and scene state, each in its own bundle section, with a named
+  actor's identity edge resolved through the same read path whether or not the naming assertion
+  itself ranked into the bundle;
 - relevant episodic, semantic, and procedural memories;
-- affect cues separated from longer-horizon traits;
+- affect cues separated from longer-horizon traits, each cue carrying its basis, cue
+  modality, and confidence; see [affective memory](affective-memory.md) for why a cue is
+  never reconciled into a single current feeling;
 - temporal and spatial bounds, both metric frames and symbolic places;
 - conflicts, uncertainty, and explicit unknowns; and
 - provenance needed to inspect or correct the result.
@@ -221,17 +275,45 @@ The Python SDK is the full developer and device integration surface. REST expose
 application operations. MCP exposes a small agent-appropriate capability view rather than mirroring
 every administrative method.
 
+The three surfaces carry different authority, not different capability. The SDK is the full
+surface: every public `Memory` operation, including the control plane, is reachable because the
+SDK runs inside the process that owns the memory. REST is a network-safe subset of that same
+process: the ordinary application path -- add, search, ask, compile, and the fast-capture plane
+(`capture`, `settle`, `pending_captures`) -- is always on, because it is an operation on the
+caller's own records rather than authority over a person, while identity administration (naming,
+reading, unlinking, and erasing a person) and embodied analysis (`speech`, `faces`) are opt-in
+behind `create_app`'s `identity_operations` and `embodied_operations`, both defaulting to off,
+because a caller reaching REST over a network is not automatically the memory's owner. MCP is the
+agent view of the same process and carries its own `identity_operations` switch with the same
+name and the same default-on-for-a-trusted-agent-host reasoning; a host that wants REST and MCP to
+grant the same agent the same authority sets both switches the same way. Neither transport ever
+reaches the control plane -- `consolidation_candidates`, `consolidate`, `forget`, `rollback`, and
+`operations` stay SDK-only regardless of any switch.
+
 The compiler is that view's centre. `POST /v1/context` and the `compile_context` MCP tool return a
 budgeted bundle with provenance, and `GET /healthz` and the MCP server instructions advertise the
-configured modalities and backends so an agent does not discover them through failure. Both are
-read-only: compiling context selects and structures existing evidence and resolves nothing.
+configured modalities and backends so an agent does not discover them through failure. Both
+resolve nothing and write no memory beyond the same query-audio transcript cache `search` writes,
+which is why neither is annotated read-only. A compilation that finds nothing does record that,
+as the bounded signal the control plane's `QUERY_FAILURE` trigger reads, which changes no
+evidence and no memory.
 Answering stays available as a convenience rather than the operating-system boundary.
 
 High-rate sensor streams stay on the embedded SDK boundary. Agents operate on completed
 observations or stable asset identifiers. Cognitive forgetting, consolidation, operation rollback,
-retention policy, and physical deletion stay with the process that owns the memory; identity
+and applying a retention policy stay with the process that owns the memory; identity
 naming, merge reversal, and erasure are separate trusted tools that no ordinary recall or compile
-call grants.
+call grants, and a host withholds them, the two analysis tools, or every mutating tool by
+building the server without that group.
+
+The three data-subject rights that are not naming -- recording consent, exporting a subject, and
+applying retention -- reach REST behind the same `identity_operations` switch and reach MCP not at
+all. Consent is a statement its subject makes, so an agent that could record one could manufacture
+permission; an export is everything held about a person and retention physically deletes, so both
+are authority over a person's whole record rather than a request about the caller's own. The
+export route is the one place a control-plane value crosses a transport, because the right of
+access covers how the data was processed and not only what is held; it is read-only, and no route
+proposes, applies, or reverses an operation.
 
 All interfaces call one owner of one physical `data_dir`. Supporting several agents against that
 owner does not introduce logical account or request scope into the memory contract. A hosted
@@ -272,6 +354,14 @@ defaults or justify superiority claims.
 
 1. Measure the current strong `add`, streaming prefetch, search, and formation paths on target
    hardware before setting latency objectives. Open: no named-hardware measurement exists yet.
+   The [benchmark harness](benchmarking.md#reported-performance-and-resource-metrics) can now
+   produce most of these numbers from a real run: capture acknowledgement, time to searchable,
+   and formation lag from `mindbridge-bench eval --ingest capture`, search and answer latency
+   from any run, and CPU, memory, disk, and energy (Intel RAPL and `nvidia-smi` power draw, where
+   the platform exposes them) for the whole run. Speculative first-hit latency stays unmeasured:
+   the streaming prefetch path issues an ordinary `Memory.search()`, indistinguishable in
+   telemetry from any other search, and the harness does not exercise streaming ingest. Running
+   this on named hardware and publishing the result is still what closes the gate.
 2. Add an explicit fast-capture path and SQLite-backed durable enrichment work without changing
    current `add()` semantics. Done: `capture()`, `settle()`, and `pending_captures()`;
    `settle()` honours a retry ceiling so one poisoned capture cannot block the queue,
@@ -285,26 +375,55 @@ defaults or justify superiority claims.
 3. Generalize formation into one bounded memory-management loop with structured proposals,
    replay, rollback, and privacy tests. Done: the operation log and authority tests
    (`consolidate()`, `forget()`, `rollback()`, `operations()`), the `identify` intent that
-   makes naming a person an evidence-bearing, reversible claim, the durable trigger
-   (`consolidation_candidates()`), consolidation forgetting as one reversible operation, the
-   declarative `consolidation` slot that makes the loop reachable without a Python app loader,
-   kernel rejection of proposals that name records the backend was not shown, of partial
-   multi-target operations, and of proposals whose targets moved before the commit, native media
-   in the bundled consolidation backend's input, and replay of a logged sequence against a fresh
-   store, covered as a test rather than as an `apply(operation)` surface. Open: companion-scenario
-   privacy tests; a post-hoc outcome field, without which only rollback success of the slow-loop
-   measurements is derivable; and identity merge and split, which stay outside the operation
-   log until the identity-governance round.
+   makes naming a person an evidence-bearing, reversible claim, consolidation forgetting as one
+   reversible operation, the declarative `consolidation` slot that makes the loop reachable
+   without a Python app loader, kernel rejection of proposals that name records the backend was
+   not shown, of partial multi-target operations, and of proposals whose targets moved before the
+   commit, and native media in the bundled consolidation backend's input. The loop is now an
+   entity rather than two primitives a host joins: `deliberate()` and `mindbridge deliberate`
+   run candidates through consolidation to a fixed point, all six triggers are produced from
+   committed state rather than named in an enum -- `QUERY_FAILURE` from recorded empty recalls,
+   `PRESSURE` from a declared record budget, `IDLE` from an operator-declared window -- and every
+   pass records that it weighed its evidence set whatever it yielded, so a candidate the model
+   could not resolve stops coming back until its own signal moves instead of being paid for every
+   round. `consolidate()` holds no lock across the backend round trip, so slow reasoning does not
+   stall a concurrent `add()`; the in-transaction re-check remains the correctness guarantee.
+   Replay is a public, tested path through `apply(operation)`, and `record_outcome()` writes the
+   post-hoc outcome the slow-loop measurements need. The identity lifecycle joined the same log:
+   the corroborated cross-modal `MERGE` the kernel commits and `rollback()` re-splits, the
+   `CORRECT` that `unlink_identity` logs and `rollback()` re-links, and the irreversible `FORGET`
+   row an identity erasure leaves so the request is auditable without being recoverable. Open:
+   companion-scenario privacy tests.
 4. Add a context compiler whose output improves downstream tasks within declared budgets. Done
-   for selection, budgeting, the latency deadline, and the explicit unknowns a thin bundle
-   reports: `compile()`. Open: a downstream-task measurement against the no-memory,
-   full-context, and retrieval-only baselines, and the person link, which needs an identity edge
-   the bundle cannot reach today.
-5. Extend REST or MCP only after the Python contract and authority model are stable. Done for the
-   compiler and for one capability document rendered identically by `/healthz`, the MCP server
-   instructions, and `mindbridge doctor`; the control-plane intents stay off REST and MCP. Open:
-   a supported switch for withholding the embodied and identity tools from an MCP server, so a
-   host can expose recall and compile alone.
+   for selection, budgeting, the latency deadline, the explicit unknowns a thin bundle reports,
+   and the person link: `compile()` resolves a memory's identity edge -- its own bound semantic
+   assertion or its media's asset-keyed speech speaker or face observation -- into a `NamedActor`
+   or `ProvisionalActor`, whether or not the naming assertion itself ranked into the bundle. Open:
+   a downstream-task measurement against the no-memory, full-context, and retrieval-only
+   baselines. The [benchmark harness's `compile` arm](benchmarking.md#baseline-arms) can now
+   produce that comparison -- it answers from `compile()`'s rendered bundle beside `blind`,
+   `full-context`, and the product's own `mindbridge` (retrieval-only) arm on the same questions,
+   and reports each answered question's bundle chars and item count as the numerator half of
+   useful evidence per token. Running it across the benchmark suite and publishing the result is
+   still what closes the gate.
+5. Extend REST or MCP only after the Python contract and authority model are stable. Done: the
+   compiler; one capability document rendered identically by `/healthz`, the MCP server
+   instructions, and `mindbridge doctor`; and the three switches
+   `build_mcp_server(identity_operations=, embodied_operations=, write_operations=)`, which
+   withhold naming and erasing a person, the two analysis tools -- and with them the
+   cross-modal identity merge `analyze_faces` commits -- and adding, deleting and reinforcing.
+   Each withholds by never registering the group, so a withheld tool is unknown rather than
+   refused, and the instructions name what is missing. `ask_memory` reaches the same face
+   recognition `analyze_faces` uses to answer a question over a photo or video, so
+   `embodied_operations=False` also passes `Memory.ask(..., link_identities=False)`: recognition
+   may still run, but the corroborated bind never commits. All three False therefore leaves
+   exactly the five read tools with no path to merge authority, which is recall and compile
+   alone. REST reaches the fast-capture plane always, and the same identity and embodied
+   operations behind its own `identity_operations` and `embodied_operations` switches on
+   `create_app`, mirroring the MCP switches of the same name, so a networked application can use
+   `capture`/`settle`/`pending_captures` unconditionally and, where the host opts in, name, read,
+   unlink, or erase a person or run face and speech analysis exactly as an MCP-connected agent
+   can. The control-plane intents stay off REST and MCP.
 
 Fast capture is now independent of slow reasoning, the control plane governs the lifecycle through
 validated, logged, reversible operations, and the compiler produces budgeted task-ready context.

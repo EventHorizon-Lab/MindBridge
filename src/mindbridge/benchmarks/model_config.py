@@ -136,6 +136,12 @@ class RunOverrides(_HarnessModel):
     # command-line-only because it labels one run as the control rather than describing a sweep.
     arms: str | None = None
     full_context_chars: Annotated[int, Field(strict=True, gt=0)] | None = None
+    # The compile arm's `ContextBudget` and the ingest mode `capture()`+`settle()` exercises
+    # through the public SDK -- baseline-sweep knobs, the same reason `full_context_chars` lives
+    # here.
+    compile_max_items: Annotated[int, Field(strict=True, gt=0)] | None = None
+    compile_max_chars: Annotated[int, Field(strict=True, gt=0)] | None = None
+    ingest: Literal["add", "capture"] | None = None
     output_path: Path | None = None
     run_id: str | None = None
     task_data: Mapping[str, Path] | None = None

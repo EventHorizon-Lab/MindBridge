@@ -3,6 +3,7 @@
 import base64
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -25,6 +26,7 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.types import (
+    AffectCue,
     AnswerResult,
     AssetRef,
     Blob,
@@ -34,13 +36,17 @@ from mindbridge.types import (
     ContextConflict,
     ContextUnknown,
     ContextUnknownKind,
+    EvidenceBasis,
     FaceObservation,
     IdentityErasure,
     IdentityProfile,
     MemoryCapabilities,
+    MemoryContext,
+    MemoryKind,
     MemoryRecord,
     MemoryType,
     Modality,
+    NamedActor,
     ObservationContext,
     Page,
     ProvisionalActor,
@@ -119,6 +125,24 @@ CAPABILITIES = MemoryCapabilities(
     speaker_recognition=True,
 )
 PROVISIONAL = ProvisionalActor(identity_id="identity_2", memory_ids=("memory_2",))
+AFFECT_CONTEXT = MemoryContext(
+    kind=MemoryKind.AFFECT,
+    basis=EvidenceBasis.MODEL_INFERENCE,
+    confidence=0.72,
+    valid_from=None,
+    valid_until=None,
+    recorded_at=NOW,
+    evidence_ids=("memory_2",),
+    cue_modality=Modality.AUDIO,
+    valence=-0.2,
+    arousal=0.8,
+)
+NAMED = NamedActor(
+    identity_id="identity_3",
+    name="Alice",
+    memory_ids=("memory_2",),
+    naming_assertion_id="memory_3",
+)
 CONFLICT = ContextConflict(
     lineage_id="lineage_1",
     subject="ana",
@@ -242,9 +266,10 @@ class FakeMemory:
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        link_identities: bool = True,
     ) -> AnswerResult:
         self._fail()
-        self.calls.append(("ask", question, limit, memory_type, reference_at))
+        self.calls.append(("ask", question, limit, memory_type, reference_at, link_identities))
         return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
 
     def get(self, memory_id: str) -> MemoryRecord:
@@ -485,7 +510,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
             OCCURRED_FROM,
             OCCURRED_UNTIL,
         ),
-        ("ask", "What color?", 5, MemoryType.PROCEDURAL, NOW),
+        ("ask", "What color?", 5, MemoryType.PROCEDURAL, NOW, True),
         ("get", "memory_1"),
         ("list", 7, "cursor_1"),
         ("delete", "memory_1"),
@@ -1007,6 +1032,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
     assert bundle["budget"] == {
         "max_chars": 2_000,
         "max_items": 8,
+        "max_media_items": None,
         "memory_types": ["episodic", "semantic"],
         "min_confidence": 0.5,
         "freshness_seconds": 3_600.0,
@@ -1015,6 +1041,12 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
     assert [hit["id"] for hit in bundle["facts"]] == ["memory_1"]
     assert [hit["id"] for hit in bundle["episodes"]] == ["memory_2"]
     assert bundle["actors"] == [{"identity_id": "identity_2", "memory_ids": ["memory_2"]}]
+    # An affect entry is a hit plus its evidence hop: the events formed from the same
+    # observations the cue itself cites, which travel inside `context`.
+    assert [
+        (cue["id"], cue["context"]["evidence_ids"], cue["event_ids"]) for cue in bundle["affect"]
+    ] == [("memory_3", ["memory_2"], ["memory_9"])]
+    assert bundle["affect"][0]["context"]["basis"] == "model_inference"
     assert bundle["conflicts"] == [
         {
             "lineage_id": "lineage_1",
@@ -1053,11 +1085,51 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
     assert defaulted.structured_content["budget"] == {
         "max_chars": 16_000,
         "max_items": 24,
+        "max_media_items": None,
         "memory_types": None,
         "min_confidence": 0.0,
         "freshness_seconds": None,
         "max_latency_ms": None,
     }
+
+
+async def test_the_compile_tool_reports_a_named_actor_too() -> None:
+    """Mirrors the provisional-actor case above for a person a naming assertion already names.
+
+    `actors` carries a `SearchHit`, a `NamedActor`, or a `ProvisionalActor`; only the
+    provisional shape was exercised through this tool. A named actor's structured content
+    carries `name` and `naming_assertion_id`, which is what discriminates it from the
+    provisional one.
+    """
+    memory = FakeMemory()
+    original_compile = memory.compile
+
+    def compile_with_named_actor(
+        goal: ContentInput,
+        *,
+        budget: ContextBudget | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> ContextBundle:
+        bundle = original_compile(goal, budget=budget, reference_at=reference_at, scope=scope)
+        return replace(bundle, actors=(NAMED,))
+
+    memory.compile = compile_with_named_actor  # type: ignore[method-assign]
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        compiled = await client.call_tool("compile_context", {"goal": "Who was there?"})
+
+    assert compiled.is_error is False
+    bundle = compiled.structured_content
+    assert bundle is not None
+    assert bundle["actors"] == [
+        {
+            "identity_id": "identity_3",
+            "name": "Alice",
+            "memory_ids": ["memory_2"],
+            "naming_assertion_id": "memory_3",
+        }
+    ]
 
 
 async def test_the_server_greeting_advertises_the_configured_composition() -> None:
@@ -1100,6 +1172,96 @@ async def test_every_tool_and_argument_carries_usable_prose() -> None:
     descriptions = {tool.name: tool.description for tool in tools}
     assert len(set(descriptions.values())) == len(descriptions)
     assert "backend_not_configured" in cast(str, descriptions["ask_memory"])
+
+
+_READ_TOOLS = {
+    "search_memories",
+    "ask_memory",
+    "compile_context",
+    "get_memory",
+    "list_memories",
+}
+_WRITE_TOOLS = {"add_memory", "delete_memory", "reinforce_memories"}
+_EMBODIED_TOOLS = {"analyze_speech", "analyze_faces"}
+_IDENTITY_TOOLS = {
+    "register_speaker",
+    "register_identity",
+    "get_identity",
+    "unlink_identity",
+    "forget_identity",
+}
+
+
+async def _exposed(**switches: bool) -> set[str]:
+    async with Client(build_mcp_server(cast(Memory, FakeMemory()), **switches)) as client:
+        return {tool.name for tool in (await client.list_tools()).tools}
+
+
+async def test_every_tool_belongs_to_exactly_one_withholdable_group() -> None:
+    """Gate 5 wants recall and compile alone, so every group has to be nameable.
+
+    The read tools are the floor: `compile_context` and `search_memories` in particular must
+    survive every combination, because withholding them would leave an agent nothing to consume.
+    """
+    groups = (_READ_TOOLS, _WRITE_TOOLS, _EMBODIED_TOOLS, _IDENTITY_TOOLS)
+    published = await _exposed()
+
+    assert published == set().union(*groups)
+    assert len(published) == sum(len(group) for group in groups) == 15
+
+    assert await _exposed(write_operations=False) == published - _WRITE_TOOLS
+    assert await _exposed(embodied_operations=False) == published - _EMBODIED_TOOLS
+    # One mixed combination: an agent that may name people but not create or analyze anything.
+    assert (
+        await _exposed(write_operations=False, embodied_operations=False)
+        == _READ_TOOLS | _IDENTITY_TOOLS
+    )
+    assert (
+        await _exposed(
+            write_operations=False,
+            embodied_operations=False,
+            identity_operations=False,
+        )
+        == _READ_TOOLS
+    )
+
+
+async def test_ask_memory_passes_embodied_operations_as_link_identities() -> None:
+    """`ask_memory` reaches the same face recognition `analyze_faces` commits a merge from.
+
+    Withholding `embodied_operations` must also withhold the one write `ask_memory` could
+    otherwise still reach on its own: `build_mcp_server` passes
+    `link_identities=embodied_operations` into every `Memory.ask` call it makes.
+    """
+    memory = FakeMemory()
+    async with Client(build_mcp_server(cast(Memory, memory), embodied_operations=False)) as client:
+        await client.call_tool("ask_memory", {"question": "who is this?"})
+    async with Client(build_mcp_server(cast(Memory, memory), embodied_operations=True)) as client:
+        await client.call_tool("ask_memory", {"question": "who is this?"})
+
+    link_identities_by_call = [call[-1] for call in memory.calls if call[0] == "ask"]
+    assert link_identities_by_call == [False, True]
+
+
+async def test_a_withheld_group_is_announced_and_its_tools_are_unknown() -> None:
+    """A withheld tool must fail as unknown, and the instructions must say what is missing."""
+    server = build_mcp_server(
+        cast(Memory, FakeMemory()),
+        identity_operations=False,
+        embodied_operations=False,
+        write_operations=False,
+    )
+    async with Client(server) as client:
+        refused = [
+            await client.call_tool("add_memory", {"content": "x"}),
+            await client.call_tool("analyze_faces", {"memory_id": "memory_1"}),
+        ]
+
+    assert all(result.is_error is True for result in refused)
+    instructions = cast(str, server.instructions)
+    assert "Identity operations are not exposed here" in instructions
+    assert "Embodied operations are not exposed here" in instructions
+    assert "This memory is read-only to you" in instructions
 
 
 async def test_a_host_can_withhold_the_identity_tools_from_an_agent() -> None:
@@ -1176,7 +1338,7 @@ def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
         episodes=(_media_hit(),),
         facts=(_hit(),),
         procedures=(),
-        affect=(),
+        affect=(_affect_cue(),),
         traits=(),
         conflicts=(CONFLICT,),
         unknowns=(UNKNOWN,),
@@ -1188,6 +1350,19 @@ def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
         chars=42,
         elapsed_ms=7,
         deadline_exceeded=False,
+    )
+
+
+def _affect_cue() -> AffectCue:
+    """One affect entry, whose evidence hop must reach the wire beside the hit fields."""
+    return AffectCue(
+        id="memory_3",
+        content="The user sounded tense.",
+        score=0.6,
+        memory_type=MemoryType.EPISODIC,
+        created_at=NOW,
+        context=AFFECT_CONTEXT,
+        event_ids=("memory_9",),
     )
 
 

@@ -3,7 +3,9 @@
 import base64
 import inspect
 import json
+import re
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -11,8 +13,10 @@ import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
+import mindbridge
 from mindbridge.api.app import create_app
 from mindbridge.exceptions import (
+    IdentityNotFoundError,
     IndexUnavailableError,
     MemoryNotFoundError,
     ModelError,
@@ -22,27 +26,45 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.types import (
+    AffectCue,
     AnswerResult,
     AssetRef,
     Blob,
+    ConsentClaim,
+    ConsentState,
     ContentInput,
     ContextBudget,
     ContextBundle,
     ContextConflict,
     ContextUnknown,
     ContextUnknownKind,
+    EvidenceBasis,
+    ExportBundle,
+    FaceObservation,
+    IdentityErasure,
+    IdentityProfile,
     MemoryCapabilities,
+    MemoryContext,
+    MemoryIntent,
+    MemoryKind,
+    MemoryOperation,
+    MemoryOperationRecord,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
+    NamedActor,
     ObservationContext,
     Page,
+    PendingCapture,
     ProvisionalActor,
+    RetentionReport,
     RetrievalCandidateTrace,
     RetrievalRejection,
     RetrievalScope,
     RetrievalTrace,
     SearchHit,
+    SpeakerSegment,
     TracedSearchResult,
 )
 
@@ -84,6 +106,24 @@ CAPABILITIES = MemoryCapabilities(
 
 
 PROVISIONAL = ProvisionalActor(identity_id="identity_2", memory_ids=("memory_2",))
+AFFECT_CONTEXT = MemoryContext(
+    kind=MemoryKind.AFFECT,
+    basis=EvidenceBasis.MODEL_INFERENCE,
+    confidence=0.72,
+    valid_from=None,
+    valid_until=None,
+    recorded_at=NOW,
+    evidence_ids=("memory_2",),
+    cue_modality=Modality.AUDIO,
+    valence=-0.2,
+    arousal=0.8,
+)
+NAMED = NamedActor(
+    identity_id="identity_3",
+    name="Alice",
+    memory_ids=("memory_2",),
+    naming_assertion_id="memory_3",
+)
 CONFLICT = ContextConflict(
     lineage_id="lineage_1",
     subject="ana",
@@ -95,6 +135,59 @@ UNKNOWN = ContextUnknown(
     kind=ContextUnknownKind.BUDGET_EXCLUDED,
     detail="3 candidates did not fit 24 items and 16000 chars",
 )
+SEGMENT = SpeakerSegment(
+    asset_id="b" * 64,
+    start_ms=0,
+    end_ms=1500,
+    text="Where is the toolbox?",
+    speaker_id="speaker_1",
+    speaker_name="Ann",
+    identity_score=0.82,
+)
+FACE = FaceObservation(
+    asset_id="c" * 64,
+    bounding_box=(0.1, 0.2, 0.3, 0.4),
+    identity_id="identity_1",
+    identity_name="Ann",
+    identity_score=0.77,
+    observed_at_ms=250,
+)
+ERASURE = IdentityErasure(
+    identity_id="identity_1",
+    alias_ids=("identity_4",),
+    face_exemplars=3,
+    voice_exemplars=2,
+    face_observations=7,
+    speech_segments=11,
+)
+PROFILE = IdentityProfile(
+    identity_id="identity_1",
+    name="Ann",
+    relationship="daughter",
+    confirmed=True,
+    evidence_ids=("memory_1",),
+)
+CONSENT_OPERATION = MemoryOperationRecord(
+    operation_id=7,
+    operation=MemoryOperation(
+        intent=MemoryIntent.CONSENT,
+        consent=ConsentClaim(
+            identity_id="identity_1",
+            state=ConsentState.WITHDRAWN,
+            note="asked at the door",
+        ),
+    ),
+    trigger=MemoryTrigger.MANUAL,
+    applied_at=NOW,
+    created_ids=("memory_9",),
+)
+PENDING = PendingCapture(
+    memory_id="memory_1",
+    enqueued_at=NOW,
+    attempts=1,
+    last_error="model timed out",
+    awaiting="enrichment",
+)
 
 
 class FakeMemory:
@@ -104,6 +197,8 @@ class FakeMemory:
         self.failure = failure
         self.deleted = True
         self.declared = CAPABILITIES
+        self.profile: IdentityProfile | None = PROFILE
+        self.restored: str | None = "identity_2"
 
     @property
     def capabilities(self) -> MemoryCapabilities:
@@ -245,9 +340,10 @@ class FakeMemory:
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        link_identities: bool = True,
     ) -> AnswerResult:
         self._fail()
-        self.calls.append(("ask", question, limit, memory_type, reference_at))
+        self.calls.append(("ask", question, limit, memory_type, reference_at, link_identities))
         return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
 
     def get(self, memory_id: str) -> MemoryRecord:
@@ -264,6 +360,127 @@ class FakeMemory:
         self._fail()
         self.calls.append(("delete", memory_id))
         return self.deleted
+
+    def capture(
+        self,
+        content: ContentInput,
+        *,
+        occurred_at: datetime | None = None,
+        occurred_end: datetime | None = None,
+        metadata: Mapping[str, object] | None = None,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
+        context: ObservationContext | None = None,
+    ) -> MemoryRecord:
+        self._fail()
+        copied_metadata = dict(metadata or {})
+        self.calls.append(
+            ("capture", content, occurred_at, occurred_end, copied_metadata, memory_type)
+        )
+        return _record(
+            "memory_1",
+            content if isinstance(content, str) else "Multimodal memory.",
+            occurred_at=occurred_at,
+            occurred_end=occurred_end,
+            metadata=copied_metadata,
+            memory_type=memory_type,
+        )
+
+    def settle(
+        self,
+        *,
+        limit: int = 100,
+        max_attempts: int = 3,
+        memory_ids: Sequence[str] | None = None,
+    ) -> int:
+        self._fail()
+        self.calls.append(
+            ("settle", limit, max_attempts, tuple(memory_ids) if memory_ids else None)
+        )
+        return 2
+
+    def pending_captures(
+        self,
+        *,
+        limit: int = 100,
+        memory_ids: Sequence[str] | None = None,
+    ) -> tuple[PendingCapture, ...]:
+        self._fail()
+        self.calls.append(("pending_captures", limit, tuple(memory_ids) if memory_ids else None))
+        return (PENDING,)
+
+    def speech(self, memory_id: str) -> tuple[SpeakerSegment, ...]:
+        self._fail()
+        self.calls.append(("speech", memory_id))
+        return (SEGMENT,)
+
+    def faces(self, memory_id: str) -> tuple[FaceObservation, ...]:
+        self._fail()
+        self.calls.append(("faces", memory_id))
+        return (FACE,)
+
+    def register_identity(
+        self,
+        identity_id: str,
+        name: str,
+        *,
+        relationship: str | None = None,
+    ) -> None:
+        self._fail()
+        self.calls.append(("register_identity", identity_id, name, relationship))
+
+    def identity(self, identity_id: str) -> IdentityProfile | None:
+        self._fail()
+        self.calls.append(("identity", identity_id))
+        return self.profile
+
+    def unlink_identity(self, alias_id: str) -> str | None:
+        self._fail()
+        self.calls.append(("unlink_identity", alias_id))
+        return self.restored
+
+    def forget_identity(self, identity_id: str) -> IdentityErasure:
+        self._fail()
+        self.calls.append(("forget_identity", identity_id))
+        return ERASURE
+
+    def record_consent(
+        self,
+        identity_id: str,
+        state: ConsentState,
+        *,
+        note: str | None = None,
+    ) -> MemoryOperationRecord | None:
+        self._fail()
+        self.calls.append(("record_consent", identity_id, state, note))
+        return CONSENT_OPERATION
+
+    def consent(self, identity_id: str) -> ConsentState | None:
+        self._fail()
+        self.calls.append(("consent", identity_id))
+        return ConsentState.WITHDRAWN
+
+    def export(
+        self,
+        *,
+        identity_id: str | None = None,
+        memory_ids: Sequence[str] | None = None,
+    ) -> ExportBundle:
+        self._fail()
+        self.calls.append(
+            ("export", identity_id, None if memory_ids is None else tuple(memory_ids))
+        )
+        return ExportBundle(
+            exported_at=NOW,
+            identity_id=identity_id,
+            identities=(PROFILE,),
+            records=(_record("memory_1", "Ann came by."),),
+            operations=(CONSENT_OPERATION,),
+        )
+
+    def apply_retention(self, *, dry_run: bool = False) -> RetentionReport:
+        self._fail()
+        self.calls.append(("apply_retention", dry_run))
+        return RetentionReport(dry_run=dry_run, forgotten_memory_ids=("mem_1",))
 
     def close(self) -> None:
         self.close_count += 1
@@ -366,7 +583,7 @@ def test_resource_routes_map_the_public_memory_values() -> None:
             OCCURRED_FROM,
             OCCURRED_UNTIL,
         ),
-        ("ask", "What color is it?", 4, MemoryType.PROCEDURAL, NOW),
+        ("ask", "What color is it?", 4, MemoryType.PROCEDURAL, NOW, False),
         ("delete", "memory_1"),
     ]
     assert memory.close_count == 0
@@ -508,6 +725,37 @@ def test_memory_routes_are_sync_for_fastapi_threadpool_execution() -> None:
 
     assert endpoints
     assert all(not inspect.iscoroutinefunction(endpoint) for endpoint in endpoints)
+
+
+def test_the_documented_v1_route_counts_are_the_real_ones() -> None:
+    """`docs/api/rest.md` spells out the always-on and gated `/v1` route counts in prose.
+
+    Parses "twelve ... or twenty-two when" from the doc and checks each number against the
+    routes `create_app` actually registers, once with both opt-in switches off and once with
+    both on, so a route added or removed without a doc update fails here. A tiny local map
+    stands in for `test_surface_parity._COUNT_WORDS`: that module has no `__init__.py`, so
+    importing it by dotted path here collides with mypy's own file-based module discovery.
+    """
+    count_words = {12: "twelve", 22: "twenty-two"}
+
+    def v1_route_count(**kwargs: bool) -> int:
+        app = create_app(memory=FakeMemory(), **kwargs)
+        return sum(
+            1
+            for route in app.routes
+            if isinstance(route, APIRoute) and route.path.startswith("/v1/")
+        )
+
+    always_on = v1_route_count()
+    gated = v1_route_count(identity_operations=True, embodied_operations=True)
+
+    page = (Path(mindbridge.__file__).parents[2] / "docs" / "api" / "rest.md").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"exposes (\w+) `Memory` operations under `/v1`, or ([\w-]+) when", page)
+    assert match is not None
+    assert match.group(1) == count_words[always_on]
+    assert match.group(2) == count_words[gated]
 
 
 @pytest.mark.parametrize("field", ["tenant_id", "user_id", "run_id"])
@@ -828,6 +1076,7 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
     assert bundle["budget"] == {
         "max_chars": 2_000,
         "max_items": 8,
+        "max_media_items": None,
         "memory_types": ["episodic", "semantic"],
         "min_confidence": 0.5,
         "freshness_seconds": 3_600.0,
@@ -837,6 +1086,12 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
     assert [hit["id"] for hit in bundle["episodes"]] == ["memory_2"]
     # A person the evidence observed whom nobody has named travels beside the ranked hits.
     assert bundle["actors"] == [{"identity_id": "identity_2", "memory_ids": ["memory_2"]}]
+    # An affect entry is a hit plus its evidence hop: the events formed from the same
+    # observations the cue itself cites, which travel inside `context`.
+    assert [
+        (cue["id"], cue["context"]["evidence_ids"], cue["event_ids"]) for cue in bundle["affect"]
+    ] == [("memory_3", ["memory_2"], ["memory_9"])]
+    assert bundle["affect"][0]["context"]["basis"] == "model_inference"
     assert bundle["conflicts"] == [
         {
             "lineage_id": "lineage_1",
@@ -875,6 +1130,42 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
     assert "/private/mindbridge/assets" not in response.text
 
 
+def test_the_context_route_reports_a_named_actor_too() -> None:
+    """Mirrors the provisional-actor case above for a person a naming assertion already names.
+
+    `actors` is `SearchHitResponse | NamedActorResponse | ProvisionalActorResponse`; only the
+    provisional shape was exercised through this route. A `NamedActorResponse` carries `name`
+    and `naming_assertion_id`, which is what discriminates it from the provisional one.
+    """
+    memory = FakeMemory()
+    original_compile = memory.compile
+
+    def compile_with_named_actor(
+        goal: ContentInput,
+        *,
+        budget: ContextBudget | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> ContextBundle:
+        bundle = original_compile(goal, budget=budget, reference_at=reference_at, scope=scope)
+        return replace(bundle, actors=(NAMED,))
+
+    memory.compile = compile_with_named_actor  # type: ignore[method-assign]
+
+    with TestClient(create_app(memory=memory)) as client:
+        response = client.post("/v1/context", json={"goal": "Who was there?"})
+
+    assert response.status_code == 200
+    assert response.json()["actors"] == [
+        {
+            "identity_id": "identity_3",
+            "name": "Alice",
+            "memory_ids": ["memory_2"],
+            "naming_assertion_id": "memory_3",
+        }
+    ]
+
+
 def test_the_context_route_defaults_to_the_sdk_budget() -> None:
     memory = FakeMemory()
     with TestClient(create_app(memory=memory)) as client:
@@ -885,6 +1176,7 @@ def test_the_context_route_defaults_to_the_sdk_budget() -> None:
     assert response.json()["budget"] == {
         "max_chars": 16_000,
         "max_items": 24,
+        "max_media_items": None,
         "memory_types": None,
         "min_confidence": 0.0,
         "freshness_seconds": None,
@@ -982,6 +1274,285 @@ def test_reinforce_route_reaches_the_sdk_and_rejects_an_empty_list() -> None:
     assert empty.json()["code"] == "validation_error"
 
 
+def test_capture_settle_and_pending_captures_are_always_on() -> None:
+    """The fast plane is an ordinary application operation, unlike identity and embodied access."""
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory)) as client:
+        captured = client.post(
+            "/v1/capture",
+            json={"content": "The spare key is in the blue toolbox.", "metadata": {"room": "hall"}},
+        )
+        settled = client.post(
+            "/v1/settle",
+            json={"limit": 10, "max_attempts": 5, "memory_ids": ["memory_1", "memory_2"]},
+        )
+        settled_defaults = client.post("/v1/settle", json={})
+        pending = client.get(
+            "/v1/pending_captures", params={"limit": 5, "memory_ids": ["memory_1"]}
+        )
+
+    assert captured.status_code == 201
+    assert captured.json()["content"] == "The spare key is in the blue toolbox."
+    assert settled.status_code == 200
+    assert settled.json() == {"settled": 2}
+    assert settled_defaults.json() == {"settled": 2}
+    assert pending.status_code == 200
+    assert pending.json() == {
+        "items": [
+            {
+                "memory_id": "memory_1",
+                "enqueued_at": "2026-08-27T12:00:00Z",
+                "attempts": 1,
+                "last_error": "model timed out",
+                "awaiting": "enrichment",
+            }
+        ]
+    }
+    assert memory.calls == [
+        (
+            "capture",
+            "The spare key is in the blue toolbox.",
+            None,
+            None,
+            {"room": "hall"},
+            MemoryType.SEMANTIC,
+        ),
+        ("settle", 10, 5, ("memory_1", "memory_2")),
+        ("settle", 100, 3, None),
+        ("pending_captures", 5, ("memory_1",)),
+    ]
+
+
+def test_identity_and_embodied_routes_are_off_by_default_and_404_not_403() -> None:
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory)) as client:
+        speech = client.post("/v1/speech", json={"memory_id": "memory_1"})
+        faces = client.post("/v1/faces", json={"memory_id": "memory_1"})
+        registered = client.post(
+            "/v1/identities", json={"identity_id": "identity_1", "name": "Ann"}
+        )
+        got = client.get("/v1/identities/identity_1")
+        unlinked = client.post("/v1/identities/identity_1/unlink")
+        forgotten = client.delete("/v1/identities/identity_1")
+        stated = client.post("/v1/identities/identity_1/consent", json={"state": "withdrawn"})
+        consent = client.get("/v1/identities/identity_1/consent")
+        exported = client.get("/v1/export", params={"identity_id": "identity_1"})
+        retained = client.post("/v1/retention", json={"dry_run": True})
+        openapi = client.get("/openapi.json").json()
+
+    for response in (
+        speech,
+        faces,
+        registered,
+        got,
+        unlinked,
+        forgotten,
+        stated,
+        consent,
+        exported,
+        retained,
+    ):
+        assert response.status_code == 404
+    assert "/v1/speech" not in openapi["paths"]
+    assert "/v1/identities" not in openapi["paths"]
+    assert "/v1/export" not in openapi["paths"]
+    assert "/v1/retention" not in openapi["paths"]
+    assert memory.calls == []
+
+
+def test_embodied_routes_dispatch_to_the_sdk_when_enabled() -> None:
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory, embodied_operations=True)) as client:
+        speech = client.post("/v1/speech", json={"memory_id": "memory_1"})
+        faces = client.post("/v1/faces", json={"memory_id": "memory_1"})
+
+    assert speech.status_code == 200
+    assert speech.json() == {
+        "segments": [
+            {
+                "asset_id": "b" * 64,
+                "start_ms": 0,
+                "end_ms": 1500,
+                "text": "Where is the toolbox?",
+                "speaker_id": "speaker_1",
+                "speaker_name": "Ann",
+                "identity_score": 0.82,
+            }
+        ]
+    }
+    assert faces.status_code == 200
+    assert faces.json()["observations"][0]["identity_id"] == "identity_1"
+    assert memory.calls == [("speech", "memory_1"), ("faces", "memory_1")]
+
+
+def test_answer_only_links_identities_when_embodied_operations_is_enabled() -> None:
+    """A caller with recall access alone must not acquire merge authority through `/v1/answers`.
+
+    `embodied_operations` gates `analyze_faces`, which commits the corroborated cross-modal
+    identity merge; `ask` reaches the same merge through its own face recognition, so REST must
+    pass the same switch through as `Memory.ask(..., link_identities=...)` rather than always
+    defaulting it on.
+    """
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory)) as client:
+        client.post("/v1/answers", json={"question": "What color is it?"})
+    assert memory.calls[-1][-1] is False
+
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory, embodied_operations=True)) as client:
+        client.post("/v1/answers", json={"question": "What color is it?"})
+    assert memory.calls[-1][-1] is True
+
+
+def test_embodied_routes_map_memory_not_found() -> None:
+    memory = FakeMemory(MemoryNotFoundError("memory is missing"))
+
+    with TestClient(create_app(memory=memory, embodied_operations=True)) as client:
+        response = client.post("/v1/speech", json={"memory_id": "memory_1"})
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "memory_not_found"
+
+
+def test_embodied_routes_map_unsupported_modality() -> None:
+    memory = FakeMemory(ModelError("no face backend", reason="unsupported_modality"))
+
+    with TestClient(create_app(memory=memory, embodied_operations=True)) as client:
+        response = client.post("/v1/faces", json={"memory_id": "memory_1"})
+
+    assert response.status_code == 422
+    assert response.json()["reason"] == "unsupported_modality"
+
+
+def test_identity_routes_dispatch_to_the_sdk_when_enabled() -> None:
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory, identity_operations=True)) as client:
+        registered = client.post(
+            "/v1/identities",
+            json={"identity_id": "identity_1", "name": "Ann", "relationship": "daughter"},
+        )
+        got = client.get("/v1/identities/identity_1")
+        unlinked = client.post("/v1/identities/identity_1/unlink")
+        forgotten = client.delete("/v1/identities/identity_1")
+
+    assert registered.status_code == 200
+    assert registered.json() == {"registered": True}
+    assert got.status_code == 200
+    assert got.json()["identity"]["name"] == "Ann"
+    assert unlinked.status_code == 200
+    assert unlinked.json() == {"restored_identity_id": "identity_2"}
+    assert forgotten.status_code == 200
+    assert forgotten.json()["erasure"]["identity_id"] == "identity_1"
+    assert memory.calls == [
+        ("register_identity", "identity_1", "Ann", "daughter"),
+        ("identity", "identity_1"),
+        ("unlink_identity", "identity_1"),
+        ("forget_identity", "identity_1"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "relationship"),
+    [
+        ("Alice Smith", "close friend"),
+        ("\u674e\u96f7", "\u670b\u53cb"),
+    ],
+)
+def test_register_identity_accepts_names_with_spaces_and_non_ascii_characters(
+    name: str,
+    relationship: str,
+) -> None:
+    """A person's name is plain text, not a memory-id-shaped token; REST must not reject either."""
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory, identity_operations=True)) as client:
+        response = client.post(
+            "/v1/identities",
+            json={"identity_id": "identity_1", "name": name, "relationship": relationship},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"registered": True}
+    # The SDK receives the name and relationship exactly as sent, unmodified.
+    assert memory.calls == [("register_identity", "identity_1", name, relationship)]
+
+
+def test_the_data_subject_rights_dispatch_to_the_sdk_when_identities_are_enabled() -> None:
+    """Consent, export, and retention ride the same switch that gates naming and erasure."""
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory, identity_operations=True)) as client:
+        stated = client.post(
+            "/v1/identities/identity_1/consent",
+            json={"state": "withdrawn", "note": "asked at the door"},
+        )
+        consent = client.get("/v1/identities/identity_1/consent")
+        exported = client.get("/v1/export", params={"identity_id": "identity_1"})
+        retained = client.post("/v1/retention", json={"dry_run": True})
+
+    assert stated.status_code == 200
+    operation = stated.json()["operation"]
+    assert operation["intent"] == "consent"
+    assert operation["consent"] == {
+        "identity_id": "identity_1",
+        "state": "withdrawn",
+        "note": "asked at the door",
+    }
+    assert operation["created_ids"] == ["memory_9"]
+    assert consent.json() == {"consent": "withdrawn"}
+    assert exported.status_code == 200
+    bundle = exported.json()
+    assert bundle["identity_id"] == "identity_1"
+    assert [record["id"] for record in bundle["records"]] == ["memory_1"]
+    assert [profile["name"] for profile in bundle["identities"]] == ["Ann"]
+    assert [row["operation_id"] for row in bundle["operations"]] == [7]
+    assert retained.status_code == 200
+    assert retained.json() == {
+        "dry_run": True,
+        "media_memory_ids": [],
+        "forgotten_memory_ids": ["mem_1"],
+        "asset_ids": [],
+        "capture_memory_ids": [],
+        "deleted": 1,
+    }
+    assert memory.calls == [
+        ("record_consent", "identity_1", ConsentState.WITHDRAWN, "asked at the door"),
+        ("consent", "identity_1"),
+        ("export", "identity_1", None),
+        ("apply_retention", True),
+    ]
+
+
+def test_get_identity_reports_no_registered_profile_without_failing() -> None:
+    memory = FakeMemory()
+    memory.profile = None
+
+    with TestClient(create_app(memory=memory, identity_operations=True)) as client:
+        response = client.get("/v1/identities/unknown_id")
+
+    assert response.status_code == 200
+    assert response.json() == {"identity": None}
+
+
+def test_identity_routes_map_identity_not_found() -> None:
+    memory = FakeMemory(IdentityNotFoundError("identity does not exist: identity_1"))
+
+    with TestClient(create_app(memory=memory, identity_operations=True)) as client:
+        registered = client.post(
+            "/v1/identities", json={"identity_id": "identity_1", "name": "Ann"}
+        )
+        forgotten = client.delete("/v1/identities/identity_1")
+
+    assert registered.status_code == 404
+    assert registered.json()["code"] == "identity_not_found"
+    assert forgotten.status_code == 404
+    assert forgotten.json()["code"] == "identity_not_found"
+
+
 def _record(
     memory_id: str,
     content: str,
@@ -1018,7 +1589,7 @@ def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
         episodes=(_media_hit(),),
         facts=(_hit(),),
         procedures=(),
-        affect=(),
+        affect=(_affect_cue(),),
         traits=(),
         conflicts=(CONFLICT,),
         unknowns=(UNKNOWN,),
@@ -1030,6 +1601,19 @@ def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
         chars=42,
         elapsed_ms=7,
         deadline_exceeded=False,
+    )
+
+
+def _affect_cue() -> AffectCue:
+    """One affect entry, whose evidence hop must reach the wire beside the hit fields."""
+    return AffectCue(
+        id="memory_3",
+        content="The user sounded tense.",
+        score=0.6,
+        memory_type=MemoryType.EPISODIC,
+        created_at=NOW,
+        context=AFFECT_CONTEXT,
+        event_ids=("memory_9",),
     )
 
 

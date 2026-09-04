@@ -8,22 +8,29 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from mindbridge import AssetRef, ContextBudget, MemoryType, Modality, SearchHit
 from mindbridge._telemetry import (
+    CAPTURE_TIME_TO_SEARCHABLE,
     MODEL_MODULE,
     MODEL_TTFT,
     SPAN_KIND,
     TOKEN_AUDIO_SECONDS,
 )
 from mindbridge.benchmarks import eval as eval_module
+from mindbridge.benchmarks import eval_telemetry as eval_telemetry_module
 from mindbridge.benchmarks.eval import NOISE_FLOOR, SampleResult
 from mindbridge.benchmarks.eval_adapters import (
     EvalQuestion,
@@ -34,6 +41,10 @@ from mindbridge.benchmarks.eval_adapters import (
 from mindbridge.benchmarks.eval_cache import EvidenceInterval
 from mindbridge.benchmarks.eval_statistics import ScoredValue, percentile
 from mindbridge.benchmarks.eval_telemetry import (
+    BENCHMARK_COMPILE_CHARS,
+    BENCHMARK_COMPILE_ITEMS,
+    BENCHMARK_COMPILE_MEDIA_ITEMS,
+    BENCHMARK_COMPILE_SPAN,
     BENCHMARK_INGEST_ITEMS,
     BENCHMARK_INGEST_SPAN,
     BENCHMARK_TASK,
@@ -43,6 +54,7 @@ from mindbridge.benchmarks.eval_telemetry import (
     ResourceSampler,
     storage_bytes,
 )
+from mindbridge.context import compile_context
 
 
 def _span(
@@ -348,6 +360,276 @@ def test_storage_bytes_separates_media_rows_and_vectors(tmp_path: Path) -> None:
         "other": 1,
         "total": 15,
     }
+
+
+def test_resource_sampler_integrates_gpu_power_into_energy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.eval_telemetry._nvidia_utilization",
+        lambda: ((0, 50.0, 1024, 120.0),),
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.eval_telemetry._rapl_energy_uj",
+        lambda root=None: (None, "no intel-rapl packages under /sys/class/powercap"),
+    )
+    with ResourceSampler(interval_seconds=0.05) as sampler:
+        time.sleep(0.12)
+
+    energy = cast(Mapping[str, object], sampler.json(wall_seconds=1.0)["energy"])
+    gpu_joules = cast(Mapping[str, float], energy["gpu_joules"])
+    # Rectangle-rule integral of at least two 120 W samples over ~0.05 s each.
+    assert gpu_joules["0"] > 0.0
+    assert energy["cpu_package_joules"] is None
+    assert energy["available"] is True
+    assert energy["reason"] is None
+
+
+def test_resource_sampler_reports_unavailable_energy_with_a_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.eval_telemetry._nvidia_utilization",
+        lambda: (),
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.eval_telemetry._rapl_energy_uj",
+        lambda root=None: (None, "no intel-rapl packages under /sys/class/powercap"),
+    )
+    with ResourceSampler(interval_seconds=0.05) as sampler:
+        pass
+
+    energy = cast(Mapping[str, object], sampler.json(wall_seconds=1.0)["energy"])
+    assert energy == {
+        "cpu_package_joules": None,
+        "gpu_joules": None,
+        "available": False,
+        "reason": (
+            "no intel-rapl packages under /sys/class/powercap; no GPU visible to nvidia-smi"
+        ),
+    }
+
+
+def _rapl_tree(tmp_path: Path, packages: Sequence[tuple[int, int | None]]) -> Path:
+    """Write a fake powercap tree, one package per `(energy_uj, max_energy_range_uj)` pair."""
+    root = tmp_path / "powercap"
+    for index, (energy, max_range) in enumerate(packages):
+        package = root / f"intel-rapl:{index}"
+        package.mkdir(parents=True)
+        (package / "energy_uj").write_text(str(energy))
+        if max_range is not None:
+            (package / "max_energy_range_uj").write_text(str(max_range))
+    return root
+
+
+def test_rapl_energy_reads_each_package_with_the_range_it_wraps_at(tmp_path: Path) -> None:
+    root = _rapl_tree(tmp_path, ((1_000_000, 262_143_328_850), (2_500_000, None)))
+
+    readings, reason = eval_telemetry_module._rapl_energy_uj(root)
+
+    assert readings == {
+        "intel-rapl:0": (1_000_000, 262_143_328_850),
+        "intel-rapl:1": (2_500_000, None),
+    }
+    assert reason is None
+
+
+def test_rapl_deltas_are_summed_per_package(tmp_path: Path) -> None:
+    start = {"intel-rapl:0": (1_000_000, 100_000_000), "intel-rapl:1": (500_000, 100_000_000)}
+    end = {"intel-rapl:0": (3_000_000, 100_000_000), "intel-rapl:1": (900_000, 100_000_000)}
+
+    total, reason = eval_telemetry_module._rapl_delta_uj(start, end)
+
+    assert total == 2_400_000
+    assert reason is None
+
+
+def test_a_wrapped_rapl_counter_is_corrected_against_its_own_range() -> None:
+    """A run longer than a package's wrap period reported 0 J for real energy.
+
+    `energy_uj` wraps at `max_energy_range_uj` -- tens of minutes on a busy package -- so a
+    sweep that crossed one subtracted to a negative delta, which was clamped to zero. Worse,
+    the packages were summed before subtracting, so one package's wrap could hide inside
+    another's rise and publish a plausible, wrong number.
+    """
+    max_range = 100_000_000
+    # The first package wrapped 2 000 000 uj past its range; the second rose normally.
+    start = {"intel-rapl:0": (99_000_000, max_range), "intel-rapl:1": (1_000_000, max_range)}
+    end = {"intel-rapl:0": (1_000_000, max_range), "intel-rapl:1": (4_000_000, max_range)}
+
+    total, reason = eval_telemetry_module._rapl_delta_uj(start, end)
+
+    assert total == 2_000_000 + 3_000_000
+    assert reason is None
+
+
+def test_a_wrap_with_no_published_range_is_refused_rather_than_guessed(tmp_path: Path) -> None:
+    start = {"intel-rapl:0": (99_000_000, None)}
+    end = {"intel-rapl:0": (1_000_000, None)}
+
+    total, reason = eval_telemetry_module._rapl_delta_uj(start, end)
+
+    assert total is None
+    assert reason is not None and "max_energy_range_uj" in reason
+
+
+def test_a_sampler_whose_counter_wrapped_reports_the_corrected_energy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mindbridge.benchmarks.eval_telemetry._nvidia_utilization", lambda: ())
+    readings = iter(
+        (
+            ({"intel-rapl:0": (99_000_000, 100_000_000)}, None),
+            ({"intel-rapl:0": (1_000_000, 100_000_000)}, None),
+        )
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.eval_telemetry._rapl_energy_uj",
+        lambda root=None: next(readings),
+    )
+
+    with ResourceSampler(interval_seconds=0.05) as sampler:
+        pass
+
+    energy = cast(Mapping[str, object], sampler.json(wall_seconds=1.0)["energy"])
+    # 2 000 000 uj across the wrap, not the 0.0 the clamp used to publish.
+    assert energy["cpu_package_joules"] == pytest.approx(2.0)
+
+
+def test_rapl_energy_reports_why_it_could_not_read_anything(tmp_path: Path) -> None:
+    total, reason = eval_telemetry_module._rapl_energy_uj(tmp_path / "missing")
+
+    assert total is None
+    assert reason is not None and "no intel-rapl packages" in reason
+
+
+def test_rapl_energy_reports_the_unreadable_file(tmp_path: Path) -> None:
+    root = tmp_path / "powercap"
+    package = root / "intel-rapl:0"
+    package.mkdir(parents=True)
+    (package / "energy_uj").write_text("not-a-number")
+
+    total, reason = eval_telemetry_module._rapl_energy_uj(root)
+
+    assert total is None
+    assert reason is not None and "energy_uj" in reason
+
+
+# --- family 6: fast-plane and compiler telemetry (capture, settle, compile) -----------------
+
+
+def _asset(asset_id: str) -> AssetRef:
+    """A resolved image asset, which is what a record's assets must be."""
+    return AssetRef(
+        id=asset_id,
+        modality=Modality.IMAGE,
+        media_type="image/png",
+        size_bytes=1,
+        sha256="a" * 64,
+        path=Path(f"{asset_id}.png"),
+    )
+
+
+def test_compile_telemetry_counts_every_grounded_media_part() -> None:
+    """One omni memory with two assets is two media parts, the quantity the budget bounds.
+
+    The count was of hits carrying any asset, so a bundle grounding a still and a clip from one
+    observation reported the same single part as a bundle grounding only the still, and
+    multi-asset artifacts undercounted the compiler's real media spend.
+    """
+    reference = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    hit = SearchHit(
+        id="omni",
+        content="a still and a clip from one observation",
+        score=0.9,
+        created_at=reference,
+        memory_type=MemoryType.EPISODIC,
+        modality=Modality.IMAGE,
+        assets=(
+            _asset("asset-still"),
+            _asset("asset-second-still"),
+        ),
+    )
+    bundle = compile_context(
+        "what happened",
+        (hit,),
+        budget=ContextBudget(),
+        reference_at=reference,
+    )
+    assert len(bundle.hits) == 1
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with eval_module._compile_span(provider.get_tracer("test"), bundle):
+        pass
+
+    attributes = exporter.get_finished_spans()[-1].attributes
+    assert attributes is not None
+    assert attributes[BENCHMARK_COMPILE_ITEMS] == 1
+    assert attributes[BENCHMARK_COMPILE_MEDIA_ITEMS] == 2
+
+
+def test_capture_settle_and_compile_spans_are_aggregated_separately() -> None:
+    result = _aggregate(
+        (
+            _span("mindbridge.capture", end_ms=10, kind="operation"),
+            _span("mindbridge.capture", end_ms=20, kind="operation"),
+            _span(
+                "mindbridge.settle",
+                end_ms=40,
+                kind="operation",
+                attributes={CAPTURE_TIME_TO_SEARCHABLE: 55.0},
+            ),
+            _span("mindbridge.compile", end_ms=30, kind="operation"),
+            _span(
+                BENCHMARK_COMPILE_SPAN,
+                end_ms=1,
+                kind="stage",
+                attributes={
+                    BENCHMARK_COMPILE_CHARS: 900,
+                    BENCHMARK_COMPILE_ITEMS: 3,
+                    BENCHMARK_COMPILE_MEDIA_ITEMS: 1,
+                },
+            ),
+        )
+    )
+
+    capture = cast(Mapping[str, object], result["capture"])
+    assert capture["span"] == "mindbridge.capture"
+    assert capture["count"] == 2
+    assert cast(float, cast(Mapping[str, object], capture["latency_ms"])["p50"]) == pytest.approx(
+        15.0
+    )
+
+    time_to_searchable = cast(Mapping[str, object], result["time_to_searchable_ms"])
+    assert time_to_searchable["count"] == 1
+    assert cast(float, time_to_searchable["p50"]) == pytest.approx(55.0)
+
+    formation = cast(Mapping[str, object], result["formation"])
+    assert formation["span"] == "mindbridge.settle"
+    assert formation["count"] == 1
+    assert cast(float, cast(Mapping[str, object], formation["latency_ms"])["p50"]) == pytest.approx(
+        40.0
+    )
+
+    compile_block = cast(Mapping[str, object], result["compile"])
+    assert compile_block["span"] == "mindbridge.compile"
+    assert compile_block["count"] == 1
+    bundle_chars = cast(Mapping[str, object], compile_block["bundle_chars"])
+    assert bundle_chars["count"] == 1
+    assert bundle_chars["p50"] == pytest.approx(900)
+    bundle_items = cast(Mapping[str, object], compile_block["bundle_items"])
+    assert bundle_items["p50"] == pytest.approx(3)
+    bundle_media_items = cast(Mapping[str, object], compile_block["bundle_media_items"])
+    assert bundle_media_items["p50"] == pytest.approx(1)
+
+
+def test_capture_settle_and_compile_report_nothing_when_unexercised() -> None:
+    result = _aggregate((_span(SEARCH_SPAN, end_ms=5),))
+
+    assert cast(Mapping[str, object], result["capture"])["count"] == 0
+    assert cast(Mapping[str, object], result["time_to_searchable_ms"])["count"] == 0
+    assert cast(Mapping[str, object], result["formation"])["count"] == 0
+    assert cast(Mapping[str, object], result["compile"])["count"] == 0
 
 
 # --- controls: random ranker, blind answer, and R@20 next to R@1 -----------------------------

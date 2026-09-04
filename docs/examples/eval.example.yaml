@@ -189,12 +189,20 @@ benchmark:
     tasks: locomo-refined,clbench
 
     # Which arms answer: mindbridge (the product), blind (no evidence), full-context (the corpus
-    # stuffed into one prompt), random (shuffled candidates, retrieval metrics only). Baseline
-    # arms share one ingest and are never official. `--blind` labels a whole run as the control
-    # and stays a flag, so it refuses to run alongside an arm selection made here.
+    # stuffed into one prompt), random (shuffled candidates, retrieval metrics only), compile
+    # (Memory.compile's rendered bundle). Baseline arms share one ingest and are never official.
+    # `--blind` labels a whole run as the control and stays a flag, so it refuses to run alongside
+    # an arm selection made here.
     arms: mindbridge
     # Character budget the full-context arm stuffs into one prompt.
     full_context_chars: 128000
+    # ContextBudget the compile arm compiles against; defaults match the SDK's own ContextBudget.
+    compile_max_items: 24
+    compile_max_chars: 16000
+    # How memories reach the store: add (Memory.add_many/add, the strong default) or capture
+    # (Memory.capture then Memory.settle -- exercises the fast plane so capture acknowledgement
+    # and time-to-searchable are measured from a real run instead of reading empty).
+    ingest: add
     # `all` (or -1) for every unit, a 0-1 fraction, or an absolute count.
     limit: all
     offset: 0

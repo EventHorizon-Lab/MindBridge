@@ -28,6 +28,8 @@ from mindbridge import (
     Modality,
     ModelError,
     ModelInput,
+    ObservationContext,
+    RetrievalScope,
     ValidationError,
 )
 from mindbridge._telemetry import CAPTURE_FAILED, CAPTURE_SETTLED, CAPTURE_TIME_TO_SEARCHABLE
@@ -705,19 +707,25 @@ def test_two_concurrent_settles_never_run_the_models_over_one_record_twice(
         assert {hit.id for hit in memory.search("spare key")} == {record.id}
 
 
-def test_a_captured_place_survives_settlement(tmp_path: Path) -> None:
-    """`capture()` persists the observation's place, or scoped search loses the record."""
-    from mindbridge import ObservationContext, RetrievalScope
+def test_a_capture_keeps_the_place_it_was_captured_in(tmp_path: Path) -> None:
+    """`capture` acknowledges before any model work, but it must not drop a record column.
 
-    with Memory(tmp_path, embedder=CountingEmbedder(), minimum_relevance=0) as memory:
-        captured = memory.capture(
+    The place is supplied at capture time and never re-supplied: `settle` leaves the existing row
+    alone, so a place lost on the capture write is lost for good and the record is unreachable
+    from every place-scoped question about the room it was captured in.
+    """
+    with Memory(tmp_path, embedder=TinyEmbedder(), minimum_relevance=0) as memory:
+        record = memory.capture(
             "the kettle boiled dry again",
             context=ObservationContext(place_id="kitchen"),
         )
 
+        assert memory.get(record.id).place_id == "kitchen"
         assert memory.settle() == 1
-        scoped = memory.search("kettle", limit=10, scope=RetrievalScope(place_id="kitchen"))
-        assert [hit.id for hit in scoped] == [captured.id]
+        assert memory.get(record.id).place_id == "kitchen"
+        assert {
+            hit.id for hit in memory.search("kettle", scope=RetrievalScope(place_id="kitchen"))
+        } == {record.id}
 
 
 def test_settle_counts_only_the_rows_it_actually_settled(tmp_path: Path) -> None:

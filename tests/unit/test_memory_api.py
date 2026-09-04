@@ -36,6 +36,7 @@ from mindbridge._telemetry import (
     record_model_usage,
     record_unmetered_model_usage,
 )
+from mindbridge.control import dump_operation
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -64,6 +65,7 @@ from mindbridge.models.base import (
     SpeakerEmbedding,
     SpeechAnalysis,
     SpeechTurn,
+    StreamingGenerationBackend,
 )
 from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.types import (
@@ -74,9 +76,12 @@ from mindbridge.types import (
     ContextBudget,
     EvidenceBasis,
     FormationProposal,
+    IdentityChange,
     IdentityProfile,
     IndexQuantization,
+    MemoryIntent,
     MemoryKind,
+    MemoryOperationRecord,
     MemoryRecord,
     MemoryTrigger,
     MemoryType,
@@ -1022,9 +1027,69 @@ def test_relative_time_prefers_event_time_and_routes_the_reference(tmp_path: Pat
         )
 
     assert answer.hits[0].id == previous.id
-    assert "Reference time for relative dates: 2026-08-27T00:30:00.000000+14:00" in (
+    assert "Reference time for relative dates: 2026-08-27T00:30:00+14:00" in (
         models.answer_calls[-1][0].text
     )
+
+
+def test_duration_question_routes_the_reference_without_a_parsable_phrase(
+    tmp_path: Path,
+) -> None:
+    # "How long ago" carries no parsable date, so nothing narrows retrieval and no caller supplied
+    # a reference. The reader still cannot subtract without knowing when it is being asked.
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory:
+        memory.add(
+            "grandpa visited",
+            occurred_at=datetime(2026, 8, 20, 9, tzinfo=timezone.utc),
+            memory_type=MemoryType.EPISODIC,
+        )
+        # The note carries seconds, so the lower bound is compared at that resolution.
+        before = datetime.now(timezone.utc).replace(microsecond=0)
+        memory.ask("How long ago did grandpa visit?", limit=1)
+        after = datetime.now(timezone.utc)
+        memory.search("How long ago did grandpa visit?", limit=1)
+        embedded = tuple(zip(models.embed_tasks, models.embed_batches, strict=True))
+
+    prefix = "Reference time for relative dates: "
+    routed = models.answer_calls[-1][0].text
+    assert prefix in routed
+    reference = datetime.fromisoformat(routed.rsplit(prefix, 1)[1].strip())
+    assert before <= reference <= after
+    # The note is for the reader, not the index: it must never reach an embedding, or the query
+    # vector would drift with the clock and `search()` would answer differently every minute.
+    assert [text for task, batch in embedded for text in batch if task is EmbedTask.QUERY] == [
+        "How long ago did grandpa visit?"
+    ] * 2
+
+
+def test_a_transcribed_question_ends_with_the_reference_time(tmp_path: Path) -> None:
+    """The note has to be applied to what the answerer is actually handed.
+
+    A spoken question carries no text of its own, so appending the note before routing skipped it
+    entirely -- the one question shape whose asker cannot see what the reader received. Routing
+    also appends the speech identities and the transcript, so a note applied first stops being
+    the final line it is documented to be.
+    """
+    models = _FakeModels(
+        capabilities=_Capabilities(
+            embedding=frozenset({Modality.TEXT}),
+            generation=frozenset({Modality.TEXT}),
+            transcription=frozenset({Modality.AUDIO}),
+        )
+    )
+    prefix = "Reference time for relative dates: "
+    with _memory(tmp_path, models) as memory:
+        memory.add("red wrench in the shed", memory_type=MemoryType.EPISODIC)
+        memory.ask(Blob(b"spoken question", "audio/wav", "question.wav"), limit=1)
+        memory.ask("How long ago was the red wrench seen?", limit=1)
+
+    spoken, written = (call[0].text for call in models.answer_calls)
+    assert spoken.splitlines()[-1].startswith(prefix)
+    assert written.splitlines()[-1].startswith(prefix)
+    # Seconds, because that is the resolution the kernel's clock claim is worth; microseconds
+    # read as a precision the reference time does not have.
+    assert datetime.fromisoformat(written.rsplit(prefix, 1)[1].strip()).microsecond == 0
 
 
 def test_named_month_and_calendar_year_prefer_event_time(tmp_path: Path) -> None:
@@ -1088,7 +1153,7 @@ def test_natural_today_anchor_sets_relative_time_unless_reference_is_explicit(
 
     assert answer.hits[0].id == anchored.id
     assert overridden[0].id == explicit.id
-    assert "Reference time for relative dates: 2024-05-02T00:00:00.000000+00:00" in (
+    assert "Reference time for relative dates: 2024-05-02T00:00:00+00:00" in (
         models.answer_calls[-1][0].text
     )
 
@@ -2110,7 +2175,13 @@ def test_naming_is_auditable_and_rollback_restores_the_previous_name(tmp_path: P
         memory.register_identity(identity_id, "Li Hua")
 
         logged = memory.operations()
-        assert [entry.trigger for entry in logged] == [MemoryTrigger.MANUAL, MemoryTrigger.MANUAL]
+        # Two host namings, and behind them the cross-modal merge the recognizers corroborated
+        # on this one video: the kernel commits that from evidence, so it logs as EVIDENCE.
+        assert [entry.trigger for entry in logged] == [
+            MemoryTrigger.MANUAL,
+            MemoryTrigger.MANUAL,
+            MemoryTrigger.EVIDENCE,
+        ]
         assert memory.identity(identity_id) == IdentityProfile(
             identity_id=identity_id, name="Li Hua", relationship="neighbour", confirmed=True
         )
@@ -4176,6 +4247,211 @@ def test_no_hit_ask_routes_media_and_cannot_accept_fabricated_hits(tmp_path: Pat
     assert models.answer_calls[-1][0].modalities == {Modality.TEXT}
 
 
+class _CountingStreamer(_FakeModels):
+    """A streaming answerer that reports how far the caller has pulled."""
+
+    generation_model = "fake-streaming-generation"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.emitted: list[str] = []
+
+    def stream_answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+    ) -> Generator[str, None, tuple[SearchHit, ...]]:
+        del question
+        for part in ("the red ", "toolbox is ", "on the bench"):
+            self.emitted.append(part)
+            yield part
+        return tuple(hits[:1])
+
+
+def test_ask_stream_yields_deltas_then_the_result_ask_would_have_returned(
+    tmp_path: Path,
+) -> None:
+    models = _CountingStreamer()
+    with _memory(tmp_path, models) as memory:
+        memory.add("the red toolbox is on the bench")
+        memory.add("the blue crate is in bay three")
+
+        chunks = list(memory.ask_stream("where is the red toolbox?"))
+        buffered = memory.ask("where is the red toolbox?")
+
+    deltas = [chunk.text for chunk in chunks if chunk.result is None]
+    finals = [chunk.result for chunk in chunks if chunk.result is not None]
+    assert deltas == ["the red ", "toolbox is ", "on the bench"]
+    # Exactly one terminal chunk, and it is the whole `ask()` contract: answer, grounding,
+    # and abstention, not just the joined text.
+    assert len(finals) == 1
+    assert "".join(deltas) == finals[0].answer == buffered.answer
+    assert [hit.id for hit in finals[0].hits] == [hit.id for hit in buffered.hits]
+    assert finals[0].abstained is buffered.abstained is False
+
+
+def test_ask_stream_delivers_each_delta_before_the_next_is_produced(tmp_path: Path) -> None:
+    models = _CountingStreamer()
+    with _memory(tmp_path, models) as memory:
+        memory.add("the red toolbox is on the bench")
+
+        stream = memory.ask_stream("where is the red toolbox?")
+        first = next(stream)
+
+        # The point of the operation: the caller holds text while the model is still producing.
+        assert first.text == "the red "
+        assert models.emitted == ["the red "]
+        stream.close()
+
+
+def test_ask_stream_yields_one_delta_when_the_backend_does_not_stream(tmp_path: Path) -> None:
+    models = _FakeModels()
+    assert not isinstance(models, StreamingGenerationBackend)
+    with _memory(tmp_path, models) as memory:
+        memory.add("the red toolbox is on the bench")
+
+        chunks = list(memory.ask_stream("where is the red toolbox?"))
+
+    deltas = [chunk.text for chunk in chunks if chunk.result is None]
+    finals = [chunk.result for chunk in chunks if chunk.result is not None]
+    assert len(deltas) == 1
+    assert deltas[0] == finals[0].answer
+
+
+def test_ask_stream_reinforces_before_it_hands_over_the_result(tmp_path: Path) -> None:
+    models = _CountingStreamer()
+    with _memory(tmp_path, models) as memory:
+        record = memory.add("the red toolbox is on the bench")
+
+        stream = memory.ask_stream("where is the red toolbox?")
+        next(stream)
+        mid = memory._store.read_memory(record.id)
+        assert mid is not None and mid.access_count == 0
+
+        result = next(chunk.result for chunk in stream if chunk.result is not None)
+        settled = memory._store.read_memory(record.id)
+
+        # Stopping on the terminal chunk is how a result is read, and a generator stays
+        # suspended wherever the caller stops. Nothing may still be open there, or every
+        # ordinary caller would pin an operation and hang `close()`.
+        assert memory._active_operations == 0
+
+    # A caller holding the result holds a settled store, so reading access counts straight
+    # after the answer cannot race the reinforcement the answer caused.
+    assert [hit.id for hit in result.hits] == [record.id]
+    assert settled is not None and settled.access_count == 1
+
+
+def test_ask_stream_validates_before_it_is_iterated(tmp_path: Path) -> None:
+    with _memory(tmp_path) as memory:
+        memory.add("the red toolbox is on the bench")
+
+        # A generator that defers validation to the first pull would report a bad limit from
+        # somewhere other than the call that made the mistake.
+        with pytest.raises(ValidationError, match="limit must be between 1 and 100"):
+            memory.ask_stream("where is it?", limit=0)
+
+
+def test_ask_stream_without_answerer_fails_at_the_call(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with Memory(tmp_path, embedder=models) as memory:
+        memory.add("the red toolbox is on the bench")
+
+        with pytest.raises(ModelError, match="answer backend is not configured") as unconfigured:
+            memory.ask_stream("where is it?")
+        assert unconfigured.value.reason == "backend_not_configured"
+
+
+def test_abandoning_ask_stream_releases_the_operation_it_holds(tmp_path: Path) -> None:
+    models = _CountingStreamer()
+    memory = _memory(tmp_path, models)
+    try:
+        memory.add("the red toolbox is on the bench")
+
+        stream = memory.ask_stream("where is the red toolbox?")
+        next(stream)
+        assert memory._active_operations == 1
+
+        # `close()` waits on open operations, so a stream that pinned one would hang shutdown
+        # rather than fail a test.
+        stream.close()
+        assert memory._active_operations == 0
+    finally:
+        memory.close()
+
+
+def test_abandoning_ask_stream_closes_the_generation_stream_inside_the_operation(
+    tmp_path: Path,
+) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    closed: list[bool] = []
+
+    class ClosingStreamer(_CountingStreamer):
+        def stream_answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+        ) -> Generator[str, None, tuple[SearchHit, ...]]:
+            try:
+                yield from super().stream_answer(question, hits)
+            finally:
+                # Where a real adapter releases the provider's streaming response.
+                closed.append(True)
+            return tuple(hits[:1])
+
+    models = ClosingStreamer()
+    memory = Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        tracer=provider.get_tracer("test"),
+    )
+    try:
+        memory.add("the red toolbox is on the bench")
+        stream = memory.ask_stream("where is the red toolbox?")
+        next(stream)
+        assert closed == []
+        stream.close()
+    finally:
+        memory.close()
+    provider.shutdown()
+
+    assert closed == [True]
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    generation_end = spans["mindbridge.model.generation"].end_time
+    ask_end = spans["mindbridge.ask"].end_time
+    assert generation_end is not None and ask_end is not None
+    # Left to the frame's last reference dropping, the generation stream would close after the
+    # operation that owns it, which loses its model usage and inverts the trace.
+    assert generation_end <= ask_end
+
+
+def test_ask_stream_records_time_to_first_token_on_the_generation_span(tmp_path: Path) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    models = _CountingStreamer()
+    with Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        memory.add("the red toolbox is on the bench")
+        for _chunk in memory.ask_stream("where is the red toolbox?"):
+            pass
+    provider.shutdown()
+
+    generation = next(
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.model.generation"
+    )
+    assert generation.attributes is not None
+    ttft = generation.attributes[MODEL_TTFT]
+    assert isinstance(ttft, int | float) and ttft >= 0
+
+
 def test_ask_returns_only_retrieved_hits_the_answerer_used(tmp_path: Path) -> None:
     class SelectingModels(_FakeModels):
         def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
@@ -4944,6 +5220,60 @@ async def test_async_add_stream_consumes_an_async_iterable(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_async_ask_stream_yields_the_same_chunks_as_the_sync_stream(tmp_path: Path) -> None:
+    models = _CountingStreamer()
+    async with AsyncMemory(tmp_path, embedder=models, answerer=models) as memory:
+        await memory.add("the red toolbox is on the bench")
+
+        deltas: list[str] = []
+        final: AnswerResult | None = None
+        async for chunk in memory.ask_stream("where is the red toolbox?"):
+            if chunk.result is None:
+                deltas.append(chunk.text)
+            else:
+                final = chunk.result
+
+        assert deltas == ["the red ", "toolbox is ", "on the bench"]
+        assert final is not None
+        assert "".join(deltas) == final.answer
+        assert (await memory.ask("where is the red toolbox?")).answer == final.answer
+
+
+@pytest.mark.asyncio
+async def test_async_ask_stream_rejects_arguments_at_the_call_like_the_sync_stream(
+    tmp_path: Path,
+) -> None:
+    models = _CountingStreamer()
+    async with AsyncMemory(tmp_path, embedder=models, answerer=models) as memory:
+        # An `async def` generator would defer this to the first `__anext__`, so the two
+        # facades would report the same bad argument from two different places.
+        with pytest.raises(ValidationError, match="limit must be between 1 and 100"):
+            memory.ask_stream("where is it?", limit=0)
+
+
+@pytest.mark.asyncio
+async def test_async_ask_stream_releases_the_operation_when_the_caller_stops_early(
+    tmp_path: Path,
+) -> None:
+    models = _CountingStreamer()
+    memory = AsyncMemory(tmp_path, embedder=models, answerer=models)
+    try:
+        await memory.add("the red toolbox is on the bench")
+
+        stream = memory.ask_stream("where is the red toolbox?")
+        assert (await anext(stream)).text == "the red "
+        # Closing the async generator has to close the synchronous one behind it, off the
+        # event loop; otherwise `close()` waits on an operation nobody will finish.
+        await stream.aclose()
+
+        # `aclose()` awaits the synchronous close through the worker, so the operation is
+        # already released when it returns; a poll here would hide a leak behind a timeout.
+        assert memory._memory._active_operations == 0
+    finally:
+        await memory.close()
+
+
+@pytest.mark.asyncio
 async def test_async_add_stream_names_a_source_failure(tmp_path: Path) -> None:
     async def contents() -> AsyncIterator[str]:
         yield "red async clip"
@@ -5488,6 +5818,92 @@ def test_add_stream_flushes_a_slow_source_on_the_time_bound(
         assert index.flush_calls == 4
 
 
+def test_a_stream_that_ended_stops_deferring_even_if_another_outlives_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Deferral belongs to the streaming thread, so an ended stream cannot silence its flushes.
+
+    While it was one shared slot, each stream saved the value it found and restored it on the way
+    out, so the second to finish handed the *first* thread's id back. Nothing ever cleared it
+    again: every later `add`, `delete` or `optimize` on that thread returned without flushing the
+    index, and the rows stayed durable but unsearchable.
+    """
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        both_open = Barrier(2, timeout=30)
+        first_closed = Event()
+        second_closed = Event()
+        after_both: list[int] = []
+
+        def first() -> None:
+            for _record in memory.add_stream(("clip from the first stream",)):
+                both_open.wait()
+            first_closed.set()
+            assert second_closed.wait(timeout=30)
+            before = index.flush_calls
+            memory.add("a note added once both streams had ended")
+            after_both.append(index.flush_calls - before)
+
+        def second() -> None:
+            # Opens inside the first stream's group and closes after it, which is the order that
+            # made the restore hand back an ident belonging to a thread no longer streaming.
+            for _record in memory.add_stream(("clip from the second stream",)):
+                both_open.wait()
+                assert first_closed.wait(timeout=30)
+            second_closed.set()
+
+        threads = [Thread(target=first), Thread(target=second)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert not any(thread.is_alive() for thread in threads)
+
+    assert after_both == [1]
+
+
+def test_a_stream_pumped_across_threads_stops_deferring_on_the_thread_that_opened_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stream clears deferral on every thread it ran on, not just the one that ended it.
+
+    `add_stream` is a generator, so its body runs on whichever thread calls `next`. A consumer
+    that hands the iterator between workers -- what an executor-backed pump does -- opened the
+    group on one thread and closed it on another, so the exit cleared the finishing thread and
+    left the opener deferring forever: every later `add` or `delete` on that worker returned
+    without flushing the index and its rows stayed durable but unsearchable.
+    """
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+    exhausted = object()
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        stream = memory.add_stream(("clip the opener pumps", "clip the finisher pumps"))
+
+        def add_and_count_flushes() -> int:
+            before = index.flush_calls
+            memory.add("a note added on the thread that opened the stream")
+            return index.flush_calls - before
+
+        with (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="opener") as opener,
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="finisher") as finisher,
+        ):
+            # The opener runs the body up to the first yield, which is where the group opens.
+            assert opener.submit(next, stream, exhausted).result() is not exhausted
+            # Every remaining step, including the one that runs the exit, lands on the other
+            # worker.
+            while finisher.submit(next, stream, exhausted).result() is not exhausted:
+                pass
+            flushes = opener.submit(add_and_count_flushes).result()
+
+    assert flushes == 1
+
+
 def test_search_during_a_stream_sees_the_committed_items(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -5754,3 +6170,215 @@ def test_a_name_registered_before_naming_became_a_claim_survives_the_upgrade(
             )
             == 1
         )
+
+
+def _merge_row(memory: Memory) -> MemoryOperationRecord:
+    rows = [row for row in memory.operations() if row.operation.intent is MemoryIntent.MERGE]
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+def _linking_memory(tmp_path: Path, *, min_assets: int = 1) -> Memory:
+    return Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=min_assets,
+        index_speech=True,
+    )
+
+
+def test_a_cross_modal_merge_is_logged_and_rollback_re_splits_the_two_identities(
+    tmp_path: Path,
+) -> None:
+    """The kernel's own irreversible-looking bind is neither invisible nor irreversible.
+
+    Binding one voice to one face is a model embedding plus a corroboration count, committed as
+    a side effect of `faces()`. It has to reach the operation log like every other derived
+    state, or `operations()` cannot answer what fused two people and `rollback()` cannot undo
+    it.
+    """
+    # `min_assets=2` holds the merge off the first asset, so both identities exist -- and can be
+    # read back by their own `created_at` -- before anything fuses them. `faces()` on a single
+    # asset commits enrolment and the merge in the same call, leaving nothing to read.
+    with _linking_memory(tmp_path, min_assets=2) as memory:
+        seed = memory.add(Blob(b"seed video", "video/mp4", "seed.mp4"))
+        face_id = memory.faces(seed.id)[0].identity_id
+        voice_id = memory.speech(seed.id)[0].speaker_id
+        assert face_id != voice_id
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+            pre_merge_created_at = dict(
+                connection.execute(
+                    "SELECT identity_id, created_at FROM identities WHERE identity_id IN (?, ?)",
+                    (face_id, voice_id),
+                ).fetchall()
+            )
+        assert set(pre_merge_created_at) == {face_id, voice_id}
+
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        survivor = memory.faces(record.id)[0].identity_id
+        assert memory.speech(record.id)[0].speaker_id == survivor
+        memory.register_identity(survivor, "Li")
+
+        merged = _merge_row(memory)
+        change = merged.operation.identity
+        assert change is not None
+        assert change.identity_id == survivor
+        absorbed = change.moved_ids[0]
+        assert absorbed != survivor
+        # Lineage: which recognizer produced the templates, and which kernel rule bound them.
+        assert merged.model_id == _FakeFace.face_model
+        assert merged.recipe == "mindbridge-identity-link-v1"
+        assert merged.trigger is MemoryTrigger.EVIDENCE
+        # Before the reversal the absorbed ID is an alias, so it resolves to the named person.
+        assert memory.identity(absorbed) == IdentityProfile(
+            identity_id=survivor, name="Li", confirmed=True
+        )
+
+        assert memory.rollback(merged.operation_id) is True
+
+        # Two identities again: the survivor keeps the voice and the name, and the restored
+        # face identity is its own nameless person with its own exemplars.
+        assert memory.identity(absorbed) == IdentityProfile(identity_id=absorbed)
+        assert memory.identity(survivor) == IdentityProfile(
+            identity_id=survivor, name="Li", confirmed=True
+        )
+        assert memory.speech(record.id)[0].speaker_id == survivor
+        assert memory.speech(record.id)[0].speaker_name == "Li"
+        assert _merge_row(memory).rolled_back_at is not None
+
+        # The restored identity's `created_at` is its own pre-merge value, not the moment the
+        # merge (or the rollback) happened: `_merge_identities` must not overwrite it with the
+        # merge time before `_split_identity` reads it back.
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+            restored_created_at = connection.execute(
+                "SELECT created_at FROM identities WHERE identity_id = ?",
+                (absorbed,),
+            ).fetchone()[0]
+        assert restored_created_at == pre_merge_created_at[absorbed]
+
+        # Reversing a merge resets the pair's evidence rather than suppressing the pair, so
+        # continued ingestion corroborates and merges them again -- and logs that second bind as
+        # its own row. `min_assets=2` needs both assets reprocessed to recorroborate; `faces()`
+        # on `record.id` is called last on purpose, so its return value is the fresh merge.
+        memory.faces(seed.id)
+        assert memory.faces(record.id)[0].identity_id == survivor
+        standing = [
+            row
+            for row in memory.operations()
+            if row.operation.intent is MemoryIntent.MERGE and row.rolled_back_at is None
+        ]
+        assert [row.operation_id for row in standing] != [merged.operation_id]
+        assert len(standing) == 1
+
+
+def test_ask_link_identities_false_recognizes_faces_without_committing_a_merge(
+    tmp_path: Path,
+) -> None:
+    """`ask` can identify who is in a photo or video without gaining merge authority.
+
+    `_route_generation_hits` reaches the same face recognition `faces()` uses, and by default
+    commits the same corroborated cross-modal `MERGE` -- an agent with recall access alone would
+    otherwise acquire it merely by asking a question over a photo or video.
+    `link_identities=False` keeps recognition running so the question still gets answered, but
+    the bind itself is never committed: no `MERGE` row, and the two identities stay apart. This
+    is the mechanism `build_mcp_server(embodied_operations=False)` relies on for `ask_memory`.
+    """
+
+    def _identity_row_count(data_dir: Path) -> int:
+        with closing(sqlite3.connect(data_dir / "state.sqlite3")) as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM identities").fetchone()[0])
+
+    def _ask_over_a_face(data_dir: Path, *, link_identities: bool) -> bool:
+        with Memory(
+            data_dir,
+            embedder=_FakeEmbedder(),
+            answerer=_FakeModels(),
+            transcriber=_FakeSpeech(),
+            face_analyzer=_FakeFace(),
+            identity_link_min_assets=1,
+        ) as memory:
+            record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+
+            result = memory.ask("who is in the video?", link_identities=link_identities)
+
+            assert result.hits and result.hits[0].id == record.id
+            merged = any(row.operation.intent is MemoryIntent.MERGE for row in memory.operations())
+        return merged
+
+    withheld = tmp_path / "withheld"
+    assert _ask_over_a_face(withheld, link_identities=False) is False
+    # Face and voice recognition still ran -- evidence exists -- but neither identity absorbed
+    # the other, so the store still holds both of them separately.
+    assert _identity_row_count(withheld) == 2
+
+    granted = tmp_path / "granted"
+    assert _ask_over_a_face(granted, link_identities=True) is True
+    assert _identity_row_count(granted) == 1
+
+
+def test_unlinking_a_merge_is_logged_as_a_split_and_rollback_re_links_it(tmp_path: Path) -> None:
+    """`unlink_identity` is the split half of "correct or split", so it logs like one."""
+    with _linking_memory(tmp_path) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        survivor = memory.faces(record.id)[0].identity_id
+        memory.register_identity(survivor, "Li")
+        absorbed = _merge_row(memory).operation.identity.moved_ids[0]  # type: ignore[union-attr]
+
+        assert memory.unlink_identity(absorbed) == absorbed
+
+        split = memory.operations()[0]
+        assert split.operation.intent is MemoryIntent.CORRECT
+        assert split.operation.identity == IdentityChange(
+            identity_id=survivor, moved_ids=(absorbed,)
+        )
+        assert split.operation.target_ids == ()
+        assert memory.identity(absorbed) == IdentityProfile(identity_id=absorbed)
+
+        assert memory.rollback(split.operation_id) is True
+
+        # Re-linked under the identity that survived, with its name intact.
+        assert memory.identity(absorbed) == IdentityProfile(
+            identity_id=survivor, name="Li", confirmed=True
+        )
+        # The merge below it stays standing, and is still the row that reverses the bind.
+        assert _merge_row(memory).rolled_back_at is None
+
+
+def test_erasing_a_person_leaves_an_irreversible_log_row_holding_no_content(
+    tmp_path: Path,
+) -> None:
+    """Physical forgetting of a person is auditable and deliberately not recoverable.
+
+    `delete()` leaves no row at all, cognitive forgetting leaves a reversible `FORGET` row over
+    memory IDs, and this leaves a `FORGET` row over an identity: the marker that separates the
+    two is which of the two the row names. It carries IDs only, so the log cannot be mined for
+    the name or the template the erasure destroyed.
+    """
+    with _linking_memory(tmp_path) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        survivor = memory.faces(record.id)[0].identity_id
+        memory.register_identity(survivor, "Li Hua")
+        absorbed = _merge_row(memory).operation.identity.moved_ids[0]  # type: ignore[union-attr]
+
+        erasure = memory.forget_identity(survivor)
+
+        erased = memory.operations()[0]
+        assert erased.operation.intent is MemoryIntent.FORGET
+        assert erased.operation.identity == IdentityChange(
+            identity_id=survivor, moved_ids=(absorbed,)
+        )
+        assert erased.operation.target_ids == ()
+        assert erasure.alias_ids == (absorbed,)
+        # IDs and nothing else: the assertion that carried the name is named, not quoted, and
+        # the record it names is gone.
+        assert len(erased.changed_ids) == 1
+        assert "Li" not in dump_operation(erased.operation)
+        with pytest.raises(MemoryNotFoundError):
+            memory.get(erased.changed_ids[0])
+
+        assert memory.rollback(erased.operation_id) is False
+        assert memory.operations()[0].rolled_back_at is None
+        assert memory.identity(survivor) is None
+        assert '"speaker_name":null' in memory.get(record.id).content

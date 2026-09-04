@@ -57,6 +57,10 @@ have one place to stay current.
   goals, and the criteria a change must answer. States direction, not implemented status.
 - [Plugin architecture](plugin-architecture.md) — the kernel/plugin boundary and the admission rule
   a new public capability must satisfy.
+- [Affective memory direction](affective-memory.md) — how affect is stored as sourced, timed
+  hypothesis rather than fact, what exists today, and the gates a richer capability must pass.
+- [Context OS direction](context-os.md) — the fast and slow context planes, agentic memory
+  management, and the evolution gates the current release is working through.
 
 ## Evaluate
 

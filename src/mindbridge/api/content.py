@@ -60,6 +60,8 @@ Chars = Annotated[int, Field(strict=True, ge=1, le=MAX_TEXT_CHARACTERS)]
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 Seconds = Annotated[float, Field(gt=0.0)]
 Milliseconds = Annotated[int, Field(strict=True, ge=1)]
+# Zero is a real budget here -- a text-only bundle -- so this floor is not one.
+MediaItems = Annotated[int, Field(strict=True, ge=0)]
 # The published compilation defaults are the SDK value's, never a second copy of the numbers.
 _BUDGET = ContextBudget()
 
@@ -173,6 +175,9 @@ def content_input(content: Content) -> ContentInput:
 class ContextBudgetInput(StrictModel):
     max_chars: Chars = _BUDGET.max_chars
     max_items: Limit = _BUDGET.max_items
+    # Grounded media parts, not their price: 0 compiles a text-only bundle, null lets
+    # `max_chars` alone decide.
+    max_media_items: MediaItems | None = None
     memory_types: Annotated[list[MemoryType], Field(min_length=1)] | None = None
     min_confidence: Confidence = _BUDGET.min_confidence
     # `ContextBudget.freshness` is a timedelta; JSON carries the same bound as seconds.
@@ -187,6 +192,7 @@ def context_budget(request: ContextBudgetInput | None) -> ContextBudget | None:
     return ContextBudget(
         max_chars=request.max_chars,
         max_items=request.max_items,
+        max_media_items=request.max_media_items,
         memory_types=None if request.memory_types is None else frozenset(request.memory_types),
         min_confidence=request.min_confidence,
         freshness=(

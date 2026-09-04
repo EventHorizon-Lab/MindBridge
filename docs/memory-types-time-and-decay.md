@@ -85,7 +85,11 @@ bounded parser recognizes:
 
 `reference_at` supplies the timezone-aware clock for relative phrases. Without it, the current UTC
 time is used. When no explicit reference is passed, `Today is <date>` may anchor the query. `ask()`
-includes the resolved reference in generation input when relative time is involved.
+appends the resolved reference to the generation input of every question the answerer reads as
+text, whether or not the parser recognized a phrase in it: "how long ago did grandpa visit" narrows
+no retrieval window yet still needs the answering clock. It is appended after routing, so a spoken
+question carries it once transcription has given it text; a question routed with no text at all is
+handed over unchanged.
 
 For a detected range, retrieval considers both in-range and global candidates. In-range events are
 boosted; events outside the range and records without event time keep the score their relevance
@@ -137,14 +141,47 @@ commits derived records. Two kinds carry extra visibility rules:
   model cannot claim an audio cue for a source that has no audio.
 - `MemoryKind.TRAIT` stays hidden from active retrieval until two independent sources support the
   same typed claim, combining their independent confidence with a noisy-OR projection. A trusted
-  `EvidenceBasis.USER_STATEMENT` trait is visible immediately.
+  `EvidenceBasis.USER_STATEMENT` trait is visible immediately. Independence is counted per capture:
+  a raw observation resolves to the `source_id` its `ObservationContext` carried, falling back to
+  the observation record itself when the caller supplied none, and a derived record inherits the
+  groups of its own sources. So two observations of one capture — a text and an audio one, say —
+  and every cue formed from them count as one source and can never corroborate each other into a
+  visible trait. Changing a record's own evidence re-resolves the group on everything that cites
+  it, so reinforcing a source, rolling that back, or deleting one recomputes the whole citation
+  chain in the same transaction.
+
+A proposal that fails one of those per-proposal rules — an `AFFECT` cue naming a modality the
+source never carried, a pose in another coordinate frame — is dropped, counted on the
+`mindbridge.formation.refused_proposals` span attribute, and costs only itself: the observation's
+remaining proposals commit and the write succeeds. One badly grounded opinion must not fail a write
+whose source is already durable, because every retry would re-run the model and fail the same way.
+Two proposals from one source that contradict each other — one record proposed twice with different
+content, or two overlapping states in one lineage — are refused the same way, and the first of the
+pair stands. Only damage to the batch envelope — a backend returning the wrong number of results,
+or a shape that is not a batch of proposals — fails the write. A refusal is final for that
+formation recipe: the source is marked formed, so nothing retries the proposal and re-adding the
+same content forms nothing new.
+
+Formation never rewrites the caller's source record. A derived record inherits its source's event
+time, valid interval, and metric pose, and inherits the symbolic `place_id` and the `metadata` that
+every cited source agrees on, so a place-scoped or metadata-filtered recall reaches the knowledge
+formed in a room and not only the raw observation it came from. Agreement is the rule for formation
+too, because an `ENTITY`, `RELATION`, inferred `TRAIT`, or `RESPONSE_POLICY` is written once and
+later sources only add evidence to it: when a second source disagrees, the shared record keeps
+neither place nor metadata rather than the first source's, since a hard retrieval filter must not
+be guessed. Both columns follow the live evidence rather than the moment the record was written:
+deleting a source or rolling an operation back recomputes them over the sources that remain, so a
+record the survivors agree on is scoped again. A derived record carries no media assets of its own:
+it is text, and its evidence link points at the observation that holds the media.
 
 ### Naming a person is a typed assertion
 
 `register_speaker` and `register_identity` write an `ENTITY` assertion whose
 `MemoryContext.identity_id` binds it to the recognized person, whose `subject` is the name, and
 whose `value` is the recorded relationship. Its basis is `USER_STATEMENT`, so it is visible at
-once, and it needs no former: naming rests on the host's authority, not on a model.
+once, and it needs no former: naming rests on the host's authority, not on a model. It inherits
+neither place nor metadata from the evidence an agent cites for it, whoever asserts it: who
+somebody is does not stop being true in another room.
 
 Every naming assertion about one identity shares a lineage keyed on that identity rather than on
 the spelling of the name, so renaming the person supersedes the previous assertion, exactly as a
@@ -235,7 +272,9 @@ does not infer coordinate transforms.
 
 `ObservationContext(place_id="kitchen")` stores a trimmed symbolic label when metric localization is
 not available. `RetrievalScope(place_id="kitchen")` applies indexed equality in SQLite and excludes
-unlabelled records. Symbolic and metric scopes are independent and both must match when combined.
+unlabelled records. Derived records inherit the label their evidence agrees on, so the scope
+reaches formed entities, states, and relations as well as observations. Symbolic and metric scopes
+are independent and both must match when combined.
 
 `get` and `list` expose the latest typed context even when it is retired or hidden, while default
 search uses only active visible versions. Forgetting is evidence-aware: deleting evidence
@@ -304,7 +343,7 @@ first: `rollback()` returns `False` for an operation a standing later one has bu
 
 | Intent | Kernel semantics |
 | --- | --- |
-| `REINFORCE` | Link an independent source to an existing derived record. Confidence recombines by noisy-OR over independent sources, and a hidden inferred `TRAIT` can become visible. |
+| `REINFORCE` | Link an independent source to an existing derived record. Confidence recombines by noisy-OR over independent sources counted per capture, and a hidden inferred `TRAIT` can become visible — as can a record that cites the one reinforced. |
 | `CONSOLIDATE` | Derive one new record citing several sources. The sources stay as evidence, and stay in recall unless the same proposal names them in `target_ids`. |
 | `CORRECT` | Retire the current version of a bad derived inference. History is preserved, not overwritten. |
 | `FORGET` | Set `forgotten_at`. Recall skips the record; audit keeps it. |
@@ -353,25 +392,32 @@ the replacement is built from.
 
 ### What needs deliberation
 
-`consolidation_candidates()` derives due work from committed state rather than from a clock, so a
-host loop has a durable trigger instead of a timer:
+`consolidation_candidates()` derives due work from committed state rather than from a clock, so
+the loop has a durable trigger instead of a timer, and `deliberate()` is that loop:
 
 ```python
-for candidate in memory.consolidation_candidates():
-    memory.consolidate(evidence_ids=candidate.memory_ids, trigger=candidate.trigger)
+report = memory.deliberate(idle=is_charging_and_idle)
 ```
 
-`EVIDENCE` rows are derived records that gained independent evidence no standing operation has
-weighed — what the formation path leaves behind. `CONTRADICTION` rows are lineages whose current
-visible claims disagree, and clear when a `CORRECT` retires one side. `FEEDBACK` rows are records
-confirmed through `reinforce()`, or cited by an `ask()` answer under the default
-`reinforce_on_answer`, since an operation last saw them. `QUERY_FAILURE`, `PRESSURE`, and
-`IDLE` stay labels a caller may pass: nothing durable records them today, and adding bookkeeping
-for a trigger no host asks for would be a scheduler by another name.
+One round asks what is due, consolidates each row under the row's own trigger, and repeats
+because applying operations can make further work due. It ends when nothing is due, which the
+report distinguishes from hitting `max_rounds`. The two primitives stay available for a host that
+wants to schedule the halves itself.
 
-A periodic timer alone is not evidence that the work is useful. See the
-[Python SDK reference](api/python-sdk.md#memory-management-operations) for signatures, effects, and
-rollback behavior.
+`EVIDENCE` rows are derived records that gained independent evidence nothing has weighed — what
+the formation path leaves behind. `CONTRADICTION` rows are lineages whose current visible claims
+disagree. `FEEDBACK` rows are records confirmed through `reinforce()`, or cited by an `ask()`
+answer under the default `reinforce_on_answer`. `QUERY_FAILURE` rows are near-equal recalls that
+came back empty at least twice inside the configured window, named against the nearest records
+the store does hold. `PRESSURE` rows appear only over a declared `memory_budget_records`, because
+growth alone is not evidence that forgetting is useful. `IDLE` rows appear only when the operator
+passes `idle=True`, because whether the device is idle or charging is the host's knowledge.
+
+A periodic timer alone is not evidence that the work is useful — and neither is a candidate that
+always comes back, so each pass records that it weighed its evidence set whatever it yielded, and
+a candidate is not derived again until its own signal moves. See the
+[Python SDK reference](api/python-sdk.md#memory-management-operations) for signatures, effects,
+outcome recording, and rollback behavior.
 
 ## Decay and reinforcement
 

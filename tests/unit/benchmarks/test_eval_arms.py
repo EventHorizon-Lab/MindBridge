@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+import hashlib
+import math
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +17,17 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan
 
 import mindbridge.benchmarks.eval as eval_module
-from mindbridge import AnswerResult, AsyncMemory, ModelError, SearchHit
+from mindbridge import (
+    AnswerResult,
+    AsyncMemory,
+    ContextBudget,
+    EmbedTask,
+    Modality,
+    ModelError,
+    ModelInput,
+    SearchHit,
+)
+from mindbridge._telemetry import SPAN_KIND
 from mindbridge.benchmarks.eval import (
     DEFAULT_ARM,
     PRODUCT_ARM,
@@ -35,12 +47,43 @@ from mindbridge.benchmarks.eval_cache import ResponseCache
 from mindbridge.benchmarks.eval_telemetry import (
     BENCHMARK_SAMPLE,
     BENCHMARK_TASK,
+    BENCHMARK_TASK_SPAN,
     EvaluationTelemetry,
 )
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.model_config import DEFAULT_TIMEOUT_SECONDS, ModelConfig
 from mindbridge.benchmarks.official_scorers import metric_is_official, retrieval_gold_ids
 from mindbridge.benchmarks.task_catalog import TaskSpec
+
+_ATOMIC_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.AUDIO, Modality.VIDEO})
+
+
+class _TinyEmbedder:
+    """Small deterministic embedder so the fast-plane/compiler tests use a real, isolated
+    `AsyncMemory` (the public SDK) instead of a memory double, with no model service."""
+
+    embedding_capabilities = _ATOMIC_MODALITIES
+    embedding_model = "tiny-eval-arm-test"
+    embedding_space = "tiny-eval-arm-test:4:l2-v1"
+    embedding_dimension = 4
+
+    def embed(
+        self,
+        inputs: Sequence[ModelInput],
+        task: EmbedTask = EmbedTask.DOCUMENT,
+    ) -> tuple[tuple[float, ...], ...]:
+        del task
+        vectors = []
+        for value in inputs:
+            digest = hashlib.sha256(value.text.encode()).digest()
+            vector = tuple(1.0 + digest[index] / 255.0 for index in range(4))
+            norm = math.sqrt(sum(component * component for component in vector))
+            vectors.append(tuple(component / norm for component in vector))
+        return tuple(vectors)
+
+    def close(self) -> None:
+        return None
+
 
 _NOW = datetime(2026, 9, 1, tzinfo=timezone.utc)
 
@@ -351,6 +394,102 @@ def test_every_arm_answers_the_same_questions_against_one_ingest(tmp_path: Path)
     assert samples[2].metrics["retrieval_recall@10"] == 1.0
 
 
+def test_compile_arm_answers_from_a_rendered_bundle_via_the_public_sdk(tmp_path: Path) -> None:
+    """The compile arm against a real, isolated `AsyncMemory` -- the public SDK, no doubles."""
+    generator = _RecordingGenerator("Ada")
+    arm = _Arm("compile", generator=cast(eval_module._BaselineGenerator, generator))
+    _, _, question = _task()
+
+    async def run() -> eval_module._AnswerOutcome | BaseException:
+        async with AsyncMemory(tmp_path, embedder=_TinyEmbedder(), minimum_relevance=0) as memory:
+            await memory.add("Ada signed the contract")
+            await memory.add("a lunch invitation")
+            answered = await _answer_many(
+                memory,
+                (question,),
+                request_concurrency=1,
+                recall_limit=20,
+                arm=arm,
+                task_name="atm-bench",
+                unit_id="unit",
+                compile_budget=ContextBudget(max_items=5, max_chars=2_000),
+            )
+            return answered[0]
+
+    outcome = asyncio.run(run())
+    assert not isinstance(outcome, BaseException)
+
+    assert outcome.prediction == "Ada"
+    assert outcome.compiled_items is not None and outcome.compiled_items >= 1
+    assert outcome.compiled_chars is not None and outcome.compiled_chars > 0
+    assert len(outcome.memory_ids) == outcome.compiled_items
+    assert len(generator.calls) == 1
+    question_text, rendered_context = generator.calls[0]
+    assert question_text == "who signed it?"
+    # Fed the compiled bundle, not the stuffed corpus a full-context arm would build.
+    assert rendered_context is not None
+    assert rendered_context.startswith("# Context: who signed it?")
+    assert "Ada signed the contract" in rendered_context
+
+
+def test_ingest_capture_produces_real_capture_settle_spans_for_the_compile_arm(
+    tmp_path: Path,
+) -> None:
+    """`--ingest capture` drives `capture()`/`settle()` through the public SDK, so
+    `eval_telemetry` reports real capture-acknowledgement and time-to-searchable numbers
+    instead of an empty block, and the compile arm still answers off the settled store.
+    """
+    generator = _RecordingGenerator("Ada")
+    task, _, _ = _task()
+    telemetry = EvaluationTelemetry()
+
+    def memory_factory(path: Path) -> AsyncMemory:
+        return AsyncMemory(
+            path, embedder=_TinyEmbedder(), minimum_relevance=0, tracer=telemetry.tracer
+        )
+
+    try:
+        with telemetry.tracer.start_as_current_span(
+            BENCHMARK_TASK_SPAN,
+            attributes={BENCHMARK_TASK: task.spec.name, SPAN_KIND: "benchmark"},
+        ):
+            samples = asyncio.run(
+                run_loaded_task(
+                    task,
+                    run=BenchmarkRun(tmp_path / "stores", task.spec.name, "run"),
+                    memory_factory=cast(MemoryFactory, memory_factory),
+                    batch_size=4,
+                    unit_concurrency=1,
+                    request_concurrency=1,
+                    recall_limit=5,
+                    arms=(
+                        _Arm("compile", generator=cast(eval_module._BaselineGenerator, generator)),
+                    ),
+                    compile_budget=ContextBudget(max_items=5, max_chars=2_000),
+                    ingest_mode="capture",
+                    tracer=telemetry.tracer,
+                )
+            )
+        performance = telemetry.result(task.spec.name, question_count=1)
+    finally:
+        telemetry.close()
+
+    assert len(samples) == 1
+    sample = samples[0]
+    assert sample.arm == "compile"
+    assert sample.error_code is None
+    assert sample.ingest_failure_count == 0
+    assert sample.prediction == "Ada"
+    assert sample.metrics["compile_bundle_items"] >= 1.0
+
+    capture = cast(Mapping[str, object], performance["capture"])
+    assert cast(int, capture["count"]) >= 1
+    formation = cast(Mapping[str, object], performance["formation"])
+    assert cast(int, formation["count"]) >= 1
+    time_to_searchable = cast(Mapping[str, object], performance["time_to_searchable_ms"])
+    assert cast(int, time_to_searchable["count"]) >= 1
+
+
 def _sample_with(
     metrics: dict[str, float], *, arm: str = DEFAULT_ARM, task: str = "atm-bench"
 ) -> SampleResult:
@@ -481,6 +620,9 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
         SimpleNamespace(
             arms=(DEFAULT_ARM, "blind"),
             full_context_chars=24_000,
+            ingest="add",
+            compile_max_items=24,
+            compile_max_chars=16_000,
             seed=7,
             seeds=(7, 7, 7, 7),
             bootstrap_samples=20,

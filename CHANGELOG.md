@@ -10,6 +10,34 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- `ask_stream()` on `Memory` and `AsyncMemory`, and the `AnswerChunk` value it yields. `ask()`
+  already consumed a provider's token stream, timed the first token into the
+  `mindbridge.model.time_to_first_token` span attribute, and then returned only the joined text,
+  so a caller waited for the last token to see the first. `ask_stream()` runs the identical path
+  — same retrieval, grounding, abstention, and reinforcement — and yields the generated text as
+  it arrives. Each `AnswerChunk` carries either `text` or `result`, never both: the deltas join
+  to the answer, and the single terminal chunk holds the same `AnswerResult` `ask()` returns.
+  `ask()` now drains that generator, so a buffered and a streamed answer cannot drift apart. A
+  backend without `stream_answer` yields its whole answer as one delta, so the shape does not
+  depend on the provider; `capabilities.streaming_generation` reports whether delivery is
+  actually incremental. `link_identities` means on `ask_stream()` what it means on `ask()`, which
+  is this generator drained. Arguments are validated at the call rather than at the first pull, and
+  the operation the answer holds is released before the terminal chunk, so reading a result and
+  stopping there needs no cleanup. REST, MCP, and the CLI have no equivalent: each would have to
+  choose a streaming wire format, and all three gaps are documented on their own pages.
+- `AffectCue`, the entry type of the compiled `affect` section on `ContextBundle`, exported from
+  `mindbridge`: every `SearchHit` field plus `event_ids`, the active events formed from the same
+  observations the cue already cites in `context.evidence_ids` -- co-occurrence inside one capture,
+  never an attributed cause. `render()` prints `basis`, `confidence`, cue modality, valence, and
+  arousal on every affect line, so an agent can tell a model inference from a user statement
+  without a second call. The hop is resolved after selection, only for the affect entries the
+  budget bought, in one batched store read under the same visibility and scope rules that hydrated
+  the hits, and is skipped once `max_latency_ms` has passed (the `stage_skipped` unknown names it
+  alongside conflict detection). A cue carries at most eight co-derived events and `render()`
+  truncates every ID list to eight with a `+N more` count, so marks that `max_chars` does not
+  charge for cannot grow without limit. REST `POST /v1/context`, the MCP `compile_context` tool,
+  and `mindbridge compile` publish the same field, and a `ContextBundle` refuses an affect entry
+  that is not an `AffectCue`.
 - `capture()`, `settle()`, and `pending_captures()` on `Memory` and `AsyncMemory`, plus the
   `capture`, `settle`, and `pending-captures` CLI commands. `capture()` commits a record, its
   media, its observation context, and one durable enrichment queue row in a single SQLite
@@ -343,6 +371,18 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - `search` counts the candidates that survive its scope predicates instead of hydrating their
   records to count them, removing one of the two record reads per search (about 15 % of search
   latency at depth 100). Results are identical.
+- `ask()` appends the resolved reference time, to the second, as the last line of the generation
+  input of every question the answerer reads as text — after routing, so a spoken question carries
+  it once transcription has given it text — and the bundled OpenAI answer prompt now tells the
+  reader to resolve relative time expressions against that reference and each hit's `occurred_at`
+  and to state the resolved date or duration explicitly. Previously the reference was appended only when a caller passed
+  `reference_at` or the bounded parser recognized a phrase, so "how long ago did grandpa visit" —
+  which narrows no retrieval window and names no date — reached the answerer with the event times
+  of its evidence but no time of asking, making the subtraction it asks for unanswerable in
+  principle. Nothing told the reader to do that arithmetic either, so a relative phrase in a
+  memory could be returned verbatim. No protocol changed: `GenerationBackend.answer` still takes
+  `(question, hits)` and the reference travels in `question.text`, as it already did. A question
+  routed with no text at all is handed over unchanged.
 - **Breaking for existing stores:** the bundled OpenAI consolidation recipe is
   `mindbridge-consolidation-v2`. Its system prompt now describes the media parts attached to each
   evidence item, and the recipe is a digest of that prompt. The recipe salts `operation_key` and
@@ -357,13 +397,16 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   standing operation has built on. Operations that touched one lineage reverse newest first;
   reversing an older one out of order would restore a superseded version beside the current one.
 
-- The local schema is version 13. Version 9 directories upgrade in place through four steps:
+- The local schema is version 15. Version 9 directories upgrade in place through six steps:
   version 10 adds `memory_records.place_id` and its index; version 11 adds
   `memory_records.forgotten_at`, the `capture_queue` table that makes deferred enrichment durable
   across a crash, and the append-only `memory_operations` log that makes a control-plane operation
   replayable and reversible; version 12 adds `memory_semantics.identity_id` and rebuilds the
   operation-intent constraint so `identify` is an allowed intent; version 13 adds the
-  `visual_descriptions` caption cache.
+  `visual_descriptions` caption cache; version 14 adds the scheduler's durable state
+  (`memory_deliberations`, `memory_deliberation_memories`, and `query_failures`), the post-hoc
+  `memory_operations.outcome` and `outcome_note` columns, and admits the `merge` intent; version
+  15 admits the `consent` intent so a data subject's own statement can be logged.
 
 - **Breaking:** `minimum_relevance` now gates evidence relevance — the cosine the dense route
   reports, or the demoted full-text contribution when only the lexical route matched, times the
@@ -542,10 +585,100 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- Two `add_stream` calls running at once no longer leave one of their threads permanently deferring
+  its index flushes. The deferral that batches a stream's index commits was one shared slot each
+  stream saved and restored, so the stream that finished second handed back the id of the thread
+  that had finished first; nothing cleared it again, and every later `add`, `delete`,
+  `forget_identity`, `reindex`, or `optimize` on that thread returned without flushing. The records
+  stayed durable in SQLite but were not searchable until some other caller forced a drain. Deferral
+  is now thread-local and scoped to the item write, so it cannot outlive the stream that opened it.
+  Scoping it to the write also covers a stream pumped across workers: `add_stream` is a generator,
+  so its body runs on whichever thread calls `next`, and a group opened on one thread and left on
+  another used to strand the opener the same way. A consumer's own writes between two yields now
+  flush as they would outside the stream.
+- The `compile_context` MCP tool schema advertised the wrong default evidence ceiling. Its prose
+  said 6,000 characters while the field default it publishes beside it, and `ContextBudget`, have
+  been 16,000 since the per-modality cost function landed — enough of a gap for an agent that
+  budgets against the sentence to leave every video record out on purpose. The sentence now reads
+  the numbers off `ContextBudget`, so it cannot drift from them again.
+- Withheld or withdrawn consent now omits a person from `actors` however the bundle would have
+  named them. The restrained set was derived from the bound `ENTITY` hits retrieval returned, so a
+  compilation that reached only somebody's photo or clip -- their naming assertion outside the
+  budget's own type bound -- found nothing bound, consulted no consent at all, and then resolved
+  that memory's face or speech edge into exactly the `NamedActor` the withheld state promises to
+  omit. Consent is read from every identity edge actor enrichment uses, and the `consent_withheld`
+  unknown still reports the omission.
+- `apply --operation` takes a row as `operations` prints it, and a `CONSOLIDATE` row could not be
+  replayed: the printed document omitted `proposal`, which the kernel requires of every
+  consolidation, so the advertised pipe failed validation before replay for the intent the slow
+  loop produces most. Operation documents now carry the proposal, serialized by the same function
+  the log reads back, so the row round-trips.
+- `consolidation-candidates --idle` had no effect. The flag was parsed and then dropped by the
+  handler, so it asked for exactly what the default asks for and never admitted the never-weighed
+  lineages it advertises.
+- `ContextBundle.chars` counted the `## Actors` heading that a synthesized actor makes `render()`
+  write. Only the sections selection filled were charged a heading, so an episode or photo that
+  contributed nothing but an identity edge left the heading uncharged: `chars` came in short of
+  the text, and a bundle sized to a tight `max_chars` rendered past it.
+- A `max_chars` the context header alone overruns is refused with `ValidationError` naming the
+  floor it needs, instead of returning a bundle over the limit it was given and reporting that
+  oversized total as `chars`. The header is inside the bound and is written whether or not
+  anything else fits, so such a budget has no bundle that satisfies it.
+- `compile.media_items` in benchmark telemetry counts grounded media parts, which is the quantity
+  `ContextBudget.max_media_items` bounds. It counted hits carrying any asset, so an omni memory
+  with a still and a clip reported one part instead of two and multi-asset bundles looked as
+  thrifty as single-asset ones.
+- `energy.cpu_package_joules` differences each Intel RAPL package against its own counter and
+  corrects the wrap at that package's `max_energy_range_uj`. A run longer than the wrap period --
+  tens of minutes on a busy package, well inside a sweep -- subtracted to a negative delta that
+  was clamped to zero, publishing 0 J for a run that burned energy; summing the packages before
+  subtracting could also hide one package's wrap inside another's rise. A wrap on a package that
+  publishes no range now makes the value absent with that as its `reason`.
 - The benchmark description cache accepts calls from every unit worker thread. It is opened once
   for a run while units ingest on worker threads, and SQLite's per-thread binding made every
   worker-side describe fail; the write path counted each as a failed batch and fell open, so a
   vision arm could build caption-less libraries while every other counter read as healthy.
+- The MCP `compile_context` tool's `budget` description told clients the default `max_chars` was
+  6,000 when `ContextBudget` has defaulted to 16,000.
+- Evidence independence is counted per capture. A derived record cited as evidence inherits the
+  evidence groups of its own sources, so several cues formed from one capture (a text and an audio
+  `AFFECT` from one turn, say) are one independent source and can no longer corroborate each other
+  into a visible model-inferred `TRAIT`. Previously a derived source had no observation row and so
+  became its own group, which let one emotional event satisfy the two-source rule. The inherited
+  group is re-resolved on every record that cites one whose own evidence changed, so reinforcing,
+  rolling back, or deleting a source updates the confidence and visibility of the whole citation
+  chain instead of only the record directly touched. Rows written before this change keep their
+  stored group until the record they cite next changes; fresh stores are correct.
+- One badly grounded formation proposal no longer fails the write that produced it. An `AFFECT`
+  proposal whose cue modality is absent from its source, or a pose in another coordinate frame,
+  raised `ModelError` out of `add`/`add_many`/`settle` although the observation was already
+  committed — so the record stayed durable with its formation stuck in the queue and every retry
+  re-ran the model and failed identically. Text that merely mentions a photo is enough to make a
+  model call it an image cue, so this was the ordinary case: a measured run failed 3 of 7 write
+  chunks, then spent 1.7x the successful path's tokens re-forming records one at a time, and
+  reported records as unwritten that were in fact stored and searchable. Such a proposal is now
+  dropped and counted on the `mindbridge.formation.refused_proposals` span attribute — a total
+  over the whole `add`, `add_many`, `settle`, or `consolidate` span, separate from the adapter's
+  `mindbridge.formation.dropped_proposals` shape drops — while its
+  siblings commit, which is the policy the model adapter already applied to a malformed proposal
+  and consolidation already applied to this same rule. Two proposals from one source that
+  contradict each other — one record proposed twice with different content, or two overlapping
+  states in one lineage — are refused the same way, keeping the first of the pair, instead of
+  failing the write. Damage to the batch envelope still raises.
+- A formed record no longer drops the symbolic place and the metadata of the observation it was
+  formed from, and a `capture()` no longer drops the place it was captured in. `place_id` is a hard
+  SQL filter, so a place-scoped `search()`, `ask()`, or `compile()` could previously return only
+  raw observations and never the entities, states, or relations formed from them — the household
+  question the symbolic axis exists for. A captured record lost its place permanently, because
+  `settle()` leaves the committed row alone. A consolidation rests on several sources, so it
+  inherits the place and the metadata only when every cited source agrees, and inherits neither
+  when they disagree: a hard retrieval filter must not be guessed. A naming assertion inherits
+  neither in any case, because who somebody is does not stop being true in another room. Both
+  columns follow the live evidence: deleting a source or rolling an operation back recomputes them
+  over the sources that remain, so a record the survivors now agree on is scoped again instead of
+  staying unreachable from a place- or metadata-filtered read for evidence that no longer exists.
+  Derived records still carry no
+  media assets of their own: their evidence link points at the observation that holds them.
 - Forgetting, retracting, or correcting a naming assertion with a timestamp older than the identity
   row raised `sqlite3.IntegrityError` (`CHECK constraint failed: updated_at >= created_at`) out of
   the store instead of applying. The name projection is rewritten in the same transaction and was
@@ -685,6 +818,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Documentation
 
+- `docs/affective-memory.md` states the affective-memory direction: affect is preserved as a
+  sourced, timed, confidence-bearing hypothesis with a perspective rather than recognized as fact,
+  with the four affect layers, the behaviour that exists at this release, the phased roadmap
+  against the plugin admission rule, the required measurements, and the safety and prohibited-use
+  boundary. `docs/README.md`, `docs/context-os.md`, `docs/design-principles.md`, and
+  `docs/plugin-architecture.md` point at it where each already named affect cues or a future
+  emotion-analysis capability.
 - The quickstart and README no longer index into a `search` result. `search` returns an empty tuple
   whenever no candidate clears `minimum_relevance` or the top two dense confidences tie within
   `ambiguity_margin`, so the published first example could raise `IndexError` on a correct install.
@@ -730,6 +870,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   [configuration](docs/configuration.md).
 - Do not point `Memory` at an old database directory. Start with an empty path and keep the former
   deployment available until retrieval has been validated.
+- Records formed before this release keep the empty `place_id` and `metadata` they were written
+  with; nothing backfills them. A source is marked formed for its recipe, so re-adding the
+  observation forms nothing new: re-form by changing the formation recipe, or add the content
+  again as a fresh observation. For the same reason a refused proposal is final for that recipe —
+  the source is complete, and the proposal is not retried.
 
 ### Current limits
 
