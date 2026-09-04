@@ -44,7 +44,6 @@ from mindbridge._telemetry import (
     CAPTURE_SETTLED,
     CAPTURE_TIME_TO_SEARCHABLE,
     EMBEDDING_PARTS_ELIDED,
-    FORMATION_PROPOSALS_DROPPED,
     IDENTITY_CACHED,
     IDENTITY_CREATED,
     IDENTITY_EVIDENCE_ASSETS,
@@ -62,6 +61,7 @@ from mindbridge._telemetry import (
     mark_model_requests,
     model_span,
     operation_span,
+    record_formation_refusals,
     traced_span,
 )
 from mindbridge.configuration import MindBridgeConfig, resolve_memory_config
@@ -3356,7 +3356,7 @@ class Memory:
         pairs: builtins.list[tuple[_PreparedMemory, str, float]] = []
         inputs_by_id = {value.memory_id: value for value in inputs}
         formed_sources = tuple(source for source in pending if source.id in inputs_by_id)
-        dropped = 0
+        refused = 0
         for source in formed_sources:
             proposals = proposals_by_id.get(source.id, ())
             # Application data and the symbolic place travel with the knowledge formed from them:
@@ -3368,18 +3368,16 @@ class Memory:
             # share keeps only what they all say, which `_commit_formation` settles.
             place_id, metadata = _agreed_inheritance((source,))
             for proposal in proposals:
-                try:
-                    _validate_formation_proposal(proposal, inputs_by_id[source.id])
-                except ModelError:
-                    # One derived opinion the model grounded wrongly -- an affect cue naming a
-                    # modality the source never carried, a pose in another frame -- must not cost
-                    # the caller the observation it came from. `add` commits the source before
-                    # formation runs, so raising here fails a write that in fact succeeded, and
-                    # every retry re-runs formation and fails the same way. It is dropped and
-                    # counted instead, which is the policy the model adapter already applies to a
-                    # malformed one, and which consolidation already applies to this same rule.
-                    # Damage to the batch envelope still raises above: that is not one opinion.
-                    dropped += 1
+                # One derived opinion the model grounded wrongly -- an affect cue naming a
+                # modality the source never carried, a pose in another frame -- must not cost the
+                # caller the observation it came from. `add` commits the source before formation
+                # runs, so failing here fails a write that in fact succeeded, and every retry
+                # re-runs formation and fails the same way. It is dropped and counted instead,
+                # which is the policy the model adapter already applies to a malformed one, and
+                # which consolidation already applies to this same rule. Damage to the batch
+                # envelope still raises above: that is not one opinion.
+                if _formation_refusal(proposal, inputs_by_id[source.id]) is not None:
+                    refused += 1
                     continue
                 prepared = _prepare_memory(
                     self._prepare_content(proposal.content, operation),
@@ -3413,8 +3411,8 @@ class Memory:
                         proposal.confidence,
                     )
                 )
-        grounded, refused = _grounded_formation_pairs(pairs)
-        _record_dropped_proposals(dropped + refused)
+        grounded, conflicting = _grounded_formation_pairs(pairs)
+        record_formation_refusals(refused + conflicting)
         self._commit_formation(grounded, formed_sources, completed_at=now)
 
     def _commit_formation(
@@ -7074,18 +7072,19 @@ def _formation_memory_type(kind: MemoryKind) -> MemoryType:
     return MemoryType.SEMANTIC
 
 
-def _validate_formation_proposal(
+def _formation_refusal(
     proposal: FormationProposal,
     source: FormationInput,
-) -> None:
+) -> str | None:
+    """Say why the kernel refuses to ground this proposal in this source, or `None` to keep it.
+
+    A refusal costs the proposal and nothing else, on both paths that ask: formation drops it,
+    and consolidation moves on to the next cited source.
+    """
     if proposal.kind is MemoryKind.AFFECT and (
         proposal.cue_modality is None or proposal.cue_modality not in source.content.modalities
     ):
-        raise ModelError(
-            "affect formation must name a modality present in its source",
-            reason="response_invalid",
-            stage="form",
-        )
+        return "affect formation must name a modality present in its source"
     if proposal.spatial is not None:
         observed = source.context.spatial
         if (
@@ -7093,11 +7092,8 @@ def _validate_formation_proposal(
             or proposal.spatial.frame_id != observed.frame_id
             or proposal.spatial.anchor is not observed.anchor
         ):
-            raise ModelError(
-                "spatial formation must use the source observation frame and anchor",
-                reason="response_invalid",
-                stage="form",
-            )
+            return "spatial formation must use the source observation frame and anchor"
+    return None
 
 
 class _RejectedOperation(Exception):
@@ -7168,18 +7164,16 @@ def _consolidation_primary(
         ),
     )
     for source in reversed(ranked):
-        try:
-            _validate_formation_proposal(
-                proposal,
-                FormationInput(
-                    memory_id=source.id,
-                    content=ModelInput(text=source.content, assets=source.assets),
-                    context=_observation_from_record(source),
-                ),
-            )
-        except ModelError:
-            continue
-        return source
+        refusal = _formation_refusal(
+            proposal,
+            FormationInput(
+                memory_id=source.id,
+                content=ModelInput(text=source.content, assets=source.assets),
+                context=_observation_from_record(source),
+            ),
+        )
+        if refusal is None:
+            return source
     return None
 
 
@@ -8298,17 +8292,6 @@ def _validated_descriptions(
             "vision description exceeded the supported text length", reason="payload_too_large"
         )
     return normalized
-
-
-def _record_dropped_proposals(count: int) -> None:
-    """Publish how many proposals kernel validation refused, so no loss is silent.
-
-    Recorded even at zero, because the absence of the attribute is otherwise indistinguishable
-    from formation never having run -- which is the state this signal exists to tell apart.
-    """
-    span = trace.get_current_span()
-    if span.is_recording():
-        span.set_attribute(FORMATION_PROPOSALS_DROPPED, count)
 
 
 def _record_elided_parts(count: int) -> None:

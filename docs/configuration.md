@@ -177,8 +177,9 @@ A failed call leaves the source observation committed, and retry tracking preven
 proposals for sources already formed by the same recipe.
 
 MindBridge validates the response envelope and every proposal. Invalid envelopes fail the call;
-invalid individual proposals are dropped and counted by
-`mindbridge.formation.dropped_proposals`. See
+individual proposals the adapter cannot read are dropped and counted by
+`mindbridge.formation.dropped_proposals`, and proposals the kernel refuses to ground are counted
+over the whole operation by `mindbridge.formation.refused_proposals`. See
 [memory types, time, and decay](memory-types-time-and-decay.md) for the resulting typed records and
 visibility rules.
 

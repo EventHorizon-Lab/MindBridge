@@ -565,7 +565,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   model call it an image cue, so this was the ordinary case: a measured run failed 3 of 7 write
   chunks, then spent 1.7x the successful path's tokens re-forming records one at a time, and
   reported records as unwritten that were in fact stored and searchable. Such a proposal is now
-  dropped and counted on the `mindbridge.formation.dropped_proposals` span attribute while its
+  dropped and counted on the `mindbridge.formation.refused_proposals` span attribute — a total
+  over the whole `add`, `add_many`, `settle`, or `consolidate` span, separate from the adapter's
+  `mindbridge.formation.dropped_proposals` shape drops — while its
   siblings commit, which is the policy the model adapter already applied to a malformed proposal
   and consolidation already applied to this same rule. Two proposals from one source that
   contradict each other — one record proposed twice with different content, or two overlapping

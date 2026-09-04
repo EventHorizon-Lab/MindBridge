@@ -34,7 +34,12 @@ EMBEDDING_PARTS_ELIDED = "mindbridge.embedding.elided_parts"
 EMBEDDING_VIDEO_SAMPLED = "mindbridge.embedding.video_sampled_inputs"
 GROUNDING_MEDIA_ELIDED = "mindbridge.grounding.media_elided_hits"
 GROUNDING_HITS_DROPPED = "mindbridge.grounding.dropped_hits"
+# Proposals the model adapter could not read, counted on the model span, and proposals the kernel
+# refused for how they were grounded, accumulated over a whole operation. They answer different
+# questions -- a backend returning garbage, against a backend grounding an opinion wrongly -- so
+# they stay separate names.
 FORMATION_PROPOSALS_DROPPED = "mindbridge.formation.dropped_proposals"
+FORMATION_PROPOSALS_REFUSED = "mindbridge.formation.refused_proposals"
 VISION_BATCHES_FAILED = "mindbridge.vision.failed_batches"
 IDENTITY_OBSERVATIONS = "mindbridge.identity.observations"
 IDENTITY_MATCHED = "mindbridge.identity.matched_existing"
@@ -112,11 +117,33 @@ class _OperationUsage:
         _record_modalities(span, "output", self.output_by_modality)
 
 
+@dataclass(slots=True)
+class _FormationRefusals:
+    lock: Lock = field(default_factory=Lock)
+    count: int = 0
+    formed: bool = False
+
+    def add(self, count: int) -> None:
+        with self.lock:
+            self.count += count
+            self.formed = True
+
+    def write(self, span: Span) -> None:
+        # Only once formation actually ran: the absence of the attribute is otherwise
+        # indistinguishable from a pass that refused nothing, which is what it exists to tell
+        # apart. Every operation opens one of these, and most never form anything.
+        if self.formed:
+            span.set_attribute(FORMATION_PROPOSALS_REFUSED, self.count)
+
+
 _CURRENT_MODEL_USAGE: ContextVar[_ModelUsage | None] = ContextVar(
     "mindbridge_model_usage", default=None
 )
 _CURRENT_OPERATION_USAGE: ContextVar[_OperationUsage | None] = ContextVar(
     "mindbridge_operation_usage", default=None
+)
+_CURRENT_FORMATION_REFUSALS: ContextVar[_FormationRefusals | None] = ContextVar(
+    "mindbridge_formation_refusals", default=None
 )
 
 
@@ -159,14 +186,18 @@ def operation_span(
             yield span
             return
         usage = _OperationUsage()
+        refusals = _FormationRefusals()
         token = _CURRENT_OPERATION_USAGE.set(usage)
+        refusals_token = _CURRENT_FORMATION_REFUSALS.set(refusals)
         try:
             yield span
         finally:
             try:
                 usage.write(span)
+                refusals.write(span)
             finally:
                 _CURRENT_OPERATION_USAGE.reset(token)
+                _CURRENT_FORMATION_REFUSALS.reset(refusals_token)
 
 
 @contextmanager
@@ -217,6 +248,17 @@ def mark_model_requests(count: int, *, token_usage_expected: int | None = None) 
     )
     span.set_attribute(TOKEN_REPORTED_REQUEST_COUNT, 0)
     span.set_attribute(TOKEN_COMPLETE, expected == 0)
+
+
+def record_formation_refusals(count: int) -> None:
+    """Add one formation pass's refused proposals to the current operation's total.
+
+    Called even at zero, because one operation forms many records: `settle` runs a pass per
+    captured row, and publishing per pass let the last row overwrite what the first one lost.
+    """
+    refusals = _CURRENT_FORMATION_REFUSALS.get()
+    if refusals is not None:
+        refusals.add(count)
 
 
 def current_model_request_count() -> int:

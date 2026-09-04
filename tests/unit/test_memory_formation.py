@@ -24,7 +24,7 @@ from mindbridge import (
     RetrievalScope,
     SearchHit,
 )
-from mindbridge._telemetry import FORMATION_PROPOSALS_DROPPED
+from mindbridge._telemetry import FORMATION_PROPOSALS_REFUSED
 
 
 class PreferenceFormer:
@@ -294,9 +294,9 @@ def test_a_proposal_the_kernel_refuses_is_dropped_and_not_charged_to_the_write(
         assert memory.pending_captures(memory_ids=(source.id,)) == ()
 
     assert [
-        span.attributes[FORMATION_PROPOSALS_DROPPED]
+        span.attributes[FORMATION_PROPOSALS_REFUSED]
         for span in exporter.get_finished_spans()
-        if span.attributes is not None and FORMATION_PROPOSALS_DROPPED in span.attributes
+        if span.attributes is not None and FORMATION_PROPOSALS_REFUSED in span.attributes
     ] == [1]
 
 
@@ -499,7 +499,59 @@ def test_two_contradictory_states_from_one_source_cost_only_the_later_one(
         assert memory.pending_captures(memory_ids=(source.id,)) == ()
 
     assert [
-        span.attributes[FORMATION_PROPOSALS_DROPPED]
+        span.attributes[FORMATION_PROPOSALS_REFUSED]
         for span in exporter.get_finished_spans()
-        if span.attributes is not None and FORMATION_PROPOSALS_DROPPED in span.attributes
+        if span.attributes is not None and FORMATION_PROPOSALS_REFUSED in span.attributes
+    ] == [1]
+
+
+def test_refused_proposals_are_totalled_over_the_whole_settle(tmp_path: Path) -> None:
+    """`settle` forms one record at a time, and the operation reports the whole batch.
+
+    Publishing per pass let the last record settled overwrite the count, so a batch whose first
+    record lost a proposal reported zero refusals -- the reading an operator would take as proof
+    that nothing was lost.
+    """
+
+    class PhotoAffectFormer(PreferenceFormer):
+        def form(
+            self, inputs: Sequence[FormationInput]
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            return tuple(
+                (
+                    FormationProposal(
+                        kind=MemoryKind.AFFECT,
+                        content="The user looked happy",
+                        subject="user",
+                        value="happy",
+                        # The source is text; no image was ever observed.
+                        cue_modality=Modality.IMAGE,
+                    ),
+                )
+                if "photo" in (value.content.text or "")
+                else ()
+                for value in inputs
+            )
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=PhotoAffectFormer(),
+        minimum_relevance=0,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        memory.capture("I shared a photo described as a smile")
+        memory.capture("I prefer tea")
+
+        assert memory.settle() == 2
+
+    assert [
+        span.attributes[FORMATION_PROPOSALS_REFUSED]
+        for span in exporter.get_finished_spans()
+        if span.name == "mindbridge.settle"
+        and span.attributes is not None
+        and FORMATION_PROPOSALS_REFUSED in span.attributes
     ] == [1]

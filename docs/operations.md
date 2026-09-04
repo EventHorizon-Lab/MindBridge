@@ -221,6 +221,9 @@ Watch these degradation and recognition attributes:
   because the model's prompt exceeded its context.
 - `mindbridge.grounding.media_elided_hits` and `mindbridge.grounding.dropped_hits` count evidence
   removed from OpenAI grounding requests.
+- `mindbridge.formation.refused_proposals` counts the proposals the kernel refused to ground,
+  totalled over the whole operation span and present only when formation ran; the model adapter's
+  `mindbridge.formation.dropped_proposals` counts the ones it could not read at all.
 - `mindbridge.identity.faces` and `mindbridge.identity.speakers` report observations, distinct
   identities, existing matches, creations, and cache status for each analyzed asset.
 

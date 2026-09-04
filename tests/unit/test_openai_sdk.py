@@ -3017,19 +3017,17 @@ def test_a_malformed_proposal_does_not_discard_its_valid_siblings() -> None:
 def test_formation_prompt_states_every_source_rule_the_validator_enforces(
     proposal: FormationProposal, phrase: str
 ) -> None:
-    # These two rules are enforced in `memory.py`, not by the adapter's shape checks, and they
-    # fail the whole `add()` after the source has committed -- so a proposal that breaks one is
-    # unrecoverable for the caller, and the prompt is the only place the model can learn the rule.
-    # Red in both directions: if the prompt drops the sentence, or if the validator drops the rule.
+    # These two rules are enforced in `memory.py`, not by the adapter's shape checks, and a
+    # proposal that breaks one is dropped -- so the caller never learns it was formed, and the
+    # prompt is the only place the model can learn the rule. Red in both directions: if the
+    # prompt drops the sentence, or if the validator drops the rule.
     source = FormationInput(
         memory_id="observation_0",
         content=ModelInput(text="Dad sounded exhausted on the phone."),
         context=ObservationContext(),
     )
 
-    with pytest.raises(ModelError):
-        memory_module._validate_formation_proposal(proposal, source)
-
+    assert memory_module._formation_refusal(proposal, source) is not None
     assert phrase in openai_backend._FORMATION_SYSTEM_PROMPT
 
 
