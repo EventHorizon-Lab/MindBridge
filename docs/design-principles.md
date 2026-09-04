@@ -132,7 +132,7 @@ The SDK, MCP, product CLI, and REST API share one execution plane: the applicati
 `Memory` instance and its domain operations. The SDK exposes that plane directly. Other surfaces may
 normalize transport input and serialize output, but they must not implement their own modality
 routing, retrieval, persistence, provider selection, defaults, or error policy. See
-[architecture](architecture.md#interface-and-trust-boundaries).
+[architecture](architecture.md#public-and-trust-boundaries).
 
 For developers:
 
@@ -266,7 +266,7 @@ matrix, license and security requirements, performance envelope, and maintenance
 ### Add extensions as narrow, optional capabilities
 
 The extension surface is the set of explicit backend protocols listed in
-[architecture](architecture.md#model-and-plugin-boundary); that page owns the inventory and this one
+[architecture](architecture.md#model-boundary); that page owns the inventory and this one
 does not repeat it. Applications can pass those objects directly to `Memory`; `Memory.from_config`
 provides a typed convenience layer for the bundled implementations and delegates to the same
 constructor. Explicit objects remain the third-party plugin mechanism; there is no global runtime
@@ -315,7 +315,7 @@ an owning reference for detail. A cell that stops being true is a defect in this
 | Embedding | Caller explicitly supplies a backend; Jina v5 Omni is the bundled omni adapter | Omni-capable recommended composition with route-specific execution |
 | Generation | Optional caller-supplied backend with explicit capabilities | Omni-capable recommended composition where the deployment supports it |
 | Speech runtime | Built-in FunASR adapter uses `AutoModel` | Additional measured runtime adapters, selected explicitly or by observable policy |
-| Extensions | The explicit model protocols in [architecture](architecture.md#model-and-plugin-boundary), including `ConsolidationBackend` for the memory control plane, one of them optional; no registry. Declarative configuration builds a subset of the slots; the rest are object injection only | Optional domain capabilities after a real implementation establishes the contract |
+| Extensions | The explicit model protocols in [architecture](architecture.md#model-boundary), including `ConsolidationBackend` for the memory control plane, one of them optional; no registry. Declarative configuration builds a subset of the slots; the rest are object injection only | Optional domain capabilities after a real implementation establishes the contract |
 | Hardware | Runs where Python, dependencies, and the selected models are supported | Verified device-class matrix with published quality, latency, and resource evidence |
 | Developer interfaces | Typed Python API, OpenAPI-documented REST adapter, and a JSON-only product CLI over the same composition | Same small vocabulary and time-to-first-success across supported transports |
 | Execution plane | Python SDK, REST, MCP, and the `mindbridge` CLI all dispatch to one `Memory`; none of them implements its own routing, persistence, or defaults | Every surface reaches the operations the SDK publishes, with no transport gap left undocumented |
