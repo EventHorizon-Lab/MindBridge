@@ -230,6 +230,13 @@ Explicit reinforcement is not idempotent: every call raises `access_count` for t
 and moves the ranker's reinforcement factor, so a lost response must not be retried blindly.
 Unknown IDs are skipped, and `reinforced` counts the ones that existed.
 
+`answer` may run face recognition on a retrieved photo or video to identify who appears in it, the
+same as `analyzeFaces`, and that recognition can corroborate and commit a cross-modal identity
+merge. `POST /v1/answers` passes `Memory.ask(..., link_identities=embodied_operations)`, so a
+caller with recall access alone cannot acquire that merge authority through an answer unless the
+host has also opted `create_app` into `embodied_operations`: with the switch off, an answer may
+still identify who appears in the evidence, but the bind is never committed.
+
 `compileContext` selects and structures existing evidence, reports conflicts without resolving
 them, calls no generation model, and stores no memory. It is not a pure read: it runs the same
 retrieval path `searchMemories` runs and can make the same one write, caching a transcript for

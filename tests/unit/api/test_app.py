@@ -292,9 +292,10 @@ class FakeMemory:
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        link_identities: bool = True,
     ) -> AnswerResult:
         self._fail()
-        self.calls.append(("ask", question, limit, memory_type, reference_at))
+        self.calls.append(("ask", question, limit, memory_type, reference_at, link_identities))
         return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
 
     def get(self, memory_id: str) -> MemoryRecord:
@@ -495,7 +496,7 @@ def test_resource_routes_map_the_public_memory_values() -> None:
             OCCURRED_FROM,
             OCCURRED_UNTIL,
         ),
-        ("ask", "What color is it?", 4, MemoryType.PROCEDURAL, NOW),
+        ("ask", "What color is it?", 4, MemoryType.PROCEDURAL, NOW, False),
         ("delete", "memory_1"),
     ]
     assert memory.close_count == 0
@@ -1206,6 +1207,25 @@ def test_embodied_routes_dispatch_to_the_sdk_when_enabled() -> None:
     assert faces.status_code == 200
     assert faces.json()["observations"][0]["identity_id"] == "identity_1"
     assert memory.calls == [("speech", "memory_1"), ("faces", "memory_1")]
+
+
+def test_answer_only_links_identities_when_embodied_operations_is_enabled() -> None:
+    """A caller with recall access alone must not acquire merge authority through `/v1/answers`.
+
+    `embodied_operations` gates `analyze_faces`, which commits the corroborated cross-modal
+    identity merge; `ask` reaches the same merge through its own face recognition, so REST must
+    pass the same switch through as `Memory.ask(..., link_identities=...)` rather than always
+    defaulting it on.
+    """
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory)) as client:
+        client.post("/v1/answers", json={"question": "What color is it?"})
+    assert memory.calls[-1][-1] is False
+
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory, embodied_operations=True)) as client:
+        client.post("/v1/answers", json={"question": "What color is it?"})
+    assert memory.calls[-1][-1] is True
 
 
 def test_embodied_routes_map_memory_not_found() -> None:

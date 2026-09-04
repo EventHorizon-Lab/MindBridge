@@ -405,6 +405,7 @@ class _Memory(Protocol):
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        link_identities: bool = True,
     ) -> AnswerResult: ...
 
     def compile(
@@ -678,6 +679,11 @@ def _v1_router(
                 memory_type=request.memory_type,
                 reference_at=request.reference_at,
                 scope=request.scope,
+                # Mirrors MCP's own `embodied_operations` switch (`docs/context-os.md`): a
+                # caller with recall access alone must not acquire cross-modal merge authority
+                # through `ask`, so REST only lets an answer commit that bind when the host has
+                # opted in to embodied operations.
+                link_identities=embodied_operations,
             )
         )
 

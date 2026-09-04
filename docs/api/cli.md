@@ -145,8 +145,9 @@ default `reinforce_on_answer=True`, `ask` also reinforces the hits the answerer 
 `--link-identities` (true), a voice-and-face pair corroborated across enough assets is fused into
 one identity and logged as a `merge` row, the same as `analyze_faces`; `--no-link-identities`
 still runs recognition to answer the question but never commits that bind. `--url` compositions
-send no such request to REST, so `--link-identities` has no effect there and the remote answerer
-always behaves as if it were true.
+send no such request to REST: `POST /v1/answers` decides the same question from `create_app`'s own
+`embodied_operations` switch instead, so `--link-identities` has no effect there and the remote
+answerer links identities only when the host has opted in to embodied operations.
 
 ### Content and JSONL input
 
