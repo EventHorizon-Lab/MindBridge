@@ -1406,15 +1406,15 @@ class Memory:
                     self._recognize_speech(speech_assets, assets)
                 hits = search().hits
             hits = _grounding_hits(hits, limit, budget_chars=self._evidence_budget)
-            # Every textual question gets the reference time, not just the ones whose phrasing a
-            # parser recognized. "How long ago did grandpa visit?" narrows no retrieval window and
-            # names no date, yet it is exactly the question the reader cannot answer without
-            # knowing when it is being asked. Gated on text only because a media-only question has
-            # no text part to carry the note without changing which modalities the answer routes.
-            routed_question = self._route_generation(
-                _with_reference_time(prepared, reference) if prepared.text else prepared,
-                assets,
-            )
+            # Every question the answerer reads as text gets the reference time, not just the ones
+            # whose phrasing a parser recognized. "How long ago did grandpa visit?" narrows no
+            # retrieval window and names no date, yet it is exactly the question the reader cannot
+            # answer without knowing when it is being asked. Applied after routing, because that
+            # is what decides whether the reader gets text at all -- a spoken question becomes
+            # text there -- and because routing appends speech identities and transcripts, which
+            # would otherwise land after the line documented as final.
+            routed = self._route_generation(prepared, assets)
+            routed_question = _with_reference_time(routed, reference) if routed.text else routed
             routed_hits = self._route_generation_hits(hits, assets) if hits else ()
             self._persist_transcripts(assets)
             result = self._answer(routed_question, routed_hits)
@@ -8270,9 +8270,10 @@ def _batch_values(
     return batch
 
 
-def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _PreparedContent:
-    note = f"Reference time for relative dates: {reference_at.isoformat(timespec='microseconds')}"
-    return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
+def _with_reference_time(question: ModelInput, reference_at: datetime) -> ModelInput:
+    """Append the answering clock as the final line of what the reader is handed."""
+    note = f"Reference time for relative dates: {reference_at.isoformat(timespec='seconds')}"
+    return replace(question, text=f"{question.text}\n\n{note}" if question.text else note)
 
 
 def _validated_descriptions(

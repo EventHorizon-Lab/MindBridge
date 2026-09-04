@@ -1022,7 +1022,7 @@ def test_relative_time_prefers_event_time_and_routes_the_reference(tmp_path: Pat
         )
 
     assert answer.hits[0].id == previous.id
-    assert "Reference time for relative dates: 2026-08-27T00:30:00.000000+14:00" in (
+    assert "Reference time for relative dates: 2026-08-27T00:30:00+14:00" in (
         models.answer_calls[-1][0].text
     )
 
@@ -1039,7 +1039,8 @@ def test_duration_question_routes_the_reference_without_a_parsable_phrase(
             occurred_at=datetime(2026, 8, 20, 9, tzinfo=timezone.utc),
             memory_type=MemoryType.EPISODIC,
         )
-        before = datetime.now(timezone.utc)
+        # The note carries seconds, so the lower bound is compared at that resolution.
+        before = datetime.now(timezone.utc).replace(microsecond=0)
         memory.ask("How long ago did grandpa visit?", limit=1)
         after = datetime.now(timezone.utc)
         memory.search("How long ago did grandpa visit?", limit=1)
@@ -1055,6 +1056,35 @@ def test_duration_question_routes_the_reference_without_a_parsable_phrase(
     assert [text for task, batch in embedded for text in batch if task is EmbedTask.QUERY] == [
         "How long ago did grandpa visit?"
     ] * 2
+
+
+def test_a_transcribed_question_ends_with_the_reference_time(tmp_path: Path) -> None:
+    """The note has to be applied to what the answerer is actually handed.
+
+    A spoken question carries no text of its own, so appending the note before routing skipped it
+    entirely -- the one question shape whose asker cannot see what the reader received. Routing
+    also appends the speech identities and the transcript, so a note applied first stops being
+    the final line it is documented to be.
+    """
+    models = _FakeModels(
+        capabilities=_Capabilities(
+            embedding=frozenset({Modality.TEXT}),
+            generation=frozenset({Modality.TEXT}),
+            transcription=frozenset({Modality.AUDIO}),
+        )
+    )
+    prefix = "Reference time for relative dates: "
+    with _memory(tmp_path, models) as memory:
+        memory.add("red wrench in the shed", memory_type=MemoryType.EPISODIC)
+        memory.ask(Blob(b"spoken question", "audio/wav", "question.wav"), limit=1)
+        memory.ask("How long ago was the red wrench seen?", limit=1)
+
+    spoken, written = (call[0].text for call in models.answer_calls)
+    assert spoken.splitlines()[-1].startswith(prefix)
+    assert written.splitlines()[-1].startswith(prefix)
+    # Seconds, because that is the resolution the kernel's clock claim is worth; microseconds
+    # read as a precision the reference time does not have.
+    assert datetime.fromisoformat(written.rsplit(prefix, 1)[1].strip()).microsecond == 0
 
 
 def test_named_month_and_calendar_year_prefer_event_time(tmp_path: Path) -> None:
@@ -1118,7 +1148,7 @@ def test_natural_today_anchor_sets_relative_time_unless_reference_is_explicit(
 
     assert answer.hits[0].id == anchored.id
     assert overridden[0].id == explicit.id
-    assert "Reference time for relative dates: 2024-05-02T00:00:00.000000+00:00" in (
+    assert "Reference time for relative dates: 2024-05-02T00:00:00+00:00" in (
         models.answer_calls[-1][0].text
     )
 

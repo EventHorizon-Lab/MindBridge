@@ -860,9 +860,11 @@ evidence, and the kernel builds the typed assertion.
 `FaceAnalysis(faces)` using `FaceEmbedding`.
 
 An answerer receives the question's time in `question.text`, as a final
-`Reference time for relative dates: <ISO 8601>` line, and each hit's event time as `occurred_at`
-(or `created_at`). The kernel owns the clock: a backend must not substitute its own wall clock
-when the line is absent, which is what a media-only question looks like.
+`Reference time for relative dates: <ISO 8601 seconds>` line, and each hit's event time as
+`occurred_at` (or `created_at`). The line is appended after routing, so a spoken question carries
+it once transcription has given it text, and nothing follows it. The kernel owns the clock: a
+backend must not substitute its own wall clock when the line is absent, which is what a question
+routed with no text at all looks like.
 
 | Backend value | Fields |
 | --- | --- |
