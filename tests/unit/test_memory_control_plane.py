@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -51,6 +51,7 @@ from mindbridge import (
     ModelError,
     ModelInput,
     ObservationContext,
+    RetrievalScope,
     SearchHit,
     SpeakerEmbedding,
     SpeechAnalysis,
@@ -175,14 +176,32 @@ def _memory(tmp_path: Path, consolidator: object | None = None, **kwargs: object
     )
 
 
-def _observations(memory: Memory, *contents: str) -> tuple[MemoryRecord, ...]:
+def _observations(
+    memory: Memory,
+    *contents: str,
+    places: Sequence[str | None] | None = None,
+    tags: Sequence[Mapping[str, object] | None] | None = None,
+) -> tuple[MemoryRecord, ...]:
+    """Add one observation per content, optionally placing and tagging them pairwise."""
     return tuple(
         memory.add(
             content,
             occurred_at=OCCURRED + timedelta(minutes=index),
-            context=ObservationContext(basis=EvidenceBasis.OBSERVATION, source_id=f"cam-{index}"),
+            context=ObservationContext(
+                basis=EvidenceBasis.OBSERVATION,
+                source_id=f"cam-{index}",
+                place_id=place,
+            ),
+            metadata=tag,
         )
-        for index, content in enumerate(contents)
+        for index, (content, place, tag) in enumerate(
+            zip(
+                contents,
+                places or (None,) * len(contents),
+                tags or (None,) * len(contents),
+                strict=True,
+            )
+        )
     )
 
 
@@ -1867,6 +1886,108 @@ def test_a_query_gathered_window_is_never_widened(tmp_path: Path) -> None:
         assert [reason for _operation, reason in report.rejected] == ["target_not_shown"]
         assert memory.get(outside).forgotten_at is None
         assert memory.operations() == ()
+
+
+def _consolidate_trait(
+    memory: Memory,
+    consolidator: ScriptedConsolidator,
+    *sources: tuple[str | None, str],
+) -> MemoryRecord:
+    """Consolidate one trait out of one observation per `(place_id, household tag)` pair."""
+    observed = _observations(
+        memory,
+        *(f"Ana waited calmly, time {index}" for index in range(len(sources))),
+        places=[place_id for place_id, _household in sources],
+        tags=[{"household": household} for _place_id, household in sources],
+    )
+    evidence_ids = tuple(record.id for record in observed)
+    consolidator._scripts.append(
+        (
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE,
+                evidence_ids=evidence_ids,
+                proposal=_trait("Ana", "patient"),
+            ),
+        )
+    )
+    report = memory.consolidate(evidence_ids=evidence_ids)
+    assert report.rejected == ()
+    return memory.get(report.operations[0].created_ids[0])
+
+
+def test_a_consolidation_inherits_what_all_of_its_evidence_agrees_on(tmp_path: Path) -> None:
+    """A derived record stands where its evidence stands -- when the evidence says one thing.
+
+    Formation derives from one observation and inherits its place and metadata outright. A
+    consolidation rests on several, so agreement is the condition: two sightings in the kitchen
+    make kitchen knowledge, and a sighting in the kitchen plus one in the garage makes knowledge
+    that belongs to neither room. `place_id` is a hard retrieval filter, so guessing would file
+    the knowledge somewhere it was never observed.
+    """
+    agreeing = ScriptedConsolidator()
+    with _memory(tmp_path / "agree", agreeing) as memory:
+        derived = _consolidate_trait(memory, agreeing, ("kitchen", "flat-2"), ("kitchen", "flat-2"))
+
+        assert derived.place_id == "kitchen"
+        assert derived.metadata == {"household": "flat-2"}
+        assert derived.id in {
+            hit.id
+            for hit in memory.search("patient", limit=10, scope=RetrievalScope(place_id="kitchen"))
+        }
+
+    disagreeing = ScriptedConsolidator()
+    with _memory(tmp_path / "disagree", disagreeing) as memory:
+        derived = _consolidate_trait(
+            memory, disagreeing, ("kitchen", "flat-2"), ("garage", "flat-9")
+        )
+
+        assert derived.place_id is None
+        assert derived.metadata == {}
+        assert derived.id not in {
+            hit.id
+            for hit in memory.search("patient", limit=10, scope=RetrievalScope(place_id="kitchen"))
+        }
+
+
+def test_an_asserted_name_is_not_scoped_to_where_the_person_was_seen(tmp_path: Path) -> None:
+    """Who somebody is does not stop being true in the next room.
+
+    A naming assertion cites evidence but claims nothing about a place, so inheriting the place
+    of the clips it was recognized in would hide the name from every question asked anywhere
+    else -- and `register_identity`, which asserts the same thing with no evidence at all, files
+    it nowhere.
+    """
+    consolidator = ScriptedConsolidator()
+    with _identity_memory(tmp_path, consolidator) as memory:
+        kitchen = ObservationContext(place_id="kitchen")
+        first = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"), context=kitchen)
+        second = memory.add(
+            Blob(b"stranger speaks again", "video/mp4", "two.mp4"),
+            context=kitchen,
+            metadata={"household": "flat-2"},
+        )
+        identity_id = memory.faces(first.id)[0].identity_id
+        for cited in (first.id, second.id):
+            consolidator._scripts.append(
+                (
+                    MemoryOperation(
+                        intent=MemoryIntent.IDENTIFY,
+                        claim=IdentityClaim(identity_id=identity_id, name="Li"),
+                        evidence_ids=(cited,),
+                        rationale="the stranger said so",
+                    ),
+                )
+            )
+            assert not memory.consolidate(evidence_ids=(first.id, second.id)).rejected
+
+        (asserted,) = [
+            record
+            for record in memory.list(limit=100).items
+            if record.context is not None and record.context.identity_id == identity_id
+        ]
+        assert asserted.place_id is None
+        assert asserted.metadata == {}
+        assert asserted.id in {hit.id for hit in memory.search("recognized person", limit=10)}
 
 
 # ---------------------------------------------------------------------------------------------

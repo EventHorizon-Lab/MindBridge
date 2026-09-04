@@ -371,6 +371,18 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - `search` counts the candidates that survive its scope predicates instead of hydrating their
   records to count them, removing one of the two record reads per search (about 15 % of search
   latency at depth 100). Results are identical.
+- `ask()` appends the resolved reference time, to the second, as the last line of the generation
+  input of every question the answerer reads as text — after routing, so a spoken question carries
+  it once transcription has given it text — and the bundled OpenAI answer prompt now tells the
+  reader to resolve relative time expressions against that reference and each hit's `occurred_at`
+  and to state the resolved date or duration explicitly. Previously the reference was appended only when a caller passed
+  `reference_at` or the bounded parser recognized a phrase, so "how long ago did grandpa visit" —
+  which narrows no retrieval window and names no date — reached the answerer with the event times
+  of its evidence but no time of asking, making the subtraction it asks for unanswerable in
+  principle. Nothing told the reader to do that arithmetic either, so a relative phrase in a
+  memory could be returned verbatim. No protocol changed: `GenerationBackend.answer` still takes
+  `(question, hits)` and the reference travels in `question.text`, as it already did. A question
+  routed with no text at all is handed over unchanged.
 - **Breaking for existing stores:** the bundled OpenAI consolidation recipe is
   `mindbridge-consolidation-v2`. Its system prompt now describes the media parts attached to each
   evidence item, and the recipe is a digest of that prompt. The recipe salts `operation_key` and
@@ -637,6 +649,36 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   rolling back, or deleting a source updates the confidence and visibility of the whole citation
   chain instead of only the record directly touched. Rows written before this change keep their
   stored group until the record they cite next changes; fresh stores are correct.
+- One badly grounded formation proposal no longer fails the write that produced it. An `AFFECT`
+  proposal whose cue modality is absent from its source, or a pose in another coordinate frame,
+  raised `ModelError` out of `add`/`add_many`/`settle` although the observation was already
+  committed — so the record stayed durable with its formation stuck in the queue and every retry
+  re-ran the model and failed identically. Text that merely mentions a photo is enough to make a
+  model call it an image cue, so this was the ordinary case: a measured run failed 3 of 7 write
+  chunks, then spent 1.7x the successful path's tokens re-forming records one at a time, and
+  reported records as unwritten that were in fact stored and searchable. Such a proposal is now
+  dropped and counted on the `mindbridge.formation.refused_proposals` span attribute — a total
+  over the whole `add`, `add_many`, `settle`, or `consolidate` span, separate from the adapter's
+  `mindbridge.formation.dropped_proposals` shape drops — while its
+  siblings commit, which is the policy the model adapter already applied to a malformed proposal
+  and consolidation already applied to this same rule. Two proposals from one source that
+  contradict each other — one record proposed twice with different content, or two overlapping
+  states in one lineage — are refused the same way, keeping the first of the pair, instead of
+  failing the write. Damage to the batch envelope still raises.
+- A formed record no longer drops the symbolic place and the metadata of the observation it was
+  formed from, and a `capture()` no longer drops the place it was captured in. `place_id` is a hard
+  SQL filter, so a place-scoped `search()`, `ask()`, or `compile()` could previously return only
+  raw observations and never the entities, states, or relations formed from them — the household
+  question the symbolic axis exists for. A captured record lost its place permanently, because
+  `settle()` leaves the committed row alone. A consolidation rests on several sources, so it
+  inherits the place and the metadata only when every cited source agrees, and inherits neither
+  when they disagree: a hard retrieval filter must not be guessed. A naming assertion inherits
+  neither in any case, because who somebody is does not stop being true in another room. Both
+  columns follow the live evidence: deleting a source or rolling an operation back recomputes them
+  over the sources that remain, so a record the survivors now agree on is scoped again instead of
+  staying unreachable from a place- or metadata-filtered read for evidence that no longer exists.
+  Derived records still carry no
+  media assets of their own: their evidence link points at the observation that holds them.
 - Forgetting, retracting, or correcting a naming assertion with a timestamp older than the identity
   row raised `sqlite3.IntegrityError` (`CHECK constraint failed: updated_at >= created_at`) out of
   the store instead of applying. The name projection is rewritten in the same transaction and was
@@ -828,6 +870,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   [configuration](docs/configuration.md).
 - Do not point `Memory` at an old database directory. Start with an empty path and keep the former
   deployment available until retrieval has been validated.
+- Records formed before this release keep the empty `place_id` and `metadata` they were written
+  with; nothing backfills them. A source is marked formed for its recipe, so re-adding the
+  observation forms nothing new: re-form by changing the formation recipe, or add the content
+  again as a fresh observation. For the same reason a refused proposal is final for that recipe —
+  the source is complete, and the proposal is not retried.
 
 ### Current limits
 

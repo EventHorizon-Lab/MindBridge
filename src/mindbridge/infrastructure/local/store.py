@@ -1721,6 +1721,7 @@ class LocalStore:
         *,
         evidence: Sequence[tuple[str, str, float]],
         source_memory_ids: Sequence[str],
+        narrowed: Sequence[tuple[str, str | None, str]] = (),
         recipe: str,
         completed_at: datetime,
         operation: StoredOperation | None = None,
@@ -1735,6 +1736,9 @@ class LocalStore:
         is written and the derived record stays open to further independent evidence.
         `forget_ids` is consolidation forgetting: sources the derived record replaces in ordinary
         recall, retired in this same commit and cleared again by rolling the operation back.
+        `narrowed` is `(memory_id, place_id, metadata_json)` for records already written whose
+        inherited columns no longer hold for all their evidence. Only those two columns change,
+        and neither reaches the search index, so nothing is queued for re-indexing.
         `require_active` names memories that must still exist and still be un-forgotten inside
         this transaction; if any moved since the caller validated it, nothing is written and
         `StaleOperationError` is raised. `require_unretired` names memories whose current version
@@ -1789,6 +1793,24 @@ class LocalStore:
                     superseded=superseded,
                 )
                 transaction_memory_ids.add(memory.memory_id)
+            connection.executemany(
+                """
+                UPDATE memory_records
+                SET place_id = ?,
+                    metadata_json = ?,
+                    updated_at = MAX(updated_at, ?)
+                WHERE memory_id = ?
+                """,
+                (
+                    (
+                        place_id,
+                        _canonical_object_json(metadata_json),
+                        _datetime_text(completed_at),
+                        memory_id,
+                    )
+                    for memory_id, place_id, metadata_json in narrowed
+                ),
+            )
             for embedding in supplied_embeddings:
                 self._write_embedding(connection, embedding)
             linked: list[tuple[str, str]] = []
@@ -7140,11 +7162,52 @@ def _semantic_visibility(
     )
 
 
+def _refresh_inherited_columns(connection: sqlite3.Connection, memory_id: str) -> None:
+    """Re-derive the place and the metadata one derived record inherits from its live evidence.
+
+    The kernel clears both columns when two sources disagree, and evidence is not permanent: a
+    deleted source or a rolled-back consolidation retires it. Recomputing them here, with the
+    kernel's rule -- every remaining source agrees, or nothing -- keeps a record whose survivors
+    all stand in one room from staying unscoped and out of every place-filtered read.
+
+    A naming assertion -- a bound `ENTITY` -- inherits neither column from the clips that show
+    the person, so it is left alone: who somebody is does not stop being true in another room.
+    """
+    rows = connection.execute(
+        """
+        SELECT r.place_id, r.metadata_json
+        FROM memory_evidence AS e
+        JOIN memory_records AS r ON r.memory_id = e.source_memory_id
+        WHERE e.memory_id = ? AND e.retired_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM memory_semantics AS s
+              WHERE s.memory_id = e.memory_id AND s.kind = ? AND s.identity_id IS NOT NULL
+          )
+        """,
+        (memory_id, MemoryKind.ENTITY.value),
+    ).fetchall()
+    if not rows:
+        # Nothing supports the record any more, or nothing may reach it. The caller removes an
+        # unsupported record; clearing its columns first would only alter the row it deletes.
+        return
+    places = {_optional_row_text(row, "place_id") for row in rows}
+    tags = {_canonical_object_json(_row_text(row, "metadata_json")) for row in rows}
+    connection.execute(
+        "UPDATE memory_records SET place_id = ?, metadata_json = ? WHERE memory_id = ?",
+        (
+            places.pop() if len(places) == 1 else None,
+            tags.pop() if len(tags) == 1 else "{}",
+            memory_id,
+        ),
+    )
+
+
 def _refresh_evidence_projection(
     connection: sqlite3.Connection,
     memory_id: str,
     changed_at: datetime,
 ) -> None:
+    _refresh_inherited_columns(connection, memory_id)
     evidence_count, confidence = _evidence_summary(connection, memory_id)
     rows = connection.execute(
         """

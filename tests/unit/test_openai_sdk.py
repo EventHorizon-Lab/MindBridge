@@ -1412,6 +1412,40 @@ def test_answer_serializes_temporal_and_metadata_evidence() -> None:
     assert answer.answer == "It arrived on August 26."
 
 
+def test_answer_instructs_the_reader_to_resolve_relative_time() -> None:
+    systems: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        systems.append(json.loads(request.content)["messages"][0]["content"])
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "Two weeks ago, on 20 August 2026."},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    hit = SearchHit(
+        id="memory_1",
+        content="grandpa visited",
+        score=0.9,
+        created_at=NOW,
+        occurred_at=datetime(2026, 8, 20, 9, tzinfo=timezone.utc),
+    )
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        _model(_sdk_client(client)).answer("How long ago did grandpa visit?", (hit,))
+
+    assert systems == [openai_backend._GROUNDED_SYSTEM_PROMPT]
+    # Anchored on the instruction, not on its wording: rephrasing the sentence is fine, dropping
+    # the arithmetic it asks for is not.
+    assert "resolve" in systems[0] and "reference time" in systems[0]
+
+
 def test_answer_can_pin_sampling_for_reproducible_evaluation() -> None:
     requests: list[dict[str, object]] = []
 
@@ -2980,19 +3014,17 @@ def test_a_malformed_proposal_does_not_discard_its_valid_siblings() -> None:
 def test_formation_prompt_states_every_source_rule_the_validator_enforces(
     proposal: FormationProposal, phrase: str
 ) -> None:
-    # These two rules are enforced in `memory.py`, not by the adapter's shape checks, and they
-    # fail the whole `add()` after the source has committed -- so a proposal that breaks one is
-    # unrecoverable for the caller, and the prompt is the only place the model can learn the rule.
-    # Red in both directions: if the prompt drops the sentence, or if the validator drops the rule.
+    # These two rules are enforced in `memory.py`, not by the adapter's shape checks, and a
+    # proposal that breaks one is dropped -- so the caller never learns it was formed, and the
+    # prompt is the only place the model can learn the rule. Red in both directions: if the
+    # prompt drops the sentence, or if the validator drops the rule.
     source = FormationInput(
         memory_id="observation_0",
         content=ModelInput(text="Dad sounded exhausted on the phone."),
         context=ObservationContext(),
     )
 
-    with pytest.raises(ModelError):
-        memory_module._validate_formation_proposal(proposal, source)
-
+    assert memory_module._formation_refusal(proposal, source) is not None
     assert phrase in openai_backend._FORMATION_SYSTEM_PROMPT
 
 

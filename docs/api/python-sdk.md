@@ -334,7 +334,9 @@ ask_stream(
 ```
 
 `reference_at` is the timezone-aware clock for relative time and decay. The current UTC time is
-used when it is omitted. `occurred_from` and `occurred_until` are optional timezone-aware,
+used when it is omitted. `ask` resolves it once and appends it to the question text it hands the
+answerer, so a reader asked for a duration has both the event time of each hit and the time it is
+being asked. `occurred_from` and `occurred_until` are optional timezone-aware,
 half-open event-overlap filters; either may be omitted, and two bounds require
 `occurred_until > occurred_from`. Records without `occurred_at` do not match a bounded search.
 
@@ -1112,6 +1114,13 @@ evidence, and the kernel builds the typed assertion.
 `ModelInput` contains normalized `text` and resolved `assets`. Speech adapters return
 `SpeechAnalysis(turns, speakers)` using `SpeechTurn` and `SpeakerEmbedding`; face adapters return
 `FaceAnalysis(faces)` using `FaceEmbedding`.
+
+An answerer receives the question's time in `question.text`, as a final
+`Reference time for relative dates: <ISO 8601 seconds>` line, and each hit's event time as
+`occurred_at` (or `created_at`). The line is appended after routing, so a spoken question carries
+it once transcription has given it text, and nothing follows it. The kernel owns the clock: a
+backend must not substitute its own wall clock when the line is absent, which is what a question
+routed with no text at all looks like.
 
 | Backend value | Fields |
 | --- | --- |

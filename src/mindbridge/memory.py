@@ -64,6 +64,7 @@ from mindbridge._telemetry import (
     mark_model_requests,
     model_span,
     operation_span,
+    record_formation_refusals,
     traced_span,
 )
 from mindbridge.configuration import MindBridgeConfig, resolve_memory_config
@@ -191,6 +192,7 @@ from mindbridge.types import (
 )
 
 _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
+_EMPTY_METADATA_JSON = "{}"
 # Naming a person is a claim the host asserts, so its recipe names the kernel rule that produced
 # it rather than a model space. That is what lets `register_identity` work with no former and no
 # consolidator configured.
@@ -555,6 +557,10 @@ class _PreparedMemory:
     occurred_end: datetime | None
     memory_type: MemoryType
     context: ObservationContext | MemoryContext | None = None
+    # The record column, carried separately from `context` because both write paths need it and
+    # only an `ObservationContext` has one: a formed record's `MemoryContext` deliberately has no
+    # place, so formation sets this from the observation it was formed from.
+    place_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -1114,6 +1120,7 @@ class Memory:
                             occurred_end=prepared.occurred_end,
                             created_at=now,
                             updated_at=now,
+                            place_id=prepared.place_id,
                             context=_stored_memory_context(prepared, recorded_at=now),
                         ),
                     ),
@@ -1583,16 +1590,15 @@ class Memory:
                     self._recognize_speech(speech_assets, assets)
                 hits = search().hits
             hits = _grounding_hits(hits, limit, budget_chars=self._evidence_budget)
-            routed_question = self._route_generation(
-                (
-                    _with_reference_time(prepared, reference)
-                    if explicit_reference is not None
-                    or temporal_text != prepared.text
-                    or temporal_range is not None
-                    else prepared
-                ),
-                assets,
-            )
+            # Every question the answerer reads as text gets the reference time, not just the ones
+            # whose phrasing a parser recognized. "How long ago did grandpa visit?" narrows no
+            # retrieval window and names no date, yet it is exactly the question the reader cannot
+            # answer without knowing when it is being asked. Applied after routing, because that
+            # is what decides whether the reader gets text at all -- a spoken question becomes
+            # text there -- and because routing appends speech identities and transcripts, which
+            # would otherwise land after the line documented as final.
+            routed = self._route_generation(prepared, assets)
+            routed_question = _with_reference_time(routed, reference) if routed.text else routed
             routed_hits = (
                 self._route_generation_hits(hits, assets, link_identities=link_identities)
                 if hits
@@ -3462,12 +3468,13 @@ class Memory:
             ),
             evidence_ids=tuple(sorted(source.id for source in sources)),
         )
+        place_id, metadata = _agreed_inheritance(sources)
         prepared = replace(
             _prepare_memory(
                 self._prepare_content(proposal.content, assets),
                 occurred_at=primary.occurred_at,
                 occurred_end=primary.occurred_end,
-                metadata=None,
+                metadata=metadata,
                 memory_type=_formation_memory_type(proposal.kind),
             ),
             memory_id=_formation_memory_id(
@@ -3477,6 +3484,7 @@ class Memory:
                 context=context,
             ),
             context=context,
+            place_id=place_id,
         )
         logged = self._commit_formation(
             tuple((prepared, source.id, proposal.confidence) for source in sources),
@@ -3558,6 +3566,9 @@ class Memory:
                 self._prepare_content(proposal.content, assets),
                 occurred_at=None,
                 occurred_end=None,
+                # A name is not observed anywhere: who somebody is stays true in the next room,
+                # so the assertion inherits neither the place nor the tags of the clips they were
+                # recognized in, exactly as `register_identity` asserts it from no evidence.
                 metadata=None,
                 memory_type=_formation_memory_type(proposal.kind),
             ),
@@ -4119,14 +4130,7 @@ class Memory:
                         occurred_end=memory.occurred_end,
                         created_at=now,
                         updated_at=now,
-                        # Only an `ObservationContext` carries a place: it is what the caller
-                        # supplies at capture time. `MemoryContext` is the formed-semantics shape
-                        # and deliberately has none.
-                        place_id=(
-                            memory.context.place_id
-                            if isinstance(memory.context, ObservationContext)
-                            else None
-                        ),
+                        place_id=memory.place_id,
                         context=_stored_memory_context(memory, recorded_at=now),
                     )
                     for memory in missing
@@ -4436,15 +4440,34 @@ class Memory:
         pairs: builtins.list[tuple[_PreparedMemory, str, float]] = []
         inputs_by_id = {value.memory_id: value for value in inputs}
         formed_sources = tuple(source for source in pending if source.id in inputs_by_id)
+        refused = 0
         for source in formed_sources:
             proposals = proposals_by_id.get(source.id, ())
+            # Application data and the symbolic place travel with the knowledge formed from them:
+            # a host that filters recall by metadata expects the tag on the observation to hold
+            # for what was learned from it, and `place_id` is a hard filter, so knowledge formed
+            # from an observation in a room has to stand in that room too -- otherwise a
+            # place-scoped question sees the raw observation and none of the entities, states, or
+            # relations formed from it. One source agrees with itself; a record several sources
+            # share keeps only what they all say, which `_commit_formation` settles.
+            place_id, metadata = _agreed_inheritance((source,))
             for proposal in proposals:
-                _validate_formation_proposal(proposal, inputs_by_id[source.id])
+                # One derived opinion the model grounded wrongly -- an affect cue naming a
+                # modality the source never carried, a pose in another frame -- must not cost the
+                # caller the observation it came from. `add` commits the source before formation
+                # runs, so failing here fails a write that in fact succeeded, and every retry
+                # re-runs formation and fails the same way. It is dropped and counted instead,
+                # which is the policy the model adapter already applies to a malformed one, and
+                # which consolidation already applies to this same rule. Damage to the batch
+                # envelope still raises above: that is not one opinion.
+                if _formation_refusal(proposal, inputs_by_id[source.id]) is not None:
+                    refused += 1
+                    continue
                 prepared = _prepare_memory(
                     self._prepare_content(proposal.content, operation),
                     occurred_at=source.occurred_at,
                     occurred_end=source.occurred_end,
-                    metadata=None,
+                    metadata=metadata,
                     memory_type=_formation_memory_type(proposal.kind),
                 )
                 context = _formation_context(
@@ -4466,13 +4489,15 @@ class Memory:
                                 context=context,
                             ),
                             context=context,
+                            place_id=place_id,
                         ),
                         source.id,
                         proposal.confidence,
                     )
                 )
-        _validate_formation_pairs(pairs)
-        self._commit_formation(pairs, formed_sources, completed_at=now)
+        grounded, conflicting = _grounded_formation_pairs(pairs)
+        record_formation_refusals(refused + conflicting)
+        self._commit_formation(grounded, formed_sources, completed_at=now)
 
     def _commit_formation(
         self,
@@ -4493,17 +4518,28 @@ class Memory:
         """
         recipe = self._formation_space if recipe is None else recipe
         ordered_pairs = tuple(sorted(pairs, key=lambda value: (value[0].memory_id, value[1] or "")))
-        unique = tuple(
-            {
-                prepared.memory_id: prepared
-                for prepared, _source, _score in reversed(ordered_pairs)
-            }.values()
-        )
-        unique = tuple(sorted(unique, key=lambda value: value.memory_id))
+        by_id: dict[str, builtins.list[_PreparedMemory]] = {}
+        for prepared, _source, _score in ordered_pairs:
+            by_id.setdefault(prepared.memory_id, []).append(prepared)
         with _translate_storage_errors("check formed memories"):
-            existing = self._store.read_memories(tuple(value.memory_id for value in unique))
-        existing_ids = {value.memory_id for value in existing}
-        missing = tuple(value for value in unique if value.memory_id not in existing_ids)
+            existing = self._store.read_memories(tuple(sorted(by_id)))
+        existing_by_id = {value.memory_id: value for value in existing}
+        unique = tuple(
+            _agreed_columns(values, existing_by_id.get(memory_id))
+            for memory_id, values in sorted(by_id.items())
+        )
+        # A record whose ID excludes its source -- an entity, a relation, an inferred trait -- is
+        # written once and every later source only adds evidence to it, so what the first source
+        # said would otherwise stand for evidence that disagrees. The columns it no longer agrees
+        # on are cleared on the stored row inside the same transaction; nothing is re-embedded,
+        # because neither column reaches the index.
+        narrowed = tuple(
+            (value.memory_id, value.place_id, value.metadata_json)
+            for value in unique
+            if (row := existing_by_id.get(value.memory_id)) is not None
+            and (value.place_id, value.metadata_json) != (row.place_id, row.metadata_json)
+        )
+        missing = tuple(value for value in unique if value.memory_id not in existing_by_id)
         parts = tuple(
             (memory, object_part, model_input)
             for memory in missing
@@ -4525,6 +4561,7 @@ class Memory:
                 occurred_end=memory.occurred_end,
                 created_at=completed_at,
                 updated_at=completed_at,
+                place_id=memory.place_id,
                 context=cast(MemoryContext, memory.context),
             )
             for memory in missing
@@ -4567,6 +4604,7 @@ class Memory:
                         if source_id is not None
                     ),
                     source_memory_ids=tuple(source.id for source in sources),
+                    narrowed=narrowed,
                     recipe=recipe,
                     completed_at=completed_at,
                     operation=operation,
@@ -8265,6 +8303,7 @@ def _prepare_memory(
         occurred_end=normalized_occurred_end,
         memory_type=normalized_memory_type,
         context=context,
+        place_id=None if context is None else context.place_id,
     )
 
 
@@ -8284,6 +8323,7 @@ def _prepared_from_stored(memory: StoredMemory) -> _PreparedMemory:
         occurred_at=memory.occurred_at,
         occurred_end=memory.occurred_end,
         memory_type=MemoryType(memory.memory_type),
+        place_id=memory.place_id,
     )
 
 
@@ -8348,18 +8388,19 @@ def _formation_memory_type(kind: MemoryKind) -> MemoryType:
     return KIND_MEMORY_TYPES.get(kind, MemoryType.SEMANTIC)
 
 
-def _validate_formation_proposal(
+def _formation_refusal(
     proposal: FormationProposal,
     source: FormationInput,
-) -> None:
+) -> str | None:
+    """Say why the kernel refuses to ground this proposal in this source, or `None` to keep it.
+
+    A refusal costs the proposal and nothing else, on both paths that ask: formation drops it,
+    and consolidation moves on to the next cited source.
+    """
     if proposal.kind is MemoryKind.AFFECT and (
         proposal.cue_modality is None or proposal.cue_modality not in source.content.modalities
     ):
-        raise ModelError(
-            "affect formation must name a modality present in its source",
-            reason="response_invalid",
-            stage="form",
-        )
+        return "affect formation must name a modality present in its source"
     if proposal.spatial is not None:
         observed = source.context.spatial
         if (
@@ -8367,11 +8408,8 @@ def _validate_formation_proposal(
             or proposal.spatial.frame_id != observed.frame_id
             or proposal.spatial.anchor is not observed.anchor
         ):
-            raise ModelError(
-                "spatial formation must use the source observation frame and anchor",
-                reason="response_invalid",
-                stage="form",
-            )
+            return "spatial formation must use the source observation frame and anchor"
+    return None
 
 
 class _RejectedOperation(Exception):
@@ -8501,18 +8539,16 @@ def _consolidation_primary(
         ),
     )
     for source in reversed(ranked):
-        try:
-            _validate_formation_proposal(
-                proposal,
-                FormationInput(
-                    memory_id=source.id,
-                    content=ModelInput(text=source.content, assets=source.assets),
-                    context=_observation_from_record(source),
-                ),
-            )
-        except ModelError:
-            continue
-        return source
+        refusal = _formation_refusal(
+            proposal,
+            FormationInput(
+                memory_id=source.id,
+                content=ModelInput(text=source.content, assets=source.assets),
+                context=_observation_from_record(source),
+            ),
+        )
+        if refusal is None:
+            return source
     return None
 
 
@@ -8556,42 +8592,46 @@ def _memory_outcome(value: str) -> MemoryOutcome:
         raise StorageError("a logged memory operation has an unknown outcome") from None
 
 
-def _validate_formation_pairs(
+def _grounded_formation_pairs(
     pairs: Sequence[tuple[_PreparedMemory, str | None, float]],
-) -> None:
+) -> tuple[tuple[tuple[_PreparedMemory, str | None, float], ...], int]:
+    """Keep the first of each conflicting proposal from one source; return the rest as refused.
+
+    Two proposals of one record that disagree, and two contradictory states in one lineage, are
+    grounding faults inside a single model response -- not damage to the envelope. The source is
+    already committed when formation runs, so failing the write would report a stored observation
+    as unwritten and every retry would re-run the model and fail identically.
+    """
+    kept: builtins.list[tuple[_PreparedMemory, str | None, float]] = []
+    refused = 0
     seen: dict[tuple[str, str | None], _PreparedMemory] = {}
     states: dict[tuple[str | None, str], builtins.list[MemoryContext]] = {}
-    for prepared, source_id, _confidence in pairs:
-        key = (prepared.memory_id, source_id)
-        prior = seen.setdefault(key, prepared)
-        if prior != prepared:
-            raise ModelError(
-                "formation returned conflicting duplicates for one source",
-                reason="response_invalid",
-                stage="form",
-            )
+    for pair in pairs:
+        prepared, source_id, _confidence = pair
+        if seen.setdefault((prepared.memory_id, source_id), prepared) != prepared:
+            refused += 1
+            continue
         context = prepared.context
         if isinstance(context, MemoryContext) and context.kind is MemoryKind.STATE:
-            states.setdefault((source_id, context.lineage_id or prepared.memory_id), []).append(
-                context
+            lineage = states.setdefault(
+                (source_id, context.lineage_id or prepared.memory_id),
+                [],
             )
-    for values in states.values():
-        for index, left in enumerate(values):
             if any(
-                left.value != right.value
+                standing.value != context.value
                 and _valid_intervals_overlap(
-                    left.valid_from,
-                    left.valid_until,
-                    right.valid_from,
-                    right.valid_until,
+                    standing.valid_from,
+                    standing.valid_until,
+                    context.valid_from,
+                    context.valid_until,
                 )
-                for right in values[index + 1 :]
+                for standing in lineage
             ):
-                raise ModelError(
-                    "formation returned conflicting states for one source",
-                    reason="response_invalid",
-                    stage="form",
-                )
+                refused += 1
+                continue
+            lineage.append(context)
+        kept.append(pair)
+    return tuple(kept), refused
 
 
 def _valid_intervals_overlap(
@@ -8603,6 +8643,43 @@ def _valid_intervals_overlap(
     return not (
         (left_until is not None and right_from is not None and left_until <= right_from)
         or (right_until is not None and left_from is not None and right_until <= left_from)
+    )
+
+
+def _agreed_inheritance(
+    sources: Sequence[MemoryRecord],
+) -> tuple[str | None, Mapping[str, object] | None]:
+    """The place and the metadata every cited source agrees on, or nothing.
+
+    A place is a hard retrieval filter, so disagreement inherits nothing rather than a majority.
+    """
+    places = {source.place_id for source in sources}
+    tags = {_metadata_json(source.metadata) for source in sources}
+    return (
+        sources[0].place_id if len(places) == 1 else None,
+        sources[0].metadata if len(tags) == 1 else None,
+    )
+
+
+def _agreed_columns(
+    values: Sequence[_PreparedMemory],
+    stored: StoredMemory | None,
+) -> _PreparedMemory:
+    """Return the first proposal of one derived record carrying only agreed inherited columns.
+
+    Same rule as `_agreed_inheritance`, applied where the sources arrive one write at a time: the
+    place and the metadata survive only while every proposal of this record -- and the row already
+    written for it -- says the same thing.
+    """
+    places = {value.place_id for value in values}
+    tags = {value.metadata_json for value in values}
+    if stored is not None:
+        places.add(stored.place_id)
+        tags.add(stored.metadata_json)
+    return replace(
+        values[0],
+        place_id=values[0].place_id if len(places) == 1 else None,
+        metadata_json=values[0].metadata_json if len(tags) == 1 else _EMPTY_METADATA_JSON,
     )
 
 
@@ -9596,9 +9673,10 @@ def _batch_values(
     return batch
 
 
-def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _PreparedContent:
-    note = f"Reference time for relative dates: {reference_at.isoformat(timespec='microseconds')}"
-    return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
+def _with_reference_time(question: ModelInput, reference_at: datetime) -> ModelInput:
+    """Append the answering clock as the final line of what the reader is handed."""
+    note = f"Reference time for relative dates: {reference_at.isoformat(timespec='seconds')}"
+    return replace(question, text=f"{question.text}\n\n{note}" if question.text else note)
 
 
 def _validated_descriptions(
