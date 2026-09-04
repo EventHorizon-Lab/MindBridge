@@ -1120,21 +1120,17 @@ def test_percentile_interpolates_and_reports_nothing_for_no_observations() -> No
     assert percentile((5.0,), 0.99) == pytest.approx(5.0)
 
 
-def test_scalar_metric_samples_bound_quantiles_but_keep_exact_average(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(eval_telemetry_module, "_MAX_RETAINED_DURATIONS", 2)
+def test_scalar_metric_samples_do_not_truncate_late_observations() -> None:
     samples = eval_telemetry_module._Samples()
-    for value in range(3):
+    for value in range(200_001):
         samples.add(float(value))
 
     result = samples.json()
 
-    assert result["count"] == 3
-    assert result["retained_count"] == 2
-    assert result["complete"] is False
-    assert result["average"] == pytest.approx(1.0)
-    assert result["p50"] is result["p95"] is result["p99"] is None
+    assert result["count"] == result["retained_count"] == 200_001
+    assert result["complete"] is True
+    assert result["average"] == pytest.approx(100_000.0)
+    assert result["p99"] == pytest.approx(198_000.0)
 
 
 # --- reproducibility fields ------------------------------------------------------------------

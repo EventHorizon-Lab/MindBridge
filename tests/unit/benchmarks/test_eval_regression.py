@@ -81,7 +81,7 @@ def _result() -> dict[str, Any]:
                             "complete": True,
                             "p95": 100.0,
                         },
-                        "latency_ms": {"p95": 500.0},
+                        "latency_ms": {"complete": True, "p95": 500.0},
                         "throughput_per_active_second": 2.0,
                     },
                     "ask_retrieval_core": {"latency_ms": {"p95": 40.0}},
@@ -92,7 +92,7 @@ def _result() -> dict[str, Any]:
                         "success_count": 10,
                         "error_count": 0,
                         "complete": True,
-                        "latency_ms": {"p95": 40.0},
+                        "latency_ms": {"complete": True, "p95": 40.0},
                     },
                     "token_usage": {"product": {"average_tokens_per_request": 250.0}},
                 },
@@ -173,10 +173,28 @@ def test_performance_comparison_rejects_incomplete_ttft_distribution() -> None:
         performance_comparisons(candidate, baseline, {"answer_e2e_ttft_p95": 0.1})
 
 
+def test_performance_comparison_rejects_incomplete_answer_latency_distribution() -> None:
+    candidate = _result()
+    baseline = _result()
+    candidate["tasks"][0]["performance"]["answer"]["latency_ms"]["complete"] = False
+
+    with pytest.raises(ValueError, match="no complete answer_e2e_latency_p95"):
+        performance_comparisons(candidate, baseline, {"answer_e2e_latency_p95": 0.1})
+
+
 def test_performance_comparison_rejects_incomplete_search_replay() -> None:
     candidate = _result()
     baseline = _result()
     candidate["tasks"][0]["performance"]["search_e2e"]["complete"] = False
+
+    with pytest.raises(ValueError, match="no complete retrieval_e2e_latency_p95"):
+        performance_comparisons(candidate, baseline, {"retrieval_e2e_latency_p95": 0.1})
+
+
+def test_performance_comparison_rejects_incomplete_search_latency_distribution() -> None:
+    candidate = _result()
+    baseline = _result()
+    candidate["tasks"][0]["performance"]["search_e2e"]["latency_ms"]["complete"] = False
 
     with pytest.raises(ValueError, match="no complete retrieval_e2e_latency_p95"):
         performance_comparisons(candidate, baseline, {"retrieval_e2e_latency_p95": 0.1})

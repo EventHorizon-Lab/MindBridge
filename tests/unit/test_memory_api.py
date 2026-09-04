@@ -37,6 +37,7 @@ from mindbridge._telemetry import (
     TOKEN_EXPECTED_REQUEST_COUNT,
     TOKEN_REPORTED_REQUEST_COUNT,
     TOKEN_TOTAL,
+    _observe_retrieval_results,
     mark_model_requests,
     record_model_usage,
     record_unmetered_model_usage,
@@ -514,6 +515,53 @@ def test_crud_search_ask_and_stable_duplicate(tmp_path: Path) -> None:
 
     assert models.closed is True
     assert models.close_calls == 1
+
+
+def test_ask_observes_the_pre_grounding_ranking_without_affecting_answers(
+    tmp_path: Path,
+) -> None:
+    models = _FakeModels()
+    observed: list[object] = []
+
+    def broken_observer(_results: object) -> None:
+        raise RuntimeError("observer failure")
+
+    with _memory(tmp_path, models, reinforce_on_answer=False) as memory:
+        memory.add_many(tuple(f"red evidence {index}" for index in range(9)))
+        with _observe_retrieval_results(observed.append):
+            result = memory.ask("red", limit=3)
+        with _observe_retrieval_results(broken_observer):
+            unaffected = memory.ask("red", limit=3)
+
+    assert len(observed) == 1
+    ranking = cast(tuple[SearchHit, ...], observed[0])
+    assert len(ranking) == 9
+    assert result.hits == ranking[:3]
+    assert unaffected == result
+
+
+def test_ask_observes_ranking_before_parallel_speech_failure(tmp_path: Path) -> None:
+    class FailingSpeech(_FakeSpeech):
+        def analyze(self, _assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+            raise RuntimeError("speech unavailable")
+
+    observed: list[object] = []
+    with _memory(
+        tmp_path,
+        _FakeModels(),
+        transcriber=FailingSpeech(),
+        index_speech=False,
+        reinforce_on_answer=False,
+    ) as memory:
+        memory.add_many(tuple(f"red evidence {index}" for index in range(3)))
+        with (
+            _observe_retrieval_results(observed.append),
+            pytest.raises(ModelError, match="failed to analyze speech"),
+        ):
+            memory.ask(("red", Blob(b"spoken question", "audio/wav", "question.wav")), limit=1)
+
+    ranking = cast(tuple[SearchHit, ...], observed[0])
+    assert len(ranking) == 3
 
 
 @pytest.mark.parametrize("write_method", ("add", "capture"))
