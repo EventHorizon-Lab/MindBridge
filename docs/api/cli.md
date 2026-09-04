@@ -109,7 +109,7 @@ credential behavior live in [configuration](../configuration.md).
 | `forget-identity` | `IDENTITY_ID` | erasure counts | no |
 | `unlink-identity` | `ALIAS_ID` | `{"restored_identity_id":...}` | no |
 | `reinforce` | one or more `MEMORY_ID` values | `{"reinforced":int}` | no |
-| `consolidation-candidates` | `--limit` | `{"candidates":[{"trigger":...,"memory_ids":[...],"evidence_count":int}]}` | no |
+| `consolidation-candidates` | `--limit`; `--idle` | `{"candidates":[{"trigger":...,"memory_ids":[...],"evidence_count":int}]}` | no |
 | `consolidate` | optional goal content; `--evidence-id`; `--limit`; `--trigger` | `{"operations":[...],"rejected":[...],"weighed":int}` | no |
 | `deliberate` | `--limit`; `--max-rounds`; `--idle` | `{"rounds":int,"weighed":int,"skipped":int,"applied":int,"rejected":int,"model_calls":int}` | no |
 | `apply` | `--operation` | `{"operation":{...}}` | no |
@@ -150,12 +150,13 @@ what it said about them. `outcome` and `outcome_note` are `null` until `record-o
 operation, are post-hoc and never fed back into a decision, and a later `record-outcome` call
 replaces an earlier judgement the same way `rollback` replaces a standing operation.
 
-`deliberate` runs `consolidation-candidates` and `consolidate` in a loop, each round consolidating
-every row `consolidation-candidates` returns with that row's own trigger, until a round yields no
-candidates or `--max-rounds` is reached; the counters it prints are summed across every round.
-`--idle` is passed through to `consolidation-candidates` on every round, declaring an approved
-idle window that admits lineages nothing has ever weighed; the CLI never infers idleness from a
-clock. `apply` applies one host-supplied operation -- read from `--operation` in the same JSON
+`consolidation-candidates`'s `--idle` declares an approved idle window, admitting lineages
+nothing has ever weighed; the CLI never infers idleness from a clock. `deliberate` runs
+`consolidation-candidates` and `consolidate` in a loop, each round consolidating every row
+`consolidation-candidates` returns with that row's own trigger, until a round yields no
+candidates or `--max-rounds` is reached; the counters it prints are summed across every round,
+and its own `--idle` passes the same declaration through to `consolidation-candidates` on every
+round. `apply` applies one host-supplied operation -- read from `--operation` in the same JSON
 shape `operations` logs a row in -- through the same kernel validation a proposal gets, which is
 the public replay path: reproducing a logged sequence against a fresh store configured with the
 recipe that produced it reproduces the same derived IDs. A refused operation exits
