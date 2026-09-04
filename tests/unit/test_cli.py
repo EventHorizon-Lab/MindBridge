@@ -15,7 +15,8 @@ import inspect
 import json
 import re
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
@@ -27,11 +28,13 @@ import pytest
 from pydantic import TypeAdapter
 
 import mindbridge
+import mindbridge.cli as cli_module
 from mindbridge import Memory, recipes
 from mindbridge.api import app as rest
 from mindbridge.api import content as rest_content
 from mindbridge.api.errors import ErrorEnvelope
-from mindbridge.cli import COMMANDS, EXIT_CODES, OPERATIONS, main
+from mindbridge.cli import COMMANDS, EXIT_CODES, OPERATIONS, _parser, main
+from mindbridge.control import load_operation
 from mindbridge.exceptions import MindBridgeError, ValidationError
 from mindbridge.memory import declared_capabilities
 from mindbridge.models.base import EmbedTask, ModelInput
@@ -41,7 +44,15 @@ from mindbridge.types import (
     AbstentionReason,
     AnswerResult,
     AssetRef,
+    EvidenceBasis,
+    FormationProposal,
+    IdentityChange,
+    MemoryIntent,
+    MemoryKind,
+    MemoryOperation,
+    MemoryOperationRecord,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
     Page,
@@ -161,6 +172,27 @@ def test_every_cli_gap_is_documented_with_its_reason() -> None:
         assert f"`{operation.replace('_', '-')}`" in page
 
 
+def test_the_documented_commands_table_and_count_are_the_real_ones() -> None:
+    """`docs/api/cli.md` states a command count in prose and lists every command in a table.
+
+    Both have drifted before: `deliberate`, `apply`, and `record-outcome` landed on the parser
+    without a documentation update in the same commit. Parsing the table and the count sentence
+    catches a command added to `COMMANDS` without a row, a row naming a command that does not
+    exist, and a stale count, rather than trusting either by inspection.
+    """
+    page = (Path(cli_module.__file__).parents[2] / "docs" / "api" / "cli.md").read_text(
+        encoding="utf-8"
+    )
+    section = page[page.index("### Commands") : page.index("### Content and JSONL input")]
+    documented = set(re.findall(r"^\| `([a-z][a-z-]*)` \|", section, re.MULTILINE))
+
+    assert documented == set(COMMANDS)
+
+    match = re.search(r"provides (\d+) SDK operation commands plus `doctor`", page)
+    assert match is not None
+    assert int(match.group(1)) == len(COMMANDS) - 1
+
+
 def test_every_public_error_code_has_a_stable_exit_status() -> None:
     def codes(root: type[MindBridgeError]) -> set[str]:
         found = {root.code}
@@ -266,6 +298,31 @@ def test_memory_documents_equal_the_rest_response_models() -> None:
         ),
     )
     assert document == rest.AnswerResponse.model_validate(answer).model_dump(mode="json")
+
+
+def test_ask_forwards_link_identities_and_defaults_it_when_absent() -> None:
+    """`--no-link-identities` must reach the SDK; a bare `Namespace` still defaults to True."""
+    from mindbridge.cli import _ask
+
+    seen: list[bool] = []
+
+    class RecordingMemory:
+        def ask(self, *_args: object, **kwargs: object) -> AnswerResult:
+            seen.append(cast(bool, kwargs["link_identities"]))
+            return AnswerResult("unknown", hits=())
+
+    memory = cast(Memory, RecordingMemory())
+    base = {
+        "content": ["question"],
+        "content_json": None,
+        "limit": 5,
+        "memory_type": None,
+        "reference_at": None,
+    }
+    _ask(memory, argparse.Namespace(**base, link_identities=False))
+    _ask(memory, argparse.Namespace(**base))
+
+    assert seen == [False, True]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -931,6 +988,7 @@ def test_remote_mode_compiles_over_v1(
                 "budget": {
                     "max_chars": 16000,
                     "max_items": 8,
+                    "max_media_items": None,
                     "memory_types": ["episodic"],
                     "min_confidence": 0.0,
                     "freshness_seconds": 3600.0,
@@ -956,8 +1014,15 @@ def test_remote_mode_passes_the_cursor_through_unparsed(
         ("faces", ("memory-1",)),
         ("register-speaker", ("speaker-1", "Ana")),
         ("register-identity", ("identity-1", "Ana")),
+        ("record-consent", ("identity-1", "withdrawn")),
+        ("consent", ("identity-1",)),
+        ("export", ("--identity-id", "identity-1")),
+        ("apply-retention", ()),
         ("reinforce", ("memory-1",)),
         ("consolidate", ("why",)),
+        ("deliberate", ()),
+        ("apply", ("--operation", '{"intent": "forget", "target_ids": ["memory-1"]}')),
+        ("record-outcome", ("1", "confirmed")),
         ("forget", ("memory-1",)),
         ("rollback", ("1",)),
         ("operations", ()),
@@ -1136,3 +1201,159 @@ def test_remote_timeout_must_be_positive_and_finite(
         main(("--url", "http://owner:8000", "--timeout", value, "list"))
     assert raised.value.code == 2
     assert "--timeout" in capsys.readouterr().err
+
+
+def test_the_control_plane_loop_commands_only_translate(
+    app: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`deliberate`, `apply`, and `record-outcome` add no policy of their own."""
+    status, added, _ = _run(capsys, "--app", app, "-q", "add", "a red wrench on the bench")
+    assert status == 0
+    memory_id = cast(str, cast(dict[str, object], added)["id"])
+
+    # No consolidator is composed here, so nothing is ever due and the loop is a no-op.
+    status, report, _ = _run(capsys, "--app", app, "-q", "deliberate", "--max-rounds", "2")
+    assert status == 0
+    assert report == {
+        "rounds": 0,
+        "weighed": 0,
+        "skipped": 0,
+        "applied": 0,
+        "rejected": 0,
+        "model_calls": 0,
+    }
+
+    # `apply` reads the same operation JSON the log stores, so a log row replays verbatim.
+    operation = json.dumps({"intent": "forget", "target_ids": [memory_id]})
+    status, applied, _ = _run(capsys, "--app", app, "-q", "apply", "--operation", operation)
+    assert status == 0
+    record = cast(dict[str, object], cast(dict[str, object], applied)["operation"])
+    assert record["intent"] == "forget"
+    assert record["forgotten_ids"] == [memory_id]
+    assert record["outcome"] is None and record["outcome_note"] is None
+
+    operation_id = cast(int, record["operation_id"])
+    status, recorded, _ = _run(
+        capsys,
+        "--app",
+        app,
+        "-q",
+        "record-outcome",
+        str(operation_id),
+        "refuted",
+        "--note",
+        "the wrench was still there",
+    )
+    assert status == 0
+    assert recorded == {"recorded": True}
+
+    status, listed, _ = _run(capsys, "--app", app, "-q", "operations")
+    assert status == 0
+    logged = cast(list[dict[str, object]], cast(dict[str, object], listed)["operations"])
+    assert logged[0]["outcome"] == "refuted"
+    assert logged[0]["outcome_note"] == "the wrench was still there"
+
+    # A refused operation reports the kernel's own reason as a validation error, exit 3.
+    status, stdout, stderr = _run(
+        capsys,
+        "--app",
+        app,
+        "-q",
+        "apply",
+        "--operation",
+        json.dumps({"intent": "correct", "target_ids": [memory_id]}),
+    )
+    assert status == EXIT_CODES["validation_error"] == 3
+    assert stdout is None
+    assert cast(dict[str, object], stderr[0])["reason"] == "not_derived"
+
+
+def test_an_operation_row_names_the_people_a_merge_moved() -> None:
+    """An identity operation names people, not records, so the row has to carry them.
+
+    `merge`, the `correct` a split logs, and the `forget` an erasure logs all leave every
+    memory-ID field empty. Without `identity` the operator surface would print an intent with no
+    subject at all.
+    """
+    record = MemoryOperationRecord(
+        operation_id=7,
+        operation=MemoryOperation(
+            intent=MemoryIntent.MERGE,
+            identity=IdentityChange(identity_id="identity-1", moved_ids=("identity-2",)),
+        ),
+        trigger=MemoryTrigger.EVIDENCE,
+        applied_at=datetime(2026, 3, 1, 12, tzinfo=timezone.utc),
+    )
+
+    document = cli_module._operation_document(record)
+
+    assert document["intent"] == "merge"
+    assert document["identity"] == {
+        "identity_id": "identity-1",
+        "moved_ids": ["identity-2"],
+    }
+    assert document["target_ids"] == []
+    assert cli_module._operation_document(replace(record, operation=_A_FORGET))["identity"] is None
+
+
+def test_the_idle_window_declared_on_the_command_line_reaches_candidate_selection() -> None:
+    """`--idle` is the operator declaring a window, so the handler has to forward it.
+
+    The flag was parsed and then dropped, so `consolidation-candidates --idle` asked for exactly
+    what the default asks for and never admitted the never-weighed lineages it advertises. Driven
+    against the handler because the declaration is what regressed, not the row it prints.
+    """
+    asked: list[Mapping[str, object]] = []
+
+    class Spy:
+        def consolidation_candidates(self, **keywords: object) -> tuple[object, ...]:
+            asked.append(keywords)
+            return ()
+
+    parser = _parser()
+    declared = parser.parse_args(["consolidation-candidates", "--idle", "--limit", "5"])
+    default = parser.parse_args(["consolidation-candidates", "--limit", "5"])
+
+    for arguments in (declared, default):
+        cli_module._consolidation_candidates(cast(Memory, Spy()), arguments)
+
+    assert asked == [{"limit": 5, "idle": True}, {"limit": 5, "idle": False}]
+
+
+def test_a_consolidation_row_carries_the_proposal_it_would_replay_from() -> None:
+    """`--operation` takes a row as `operations` prints it, so the row has to be replayable.
+
+    A consolidation's subject is what it proposed, and the kernel refuses one carrying no
+    proposal. Without this field the advertised pipe -- an `operations` row into `apply` --
+    failed validation before replay, for exactly the intent the slow loop produces most.
+    """
+    operation = MemoryOperation(
+        intent=MemoryIntent.CONSOLIDATE,
+        evidence_ids=("memory-1", "memory-2"),
+        proposal=FormationProposal(
+            kind=MemoryKind.STATE,
+            content="the bench is in the garage",
+            basis=EvidenceBasis.MODEL_INFERENCE,
+            confidence=0.8,
+            subject="bench",
+            predicate="location",
+            value="garage",
+        ),
+    )
+    record = MemoryOperationRecord(
+        operation_id=9,
+        operation=operation,
+        trigger=MemoryTrigger.EVIDENCE,
+        applied_at=datetime(2026, 3, 1, 12, tzinfo=timezone.utc),
+    )
+
+    document = cli_module._operation_document(record)
+
+    proposal = cast(dict[str, object], document["proposal"])
+    assert proposal["content"] == "the bench is in the garage"
+    assert proposal["kind"] == "state"
+    # The row round-trips: what `operations` prints is what `apply` accepts.
+    assert load_operation(json.dumps(document)) == operation
+
+
+_A_FORGET = MemoryOperation(intent=MemoryIntent.FORGET, target_ids=("memory-1",))

@@ -167,12 +167,15 @@ def _server() -> None:
     assert set(app.openapi()["paths"]) == {
         "/healthz",
         "/v1/answers",
+        "/v1/capture",
         "/v1/context",
         "/v1/memories",
         "/v1/memories/batch",
         "/v1/memories/reinforce",
         "/v1/memories/search",
         "/v1/memories/{memory_id}",
+        "/v1/pending_captures",
+        "/v1/settle",
     }
 
 

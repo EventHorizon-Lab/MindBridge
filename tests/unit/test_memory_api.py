@@ -36,6 +36,7 @@ from mindbridge._telemetry import (
     record_model_usage,
     record_unmetered_model_usage,
 )
+from mindbridge.control import dump_operation
 from mindbridge.exceptions import (
     IdentityNotFoundError,
     IndexUnavailableError,
@@ -75,9 +76,12 @@ from mindbridge.types import (
     ContextBudget,
     EvidenceBasis,
     FormationProposal,
+    IdentityChange,
     IdentityProfile,
     IndexQuantization,
+    MemoryIntent,
     MemoryKind,
+    MemoryOperationRecord,
     MemoryRecord,
     MemoryTrigger,
     MemoryType,
@@ -2171,7 +2175,13 @@ def test_naming_is_auditable_and_rollback_restores_the_previous_name(tmp_path: P
         memory.register_identity(identity_id, "Li Hua")
 
         logged = memory.operations()
-        assert [entry.trigger for entry in logged] == [MemoryTrigger.MANUAL, MemoryTrigger.MANUAL]
+        # Two host namings, and behind them the cross-modal merge the recognizers corroborated
+        # on this one video: the kernel commits that from evidence, so it logs as EVIDENCE.
+        assert [entry.trigger for entry in logged] == [
+            MemoryTrigger.MANUAL,
+            MemoryTrigger.MANUAL,
+            MemoryTrigger.EVIDENCE,
+        ]
         assert memory.identity(identity_id) == IdentityProfile(
             identity_id=identity_id, name="Li Hua", relationship="neighbour", confirmed=True
         )
@@ -6100,3 +6110,215 @@ def test_compiled_context_reports_a_person_who_is_present_but_unnamed(tmp_path: 
     assert [entry.identity_id for entry in named.actors if isinstance(entry, ProvisionalActor)] == [
         speaker_id
     ]
+
+
+def _merge_row(memory: Memory) -> MemoryOperationRecord:
+    rows = [row for row in memory.operations() if row.operation.intent is MemoryIntent.MERGE]
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+def _linking_memory(tmp_path: Path, *, min_assets: int = 1) -> Memory:
+    return Memory(
+        tmp_path,
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_analyzer=_FakeFace(),
+        identity_link_min_assets=min_assets,
+        index_speech=True,
+    )
+
+
+def test_a_cross_modal_merge_is_logged_and_rollback_re_splits_the_two_identities(
+    tmp_path: Path,
+) -> None:
+    """The kernel's own irreversible-looking bind is neither invisible nor irreversible.
+
+    Binding one voice to one face is a model embedding plus a corroboration count, committed as
+    a side effect of `faces()`. It has to reach the operation log like every other derived
+    state, or `operations()` cannot answer what fused two people and `rollback()` cannot undo
+    it.
+    """
+    # `min_assets=2` holds the merge off the first asset, so both identities exist -- and can be
+    # read back by their own `created_at` -- before anything fuses them. `faces()` on a single
+    # asset commits enrolment and the merge in the same call, leaving nothing to read.
+    with _linking_memory(tmp_path, min_assets=2) as memory:
+        seed = memory.add(Blob(b"seed video", "video/mp4", "seed.mp4"))
+        face_id = memory.faces(seed.id)[0].identity_id
+        voice_id = memory.speech(seed.id)[0].speaker_id
+        assert face_id != voice_id
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+            pre_merge_created_at = dict(
+                connection.execute(
+                    "SELECT identity_id, created_at FROM identities WHERE identity_id IN (?, ?)",
+                    (face_id, voice_id),
+                ).fetchall()
+            )
+        assert set(pre_merge_created_at) == {face_id, voice_id}
+
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        survivor = memory.faces(record.id)[0].identity_id
+        assert memory.speech(record.id)[0].speaker_id == survivor
+        memory.register_identity(survivor, "Li")
+
+        merged = _merge_row(memory)
+        change = merged.operation.identity
+        assert change is not None
+        assert change.identity_id == survivor
+        absorbed = change.moved_ids[0]
+        assert absorbed != survivor
+        # Lineage: which recognizer produced the templates, and which kernel rule bound them.
+        assert merged.model_id == _FakeFace.face_model
+        assert merged.recipe == "mindbridge-identity-link-v1"
+        assert merged.trigger is MemoryTrigger.EVIDENCE
+        # Before the reversal the absorbed ID is an alias, so it resolves to the named person.
+        assert memory.identity(absorbed) == IdentityProfile(
+            identity_id=survivor, name="Li", confirmed=True
+        )
+
+        assert memory.rollback(merged.operation_id) is True
+
+        # Two identities again: the survivor keeps the voice and the name, and the restored
+        # face identity is its own nameless person with its own exemplars.
+        assert memory.identity(absorbed) == IdentityProfile(identity_id=absorbed)
+        assert memory.identity(survivor) == IdentityProfile(
+            identity_id=survivor, name="Li", confirmed=True
+        )
+        assert memory.speech(record.id)[0].speaker_id == survivor
+        assert memory.speech(record.id)[0].speaker_name == "Li"
+        assert _merge_row(memory).rolled_back_at is not None
+
+        # The restored identity's `created_at` is its own pre-merge value, not the moment the
+        # merge (or the rollback) happened: `_merge_identities` must not overwrite it with the
+        # merge time before `_split_identity` reads it back.
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+            restored_created_at = connection.execute(
+                "SELECT created_at FROM identities WHERE identity_id = ?",
+                (absorbed,),
+            ).fetchone()[0]
+        assert restored_created_at == pre_merge_created_at[absorbed]
+
+        # Reversing a merge resets the pair's evidence rather than suppressing the pair, so
+        # continued ingestion corroborates and merges them again -- and logs that second bind as
+        # its own row. `min_assets=2` needs both assets reprocessed to recorroborate; `faces()`
+        # on `record.id` is called last on purpose, so its return value is the fresh merge.
+        memory.faces(seed.id)
+        assert memory.faces(record.id)[0].identity_id == survivor
+        standing = [
+            row
+            for row in memory.operations()
+            if row.operation.intent is MemoryIntent.MERGE and row.rolled_back_at is None
+        ]
+        assert [row.operation_id for row in standing] != [merged.operation_id]
+        assert len(standing) == 1
+
+
+def test_ask_link_identities_false_recognizes_faces_without_committing_a_merge(
+    tmp_path: Path,
+) -> None:
+    """`ask` can identify who is in a photo or video without gaining merge authority.
+
+    `_route_generation_hits` reaches the same face recognition `faces()` uses, and by default
+    commits the same corroborated cross-modal `MERGE` -- an agent with recall access alone would
+    otherwise acquire it merely by asking a question over a photo or video.
+    `link_identities=False` keeps recognition running so the question still gets answered, but
+    the bind itself is never committed: no `MERGE` row, and the two identities stay apart. This
+    is the mechanism `build_mcp_server(embodied_operations=False)` relies on for `ask_memory`.
+    """
+
+    def _identity_row_count(data_dir: Path) -> int:
+        with closing(sqlite3.connect(data_dir / "state.sqlite3")) as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM identities").fetchone()[0])
+
+    def _ask_over_a_face(data_dir: Path, *, link_identities: bool) -> bool:
+        with Memory(
+            data_dir,
+            embedder=_FakeEmbedder(),
+            answerer=_FakeModels(),
+            transcriber=_FakeSpeech(),
+            face_analyzer=_FakeFace(),
+            identity_link_min_assets=1,
+        ) as memory:
+            record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+
+            result = memory.ask("who is in the video?", link_identities=link_identities)
+
+            assert result.hits and result.hits[0].id == record.id
+            merged = any(row.operation.intent is MemoryIntent.MERGE for row in memory.operations())
+        return merged
+
+    withheld = tmp_path / "withheld"
+    assert _ask_over_a_face(withheld, link_identities=False) is False
+    # Face and voice recognition still ran -- evidence exists -- but neither identity absorbed
+    # the other, so the store still holds both of them separately.
+    assert _identity_row_count(withheld) == 2
+
+    granted = tmp_path / "granted"
+    assert _ask_over_a_face(granted, link_identities=True) is True
+    assert _identity_row_count(granted) == 1
+
+
+def test_unlinking_a_merge_is_logged_as_a_split_and_rollback_re_links_it(tmp_path: Path) -> None:
+    """`unlink_identity` is the split half of "correct or split", so it logs like one."""
+    with _linking_memory(tmp_path) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        survivor = memory.faces(record.id)[0].identity_id
+        memory.register_identity(survivor, "Li")
+        absorbed = _merge_row(memory).operation.identity.moved_ids[0]  # type: ignore[union-attr]
+
+        assert memory.unlink_identity(absorbed) == absorbed
+
+        split = memory.operations()[0]
+        assert split.operation.intent is MemoryIntent.CORRECT
+        assert split.operation.identity == IdentityChange(
+            identity_id=survivor, moved_ids=(absorbed,)
+        )
+        assert split.operation.target_ids == ()
+        assert memory.identity(absorbed) == IdentityProfile(identity_id=absorbed)
+
+        assert memory.rollback(split.operation_id) is True
+
+        # Re-linked under the identity that survived, with its name intact.
+        assert memory.identity(absorbed) == IdentityProfile(
+            identity_id=survivor, name="Li", confirmed=True
+        )
+        # The merge below it stays standing, and is still the row that reverses the bind.
+        assert _merge_row(memory).rolled_back_at is None
+
+
+def test_erasing_a_person_leaves_an_irreversible_log_row_holding_no_content(
+    tmp_path: Path,
+) -> None:
+    """Physical forgetting of a person is auditable and deliberately not recoverable.
+
+    `delete()` leaves no row at all, cognitive forgetting leaves a reversible `FORGET` row over
+    memory IDs, and this leaves a `FORGET` row over an identity: the marker that separates the
+    two is which of the two the row names. It carries IDs only, so the log cannot be mined for
+    the name or the template the erasure destroyed.
+    """
+    with _linking_memory(tmp_path) as memory:
+        record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+        survivor = memory.faces(record.id)[0].identity_id
+        memory.register_identity(survivor, "Li Hua")
+        absorbed = _merge_row(memory).operation.identity.moved_ids[0]  # type: ignore[union-attr]
+
+        erasure = memory.forget_identity(survivor)
+
+        erased = memory.operations()[0]
+        assert erased.operation.intent is MemoryIntent.FORGET
+        assert erased.operation.identity == IdentityChange(
+            identity_id=survivor, moved_ids=(absorbed,)
+        )
+        assert erased.operation.target_ids == ()
+        assert erasure.alias_ids == (absorbed,)
+        # IDs and nothing else: the assertion that carried the name is named, not quoted, and
+        # the record it names is gone.
+        assert len(erased.changed_ids) == 1
+        assert "Li" not in dump_operation(erased.operation)
+        with pytest.raises(MemoryNotFoundError):
+            memory.get(erased.changed_ids[0])
+
+        assert memory.rollback(erased.operation_id) is False
+        assert memory.operations()[0].rolled_back_at is None
+        assert memory.identity(survivor) is None
+        assert '"speaker_name":null' in memory.get(record.id).content

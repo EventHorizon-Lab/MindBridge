@@ -8,6 +8,7 @@ can reverse it.
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -18,16 +19,22 @@ import pytest
 from _feature_support import ATOMIC_MODALITIES, TinyEmbedder
 
 from mindbridge import (
+    AbstentionReason,
+    AnswerResult,
     AssetRef,
     AsyncMemory,
     Blob,
     ConsolidationBackend,
+    ConsolidationCandidate,
     ConsolidationReport,
+    ContextBudget,
+    DeliberationReport,
     EvidenceBasis,
     FaceAnalysis,
     FaceEmbedding,
     FormationInput,
     FormationProposal,
+    IdentityChange,
     IdentityClaim,
     Memory,
     MemoryIntent,
@@ -35,13 +42,17 @@ from mindbridge import (
     MemoryNotFoundError,
     MemoryOperation,
     MemoryOperationRecord,
+    MemoryOutcome,
     MemoryPlugins,
     MemoryRecord,
     MemoryTrigger,
+    MemoryType,
     Modality,
     ModelError,
+    ModelInput,
     ObservationContext,
     RetrievalScope,
+    SearchHit,
     SpeakerEmbedding,
     SpeechAnalysis,
     SpeechTurn,
@@ -997,6 +1008,7 @@ def test_an_agent_names_a_person_only_from_evidence_that_contains_them(tmp_path:
         assert [record.operation.intent for record in memory.operations()] == [
             MemoryIntent.IDENTIFY,
             MemoryIntent.IDENTIFY,
+            MemoryIntent.MERGE,
         ]
 
         # Reversing the corroborating operation takes the projected name with it.
@@ -1536,36 +1548,15 @@ def test_a_concurrent_duplicate_is_refused_inside_the_transaction(tmp_path: Path
 # Replay
 
 
-class Replayer:
-    """Replays whatever the log recorded for the evidence set it is shown."""
-
-    consolidation_model = "consolidator-test"
-    consolidation_recipe = "consolidator-test:v1"
-
-    def __init__(self, logged: Sequence[MemoryOperationRecord]) -> None:
-        self._logged = tuple(logged)
-
-    def consolidate(
-        self,
-        evidence: Sequence[MemoryRecord],
-        *,
-        trigger: MemoryTrigger,
-    ) -> tuple[MemoryOperation, ...]:
-        shown = {record.id for record in evidence}
-        return tuple(
-            row.operation for row in self._logged if set(row.operation.evidence_ids) <= shown
-        )
-
-    def close(self) -> None:
-        pass
-
-
 def test_a_logged_operation_sequence_replays_against_a_fresh_store(tmp_path: Path) -> None:
     """Gate 3's replay item: the log alone is enough to reproduce the derived state.
 
-    `applied_at` is re-stamped at replay, so transaction times differ by construction. What the
-    log is supposed to determine -- the operation keys, the derived IDs, and the evidence
-    lineage -- does not depend on it.
+    Replay is the public `apply()` surface, not a backend impersonating one: the fresh store is
+    configured with the same consolidation recipe -- a derived representation belongs to a
+    recipe -- but its backend is never called, and each logged `MemoryOperation` goes through the
+    same kernel validation a proposal does. `applied_at` is re-stamped at replay, so transaction
+    times differ by construction. What the log is supposed to determine -- the operation keys,
+    the derived IDs, and the evidence lineage -- does not depend on it.
     """
     consolidator = ScriptedConsolidator()
     with _memory(tmp_path / "origin", consolidator) as origin:
@@ -1594,7 +1585,8 @@ def test_a_logged_operation_sequence_replays_against_a_fresh_store(tmp_path: Pat
         ]
         keys = [operation_key(row.operation, recipe=row.recipe) for row in logged]
 
-    with _memory(tmp_path / "replayed", Replayer(logged)) as replayed:
+    silent = SilentConsolidator()
+    with _memory(tmp_path / "replayed", silent) as replayed:
         sources = _observations(
             replayed,
             "Ana waited calmly",
@@ -1603,19 +1595,62 @@ def test_a_logged_operation_sequence_replays_against_a_fresh_store(tmp_path: Pat
         )
         # Content-addressed identity: the same observations get the same IDs in a fresh store.
         assert [record.id for record in sources] == [first.id, second.id, third.id]
-        report = replayed.consolidate(evidence_ids=(first.id, second.id))
+        applied = tuple(replayed.apply(row.operation) for row in logged)
+        # Replay reasons about nothing: the configured backend was never asked.
+        assert silent.calls == 0
 
-        assert report.rejected == ()
         replayed_log = tuple(reversed(replayed.operations()))
         assert [
             (row.operation.intent, row.created_ids, row.changed_ids, row.forgotten_ids)
             for row in replayed_log
         ] == recorded
         assert [operation_key(row.operation, recipe=row.recipe) for row in replayed_log] == keys
-        derived = replayed.get(report.operations[0].created_ids[0])
+        derived = replayed.get(applied[0].created_ids[0])
         assert derived.context is not None
         assert set(derived.context.evidence_ids) == {first.id, second.id}
         assert replayed.get(second.id).forgotten_at is not None
+
+        # The same operation twice is one operation, exactly as it is for a proposal.
+        with pytest.raises(ValidationError) as refused:
+            replayed.apply(logged[0].operation)
+        assert refused.value.reason == "duplicate"
+
+
+def test_apply_refuses_what_the_kernel_refuses_a_proposal(tmp_path: Path) -> None:
+    """A host-supplied operation is not trusted because the host supplied it."""
+    with _memory(tmp_path) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again, calmly")
+        for operation, reason in (
+            (
+                MemoryOperation(intent=MemoryIntent.FORGET, target_ids=("missing",)),
+                "unknown_target",
+            ),
+            # CORRECT acts on derived claims. An observation is evidence, not an inference.
+            (
+                MemoryOperation(intent=MemoryIntent.CORRECT, target_ids=(first.id,)),
+                "not_derived",
+            ),
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.REINFORCE,
+                    target_ids=(first.id,),
+                    evidence_ids=(second.id,),
+                ),
+                "not_derived",
+            ),
+        ):
+            with pytest.raises(ValidationError) as refused:
+                memory.apply(operation)
+            assert refused.value.reason == reason
+        with pytest.raises(ValidationError):
+            memory.apply(cast(Any, "forget everything"))
+
+        # Cognitive forgetting through `apply` is the same operation `forget()` logs.
+        record = memory.apply(MemoryOperation(intent=MemoryIntent.FORGET, target_ids=(first.id,)))
+        assert record.forgotten_ids == (first.id,)
+        assert memory.get(first.id).forgotten_at is not None
+        assert memory.rollback(record.operation_id) is True
+        assert memory.get(first.id).forgotten_at is None
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1953,3 +1988,492 @@ def test_an_asserted_name_is_not_scoped_to_where_the_person_was_seen(tmp_path: P
         assert asserted.place_id is None
         assert asserted.metadata == {}
         assert asserted.id in {hit.id for hit in memory.search("recognized person", limit=10)}
+
+
+# ---------------------------------------------------------------------------------------------
+# The already-weighed marker
+
+
+class SilentConsolidator:
+    """Sees evidence and proposes nothing, which is the zero-yield pass the marker exists for."""
+
+    consolidation_model = "consolidator-test"
+    consolidation_recipe = "consolidator-test:v1"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def consolidate(
+        self,
+        evidence: Sequence[MemoryRecord],
+        *,
+        trigger: MemoryTrigger,
+    ) -> tuple[MemoryOperation, ...]:
+        self.calls += 1
+        return ()
+
+    def close(self) -> None:
+        pass
+
+
+def _trigger_rows(
+    memory: Memory,
+    trigger: MemoryTrigger,
+    *,
+    limit: int = 32,
+    idle: bool = False,
+) -> tuple[ConsolidationCandidate, ...]:
+    rows = memory.consolidation_candidates(limit=limit, idle=idle)
+    return tuple(row for row in rows if row.trigger is trigger)
+
+
+def test_a_zero_yield_deliberation_stops_the_candidate_coming_back(tmp_path: Path) -> None:
+    """A pass that proposed nothing still counts as weighed; a new signal makes it due again."""
+    consolidator = SilentConsolidator()
+    with _memory(tmp_path, consolidator) as memory:
+        first, _second = _observations(memory, "Ana waited calmly", "Ana waited again")
+        memory.reinforce((first.id,))
+        due = _trigger_rows(memory, MemoryTrigger.FEEDBACK)
+        assert [row.memory_ids for row in due] == [(first.id,)]
+
+        # The backend proposes nothing at all. Before the marker existed this pass left no trace
+        # -- there is no operation row to derive consumption from -- so the same candidate came
+        # back every round and was paid for every round.
+        report = memory.consolidate(
+            evidence_ids=due[0].memory_ids,
+            trigger=MemoryTrigger.FEEDBACK,
+        )
+        assert report.operations == () and report.rejected == ()
+        assert report.weighed == 1
+        assert consolidator.calls == 1
+        assert _trigger_rows(memory, MemoryTrigger.FEEDBACK) == ()
+
+        # A confirmation after the attempt is a new signal, so it is due again.
+        memory.reinforce((first.id,))
+        assert [row.memory_ids for row in _trigger_rows(memory, MemoryTrigger.FEEDBACK)] == [
+            (first.id,)
+        ]
+
+
+def test_a_contradiction_nothing_resolved_stops_being_relisted(tmp_path: Path) -> None:
+    """A model that cannot settle a disagreement must not be asked about it every round."""
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path, consolidator) as memory:
+        sources = _observations(
+            memory,
+            "Ana waited calmly",
+            "Ana waited again, calmly",
+            "Ana snapped at the delay",
+            "Ana snapped again at the delay",
+        )
+        for pair, value in (((0, 1), "patient"), ((2, 3), "impatient")):
+            cited = (sources[pair[0]].id, sources[pair[1]].id)
+            consolidator._scripts.append(
+                (
+                    MemoryOperation(
+                        intent=MemoryIntent.CONSOLIDATE,
+                        evidence_ids=cited,
+                        proposal=_trait("Ana", value),
+                    ),
+                )
+            )
+            memory.consolidate(evidence_ids=cited)
+
+        due = _trigger_rows(memory, MemoryTrigger.CONTRADICTION)
+        assert len(due) == 1
+        # Weighed and unresolved: both claims still stand, and the lineage still disagrees, but
+        # nothing about it has changed since the attempt.
+        memory.consolidate(evidence_ids=due[0].memory_ids, trigger=MemoryTrigger.CONTRADICTION)
+        assert _trigger_rows(memory, MemoryTrigger.CONTRADICTION) == ()
+
+
+def test_repeated_recall_failure_becomes_a_candidate_naming_the_nearest_records(
+    tmp_path: Path,
+) -> None:
+    """The QUERY_FAILURE producer: two near-equal empty recalls, one candidate."""
+    with _memory(tmp_path, SilentConsolidator()) as memory:
+        sources = _observations(memory, "the spare key is in the toolbox")
+        # Fails because the store holds no procedural memory, not because the words are unknown.
+        assert memory.search("where is the spare key", memory_type=MemoryType.PROCEDURAL) == ()
+        assert _trigger_rows(memory, MemoryTrigger.QUERY_FAILURE) == ()
+
+        # Near-equal, not equal: case, punctuation, and spacing are normalized away.
+        assert memory.search("Where  is the SPARE key?", memory_type=MemoryType.PROCEDURAL) == ()
+        due = _trigger_rows(memory, MemoryTrigger.QUERY_FAILURE)
+        assert len(due) == 1
+        assert due[0].evidence_count == 2
+        # No evidence of its own -- that is what failing means -- so it names what the store does
+        # hold nearest the question.
+        assert sources[0].id in due[0].memory_ids
+
+        memory.consolidate(evidence_ids=due[0].memory_ids, trigger=MemoryTrigger.QUERY_FAILURE)
+        assert _trigger_rows(memory, MemoryTrigger.QUERY_FAILURE) == ()
+
+
+def test_a_query_failure_window_bounds_how_far_back_the_signal_counts(tmp_path: Path) -> None:
+    with _memory(
+        tmp_path,
+        SilentConsolidator(),
+        query_failure_window_seconds=0.001,
+    ) as memory:
+        _observations(memory, "the spare key is in the toolbox")
+        for _attempt in range(2):
+            assert memory.search("where is the key", memory_type=MemoryType.PROCEDURAL) == ()
+        assert _trigger_rows(memory, MemoryTrigger.QUERY_FAILURE) == ()
+
+
+def test_memory_pressure_derives_candidates_only_over_a_declared_budget(tmp_path: Path) -> None:
+    """PRESSURE is a configured budget, never growth on its own."""
+    with _memory(tmp_path, SilentConsolidator()) as memory:
+        _observations(memory, "one", "two", "three", "four")
+        assert _trigger_rows(memory, MemoryTrigger.PRESSURE) == ()
+
+    with _memory(tmp_path, SilentConsolidator(), memory_budget_records=2) as memory:
+        due = _trigger_rows(memory, MemoryTrigger.PRESSURE)
+        assert len(due) == 4
+        assert {row.evidence_count for row in due} == {2}
+        memory.consolidate(evidence_ids=due[0].memory_ids, trigger=MemoryTrigger.PRESSURE)
+        assert len(_trigger_rows(memory, MemoryTrigger.PRESSURE)) == 3
+
+
+def test_an_idle_window_is_declared_by_the_operator(tmp_path: Path) -> None:
+    """IDLE is a parameter, not a clock the kernel reads."""
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path, consolidator) as memory:
+        _observations(memory, "Ana waited calmly", "Ana waited again")
+        assert _trigger_rows(memory, MemoryTrigger.IDLE) == ()
+
+        due = _trigger_rows(memory, MemoryTrigger.IDLE, idle=True)
+        assert due
+        memory.consolidate(evidence_ids=due[0].memory_ids, trigger=MemoryTrigger.IDLE)
+        weighed = set(due[0].memory_ids)
+        assert all(
+            not weighed & set(row.memory_ids)
+            for row in _trigger_rows(memory, MemoryTrigger.IDLE, idle=True)
+        )
+
+
+# ---------------------------------------------------------------------------------------------
+# The loop
+
+
+class ResolvingConsolidator:
+    """Retires the older side of any disagreement it is shown, so the loop reaches a fixed point."""
+
+    consolidation_model = "consolidator-test"
+    consolidation_recipe = "consolidator-test:v1"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def consolidate(
+        self,
+        evidence: Sequence[MemoryRecord],
+        *,
+        trigger: MemoryTrigger,
+    ) -> tuple[MemoryOperation, ...]:
+        self.calls += 1
+        derived = [
+            record
+            for record in evidence
+            if record.context is not None and record.context.kind is MemoryKind.TRAIT
+        ]
+        if trigger is not MemoryTrigger.CONTRADICTION or len(derived) < 2:
+            return ()
+        return (
+            MemoryOperation(
+                intent=MemoryIntent.CORRECT,
+                target_ids=(derived[0].id,),
+                rationale="the later reading stands",
+            ),
+        )
+
+    def close(self) -> None:
+        pass
+
+
+def test_deliberate_runs_candidates_to_a_fixed_point(tmp_path: Path) -> None:
+    """The loop entity: candidates -> consolidate -> repeat, ending because nothing is due."""
+    scripted = ScriptedConsolidator()
+    with _memory(tmp_path, scripted) as memory:
+        sources = _observations(
+            memory,
+            "Ana waited calmly",
+            "Ana waited again, calmly",
+            "Ana snapped at the delay",
+            "Ana snapped again at the delay",
+        )
+        for pair, value in (((0, 1), "patient"), ((2, 3), "impatient")):
+            cited = (sources[pair[0]].id, sources[pair[1]].id)
+            scripted._scripts.append(
+                (
+                    MemoryOperation(
+                        intent=MemoryIntent.CONSOLIDATE,
+                        evidence_ids=cited,
+                        proposal=_trait("Ana", value),
+                    ),
+                )
+            )
+            memory.consolidate(evidence_ids=cited)
+
+    resolver = ResolvingConsolidator()
+    with _memory(tmp_path, resolver) as memory:
+        assert _trigger_rows(memory, MemoryTrigger.CONTRADICTION)
+        report = memory.deliberate(limit=8, max_rounds=5)
+        assert isinstance(report, DeliberationReport)
+        assert report.applied >= 1
+        assert report.weighed >= 1
+        assert report.model_calls == report.weighed
+        # The ceiling was not what stopped it: nothing was due on the final round.
+        assert report.rounds < 5
+        assert memory.consolidation_candidates() == ()
+        assert any(row.operation.intent is MemoryIntent.CORRECT for row in memory.operations())
+
+
+def test_deliberate_does_not_loop_forever_on_a_backend_that_proposes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Zero yield must terminate and be reported as zero yield, not retried until the ceiling."""
+    consolidator = SilentConsolidator()
+    with _memory(tmp_path, consolidator) as memory:
+        sources = _observations(memory, "one", "two", "three")
+        memory.reinforce(tuple(record.id for record in sources))
+
+        report = memory.deliberate(limit=8, max_rounds=100)
+        assert report.weighed == 3
+        assert report.applied == 0
+        assert report.rejected == 0
+        assert report.rounds == 1
+        assert consolidator.calls == 3
+        assert memory.consolidation_candidates() == ()
+
+
+def test_deliberate_needs_a_backend_and_validates_its_bounds(tmp_path: Path) -> None:
+    with _memory(tmp_path) as memory:
+        _observations(memory, "one")
+        # Nothing is due in a store nobody has reinforced or consolidated, so the loop is a
+        # no-op rather than a `ModelError`: `consolidate` is never reached.
+        assert memory.deliberate() == DeliberationReport()
+        for keywords in ({"limit": 0}, {"max_rounds": 0}, {"idle": "yes"}):
+            with pytest.raises(ValidationError):
+                memory.deliberate(**cast(Any, keywords))
+
+
+# ---------------------------------------------------------------------------------------------
+# Scheduling between latency-sensitive work and slow reasoning
+
+
+class BlockingConsolidator:
+    """Holds the pass open inside the backend round trip until the test releases it."""
+
+    consolidation_model = "consolidator-test"
+    consolidation_recipe = "consolidator-test:v1"
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def consolidate(
+        self,
+        evidence: Sequence[MemoryRecord],
+        *,
+        trigger: MemoryTrigger,
+    ) -> tuple[MemoryOperation, ...]:
+        self.entered.set()
+        assert self.release.wait(timeout=30)
+        return ()
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_thinking_backend_does_not_block_a_concurrent_add(tmp_path: Path) -> None:
+    """`consolidate` releases the formation lock across the model round trip.
+
+    Slow reasoning must not stall the latency-sensitive path. Correctness does not rest on the
+    lock either: every proposal is re-checked inside its own apply transaction.
+    """
+    consolidator = BlockingConsolidator()
+    with _memory(tmp_path, consolidator) as memory:
+        sources = _observations(memory, "Ana waited calmly", "Ana waited again")
+        errors: list[BaseException] = []
+
+        def deliberating() -> None:
+            try:
+                memory.consolidate(evidence_ids=tuple(record.id for record in sources))
+            except BaseException as error:  # pragma: no cover - reported below
+                errors.append(error)
+
+        thread = threading.Thread(target=deliberating)
+        thread.start()
+        try:
+            assert consolidator.entered.wait(timeout=30)
+            # The backend is still thinking. Before the lock was split this blocked until it
+            # returned.
+            added = memory.add("Ana waited a third time", occurred_at=OCCURRED)
+            assert memory.get(added.id).id == added.id
+        finally:
+            consolidator.release.set()
+            thread.join(timeout=30)
+        assert not thread.is_alive()
+        assert errors == []
+
+
+def test_an_identity_merge_does_not_commit_while_a_consolidate_apply_pass_holds_the_lock(
+    tmp_path: Path,
+) -> None:
+    """The inverse of the test above: identity commits must serialize with formation too.
+
+    A corroborated cross-modal MERGE is authorized and committed by the kernel itself, from
+    `_link_asset_identity`, never through `consolidate()`'s own proposal pass -- so it is never
+    covered by `_apply_memory_operation`'s formation-lock scope unless it takes the lock itself.
+    Holding `_formation_lock` the way a consolidate apply pass does stands in for that pass here.
+    """
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        transcriber=OnePersonSpeech(),
+        face_analyzer=OnePersonFace(),
+        identity_link_min_assets=1,
+        minimum_relevance=0,
+    ) as memory:
+        record = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        errors: list[BaseException] = []
+
+        def merging() -> None:
+            try:
+                memory.faces(record.id)
+            except BaseException as error:  # pragma: no cover - reported below
+                errors.append(error)
+
+        memory._formation_lock.acquire()
+        try:
+            thread = threading.Thread(target=merging)
+            thread.start()
+            thread.join(timeout=0.5)
+            # The apply pass is "in progress" (simulated by holding its lock). Before this fix
+            # the merge committed anyway, since `_link_asset_identity` took no lock of its own.
+            assert thread.is_alive()
+            assert memory.operations() == ()
+        finally:
+            memory._formation_lock.release()
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+        assert errors == []
+        assert [record.operation.intent for record in memory.operations()] == [MemoryIntent.MERGE]
+        assert memory.faces(record.id)[0].identity_id == memory.speech(record.id)[0].speaker_id
+
+
+# ---------------------------------------------------------------------------------------------
+# Post-hoc outcome
+
+
+def test_record_outcome_is_post_hoc_and_changes_nothing_else(tmp_path: Path) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path, consolidator) as memory:
+        first, second = _observations(memory, "Ana waited calmly", "Ana waited again, calmly")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    proposal=_trait("Ana", "patient"),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id))
+        logged = report.operations[0]
+        assert logged.outcome is None and logged.outcome_note is None
+
+        assert memory.record_outcome(logged.operation_id, MemoryOutcome.CONFIRMED) is True
+        judged = memory.operations()[0]
+        assert judged.outcome is MemoryOutcome.CONFIRMED
+        assert judged.outcome_note is None
+        # Later evidence supersedes earlier evidence here as everywhere.
+        assert (
+            memory.record_outcome(
+                logged.operation_id,
+                MemoryOutcome.REFUTED,
+                note="Ana was waiting for a delivery, not being patient",
+            )
+            is True
+        )
+        refuted = memory.operations()[0]
+        assert refuted.outcome is MemoryOutcome.REFUTED
+        assert refuted.outcome_note is not None
+        # Purely a measurement: nothing was reversed and the derived record still stands.
+        assert refuted.rolled_back_at is None
+        assert memory.get(logged.created_ids[0]).id == logged.created_ids[0]
+
+        assert memory.record_outcome(logged.operation_id + 999, MemoryOutcome.CONFIRMED) is False
+        for arguments in (
+            (0, MemoryOutcome.CONFIRMED),
+            (logged.operation_id, "confirmed"),
+        ):
+            with pytest.raises(ValidationError):
+                memory.record_outcome(*arguments)  # type: ignore[arg-type]
+        with pytest.raises(ValidationError):
+            memory.record_outcome(logged.operation_id, MemoryOutcome.CONFIRMED, note=" ")
+
+
+class Abstainer:
+    """Refuses to answer from whatever it is shown, which is the abstention signal."""
+
+    generation_capabilities = frozenset({Modality.TEXT})
+
+    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        return AnswerResult(
+            answer="I do not know",
+            hits=(),
+            abstained=True,
+            abstention_reason=AbstentionReason.NO_EVIDENCE,
+        )
+
+    def close(self) -> None:
+        pass
+
+
+def test_an_abstention_and_a_thin_bundle_record_the_same_failure_signal(tmp_path: Path) -> None:
+    """The other two QUERY_FAILURE producers: `ask` abstaining and `compile` finding nothing."""
+    with _memory(tmp_path, SilentConsolidator(), answerer=Abstainer()) as memory:
+        _observations(memory, "the spare key is in the toolbox")
+        for _attempt in range(2):
+            assert memory.ask("where is the passport").abstained is True
+        due = _trigger_rows(memory, MemoryTrigger.QUERY_FAILURE)
+        assert len(due) == 1 and due[0].evidence_count == 2
+        memory.consolidate(evidence_ids=due[0].memory_ids, trigger=MemoryTrigger.QUERY_FAILURE)
+        assert _trigger_rows(memory, MemoryTrigger.QUERY_FAILURE) == ()
+
+        # A bundle with no evidence in it is the compiler reporting the same thing.
+        for _attempt in range(2):
+            assert (
+                memory.compile(
+                    "where is the passport",
+                    budget=ContextBudget(memory_types=frozenset({MemoryType.PROCEDURAL})),
+                ).hits
+                == ()
+            )
+        assert _trigger_rows(memory, MemoryTrigger.QUERY_FAILURE)
+
+
+def test_a_backend_may_not_propose_an_identity_merge(tmp_path: Path) -> None:
+    """Merge authority is the kernel's, not a proposal vocabulary item.
+
+    A cross-modal merge is committed from corroboration evidence the kernel counted itself, so
+    a model that asks to fuse two people is refused before anything is read or written. An
+    agent that can call ordinary recall must not be able to convert it into that authority.
+    """
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "merge", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited", "Ana waited again")
+        proposed = MemoryOperation(
+            intent=MemoryIntent.MERGE,
+            identity=IdentityChange(identity_id="identity-1", moved_ids=("identity-2",)),
+        )
+        consolidator._scripts.append((proposed,))
+
+        report = memory.consolidate(evidence_ids=(first.id, second.id))
+
+        assert report.operations == ()
+        assert report.rejected == ((proposed, "unauthorized"),)
+        assert memory.operations() == ()

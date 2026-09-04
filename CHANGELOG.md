@@ -20,7 +20,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `ask()` now drains that generator, so a buffered and a streamed answer cannot drift apart. A
   backend without `stream_answer` yields its whole answer as one delta, so the shape does not
   depend on the provider; `capabilities.streaming_generation` reports whether delivery is
-  actually incremental. Arguments are validated at the call rather than at the first pull, and
+  actually incremental. `link_identities` means on `ask_stream()` what it means on `ask()`, which
+  is this generator drained. Arguments are validated at the call rather than at the first pull, and
   the operation the answer holds is released before the terminal chunk, so reading a result and
   stopping there needs no cleanup. REST, MCP, and the CLI have no equivalent: each would have to
   choose a streaming wire format, and all three gaps are documented on their own pages.
@@ -383,13 +384,16 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   standing operation has built on. Operations that touched one lineage reverse newest first;
   reversing an older one out of order would restore a superseded version beside the current one.
 
-- The local schema is version 13. Version 9 directories upgrade in place through four steps:
+- The local schema is version 15. Version 9 directories upgrade in place through six steps:
   version 10 adds `memory_records.place_id` and its index; version 11 adds
   `memory_records.forgotten_at`, the `capture_queue` table that makes deferred enrichment durable
   across a crash, and the append-only `memory_operations` log that makes a control-plane operation
   replayable and reversible; version 12 adds `memory_semantics.identity_id` and rebuilds the
   operation-intent constraint so `identify` is an allowed intent; version 13 adds the
-  `visual_descriptions` caption cache.
+  `visual_descriptions` caption cache; version 14 adds the scheduler's durable state
+  (`memory_deliberations`, `memory_deliberation_memories`, and `query_failures`), the post-hoc
+  `memory_operations.outcome` and `outcome_note` columns, and admits the `merge` intent; version
+  15 admits the `consent` intent so a data subject's own statement can be logged.
 
 - **Breaking:** `minimum_relevance` now gates evidence relevance — the cosine the dense route
   reports, or the demoted full-text contribution when only the lexical route matched, times the
@@ -584,6 +588,39 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   been 16,000 since the per-modality cost function landed — enough of a gap for an agent that
   budgets against the sentence to leave every video record out on purpose. The sentence now reads
   the numbers off `ContextBudget`, so it cannot drift from them again.
+- Withheld or withdrawn consent now omits a person from `actors` however the bundle would have
+  named them. The restrained set was derived from the bound `ENTITY` hits retrieval returned, so a
+  compilation that reached only somebody's photo or clip -- their naming assertion outside the
+  budget's own type bound -- found nothing bound, consulted no consent at all, and then resolved
+  that memory's face or speech edge into exactly the `NamedActor` the withheld state promises to
+  omit. Consent is read from every identity edge actor enrichment uses, and the `consent_withheld`
+  unknown still reports the omission.
+- `apply --operation` takes a row as `operations` prints it, and a `CONSOLIDATE` row could not be
+  replayed: the printed document omitted `proposal`, which the kernel requires of every
+  consolidation, so the advertised pipe failed validation before replay for the intent the slow
+  loop produces most. Operation documents now carry the proposal, serialized by the same function
+  the log reads back, so the row round-trips.
+- `consolidation-candidates --idle` had no effect. The flag was parsed and then dropped by the
+  handler, so it asked for exactly what the default asks for and never admitted the never-weighed
+  lineages it advertises.
+- `ContextBundle.chars` counted the `## Actors` heading that a synthesized actor makes `render()`
+  write. Only the sections selection filled were charged a heading, so an episode or photo that
+  contributed nothing but an identity edge left the heading uncharged: `chars` came in short of
+  the text, and a bundle sized to a tight `max_chars` rendered past it.
+- A `max_chars` the context header alone overruns is refused with `ValidationError` naming the
+  floor it needs, instead of returning a bundle over the limit it was given and reporting that
+  oversized total as `chars`. The header is inside the bound and is written whether or not
+  anything else fits, so such a budget has no bundle that satisfies it.
+- `compile.media_items` in benchmark telemetry counts grounded media parts, which is the quantity
+  `ContextBudget.max_media_items` bounds. It counted hits carrying any asset, so an omni memory
+  with a still and a clip reported one part instead of two and multi-asset bundles looked as
+  thrifty as single-asset ones.
+- `energy.cpu_package_joules` differences each Intel RAPL package against its own counter and
+  corrects the wrap at that package's `max_energy_range_uj`. A run longer than the wrap period --
+  tens of minutes on a busy package, well inside a sweep -- subtracted to a negative delta that
+  was clamped to zero, publishing 0 J for a run that burned energy; summing the packages before
+  subtracting could also hide one package's wrap inside another's rise. A wrap on a package that
+  publishes no range now makes the value absent with that as its `reason`.
 - The benchmark description cache accepts calls from every unit worker thread. It is opened once
   for a run while units ingest on worker threads, and SQLite's per-thread binding made every
   worker-side describe fail; the write path counted each as a failed batch and fell open, so a

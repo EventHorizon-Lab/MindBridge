@@ -19,6 +19,7 @@ from opentelemetry.trace import Tracer
 from opentelemetry.util.types import AttributeValue
 
 from mindbridge._telemetry import (
+    CAPTURE_TIME_TO_SEARCHABLE,
     GEN_AI_TTFC,
     GROUNDING_HITS_DROPPED,
     GROUNDING_MEDIA_ELIDED,
@@ -45,6 +46,23 @@ BENCHMARK_ANSWER_SPAN = "mindbridge.benchmark.answer"
 BENCHMARK_JUDGE_SPAN = "mindbridge.benchmark.judge"
 BENCHMARK_INGEST_SPAN = "mindbridge.benchmark.ingest"
 BENCHMARK_INGEST_ITEMS = "mindbridge.benchmark.ingest.items"
+
+# The fast plane's three product operations: `capture()` acknowledges after the SQLite commit,
+# so its own span duration *is* capture-acknowledgement latency; `settle()`'s span duration is the
+# model-dependent formation work one settle() call paid, i.e. formation lag; `compile()`'s span
+# duration is compile latency. None of these run unless the harness actually calls them --
+# `--ingest capture` for the first two, the `compile` answering arm for the third -- so a run that
+# never exercises a path reports nothing under it, the same convention `SEARCH_SPAN` follows.
+CAPTURE_SPAN = "mindbridge.capture"
+SETTLE_SPAN = "mindbridge.settle"
+COMPILE_SPAN = "mindbridge.compile"
+# Harness-owned spans (like `BENCHMARK_INGEST_SPAN`) that carry a `compile()` bundle's size:
+# `compile()` itself sets no such attribute, so the eval driver tags one stage span per compiled
+# answer instead of asking product code to carry a benchmark-only measurement.
+BENCHMARK_COMPILE_SPAN = "mindbridge.benchmark.compile"
+BENCHMARK_COMPILE_CHARS = "mindbridge.benchmark.compile.chars"
+BENCHMARK_COMPILE_ITEMS = "mindbridge.benchmark.compile.items"
+BENCHMARK_COMPILE_MEDIA_ITEMS = "mindbridge.benchmark.compile.media_items"
 
 ANSWER_SPAN = "mindbridge.ask"
 # The whole retrieval leg of one `ask`, not the index lookup alone. Pointing this at
@@ -144,6 +162,26 @@ class _Durations:
                 "average": self.ttfc_seconds / self.ttfc_count * 1_000,
             }
         return result
+
+
+@dataclass(slots=True)
+class _Samples:
+    """A bounded list of scalar observations, reported as exact count/average/percentiles."""
+
+    values: list[float] = field(default_factory=list)
+
+    def add(self, value: float) -> None:
+        if len(self.values) < _MAX_RETAINED_DURATIONS:
+            self.values.append(value)
+
+    def json(self) -> dict[str, object]:
+        return {
+            "count": len(self.values),
+            "average": None if not self.values else sum(self.values) / len(self.values),
+            "p50": percentile(self.values, 0.50),
+            "p95": percentile(self.values, 0.95),
+            "p99": percentile(self.values, 0.99),
+        }
 
 
 @dataclass(slots=True)
@@ -252,6 +290,12 @@ class _TaskTelemetry:
     dropped_hits: int = 0
     vision_failed_batches: int = 0
     ingest_items: int = 0
+    # Fast-plane and compiler measurements: populated only when the run actually exercises
+    # `capture()`/`settle()` (the `--ingest capture` path) or the `compile` answering arm.
+    time_to_searchable_ms: _Samples = field(default_factory=_Samples)
+    compile_chars: _Samples = field(default_factory=_Samples)
+    compile_items: _Samples = field(default_factory=_Samples)
+    compile_media_items: _Samples = field(default_factory=_Samples)
 
     def add(self, span: ReadableSpan) -> None:
         attributes = span.attributes or {}
@@ -259,6 +303,10 @@ class _TaskTelemetry:
             self.run_ns += _duration_ns(span)
         elif span.name == BENCHMARK_INGEST_SPAN:
             self.ingest_items += _int_attribute(attributes, BENCHMARK_INGEST_ITEMS) or 0
+        elif span.name == SETTLE_SPAN:
+            self._add_time_to_searchable(attributes)
+        elif span.name == BENCHMARK_COMPILE_SPAN:
+            self._add_compile_bundle(attributes)
         elif span.name == BENCHMARK_JUDGE_SPAN:
             start, end = span.start_time, span.end_time
             if start is not None and end is not None:
@@ -279,6 +327,22 @@ class _TaskTelemetry:
             self.vision_failed_batches += _int_attribute(attributes, VISION_BATCHES_FAILED) or 0
             module = _string_attribute(attributes, MODEL_MODULE) or "unknown"
             self.tokens_by_module.setdefault(module, _Tokens()).add(attributes)
+
+    def _add_time_to_searchable(self, attributes: Mapping[str, AttributeValue]) -> None:
+        value = _float_attribute(attributes, CAPTURE_TIME_TO_SEARCHABLE)
+        if value is not None:
+            self.time_to_searchable_ms.add(value)
+
+    def _add_compile_bundle(self, attributes: Mapping[str, AttributeValue]) -> None:
+        chars = _int_attribute(attributes, BENCHMARK_COMPILE_CHARS)
+        items = _int_attribute(attributes, BENCHMARK_COMPILE_ITEMS)
+        media_items = _int_attribute(attributes, BENCHMARK_COMPILE_MEDIA_ITEMS)
+        if chars is not None:
+            self.compile_chars.add(chars)
+        if items is not None:
+            self.compile_items.add(items)
+        if media_items is not None:
+            self.compile_media_items.add(media_items)
 
     def _product_tokens_json(self, question_count: int) -> dict[str, object]:
         """Sum the modules MindBridge itself spends, leaving the judge out.
@@ -381,6 +445,26 @@ class _TaskTelemetry:
             "inference_latency_ms": node.latency_ms(),
         }
 
+    def _time_to_searchable_json(self) -> dict[str, object]:
+        return {
+            "measures": (
+                "elapsed time from one record's capture() commit to the settle() call that made "
+                "it searchable, taken from the batch-maximum wait settle() reports on its span; "
+                "empty unless the run ingests through capture()+settle() (--ingest capture)"
+            ),
+            **self.time_to_searchable_ms.json(),
+        }
+
+    def _compile_json(self) -> dict[str, object]:
+        latency = self._span_latency_json(COMPILE_SPAN)
+        return {
+            **latency,
+            "measures": "Memory.compile latency and the size of the bundle it returned",
+            "bundle_chars": self.compile_chars.json(),
+            "bundle_items": self.compile_items.json(),
+            "bundle_media_items": self.compile_media_items.json(),
+        }
+
     def json(self, question_count: int) -> dict[str, object]:
         judge_ns = (
             0
@@ -399,6 +483,10 @@ class _TaskTelemetry:
             "search": self._span_latency_json(SEARCH_SPAN),
             "answer": self._answer_json(),
             "asr": self._asr_json(),
+            "capture": self._span_latency_json(CAPTURE_SPAN),
+            "time_to_searchable_ms": self._time_to_searchable_json(),
+            "formation": self._span_latency_json(SETTLE_SPAN),
+            "compile": self._compile_json(),
             "nodes": {name: value.json() for name, value in sorted(self.nodes.items())},
             "token_usage": {
                 **self.tokens.json(question_count),
@@ -550,6 +638,9 @@ class _GpuPeak:
     utilization_percent: float = 0.0
     memory_used_bytes: int = 0
     samples: int = 0
+    # ponytail: rectangle-rule integral of periodic `power.draw` samples -- approximate, not a
+    # calibrated energy meter, but the only per-GPU energy source `nvidia-smi` exposes.
+    energy_joules: float = 0.0
 
 
 class ResourceSampler:
@@ -573,11 +664,16 @@ class ResourceSampler:
         self._started_storage: dict[str, int] | None = None
         self._stopped_storage: dict[str, int] | None = None
         self._gpu_available = False
+        self._gpu_power_reported = False
+        self._rapl_start: dict[str, tuple[int, int | None]] | None = None
+        self._rapl_joules: float | None = None
+        self._rapl_reason: str | None = None
 
     def __enter__(self) -> ResourceSampler:
         self._started_cpu_seconds = _cpu_seconds()
         if self._storage_root is not None:
             self._started_storage = storage_bytes(self._storage_root)
+        self._rapl_start, self._rapl_reason = _rapl_energy_uj()
         self._gpu_available = bool(_nvidia_utilization())
         if self._gpu_available:
             self._thread = Thread(target=self._poll, name="mindbridge-bench-resources", daemon=True)
@@ -596,6 +692,16 @@ class ResourceSampler:
             thread.join(timeout=self._interval_seconds + 5.0)
         if self._storage_root is not None:
             self._stopped_storage = storage_bytes(self._storage_root)
+        if self._rapl_start is not None:
+            end, end_reason = _rapl_energy_uj()
+            if end is None:
+                self._rapl_reason = self._rapl_reason or end_reason
+            else:
+                joules_uj, wrap_reason = _rapl_delta_uj(self._rapl_start, end)
+                if joules_uj is None:
+                    self._rapl_reason = self._rapl_reason or wrap_reason
+                else:
+                    self._rapl_joules = joules_uj / 1_000_000
 
     def json(self, *, wall_seconds: float) -> dict[str, object]:
         """Return one JSON-ready resource record for the completed evaluation."""
@@ -621,16 +727,56 @@ class ResourceSampler:
             "memory": {"peak_resident_bytes": _peak_resident_bytes()},
             "storage": _storage_growth(self._started_storage, self._stopped_storage),
             "gpu": gpu if self._gpu_available else None,
+            "energy": self._energy_json(),
+        }
+
+    def _energy_json(self) -> dict[str, object]:
+        """Report package and per-GPU energy, or exactly why neither is readable.
+
+        Never a fabricated number: a value is reported only when its source (Intel RAPL for the
+        package, ``nvidia-smi --query-gpu=power.draw`` integrated over the poll interval for the
+        GPU) actually answered.
+        """
+        cpu_joules = self._rapl_joules
+        with self._lock:
+            gpu_joules = (
+                {str(index): peak.energy_joules for index, peak in sorted(self._gpu.items())}
+                if self._gpu_available and self._gpu_power_reported
+                else None
+            )
+        reasons = [
+            reason
+            for reason in (
+                self._rapl_reason if cpu_joules is None else None,
+                None
+                if gpu_joules is not None
+                else (
+                    "nvidia-smi did not report power.draw for any GPU"
+                    if self._gpu_available
+                    else "no GPU visible to nvidia-smi"
+                ),
+            )
+            if reason
+        ]
+        available = cpu_joules is not None or gpu_joules is not None
+        return {
+            "cpu_package_joules": cpu_joules,
+            "gpu_joules": gpu_joules,
+            "available": available,
+            "reason": None if available else "; ".join(reasons),
         }
 
     def _poll(self) -> None:
         while True:
-            for index, utilization, memory_used in _nvidia_utilization():
+            for index, utilization, memory_used, power_watts in _nvidia_utilization():
                 with self._lock:
                     peak = self._gpu.setdefault(index, _GpuPeak())
                     peak.utilization_percent = max(peak.utilization_percent, utilization)
                     peak.memory_used_bytes = max(peak.memory_used_bytes, memory_used)
                     peak.samples += 1
+                    if power_watts is not None:
+                        self._gpu_power_reported = True
+                        peak.energy_joules += power_watts * self._interval_seconds
             if self._stop.wait(self._interval_seconds):
                 return
 
@@ -669,12 +815,17 @@ def _peak_resident_bytes() -> int:
     return peak if platform.system() == "Darwin" else peak * 1024
 
 
-def _nvidia_utilization() -> tuple[tuple[int, float, int], ...]:
+def _nvidia_utilization() -> tuple[tuple[int, float, int, float | None], ...]:
+    """Return each visible GPU's (index, utilization%, memory bytes, power watts-or-None).
+
+    Power is ``None`` on a card ``nvidia-smi`` cannot meter (reported as ``[N/A]``), which the
+    caller must not turn into a fabricated zero.
+    """
     try:
         result = subprocess.run(
             (
                 "nvidia-smi",
-                "--query-gpu=index,utilization.gpu,memory.used",
+                "--query-gpu=index,utilization.gpu,memory.used,power.draw",
                 "--format=csv,noheader,nounits",
             ),
             stdout=subprocess.PIPE,
@@ -690,10 +841,86 @@ def _nvidia_utilization() -> tuple[tuple[int, float, int], ...]:
     devices = []
     for line in result.stdout.splitlines():
         fields = [value.strip() for value in line.split(",")]
-        if len(fields) != 3 or not fields[0].isdecimal():
+        if len(fields) != 4 or not fields[0].isdecimal():
             continue
         try:
-            devices.append((int(fields[0]), float(fields[1]), int(float(fields[2]) * 1_048_576)))
+            power = float(fields[3])
+        except ValueError:
+            power = None
+        try:
+            devices.append(
+                (int(fields[0]), float(fields[1]), int(float(fields[2]) * 1_048_576), power)
+            )
         except ValueError:
             continue
     return tuple(devices)
+
+
+# Overridable so a test can point at a fake sysfs tree instead of the real machine.
+_RAPL_ROOT = Path("/sys/class/powercap")
+
+
+def _rapl_energy_uj(
+    root: Path | None = None,
+) -> tuple[dict[str, tuple[int, int | None]] | None, str | None]:
+    """Read each Intel RAPL package's energy counter and the range it wraps at.
+
+    Per package rather than one sum, because ``energy_uj`` wraps at that package's own
+    ``max_energy_range_uj`` and a delta can only be corrected against the counter it came from.
+    ``root`` resolves ``_RAPL_ROOT`` at call time (not as a bound default) so a test can point
+    at a fake sysfs tree by monkeypatching the module attribute.
+    """
+    if root is None:
+        root = _RAPL_ROOT
+    try:
+        packages = sorted(root.glob("intel-rapl:[0-9]*/energy_uj"))
+    except OSError as error:
+        return None, f"cannot list {root}: {error}"
+    if not packages:
+        return None, f"no intel-rapl packages under {root}"
+    readings: dict[str, tuple[int, int | None]] = {}
+    for path in packages:
+        try:
+            energy = int(path.read_text().strip())
+        except (OSError, ValueError) as error:
+            return None, f"cannot read {path}: {error}"
+        readings[path.parent.name] = (energy, _rapl_max_range_uj(path.parent))
+    return readings, None
+
+
+def _rapl_max_range_uj(package: Path) -> int | None:
+    """Return what this package's counter wraps at, or `None` when it does not publish it."""
+    try:
+        return int((package / "max_energy_range_uj").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _rapl_delta_uj(
+    start: Mapping[str, tuple[int, int | None]],
+    end: Mapping[str, tuple[int, int | None]],
+) -> tuple[int | None, str | None]:
+    """Sum each package's own delta, correcting the wrap ``energy_uj`` may have made.
+
+    A counter reading lower at the end than at the start wrapped at its
+    ``max_energy_range_uj``, which is tens of minutes on a busy package rather than the hours a
+    sweep can run for. Clamping that to zero published 0 J for a run that burned energy, and
+    summing the packages before subtracting could hide one package's wrap inside another's
+    rise. Corrected per package instead, and refused outright when a package that wrapped does
+    not publish its range, because a wrap nothing can correct is not a measurement.
+
+    ponytail: two samples cannot tell one wrap from two, so a package that wrapped more than
+    once still undercounts by whole ranges. Accumulate in the poll loop instead if a run ever
+    needs to be that long; at a 2 s interval no wrap is missed.
+    """
+    total = 0
+    for name, (start_uj, max_range) in sorted(start.items()):
+        if name not in end:
+            return None, f"{name} stopped reporting energy_uj mid-run"
+        delta = end[name][0] - start_uj
+        if delta < 0:
+            if max_range is None:
+                return None, f"{name} wrapped and publishes no max_energy_range_uj"
+            delta += max_range
+        total += delta
+    return total, None

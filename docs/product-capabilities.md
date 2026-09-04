@@ -226,7 +226,8 @@ it as `confirmed=False` with the naming evidence in `evidence_ids`, and a compil
 lists them in `actors` as a labelled `ProvisionalActor`, so an agent can say that somebody it does
 not recognize is present rather than omitting them. Naming stays host authority: the MCP adapter
 says so in the tool descriptions and can withhold the identity tools entirely with
-`build_mcp_server(memory, identity_operations=False)`.
+`build_mcp_server(memory, identity_operations=False)`, the two analysis tools with
+`embodied_operations=False`, and every mutating tool with `write_operations=False`.
 
 `forget_identity` removes the person's biometric exemplars, aliases, naming assertions, and
 indexed name while retaining the surrounding memories, media, and transcript words. It is intentionally different from
@@ -258,9 +259,9 @@ arguments, schemas, limits, and errors.
 | Add one | `add` | `POST /v1/memories` | `add_memory` | `add` |
 | Add atomic batch | `add_many` | `POST /v1/memories/batch` | — | `add-many` |
 | Add completed stream | `add_stream` | — | — | `add-stream` |
-| Capture without a model | `capture` | — | — | `capture` |
-| Settle captured records | `settle` | — | — | `settle` |
-| Report unfinished captures | `pending_captures` | — | — | `pending-captures` |
+| Capture without a model | `capture` | `POST /v1/capture` | — | `capture` |
+| Settle captured records | `settle` | `POST /v1/settle` | — | `settle` |
+| Report unfinished captures | `pending_captures` | `GET /v1/pending_captures` | — | `pending-captures` |
 | Search | `search` | `POST /v1/memories/search` | `search_memories` | `search` |
 | Explain search | `search_with_trace` | Search with `explain=true` | Search with `explain=true` | `search-with-trace` |
 | Answer | `ask` | `POST /v1/answers` | `ask_memory` | `ask` |
@@ -272,26 +273,34 @@ arguments, schemas, limits, and errors.
 | Reinforce | `reinforce` | `POST /v1/memories/reinforce` | `reinforce_memories` | `reinforce` |
 | List due deliberation | `consolidation_candidates` | — | — | `consolidation-candidates` |
 | Deliberate over evidence | `consolidate` | — | — | `consolidate` |
+| Run the management loop | `deliberate` | — | — | `deliberate` |
+| Apply one operation | `apply` | — | — | `apply` |
+| Judge one operation | `record_outcome` | — | — | `record-outcome` |
 | Cognitively forget | `forget` | — | — | `forget` |
 | Undo one operation | `rollback` | — | — | `rollback` |
 | Read the operation log | `operations` | — | — | `operations` |
-| Analyze speech | `speech` | — | `analyze_speech` | `speech` |
-| Analyze faces | `faces` | — | `analyze_faces` | `faces` |
+| Analyze speech | `speech` | `POST /v1/speech`\* | `analyze_speech` | `speech` |
+| Analyze faces | `faces` | `POST /v1/faces`\* | `analyze_faces` | `faces` |
 | Name speaker | `register_speaker` | — | `register_speaker` | `register-speaker` |
-| Name identity | `register_identity` | — | `register_identity` | `register-identity` |
-| Read identity | `identity` | — | `get_identity` | `identity` |
-| Reverse merge | `unlink_identity` | — | `unlink_identity` | `unlink-identity` |
-| Erase person | `forget_identity` | — | `forget_identity` | `forget-identity` |
+| Name identity | `register_identity` | `POST /v1/identities`† | `register_identity` | `register-identity` |
+| Read identity | `identity` | `GET /v1/identities/{id}`† | `get_identity` | `identity` |
+| Reverse merge | `unlink_identity` | `POST /v1/identities/{id}/unlink`† | `unlink_identity` | `unlink-identity` |
+| Erase person | `forget_identity` | `DELETE /v1/identities/{id}`† | `forget_identity` | `forget-identity` |
+| Record consent | `record_consent` | `POST /v1/identities/{id}/consent`† | — | `record-consent` |
+| Read consent | `consent` | `GET /v1/identities/{id}/consent`† | — | `consent` |
+| Export a subject | `export` | `GET /v1/export`† | — | `export` |
+| Apply retention | `apply_retention` | `POST /v1/retention`† | — | `apply-retention` |
 | Rebuild index | `reindex` | — | — | `reindex` |
 | Optimize index | `optimize` | — | — | `optimize` |
 | Declare capabilities | `capabilities` property | `GET /healthz` | — | `--explain` resolves composition |
 | Validate loaders | — | — | — | `doctor` |
 
-The synchronous SDK therefore exposes 28 product operations, plus construction, capability
-inspection, and lifecycle. REST exposes nine `/v1` product routes plus `/healthz`; MCP exposes
-fifteen tools; the product CLI exposes all 28 operations plus `doctor`. `AsyncMemory` mirrors the
-finite SDK operations except `forget_identity`, which currently requires synchronous `Memory`, and
-adds async stream consumption.
+The synchronous SDK therefore exposes 36 product operations, plus construction, capability
+inspection, and lifecycle. REST exposes twelve `/v1` product routes plus `/healthz`, or twenty-two
+when the host also enables `create_app`'s `embodied_operations` (\* above) and `identity_operations`
+(† above) switches; MCP exposes fifteen tools; the product CLI exposes 35 of them plus `doctor`,
+every operation except `ask_stream`, which needs a streaming wire format the CLI does not have. `AsyncMemory` mirrors the finite SDK operations except `forget_identity`, which currently
+requires synchronous `Memory`, and adds async stream consumption.
 
 ## Deployment and isolation model
 

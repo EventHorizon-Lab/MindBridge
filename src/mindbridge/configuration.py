@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
@@ -44,7 +44,7 @@ from mindbridge.models.openai_sdk import (
 from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
 from mindbridge.plugins import MemoryConfig, MemoryPlugins, MemorySettings
-from mindbridge.types import Modality
+from mindbridge.types import Modality, RetentionPolicy
 
 _Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 _PositiveFloat = Annotated[float, Field(strict=True, gt=0)]
@@ -245,6 +245,11 @@ class MindBridgeConfig(_ConfigModel):
     speech: SpeechProviderConfig | None = None
     face: OpenCVFaceConfig | None = None
     settings: MemorySettings = Field(default_factory=MemorySettings)
+    # Its own section rather than a `settings` field: every other setting shapes what recall
+    # returns and can be changed back, and this one deletes. It reaches `Memory` as
+    # `MemorySettings.retention`, which is the same value under the name `from_plugins` reads;
+    # declaring it twice is refused rather than silently resolved.
+    retention: RetentionPolicy | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,7 +320,18 @@ def resolve_memory_config(
             consolidator=consolidator,
         )
         cleanup.pop_all()
-    return MemoryComposition(config.data_dir, plugins, config.settings)
+    return MemoryComposition(config.data_dir, plugins, _with_retention(config))
+
+
+def _with_retention(config: MindBridgeConfig) -> MemoryConfig:
+    """Fold the top-level `retention` section into the settings `Memory` is constructed from."""
+    if config.retention is None:
+        return config.settings
+    if config.settings.retention != RetentionPolicy():
+        raise ValidationError(
+            "config.retention: declared both as its own section and as settings.retention"
+        )
+    return replace(config.settings, retention=config.retention)
 
 
 def _validated_config(value: MindBridgeConfig | Mapping[str, object]) -> MindBridgeConfig:

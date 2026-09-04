@@ -21,6 +21,7 @@ from typing import Literal, NoReturn
 from mindbridge.infrastructure.local._lock import DataDirectoryLock
 from mindbridge.models.base import FaceAnalysis, SpeechAnalysis
 from mindbridge.types import (
+    ConsentState,
     EvidenceBasis,
     FaceObservation,
     IdentityErasure,
@@ -34,13 +35,25 @@ from mindbridge.types import (
     SpeakerSegment,
 )
 
-_SCHEMA_VERSION = 13
-# `visual_descriptions` is the newest step, so a store one migration behind is at this version.
-# Derived rather than written out because parallel work on this repository renumbers schema steps:
-# moving this one is then a change to `_SCHEMA_VERSION` alone. Whoever adds the *next* step must
-# pin this to its own literal, because it will no longer be the last.
-_PRE_VISUAL_DESCRIPTION_VERSION = _SCHEMA_VERSION - 1
+_SCHEMA_VERSION = 15
+# `visual_descriptions` is no longer the newest step, so this is pinned to its own literal as the
+# comment that introduced it instructed: a v12 store is the one that step still has to migrate.
+_PRE_VISUAL_DESCRIPTION_VERSION = 12
 _SQLITE_PARAMETER_BATCH = 900
+# The predicate that makes one identity-bound STATE assertion a consent statement. Shared with
+# `mindbridge.memory`, which writes those assertions, so the writer and the projection can never
+# disagree about which records they are.
+CONSENT_PREDICATE = "consent"
+# The one basis a consent statement can carry, hardcoded by `_consent_proposal`. Both consent
+# reads below filter on it as well as on the predicate, so a row reaching this table by any
+# other route -- a future writer, a hand-edited database -- cannot be read as a person's own
+# statement. Defence in depth: `Memory._bound_identity` already reserves the predicate, so no
+# model-originated claim is bound to an identity in the first place.
+_CONSENT_BASIS = EvidenceBasis.USER_STATEMENT.value
+# Consent states under which the kernel stops enrolling new biometric exemplars for a person.
+# Recognition against exemplars already held is unaffected: erasing what is held is
+# `forget_identity`, and answering a question about a photo is not new processing of a person.
+_RESTRAINING_CONSENT = frozenset({ConsentState.WITHHELD.value, ConsentState.WITHDRAWN.value})
 # Kinds whose claims can contradict inside one lineage. This must stay the set the context
 # compiler reports conflicts for; `tests/unit/test_memory_control_plane.py` asserts they agree,
 # because the compiler is a product module and this is infrastructure.
@@ -79,6 +92,9 @@ _REQUIRED_TABLES = frozenset(
         "memory_versions",
         "capture_queue",
         "memory_operations",
+        "memory_deliberations",
+        "memory_deliberation_memories",
+        "query_failures",
     }
 )
 _ASSET_SCHEMA = """
@@ -385,7 +401,9 @@ CREATE TABLE IF NOT EXISTS memory_operations (
     operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
     operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
     intent TEXT NOT NULL CHECK (
-        intent IN ('reinforce', 'consolidate', 'correct', 'forget', 'identify')
+        intent IN (
+            'reinforce', 'consolidate', 'correct', 'forget', 'identify', 'merge', 'consent'
+        )
     ),
     trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
     model_id TEXT,
@@ -393,7 +411,12 @@ CREATE TABLE IF NOT EXISTS memory_operations (
     operation_json TEXT NOT NULL,
     effects_json TEXT NOT NULL,
     applied_at TEXT NOT NULL,
-    rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at)
+    rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at),
+    -- Post-hoc judgement, written only by `record_outcome`. Nullable because "nobody has judged
+    -- this yet" is the normal state and is not the same as unrefuted.
+    outcome TEXT CHECK (outcome IS NULL OR outcome IN ('confirmed', 'refuted')),
+    outcome_note TEXT CHECK (outcome_note IS NULL OR length(trim(outcome_note)) > 0),
+    CHECK (outcome IS NOT NULL OR outcome_note IS NULL)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS memory_operations_active_key_idx
@@ -446,6 +469,138 @@ _OPERATION_INTENT_REBUILD_DDL = (
     FROM memory_operations_v11
     """,
     "DROP TABLE memory_operations_v11",
+    """
+    CREATE UNIQUE INDEX memory_operations_active_key_idx
+        ON memory_operations (operation_key)
+        WHERE rolled_back_at IS NULL
+    """,
+)
+
+# The scheduler's own durable state, added in v13. Two facts the store could not answer before:
+# "has anything already weighed this?" and "which recalls came back empty?".
+#
+# `memory_deliberations` is the already-weighed marker. Without it a candidate whose deliberation
+# yielded nothing -- the backend proposed nothing, or the kernel refused everything -- left no
+# trace and came back every round, paying the model each time. A row is written per pass, zero
+# yield included, and candidate derivation excludes a candidate weighed since its own newest
+# signal.
+#
+# `query_failures` is the QUERY_FAILURE signal: a recall that returned nothing. It holds the
+# owner's own queries, which is their own memory domain, and is bounded on write rather than
+# growing without limit.
+_SCHEDULER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS memory_deliberations (
+    deliberation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
+    weighed_at TEXT NOT NULL,
+    proposed INTEGER NOT NULL CHECK (proposed >= 0),
+    applied INTEGER NOT NULL CHECK (applied >= 0),
+    rejected INTEGER NOT NULL CHECK (rejected >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS memory_deliberation_memories (
+    deliberation_id INTEGER NOT NULL
+        REFERENCES memory_deliberations (deliberation_id) ON DELETE CASCADE,
+    memory_id TEXT NOT NULL REFERENCES memory_records (memory_id) ON DELETE CASCADE,
+    PRIMARY KEY (deliberation_id, memory_id)
+);
+
+CREATE INDEX IF NOT EXISTS memory_deliberation_memories_memory_idx
+    ON memory_deliberation_memories (memory_id, deliberation_id);
+
+CREATE TABLE IF NOT EXISTS query_failures (
+    failure_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query TEXT NOT NULL CHECK (length(trim(query)) > 0),
+    normalized TEXT NOT NULL CHECK (length(normalized) > 0),
+    failed_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS query_failures_normalized_idx
+    ON query_failures (normalized, failed_at);
+"""
+
+# v13 adds the post-hoc outcome columns and widens the intent domain to admit `merge`. Both are
+# CHECK-constrained, and SQLite cannot alter a CHECK in place, so this is the same copy-and-swap
+# the v12 rebuild used. Existing rows carry over unchanged: no intent name changed and the two
+# new columns start NULL, which is exactly "nobody has judged this operation yet".
+_OPERATION_OUTCOME_REBUILD_DDL = (
+    "ALTER TABLE memory_operations RENAME TO memory_operations_v12",
+    "DROP INDEX IF EXISTS memory_operations_active_key_idx",
+    """
+    CREATE TABLE memory_operations (
+        operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
+        intent TEXT NOT NULL CHECK (
+            intent IN ('reinforce', 'consolidate', 'correct', 'forget', 'identify', 'merge')
+        ),
+        trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
+        model_id TEXT,
+        recipe TEXT,
+        operation_json TEXT NOT NULL,
+        effects_json TEXT NOT NULL,
+        applied_at TEXT NOT NULL,
+        rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at),
+        outcome TEXT CHECK (outcome IS NULL OR outcome IN ('confirmed', 'refuted')),
+        outcome_note TEXT CHECK (outcome_note IS NULL OR length(trim(outcome_note)) > 0),
+        CHECK (outcome IS NOT NULL OR outcome_note IS NULL)
+    )
+    """,
+    """
+    INSERT INTO memory_operations (
+        operation_id, operation_key, intent, trigger, model_id, recipe,
+        operation_json, effects_json, applied_at, rolled_back_at
+    )
+    SELECT
+        operation_id, operation_key, intent, trigger, model_id, recipe,
+        operation_json, effects_json, applied_at, rolled_back_at
+    FROM memory_operations_v12
+    """,
+    "DROP TABLE memory_operations_v12",
+    """
+    CREATE UNIQUE INDEX memory_operations_active_key_idx
+        ON memory_operations (operation_key)
+        WHERE rolled_back_at IS NULL
+    """,
+)
+
+# v14 admits the `consent` intent. A consent statement is an identity-bound assertion the host
+# records for its subject, and the log row is what makes it auditable and reversible, so the
+# vocabulary the CHECK enforces has to name it.
+_OPERATION_CONSENT_REBUILD_DDL = (
+    "ALTER TABLE memory_operations RENAME TO memory_operations_v13",
+    "DROP INDEX IF EXISTS memory_operations_active_key_idx",
+    """
+    CREATE TABLE memory_operations (
+        operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
+        intent TEXT NOT NULL CHECK (
+            intent IN (
+                'reinforce', 'consolidate', 'correct', 'forget', 'identify', 'merge', 'consent'
+            )
+        ),
+        trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
+        model_id TEXT,
+        recipe TEXT,
+        operation_json TEXT NOT NULL,
+        effects_json TEXT NOT NULL,
+        applied_at TEXT NOT NULL,
+        rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at),
+        outcome TEXT CHECK (outcome IS NULL OR outcome IN ('confirmed', 'refuted')),
+        outcome_note TEXT CHECK (outcome_note IS NULL OR length(trim(outcome_note)) > 0),
+        CHECK (outcome IS NOT NULL OR outcome_note IS NULL)
+    )
+    """,
+    """
+    INSERT INTO memory_operations (
+        operation_id, operation_key, intent, trigger, model_id, recipe,
+        operation_json, effects_json, applied_at, rolled_back_at, outcome, outcome_note
+    )
+    SELECT
+        operation_id, operation_key, intent, trigger, model_id, recipe,
+        operation_json, effects_json, applied_at, rolled_back_at, outcome, outcome_note
+    FROM memory_operations_v13
+    """,
+    "DROP TABLE memory_operations_v13",
     """
     CREATE UNIQUE INDEX memory_operations_active_key_idx
         ON memory_operations (operation_key)
@@ -554,6 +709,8 @@ CREATE TABLE search_index_queue (
 
 CREATE INDEX search_index_queue_order_idx
     ON search_index_queue (operation_id);
+
+{_SCHEDULER_SCHEMA}
 
 {_INDEX_TRIGGERS}
 
@@ -929,6 +1086,9 @@ class StoredOperation:
     # Rollback restores exactly these, so a supersession the backend never named is reversible.
     superseded: tuple[tuple[str, int], ...] = ()
     rolled_back_at: datetime | None = None
+    # Post-hoc judgement of this operation, written only by `record_operation_outcome`.
+    outcome: str | None = None
+    outcome_note: str | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.operation_key, "operation_key")
@@ -951,6 +1111,26 @@ class StoredOperation:
             _require_identifier(memory_id, "memory_id")
             if version <= 0:
                 raise ValueError("superseded version must be positive")
+        _require_optional_identifier(self.outcome, "outcome")
+        if self.outcome is None and self.outcome_note is not None:
+            raise ValueError("an outcome note requires an outcome")
+
+
+@dataclass(frozen=True, slots=True)
+class StoredQueryFailure:
+    """One group of near-equal recalls that came back empty, newest failure last."""
+
+    query: str
+    normalized: str
+    failures: int
+    failed_at: datetime
+
+    def __post_init__(self) -> None:
+        if not self.query.strip() or not self.normalized:
+            raise ValueError("a query failure must carry its query text")
+        if self.failures <= 0:
+            raise ValueError("failures must be positive")
+        _require_aware(self.failed_at, "failed_at")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1235,7 +1415,11 @@ class LocalStore:
         return True
 
     def complete_captures(self, memory_ids: Sequence[str]) -> int:
-        """Remove captures from the queue after every deferred stage succeeded."""
+        """Remove captures from the queue after every deferred stage succeeded.
+
+        Retention also uses it, to abandon captures whose repeated failures have aged out: the
+        queue row is the promise to keep retrying, and that is all it drops.
+        """
         selected = tuple(dict.fromkeys(memory_ids))
         for memory_id in selected:
             _require_identifier(memory_id, "memory_id")
@@ -1344,26 +1528,191 @@ class LocalStore:
                     break
         return tuple(queued[:limit])
 
-    def read_consolidation_candidates(self, *, limit: int) -> tuple[StoredCandidate, ...]:
+    def read_consolidation_candidates(
+        self,
+        *,
+        limit: int,
+        idle: bool = False,
+        record_budget: int | None = None,
+    ) -> tuple[StoredCandidate, ...]:
         """Derive due deliberation work from evidence, lineage, and feedback already recorded.
 
         There is no queue and no timer behind this: every row is a fact the store already holds,
         read back as a question. Rows are interleaved across triggers so a busy trigger cannot
         starve the others out of the window.
+
+        `record_budget` is the configured ceiling on active records; exceeding it derives
+        `PRESSURE` rows. `idle` is the operator declaring an approved window, never the store
+        guessing from a clock, and derives `IDLE` rows for lineages nothing has ever weighed.
         """
         if not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
+        if record_budget is not None and record_budget <= 0:
+            raise ValueError("record_budget must be positive")
         with self._read_transaction() as connection:
-            consumed = _consumed_at_by_memory(connection)
-            groups = (
-                _evidence_candidates(connection, consumed, limit),
-                _contradiction_candidates(connection, limit),
-                _feedback_candidates(connection, consumed, limit),
-            )
+            deliberated = _deliberated_at_by_memory(connection)
+            weighed = _merge_weighed(_consumed_at_by_memory(connection), deliberated)
+            groups = [
+                _evidence_candidates(connection, weighed, limit),
+                # Deliberations only, not the whole weighed map: the two consolidations that
+                # created a pair of disagreeing claims weighed their own sources, not the
+                # disagreement between the results, so a fresh contradiction is due even though
+                # an operation touched both records a moment ago.
+                _contradiction_candidates(connection, deliberated, limit),
+                _feedback_candidates(connection, weighed, limit),
+                _pressure_candidates(connection, weighed, limit, record_budget),
+            ]
+            if idle:
+                groups.append(_idle_candidates(connection, weighed, limit))
         interleaved = [
             candidate for row in zip_longest(*groups) for candidate in row if candidate is not None
         ]
         return tuple(interleaved[:limit])
+
+    def read_weighed_at(self, memory_ids: Sequence[str]) -> dict[str, datetime]:
+        """Return, per named memory, when a standing operation or deliberation last weighed it."""
+        # ponytail: builds the whole weighed map and then filters, because the two contributing
+        # queries already aggregate over their whole tables. Narrow both to `IN (...)` over the
+        # named IDs once a store's log is long enough for the scan to matter.
+        for memory_id in memory_ids:
+            _require_identifier(memory_id, "memory_id")
+        if not memory_ids:
+            return {}
+        with self._read_transaction() as connection:
+            weighed = _weighed_at_by_memory(connection)
+        return {memory_id: weighed[memory_id] for memory_id in memory_ids if memory_id in weighed}
+
+    def record_query_failure(
+        self,
+        query: str,
+        normalized: str,
+        *,
+        failed_at: datetime,
+        keep: int,
+    ) -> None:
+        """Append one empty-recall signal, keeping at most `keep` of them.
+
+        Bounded on write rather than by a sweeper: the table is a signal buffer, so the oldest
+        rows falling out is the retention policy, not a loss.
+        """
+        if not query.strip() or not normalized:
+            raise ValueError("a query failure must carry its query text")
+        _require_aware(failed_at, "failed_at")
+        if keep <= 0:
+            raise ValueError("keep must be positive")
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT INTO query_failures (query, normalized, failed_at) VALUES (?, ?, ?)",
+                (query, normalized, _datetime_text(failed_at)),
+            )
+            connection.execute(
+                """
+                DELETE FROM query_failures WHERE failure_id NOT IN (
+                    SELECT failure_id FROM query_failures ORDER BY failure_id DESC LIMIT ?
+                )
+                """,
+                (keep,),
+            )
+
+    def read_repeated_query_failures(
+        self,
+        *,
+        limit: int,
+        since: datetime,
+        minimum: int,
+    ) -> tuple[StoredQueryFailure, ...]:
+        """Return near-equal queries that failed at least `minimum` times since `since`."""
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        _require_aware(since, "since")
+        if minimum < 2:
+            raise ValueError("a repeated failure needs at least two failures")
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT normalized, COUNT(*) AS failures, MAX(failed_at) AS failed_at,
+                       MAX(query) AS query
+                FROM query_failures
+                WHERE failed_at >= ?
+                GROUP BY normalized
+                HAVING failures >= ?
+                ORDER BY failed_at DESC, normalized
+                LIMIT ?
+                """,
+                (_datetime_text(since), minimum, limit),
+            ).fetchall()
+        return tuple(
+            StoredQueryFailure(
+                query=_row_text(row, "query"),
+                normalized=_row_text(row, "normalized"),
+                failures=int(row["failures"]),
+                failed_at=_parse_datetime(_row_text(row, "failed_at")),
+            )
+            for row in rows
+        )
+
+    def record_deliberation(
+        self,
+        trigger: str,
+        memory_ids: Sequence[str],
+        *,
+        weighed_at: datetime,
+        proposed: int,
+        applied: int,
+        rejected: int,
+    ) -> int:
+        """Mark one evidence set weighed, whatever the pass yielded.
+
+        A zero-yield pass records the same row as a productive one. That is the whole point: the
+        candidate that produced nothing must stop coming back until its own signal moves.
+        """
+        _require_identifier(trigger, "trigger")
+        for memory_id in memory_ids:
+            _require_identifier(memory_id, "memory_id")
+        _require_aware(weighed_at, "weighed_at")
+        if min(proposed, applied, rejected) < 0:
+            raise ValueError("deliberation counts must not be negative")
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO memory_deliberations (
+                    trigger, weighed_at, proposed, applied, rejected
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (trigger, _datetime_text(weighed_at), proposed, applied, rejected),
+            )
+            deliberation_id = int(cursor.lastrowid or 0)
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO memory_deliberation_memories (deliberation_id, memory_id)
+                VALUES (?, ?)
+                """,
+                tuple((deliberation_id, memory_id) for memory_id in dict.fromkeys(memory_ids)),
+            )
+        return deliberation_id
+
+    def record_operation_outcome(
+        self,
+        operation_id: int,
+        *,
+        outcome: str,
+        note: str | None,
+    ) -> bool:
+        """Record what later evidence said about one logged operation.
+
+        Reports `False` for an unknown operation. The kernel never reads this back into a
+        decision: it exists so consolidation precision, false retirement, and contradiction
+        recovery are derivable from the log.
+        """
+        _require_identifier(outcome, "outcome")
+        if note is not None and not note.strip():
+            raise ValueError("an outcome note must not be blank")
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE memory_operations SET outcome = ?, outcome_note = ? WHERE operation_id = ?",
+                (outcome, note, operation_id),
+            )
+        return cursor.rowcount > 0
 
     def apply_formation(
         self,
@@ -1665,6 +2014,8 @@ class LocalStore:
         clear_forgotten: Sequence[str] = (),
         delete_memory_ids: Sequence[str] = (),
         require_in_force: Sequence[str] = (),
+        split_identity: str | None = None,
+        merge_identities: tuple[str, str] | None = None,
     ) -> tuple[bool, tuple[StoredAsset, ...]]:
         """Apply the caller's reversal and mark one operation rolled back, atomically.
 
@@ -1681,6 +2032,13 @@ class LocalStore:
         operation has since superseded one of them, reversing this one would restore a version
         beside a newer one and delete a record that newer one supersedes, so the reversal is
         refused instead: operations on one lineage reverse newest first.
+
+        `split_identity` reverses a logged cross-modal merge by restoring that alias as its own
+        identity, and `merge_identities` reverses a logged split by re-merging `(survivor,
+        restored)` back under the survivor. Both are refused -- `(False, ())`, nothing written --
+        when the identity graph no longer admits the reversal, which is how identity operations
+        on one person also reverse newest first: a later split has already removed the alias a
+        merge would need, and an erasure has removed both.
         """
         _require_aware(rolled_back_at, "rolled_back_at")
         for memory_id in delete_memory_ids:
@@ -1697,6 +2055,20 @@ class LocalStore:
             if row is None:
                 return False, ()
             if any(_version_retired(connection, memory_id) for memory_id in require_in_force):
+                return False, ()
+            # Both identity reversals refuse before they write, so a refusal here leaves the
+            # transaction with nothing to undo. The merge plan is checked rather than trusted:
+            # re-merging under the wrong survivor would silently rename a person.
+            if merge_identities is not None:
+                survivor, restored = merge_identities
+                plan = self._identity_link_plan(connection, survivor, restored)
+                if plan is None or plan.target_id != survivor:
+                    return False, ()
+                self._merge_identities(connection, plan)
+            restored_id = (
+                None if split_identity is None else self._split_identity(connection, split_identity)
+            )
+            if split_identity is not None and restored_id is None:
                 return False, ()
             reverted_at = max(rolled_back_at, _parse_datetime(_row_text(row, "applied_at")))
             for memory_id in dict.fromkeys(delete_memory_ids):
@@ -1730,8 +2102,13 @@ class LocalStore:
         limit: int = 100,
         operation_id: int | None = None,
         operation_key: str | None = None,
+        before_operation_id: int | None = None,
     ) -> tuple[StoredOperation, ...]:
-        """Return logged operations newest first, or the one matching an id or active key."""
+        """Return logged operations newest first, or the one matching an id or active key.
+
+        `before_operation_id` continues a newest-first scan, which is what lets a caller that
+        must see the whole log -- a data-subject export -- page it instead of truncating it.
+        """
         if not 1 <= limit <= 1_000:
             raise ValueError("limit must be between 1 and 1000")
         where = ""
@@ -1743,11 +2120,15 @@ class LocalStore:
             _require_identifier(operation_key, "operation_key")
             where = "WHERE operation_key = ? AND rolled_back_at IS NULL"
             parameters = (operation_key,)
+        elif before_operation_id is not None:
+            where = "WHERE operation_id < ?"
+            parameters = (before_operation_id,)
         with self._connection() as connection:
             rows = connection.execute(
                 f"""
                 SELECT operation_id, operation_key, intent, trigger, model_id, recipe,
-                       operation_json, effects_json, applied_at, rolled_back_at
+                       operation_json, effects_json, applied_at, rolled_back_at,
+                       outcome, outcome_note
                 FROM memory_operations
                 {where}
                 ORDER BY operation_id DESC
@@ -3017,6 +3398,34 @@ class LocalStore:
             for memory_id, identity_ids in sorted(provisional.items())
         }
 
+    def named_actors(
+        self, memory_ids: Sequence[str]
+    ) -> dict[str, tuple[tuple[str, str, str | None], ...]]:
+        """Return, per memory, the NAMED identities its identity edge resolves to.
+
+        A memory carries an identity edge two ways: its own semantic assertion may be bound to
+        an identity (`memory_semantics.identity_id`, the field `MemoryContext.identity_id`
+        projects), or its media asset may have recognized one -- the same asset-keyed join
+        `provisional_identities` reads for the unnamed case. Each entry is `(identity_id,
+        name, naming_memory_id)`. The naming assertion's own memory is never reported for
+        itself, because it already renders as its own actors hit. Empty entries are dropped,
+        so a caller can treat a missing key as "nobody named here".
+        """
+        ids = tuple(dict.fromkeys(memory_ids))
+        for memory_id in ids:
+            _require_identifier(memory_id, "memory_id")
+        if not ids:
+            return {}
+        with self._connection() as connection:
+            named = _named_identities(connection)
+            if not named:
+                return {}
+            links: dict[str, list[tuple[str, str, str]]] = {}
+            for offset in range(0, len(ids), _SQLITE_PARAMETER_BATCH // 3):
+                batch = ids[offset : offset + _SQLITE_PARAMETER_BATCH // 3]
+                _merge_named_identity_links(connection, batch, named, links)
+        return {memory_id: tuple(sorted(entries)) for memory_id, entries in sorted(links.items())}
+
     def identity_profile(self, identity_id: str) -> IdentityProfile | None:
         """Return one identity's profile, or None when it does not exist.
 
@@ -3050,6 +3459,46 @@ class LocalStore:
             confirmed=assertion is not None,
             evidence_ids=evidence_ids,
         )
+
+    def identity_consent(self, identity_id: str) -> ConsentState | None:
+        """Return the consent state one identity's standing assertion projects, or None.
+
+        `None` is "nobody has recorded a statement", which is not consent and not a refusal.
+        A merged alias resolves to its canonical identity, like every other identity read.
+        """
+        _require_identifier(identity_id, "identity_id")
+        with self._connection() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            if resolved_id is None:
+                return None
+            value = _current_consent_state(connection, resolved_id)
+        return None if value is None else ConsentState(value)
+
+    def restrained_identities(self) -> frozenset[str]:
+        """Return every identity whose standing consent withholds or withdraws processing."""
+        with self._connection() as connection:
+            return _restrained_identities(connection)
+
+    def identity_assertion_memory_ids(self, identity_id: str) -> tuple[str, ...]:
+        """Return every record bound to one identity, standing or superseded.
+
+        This is the assertion half of what is held about a person -- their names and their
+        consent statements, every version of each -- which `identity_memory_ids` does not cover
+        because those records observe nobody.
+        """
+        _require_identifier(identity_id, "identity_id")
+        with self._connection() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            if resolved_id is None:
+                return ()
+            rows = connection.execute(
+                """
+                SELECT memory_id FROM memory_semantics
+                WHERE identity_id = ? ORDER BY memory_id
+                """,
+                (resolved_id,),
+            ).fetchall()
+        return tuple(_row_text(row, "memory_id") for row in rows)
 
     def record_identity_link_evidence(self, voice_id: str, face_id: str, asset_id: str) -> int:
         """Record one voice-and-face co-occurrence and count the pair's distinct assets.
@@ -3128,10 +3577,17 @@ class LocalStore:
         allow_shared_modality: bool = False,
         memories: Iterable[StoredMemory] = (),
         embeddings: Iterable[StoredEmbedding] = (),
+        operation: StoredOperation | None = None,
     ) -> str | None:
         """Merge two identities under one stable ID, recording a reversible alias.
 
         Pass allow_shared_modality to commit a plan obtained with the same intent.
+
+        `operation` logs the control-plane operation that committed this merge in the same
+        transaction, so a cross-modal bind is visible in the operation log and reversible
+        through it. The log row carries the naming assertions the merge moved onto the survivor
+        as `changed_ids`. Returns None, changing nothing, when that operation key is already
+        applied and not rolled back.
         """
         _require_identifier(first_id, "first identity_id")
         _require_identifier(second_id, "second identity_id")
@@ -3142,6 +3598,11 @@ class LocalStore:
             embeddings,
         )
         with self._transaction() as connection:
+            if (
+                operation is not None
+                and _active_operation_id(connection, operation.operation_key) is not None
+            ):
+                return None
             plan = self._identity_link_plan(
                 connection,
                 first_id,
@@ -3154,79 +3615,112 @@ class LocalStore:
                 return first if first is not None and first == second else None
             if expected is not None and plan != expected:
                 return None
-            target, source = plan.target_id, plan.source_id
-            contributed = _sole_identity_modality(connection, source)
-            now = _datetime_text(datetime.now(timezone.utc))
-            connection.execute(
-                "UPDATE speech_segments SET speaker_id = ? WHERE speaker_id = ?",
-                (target, source),
-            )
-            connection.execute(
-                "UPDATE face_observations SET identity_id = ? WHERE identity_id = ?",
-                (target, source),
-            )
-            _merge_identity_exemplars(connection, target, source)
-            connection.execute(
-                """
-                UPDATE identities
-                SET created_at = ?, updated_at = ?
-                WHERE identity_id = ?
-                """,
-                (plan.created_at, now, target),
-            )
-            # The source's naming assertions move to the survivor before the source row goes,
-            # or `ON DELETE SET NULL` would strand the name that was asserted about this person
-            # and the projection would go on reporting a name nothing supports. The name is a
-            # projection here too: recomputed from the assertions, never assigned.
-            connection.execute(
-                "UPDATE memory_semantics SET identity_id = ? WHERE identity_id = ?",
-                (target, source),
-            )
-            connection.execute(
-                "UPDATE identity_aliases SET identity_id = ? WHERE identity_id = ?",
-                (target, source),
-            )
-            # Re-point accumulated evidence by copying it onto the target first: the
-            # same asset may already carry a row for the target, and the primary key
-            # would reject a plain UPDATE.
-            connection.execute(
-                """
-                INSERT INTO identity_link_evidence (voice_id, face_id, asset_id, created_at)
-                SELECT CASE WHEN voice_id = ? THEN ? ELSE voice_id END,
-                       CASE WHEN face_id = ? THEN ? ELSE face_id END,
-                       asset_id,
-                       created_at
-                FROM identity_link_evidence
-                WHERE voice_id = ? OR face_id = ?
-                ON CONFLICT (voice_id, face_id, asset_id) DO NOTHING
-                """,
-                (source, target, source, target, source, source),
-            )
-            connection.execute(
-                "DELETE FROM identity_link_evidence WHERE voice_id = ? OR face_id = ?",
-                (source, source),
-            )
-            # Re-pointing turns this pair's own evidence into voice_id = face_id rows, which
-            # describe an identity co-occurring with itself and can never yield a plan.
-            connection.execute("DELETE FROM identity_link_evidence WHERE voice_id = face_id")
-            connection.execute(
-                """
-                INSERT INTO identity_aliases (
-                    alias_id, identity_id, created_at, contributed_modality
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (source, target, now, contributed),
-            )
-            connection.execute("DELETE FROM identities WHERE identity_id = ?", (source,))
-            if _has_naming_assertion(connection, target):
-                _reproject_identities(connection, (target,))
+            moved_claims = self._merge_identities(connection, plan)
+            if operation is not None:
+                _insert_operation(connection, replace(operation, changed_ids=moved_claims))
             self._replace_memory_embeddings(
                 connection,
                 supplied_memories,
                 supplied_embeddings,
                 supplied_by_memory,
             )
-            return target
+            return plan.target_id
+
+    @staticmethod
+    def _merge_identities(
+        connection: sqlite3.Connection,
+        plan: IdentityLink,
+    ) -> tuple[str, ...]:
+        """Apply one validated merge inside an open transaction.
+
+        Returns the naming assertions that moved onto the survivor, which is the one effect a
+        merge has on memory records and therefore the one an operation log row can name.
+        """
+        target, source = plan.target_id, plan.source_id
+        contributed = _sole_identity_modality(connection, source)
+        now = _datetime_text(datetime.now(timezone.utc))
+        # Read before the source's `identities` row is deleted below, so the alias row can carry
+        # forward the absorbed identity's own creation time rather than the merge time. Rollback
+        # (`_split_identity`) restores the identity from this value; storing `now` here instead
+        # would make every merge-then-rollback cycle overwrite the original `created_at`.
+        source_created_at = _row_text(
+            connection.execute(
+                "SELECT created_at FROM identities WHERE identity_id = ?",
+                (source,),
+            ).fetchone(),
+            "created_at",
+        )
+        connection.execute(
+            "UPDATE speech_segments SET speaker_id = ? WHERE speaker_id = ?",
+            (target, source),
+        )
+        connection.execute(
+            "UPDATE face_observations SET identity_id = ? WHERE identity_id = ?",
+            (target, source),
+        )
+        _merge_identity_exemplars(connection, target, source)
+        connection.execute(
+            """
+            UPDATE identities
+            SET created_at = ?, updated_at = ?
+            WHERE identity_id = ?
+            """,
+            (plan.created_at, now, target),
+        )
+        moved_claims = tuple(
+            _row_text(row, "memory_id")
+            for row in connection.execute(
+                "SELECT memory_id FROM memory_semantics WHERE identity_id = ? ORDER BY memory_id",
+                (source,),
+            ).fetchall()
+        )
+        # The source's naming assertions move to the survivor before the source row goes,
+        # or `ON DELETE SET NULL` would strand the name that was asserted about this person
+        # and the projection would go on reporting a name nothing supports. The name is a
+        # projection here too: recomputed from the assertions, never assigned.
+        connection.execute(
+            "UPDATE memory_semantics SET identity_id = ? WHERE identity_id = ?",
+            (target, source),
+        )
+        connection.execute(
+            "UPDATE identity_aliases SET identity_id = ? WHERE identity_id = ?",
+            (target, source),
+        )
+        # Re-point accumulated evidence by copying it onto the target first: the
+        # same asset may already carry a row for the target, and the primary key
+        # would reject a plain UPDATE.
+        connection.execute(
+            """
+            INSERT INTO identity_link_evidence (voice_id, face_id, asset_id, created_at)
+            SELECT CASE WHEN voice_id = ? THEN ? ELSE voice_id END,
+                   CASE WHEN face_id = ? THEN ? ELSE face_id END,
+                   asset_id,
+                   created_at
+            FROM identity_link_evidence
+            WHERE voice_id = ? OR face_id = ?
+            ON CONFLICT (voice_id, face_id, asset_id) DO NOTHING
+            """,
+            (source, target, source, target, source, source),
+        )
+        connection.execute(
+            "DELETE FROM identity_link_evidence WHERE voice_id = ? OR face_id = ?",
+            (source, source),
+        )
+        # Re-pointing turns this pair's own evidence into voice_id = face_id rows, which
+        # describe an identity co-occurring with itself and can never yield a plan.
+        connection.execute("DELETE FROM identity_link_evidence WHERE voice_id = face_id")
+        connection.execute(
+            """
+            INSERT INTO identity_aliases (
+                alias_id, identity_id, created_at, contributed_modality
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (source, target, source_created_at, contributed),
+        )
+        connection.execute("DELETE FROM identities WHERE identity_id = ?", (source,))
+        if _has_naming_assertion(connection, target):
+            _reproject_identities(connection, (target,))
+        return moved_claims
 
     def identity_alias_modality(self, alias_id: str) -> Literal["face", "voice"] | None:
         """Return the modality one merged alias contributed, or None when none is recorded.
@@ -3250,6 +3744,7 @@ class LocalStore:
         *,
         memories: Iterable[StoredMemory] = (),
         embeddings: Iterable[StoredEmbedding] = (),
+        operation: StoredOperation | None = None,
     ) -> str | None:
         """Reverse one recorded merge, restoring alias_id as an independent identity.
 
@@ -3278,80 +3773,21 @@ class LocalStore:
         transaction: one resting only on media that moved back is re-attributed to the
         restored identity, one resting on both people's media is unbound, and one that never
         involved the restored modality keeps its binding.
+
+        `operation` logs the control-plane operation that split this merge, in the same
+        transaction, so a split is visible in the operation log and reversible through it. It is
+        written only when the split actually commits.
         """
         _require_identifier(alias_id, "alias_id")
         supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
             memories,
             embeddings,
         )
-        now = _datetime_text(datetime.now(timezone.utc))
         with self._transaction() as connection:
-            alias = connection.execute(
-                """
-                SELECT identity_id, created_at, contributed_modality
-                FROM identity_aliases
-                WHERE alias_id = ?
-                """,
-                (alias_id,),
-            ).fetchone()
-            if alias is None or alias["contributed_modality"] is None:
+            if self._split_identity(connection, alias_id) is None:
                 return None
-            target = _row_text(alias, "identity_id")
-            modality = _identity_modality(alias["contributed_modality"])
-            modalities = {
-                _identity_modality(row["modality"])
-                for row in connection.execute(
-                    """
-                    SELECT DISTINCT modality
-                    FROM identity_exemplars
-                    WHERE identity_id = ?
-                    """,
-                    (target,),
-                ).fetchall()
-            }
-            if modalities != {"face", "voice"}:
-                return None
-            connection.execute(
-                """
-                INSERT INTO identities (identity_id, name, relationship, created_at, updated_at)
-                VALUES (?, NULL, NULL, ?, ?)
-                """,
-                (alias_id, _row_text(alias, "created_at"), now),
-            )
-            connection.execute(
-                """
-                UPDATE identity_exemplars
-                SET identity_id = ?
-                WHERE identity_id = ? AND modality = ?
-                """,
-                (alias_id, target, modality),
-            )
-            if modality == "face":
-                connection.execute(
-                    "UPDATE face_observations SET identity_id = ? WHERE identity_id = ?",
-                    (alias_id, target),
-                )
-            else:
-                connection.execute(
-                    "UPDATE speech_segments SET speaker_id = ? WHERE speaker_id = ?",
-                    (alias_id, target),
-                )
-            connection.execute("DELETE FROM identity_aliases WHERE alias_id = ?", (alias_id,))
-            connection.execute(
-                """
-                DELETE FROM identity_link_evidence
-                WHERE voice_id IN (?, ?) AND face_id IN (?, ?)
-                """,
-                (target, alias_id, target, alias_id),
-            )
-            _rebind_unlinked_claims(
-                connection,
-                target=target,
-                restored=alias_id,
-                modality=modality,
-            )
-            if _has_naming_assertion(connection, target):
-                _reproject_identities(connection, (target,))
+            if operation is not None:
+                _insert_operation(connection, operation)
             self._replace_memory_embeddings(
                 connection,
                 supplied_memories,
@@ -3359,6 +3795,82 @@ class LocalStore:
                 supplied_by_memory,
             )
             return alias_id
+
+    @staticmethod
+    def _split_identity(connection: sqlite3.Connection, alias_id: str) -> str | None:
+        """Reverse one recorded merge inside an open transaction.
+
+        Returns the restored identity, or None -- having changed nothing -- when the alias has
+        no recorded split point or the survivor would be left with no exemplars.
+        """
+        now = _datetime_text(datetime.now(timezone.utc))
+        alias = connection.execute(
+            """
+            SELECT identity_id, created_at, contributed_modality
+            FROM identity_aliases
+            WHERE alias_id = ?
+            """,
+            (alias_id,),
+        ).fetchone()
+        if alias is None or alias["contributed_modality"] is None:
+            return None
+        target = _row_text(alias, "identity_id")
+        modality = _identity_modality(alias["contributed_modality"])
+        modalities = {
+            _identity_modality(row["modality"])
+            for row in connection.execute(
+                """
+                SELECT DISTINCT modality
+                FROM identity_exemplars
+                WHERE identity_id = ?
+                """,
+                (target,),
+            ).fetchall()
+        }
+        if modalities != {"face", "voice"}:
+            return None
+        connection.execute(
+            """
+            INSERT INTO identities (identity_id, name, relationship, created_at, updated_at)
+            VALUES (?, NULL, NULL, ?, ?)
+            """,
+            (alias_id, _row_text(alias, "created_at"), now),
+        )
+        connection.execute(
+            """
+            UPDATE identity_exemplars
+            SET identity_id = ?
+            WHERE identity_id = ? AND modality = ?
+            """,
+            (alias_id, target, modality),
+        )
+        if modality == "face":
+            connection.execute(
+                "UPDATE face_observations SET identity_id = ? WHERE identity_id = ?",
+                (alias_id, target),
+            )
+        else:
+            connection.execute(
+                "UPDATE speech_segments SET speaker_id = ? WHERE speaker_id = ?",
+                (alias_id, target),
+            )
+        connection.execute("DELETE FROM identity_aliases WHERE alias_id = ?", (alias_id,))
+        connection.execute(
+            """
+            DELETE FROM identity_link_evidence
+            WHERE voice_id IN (?, ?) AND face_id IN (?, ?)
+            """,
+            (target, alias_id, target, alias_id),
+        )
+        _rebind_unlinked_claims(
+            connection,
+            target=target,
+            restored=alias_id,
+            modality=modality,
+        )
+        if _has_naming_assertion(connection, target):
+            _reproject_identities(connection, (target,))
+        return alias_id
 
     def identity_equivalence_class(self, identity_id: str) -> tuple[str, ...] | None:
         """Return every ID that names one identity: the canonical ID first, then its aliases.
@@ -3394,6 +3906,7 @@ class LocalStore:
         *,
         memories: Iterable[StoredMemory] = (),
         embeddings: Iterable[StoredEmbedding] = (),
+        operation: StoredOperation | None = None,
     ) -> IdentityErasure | None:
         """Erase one person's identity cluster, keeping the memories that mention them.
 
@@ -3418,6 +3931,11 @@ class LocalStore:
         Pass `memories` and `embeddings` to atomically replace indexed documents that named the
         person, exactly as `register_identity` does -- the erasure commits in SQLite before the
         outbox tells the projection.
+
+        `operation` logs, in the same transaction, that this erasure happened. The row is audit
+        history and nothing more: it names the identity and its aliases, and the naming
+        assertions the erasure deleted, so `operations()` can show that a person was erased
+        without holding anything a rollback could restore.
 
         Recoverability, stated plainly: freed cells are zero-filled (`PRAGMA secure_delete`) and
         the write-ahead log is checkpointed and truncated afterwards, so the exemplar bytes are
@@ -3464,16 +3982,26 @@ class LocalStore:
             # their vectors, which is exactly what erasure promises to remove. Deleting the
             # record cascades its semantics, versions, and embeddings, and the embedding trigger
             # queues the index deletions.
-            for row in connection.execute(
-                "SELECT memory_id FROM memory_semantics WHERE identity_id = ? AND kind = ?",
-                (resolved_id, MemoryKind.ENTITY.value),
-            ).fetchall():
+            erased_claims = tuple(
+                _row_text(row, "memory_id")
+                for row in connection.execute(
+                    """
+                    SELECT memory_id FROM memory_semantics
+                    WHERE identity_id = ? AND kind = ?
+                    ORDER BY memory_id
+                    """,
+                    (resolved_id, MemoryKind.ENTITY.value),
+                ).fetchall()
+            )
+            for memory_id in erased_claims:
                 connection.execute(
                     "DELETE FROM memory_records WHERE memory_id = ?",
-                    (_row_text(row, "memory_id"),),
+                    (memory_id,),
                 )
             # Cascades the aliases, exemplars and link evidence; NULLs the speech segments.
             connection.execute("DELETE FROM identities WHERE identity_id = ?", (resolved_id,))
+            if operation is not None:
+                _insert_operation(connection, replace(operation, changed_ids=erased_claims))
             self._replace_memory_embeddings(
                 connection,
                 supplied_memories,
@@ -3618,6 +4146,58 @@ class LocalStore:
                 ),
             ).fetchall()
         return tuple(_asset_from_row(row) for row in rows)
+
+    def asset_memory_ids(self, asset_ids: Sequence[str]) -> tuple[str, ...]:
+        """Return every memory that references any of these assets, oldest memory first."""
+        selected = tuple(dict.fromkeys(asset_ids))
+        for asset_id in selected:
+            _sha256(asset_id)
+        if not selected:
+            return ()
+        found: list[str] = []
+        with self._connection() as connection:
+            for offset in range(0, len(selected), _SQLITE_PARAMETER_BATCH):
+                batch = selected[offset : offset + _SQLITE_PARAMETER_BATCH]
+                placeholders = ", ".join("?" for _asset_id in batch)
+                found.extend(
+                    _row_text(row, "memory_id")
+                    for row in connection.execute(
+                        f"""
+                        SELECT DISTINCT memory_id FROM memory_assets
+                        WHERE asset_id IN ({placeholders})
+                        ORDER BY memory_id
+                        """,
+                        batch,
+                    ).fetchall()
+                )
+        return tuple(dict.fromkeys(found))
+
+    def forgotten_memory_ids(
+        self,
+        *,
+        forgotten_before: datetime,
+        limit: int = 100,
+    ) -> tuple[str, ...]:
+        """Return memories cognitively forgotten before a moment, oldest forgetting first.
+
+        The read half of retention over `forget()`: cognitive forgetting is reversible by
+        design, so something has to decide when it becomes final, and only a declared policy or
+        a person may.
+        """
+        _require_aware(forgotten_before, "forgotten_before")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT memory_id FROM memory_records
+                WHERE forgotten_at IS NOT NULL AND forgotten_at < ?
+                ORDER BY forgotten_at, memory_id
+                LIMIT ?
+                """,
+                (_datetime_text(forgotten_before), limit),
+            ).fetchall()
+        return tuple(_row_text(row, "memory_id") for row in rows)
 
     def asset_storage_bytes(self) -> int:
         """Return the total size of every stored media asset descriptor."""
@@ -3941,9 +4521,14 @@ class LocalStore:
             if version == 11:
                 _migrate_v11(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            # Last rung, which is what `_PRE_VISUAL_DESCRIPTION_VERSION` assumes.
             if version == _PRE_VISUAL_DESCRIPTION_VERSION:
                 _migrate_visual_descriptions(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 13:
+                _migrate_v13(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 14:
+                _migrate_v14(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
@@ -4460,6 +5045,11 @@ class LocalStore:
         known_identities = set(existing)
         if preferred_exists and preferred_identity is not None:
             known_identities.add(preferred_identity)
+        # Consent restrains enrolment, not recognition. A person who withheld or withdrew it
+        # still matches the exemplars already held -- destroying those is `forget_identity` --
+        # but this observation adds nothing to their template, so the bank stops growing from
+        # the moment they said so.
+        restrained = _restrained_identities(connection)
         claimed: dict[int | None, set[str]] = {}
         matches: dict[str, tuple[str, float | None]] = {}
         changes: dict[str, _IdentityChange] = {}
@@ -4487,6 +5077,15 @@ class LocalStore:
                 identity_id, score = preferred_identity, None
             else:
                 identity_id, score = f"identity_{uuid.uuid4().hex}", None
+            if identity_id in restrained:
+                # Recognized, reported, and nothing written: no exemplar, no `identities` row
+                # update, and so nothing for a rollback to undo either.
+                matches[label] = (
+                    identity_id,
+                    None if score is None else max(0.0, min(1.0, score)),
+                )
+                group_claims.add(identity_id)
+                continue
             if identity_id not in changes:
                 previous = (
                     None
@@ -4938,7 +5537,53 @@ def _migrate_visual_descriptions(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
         if not has_descriptions:
             connection.execute(_VISUAL_DESCRIPTION_DDL)
-        connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version = 13")
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def _migrate_v13(connection: sqlite3.Connection) -> None:
+    """Add the scheduler's durable state, the post-hoc outcome, and the `merge` intent.
+
+    The operation-log rebuild is skipped when the table already carries `outcome`, because a
+    store created by a v10 or v11 development build ran `_CONTROL_SCHEMA`, which now declares
+    the v14 shape outright.
+    """
+    try:
+        operation_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(memory_operations)")
+        }
+        connection.execute("BEGIN IMMEDIATE")
+        connection.executescript(_SCHEDULER_SCHEMA)
+        if "outcome" not in operation_columns:
+            for statement in _OPERATION_OUTCOME_REBUILD_DDL:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 14")
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def _migrate_v14(connection: sqlite3.Connection) -> None:
+    """Admit the `consent` intent, so a data subject's own statement can be logged.
+
+    A store created by a v12 development build ran `_CONTROL_SCHEMA`, which now declares the v15
+    vocabulary outright, so the rebuild is skipped when the constraint already names `consent`.
+    """
+    try:
+        declared = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memory_operations'"
+        ).fetchone()
+        connection.execute("BEGIN IMMEDIATE")
+        if declared is None or "'consent'" not in str(declared[0]):
+            for statement in _OPERATION_CONSENT_REBUILD_DDL:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 15")
         connection.commit()
     except BaseException:
         if connection.in_transaction:
@@ -5498,12 +6143,64 @@ def _current_naming_assertion(
     return row
 
 
+def _current_consent_state(connection: sqlite3.Connection, identity_id: str) -> str | None:
+    """Return the consent state one identity's standing assertion projects, or None.
+
+    Consent is a bound STATE assertion rather than a bound ENTITY one, which is what keeps it
+    out of `_current_naming_assertion` above: the two live in separate lineages, so recording
+    consent never displaces a name and renaming somebody never disturbs their consent.
+    """
+    row: sqlite3.Row | None = connection.execute(
+        """
+        SELECT s.value
+        FROM memory_semantics AS s
+        JOIN memory_versions AS v ON v.memory_id = s.memory_id
+        JOIN memory_records AS r ON r.memory_id = s.memory_id
+        WHERE s.identity_id = ? AND s.kind = ? AND s.predicate = ? AND s.basis = ?
+          AND v.retired_at IS NULL AND v.visible = 1 AND r.forgotten_at IS NULL
+        ORDER BY v.recorded_at DESC, s.memory_id DESC
+        LIMIT 1
+        """,
+        (identity_id, MemoryKind.STATE.value, CONSENT_PREDICATE, _CONSENT_BASIS),
+    ).fetchone()
+    return None if row is None else _optional_row_text(row, "value")
+
+
+def _restrained_identities(connection: sqlite3.Connection) -> frozenset[str]:
+    """Return every identity whose standing consent assertion restrains the kernel.
+
+    Withheld and withdrawn restrain identically; the distinction between them is audit history,
+    not policy. Read fresh on each recognition rather than cached, because a person withdrawing
+    consent has to take effect on the next observation, not on the next process start.
+    """
+    # Ordered oldest-first per identity so the newest standing assertion is the one that
+    # survives the dict build, which is the same rule `_current_naming_assertion` applies.
+    standing: dict[str, str | None] = {
+        _row_text(row, "identity_id"): _optional_row_text(row, "value")
+        for row in connection.execute(
+            """
+            SELECT s.identity_id, s.value
+            FROM memory_semantics AS s
+            JOIN memory_versions AS v ON v.memory_id = s.memory_id
+            JOIN memory_records AS r ON r.memory_id = s.memory_id
+            WHERE s.kind = ? AND s.predicate = ? AND s.basis = ? AND s.identity_id IS NOT NULL
+              AND v.retired_at IS NULL AND v.visible = 1 AND r.forgotten_at IS NULL
+            ORDER BY s.identity_id, v.recorded_at, s.memory_id
+            """,
+            (MemoryKind.STATE.value, CONSENT_PREDICATE, _CONSENT_BASIS),
+        ).fetchall()
+    }
+    return frozenset(
+        identity_id for identity_id, value in standing.items() if value in _RESTRAINING_CONSENT
+    )
+
+
 def _visible_naming_assertions(connection: sqlite3.Connection) -> tuple[sqlite3.Row, ...]:
-    """Return the identity and subject of every currently visible naming assertion."""
+    """Return the identity, subject, and memory id of every currently visible naming assertion."""
     return tuple(
         connection.execute(
             """
-            SELECT s.identity_id, s.subject
+            SELECT s.identity_id, s.subject, s.memory_id
             FROM memory_semantics AS s
             JOIN memory_versions AS v ON v.memory_id = s.memory_id
             JOIN memory_records AS r ON r.memory_id = s.memory_id
@@ -5513,6 +6210,66 @@ def _visible_naming_assertions(connection: sqlite3.Connection) -> tuple[sqlite3.
             (MemoryKind.ENTITY.value,),
         ).fetchall()
     )
+
+
+def _named_identities(connection: sqlite3.Connection) -> dict[str, tuple[str, str]]:
+    """Return, per identity, the `(name, naming_memory_id)` its visible naming assertion gives.
+
+    An identity with no visible assertion, or one whose subject is somehow unset, is simply
+    absent -- `named_actors` treats a missing key as "not currently named".
+    """
+    named: dict[str, tuple[str, str]] = {}
+    for row in _visible_naming_assertions(connection):
+        name = _optional_row_text(row, "subject")
+        if name is not None:
+            named[_row_text(row, "identity_id")] = (name, _row_text(row, "memory_id"))
+    return named
+
+
+def _merge_named_identity_links(
+    connection: sqlite3.Connection,
+    batch: Sequence[str],
+    named: Mapping[str, tuple[str, str]],
+    links: dict[str, list[tuple[str, str, str]]],
+) -> None:
+    """Resolve one batch of memories' identity edges and add the named ones to `links`.
+
+    The identity edge is read two ways in one query: the asset-keyed speech speaker or face
+    observation `provisional_identities` reads for the unnamed case, and the memory's own
+    bound semantic assertion (`memory_semantics.identity_id`). A memory naming itself -- the
+    naming assertion's own row -- is skipped, because it already renders as its own actors hit.
+    """
+    placeholders = ", ".join("?" for _memory_id in batch)
+    rows = connection.execute(
+        f"""
+        SELECT ma.memory_id AS memory_id, sp.speaker_id AS identity_id
+        FROM memory_assets AS ma
+        JOIN speech_segments AS sp ON sp.asset_id = ma.asset_id
+        WHERE ma.memory_id IN ({placeholders}) AND sp.speaker_id IS NOT NULL
+        UNION
+        SELECT ma.memory_id AS memory_id, f.identity_id AS identity_id
+        FROM memory_assets AS ma
+        JOIN face_observations AS f ON f.asset_id = ma.asset_id
+        WHERE ma.memory_id IN ({placeholders})
+        UNION
+        SELECT s.memory_id AS memory_id, s.identity_id AS identity_id
+        FROM memory_semantics AS s
+        WHERE s.memory_id IN ({placeholders}) AND s.identity_id IS NOT NULL
+        """,
+        (*batch, *batch, *batch),
+    ).fetchall()
+    for row in rows:
+        identity_id = _row_text(row, "identity_id")
+        entry = named.get(identity_id)
+        if entry is None:
+            continue
+        memory_id = _row_text(row, "memory_id")
+        name, naming_memory_id = entry
+        if memory_id == naming_memory_id:
+            continue
+        bucket = links.setdefault(memory_id, [])
+        if not any(identity_id == existing[0] for existing in bucket):
+            bucket.append((identity_id, name, naming_memory_id))
 
 
 def _has_naming_assertion(connection: sqlite3.Connection, identity_id: str) -> bool:
@@ -5763,6 +6520,48 @@ def _validate_formation_links(
             raise ValueError("confidence must be between zero and one")
 
 
+def _weighed_at_by_memory(connection: sqlite3.Connection) -> dict[str, datetime]:
+    """Return, per memory, when anything last weighed it: an operation or a deliberation.
+
+    Both halves are needed. An applied operation proves the record was considered *and* acted
+    on; a deliberation row proves only that it was considered, which is exactly the case an
+    operation log cannot record -- the backend proposed nothing, or the kernel refused
+    everything. Without the second half a zero-yield candidate returns every round and is paid
+    for every round.
+    """
+    return _merge_weighed(
+        _consumed_at_by_memory(connection),
+        _deliberated_at_by_memory(connection),
+    )
+
+
+def _merge_weighed(
+    consumed: dict[str, datetime],
+    deliberated: Mapping[str, datetime],
+) -> dict[str, datetime]:
+    """Keep the newer of the two marks per memory, mutating and returning the first."""
+    for memory_id, deliberated_at in deliberated.items():
+        previous = consumed.get(memory_id)
+        if previous is None or deliberated_at > previous:
+            consumed[memory_id] = deliberated_at
+    return consumed
+
+
+def _deliberated_at_by_memory(connection: sqlite3.Connection) -> dict[str, datetime]:
+    """Return, per memory, when a deliberation last had it in its evidence set."""
+    return {
+        _row_text(row, "memory_id"): _parse_datetime(_row_text(row, "weighed_at"))
+        for row in connection.execute(
+            """
+            SELECT m.memory_id AS memory_id, MAX(d.weighed_at) AS weighed_at
+            FROM memory_deliberation_memories AS m
+            JOIN memory_deliberations AS d ON d.deliberation_id = m.deliberation_id
+            GROUP BY m.memory_id
+            """
+        ).fetchall()
+    }
+
+
 def _consumed_at_by_memory(connection: sqlite3.Connection) -> dict[str, datetime]:
     """Return, per memory, when a still-standing operation last consumed or produced it.
 
@@ -5797,7 +6596,7 @@ def _evidence_candidates(
     consumed: Mapping[str, datetime],
     limit: int,
 ) -> list[StoredCandidate]:
-    """Derived records that gained independent evidence no standing operation has weighed."""
+    """Derived records that gained independent evidence nothing has weighed yet."""
     # ponytail: over-fetch the newest window and filter, rather than push the consumed-time
     # comparison into SQL. Raise the factor only if a store whose newest records are all already
     # deliberated measurably under-fills the window.
@@ -5857,12 +6656,15 @@ def _evidence_candidates(
 
 def _contradiction_candidates(
     connection: sqlite3.Connection,
+    weighed: Mapping[str, datetime],
     limit: int,
 ) -> list[StoredCandidate]:
     """Lineages whose current visible claims disagree, the way the compiler reports them.
 
-    A contradiction stays listed until the data stops contradicting: retiring one side through
-    `CORRECT` is what clears it, so this needs no separate record of having been reported.
+    Retiring one side through `CORRECT` is what clears a contradiction, but a deliberation the
+    model could not resolve clears nothing -- so the lineage is dropped while nothing about it
+    has changed since it was last weighed, and returns as soon as a further claim is recorded in
+    it. The signal is the newest transaction time among the disagreeing claims.
     """
     lineages = {
         _row_text(row, "lineage_id"): int(row["values_count"])
@@ -5886,9 +6688,10 @@ def _contradiction_candidates(
         return []
     placeholders = ", ".join("?" for _lineage_id in lineages)
     members: dict[str, list[str]] = {lineage_id: [] for lineage_id in lineages}
+    signal: dict[str, datetime] = {}
     for row in connection.execute(
         f"""
-        SELECT s.lineage_id AS lineage_id, s.memory_id AS memory_id
+        SELECT s.lineage_id AS lineage_id, s.memory_id AS memory_id, v.recorded_at AS recorded_at
         FROM memory_semantics AS s
         JOIN memory_versions AS v ON v.memory_id = s.memory_id
         JOIN memory_records AS r ON r.memory_id = s.memory_id
@@ -5898,7 +6701,11 @@ def _contradiction_candidates(
         """,
         tuple(lineages),
     ).fetchall():
-        members[_row_text(row, "lineage_id")].append(_row_text(row, "memory_id"))
+        lineage_id = _row_text(row, "lineage_id")
+        members[lineage_id].append(_row_text(row, "memory_id"))
+        recorded_at = _parse_datetime(_row_text(row, "recorded_at"))
+        if lineage_id not in signal or recorded_at > signal[lineage_id]:
+            signal[lineage_id] = recorded_at
     return [
         StoredCandidate(
             trigger="contradiction",
@@ -5906,8 +6713,90 @@ def _contradiction_candidates(
             evidence_count=lineages[lineage_id],
         )
         for lineage_id, memory_ids in members.items()
-        if memory_ids
+        if memory_ids and _is_due(signal[lineage_id], memory_ids, weighed)
     ]
+
+
+def _is_due(
+    signal_at: datetime, memory_ids: Sequence[str], weighed: Mapping[str, datetime]
+) -> bool:
+    """Report whether a group's own signal is newer than anything that has weighed it."""
+    marks = [weighed[memory_id] for memory_id in memory_ids if memory_id in weighed]
+    return not marks or signal_at > max(marks)
+
+
+def _pressure_candidates(
+    connection: sqlite3.Connection,
+    weighed: Mapping[str, datetime],
+    limit: int,
+    record_budget: int | None,
+) -> list[StoredCandidate]:
+    """Oldest never-weighed records, while the store holds more than its configured budget.
+
+    Pressure has no signal time of its own -- the condition is a level, not an event -- so
+    "already weighed" here means weighed at all rather than weighed since some moment. Once
+    everything in the store has been weighed once, pressure derives nothing further: a
+    deliberation that keeps re-proposing the same forgetting is the disease this marker exists to
+    cure, and the honest answer is that there is no new work.
+    """
+    if record_budget is None:
+        return []
+    active = int(
+        connection.execute(
+            "SELECT COUNT(*) AS records FROM memory_records WHERE forgotten_at IS NULL"
+        ).fetchone()["records"]
+    )
+    if active <= record_budget:
+        return []
+    rows = connection.execute(
+        """
+        SELECT memory_id
+        FROM memory_records
+        WHERE forgotten_at IS NULL
+        ORDER BY COALESCE(last_accessed_at, created_at), memory_id
+        LIMIT ?
+        """,
+        (min(1_000, limit * 4),),
+    ).fetchall()
+    over = active - record_budget
+    return [
+        StoredCandidate(
+            trigger="pressure",
+            memory_ids=(memory_id,),
+            evidence_count=over,
+        )
+        for memory_id in (_row_text(row, "memory_id") for row in rows)
+        if memory_id not in weighed
+    ][:limit]
+
+
+def _idle_candidates(
+    connection: sqlite3.Connection,
+    weighed: Mapping[str, datetime],
+    limit: int,
+) -> list[StoredCandidate]:
+    """Derived lineages nothing has ever weighed, oldest first.
+
+    Only reached when the operator declares the window. The kernel never infers idleness from a
+    clock: whether the device is idle or charging is the host's knowledge, not the store's.
+    """
+    rows = connection.execute(
+        """
+        SELECT s.memory_id AS memory_id
+        FROM memory_semantics AS s
+        JOIN memory_versions AS v ON v.memory_id = s.memory_id
+        JOIN memory_records AS r ON r.memory_id = s.memory_id
+        WHERE v.retired_at IS NULL AND r.forgotten_at IS NULL
+        ORDER BY v.recorded_at, s.memory_id
+        LIMIT ?
+        """,
+        (min(1_000, limit * 4),),
+    ).fetchall()
+    return [
+        StoredCandidate(trigger="idle", memory_ids=(memory_id,), evidence_count=1)
+        for memory_id in (_row_text(row, "memory_id") for row in rows)
+        if memory_id not in weighed
+    ][:limit]
 
 
 def _feedback_candidates(
@@ -6012,6 +6901,8 @@ def _operation_from_row(row: sqlite3.Row) -> StoredOperation:
         superseded=tuple((pair[0], int(pair[1])) for pair in effects.get("superseded") or ()),
         applied_at=_parse_datetime(_row_text(row, "applied_at")),
         rolled_back_at=_optional_datetime_from_row(row, "rolled_back_at"),
+        outcome=_optional_row_text(row, "outcome"),
+        outcome_note=_optional_row_text(row, "outcome_note"),
     )
 
 
