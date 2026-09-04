@@ -34,7 +34,7 @@ from mindbridge.types import (
     SpeakerSegment,
 )
 
-_SCHEMA_VERSION = 12
+_SCHEMA_VERSION = 13
 _SQLITE_PARAMETER_BATCH = 900
 # Kinds whose claims can contradict inside one lineage. This must stay the set the context
 # compiler reports conflicts for; `tests/unit/test_memory_control_plane.py` asserts they agree,
@@ -73,6 +73,9 @@ _REQUIRED_TABLES = frozenset(
         "memory_versions",
         "capture_queue",
         "memory_operations",
+        "memory_deliberations",
+        "memory_deliberation_memories",
+        "query_failures",
     }
 )
 _ASSET_SCHEMA = """
@@ -379,7 +382,7 @@ CREATE TABLE IF NOT EXISTS memory_operations (
     operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
     operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
     intent TEXT NOT NULL CHECK (
-        intent IN ('reinforce', 'consolidate', 'correct', 'forget', 'identify')
+        intent IN ('reinforce', 'consolidate', 'correct', 'forget', 'identify', 'merge')
     ),
     trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
     model_id TEXT,
@@ -387,7 +390,12 @@ CREATE TABLE IF NOT EXISTS memory_operations (
     operation_json TEXT NOT NULL,
     effects_json TEXT NOT NULL,
     applied_at TEXT NOT NULL,
-    rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at)
+    rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at),
+    -- Post-hoc judgement, written only by `record_outcome`. Nullable because "nobody has judged
+    -- this yet" is the normal state and is not the same as unrefuted.
+    outcome TEXT CHECK (outcome IS NULL OR outcome IN ('confirmed', 'refuted')),
+    outcome_note TEXT CHECK (outcome_note IS NULL OR length(trim(outcome_note)) > 0),
+    CHECK (outcome IS NOT NULL OR outcome_note IS NULL)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS memory_operations_active_key_idx
@@ -447,6 +455,93 @@ _OPERATION_INTENT_REBUILD_DDL = (
     """,
 )
 
+# The scheduler's own durable state, added in v13. Two facts the store could not answer before:
+# "has anything already weighed this?" and "which recalls came back empty?".
+#
+# `memory_deliberations` is the already-weighed marker. Without it a candidate whose deliberation
+# yielded nothing -- the backend proposed nothing, or the kernel refused everything -- left no
+# trace and came back every round, paying the model each time. A row is written per pass, zero
+# yield included, and candidate derivation excludes a candidate weighed since its own newest
+# signal.
+#
+# `query_failures` is the QUERY_FAILURE signal: a recall that returned nothing. It holds the
+# owner's own queries, which is their own memory domain, and is bounded on write rather than
+# growing without limit.
+_SCHEDULER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS memory_deliberations (
+    deliberation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
+    weighed_at TEXT NOT NULL,
+    proposed INTEGER NOT NULL CHECK (proposed >= 0),
+    applied INTEGER NOT NULL CHECK (applied >= 0),
+    rejected INTEGER NOT NULL CHECK (rejected >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS memory_deliberation_memories (
+    deliberation_id INTEGER NOT NULL
+        REFERENCES memory_deliberations (deliberation_id) ON DELETE CASCADE,
+    memory_id TEXT NOT NULL REFERENCES memory_records (memory_id) ON DELETE CASCADE,
+    PRIMARY KEY (deliberation_id, memory_id)
+);
+
+CREATE INDEX IF NOT EXISTS memory_deliberation_memories_memory_idx
+    ON memory_deliberation_memories (memory_id, deliberation_id);
+
+CREATE TABLE IF NOT EXISTS query_failures (
+    failure_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query TEXT NOT NULL CHECK (length(trim(query)) > 0),
+    normalized TEXT NOT NULL CHECK (length(normalized) > 0),
+    failed_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS query_failures_normalized_idx
+    ON query_failures (normalized, failed_at);
+"""
+
+# v13 adds the post-hoc outcome columns and widens the intent domain to admit `merge`. Both are
+# CHECK-constrained, and SQLite cannot alter a CHECK in place, so this is the same copy-and-swap
+# the v12 rebuild used. Existing rows carry over unchanged: no intent name changed and the two
+# new columns start NULL, which is exactly "nobody has judged this operation yet".
+_OPERATION_OUTCOME_REBUILD_DDL = (
+    "ALTER TABLE memory_operations RENAME TO memory_operations_v12",
+    "DROP INDEX IF EXISTS memory_operations_active_key_idx",
+    """
+    CREATE TABLE memory_operations (
+        operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
+        intent TEXT NOT NULL CHECK (
+            intent IN ('reinforce', 'consolidate', 'correct', 'forget', 'identify', 'merge')
+        ),
+        trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
+        model_id TEXT,
+        recipe TEXT,
+        operation_json TEXT NOT NULL,
+        effects_json TEXT NOT NULL,
+        applied_at TEXT NOT NULL,
+        rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at),
+        outcome TEXT CHECK (outcome IS NULL OR outcome IN ('confirmed', 'refuted')),
+        outcome_note TEXT CHECK (outcome_note IS NULL OR length(trim(outcome_note)) > 0),
+        CHECK (outcome IS NOT NULL OR outcome_note IS NULL)
+    )
+    """,
+    """
+    INSERT INTO memory_operations (
+        operation_id, operation_key, intent, trigger, model_id, recipe,
+        operation_json, effects_json, applied_at, rolled_back_at
+    )
+    SELECT
+        operation_id, operation_key, intent, trigger, model_id, recipe,
+        operation_json, effects_json, applied_at, rolled_back_at
+    FROM memory_operations_v12
+    """,
+    "DROP TABLE memory_operations_v12",
+    """
+    CREATE UNIQUE INDEX memory_operations_active_key_idx
+        ON memory_operations (operation_key)
+        WHERE rolled_back_at IS NULL
+    """,
+)
+
 _PLACE_COLUMN_DDL = """
 ALTER TABLE memory_records
 ADD COLUMN place_id TEXT CHECK (
@@ -467,7 +562,7 @@ CREATE INDEX memory_records_place_idx
     WHERE place_id IS NOT NULL
 """
 
-_SCHEMA_V12 = f"""
+_SCHEMA_V13 = f"""
 BEGIN IMMEDIATE;
 
 CREATE TABLE memory_records (
@@ -532,9 +627,11 @@ CREATE TABLE search_index_queue (
 CREATE INDEX search_index_queue_order_idx
     ON search_index_queue (operation_id);
 
+{_SCHEDULER_SCHEMA}
+
 {_INDEX_TRIGGERS}
 
-PRAGMA user_version = 12;
+PRAGMA user_version = 13;
 COMMIT;
 """
 
@@ -904,6 +1001,9 @@ class StoredOperation:
     # Rollback restores exactly these, so a supersession the backend never named is reversible.
     superseded: tuple[tuple[str, int], ...] = ()
     rolled_back_at: datetime | None = None
+    # Post-hoc judgement of this operation, written only by `record_operation_outcome`.
+    outcome: str | None = None
+    outcome_note: str | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.operation_key, "operation_key")
@@ -926,6 +1026,26 @@ class StoredOperation:
             _require_identifier(memory_id, "memory_id")
             if version <= 0:
                 raise ValueError("superseded version must be positive")
+        _require_optional_identifier(self.outcome, "outcome")
+        if self.outcome is None and self.outcome_note is not None:
+            raise ValueError("an outcome note requires an outcome")
+
+
+@dataclass(frozen=True, slots=True)
+class StoredQueryFailure:
+    """One group of near-equal recalls that came back empty, newest failure last."""
+
+    query: str
+    normalized: str
+    failures: int
+    failed_at: datetime
+
+    def __post_init__(self) -> None:
+        if not self.query.strip() or not self.normalized:
+            raise ValueError("a query failure must carry its query text")
+        if self.failures <= 0:
+            raise ValueError("failures must be positive")
+        _require_aware(self.failed_at, "failed_at")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1320,26 +1440,191 @@ class LocalStore:
                     break
         return tuple(queued[:limit])
 
-    def read_consolidation_candidates(self, *, limit: int) -> tuple[StoredCandidate, ...]:
+    def read_consolidation_candidates(
+        self,
+        *,
+        limit: int,
+        idle: bool = False,
+        record_budget: int | None = None,
+    ) -> tuple[StoredCandidate, ...]:
         """Derive due deliberation work from evidence, lineage, and feedback already recorded.
 
         There is no queue and no timer behind this: every row is a fact the store already holds,
         read back as a question. Rows are interleaved across triggers so a busy trigger cannot
         starve the others out of the window.
+
+        `record_budget` is the configured ceiling on active records; exceeding it derives
+        `PRESSURE` rows. `idle` is the operator declaring an approved window, never the store
+        guessing from a clock, and derives `IDLE` rows for lineages nothing has ever weighed.
         """
         if not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
+        if record_budget is not None and record_budget <= 0:
+            raise ValueError("record_budget must be positive")
         with self._read_transaction() as connection:
-            consumed = _consumed_at_by_memory(connection)
-            groups = (
-                _evidence_candidates(connection, consumed, limit),
-                _contradiction_candidates(connection, limit),
-                _feedback_candidates(connection, consumed, limit),
-            )
+            deliberated = _deliberated_at_by_memory(connection)
+            weighed = _merge_weighed(_consumed_at_by_memory(connection), deliberated)
+            groups = [
+                _evidence_candidates(connection, weighed, limit),
+                # Deliberations only, not the whole weighed map: the two consolidations that
+                # created a pair of disagreeing claims weighed their own sources, not the
+                # disagreement between the results, so a fresh contradiction is due even though
+                # an operation touched both records a moment ago.
+                _contradiction_candidates(connection, deliberated, limit),
+                _feedback_candidates(connection, weighed, limit),
+                _pressure_candidates(connection, weighed, limit, record_budget),
+            ]
+            if idle:
+                groups.append(_idle_candidates(connection, weighed, limit))
         interleaved = [
             candidate for row in zip_longest(*groups) for candidate in row if candidate is not None
         ]
         return tuple(interleaved[:limit])
+
+    def read_weighed_at(self, memory_ids: Sequence[str]) -> dict[str, datetime]:
+        """Return, per named memory, when a standing operation or deliberation last weighed it."""
+        # ponytail: builds the whole weighed map and then filters, because the two contributing
+        # queries already aggregate over their whole tables. Narrow both to `IN (...)` over the
+        # named IDs once a store's log is long enough for the scan to matter.
+        for memory_id in memory_ids:
+            _require_identifier(memory_id, "memory_id")
+        if not memory_ids:
+            return {}
+        with self._read_transaction() as connection:
+            weighed = _weighed_at_by_memory(connection)
+        return {memory_id: weighed[memory_id] for memory_id in memory_ids if memory_id in weighed}
+
+    def record_query_failure(
+        self,
+        query: str,
+        normalized: str,
+        *,
+        failed_at: datetime,
+        keep: int,
+    ) -> None:
+        """Append one empty-recall signal, keeping at most `keep` of them.
+
+        Bounded on write rather than by a sweeper: the table is a signal buffer, so the oldest
+        rows falling out is the retention policy, not a loss.
+        """
+        if not query.strip() or not normalized:
+            raise ValueError("a query failure must carry its query text")
+        _require_aware(failed_at, "failed_at")
+        if keep <= 0:
+            raise ValueError("keep must be positive")
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT INTO query_failures (query, normalized, failed_at) VALUES (?, ?, ?)",
+                (query, normalized, _datetime_text(failed_at)),
+            )
+            connection.execute(
+                """
+                DELETE FROM query_failures WHERE failure_id NOT IN (
+                    SELECT failure_id FROM query_failures ORDER BY failure_id DESC LIMIT ?
+                )
+                """,
+                (keep,),
+            )
+
+    def read_repeated_query_failures(
+        self,
+        *,
+        limit: int,
+        since: datetime,
+        minimum: int,
+    ) -> tuple[StoredQueryFailure, ...]:
+        """Return near-equal queries that failed at least `minimum` times since `since`."""
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        _require_aware(since, "since")
+        if minimum < 2:
+            raise ValueError("a repeated failure needs at least two failures")
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT normalized, COUNT(*) AS failures, MAX(failed_at) AS failed_at,
+                       MAX(query) AS query
+                FROM query_failures
+                WHERE failed_at >= ?
+                GROUP BY normalized
+                HAVING failures >= ?
+                ORDER BY failed_at DESC, normalized
+                LIMIT ?
+                """,
+                (_datetime_text(since), minimum, limit),
+            ).fetchall()
+        return tuple(
+            StoredQueryFailure(
+                query=_row_text(row, "query"),
+                normalized=_row_text(row, "normalized"),
+                failures=int(row["failures"]),
+                failed_at=_parse_datetime(_row_text(row, "failed_at")),
+            )
+            for row in rows
+        )
+
+    def record_deliberation(
+        self,
+        trigger: str,
+        memory_ids: Sequence[str],
+        *,
+        weighed_at: datetime,
+        proposed: int,
+        applied: int,
+        rejected: int,
+    ) -> int:
+        """Mark one evidence set weighed, whatever the pass yielded.
+
+        A zero-yield pass records the same row as a productive one. That is the whole point: the
+        candidate that produced nothing must stop coming back until its own signal moves.
+        """
+        _require_identifier(trigger, "trigger")
+        for memory_id in memory_ids:
+            _require_identifier(memory_id, "memory_id")
+        _require_aware(weighed_at, "weighed_at")
+        if min(proposed, applied, rejected) < 0:
+            raise ValueError("deliberation counts must not be negative")
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO memory_deliberations (
+                    trigger, weighed_at, proposed, applied, rejected
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (trigger, _datetime_text(weighed_at), proposed, applied, rejected),
+            )
+            deliberation_id = int(cursor.lastrowid or 0)
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO memory_deliberation_memories (deliberation_id, memory_id)
+                VALUES (?, ?)
+                """,
+                tuple((deliberation_id, memory_id) for memory_id in dict.fromkeys(memory_ids)),
+            )
+        return deliberation_id
+
+    def record_operation_outcome(
+        self,
+        operation_id: int,
+        *,
+        outcome: str,
+        note: str | None,
+    ) -> bool:
+        """Record what later evidence said about one logged operation.
+
+        Reports `False` for an unknown operation. The kernel never reads this back into a
+        decision: it exists so consolidation precision, false retirement, and contradiction
+        recovery are derivable from the log.
+        """
+        _require_identifier(outcome, "outcome")
+        if note is not None and not note.strip():
+            raise ValueError("an outcome note must not be blank")
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE memory_operations SET outcome = ?, outcome_note = ? WHERE operation_id = ?",
+                (outcome, note, operation_id),
+            )
+        return cursor.rowcount > 0
 
     def apply_formation(
         self,
@@ -1707,7 +1992,8 @@ class LocalStore:
             rows = connection.execute(
                 f"""
                 SELECT operation_id, operation_key, intent, trigger, model_id, recipe,
-                       operation_json, effects_json, applied_at, rolled_back_at
+                       operation_json, effects_json, applied_at, rolled_back_at,
+                       outcome, outcome_note
                 FROM memory_operations
                 {where}
                 ORDER BY operation_id DESC
@@ -3782,6 +4068,9 @@ class LocalStore:
             if version == 11:
                 _migrate_v11(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 12:
+                _migrate_v12(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
                 raise UnsupportedSchemaError(
@@ -4522,7 +4811,7 @@ def _create_schema(
     if existing_tables:
         raise UnsupportedSchemaError("local data directory contains an unversioned SQLite schema")
     try:
-        connection.executescript(_SCHEMA_V12)
+        connection.executescript(_SCHEMA_V13)
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -4761,6 +5050,30 @@ def _migrate_v11(connection: sqlite3.Connection) -> None:
         for statement in _OPERATION_INTENT_REBUILD_DDL:
             connection.execute(statement)
         connection.execute("PRAGMA user_version = 12")
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def _migrate_v12(connection: sqlite3.Connection) -> None:
+    """Add the scheduler's durable state, the post-hoc outcome, and the `merge` intent.
+
+    The operation-log rebuild is skipped when the table already carries `outcome`, because a
+    store created by a v10 or v11 development build ran `_CONTROL_SCHEMA`, which now declares
+    the v13 shape outright.
+    """
+    try:
+        operation_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(memory_operations)")
+        }
+        connection.execute("BEGIN IMMEDIATE")
+        connection.executescript(_SCHEDULER_SCHEMA)
+        if "outcome" not in operation_columns:
+            for statement in _OPERATION_OUTCOME_REBUILD_DDL:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 13")
         connection.commit()
     except BaseException:
         if connection.in_transaction:
@@ -5583,6 +5896,48 @@ def _validate_formation_links(
             raise ValueError("confidence must be between zero and one")
 
 
+def _weighed_at_by_memory(connection: sqlite3.Connection) -> dict[str, datetime]:
+    """Return, per memory, when anything last weighed it: an operation or a deliberation.
+
+    Both halves are needed. An applied operation proves the record was considered *and* acted
+    on; a deliberation row proves only that it was considered, which is exactly the case an
+    operation log cannot record -- the backend proposed nothing, or the kernel refused
+    everything. Without the second half a zero-yield candidate returns every round and is paid
+    for every round.
+    """
+    return _merge_weighed(
+        _consumed_at_by_memory(connection),
+        _deliberated_at_by_memory(connection),
+    )
+
+
+def _merge_weighed(
+    consumed: dict[str, datetime],
+    deliberated: Mapping[str, datetime],
+) -> dict[str, datetime]:
+    """Keep the newer of the two marks per memory, mutating and returning the first."""
+    for memory_id, deliberated_at in deliberated.items():
+        previous = consumed.get(memory_id)
+        if previous is None or deliberated_at > previous:
+            consumed[memory_id] = deliberated_at
+    return consumed
+
+
+def _deliberated_at_by_memory(connection: sqlite3.Connection) -> dict[str, datetime]:
+    """Return, per memory, when a deliberation last had it in its evidence set."""
+    return {
+        _row_text(row, "memory_id"): _parse_datetime(_row_text(row, "weighed_at"))
+        for row in connection.execute(
+            """
+            SELECT m.memory_id AS memory_id, MAX(d.weighed_at) AS weighed_at
+            FROM memory_deliberation_memories AS m
+            JOIN memory_deliberations AS d ON d.deliberation_id = m.deliberation_id
+            GROUP BY m.memory_id
+            """
+        ).fetchall()
+    }
+
+
 def _consumed_at_by_memory(connection: sqlite3.Connection) -> dict[str, datetime]:
     """Return, per memory, when a still-standing operation last consumed or produced it.
 
@@ -5617,7 +5972,7 @@ def _evidence_candidates(
     consumed: Mapping[str, datetime],
     limit: int,
 ) -> list[StoredCandidate]:
-    """Derived records that gained independent evidence no standing operation has weighed."""
+    """Derived records that gained independent evidence nothing has weighed yet."""
     # ponytail: over-fetch the newest window and filter, rather than push the consumed-time
     # comparison into SQL. Raise the factor only if a store whose newest records are all already
     # deliberated measurably under-fills the window.
@@ -5677,12 +6032,15 @@ def _evidence_candidates(
 
 def _contradiction_candidates(
     connection: sqlite3.Connection,
+    weighed: Mapping[str, datetime],
     limit: int,
 ) -> list[StoredCandidate]:
     """Lineages whose current visible claims disagree, the way the compiler reports them.
 
-    A contradiction stays listed until the data stops contradicting: retiring one side through
-    `CORRECT` is what clears it, so this needs no separate record of having been reported.
+    Retiring one side through `CORRECT` is what clears a contradiction, but a deliberation the
+    model could not resolve clears nothing -- so the lineage is dropped while nothing about it
+    has changed since it was last weighed, and returns as soon as a further claim is recorded in
+    it. The signal is the newest transaction time among the disagreeing claims.
     """
     lineages = {
         _row_text(row, "lineage_id"): int(row["values_count"])
@@ -5706,9 +6064,10 @@ def _contradiction_candidates(
         return []
     placeholders = ", ".join("?" for _lineage_id in lineages)
     members: dict[str, list[str]] = {lineage_id: [] for lineage_id in lineages}
+    signal: dict[str, datetime] = {}
     for row in connection.execute(
         f"""
-        SELECT s.lineage_id AS lineage_id, s.memory_id AS memory_id
+        SELECT s.lineage_id AS lineage_id, s.memory_id AS memory_id, v.recorded_at AS recorded_at
         FROM memory_semantics AS s
         JOIN memory_versions AS v ON v.memory_id = s.memory_id
         JOIN memory_records AS r ON r.memory_id = s.memory_id
@@ -5718,7 +6077,11 @@ def _contradiction_candidates(
         """,
         tuple(lineages),
     ).fetchall():
-        members[_row_text(row, "lineage_id")].append(_row_text(row, "memory_id"))
+        lineage_id = _row_text(row, "lineage_id")
+        members[lineage_id].append(_row_text(row, "memory_id"))
+        recorded_at = _parse_datetime(_row_text(row, "recorded_at"))
+        if lineage_id not in signal or recorded_at > signal[lineage_id]:
+            signal[lineage_id] = recorded_at
     return [
         StoredCandidate(
             trigger="contradiction",
@@ -5726,8 +6089,90 @@ def _contradiction_candidates(
             evidence_count=lineages[lineage_id],
         )
         for lineage_id, memory_ids in members.items()
-        if memory_ids
+        if memory_ids and _is_due(signal[lineage_id], memory_ids, weighed)
     ]
+
+
+def _is_due(
+    signal_at: datetime, memory_ids: Sequence[str], weighed: Mapping[str, datetime]
+) -> bool:
+    """Report whether a group's own signal is newer than anything that has weighed it."""
+    marks = [weighed[memory_id] for memory_id in memory_ids if memory_id in weighed]
+    return not marks or signal_at > max(marks)
+
+
+def _pressure_candidates(
+    connection: sqlite3.Connection,
+    weighed: Mapping[str, datetime],
+    limit: int,
+    record_budget: int | None,
+) -> list[StoredCandidate]:
+    """Oldest never-weighed records, while the store holds more than its configured budget.
+
+    Pressure has no signal time of its own -- the condition is a level, not an event -- so
+    "already weighed" here means weighed at all rather than weighed since some moment. Once
+    everything in the store has been weighed once, pressure derives nothing further: a
+    deliberation that keeps re-proposing the same forgetting is the disease this marker exists to
+    cure, and the honest answer is that there is no new work.
+    """
+    if record_budget is None:
+        return []
+    active = int(
+        connection.execute(
+            "SELECT COUNT(*) AS records FROM memory_records WHERE forgotten_at IS NULL"
+        ).fetchone()["records"]
+    )
+    if active <= record_budget:
+        return []
+    rows = connection.execute(
+        """
+        SELECT memory_id
+        FROM memory_records
+        WHERE forgotten_at IS NULL
+        ORDER BY COALESCE(last_accessed_at, created_at), memory_id
+        LIMIT ?
+        """,
+        (min(1_000, limit * 4),),
+    ).fetchall()
+    over = active - record_budget
+    return [
+        StoredCandidate(
+            trigger="pressure",
+            memory_ids=(memory_id,),
+            evidence_count=over,
+        )
+        for memory_id in (_row_text(row, "memory_id") for row in rows)
+        if memory_id not in weighed
+    ][:limit]
+
+
+def _idle_candidates(
+    connection: sqlite3.Connection,
+    weighed: Mapping[str, datetime],
+    limit: int,
+) -> list[StoredCandidate]:
+    """Derived lineages nothing has ever weighed, oldest first.
+
+    Only reached when the operator declares the window. The kernel never infers idleness from a
+    clock: whether the device is idle or charging is the host's knowledge, not the store's.
+    """
+    rows = connection.execute(
+        """
+        SELECT s.memory_id AS memory_id
+        FROM memory_semantics AS s
+        JOIN memory_versions AS v ON v.memory_id = s.memory_id
+        JOIN memory_records AS r ON r.memory_id = s.memory_id
+        WHERE v.retired_at IS NULL AND r.forgotten_at IS NULL
+        ORDER BY v.recorded_at, s.memory_id
+        LIMIT ?
+        """,
+        (min(1_000, limit * 4),),
+    ).fetchall()
+    return [
+        StoredCandidate(trigger="idle", memory_ids=(memory_id,), evidence_count=1)
+        for memory_id in (_row_text(row, "memory_id") for row in rows)
+        if memory_id not in weighed
+    ][:limit]
 
 
 def _feedback_candidates(
@@ -5832,6 +6277,8 @@ def _operation_from_row(row: sqlite3.Row) -> StoredOperation:
         superseded=tuple((pair[0], int(pair[1])) for pair in effects.get("superseded") or ()),
         applied_at=_parse_datetime(_row_text(row, "applied_at")),
         rolled_back_at=_optional_datetime_from_row(row, "rolled_back_at"),
+        outcome=_optional_row_text(row, "outcome"),
+        outcome_note=_optional_row_text(row, "outcome_note"),
     )
 
 

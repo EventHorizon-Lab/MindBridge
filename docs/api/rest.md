@@ -454,7 +454,7 @@ REST has no route for these Python operations:
 | `search_with_trace` | Send `POST /v1/memories/search` with `"explain": true` |
 | `register_speaker` | No route; has an [MCP tool](mcp.md#tools). REST names an identity, not a voice-only speaker |
 | `reindex`, `optimize` | Index maintenance an operator schedules |
-| `consolidation_candidates`, `consolidate`, `forget`, `rollback`, `operations` | No route and no MCP tool; the memory control plane stays under host authority |
+| `consolidation_candidates`, `consolidate`, `deliberate`, `apply`, `record_outcome`, `forget`, `rollback`, `operations` | No route and no MCP tool; the memory control plane stays under host authority |
 
 `speech`, `faces`, `register_identity`, `identity`, `unlink_identity`, and `forget_identity` do
 have routes, listed in [Endpoints](#endpoints) -- but only when the host enables

@@ -543,6 +543,19 @@ class MemoryTrigger(str, Enum):
     IDLE = "idle"
 
 
+class MemoryOutcome(str, Enum):
+    """What later evidence said about one already-applied control-plane operation.
+
+    Recorded after the fact by `record_outcome()`, which is what makes the slow loop's quality
+    measurable: consolidation precision and contradiction recovery are `CONFIRMED` rates over
+    `CONSOLIDATE` and `CORRECT` rows, and false retirement is the `REFUTED` rate over rows that
+    forgot something. The kernel never sets it and never reads it back into a decision.
+    """
+
+    CONFIRMED = "confirmed"
+    REFUTED = "refuted"
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class MemoryOperation:
     """One proposed memory operation whose required fields follow from its intent."""
@@ -620,6 +633,11 @@ class MemoryOperationRecord:
     # the backend never named and may never have been shown. `rollback()` restores exactly these.
     superseded: tuple[tuple[str, int], ...] = ()
     rolled_back_at: datetime | None = None
+    # Post-hoc, written by `record_outcome()` and never by the kernel: what later evidence said
+    # about this operation. `None` means nobody has judged it yet, which is not the same as
+    # unrefuted.
+    outcome: MemoryOutcome | None = None
+    outcome_note: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -649,6 +667,15 @@ class MemoryOperationRecord:
             if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
                 raise ValidationError("superseded version must be a positive integer")
         object.__setattr__(self, "superseded", superseded)
+        if self.outcome is not None and not isinstance(self.outcome, MemoryOutcome):
+            raise ValidationError("operation outcome is invalid")
+        object.__setattr__(
+            self,
+            "outcome_note",
+            _optional_text(self.outcome_note, "operation outcome_note"),
+        )
+        if self.outcome is None and self.outcome_note is not None:
+            raise ValidationError("an outcome note requires an outcome")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -657,7 +684,9 @@ class ConsolidationCandidate:
 
     `memory_ids` is the set to hand straight to `consolidate(evidence_ids=...)`. `evidence_count`
     is what the trigger counted: new evidence links for `EVIDENCE`, distinct conflicting values
-    for `CONTRADICTION`, and recorded confirmations for `FEEDBACK`.
+    for `CONTRADICTION`, recorded confirmations for `FEEDBACK`, recorded recall failures for
+    `QUERY_FAILURE`, and the record count over budget for `PRESSURE`. An `IDLE` row counts one:
+    the operator opened the window, so the count is the lineage, not a measured signal.
     """
 
     trigger: MemoryTrigger
@@ -680,12 +709,21 @@ class ConsolidationCandidate:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ConsolidationReport:
-    """What one consolidation pass applied and which proposals the kernel refused."""
+    """What one consolidation pass applied and which proposals the kernel refused.
+
+    `weighed` is how many evidence records the backend was actually shown. Zero means the pass
+    reached no backend at all -- every named record had been forgotten, corrected, or deleted by
+    the time the pass opened -- which is a different thing from a backend that was shown evidence
+    and proposed nothing.
+    """
 
     operations: tuple[MemoryOperationRecord, ...] = ()
     rejected: tuple[tuple[MemoryOperation, str], ...] = ()
+    weighed: int = 0
 
     def __post_init__(self) -> None:
+        if isinstance(self.weighed, bool) or not isinstance(self.weighed, int) or self.weighed < 0:
+            raise ValidationError("consolidation weighed must be a non-negative integer")
         operations = tuple(self.operations)
         if any(not isinstance(value, MemoryOperationRecord) for value in operations):
             raise ValidationError("consolidation operations are invalid")
@@ -702,6 +740,32 @@ class ConsolidationReport:
             raise ValidationError("consolidation rejections are invalid")
         object.__setattr__(self, "operations", operations)
         object.__setattr__(self, "rejected", rejected)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DeliberationReport:
+    """What one bounded run of the memory-management loop did.
+
+    `rounds` counts candidate passes actually run, so a loop that stopped because nothing was due
+    reports the rounds it did rather than the ceiling it was given. `weighed` counts candidates
+    handed to the backend and `skipped` counts candidates whose evidence had all become inactive
+    by the time the pass opened, so `weighed + skipped` is the candidate total. `model_calls` is
+    the loop's cost proxy: the `ConsolidationBackend` protocol reports no token or currency cost,
+    so this counts backend round trips instead of inventing one.
+    """
+
+    rounds: int = 0
+    weighed: int = 0
+    skipped: int = 0
+    applied: int = 0
+    rejected: int = 0
+    model_calls: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("rounds", "weighed", "skipped", "applied", "rejected", "model_calls"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValidationError(f"deliberation {name} must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
