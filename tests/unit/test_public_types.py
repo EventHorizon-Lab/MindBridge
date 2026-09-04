@@ -21,6 +21,7 @@ from mindbridge.exceptions import (
 )
 from mindbridge.types import (
     AbstentionReason,
+    AnswerChunk,
     AnswerResult,
     AssetRef,
     Blob,
@@ -251,6 +252,22 @@ def test_answer_and_page_reuse_the_public_values() -> None:
     with pytest.raises(ValidationError, match="must agree"):
         AnswerResult(answer="unknown", abstained=True)
     assert Page(items=(memory,), next_cursor="cursor_1").items == (memory,)
+
+
+def test_an_answer_chunk_is_either_a_delta_or_the_result_and_never_both() -> None:
+    result = AnswerResult(answer="It is in the toolbox.")
+
+    assert AnswerChunk(text="It is ").text == "It is "
+    assert AnswerChunk(result=result).result is result
+    assert AnswerChunk(text="It is ").result is None
+    assert AnswerChunk(result=result).text == ""
+
+    # Both shapes in one chunk, or neither, would make "join the deltas" and "wait for the
+    # result" two different readings of the same stream.
+    with pytest.raises(ValidationError, match="either text or a result"):
+        AnswerChunk(text="It is ", result=result)
+    with pytest.raises(ValidationError, match="either text or a result"):
+        AnswerChunk()
 
 
 def test_a_context_unknown_states_one_typed_reason() -> None:

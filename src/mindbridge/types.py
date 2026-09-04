@@ -1632,6 +1632,28 @@ class AnswerResult:
 
 
 @dataclass(frozen=True, slots=True)
+class AnswerChunk:
+    """One streamed answer delta, or the terminal chunk carrying the grounded result.
+
+    Exactly one field is populated. A delta carries `text` and no `result`; the single terminal
+    chunk carries `result` and no `text`. `"".join(chunk.text for chunk in stream)` therefore
+    reconstructs the answer, and a caller that only wants the grounded outcome can wait for the
+    chunk whose `result` is set.
+    """
+
+    text: str = ""
+    result: AnswerResult | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise ValidationError("answer chunk text must be a string")
+        if self.result is not None and not isinstance(self.result, AnswerResult):
+            raise ValidationError("answer chunk result is invalid")
+        if bool(self.text) == (self.result is not None):
+            raise ValidationError("an answer chunk carries either text or a result")
+
+
+@dataclass(frozen=True, slots=True)
 class Page:
     """One stable page of memories."""
 

@@ -17,7 +17,7 @@ inference, but it cannot own or bypass those rules.
 ## Implemented composition
 
 The supported plugins are the narrow backend protocols inventoried in
-[architecture](architecture.md#model-and-plugin-boundary). That page owns the list; this page owns
+[architecture](architecture.md#model-boundary). That page owns the list; this page owns
 the rules for adding to it. The declarative entry point constructs bundled implementations without
 exposing runtime details:
 

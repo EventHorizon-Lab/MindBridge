@@ -320,6 +320,15 @@ ask(
     reference_at: datetime | None = None,
     scope: RetrievalScope | None = None,
 ) -> AnswerResult
+
+ask_stream(
+    question: ContentInput,
+    *,
+    limit: int = 5,
+    memory_type: MemoryType | None = None,
+    reference_at: datetime | None = None,
+    scope: RetrievalScope | None = None,
+) -> Iterator[AnswerChunk]
 ```
 
 `reference_at` is the timezone-aware clock for relative time and decay. The current UTC time is
@@ -337,6 +346,39 @@ candidate retrieval; see
 contains identifiers, score components, ranks, and rejection reasons, but no query, content,
 metadata, media, vectors, paths, or model output. `ask` requires an answerer and returns only the
 retrieved hits the answerer actually used.
+
+`ask_stream` runs the same path and yields the answer while the model is still producing it.
+Retrieval, grounding, and reinforcement are unchanged; only delivery of the generated text is
+incremental. Each `AnswerChunk` carries either `text` or `result`, never both: the deltas join to
+the answer, and the single terminal chunk holds the same `AnswerResult` `ask` returns.
+
+```python
+answer = None
+for chunk in memory.ask_stream("Where is the red toolbox?"):
+    if chunk.result is None:
+        print(chunk.text, end="", flush=True)
+    else:
+        answer = chunk.result
+```
+
+Arguments are validated when `ask_stream` is called, not when the stream is first pulled. A
+backend without `stream_answer` still works: it yields its whole answer as one delta. Reading to
+the terminal chunk releases everything the answer held, so stopping there needs no cleanup;
+abandoning the stream mid-answer leaves one operation open until the generator is closed or
+collected, and `close()` waits for open operations.
+
+Streaming is a property of the composed backend, reported by
+`capabilities.streaming_generation`. It changes when the answer becomes visible, not how long it
+takes: a model that reasons before it answers spends most of its generation time before the first
+visible token, and `ask_stream` recovers only what follows it. The
+`mindbridge.model.generation` span records `mindbridge.model.time_to_first_token` either way, so
+the split is measurable before it is designed around. That span stays open for the life of the
+stream, so with `ask_stream` its duration includes the time a caller spends between chunks.
+
+`AsyncMemory.ask_stream` is the same contract as an `AsyncGenerator[AnswerChunk, None]`,
+including validation at the call. Every step of the underlying stream runs in one worker thread,
+so the event loop stays free while the provider generates, at the cost of a thread per in-flight
+stream; `aclose()` closes the stream behind it.
 
 ```text
 compile(
@@ -690,7 +732,7 @@ These are the 105 supported names exported by `mindbridge`:
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `ProvisionalActor`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `AnswerChunk`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `ProvisionalActor`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
@@ -719,6 +761,7 @@ The principal immutable values are:
 | `PendingCapture` | `memory_id`, `enqueued_at`, `attempts`, `last_error`, `awaiting` |
 | `SearchHit` | all visible memory fields plus `score` |
 | `AnswerResult` | `answer`, `hits`, `abstained`, `abstention_reason` |
+| `AnswerChunk` | `text`, `result` |
 | `Page` | `items`, `next_cursor` |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
 | `IdentityProfile` | `identity_id`, `name`, `relationship`, `confirmed`, `evidence_ids`; the last two are derived from the current visible naming assertion, never stored |
