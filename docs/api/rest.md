@@ -2,8 +2,8 @@
 
 ## Surface
 
-The optional FastAPI adapter exposes twelve `Memory` operations under `/v1`, or eighteen when the
-host builds it with `identity_operations=True` and `embodied_operations=True`. It validates
+The optional FastAPI adapter exposes twelve `Memory` operations under `/v1`, or twenty-two when
+the host builds it with `identity_operations=True` and `embodied_operations=True`. It validates
 transport input, calls the injected synchronous memory, and serializes the public SDK values; it
 is not a separate storage or retrieval implementation.
 

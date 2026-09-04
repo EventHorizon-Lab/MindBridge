@@ -3,6 +3,7 @@
 import base64
 import inspect
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,7 @@ import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
+import mindbridge
 from mindbridge.api.app import create_app
 from mindbridge.exceptions import (
     IdentityNotFoundError,
@@ -707,6 +709,37 @@ def test_memory_routes_are_sync_for_fastapi_threadpool_execution() -> None:
 
     assert endpoints
     assert all(not inspect.iscoroutinefunction(endpoint) for endpoint in endpoints)
+
+
+def test_the_documented_v1_route_counts_are_the_real_ones() -> None:
+    """`docs/api/rest.md` spells out the always-on and gated `/v1` route counts in prose.
+
+    Parses "twelve ... or twenty-two when" from the doc and checks each number against the
+    routes `create_app` actually registers, once with both opt-in switches off and once with
+    both on, so a route added or removed without a doc update fails here. A tiny local map
+    stands in for `test_surface_parity._COUNT_WORDS`: that module has no `__init__.py`, so
+    importing it by dotted path here collides with mypy's own file-based module discovery.
+    """
+    count_words = {12: "twelve", 22: "twenty-two"}
+
+    def v1_route_count(**kwargs: bool) -> int:
+        app = create_app(memory=FakeMemory(), **kwargs)
+        return sum(
+            1
+            for route in app.routes
+            if isinstance(route, APIRoute) and route.path.startswith("/v1/")
+        )
+
+    always_on = v1_route_count()
+    gated = v1_route_count(identity_operations=True, embodied_operations=True)
+
+    page = (Path(mindbridge.__file__).parents[2] / "docs" / "api" / "rest.md").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"exposes (\w+) `Memory` operations under `/v1`, or ([\w-]+) when", page)
+    assert match is not None
+    assert match.group(1) == count_words[always_on]
+    assert match.group(2) == count_words[gated]
 
 
 @pytest.mark.parametrize("field", ["tenant_id", "user_id", "run_id"])
