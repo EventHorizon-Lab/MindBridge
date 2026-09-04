@@ -1390,11 +1390,12 @@ async def _run_arms(
     )
     results: list[SampleResult] = []
     for task in tasks:
+        sample_count = sum(len(unit.questions) for unit in task.units) * len(arms)
         if not arguments.quiet:
-            print(
-                f"mindbridge-bench eval: running {task.spec.name} ({len(task.units)} units)",
-                file=sys.stderr,
-            )
+            _announce(f"running {task.spec.name} ({len(task.units)} units, {sample_count} samples)")
+        progress = _progress_reporter(
+            f"running {task.spec.name}", "samples", enabled=not arguments.quiet
+        )
         with traced_span(
             tracer,
             BENCHMARK_TASK_SPAN,
@@ -1422,6 +1423,7 @@ async def _run_arms(
                     compile_budget=compile_budget,
                     ingest_mode=arguments.ingest,
                     tracer=tracer,
+                    on_progress=progress,
                 )
             )
     return tuple(results)
@@ -1444,6 +1446,7 @@ async def run_loaded_task(
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     ingest_mode: str = DEFAULT_INGEST_MODE,
     tracer: Tracer | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[SampleResult, ...]:
     """Run normalized units with bounded workers while preserving release order."""
     if min(batch_size, unit_concurrency, request_concurrency, recall_limit) <= 0:
@@ -1453,6 +1456,9 @@ async def run_loaded_task(
     slots: list[tuple[SampleResult, ...] | None] = [None] * len(task.units)
     queue: asyncio.Queue[tuple[int, EvalUnit]] = asyncio.Queue()
     request_semaphore = asyncio.Semaphore(request_concurrency)
+    completed = 0
+    total = sum(len(unit.questions) for unit in task.units) * len(arms)
+    notify_progress = on_progress or _ignore_progress
     for index, unit in enumerate(task.units):
         queue.put_nowait((index, unit))
 
@@ -1463,7 +1469,15 @@ async def run_loaded_task(
             except asyncio.QueueEmpty:
                 return
             data_dir = run.unit_dir(unit.unit_id)
-            slots[index] = await _run_unit(
+            reported = 0
+
+            def sample_completed() -> None:
+                nonlocal completed, reported
+                completed += 1
+                reported += 1
+                notify_progress(completed, total)
+
+            samples = await _run_unit(
                 task,
                 unit,
                 data_dir,
@@ -1480,7 +1494,11 @@ async def run_loaded_task(
                 compile_budget=compile_budget,
                 ingest_mode=ingest_mode,
                 tracer=tracer,
+                on_sample_completed=sample_completed,
             )
+            slots[index] = samples
+            for _ in range(len(samples) - reported):
+                sample_completed()
             queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(min(unit_concurrency, len(task.units)))]
@@ -1508,6 +1526,7 @@ async def _run_unit(
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     ingest_mode: str = DEFAULT_INGEST_MODE,
     tracer: Tracer | None = None,
+    on_sample_completed: Callable[[], None] | None = None,
 ) -> tuple[SampleResult, ...]:
     ordered = tuple((arm, question) for arm in arms for question in unit.questions)
     results: dict[tuple[str, str], SampleResult] = {}
@@ -1522,6 +1541,7 @@ async def _run_unit(
                 log_samples=log_samples,
             )
         )
+    _report_completions(on_sample_completed, len(results))
     if len(results) == len(ordered):
         return tuple(results[(arm.name, question.question_id)] for arm, question in ordered)
     pending_questions = {
@@ -1586,6 +1606,7 @@ async def _run_unit(
                         response_cache=response_cache,
                         compile_budget=compile_budget,
                         tracer=tracer,
+                        on_sample_completed=on_sample_completed,
                     )
                 )
     except BaseException as error:
@@ -1629,6 +1650,7 @@ async def _answer_arms(
     response_cache: ResponseCache | None,
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     tracer: Tracer | None = None,
+    on_sample_completed: Callable[[], None] | None = None,
 ) -> dict[tuple[str, str], SampleResult]:
     """Answer one cutoff's pending questions once per arm, against one ingested store."""
     results: dict[tuple[str, str], SampleResult] = {}
@@ -1660,6 +1682,7 @@ async def _answer_arms(
             context=context,
             compile_budget=compile_budget,
             tracer=tracer,
+            on_complete=on_sample_completed,
         )
         for question, outcome in zip(questions, answered, strict=True):
             results[(arm.name, question.question_id)] = _sample(
@@ -1917,6 +1940,7 @@ async def _answer_many(
     request_semaphore: asyncio.Semaphore | None = None,
     recall_limit: int,
     on_answer: Callable[[EvalQuestion, _AnswerOutcome], None] | None = None,
+    on_complete: Callable[[], None] | None = None,
     arm: _Arm = PRODUCT_ARM,
     task_name: str = "",
     unit_id: str = "",
@@ -1927,24 +1951,28 @@ async def _answer_many(
     semaphore = request_semaphore or asyncio.Semaphore(request_concurrency)
 
     async def answer(question: EvalQuestion) -> _AnswerOutcome:
-        async with semaphore:
-            identity = f"{task_name}/{unit_id}/{question.question_id}"
-            sample_id = identity if arm.name == DEFAULT_ARM else f"{arm.name}:{identity}"
-            with _answer_span(tracer, task_name, sample_id):
-                outcome = await _arm_outcome(
-                    memory,
-                    question,
-                    arm=arm,
-                    task_name=task_name,
-                    sample_id=sample_id,
-                    recall_limit=recall_limit,
-                    context=context,
-                    compile_budget=compile_budget,
-                    tracer=tracer,
-                )
-        if on_answer is not None:
-            on_answer(question, outcome)
-        return outcome
+        try:
+            async with semaphore:
+                identity = f"{task_name}/{unit_id}/{question.question_id}"
+                sample_id = identity if arm.name == DEFAULT_ARM else f"{arm.name}:{identity}"
+                with _answer_span(tracer, task_name, sample_id):
+                    outcome = await _arm_outcome(
+                        memory,
+                        question,
+                        arm=arm,
+                        task_name=task_name,
+                        sample_id=sample_id,
+                        recall_limit=recall_limit,
+                        context=context,
+                        compile_budget=compile_budget,
+                        tracer=tracer,
+                    )
+            if on_answer is not None:
+                on_answer(question, outcome)
+            return outcome
+        finally:
+            if on_complete is not None:
+                on_complete()
 
     return tuple(
         await asyncio.gather(*(answer(question) for question in questions), return_exceptions=True)
@@ -2332,9 +2360,11 @@ async def _apply_judges(
     }
     planned: dict[str, JudgePlan] = {}
     for sample in samples:
-        if sample.error_code is not None or sample.ingest_failure_count:
-            continue
-        if not _Arm(sample.arm).generates:
+        if (
+            sample.error_code is not None
+            or sample.ingest_failure_count
+            or not _Arm(sample.arm).generates
+        ):
             continue
         question = questions[(sample.task, sample.unit_id, sample.question_id)]
         plan = judge_plan(
@@ -2349,10 +2379,7 @@ async def _apply_judges(
     if not planned:
         return tuple(samples)
     if not arguments.quiet:
-        print(
-            f"mindbridge-bench eval: judging {len(planned)} answers with {config.model}",
-            file=sys.stderr,
-        )
+        _announce(f"judging {len(planned)} answers with {config.model}")
     try:
         from openai import AsyncOpenAI
     except ImportError:
@@ -2372,22 +2399,31 @@ async def _apply_judges(
         )
     )
     semaphore = asyncio.Semaphore(config.concurrency)
-    try:
-        judged = await asyncio.gather(
-            *(
-                _judge_sample(
-                    sample,
-                    planned.get(sample.sample_id),
-                    client=client,
-                    cache=cache,
-                    semaphore=semaphore,
-                    config=config,
-                    log_samples=arguments.log_samples,
-                    tracer=selected_tracer,
-                )
-                for sample in samples
-            )
+    progress = _progress_reporter(
+        f"judging with {config.model}", "answers", enabled=not arguments.quiet
+    )
+    completed = 0
+
+    async def judge(sample: SampleResult) -> SampleResult:
+        nonlocal completed
+        plan = planned.get(sample.sample_id)
+        result = await _judge_sample(
+            sample,
+            plan,
+            client=client,
+            cache=cache,
+            semaphore=semaphore,
+            config=config,
+            log_samples=arguments.log_samples,
+            tracer=selected_tracer,
         )
+        if plan is not None:
+            completed += 1
+            progress(completed, len(planned))
+        return result
+
+    try:
+        judged = await asyncio.gather(*(judge(sample) for sample in samples))
     finally:
         await client.close()
         if cache is not None:
@@ -3906,6 +3942,35 @@ def _json_bytes(value: object, *, pretty: bool = False) -> bytes:
 
 def _announce(message: str) -> None:
     print(f"mindbridge-bench eval: {message}", file=sys.stderr)
+
+
+def _ignore_progress(_completed: int, _total: int) -> None:
+    pass
+
+
+def _report_completions(callback: Callable[[], None] | None, count: int) -> None:
+    if callback is not None:
+        for _ in range(count):
+            callback()
+
+
+def _progress_reporter(
+    stage: str, noun: str, *, enabled: bool = True
+) -> Callable[[int, int], None]:
+    """Report the first completion and each new ten-percent milestone."""
+    if not enabled:
+        return _ignore_progress
+    last_decile = 0
+
+    def report(completed: int, total: int) -> None:
+        nonlocal last_decile
+        decile = completed * 10 // total
+        if completed != 1 and completed != total and decile <= last_decile:
+            return
+        last_decile = decile
+        _announce(f"{stage}: {completed}/{total} {noun} ({completed / total:.0%})")
+
+    return report
 
 
 _first_ingest_failure_announced = False

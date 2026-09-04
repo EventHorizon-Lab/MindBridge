@@ -214,6 +214,9 @@ repository rather than the process directory; `--data-root` defaults to
 `<benchmarks-root>/data`. Run `mindbridge-bench eval --help` for the full concurrency, cache,
 generation, and comparison options.
 
+Unless `--quiet` is set, `eval` reports sample and judge progress to stderr after the first
+completion and at roughly ten-percent intervals.
+
 `--limit` accepts `-1`, a fraction between zero and one, or an absolute adapter-unit count. Use an
 integer for a count; a non-integral value above one is truncated to an integer by the current
 loader selection. Its unit is adapter-specific: OpenEQA limits episodes and retains every question
