@@ -578,11 +578,11 @@ class Memory:
         self._owner_pid = os.getpid()
         self._write_lock = RLock()
         self._formation_lock = RLock()
-        # Whether *this* thread is inside an `add_stream` group, so a concurrent `add` on another
-        # thread keeps flushing before it returns. Thread-local rather than one shared slot: two
-        # threads streaming at once saved and restored each other's value, so the second to finish
-        # handed the first thread's id back and pinned deferral on a thread that had left the
-        # stream -- every later drain on it silently returned without flushing the index.
+        # Whether *this* thread is inside an `add_stream` item write, so a concurrent `add` on
+        # another thread keeps flushing before it returns. Thread-local rather than one shared
+        # slot: two threads streaming at once saved and restored each other's value, so the second
+        # to finish handed the first thread's id back and pinned deferral on a thread that had left
+        # the stream -- every later drain on it silently returned without flushing the index.
         self._deferral = local()
         # Settlement is the one path that runs the expensive model stages over rows another
         # caller can already see queued, so two threads would otherwise embed the same record
@@ -1187,32 +1187,48 @@ class Memory:
         # outbox work, so there is nothing for a group to batch. Deferring index commits for it
         # would only postpone work some other caller left pending, and the empty forced drain at
         # each boundary would put a Zvec lock back on the path capture exists to keep clear.
-        outer_deferral = self._deferring
-        if not capture:
-            self._deferral.active = True
-        try:
-            while True:
-                try:
-                    content = next(iterator)
-                except StopIteration:
-                    break
-                except MindBridgeError as error:
-                    if error.subject is None:
-                        error.subject = f"contents[{index}]"
-                    raise
+        while True:
+            try:
+                content = next(iterator)
+            except StopIteration:
+                break
+            except MindBridgeError as error:
+                if error.subject is None:
+                    error.subject = f"contents[{index}]"
+                raise
+            with self._deferred_index(defer=not capture):
                 record = self._add_stream_item(content, index=index, capture=capture)
-                if not capture:
-                    grouped, group_started = self._advance_stream_group(grouped + 1, group_started)
-                yield record
-                index += 1
-            if grouped:
-                self._flush_stream_group()
+            if not capture:
+                grouped, group_started = self._advance_stream_group(grouped + 1, group_started)
+            yield record
+            index += 1
+        if grouped:
+            self._flush_stream_group()
+
+    @contextmanager
+    def _deferred_index(self, *, defer: bool) -> Iterator[None]:
+        """Defer the calling thread's index commits for the block when `defer`.
+
+        Scoped to the item write rather than the whole stream because `add_stream` is a
+        generator: its body runs on whichever thread calls `next`, so a consumer that hands the
+        iterator between workers opened the group on one thread and left it on another. Entering
+        and leaving on the same thread within one resumption keeps every thread the stream ran on
+        clear of a deferral nothing would ever lift, and a consumer's own writes between two
+        yields flush the way they would outside the stream.
+        """
+        if not defer:
+            yield
+            return
+        outer = self._deferring
+        self._deferral.active = True
+        try:
+            yield
         finally:
-            self._deferral.active = outer_deferral
+            self._deferral.active = outer
 
     @property
     def _deferring(self) -> bool:
-        """Whether the calling thread has an `add_stream` group open."""
+        """Whether the calling thread is inside a deferred `add_stream` item write."""
         return bool(getattr(self._deferral, "active", False))
 
     def _add_stream_item(
