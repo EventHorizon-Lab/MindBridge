@@ -199,7 +199,7 @@ a thin bundle explains itself instead of looking like an empty store.
 | `kind` | When it appears |
 | --- | --- |
 | `budget_excluded` | Counted candidates a bound removed, or that did not fit the budget, or actor lines that did not fit `max_chars` |
-| `section_empty` | A bundle section a `memory_types` request left empty, naming the section and whether the filter excluded every type it carries or the ranking simply reached none |
+| `section_empty` | A bundle section a `memory_types` request left empty, naming the section and either that the filter excluded every type it carries, or that the request admitted the type and no record of it reached the bundle at all -- a kind-keyed section (`actors`, `scene`, `affect`, `traits`) empty while another section already carries a record of its type is silent, since flagging it would be noise in most bundles |
 | `scope_empty` | A `scope` was supplied and retrieval matched nothing; the entry names the bounds |
 | `modality_unsupported` | The goal carries media this composition's embedder cannot search |
 | `stage_skipped` | An optional stage the `max_latency_ms` deadline skipped |

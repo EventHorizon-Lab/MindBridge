@@ -463,7 +463,12 @@ def _section_empty(
     Only a request that named types gets these: without one an empty section means the store
     holds nothing for it, which is not a statement about this request. With one, an empty
     section is either a section the filter can never fill -- its records carry a type the
-    request excluded -- or one the filter admits and no candidate reached.
+    request excluded -- or one the filter admits and no record of that type reached the bundle
+    at all (`feeds.isdisjoint(present)`). The second variant is deliberately narrower than "this
+    section is empty": a kind-keyed section (`actors`, `scene`, `affect`, `traits`) that is empty
+    while a *different* section already carries a record of the same underlying `MemoryType`
+    stays silent, because flagging it would be noise in most bundles -- the type was not missing,
+    it just formed into another kind.
     """
     requested = budget.memory_types
     if requested is None:
