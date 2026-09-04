@@ -5513,7 +5513,23 @@ def test_a_cross_modal_merge_is_logged_and_rollback_re_splits_the_two_identities
     state, or `operations()` cannot answer what fused two people and `rollback()` cannot undo
     it.
     """
-    with _linking_memory(tmp_path) as memory:
+    # `min_assets=2` holds the merge off the first asset, so both identities exist -- and can be
+    # read back by their own `created_at` -- before anything fuses them. `faces()` on a single
+    # asset commits enrolment and the merge in the same call, leaving nothing to read.
+    with _linking_memory(tmp_path, min_assets=2) as memory:
+        seed = memory.add(Blob(b"seed video", "video/mp4", "seed.mp4"))
+        face_id = memory.faces(seed.id)[0].identity_id
+        voice_id = memory.speech(seed.id)[0].speaker_id
+        assert face_id != voice_id
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+            pre_merge_created_at = dict(
+                connection.execute(
+                    "SELECT identity_id, created_at FROM identities WHERE identity_id IN (?, ?)",
+                    (face_id, voice_id),
+                ).fetchall()
+            )
+        assert set(pre_merge_created_at) == {face_id, voice_id}
+
         record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
         survivor = memory.faces(record.id)[0].identity_id
         assert memory.speech(record.id)[0].speaker_id == survivor
@@ -5546,9 +5562,21 @@ def test_a_cross_modal_merge_is_logged_and_rollback_re_splits_the_two_identities
         assert memory.speech(record.id)[0].speaker_name == "Li"
         assert _merge_row(memory).rolled_back_at is not None
 
-        # `faces()` is called last on purpose: reversing a merge resets the pair's evidence
-        # rather than suppressing the pair, so continued ingestion corroborates and merges them
-        # again -- and logs that second bind as its own row.
+        # The restored identity's `created_at` is its own pre-merge value, not the moment the
+        # merge (or the rollback) happened: `_merge_identities` must not overwrite it with the
+        # merge time before `_split_identity` reads it back.
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+            restored_created_at = connection.execute(
+                "SELECT created_at FROM identities WHERE identity_id = ?",
+                (absorbed,),
+            ).fetchone()[0]
+        assert restored_created_at == pre_merge_created_at[absorbed]
+
+        # Reversing a merge resets the pair's evidence rather than suppressing the pair, so
+        # continued ingestion corroborates and merges them again -- and logs that second bind as
+        # its own row. `min_assets=2` needs both assets reprocessed to recorroborate; `faces()`
+        # on `record.id` is called last on purpose, so its return value is the fresh merge.
+        memory.faces(seed.id)
         assert memory.faces(record.id)[0].identity_id == survivor
         standing = [
             row

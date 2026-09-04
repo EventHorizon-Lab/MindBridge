@@ -3054,6 +3054,17 @@ class LocalStore:
         target, source = plan.target_id, plan.source_id
         contributed = _sole_identity_modality(connection, source)
         now = _datetime_text(datetime.now(timezone.utc))
+        # Read before the source's `identities` row is deleted below, so the alias row can carry
+        # forward the absorbed identity's own creation time rather than the merge time. Rollback
+        # (`_split_identity`) restores the identity from this value; storing `now` here instead
+        # would make every merge-then-rollback cycle overwrite the original `created_at`.
+        source_created_at = _row_text(
+            connection.execute(
+                "SELECT created_at FROM identities WHERE identity_id = ?",
+                (source,),
+            ).fetchone(),
+            "created_at",
+        )
         connection.execute(
             "UPDATE speech_segments SET speaker_id = ? WHERE speaker_id = ?",
             (target, source),
@@ -3119,7 +3130,7 @@ class LocalStore:
                 alias_id, identity_id, created_at, contributed_modality
             ) VALUES (?, ?, ?, ?)
             """,
-            (source, target, now, contributed),
+            (source, target, source_created_at, contributed),
         )
         connection.execute("DELETE FROM identities WHERE identity_id = ?", (source,))
         if _has_naming_assertion(connection, target):
