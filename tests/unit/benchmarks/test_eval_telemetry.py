@@ -1,19 +1,27 @@
-"""Checks for bounded benchmark timing and token aggregation."""
+"""Checks for benchmark timing and token aggregation."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
 
+import mindbridge.benchmarks.eval_telemetry as eval_telemetry
 from mindbridge._telemetry import (
+    GEN_AI_TTFC,
     GROUNDING_HITS_DROPPED,
     GROUNDING_MEDIA_ELIDED,
     MODEL_MODULE,
+    MODEL_REQUEST_COUNT,
     MODEL_TTFT,
     OPERATION_TTFT,
     SPAN_KIND,
+    TOKEN_EXPECTED_REQUEST_COUNT,
+    TOKEN_REPORTED_REQUEST_COUNT,
+    TOKEN_TOTAL,
     VISION_BATCHES_FAILED,
     mark_model_requests,
     record_model_usage,
@@ -28,8 +36,103 @@ from mindbridge.benchmarks.eval_telemetry import (
     BENCHMARK_TASK,
     BENCHMARK_TASK_SPAN,
     DIAGNOSTIC_PURPOSE,
+    RETRIEVAL_QUALITY_PURPOSE,
     EvaluationTelemetry,
 )
+
+
+def test_telemetry_distribution_retention_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(eval_telemetry, "_MAX_RETAINED_DURATIONS", 2)
+    durations = eval_telemetry._Durations()
+    samples = eval_telemetry._Samples()
+    tokens = eval_telemetry._Tokens()
+
+    for index in range(3):
+        durations.add(
+            cast(
+                ReadableSpan,
+                SimpleNamespace(
+                    start_time=index * 10,
+                    end_time=index * 10 + 5,
+                    attributes={
+                        OPERATION_TTFT: float(index + 1),
+                        GEN_AI_TTFC: (index + 1) / 1_000,
+                    },
+                ),
+            )
+        )
+        samples.add(float(index + 1))
+        tokens.add(
+            {
+                MODEL_REQUEST_COUNT: 1,
+                TOKEN_EXPECTED_REQUEST_COUNT: 1,
+                TOKEN_REPORTED_REQUEST_COUNT: 1,
+                TOKEN_TOTAL: index + 1,
+            }
+        )
+
+    assert (
+        len(durations.durations_ns)
+        == len(durations.intervals_ns)
+        == len(durations.ttft_ms)
+        == len(durations.ttfc_ms)
+        == 2
+    )
+    assert len(samples.values) == len(tokens.exact_call_tokens) == 2
+    assert durations.latency_ms() == {
+        "count": 3,
+        "retained_count": 2,
+        "complete": False,
+        "average": 5 / 1_000_000,
+        "p50": None,
+        "p95": None,
+        "p99": None,
+    }
+    duration_seconds = cast(
+        dict[str, object], eval_telemetry._TaskTelemetry(run=durations).json(3)["duration_seconds"]
+    )
+    assert duration_seconds["mindbridge"] is None
+    assert duration_seconds["total"] is None
+    assert cast(dict[str, object], durations.ttft_json())["average"] == 2.0
+    assert cast(dict[str, object], durations.ttfc_json())["average"] == 2.0
+    assert cast(dict[str, object], durations.ttft_json())["p99"] is None
+    assert cast(dict[str, object], durations.ttfc_json())["p99"] is None
+    per_call = cast(dict[str, object], tokens.json(3)["per_call_total_tokens"])
+    assert per_call["complete"] is False
+    assert per_call["average"] == 2.0
+    assert per_call["p99"] is None
+
+
+def test_retrieval_quality_spans_are_excluded_from_product_telemetry() -> None:
+    telemetry = EvaluationTelemetry()
+    try:
+        with (
+            telemetry.tracer.start_as_current_span(
+                BENCHMARK_TASK_SPAN,
+                attributes={BENCHMARK_TASK: "fixture", SPAN_KIND: "benchmark"},
+            ),
+            telemetry.tracer.start_as_current_span(
+                "mindbridge.benchmark.retrieval_quality",
+                attributes={
+                    BENCHMARK_PURPOSE: RETRIEVAL_QUALITY_PURPOSE,
+                    SPAN_KIND: "benchmark",
+                },
+            ),
+            telemetry.tracer.start_as_current_span(
+                "mindbridge.model.embedding",
+                attributes={SPAN_KIND: "model", MODEL_MODULE: "embedding"},
+            ),
+        ):
+            record_model_usage(input_tokens=2, output_tokens=0, total_tokens=2)
+        result = telemetry.result("fixture", question_count=1)
+    finally:
+        telemetry.close()
+
+    assert result["nodes"] == {}
+    assert cast(dict[str, object], result["token_usage"])["request_count"] == 0
+    assert cast(dict[str, object], result["diagnostic"])["nodes"] == {}
 
 
 def test_evaluation_telemetry_aggregates_nodes_ttft_and_modal_tokens() -> None:
@@ -155,6 +258,7 @@ def test_component_tokens_and_incomplete_per_call_average_stay_unknown() -> None
     assert per_call == {
         "count": 2,
         "retained_count": 1,
+        "observed_count": 1,
         "complete": False,
         "average": None,
         "p50": 10.0,
@@ -287,6 +391,7 @@ def test_ttft_distribution_marks_missing_observations_incomplete() -> None:
     assert ttft == {
         "count": 2,
         "retained_count": 1,
+        "observed_count": 1,
         "complete": False,
         "average": None,
         "p50": 12.0,

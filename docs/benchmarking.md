@@ -589,18 +589,20 @@ number would measure the generator's prior knowledge of the scripts rather than 
 
 ## Reported performance and resource metrics
 
-Every task and arm row in `results.jsonl` carries a `performance` object. Distributions retain all
-observations and report count, average, p50, p95, and p99. Throughput divides successful work by
-the union of successful active intervals, so concurrency overlap is counted once and idle gaps do
-not inflate the denominator. A TTFT distribution also reports `retained_count`; when a successful
-answer has no observed first token, `complete` is false and `average` is null (the retained
-quantiles remain diagnostic only).
+Every task and arm row in `results.jsonl` carries a `performance` object. Distributions retain up to
+200,000 observations and report count, average, p50, p95, and p99. Counts and averages remain exact;
+after the retention limit, `complete` is false, quantiles and an interval union that cannot remain
+exact are null. Throughput divides successful work by the union of successful active intervals, so
+concurrency overlap is counted once and idle gaps do not inflate the denominator. TTFT and
+token-per-call distributions also report `observed_count`: their exact average remains available
+when every value was observed but only the first 200,000 values were retained; missing observations
+make the average null.
 
 | Block | Boundary and quantities |
 | --- | --- |
 | `duration_seconds` | Gap-free active wall-time unions for the product and judge phases. Its average denominator is the union of sample IDs measured in either phase, so a cached product answer judged by an uncached call is counted once. |
 | `ingest` | Attempt, success, and error counts; attempted and accepted items; durable/searchable batch latency; compute and active-wall throughput. |
-| `search_e2e` | Post-answer warm-store replay of public `Memory.search`. Its caller span starts before request admission and `sdk_operation` is the nested SDK boundary. Replay nodes and tokens remain isolated under `diagnostic`. |
+| `search_e2e` | Run-global, post-answer warm-store replay of public `Memory.search(limit=recall_limit)`. The second pass starts only after every selected task has finished its formal answers. Its caller span starts before request admission and `sdk_operation` is the nested SDK boundary. Replay nodes and tokens remain isolated under `diagnostic`. |
 | `ask_retrieval_core` | The complete retrieval prerequisite inside `Memory.ask`: content preparation, temporal/scope handling, query speech, embedding, index lookup, and ranking. |
 | `answer` | Caller end-to-end completion latency and TTFT, plus nested SDK operation latency, generation TTFT, generation first-chunk time, and throughput. |
 | `asr` | Audio duration, inference duration, call success/error counts, standard real-time factor, speedup, and latency distribution. |
@@ -659,8 +661,9 @@ publishing a range makes `cpu_package_joules` absent with that as its `reason`, 
 number nothing can correct.
 
 `search_e2e` and `ask_retrieval_core` must not be conflated. The former is a standalone,
-post-answer warm-store replay of each fresh product question through public `Memory.search`; it is
-the metric used by `retrieval_e2e_latency_p95` performance budgets. It does not claim to be the
+post-answer warm-store replay of each fresh product question through public `Memory.search`; all
+selected tasks finish their formal answers before this run-global second pass begins. It is the
+metric used by `retrieval_e2e_latency_p95` performance budgets. It does not claim to be the
 retrieval performed by the answer. `ask_retrieval_core` measures that real in-answer retrieval
 path. The old `performance.search` field remains only as a deprecated alias of
 `ask_retrieval_core`.
@@ -686,9 +689,10 @@ transcription spans while `request_count` includes those internal fallback model
 Token totals are never estimated. `complete` covers total tokens, while input, output, cached
 input, and reasoning output each have their own `*_complete` flag. An unavailable component is
 `null`, not zero; its `reported_*` field is only the known lower bound. An incomplete per-call
-distribution has `average: null` and a separately named `retained_average`. Retrieval model usage
-is reported under `diagnostic.token_usage`; it is excluded from product nodes and
-`token_usage.product`, while judge usage stays visible in the top-level total and its own module.
+distribution has a separately named `retained_average`; its exact average is null only when calls
+failed to report totals, not merely when percentile retention was capped. Post-answer replay model
+usage is reported under `diagnostic.token_usage`. The retrieval-quality scoring query is excluded
+from span and token aggregates; judge usage stays visible in the top-level total and its own module.
 
 The run-level `resources` object has two attribution scopes:
 
@@ -700,8 +704,8 @@ The run-level `resources` object has two attribution scopes:
 
 When `benchmark.server_metrics` supplies `/metrics` URLs, `resources.model_servers` records
 whitelisted vLLM counter and histogram deltas plus start/end gauges. Its window begins after the
-embedding warmup, includes product answers and the post-answer public-search replay, and ends
-before judging.
+embedding warmup, includes product answers, retrieval-quality scoring queries, and the post-answer
+public-search replay, and ends before judging.
 Those metrics are process-global and explicitly warn that shared traffic may be included. If an
 endpoint is not configured or cannot be read, the artifact says `unavailable` rather than
 inventing remote GPU or server utilization. `storage.media_share` remains the fraction of storage
@@ -733,10 +737,17 @@ quietly omitted. `performance.token_usage` also carries a `product` block: the t
 itself spent (embedding, generation, transcription, description), summed only over modules whose
 usage is complete. The console table prints those with a trailing `*` when the run total is null
 because the judge omitted usage on some requests; the cost axis needs the product number and it is
-measured. Recall scores the retriever's own ranked list, recorded per sample as
-`ranked_source_ids` from a `search` at `RETRIEVAL_CANDIDATE_LIMIT`, never the evidence the
-generator cited. New response-cache entries preserve that list; a legacy cache entry without one
-is counted in `retrieval.unranked_labelled_question_count` instead of being scored as zero.
+measured. Recall scores a dedicated public `Memory.search(limit=100)` for each gold-labelled product
+question, never the evidence the generator cited. All formal answers and the timed warm-search
+replay finish before these scoring queries start, so they cannot warm or mutate either measured
+path; their spans and tokens are excluded from product performance aggregates. A task that combines
+gold retrieval labels with causal cutoffs is rejected until the runner can provide an isolated store
+snapshot for each cutoff. The answer's own candidate depth remains separate as
+`answer_retrieval_candidate_limit` in arm provenance. The random arm requests 100 for gold-labelled
+questions and `recall_limit` otherwise. Each sample's `retrieval_candidates` records how many ranked
+hits the scoring search actually returned. New response-cache entries preserve the ranked IDs; a
+legacy cache entry without one is counted in
+`retrieval.unranked_labelled_question_count` instead of being scored as zero.
 
 ## Gold evidence per benchmark family
 
@@ -837,13 +848,16 @@ Three result fields carry a caveat that decides whether they can be quoted:
   too, the same way the `[source_id: ...]` marker the runner prefixes to every stored memory is
   part of what the full-text index sees.
 - **`retrieval_*` scores the retriever's ranked candidate list, not the answer's evidence.** The
-  runner takes the top `retrieval_candidate_limit` (100) hits in score order through `search`, so
-  a miss there is a retrieval failure. What the answer actually grounded on is separate:
+  runner issues a dedicated public top-100 search after all formal answers and the timed warm-search
+  replay. The artifact records this fixed limit, and `retrieval_candidates` records the actual
+  returned count for each sample. A miss there is a retrieval failure. What the answer actually
+  grounded on is separate:
   `evidence` is the answer's hits, and `dropped_hits` counts what the answerer's inline context
   budget removed. A gold that is in the candidate list but not in `evidence` is budget loss, not
-  retrieval loss. Current response-cache entries retain the ranked candidate IDs; legacy entries
-  that predate that field report the retrieval metric as unranked. `ref_at_300` stays a property of
-  the answer's evidence.
+  retrieval loss. The scoring query is outside answer latency and span/token aggregates but inside
+  the non-exclusive client/server resource window. Current response-cache entries retain the
+  ranked candidate IDs; legacy entries that predate that field report the retrieval metric as
+  unranked. `ref_at_300` stays a property of the answer's evidence.
 
 `performance` is aggregated separately for each task and arm, and each task row carries only the
 measurements attributed to its own arm.

@@ -63,7 +63,6 @@ from mindbridge._telemetry import (
     SPAN_KIND,
     TRACER_NAME,
     VISION_BATCHES_FAILED,
-    _record_retrieval_results,
     current_model_request_count,
     mark_model_requests,
     model_span,
@@ -569,6 +568,10 @@ class _PreparedMemory:
     # only an `ObservationContext` has one: a formed record's `MemoryContext` deliberately has no
     # place, so formation sets this from the observation it was formed from.
     place_id: str | None = None
+    # Releases before place-scoped identity included `place_id` in the content address. Kept only
+    # long enough to reuse an existing row from such a store; newly written rows always use the
+    # current ID, so two otherwise equal observations in different places remain distinct.
+    legacy_memory_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -1097,6 +1100,15 @@ class Memory:
                 memory_type=memory_type,
                 context=context,
             )
+            if prepared.legacy_memory_id is not None:
+                with (
+                    self._trace("mindbridge.storage.lookup", kind="stage"),
+                    _translate_storage_errors("check existing memory"),
+                ):
+                    candidates = self._store.read_memories(
+                        (prepared.memory_id, prepared.legacy_memory_id)
+                    )
+                prepared = _resolve_prepared_memory_ids((prepared,), candidates)[0]
             # Reject here what `add()` would reject, before the commit. Committing media no
             # configured model can ever take would make the record durable and then fail every
             # `settle()` forever, which is a queue entry no retry ceiling should have to absorb.
@@ -1602,7 +1614,6 @@ class Memory:
                     if speech_assets:
                         self._recognize_speech(speech_assets, assets)
                     hits = prepared_search().hits
-            _record_retrieval_results(hits)
             hits = _grounding_hits(hits, limit, budget_chars=self._evidence_budget)
             # Every question the answerer reads as text gets the reference time, not just the ones
             # whose phrasing a parser recognized. "How long ago did grandpa visit?" narrows no
@@ -4078,14 +4089,29 @@ class Memory:
         *,
         operation: _OperationAssets,
     ) -> tuple[MemoryRecord, ...]:
-        unique = {memory.memory_id: memory for memory in prepared}
-        ordered_ids = tuple(unique)
+        lookup_ids = tuple(
+            dict.fromkeys(
+                candidate
+                for memory in prepared
+                for candidate in (memory.memory_id, memory.legacy_memory_id)
+                if candidate is not None
+            )
+        )
         with (
             self._trace("mindbridge.storage.lookup", kind="stage"),
             _translate_storage_errors("check existing memories"),
         ):
-            existing_rows = self._store.read_memories(ordered_ids)
-        existing_ids = {row.memory_id for row in existing_rows}
+            candidates = self._store.read_memories(lookup_ids)
+        prepared = _resolve_prepared_memory_ids(prepared, candidates)
+        unique = {memory.memory_id: memory for memory in prepared}
+        ordered_ids = tuple(unique)
+        candidates_by_id = {row.memory_id: row for row in candidates}
+        existing_rows = tuple(
+            candidates_by_id[memory_id]
+            for memory_id in ordered_ids
+            if memory_id in candidates_by_id
+        )
+        existing_ids = set(candidates_by_id) & set(ordered_ids)
         missing = [unique[memory_id] for memory_id in ordered_ids if memory_id not in existing_ids]
         # Settled before this write takes its own speech-index guard: the two batches are
         # independent, and nesting the guards would share one rollback list between them.
@@ -8400,19 +8426,21 @@ def _prepare_memory(
         identity["occurred_end"] = _datetime_text(normalized_occurred_end)
     if normalized_memory_type is not MemoryType.SEMANTIC:
         identity["memory_type"] = normalized_memory_type.value
+    legacy_memory_id: str | None = None
     if context is not None:
         if not isinstance(context, ObservationContext):
             raise ValidationError("context must be an ObservationContext")
-        identity["context"] = _observation_context_identity(context)
-    payload = json.dumps(
-        identity,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+        context_identity = _observation_context_identity(context)
+        identity["context"] = context_identity
+        if context.place_id is not None:
+            legacy_identity = dict(identity)
+            legacy_identity["context"] = {
+                key: value for key, value in context_identity.items() if key != "place_id"
+            }
+            legacy_memory_id = _observation_memory_id(legacy_identity)
+    memory_id = _observation_memory_id(identity)
     return _PreparedMemory(
-        memory_id=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        memory_id=memory_id,
         content=content,
         metadata_json=metadata_json,
         occurred_at=normalized_occurred_at,
@@ -8420,6 +8448,35 @@ def _prepare_memory(
         memory_type=normalized_memory_type,
         context=context,
         place_id=None if context is None else context.place_id,
+        legacy_memory_id=(legacy_memory_id if legacy_memory_id != memory_id else None),
+    )
+
+
+def _observation_memory_id(identity: Mapping[str, object]) -> str:
+    payload = json.dumps(
+        identity,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _resolve_prepared_memory_ids(
+    prepared: Sequence[_PreparedMemory],
+    candidates: Sequence[StoredMemory],
+) -> tuple[_PreparedMemory, ...]:
+    """Prefer current IDs, falling back only to an old row from the same explicit place."""
+    existing = {memory.memory_id: memory for memory in candidates}
+    return tuple(
+        replace(memory, memory_id=legacy_id, legacy_memory_id=None)
+        if memory.memory_id not in existing
+        and (legacy_id := memory.legacy_memory_id) is not None
+        and (legacy := existing.get(legacy_id)) is not None
+        and legacy.place_id == memory.place_id
+        else memory
+        for memory in prepared
     )
 
 

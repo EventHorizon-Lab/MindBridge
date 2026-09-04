@@ -37,7 +37,6 @@ from mindbridge._telemetry import (
     TOKEN_EXPECTED_REQUEST_COUNT,
     TOKEN_REPORTED_REQUEST_COUNT,
     TOKEN_TOTAL,
-    _observe_retrieval_results,
     mark_model_requests,
     record_model_usage,
     record_unmetered_model_usage,
@@ -515,6 +514,58 @@ def test_crud_search_ask_and_stable_duplicate(tmp_path: Path) -> None:
 
     assert models.closed is True
     assert models.close_calls == 1
+
+
+@pytest.mark.parametrize("write_method", ("add", "capture"))
+def test_legacy_placed_memory_keeps_its_id_without_crossing_places(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_method: str,
+) -> None:
+    context = ObservationContext(place_id="kitchen")
+    current_identity = memory_module._observation_context_identity
+
+    def legacy_identity(value: ObservationContext) -> dict[str, object]:
+        identity = current_identity(value)
+        identity.pop("place_id", None)
+        return identity
+
+    with monkeypatch.context() as legacy:
+        legacy.setattr(memory_module, "_observation_context_identity", legacy_identity)
+        with _memory(tmp_path, _FakeModels()) as memory:
+            original = getattr(memory, write_method)("red toolbox", context=context)
+            if write_method == "capture":
+                assert memory.settle() == 1
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        duplicate = getattr(memory, write_method)("red toolbox", context=context)
+        other = getattr(memory, write_method)(
+            "red toolbox",
+            context=ObservationContext(place_id="garage"),
+        )
+        if write_method == "capture":
+            assert memory.settle() == 1
+        assert duplicate.id == original.id
+        assert other.id != original.id
+        assert memory.get(original.id).place_id == "kitchen"
+        assert memory.get(other.id).place_id == "garage"
+        assert [
+            hit.id
+            for hit in memory.search(
+                "red toolbox",
+                scope=RetrievalScope(place_id="kitchen"),
+            )
+        ] == [original.id]
+        assert [
+            hit.id
+            for hit in memory.search(
+                "red toolbox",
+                scope=RetrievalScope(place_id="garage"),
+            )
+        ] == [other.id]
+        assert memory.delete(original.id) is True
+        with pytest.raises(MemoryNotFoundError):
+            memory.get(original.id)
 
 
 def test_memory_traces_end_to_end_stages_and_streaming_ttft(tmp_path: Path) -> None:
@@ -5472,27 +5523,6 @@ async def test_async_ask_stream_yields_the_same_chunks_as_the_sync_stream(tmp_pa
         assert final is not None
         assert "".join(deltas) == final.answer
         assert (await memory.ask("where is the red toolbox?")).answer == final.answer
-
-
-@pytest.mark.asyncio
-async def test_async_ask_stream_exposes_its_pre_grounding_ranking_to_an_observer(
-    tmp_path: Path,
-) -> None:
-    models = _CountingStreamer()
-    observed: list[object] = []
-    async with AsyncMemory(tmp_path, embedder=models, answerer=models) as memory:
-        await memory.add("the red toolbox is on the bench")
-        await memory.add("the blue crate is in bay three")
-
-        with _observe_retrieval_results(observed.append):
-            chunks = [chunk async for chunk in memory.ask_stream("where is the toolbox?")]
-
-    assert len(observed) == 1
-    ranking = cast(tuple[SearchHit, ...], observed[0])
-    result = next(chunk.result for chunk in chunks if chunk.result is not None)
-    assert ranking
-    assert result is not None
-    assert result.hits == ranking[:1]
 
 
 @pytest.mark.asyncio

@@ -85,6 +85,7 @@ DEFAULT_BENCHMARK_ARM = "mindbridge"
 SHARED_BENCHMARK_ARM = "shared"
 PRODUCT_PURPOSE = "product"
 DIAGNOSTIC_PURPOSE = "diagnostic"
+RETRIEVAL_QUALITY_PURPOSE = "retrieval_quality"
 JUDGE_PURPOSE = "judge"
 
 ANSWER_SPAN = "mindbridge.ask"
@@ -101,6 +102,9 @@ JUDGE_MODULE = "judge"
 _GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
 _MODEL_BATCH_SIZE = "mindbridge.model.batch_size"
 _INPUT_MODALITIES = "mindbridge.input.modalities"
+
+# ponytail: aggregates stay exact; only quantile samples and active-time intervals are capped.
+_MAX_RETAINED_DURATIONS = 200_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +123,7 @@ class _Durations:
     ttft_total_ms: float = 0.0
     ttfc_count: int = 0
     ttfc_total_ms: float = 0.0
+    interval_count: int = 0
     durations_ns: list[int] = field(default_factory=list)
     ttft_ms: list[float] = field(default_factory=list)
     ttfc_ms: list[float] = field(default_factory=list)
@@ -130,9 +135,12 @@ class _Durations:
         self.count += 1
         duration_ns = _duration_ns(span)
         self.total_ns += duration_ns
-        self.durations_ns.append(duration_ns)
+        if len(self.durations_ns) < _MAX_RETAINED_DURATIONS:
+            self.durations_ns.append(duration_ns)
         if span.start_time is not None and span.end_time is not None:
-            self.intervals_ns.append((span.start_time, max(span.start_time, span.end_time)))
+            self.interval_count += 1
+            if len(self.intervals_ns) < _MAX_RETAINED_DURATIONS:
+                self.intervals_ns.append((span.start_time, max(span.start_time, span.end_time)))
             self.first_start_ns = (
                 span.start_time
                 if self.first_start_ns is None
@@ -152,13 +160,15 @@ class _Durations:
         if ttft is not None:
             self.ttft_count += 1
             self.ttft_total_ms += ttft
-            self.ttft_ms.append(ttft)
+            if len(self.ttft_ms) < _MAX_RETAINED_DURATIONS:
+                self.ttft_ms.append(ttft)
         ttfc = _float_attribute(attributes, GEN_AI_TTFC)
         if ttfc is not None:
             self.ttfc_count += 1
             ttfc_ms = ttfc * 1_000
             self.ttfc_total_ms += ttfc_ms
-            self.ttfc_ms.append(ttfc_ms)
+            if len(self.ttfc_ms) < _MAX_RETAINED_DURATIONS:
+                self.ttfc_ms.append(ttfc_ms)
 
     def wall_seconds(self) -> float | None:
         """Return the elapsed time from the first span start to the last span end."""
@@ -168,11 +178,12 @@ class _Durations:
 
     def active_seconds(self) -> float | None:
         """Return the union of retained span intervals, excluding gaps and overlap."""
-        if not self.intervals_ns:
+        if not self.intervals_ns or len(self.intervals_ns) != self.interval_count:
             return None
-        start, end = sorted(self.intervals_ns)[0]
+        intervals = sorted(self.intervals_ns)
+        start, end = intervals[0]
         active_ns = 0
-        for next_start, next_end in sorted(self.intervals_ns)[1:]:
+        for next_start, next_end in intervals[1:]:
             if next_start <= end:
                 end = max(end, next_end)
                 continue
@@ -181,7 +192,7 @@ class _Durations:
         return (active_ns + end - start) / 1_000_000_000
 
     def latency_ms(self) -> dict[str, object]:
-        """Return exact quantiles over the retained per-span durations."""
+        """Return exact aggregates, omitting quantiles if retention was capped."""
         return _distribution_json(
             tuple(value / 1_000_000 for value in self.durations_ns),
             total_count=self.count,
@@ -194,6 +205,7 @@ class _Durations:
         return _observed_distribution_json(
             self.ttft_ms,
             total_count=self.count,
+            observed_count=self.ttft_count,
             total=self.ttft_total_ms,
         )
 
@@ -203,6 +215,7 @@ class _Durations:
         return _observed_distribution_json(
             self.ttfc_ms,
             total_count=self.count,
+            observed_count=self.ttfc_count,
             total=self.ttfc_total_ms,
         )
 
@@ -228,21 +241,20 @@ class _Durations:
 
 @dataclass(slots=True)
 class _Samples:
-    """Scalar observations retained in full for unbiased exact percentiles."""
+    """Scalar observations with exact totals and bounded quantile retention."""
 
+    count: int = 0
+    total: float = 0.0
     values: list[float] = field(default_factory=list)
 
     def add(self, value: float) -> None:
-        self.values.append(value)
+        self.count += 1
+        self.total += value
+        if len(self.values) < _MAX_RETAINED_DURATIONS:
+            self.values.append(value)
 
     def json(self) -> dict[str, object]:
-        return {
-            "count": len(self.values),
-            "average": None if not self.values else sum(self.values) / len(self.values),
-            "p50": percentile(self.values, 0.50),
-            "p95": percentile(self.values, 0.95),
-            "p99": percentile(self.values, 0.99),
-        }
+        return _distribution_json(self.values, total_count=self.count, total=self.total)
 
 
 @dataclass(slots=True)
@@ -265,6 +277,8 @@ class _Tokens:
     cached_input_complete: bool = True
     reasoning_output_complete: bool = True
     audio_seconds: float = 0.0
+    exact_call_token_count: int = 0
+    exact_call_token_total: float = 0.0
     exact_call_tokens: list[float] = field(default_factory=list)
     calls_by_input_modality: dict[str, int] = field(default_factory=dict)
     input_by_modality: dict[str, int] = field(default_factory=dict)
@@ -332,7 +346,10 @@ class _Tokens:
         # A distribution is exact only when one traced call represents one provider request.
         # Batched totals stay in the aggregate and make this distribution explicitly incomplete.
         if requests == expected == reported == 1 and resolved_total is not None:
-            self.exact_call_tokens.append(float(resolved_total))
+            self.exact_call_token_count += 1
+            self.exact_call_token_total += resolved_total
+            if len(self.exact_call_tokens) < _MAX_RETAINED_DURATIONS:
+                self.exact_call_tokens.append(float(resolved_total))
         self.audio_seconds += _float_attribute(attributes, TOKEN_AUDIO_SECONDS) or 0.0
         requested = attributes.get("mindbridge.input.modalities")
         if isinstance(requested, tuple) and all(isinstance(value, str) for value in requested):
@@ -363,16 +380,19 @@ class _Tokens:
         )
         per_call: dict[str, object] | None = None
         if self.expected_request_count:
-            exact_total = sum(self.exact_call_tokens)
             per_call = _distribution_json(
                 self.exact_call_tokens,
                 total_count=self.expected_request_count,
-                total=exact_total,
+                total=self.exact_call_token_total,
+                observed_count=self.exact_call_token_count,
             )
+            per_call["observed_count"] = self.exact_call_token_count
             per_call["retained_average"] = (
-                None if not self.exact_call_tokens else exact_total / len(self.exact_call_tokens)
+                None
+                if not self.exact_call_tokens
+                else sum(self.exact_call_tokens) / len(self.exact_call_tokens)
             )
-            if not per_call["complete"]:
+            if self.exact_call_token_count != self.expected_request_count:
                 per_call["average"] = None
         modality_complete = (
             complete
@@ -456,7 +476,11 @@ class _Tokens:
         self.cached_input_complete &= other.cached_input_complete
         self.reasoning_output_complete &= other.reasoning_output_complete
         self.audio_seconds += other.audio_seconds
-        self.exact_call_tokens.extend(other.exact_call_tokens)
+        self.exact_call_token_count += other.exact_call_token_count
+        self.exact_call_token_total += other.exact_call_token_total
+        retained = _MAX_RETAINED_DURATIONS - len(self.exact_call_tokens)
+        if retained > 0:
+            self.exact_call_tokens.extend(other.exact_call_tokens[:retained])
         for source, target in (
             (other.calls_by_input_modality, self.calls_by_input_modality),
             (other.input_by_modality, self.input_by_modality),
@@ -581,6 +605,9 @@ class _TaskTelemetry:
         attributes = span.attributes or {}
         status = _span_status(span)
         purpose = _string_attribute(attributes, BENCHMARK_PURPOSE) or PRODUCT_PURPOSE
+        if purpose == RETRIEVAL_QUALITY_PURPOSE:
+            # This harness-only scoring query is neither product work nor the timed warm replay.
+            return
         diagnostic = purpose == DIAGNOSTIC_PURPOSE
         if span.name == BENCHMARK_ANSWER_SPAN and not diagnostic:
             self.caller_answers.add(span)
@@ -911,9 +938,15 @@ class _TaskTelemetry:
         return result
 
     def json(self, question_count: int) -> dict[str, object]:
-        run_seconds = self.run.active_seconds() or 0.0
-        judge_seconds = self.judge.active_seconds() or 0.0
-        total_seconds = run_seconds + judge_seconds
+        run_seconds = self.run.active_seconds()
+        judge_seconds = self.judge.active_seconds()
+        if not self.run.interval_count:
+            run_seconds = 0.0
+        if not self.judge.interval_count:
+            judge_seconds = 0.0
+        total_seconds = (
+            None if run_seconds is None or judge_seconds is None else run_seconds + judge_seconds
+        )
         judge_question_count = len(self.judge_samples)
         measured_samples = self.product_samples | self.judge_samples
         average_denominator = len(measured_samples) or question_count or None
@@ -950,15 +983,21 @@ class _TaskTelemetry:
                 "average_denominator_question_count": average_denominator,
                 "total": total_seconds,
                 "average": (
-                    None if average_denominator is None else total_seconds / average_denominator
+                    None
+                    if average_denominator is None or total_seconds is None
+                    else total_seconds / average_denominator
                 ),
                 "mindbridge": run_seconds,
                 "judge": judge_seconds,
                 "mindbridge_average": (
-                    None if not question_count else run_seconds / question_count
+                    None
+                    if not question_count or run_seconds is None
+                    else run_seconds / question_count
                 ),
                 "judge_average": (
-                    None if not judge_question_count else judge_seconds / judge_question_count
+                    None
+                    if not judge_question_count or judge_seconds is None
+                    else judge_seconds / judge_question_count
                 ),
             },
             "ingest": self._ingest_json(),
@@ -1037,7 +1076,7 @@ class EvaluationTelemetry(SpanProcessor):
     def __init__(self) -> None:
         self._lock = Lock()
         self._span_scopes: dict[int, _SpanScope] = {}
-        self._samples: dict[str, _TaskTelemetry] = {}
+        self._samples: dict[str, SampleGrounding] = {}
         self._tasks: dict[tuple[str, str], _TaskTelemetry] = {}
         self._provider = TracerProvider()
         self._provider.add_span_processor(self)
@@ -1109,7 +1148,18 @@ class EvaluationTelemetry(SpanProcessor):
                 selected_arm = arm or DEFAULT_BENCHMARK_ARM
                 self._tasks.setdefault((task, selected_arm), _TaskTelemetry()).add(span)
             if sample is not None:
-                self._samples.setdefault(sample, _TaskTelemetry()).add(span)
+                grounding = self._samples.get(sample, SampleGrounding(0, 0))
+                if (
+                    _string_attribute(attributes, SPAN_KIND) == "model"
+                    and _int_attribute(attributes, MODEL_REQUEST_COUNT) != 0
+                ):
+                    grounding = SampleGrounding(
+                        dropped_hits=grounding.dropped_hits
+                        + (_int_attribute(attributes, GROUNDING_HITS_DROPPED) or 0),
+                        media_elided_hits=grounding.media_elided_hits
+                        + (_int_attribute(attributes, GROUNDING_MEDIA_ELIDED) or 0),
+                    )
+                self._samples[sample] = grounding
 
     def result(
         self,
@@ -1130,13 +1180,7 @@ class EvaluationTelemetry(SpanProcessor):
     def sample_grounding(self, sample_id: str) -> SampleGrounding | None:
         """Return one answer's budget loss, or None when no answer span was recorded."""
         with self._lock:
-            values = self._samples.get(sample_id)
-        if values is None:
-            return None
-        return SampleGrounding(
-            dropped_hits=values.dropped_hits,
-            media_elided_hits=values.media_elided_hits,
-        )
+            return self._samples.get(sample_id)
 
     def shutdown(self) -> None:
         """Release the private provider; aggregation itself has no exporter."""
@@ -1192,25 +1236,36 @@ def _distribution_json(
     *,
     total_count: int,
     total: float,
+    observed_count: int | None = None,
 ) -> dict[str, object]:
-    retained = tuple(values)
+    retained_count = len(values)
+    quantiles_complete = retained_count == (
+        total_count if observed_count is None else observed_count
+    )
+    retained = tuple(sorted(values)) if quantiles_complete else ()
     return {
         "count": total_count,
-        "retained_count": len(retained),
-        "complete": total_count == len(retained),
+        "retained_count": retained_count,
+        "complete": total_count == retained_count,
         "average": None if not total_count else total / total_count,
-        "p50": percentile(retained, 0.50),
-        "p95": percentile(retained, 0.95),
-        "p99": percentile(retained, 0.99),
+        "p50": percentile(retained, 0.50, presorted=True),
+        "p95": percentile(retained, 0.95, presorted=True),
+        "p99": percentile(retained, 0.99, presorted=True),
     }
 
 
 def _observed_distribution_json(
-    values: Sequence[float], *, total_count: int, total: float
+    values: Sequence[float], *, total_count: int, observed_count: int, total: float
 ) -> dict[str, object]:
-    result = _distribution_json(values, total_count=total_count, total=total)
-    result["retained_average"] = None if not values else total / len(values)
-    if not result["complete"]:
+    result = _distribution_json(
+        values,
+        total_count=total_count,
+        total=total,
+        observed_count=observed_count,
+    )
+    result["observed_count"] = observed_count
+    result["retained_average"] = None if not values else sum(values) / len(values)
+    if observed_count != total_count:
         result["average"] = None
     return result
 
@@ -1402,7 +1457,7 @@ class ResourceSampler:
         return {
             "measurement": {
                 "scope": "client_process_and_system_devices",
-                "phase": "product_execution_including_post_answer_search_replay",
+                "phase": "product_execution_including_retrieval_quality_and_search_replay",
                 "exclusive_attribution": False,
                 "wall_seconds": measured_wall_seconds,
                 "storage_scope": "selected_run_directories",

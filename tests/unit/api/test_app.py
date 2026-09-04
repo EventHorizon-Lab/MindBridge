@@ -22,6 +22,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 from starlette.requests import Request
+from starlette.types import Message, Scope
 
 import mindbridge
 from mindbridge.api import app as app_module
@@ -721,6 +722,71 @@ def test_answer_stream_failure_after_a_delta_ends_with_an_error_event() -> None:
     )
     assert span.status.status_code is StatusCode.ERROR
     assert not span.events
+
+
+@pytest.mark.parametrize("failed_message", ["http.response.start", "http.response.body"])
+@pytest.mark.asyncio
+async def test_answer_stream_closes_after_the_transport_send_fails(
+    failed_message: str,
+) -> None:
+    closed = Event()
+
+    class CloseTrackedMemory(FakeMemory):
+        def ask_stream(
+            self,
+            question: ContentInput,
+            *,
+            limit: int = 5,
+            memory_type: MemoryType | None = None,
+            reference_at: datetime | None = None,
+            scope: RetrievalScope | None = None,
+            link_identities: bool = True,
+        ) -> Generator[AnswerChunk, None, AnswerResult]:
+            del question, limit, memory_type, reference_at, scope, link_identities
+            result = AnswerResult(answer="answer")
+            try:
+                yield AnswerChunk(text="answer")
+                yield AnswerChunk(result=result)
+                return result
+            finally:
+                closed.set()
+
+    app = create_app(memory=CloseTrackedMemory())
+    endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if isinstance(route, APIRoute) and route.path == "/v1/answers/stream"
+    )
+    never_disconnect = asyncio.Event()
+
+    async def receive() -> Message:
+        await never_disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/v1/answers/stream", "headers": []},
+        receive,
+    )
+    response = await endpoint(app_module.AnswerRequest(question="Where is it?"), request)
+
+    async def send(message: Message) -> None:
+        if message["type"] == failed_message:
+            raise RuntimeError("transport send failed")
+
+    response_scope = cast(
+        Scope,
+        {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "method": "POST",
+            "path": "/v1/answers/stream",
+            "headers": [],
+        },
+    )
+    with pytest.raises(RuntimeError, match="transport send failed"):
+        await response(response_scope, receive, send)
+
+    assert await asyncio.to_thread(closed.wait, 0.5)
 
 
 @pytest.mark.asyncio

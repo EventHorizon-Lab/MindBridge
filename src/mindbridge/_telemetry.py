@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager, suppress
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from threading import Lock
@@ -76,6 +76,10 @@ class _ModelUsage:
     total_tokens: int | None = None
     cached_input_tokens: int | None = None
     reasoning_output_tokens: int | None = None
+    input_complete: bool | None = None
+    output_complete: bool | None = None
+    cached_input_complete: bool | None = None
+    reasoning_output_complete: bool | None = None
     input_by_modality: Mapping[str, int] = field(default_factory=dict)
     output_by_modality: Mapping[str, int] = field(default_factory=dict)
     audio_seconds: float | None = None
@@ -125,13 +129,10 @@ class _OperationUsage:
                 self.reasoning_output_tokens += usage.reasoning_output_tokens
                 self.reasoning_output_seen = True
             if usage.expected_requests:
-                reported_all = usage.expected_requests == usage.reported_requests
-                self.input_complete &= reported_all and usage.input_tokens is not None
-                self.output_complete &= reported_all and usage.output_tokens is not None
-                self.cached_input_complete &= reported_all and usage.cached_input_tokens is not None
-                self.reasoning_output_complete &= (
-                    reported_all and usage.reasoning_output_tokens is not None
-                )
+                self.input_complete &= usage.input_complete is True
+                self.output_complete &= usage.output_complete is True
+                self.cached_input_complete &= usage.cached_input_complete is True
+                self.reasoning_output_complete &= usage.reasoning_output_complete is True
             self.total_tokens += usage.total_tokens or 0
             self.total_complete &= usage.reported_requests == 0 or usage.total_tokens is not None
             _sum_modalities(self.input_by_modality, usage.input_by_modality)
@@ -208,28 +209,6 @@ _CURRENT_OPERATION_USAGE: ContextVar[_OperationUsage | None] = ContextVar(
 _CURRENT_FORMATION_REFUSALS: ContextVar[_FormationRefusals | None] = ContextVar(
     "mindbridge_formation_refusals", default=None
 )
-_RETRIEVAL_OBSERVER: ContextVar[Callable[[object], None] | None] = ContextVar(
-    "mindbridge_retrieval_observer", default=None
-)
-
-
-@contextmanager
-def _observe_retrieval_results(observer: Callable[[object], None]) -> Iterator[None]:
-    """Let an in-process benchmark observe the ranked list an answer already computed."""
-    token = _RETRIEVAL_OBSERVER.set(observer)
-    try:
-        yield
-    finally:
-        _RETRIEVAL_OBSERVER.reset(token)
-
-
-def _record_retrieval_results(results: object) -> None:
-    observer = _RETRIEVAL_OBSERVER.get()
-    if observer is None:
-        return
-    # Observability must not change a product answer; the harness marks the missing list.
-    with suppress(Exception):
-        observer(results)
 
 
 def token_modality_attribute(direction: str, modality: str) -> str:
@@ -321,6 +300,10 @@ def mark_model_requests(count: int, *, token_usage_expected: int | None = None) 
         usage.total_tokens = None
         usage.cached_input_tokens = None
         usage.reasoning_output_tokens = None
+        usage.input_complete = None
+        usage.output_complete = None
+        usage.cached_input_complete = None
+        usage.reasoning_output_complete = None
         usage.input_by_modality = {}
         usage.output_by_modality = {}
         usage.audio_seconds = None
@@ -392,9 +375,42 @@ def record_model_usage(
     request_count: int = 1,
     expected_requests: int = 1,
     reported_requests: int = 1,
+    input_tokens_complete: bool | None = None,
+    output_tokens_complete: bool | None = None,
+    cached_input_tokens_complete: bool | None = None,
+    reasoning_output_tokens_complete: bool | None = None,
     audio_seconds: float | None = None,
 ) -> None:
     """Attach provider-reported usage to the current model span without estimation."""
+    reported_all = expected_requests == reported_requests
+    component_states = (
+        (
+            TOKEN_INPUT_COMPLETE,
+            input_tokens,
+            input_tokens_complete,
+        ),
+        (
+            TOKEN_OUTPUT_COMPLETE,
+            output_tokens,
+            output_tokens_complete,
+        ),
+        (
+            TOKEN_CACHED_INPUT_COMPLETE,
+            cached_input_tokens,
+            cached_input_tokens_complete,
+        ),
+        (
+            TOKEN_REASONING_OUTPUT_COMPLETE,
+            reasoning_output_tokens,
+            reasoning_output_tokens_complete,
+        ),
+    )
+    resolved_states = tuple(
+        explicit
+        if explicit is not None
+        else bool(expected_requests and reported_all and value is not None)
+        for _name, value, explicit in component_states
+    )
     usage = _CURRENT_MODEL_USAGE.get()
     if usage is not None:
         usage.request_count = request_count
@@ -405,6 +421,10 @@ def record_model_usage(
         usage.total_tokens = total_tokens
         usage.cached_input_tokens = cached_input_tokens
         usage.reasoning_output_tokens = reasoning_output_tokens
+        usage.input_complete = resolved_states[0]
+        usage.output_complete = resolved_states[1]
+        usage.cached_input_complete = resolved_states[2]
+        usage.reasoning_output_complete = resolved_states[3]
         usage.input_by_modality = dict(input_by_modality or {})
         usage.output_by_modality = dict(output_by_modality or {})
         usage.audio_seconds = audio_seconds
@@ -419,19 +439,8 @@ def record_model_usage(
         expected_requests == reported_requests
         and (reported_requests == 0 or total_tokens is not None),
     )
-    components = (
-        (TOKEN_INPUT_COMPLETE, input_tokens),
-        (TOKEN_OUTPUT_COMPLETE, output_tokens),
-        (TOKEN_CACHED_INPUT_COMPLETE, cached_input_tokens),
-        (TOKEN_REASONING_OUTPUT_COMPLETE, reasoning_output_tokens),
-    )
-    for name, value in components:
-        span.set_attribute(
-            name,
-            bool(
-                expected_requests and expected_requests == reported_requests and value is not None
-            ),
-        )
+    for (name, _value, _explicit), complete in zip(component_states, resolved_states, strict=True):
+        span.set_attribute(name, complete)
     if input_tokens is not None:
         span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
     if output_tokens is not None:

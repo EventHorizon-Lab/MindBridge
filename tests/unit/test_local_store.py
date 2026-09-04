@@ -169,6 +169,7 @@ def _install_legacy_identity_schema(
     connection: sqlite3.Connection,
     *,
     with_name: bool,
+    embedding_required: bool = True,
 ) -> None:
     connection.executescript(
         """
@@ -189,6 +190,7 @@ def _install_legacy_identity_schema(
         """
     )
     name_column = "name TEXT," if with_name else ""
+    centroid_column = "centroid BLOB NOT NULL," if embedding_required else "centroid BLOB,"
     connection.executescript(
         f"""
         CREATE TABLE speaker_identities (
@@ -197,7 +199,7 @@ def _install_legacy_identity_schema(
             model_id TEXT NOT NULL,
             space_id TEXT NOT NULL,
             dimension INTEGER NOT NULL,
-            centroid BLOB NOT NULL,
+            {centroid_column}
             observations INTEGER NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -412,6 +414,45 @@ def test_schema_v3_adds_optional_speaker_names(tmp_path: Path) -> None:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(identities)")}
             assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
         assert "name" in columns
+
+
+@pytest.mark.skipif(sqlite3.sqlite_version_info < (3, 35), reason="DROP COLUMN needs SQLite 3.35")
+def test_schema_v3_keeps_a_speaker_whose_legacy_embedding_is_missing(tmp_path: Path) -> None:
+    with LocalStore(tmp_path):
+        pass
+    timestamp = "2026-08-27T01:02:03.000000Z"
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        _install_legacy_identity_schema(
+            connection,
+            with_name=False,
+            embedding_required=False,
+        )
+        connection.execute(
+            """
+            INSERT INTO speaker_identities (
+                speaker_id, model_id, space_id, dimension, centroid,
+                observations, created_at, updated_at
+            ) VALUES ('speaker-without-vector', 'cam++', 'cam++:legacy', 2, NULL, 1, ?, ?)
+            """,
+            (timestamp, timestamp),
+        )
+        connection.execute("PRAGMA user_version = 3")
+        connection.commit()
+
+    with LocalStore(tmp_path) as store:
+        profile = store.identity_profile("speaker-without-vector")
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            exemplars = connection.execute(
+                "SELECT COUNT(*) FROM identity_exemplars WHERE identity_id = ?",
+                ("speaker-without-vector",),
+            ).fetchone()[0]
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
+
+    assert profile == IdentityProfile(identity_id="speaker-without-vector")
+    assert exemplars == 0
+    assert version == _SCHEMA_VERSION
+    assert foreign_keys == []
 
 
 @pytest.mark.skipif(sqlite3.sqlite_version_info < (3, 35), reason="DROP COLUMN needs SQLite 3.35")

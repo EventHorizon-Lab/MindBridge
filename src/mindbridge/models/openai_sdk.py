@@ -655,9 +655,13 @@ class OpenAIModels:
         # Video files are never uploaded by this operation. Verify the source descriptors first,
         # reject oversized source images before reading them, then enforce provider limits against
         # the image data URLs the request actually carries.
-        _require_asset_integrity(assets)
-        _require_inline_size(
-            tuple(asset for asset in assets if asset.modality is not Modality.VIDEO)
+        verified_assets = _require_asset_integrity(assets)
+        _require_verified_inline_size(
+            tuple(
+                verified
+                for verified in verified_assets
+                if verified[0].modality is not Modality.VIDEO
+            )
         )
         content = _vision_content(batch)
         _require_inline_image_size(content)
@@ -1223,9 +1227,12 @@ def _record_usage_batch(
     token_usages = tuple(usage for usage in available if usage.token_based)
     reported = tuple(usage for usage in token_usages if usage.total_tokens is not None)
     missing = request_count - len(available)
-    input_tokens = _sum_optional(token_usages, "input_tokens")
-    output_tokens = _sum_optional(token_usages, "output_tokens")
-    total_tokens = _sum_optional(reported, "total_tokens")
+    expected = len(token_usages) + missing
+    input_tokens = _sum_reported(token_usages, "input_tokens")
+    output_tokens = _sum_reported(token_usages, "output_tokens")
+    total_tokens = _sum_reported(reported, "total_tokens")
+    cached_input_tokens = _sum_reported(token_usages, "cached_input_tokens")
+    reasoning_output_tokens = _sum_reported(token_usages, "reasoning_output_tokens")
     input_by_modality = _sum_modalities(token_usages, "input_by_modality")
     output_by_modality = _sum_modalities(token_usages, "output_by_modality")
     audio_seconds = (
@@ -1238,13 +1245,21 @@ def _record_usage_batch(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
-        cached_input_tokens=_sum_optional(token_usages, "cached_input_tokens"),
-        reasoning_output_tokens=_sum_optional(token_usages, "reasoning_output_tokens"),
+        cached_input_tokens=cached_input_tokens,
+        reasoning_output_tokens=reasoning_output_tokens,
         input_by_modality=input_by_modality,
         output_by_modality=output_by_modality,
         request_count=request_count,
-        expected_requests=len(token_usages) + missing,
+        expected_requests=expected,
         reported_requests=len(reported),
+        input_tokens_complete=_component_complete(token_usages, "input_tokens", expected),
+        output_tokens_complete=_component_complete(token_usages, "output_tokens", expected),
+        cached_input_tokens_complete=_component_complete(
+            token_usages, "cached_input_tokens", expected
+        ),
+        reasoning_output_tokens_complete=_component_complete(
+            token_usages, "reasoning_output_tokens", expected
+        ),
         audio_seconds=audio_seconds or None,
     )
 
@@ -1333,12 +1348,16 @@ def _modality_tokens(
     return exact
 
 
-def _sum_optional(usages: Sequence[_ModelUsage], name: str) -> int | None:
-    values = tuple(getattr(usage, name) for usage in usages)
-    return (
-        sum(cast(tuple[int, ...], values))
-        if values and all(v is not None for v in values)
-        else None
+def _sum_reported(usages: Sequence[_ModelUsage], name: str) -> int | None:
+    values = tuple(value for usage in usages if (value := getattr(usage, name)) is not None)
+    return sum(cast(tuple[int, ...], values)) if values else None
+
+
+def _component_complete(usages: Sequence[_ModelUsage], name: str, expected: int) -> bool:
+    return bool(
+        expected
+        and len(usages) == expected
+        and all(getattr(usage, name) is not None for usage in usages)
     )
 
 
@@ -2348,8 +2367,14 @@ def _json_text(value: object) -> str:
 def _require_inline_size(
     assets: Sequence[AssetRef],
 ) -> None:
+    _require_verified_inline_size(_require_asset_integrity(assets))
+
+
+def _require_verified_inline_size(
+    assets: Sequence[tuple[AssetRef, int]],
+) -> None:
     size = 0
-    for asset, actual_size in _require_asset_integrity(assets):
+    for asset, actual_size in assets:
         encoded_size = _encoded_size(actual_size)
         if _inline_item_size(asset, actual_size) > _MAX_INLINE_MODEL_ITEM_BYTES:
             raise ModelError(

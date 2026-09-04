@@ -776,6 +776,29 @@ def test_random_ranker_expectation_is_reported_next_to_measured_recall() -> None
     assert cast(Mapping[str, object], retrieval["candidate_pool_size"])["mean"] == pytest.approx(10)
 
 
+def test_retrieval_cutoffs_use_the_actual_ask_candidate_window() -> None:
+    sample = _sample("q1", sources=("s1",), gold=("s1",), candidate_count=20)
+
+    unbudgeted = eval_module._retrieval_quality(
+        (sample,),
+        seed=7,
+        bootstrap_samples=32,
+        recall_limit=2,
+    )
+    budgeted = eval_module._retrieval_quality(
+        (sample,),
+        seed=7,
+        bootstrap_samples=32,
+        recall_limit=2,
+        retrieval_candidate_limit=eval_module.RETRIEVAL_CANDIDATE_LIMIT,
+    )
+
+    assert unbudgeted["retrieval_candidate_limit"] == 6
+    assert unbudgeted["truncated_cutoffs"] == [10, 20]
+    assert budgeted["retrieval_candidate_limit"] == eval_module.RETRIEVAL_CANDIDATE_LIMIT
+    assert budgeted["truncated_cutoffs"] == []
+
+
 def test_retrieval_quality_says_so_when_the_adapter_carries_no_gold_evidence() -> None:
     samples = (_sample("q1", sources=("s1",), gold=(), candidate_count=4),)
 
@@ -1097,15 +1120,21 @@ def test_percentile_interpolates_and_reports_nothing_for_no_observations() -> No
     assert percentile((5.0,), 0.99) == pytest.approx(5.0)
 
 
-def test_scalar_metric_samples_do_not_truncate_late_observations() -> None:
+def test_scalar_metric_samples_bound_quantiles_but_keep_exact_average(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(eval_telemetry_module, "_MAX_RETAINED_DURATIONS", 2)
     samples = eval_telemetry_module._Samples()
-    for value in range(200_001):
+    for value in range(3):
         samples.add(float(value))
 
     result = samples.json()
 
-    assert result["count"] == 200_001
-    assert result["p99"] == pytest.approx(198_000.0)
+    assert result["count"] == 3
+    assert result["retained_count"] == 2
+    assert result["complete"] is False
+    assert result["average"] == pytest.approx(1.0)
+    assert result["p50"] is result["p95"] is result["p99"] is None
 
 
 # --- reproducibility fields ------------------------------------------------------------------

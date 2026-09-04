@@ -775,8 +775,11 @@ CREATE TABLE identity_exemplars (
 INSERT INTO identity_exemplars (
     identity_id, modality, position, model_id, space_id, dimension, vector, created_at
 )
+-- A legacy name-only speaker is still authoritative identity data. Preserve its identity above,
+-- but do not invent a biometric vector merely to satisfy the new exemplar schema.
 SELECT speaker_id, 'voice', 0, model_id, space_id, dimension, centroid, created_at
-FROM speaker_identities;
+FROM speaker_identities
+WHERE centroid IS NOT NULL;
 
 CREATE INDEX identity_exemplars_space_idx
     ON identity_exemplars (modality, space_id, dimension, identity_id, position);
