@@ -1,4 +1,4 @@
-"""Regression checks for the LongMemEval, CL-Bench, BEAM, PersonaMem-v3 and OpenEQA adapters.
+"""Regression checks for dataset adapters with nontrivial official release shapes.
 
 Each case pins a shape the pinned releases actually contain and an earlier
 version of these loaders rejected or mishandled.
@@ -15,11 +15,14 @@ import pytest
 from mindbridge.benchmarks.beam import BEAM_CATEGORIES, load_beam
 from mindbridge.benchmarks.clbench import (
     OVERSIZED_QUESTION_CHARACTERS,
+    _load_clbench_selected,
     load_clbench,
     split_question,
 )
 from mindbridge.benchmarks.download import _patterns
+from mindbridge.benchmarks.eval_adapters import load_task
 from mindbridge.benchmarks.longmemeval import load_longmemeval
+from mindbridge.benchmarks.memlens import load_memlens
 from mindbridge.benchmarks.openeqa import OPENEQA_SPLITS, episode_frames, load_openeqa
 from mindbridge.benchmarks.personamem_v3 import (
     load_personamem_v3,
@@ -116,6 +119,34 @@ def test_longmemeval_reads_dates_without_a_locale_and_flags_abstention(tmp_path:
         load_longmemeval(bad)
 
 
+def test_memlens_reads_direct_and_data_wrapped_releases_without_changing_root_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = {
+        "question_id": "q1",
+        "question_type": "preference",
+        "question": "What is my favorite color?",
+        "answer": "Blue.",
+        "question_date": "2025/01/15 (Wed) 10:00",
+        "haystack_dates": ["2025/01/14 (Tue) 09:00"],
+        "haystack_sessions": [[{"role": "user", "content": "It is blue."}]],
+    }
+    direct_path = _write(tmp_path / "direct.json", [record])
+    wrapped = load_memlens(_write(tmp_path / "wrapped.json", {"data": [record]}))
+    invalid = _write(tmp_path / "invalid.json", {"questions": [record]})
+
+    with pytest.raises(
+        ValueError, match="MEMLENS dataset root must be a list or contain a data list"
+    ):
+        load_memlens(invalid)
+
+    def fail_stdlib_parse(_payload: object) -> object:
+        raise AssertionError("direct MEMLENS lists must use Pydantic's JSON parser")
+
+    monkeypatch.setattr(json, "loads", fail_stdlib_parse)
+    assert load_memlens(direct_path) == wrapped
+
+
 def test_clbench_splits_the_question_off_its_reference_document(tmp_path: Path) -> None:
     document = "PARA ONE\n\nPARA TWO"
     records = [
@@ -166,6 +197,40 @@ def test_clbench_splits_the_question_off_its_reference_document(tmp_path: Path) 
     assert [turn.content for turn in first.turns] == ["PARA\u2028ONE\n\nPARA TWO"]
     assert tasks["t2"].question_unsliced is True
     assert split_question("only one paragraph") == ("", "only one paragraph", False)
+
+
+def test_clbench_finite_slice_only_parses_selected_jsonl_records(tmp_path: Path) -> None:
+    def record(task_id: str) -> dict[str, object]:
+        return {
+            "messages": [{"role": "user", "content": f"Question {task_id}?"}],
+            "rubrics": ["Answer it."],
+            "metadata": {
+                "task_id": task_id,
+                "context_id": "context",
+                "context_category": "category",
+                "sub_category": "subcategory",
+            },
+        }
+
+    dataset = tmp_path / "CL-bench.jsonl"
+    dataset.write_text(
+        "\n".join((json.dumps(record("skip")), json.dumps(record("keep")), "invalid")),
+        encoding="utf-8",
+    )
+
+    selected = _load_clbench_selected(dataset, 1, 1)
+
+    assert tuple(task.task_id for task in selected) == ("keep",)
+    with pytest.raises(ValueError):
+        load_clbench(dataset)
+    with pytest.raises(ValueError):
+        load_task(
+            TASKS["clbench"],
+            root=tmp_path,
+            dataset_path=dataset,
+            limit=1,
+            verify_digest=False,
+        )
 
 
 def test_beam_flattens_the_ten_million_tier_and_resolves_each_reference_key(

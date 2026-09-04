@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -35,7 +36,7 @@ from mindbridge.types import (
     SpeakerSegment,
 )
 
-_SCHEMA_VERSION = 15
+_SCHEMA_VERSION = 16
 # `visual_descriptions` is no longer the newest step, so this is pinned to its own literal as the
 # comment that introduced it instructed: a v12 store is the one that step still has to migrate.
 _PRE_VISUAL_DESCRIPTION_VERSION = 12
@@ -1075,6 +1076,9 @@ class StoredOperation:
     operation_id: int = 0
     created_ids: tuple[str, ...] = ()
     changed_ids: tuple[str, ...] = ()
+    # Existing deterministic records whose retired version this operation restated. Rollback
+    # retires this operation's new version without pretending the physical record was created.
+    activated_ids: tuple[str, ...] = ()
     # Records this operation moved out of ordinary recall, whether as a FORGET intent or as the
     # consolidation forgetting a CONSOLIDATE carried. Rollback clears exactly these.
     forgotten_ids: tuple[str, ...] = ()
@@ -1101,7 +1105,7 @@ class StoredOperation:
             _require_aware(self.rolled_back_at, "rolled_back_at")
         if self.operation_id < 0:
             raise ValueError("operation_id must not be negative")
-        for name in ("created_ids", "changed_ids", "forgotten_ids"):
+        for name in ("created_ids", "changed_ids", "activated_ids", "forgotten_ids"):
             for memory_id in getattr(self, name):
                 _require_identifier(memory_id, name)
         for memory_id, source_memory_id in self.linked:
@@ -1520,12 +1524,13 @@ class LocalStore:
                         (
                             *(batch or ()),
                             *(() if max_attempts is None else (max_attempts,)),
-                            limit - len(queued),
+                            limit,
                         ),
                     ).fetchall()
                 )
-                if len(queued) >= limit:
-                    break
+        # Each chunk is only oldest-first within itself. Merge the chunks so an old ID beyond
+        # SQLite's parameter limit cannot be starved by newer IDs in the first chunk.
+        queued.sort(key=lambda row: (row.enqueued_at, row.memory_id))
         return tuple(queued[:limit])
 
     def read_consolidation_candidates(
@@ -1714,7 +1719,7 @@ class LocalStore:
             )
         return cursor.rowcount > 0
 
-    def apply_formation(
+    def apply_formation(  # noqa: C901 - one atomic formation transaction
         self,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding],
@@ -1728,6 +1733,9 @@ class LocalStore:
         forget_ids: Sequence[str] = (),
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
+        projection_identity_id: str | None = None,
+        projection_memories: Iterable[StoredMemory] = (),
+        projection_embeddings: Iterable[StoredEmbedding] = (),
     ) -> bool:
         """Commit derived records, evidence, and source completion in one transaction.
 
@@ -1755,6 +1763,14 @@ class LocalStore:
             memories,
             embeddings,
         )
+        projected_memories, projected_embeddings, projected_by_memory = _prepare_write_batch(
+            projection_memories,
+            projection_embeddings,
+        )
+        if projection_identity_id is not None:
+            _require_identifier(projection_identity_id, "projection_identity_id")
+        elif projected_memories:
+            raise ValueError("projection memories require projection_identity_id")
         sources = tuple(dict.fromkeys(source_memory_ids))
         _require_identifier(recipe, "recipe")
         _require_aware(completed_at, "completed_at")
@@ -1782,6 +1798,19 @@ class LocalStore:
                 for source_memory_id in sources
             ):
                 return False
+            # `_write_memory` can attach a new record's context evidence before the explicit
+            # evidence loop. Measure standing links first so the operation still records every
+            # link it created and rollback can retire it.
+            already_linked = {
+                (memory_id, source_memory_id)
+                for memory_id, source_memory_id, _confidence in evidence
+                if _memory_evidence_linked(connection, memory_id, source_memory_id)
+            }
+            activated = tuple(
+                memory.memory_id
+                for memory in supplied_memories
+                if memory.context is not None and _version_retired(connection, memory.memory_id)
+            )
             transaction_memory_ids: set[str] = set()
             superseded: list[tuple[str, int]] = []
             for memory in supplied_memories:
@@ -1815,13 +1844,16 @@ class LocalStore:
                 self._write_embedding(connection, embedding)
             linked: list[tuple[str, str]] = []
             for memory_id, source_memory_id, confidence in evidence:
-                if _add_memory_evidence(
+                _add_memory_evidence(
                     connection,
                     memory_id,
                     source_memory_id,
                     confidence=confidence,
                     recorded_at=completed_at,
-                ):
+                )
+                pair = (memory_id, source_memory_id)
+                if pair not in already_linked:
+                    already_linked.add(pair)
                     linked.append((memory_id, source_memory_id))
             _refresh_multi_source_projections(
                 connection,
@@ -1833,6 +1865,17 @@ class LocalStore:
                 tuple(memory.memory_id for memory in supplied_memories)
                 + tuple(memory_id for memory_id, _source, _confidence in evidence),
             )
+            if projection_identity_id is not None:
+                if _resolve_identity_id(connection, projection_identity_id) is None:
+                    raise StaleOperationError(
+                        f"{projection_identity_id} is no longer an active identity"
+                    )
+                self._replace_memory_embeddings(
+                    connection,
+                    projected_memories,
+                    projected_embeddings,
+                    projected_by_memory,
+                )
             connection.executemany(
                 """
                 INSERT INTO formation_runs (source_memory_id, recipe, completed_at)
@@ -1849,6 +1892,7 @@ class LocalStore:
                     connection,
                     replace(
                         operation,
+                        activated_ids=activated,
                         forgotten_ids=forgotten,
                         linked=tuple(linked),
                         superseded=tuple(dict.fromkeys(superseded)),
@@ -2016,6 +2060,7 @@ class LocalStore:
         require_in_force: Sequence[str] = (),
         split_identity: str | None = None,
         merge_identities: tuple[str, str] | None = None,
+        require_no_later_dependencies: Sequence[str] = (),
     ) -> tuple[bool, tuple[StoredAsset, ...]]:
         """Apply the caller's reversal and mark one operation rolled back, atomically.
 
@@ -2039,6 +2084,10 @@ class LocalStore:
         when the identity graph no longer admits the reversal, which is how identity operations
         on one person also reverse newest first: a later split has already removed the alias a
         merge would need, and an erasure has removed both.
+
+        `require_no_later_dependencies` names deterministic outputs this operation introduced or
+        restated. A later standing log row that cites or changes one makes this operation no
+        longer independently reversible.
         """
         _require_aware(rolled_back_at, "rolled_back_at")
         for memory_id in delete_memory_ids:
@@ -2053,6 +2102,12 @@ class LocalStore:
                 (operation_id,),
             ).fetchone()
             if row is None:
+                return False, ()
+            if _later_operation_depends_on(
+                connection,
+                operation_id,
+                require_no_later_dependencies,
+            ):
                 return False, ()
             if any(_version_retired(connection, memory_id) for memory_id in require_in_force):
                 return False, ()
@@ -2137,6 +2192,29 @@ class LocalStore:
                 (*parameters, limit),
             ).fetchall()
         return tuple(_operation_from_row(row) for row in rows)
+
+    def naming_operation_key(self, operation_key: str, memory_id: str) -> str | None:
+        """Return a log key for a naming attempt, or None for a standing duplicate.
+
+        A superseded deterministic assertion still has an active historical operation with the
+        base key. Restating that retired assertion is a new auditable operation, keyed by the
+        version it is about to create; repeating a currently standing assertion remains a no-op.
+        """
+        _require_identifier(operation_key, "operation_key")
+        _require_identifier(memory_id, "memory_id")
+        with self._connection() as connection:
+            if _active_operation_id(connection, operation_key) is None:
+                return operation_key
+            if not _version_retired(connection, memory_id):
+                return None
+            row = connection.execute(
+                "SELECT COALESCE(MAX(version), 0) AS version FROM memory_versions WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("failed to read naming assertion version")
+        payload = f"mindbridge-operation-restatement-v1:{operation_key}:{int(row['version']) + 1}"
+        return hashlib.sha256(payload.encode()).hexdigest()
 
     def read_memory(self, memory_id: str) -> StoredMemory | None:
         """Return one memory, or none when it does not exist."""
@@ -3279,6 +3357,59 @@ class LocalStore:
         if row is None:
             return None, None
         return _optional_row_text(row, "subject"), _optional_row_text(row, "value")
+
+    def naming_projection_after_assertion(
+        self,
+        identity_id: str,
+        memory_id: str,
+        context: MemoryContext,
+    ) -> tuple[str | None, str | None]:
+        """Preview the projection after applying one bound naming assertion.
+
+        The caller uses this while holding its write lock to build speech documents before the
+        assertion transaction. The store remains the source of the evidence-group visibility
+        rule, so the preview and the commit cannot disagree about corroboration.
+        """
+        _require_identifier(identity_id, "identity_id")
+        _require_identifier(memory_id, "memory_id")
+        if context.kind is not MemoryKind.ENTITY or context.identity_id != identity_id:
+            raise ValueError("context must be a naming assertion for identity_id")
+        with self._connection() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            if resolved_id is None:
+                return None, None
+            groups = {
+                _row_text(row, "source_group_id")
+                for row in connection.execute(
+                    """
+                    SELECT source_group_id FROM memory_evidence
+                    WHERE memory_id = ? AND retired_at IS NULL
+                    """,
+                    (memory_id,),
+                ).fetchall()
+            }
+            for source_memory_id in context.evidence_ids:
+                source = connection.execute(_SOURCE_GROUP_QUERY, (source_memory_id,)).fetchone()
+                if source is None:
+                    raise sqlite3.IntegrityError("evidence source memory does not exist")
+                groups.add(_row_text(source, "source_group_id"))
+            visible = _semantic_visibility(
+                connection,
+                memory_id=memory_id,
+                lineage_id=context.lineage_id or memory_id,
+                kind=context.kind.value,
+                basis=context.basis.value,
+                identity_id=context.identity_id,
+                evidence_count=len(groups),
+                valid_from=context.valid_from,
+                valid_until=context.valid_until,
+            )
+            if visible:
+                return context.subject, context.value
+            current = _current_naming_assertion(connection, resolved_id)
+        if current is None:
+            return None, None
+        return _optional_row_text(current, "subject"), _optional_row_text(current, "value")
 
     def refresh_identity_projection(
         self,
@@ -4620,6 +4751,9 @@ class LocalStore:
             if version == 14:
                 _migrate_v14(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 15:
+                _migrate_v15(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
                 raise UnsupportedSchemaError(
@@ -4769,6 +4903,7 @@ class LocalStore:
             ).fetchall()
         )
         supplied_asset_ids = tuple(asset.asset_id for asset in memory.assets)
+        reactivating = memory.context is not None and _version_retired(connection, memory.memory_id)
         index_content_changed = existing is not None and (
             _row_text(existing, "content") != memory.content
             or _row_text(existing, "modality") != memory.modality
@@ -4827,7 +4962,7 @@ class LocalStore:
                     for position, asset_id in enumerate(supplied_asset_ids)
                 ),
             )
-        if index_content_changed:
+        if index_content_changed or reactivating:
             self._queue_memory_embeddings(
                 connection,
                 memory.memory_id,
@@ -5674,11 +5809,140 @@ def _migrate_v14(connection: sqlite3.Connection) -> None:
             for statement in _OPERATION_CONSENT_REBUILD_DDL:
                 connection.execute(statement)
         connection.execute("PRAGMA user_version = 15")
+
         connection.commit()
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
         raise
+
+
+def _migrate_v15(connection: sqlite3.Connection) -> None:
+    """Give identities registered before naming assertions existed an assertion."""
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _v16_backfill_naming_assertions(connection)
+        connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+# The kernel derives these IDs in `memory.py`; importing it here would invert the dependency.
+# Keep the restatement pinned by a migration contract test.
+_NAMING_RECIPE = "mindbridge-identity-naming-v1"
+_NAMING_PREDICATE = "identity"
+
+
+def _naming_assertion_ids(
+    identity_id: str,
+    name: str,
+    relationship: str | None,
+) -> tuple[str, str]:
+    """Return the `(memory_id, lineage_id)` the kernel mints for a host naming assertion."""
+    lineage = _canonical_json(
+        {
+            "kind": MemoryKind.ENTITY.value,
+            "predicate": _NAMING_PREDICATE,
+            "frame_id": None,
+            "anchor": None,
+            "subject": None,
+            "identity_id": identity_id,
+        }
+    )
+    formation = _canonical_json(
+        {
+            "recipe": _NAMING_RECIPE,
+            "kind": MemoryKind.ENTITY.value,
+            "identity_id": identity_id,
+            "subject": _canonical_subject(name),
+            "predicate": _NAMING_PREDICATE,
+            "value": _canonical_subject(relationship),
+            "assertion_basis": EvidenceBasis.USER_STATEMENT.value,
+            "cue_modality": None,
+            "episode_source": None,
+            "content": None,
+            "valid_from": None,
+            "valid_until": None,
+            "spatial": None,
+        }
+    )
+    return (
+        hashlib.sha256(f"mindbridge-formation-v1:{formation}".encode()).hexdigest(),
+        hashlib.sha256(f"mindbridge-lineage-v1:{lineage}".encode()).hexdigest(),
+    )
+
+
+def _canonical_json(payload: Mapping[str, object]) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _v16_backfill_naming_assertions(connection: sqlite3.Connection) -> None:
+    """Backfill the visible ENTITY assertion required by current identity reads."""
+    rows = connection.execute(
+        """
+        SELECT identity_id, name, relationship, created_at
+        FROM identities AS i
+        WHERE i.name IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM memory_semantics AS s
+              WHERE s.identity_id = i.identity_id AND s.kind = ?
+          )
+        """,
+        (MemoryKind.ENTITY.value,),
+    ).fetchall()
+    for row in rows:
+        identity_id = _row_text(row, "identity_id")
+        name = _row_text(row, "name")
+        relationship = _optional_row_text(row, "relationship")
+        memory_id, lineage_id = _naming_assertion_ids(identity_id, name, relationship)
+        recorded_at = _row_text(row, "created_at")
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO memory_records (
+                memory_id, content, modality, memory_type, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, 'text', 'semantic', '{}', ?, ?)
+            """,
+            (
+                memory_id,
+                (
+                    f"{name} is a recognized person."
+                    if relationship is None
+                    else f"{name} is a recognized person, {relationship}."
+                ),
+                recorded_at,
+                recorded_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO memory_semantics (
+                memory_id, lineage_id, kind, basis,
+                subject, predicate, value, recipe, identity_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory_id,
+                lineage_id,
+                MemoryKind.ENTITY.value,
+                EvidenceBasis.USER_STATEMENT.value,
+                name,
+                _NAMING_PREDICATE,
+                relationship,
+                _NAMING_RECIPE,
+                identity_id,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO memory_versions (
+                memory_id, version, confidence, recorded_at, visible
+            ) VALUES (?, 1, 1.0, ?, 1)
+            """,
+            (memory_id, recorded_at),
+        )
 
 
 def _write_memory_context(
@@ -5690,7 +5954,7 @@ def _write_memory_context(
     superseded: list[tuple[str, int]] | None = None,
 ) -> None:
     existing = connection.execute(
-        "SELECT 1 FROM memory_semantics WHERE memory_id = ?",
+        "SELECT lineage_id FROM memory_semantics WHERE memory_id = ?",
         (memory_id,),
     ).fetchone()
     if existing is not None:
@@ -5702,9 +5966,16 @@ def _write_memory_context(
                 confidence=context.confidence,
                 recorded_at=context.recorded_at,
             )
-        return
+        if not _version_retired(connection, memory_id):
+            return
+        # A deterministic claim can already have a record while every version is retired.
+        # Restating it is a fresh assertion and must create a new current version.
 
-    lineage_id = context.lineage_id or memory_id
+    lineage_id = (
+        _row_text(existing, "lineage_id")
+        if existing is not None
+        else context.lineage_id or memory_id
+    )
     recorded_at = _next_lineage_transaction_time(
         connection,
         context.recorded_at,
@@ -5718,7 +5989,7 @@ def _write_memory_context(
     orientation = None if spatial is None else spatial.orientation_xyzw
     connection.execute(
         """
-        INSERT INTO memory_semantics (
+        INSERT OR IGNORE INTO memory_semantics (
             memory_id, lineage_id, kind, basis, source_id,
             subject, predicate, value, model_id, recipe, identity_id,
             cue_modality, valence, arousal,
@@ -5755,89 +6026,19 @@ def _write_memory_context(
             None if spatial is None else spatial.position_uncertainty_m,
         ),
     )
-    for source_memory_id in context.evidence_ids:
-        _insert_memory_evidence(
-            connection,
-            memory_id,
-            source_memory_id,
-            confidence=context.confidence,
-            recorded_at=recorded_at,
-        )
-
-    supersedes_id = context.supersedes_id
-    # A state changes, an asserted trait replaces the last one, and naming a person supersedes
-    # whatever they were called before -- so the retracted name stops answering to active reads
-    # instead of sitting beside the current one. Everything else accumulates evidence instead.
-    reconcile_lineage = (
-        context.kind is MemoryKind.STATE
-        or (context.kind is MemoryKind.TRAIT and context.basis is EvidenceBasis.USER_STATEMENT)
-        or (context.kind is MemoryKind.ENTITY and context.identity_id is not None)
-    )
-    if reconcile_lineage:
-        old_rows = connection.execute(
-            """
-            SELECT
-                s.memory_id, v.version, v.confidence, v.valid_from, v.valid_until,
-                v.recorded_at, v.visible, v.supersedes_id
-            FROM memory_semantics AS s
-            JOIN memory_versions AS v ON v.memory_id = s.memory_id
-            WHERE s.lineage_id = ? AND s.kind = ?
-              AND s.memory_id <> ? AND v.retired_at IS NULL
-            ORDER BY v.recorded_at, s.memory_id, v.version
-            """,
-            (lineage_id, context.kind.value, memory_id),
-        ).fetchall()
-        for old in old_rows:
-            old_from = _optional_datetime_from_row(old, "valid_from")
-            old_until = _optional_datetime_from_row(old, "valid_until")
-            old_recorded = _parse_datetime(_row_text(old, "recorded_at"))
-            # Independent assertions in one storage batch remain conflicting. Wall-clock equality
-            # alone cannot identify a batch on low-resolution or frozen clocks.
-            if (
-                transaction_memory_ids is not None
-                and _row_text(old, "memory_id") in transaction_memory_ids
-            ) or not _intervals_overlap(
-                valid_from,
-                valid_until,
-                old_from,
-                old_until,
-            ):
-                continue
-            tx_time = max(recorded_at, old_recorded + timedelta(microseconds=1))
-            recorded_at = tx_time
-            connection.execute(
-                """
-                UPDATE memory_versions
-                SET retired_at = ?
-                WHERE memory_id = ? AND version = ? AND retired_at IS NULL
-                """,
-                (
-                    _datetime_text(tx_time),
-                    _row_text(old, "memory_id"),
-                    int(old["version"]),
-                ),
+    if existing is None:
+        for source_memory_id in context.evidence_ids:
+            _insert_memory_evidence(
+                connection,
+                memory_id,
+                source_memory_id,
+                confidence=context.confidence,
+                recorded_at=recorded_at,
             )
-            if superseded is not None:
-                superseded.append((_row_text(old, "memory_id"), int(old["version"])))
-            if valid_from is not None and (old_from is None or old_from < valid_from):
-                _carry_memory_version(
-                    connection,
-                    old,
-                    valid_from=old_from,
-                    valid_until=valid_from,
-                    recorded_at=tx_time,
-                )
-            if valid_until is not None and (old_until is None or valid_until < old_until):
-                _carry_memory_version(
-                    connection,
-                    old,
-                    valid_from=valid_until,
-                    valid_until=old_until,
-                    recorded_at=tx_time,
-                )
-            supersedes_id = supersedes_id or _row_text(old, "memory_id")
 
     evidence_count, _confidence = _evidence_summary(connection, memory_id)
+    # Decide visibility before this write changes its lineage: an uncorroborated inferred name
+    # waits beside the standing name instead of displacing it.
     visible = _semantic_visibility(
         connection,
         memory_id=memory_id,
@@ -5849,15 +6050,46 @@ def _write_memory_context(
         valid_from=valid_from,
         valid_until=valid_until,
     )
+
+    supersedes_id = context.supersedes_id
+    # A state changes, an asserted trait replaces the last one, and naming a person supersedes
+    # whatever they were called before -- so the retracted name stops answering to active reads
+    # instead of sitting beside the current one. Everything else accumulates evidence instead.
+    reconcile_lineage = visible and (
+        context.kind is MemoryKind.STATE
+        or (context.kind is MemoryKind.TRAIT and context.basis is EvidenceBasis.USER_STATEMENT)
+        or (context.kind is MemoryKind.ENTITY and context.identity_id is not None)
+    )
+    if reconcile_lineage:
+        recorded_at, supersedes_id = _retire_displaced_lineage(
+            connection,
+            memory_id,
+            lineage_id=lineage_id,
+            kind=context.kind.value,
+            recorded_at=recorded_at,
+            supersedes_id=supersedes_id,
+            valid_from=valid_from,
+            valid_until=valid_until,
+            transaction_memory_ids=transaction_memory_ids,
+            superseded=superseded,
+        )
+
+    latest = connection.execute(
+        "SELECT COALESCE(MAX(version), 0) AS version FROM memory_versions WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()
+    if latest is None:
+        raise RuntimeError("failed to allocate a memory version")
     connection.execute(
         """
         INSERT INTO memory_versions (
             memory_id, version, confidence, valid_from, valid_until,
             recorded_at, retired_at, visible, supersedes_id
-        ) VALUES (?, 1, ?, ?, ?, ?, NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
         """,
         (
             memory_id,
+            int(latest["version"]) + 1,
             context.confidence,
             _optional_datetime_text(valid_from),
             _optional_datetime_text(valid_until),
@@ -5866,6 +6098,73 @@ def _write_memory_context(
             supersedes_id,
         ),
     )
+
+
+def _retire_displaced_lineage(
+    connection: sqlite3.Connection,
+    memory_id: str,
+    *,
+    lineage_id: str,
+    kind: str,
+    recorded_at: datetime,
+    supersedes_id: str | None,
+    valid_from: datetime | None,
+    valid_until: datetime | None,
+    transaction_memory_ids: set[str] | None,
+    superseded: list[tuple[str, int]] | None,
+) -> tuple[datetime, str | None]:
+    """Retire standing versions displaced by one newly current assertion."""
+    old_rows = connection.execute(
+        """
+        SELECT
+            s.memory_id, v.version, v.confidence, v.valid_from, v.valid_until,
+            v.recorded_at, v.visible, v.supersedes_id
+        FROM memory_semantics AS s
+        JOIN memory_versions AS v ON v.memory_id = s.memory_id
+        WHERE s.lineage_id = ? AND s.kind = ?
+          AND s.memory_id <> ? AND v.retired_at IS NULL
+        ORDER BY v.recorded_at, s.memory_id, v.version
+        """,
+        (lineage_id, kind, memory_id),
+    ).fetchall()
+    for old in old_rows:
+        old_from = _optional_datetime_from_row(old, "valid_from")
+        old_until = _optional_datetime_from_row(old, "valid_until")
+        old_recorded = _parse_datetime(_row_text(old, "recorded_at"))
+        if (
+            transaction_memory_ids is not None
+            and _row_text(old, "memory_id") in transaction_memory_ids
+        ) or not _intervals_overlap(valid_from, valid_until, old_from, old_until):
+            continue
+        tx_time = max(recorded_at, old_recorded + timedelta(microseconds=1))
+        recorded_at = tx_time
+        connection.execute(
+            """
+            UPDATE memory_versions SET retired_at = ?
+            WHERE memory_id = ? AND version = ? AND retired_at IS NULL
+            """,
+            (_datetime_text(tx_time), _row_text(old, "memory_id"), int(old["version"])),
+        )
+        if superseded is not None:
+            superseded.append((_row_text(old, "memory_id"), int(old["version"])))
+        if valid_from is not None and (old_from is None or old_from < valid_from):
+            _carry_memory_version(
+                connection,
+                old,
+                valid_from=old_from,
+                valid_until=valid_from,
+                recorded_at=tx_time,
+            )
+        if valid_until is not None and (old_until is None or valid_until < old_until):
+            _carry_memory_version(
+                connection,
+                old,
+                valid_from=valid_until,
+                valid_until=old_until,
+                recorded_at=tx_time,
+            )
+        supersedes_id = supersedes_id or _row_text(old, "memory_id")
+    return recorded_at, supersedes_id
 
 
 def _intervals_overlap(
@@ -6061,6 +6360,24 @@ def _restamp_dependent_evidence(
             break
 
 
+def _memory_evidence_linked(
+    connection: sqlite3.Connection,
+    memory_id: str,
+    source_memory_id: str,
+) -> bool:
+    """Return whether one evidence link currently stands."""
+    return (
+        connection.execute(
+            """
+            SELECT 1 FROM memory_evidence
+            WHERE memory_id = ? AND source_memory_id = ? AND retired_at IS NULL
+            """,
+            (memory_id, source_memory_id),
+        ).fetchone()
+        is not None
+    )
+
+
 def _insert_memory_evidence(
     connection: sqlite3.Connection,
     memory_id: str,
@@ -6069,16 +6386,7 @@ def _insert_memory_evidence(
     confidence: float,
     recorded_at: datetime,
 ) -> bool:
-    if (
-        connection.execute(
-            """
-        SELECT 1 FROM memory_evidence
-        WHERE memory_id = ? AND source_memory_id = ? AND retired_at IS NULL
-        """,
-            (memory_id, source_memory_id),
-        ).fetchone()
-        is not None
-    ):
+    if _memory_evidence_linked(connection, memory_id, source_memory_id):
         return False
     source = connection.execute(_SOURCE_GROUP_QUERY, (source_memory_id,)).fetchone()
     if source is None:
@@ -7031,6 +7339,44 @@ def _active_operation_id(connection: sqlite3.Connection, operation_key: str) -> 
     return None if row is None else int(row["operation_id"])
 
 
+def _later_operation_depends_on(
+    connection: sqlite3.Connection,
+    operation_id: int,
+    memory_ids: Sequence[str],
+) -> bool:
+    """Return whether a later standing operation names one of these outputs."""
+    ids = tuple(dict.fromkeys(memory_ids))
+    for memory_id in ids:
+        _require_identifier(memory_id, "memory_id")
+    for offset in range(0, len(ids), _SQLITE_PARAMETER_BATCH - 1):
+        batch = ids[offset : offset + _SQLITE_PARAMETER_BATCH - 1]
+        placeholders = ", ".join("?" for _memory_id in batch)
+        if (
+            connection.execute(
+                f"""
+            SELECT 1
+            FROM memory_operations AS o
+            JOIN json_tree(json_array(
+                json_extract(o.operation_json, '$.evidence_ids'),
+                json_extract(o.operation_json, '$.target_ids'),
+                json_extract(o.effects_json, '$.created_ids'),
+                json_extract(o.effects_json, '$.changed_ids'),
+                json_extract(o.effects_json, '$.activated_ids'),
+                json_extract(o.effects_json, '$.linked'),
+                json_extract(o.effects_json, '$.superseded')
+            )) AS j
+            WHERE o.operation_id > ? AND o.rolled_back_at IS NULL
+              AND j.type = 'text' AND j.value IN ({placeholders})
+            LIMIT 1
+            """,
+                (operation_id, *batch),
+            ).fetchone()
+            is not None
+        ):
+            return True
+    return False
+
+
 def _insert_operation(connection: sqlite3.Connection, operation: StoredOperation) -> int:
     cursor = connection.execute(
         """
@@ -7050,6 +7396,7 @@ def _insert_operation(connection: sqlite3.Connection, operation: StoredOperation
                 {
                     "created_ids": list(operation.created_ids),
                     "changed_ids": list(operation.changed_ids),
+                    "activated_ids": list(operation.activated_ids),
                     "forgotten_ids": list(operation.forgotten_ids),
                     "linked": [list(pair) for pair in operation.linked],
                     "superseded": [list(pair) for pair in operation.superseded],
@@ -7080,6 +7427,7 @@ def _operation_from_row(row: sqlite3.Row) -> StoredOperation:
         operation_json=_row_text(row, "operation_json"),
         created_ids=tuple(effects.get("created_ids") or ()),
         changed_ids=tuple(effects.get("changed_ids") or ()),
+        activated_ids=tuple(effects.get("activated_ids") or ()),
         forgotten_ids=tuple(effects.get("forgotten_ids") or ()),
         linked=tuple((pair[0], pair[1]) for pair in effects.get("linked") or ()),
         superseded=tuple((pair[0], int(pair[1])) for pair in effects.get("superseded") or ()),

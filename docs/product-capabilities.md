@@ -265,7 +265,7 @@ arguments, schemas, limits, and errors.
 | Search | `search` | `POST /v1/memories/search` | `search_memories` | `search` |
 | Explain search | `search_with_trace` | Search with `explain=true` | Search with `explain=true` | `search-with-trace` |
 | Answer | `ask` | `POST /v1/answers` | `ask_memory` | `ask` |
-| Answer incrementally | `ask_stream` | — | — | — |
+| Answer incrementally | `ask_stream` | `POST /v1/answers/stream` | — | — |
 | Compile context | `compile` | `POST /v1/context` | `compile_context` | `compile` |
 | Get by ID | `get` | `GET /v1/memories/{memory_id}` | `get_memory` | `get` |
 | List newest | `list` | `GET /v1/memories` | `list_memories` | `list` |
@@ -296,7 +296,7 @@ arguments, schemas, limits, and errors.
 | Validate loaders | — | — | — | `doctor` |
 
 The synchronous SDK therefore exposes 36 product operations, plus construction, capability
-inspection, and lifecycle. REST exposes twelve `/v1` product routes plus `/healthz`, or twenty-two
+inspection, and lifecycle. REST exposes thirteen `/v1` product routes plus `/healthz`, or twenty-three
 when the host also enables `create_app`'s `embodied_operations` (\* above) and `identity_operations`
 († above) switches; MCP exposes fifteen tools; the product CLI exposes 35 of them plus `doctor`,
 every operation except `ask_stream`, which needs a streaming wire format the CLI does not have. `AsyncMemory` mirrors the finite SDK operations except `forget_identity`, which currently

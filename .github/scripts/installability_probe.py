@@ -168,6 +168,7 @@ def _server() -> None:
         "/healthz",
         "/v1/answers",
         "/v1/capture",
+        "/v1/answers/stream",
         "/v1/context",
         "/v1/memories",
         "/v1/memories/batch",

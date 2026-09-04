@@ -25,12 +25,20 @@ import mindbridge.models.openai_sdk as openai_backend
 from mindbridge._telemetry import (
     FORMATION_PROPOSALS_DROPPED,
     GEN_AI_FINISH_REASONS,
+    GEN_AI_OPENAI_RESPONSE_SYSTEM_FINGERPRINT,
+    GEN_AI_RESPONSE_MODEL,
     GEN_AI_TTFC,
     GROUNDING_HITS_DROPPED,
     GROUNDING_MEDIA_ELIDED,
     MODEL_REQUEST_COUNT,
+    MODEL_RESPONSE_MODELS,
+    MODEL_RESPONSE_SYSTEM_FINGERPRINTS,
     MODEL_TTFT,
+    TOKEN_AUDIO_SECONDS,
+    TOKEN_CACHED_INPUT,
     TOKEN_COMPLETE,
+    TOKEN_EXPECTED_REQUEST_COUNT,
+    TOKEN_REASONING_OUTPUT,
     TOKEN_REPORTED_REQUEST_COUNT,
     TOKEN_TOTAL,
     model_span,
@@ -38,6 +46,7 @@ from mindbridge._telemetry import (
     token_modality_attribute,
 )
 from mindbridge.exceptions import ModelError, ModelOutputTruncatedError, ValidationError
+from mindbridge.models._media import media_duration_seconds
 from mindbridge.models.base import (
     ConsolidationBackend,
     EmbeddingBackend,
@@ -215,9 +224,23 @@ def test_embedding_retries_a_context_length_rejection_as_ordered_stills(
                     }
                 },
             )
-        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [3, 4]}]})
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"index": 0, "embedding": [3, 4]}],
+                "model": "served-embedding-model",
+                "system_fingerprint": "embed-fingerprint",
+                "usage": {"prompt_tokens": 10, "total_tokens": 10},
+            },
+        )
 
-    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        provider.get_tracer("test").start_as_current_span("embedding"),
+    ):
         model = OpenAIModels(
             embedding_client=_sdk_client(client),
             embedding_model="embed-model",
@@ -226,11 +249,20 @@ def test_embedding_retries_a_context_length_rejection_as_ordered_stills(
             embedding_capabilities=frozenset({Modality.TEXT, Modality.VIDEO}),
         )
         result = model.embed((ModelInput(text="day one", assets=(video,)),))
+    provider.shutdown()
 
     # The clip goes once as video and comes back as four ordered stills, and the text is kept.
     assert [part["type"] for part in requests[0]] == ["text", "video_url"]
     assert [part["type"] for part in requests[1]] == ["text", *["image_url"] * 4]
     assert result[0] == pytest.approx((0.6, 0.8))
+    attributes = exporter.get_finished_spans()[0].attributes
+    assert attributes is not None
+    assert attributes[MODEL_REQUEST_COUNT] == 2
+    assert attributes[TOKEN_EXPECTED_REQUEST_COUNT] == 2
+    assert attributes[TOKEN_REPORTED_REQUEST_COUNT] == 1
+    assert attributes[TOKEN_COMPLETE] is False
+    assert attributes[GEN_AI_RESPONSE_MODEL] == "served-embedding-model"
+    assert attributes[GEN_AI_OPENAI_RESPONSE_SYSTEM_FINGERPRINT] == "embed-fingerprint"
 
 
 def test_embedding_does_not_resample_video_for_an_unrelated_bad_request(
@@ -355,7 +387,10 @@ def test_formation_batches_grounded_observations_and_validates_typed_output(
         assert "cue_modality" in payload["messages"][0]["content"]
         parts = payload["messages"][1]["content"]
         assert [part["type"] for part in parts] == ["text", "text", "input_audio"]
-        assert json.loads(parts[0]["text"])["observation"]["observation_id"] == "observation_0"
+        first = json.loads(parts[0]["text"])["observation"]
+        assert first["observation_id"] == "observation_0"
+        assert first["context"]["spatial"] == {"frame_id": "house", "anchor": "observer"}
+        assert not {"x", "y"} & first["context"]["spatial"].keys()
         assert json.loads(parts[1]["text"])["observation"]["observation_id"] == "observation_1"
         return httpx.Response(
             200,
@@ -410,7 +445,12 @@ def test_formation_batches_grounded_observations_and_validates_typed_output(
         FormationInput(
             memory_id="source_text",
             content=ModelInput(text="The lamp is on."),
-            context=ObservationContext(source_id="user"),
+            context=ObservationContext(
+                source_id="user",
+                spatial=SpatialContext(
+                    frame_id="house", anchor=SpatialAnchor.OBSERVER, x=1.0, y=2.0
+                ),
+            ),
         ),
         FormationInput(
             memory_id="source_audio",
@@ -449,6 +489,8 @@ def _caption_reply(*captions: str) -> httpx.Response:
                     "finish_reason": "stop",
                 }
             ],
+            "model": "served-caption-model",
+            "system_fingerprint": "caption-fingerprint",
             "usage": {"prompt_tokens": 900, "completion_tokens": 30, "total_tokens": 930},
         },
     )
@@ -503,6 +545,72 @@ def test_description_numbers_every_visual_in_one_request_and_sends_video_as_stil
     assert "video/mp4" not in serialized
 
 
+def test_description_sizes_sampled_video_frames_instead_of_the_unuploaded_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    clip = _asset(tmp_path, "clip", Modality.VIDEO, "video/mp4", b"x" * 64)
+    frame = "data:image/jpeg;base64,eA=="
+    monkeypatch.setattr(openai_backend, "_video_frame_urls", lambda *_args, **_kwargs: (frame,) * 4)
+    # The source video data URL would exceed this bound, while every emitted still fits it.
+    monkeypatch.setattr(openai_backend, "_MAX_INLINE_MODEL_ITEM_BYTES", len(frame.encode()))
+    monkeypatch.setattr(openai_backend, "_MAX_INLINE_MODEL_BYTES", 100)
+
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda _request: _caption_reply("a room"))
+    ) as client:
+        result = _vision_model(
+            _sdk_client(client), capabilities=frozenset({Modality.VIDEO})
+        ).describe((ModelInput(assets=(clip,)),))
+
+    assert result == ("a room",)
+
+
+def test_description_rejects_an_oversized_image_before_reading_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"123456")
+    monkeypatch.setattr(openai_backend, "_MAX_INLINE_MODEL_ITEM_BYTES", 28)
+    monkeypatch.setattr(
+        openai_backend,
+        "_asset_data",
+        lambda _asset: pytest.fail("oversized image must not be read"),
+    )
+
+    with httpx.Client(transport=httpx.MockTransport(_unreachable)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        with pytest.raises(ModelError, match="20 MiB") as failure:
+            model.describe((ModelInput(assets=(picture,)),))
+
+    assert failure.value.reason == "payload_too_large"
+
+
+@pytest.mark.parametrize(
+    ("item_limit", "aggregate_limit", "message"),
+    ((26, 100, "20 MiB"), (100, 15, "64 MiB")),
+)
+def test_description_bounds_the_emitted_video_frame_urls(
+    item_limit: int,
+    aggregate_limit: int,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    clip = _asset(tmp_path, "clip", Modality.VIDEO, "video/mp4", b"video")
+    frame = "data:image/jpeg;base64,eA=="
+    monkeypatch.setattr(openai_backend, "_video_frame_urls", lambda *_args, **_kwargs: (frame,) * 4)
+    monkeypatch.setattr(openai_backend, "_MAX_INLINE_MODEL_ITEM_BYTES", item_limit)
+    monkeypatch.setattr(openai_backend, "_MAX_INLINE_MODEL_BYTES", aggregate_limit)
+
+    with httpx.Client(transport=httpx.MockTransport(_unreachable)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.VIDEO}))
+        with pytest.raises(ModelError, match=message) as failure:
+            model.describe((ModelInput(assets=(clip,)),))
+
+    assert failure.value.reason == "payload_too_large"
+
+
 def test_description_reports_its_own_token_cost(tmp_path: Path) -> None:
     picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
     provider = TracerProvider()
@@ -530,6 +638,8 @@ def test_description_reports_its_own_token_cost(tmp_path: Path) -> None:
     assert attributes["gen_ai.usage.output_tokens"] == 30
     assert attributes[MODEL_REQUEST_COUNT] == 1
     assert attributes[TOKEN_COMPLETE] is True
+    assert attributes[GEN_AI_RESPONSE_MODEL] == "served-caption-model"
+    assert attributes[GEN_AI_OPENAI_RESPONSE_SYSTEM_FINGERPRINT] == "caption-fingerprint"
 
 
 @pytest.mark.parametrize(
@@ -697,6 +807,66 @@ def test_a_second_malformed_reply_is_not_retried_again(tmp_path: Path) -> None:
     assert attributes[MODEL_REQUEST_COUNT] == 2
 
 
+def test_description_transport_failure_after_malformed_reply_keeps_both_attempts(
+    tmp_path: Path,
+) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    sent = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal sent
+        sent += 1
+        if sent == 1:
+            return _malformed_reply()
+        raise httpx.ConnectError("offline", request=request)
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        with (
+            operation_span(tracer, "operation", attributes={}),
+            model_span(tracer, "model", attributes={}),
+            pytest.raises(ModelError),
+        ):
+            model.describe((ModelInput(assets=(picture,)),))
+    provider.shutdown()
+
+    attributes = {span.name: span.attributes for span in exporter.get_finished_spans()}["model"]
+    assert attributes is not None
+    assert sent == 2
+    assert attributes[MODEL_REQUEST_COUNT] == 2
+    assert attributes[TOKEN_EXPECTED_REQUEST_COUNT] == 2
+    assert attributes[TOKEN_REPORTED_REQUEST_COUNT] == 1
+    assert attributes[TOKEN_COMPLETE] is False
+
+
+def test_multi_response_provenance_is_reported_as_a_set_not_the_last_reply() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with model_span(provider.get_tracer("test"), "model", attributes={}):
+        openai_backend._record_openai_provenance(
+            {"model": "served-a", "system_fingerprint": "fingerprint-a"}
+        )
+        openai_backend._record_openai_provenance(
+            {"model": "served-b", "system_fingerprint": "fingerprint-b"}
+        )
+    provider.shutdown()
+
+    attributes = exporter.get_finished_spans()[0].attributes
+    assert attributes is not None
+    assert attributes[GEN_AI_RESPONSE_MODEL] == "mixed"
+    assert attributes[MODEL_RESPONSE_MODELS] == ("served-a", "served-b")
+    assert attributes[GEN_AI_OPENAI_RESPONSE_SYSTEM_FINGERPRINT] == "mixed"
+    assert attributes[MODEL_RESPONSE_SYSTEM_FINGERPRINTS] == (
+        "fingerprint-a",
+        "fingerprint-b",
+    )
+
+
 def test_a_truncated_description_is_not_retried(tmp_path: Path) -> None:
     # An identical second request cannot clear an output-token limit, so paying for one is waste.
     picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
@@ -722,6 +892,31 @@ def test_a_truncated_description_is_not_retried(tmp_path: Path) -> None:
         with pytest.raises(ModelOutputTruncatedError):
             model.describe((ModelInput(assets=(picture,)),))
 
+    assert len(sent) == 1
+
+
+def test_a_content_filtered_description_is_not_retried(tmp_path: Path) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    sent: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"index": 0, "message": {"content": None}, "finish_reason": "content_filter"}
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        with pytest.raises(ModelError) as failure:
+            model.describe((ModelInput(assets=(picture,)),))
+
+    assert failure.value.reason == "response_invalid"
+    assert failure.value.stage == "describe"
     assert len(sent) == 1
 
 
@@ -1537,6 +1732,7 @@ def test_stream_answer_records_exact_grounding_and_multimodal_usage(
                 "object": "chat.completion.chunk",
                 "created": 1,
                 "model": "answer-model",
+                "system_fingerprint": "stream-final-fingerprint",
                 "choices": [],
                 "usage": {
                     "prompt_tokens": 20,
@@ -1601,6 +1797,8 @@ def test_stream_answer_records_exact_grounding_and_multimodal_usage(
     assert cast(float, attributes[MODEL_TTFT]) >= 0
     assert cast(float, attributes[GEN_AI_TTFC]) >= 0
     assert attributes[GEN_AI_FINISH_REASONS] == ("stop",)
+    assert attributes[GEN_AI_RESPONSE_MODEL] == "answer-model"
+    assert attributes[GEN_AI_OPENAI_RESPONSE_SYSTEM_FINGERPRINT] == "stream-final-fingerprint"
 
 
 def test_usage_keeps_visual_audio_and_unknown_multimodal_tokens_distinct() -> None:
@@ -1658,6 +1856,71 @@ def test_partial_provider_usage_is_not_reported_as_complete_token_cost() -> None
         assert attributes["gen_ai.usage.input_tokens"] == 5
         assert attributes[token_modality_attribute("input", "text")] == 5
         assert TOKEN_TOTAL not in attributes
+        assert GEN_AI_RESPONSE_MODEL not in attributes
+        assert GEN_AI_OPENAI_RESPONSE_SYSTEM_FINGERPRINT not in attributes
+
+
+def test_partial_batch_audio_duration_is_not_reported_as_complete() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    with model_span(tracer, "partial", attributes={}):
+        openai_backend._record_usage_batch(
+            (
+                openai_backend._ModelUsage(False, audio_seconds=2.0),
+                openai_backend._ModelUsage(False),
+            ),
+            request_count=2,
+        )
+    with model_span(tracer, "complete", attributes={}):
+        openai_backend._record_usage_batch(
+            (
+                openai_backend._ModelUsage(False, audio_seconds=2.0),
+                openai_backend._ModelUsage(False, audio_seconds=3.0),
+            ),
+            request_count=2,
+        )
+    provider.shutdown()
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    partial = spans["partial"].attributes
+    complete = spans["complete"].attributes
+    assert partial is not None
+    assert complete is not None
+    assert TOKEN_AUDIO_SECONDS not in partial
+    assert complete[TOKEN_AUDIO_SECONDS] == 5.0
+
+
+def test_cached_and_reasoning_tokens_roll_up_from_models_to_the_operation() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    with operation_span(tracer, "operation", attributes={}):
+        for index, (cached, reasoning) in enumerate(((2, 3), (5, 7))):
+            with model_span(tracer, f"model-{index}", attributes={}):
+                openai_backend._record_openai_usage(
+                    {
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 8,
+                            "total_tokens": 18,
+                            "input_tokens_details": {"cached_tokens": cached},
+                            "output_tokens_details": {"reasoning_tokens": reasoning},
+                        }
+                    },
+                    input_modalities=frozenset({Modality.TEXT}),
+                    output_modalities=frozenset({Modality.TEXT}),
+                )
+    provider.shutdown()
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    assert (spans["model-0"].attributes or {})[TOKEN_CACHED_INPUT] == 2
+    assert (spans["model-0"].attributes or {})[TOKEN_REASONING_OUTPUT] == 3
+    operation = spans["operation"].attributes or {}
+    assert operation[TOKEN_CACHED_INPUT] == 7
+    assert operation[TOKEN_REASONING_OUTPUT] == 10
 
 
 def test_answer_rejects_an_oversized_grounding_payload(
@@ -2432,12 +2695,30 @@ def test_transcription_uses_its_own_endpoint_key_and_multipart_file(tmp_path: Pa
         assert b"speech-model" in body
         assert b"audio.wav" in body
         assert b"speech" in body
-        return httpx.Response(200, json={"text": "hello there"})
+        return httpx.Response(
+            200,
+            json={
+                "text": "hello there",
+                "model": "served-transcription-model",
+                "system_fingerprint": "transcription-fingerprint",
+            },
+        )
 
-    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        provider.get_tracer("test").start_as_current_span("transcription"),
+    ):
         result = _model(_sdk_client(client)).transcribe((audio,))
+    provider.shutdown()
 
     assert result == ("hello there",)
+    attributes = exporter.get_finished_spans()[0].attributes
+    assert attributes is not None
+    assert attributes[GEN_AI_RESPONSE_MODEL] == "served-transcription-model"
+    assert attributes[GEN_AI_OPENAI_RESPONSE_SYSTEM_FINGERPRINT] == "transcription-fingerprint"
 
 
 @pytest.mark.parametrize("suffix", [".mp4", ".mkv"])
@@ -2483,6 +2764,9 @@ def test_video_transcription_uploads_the_whole_demuxed_audio_track(
 
 def test_video_without_an_audio_track_costs_no_transcription_request(tmp_path: Path) -> None:
     video = _video_asset(tmp_path, "silent", 8)
+    path = video.path
+    assert path is not None
+    assert media_duration_seconds(path, stream_kind="audio") is None
 
     def respond(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
         raise AssertionError("a silent video must not reach the transcription endpoint")

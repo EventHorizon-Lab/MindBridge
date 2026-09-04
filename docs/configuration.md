@@ -95,6 +95,8 @@ If `api_key` is unset, the official SDK uses its standard credential lookup, inc
 `api_key`, endpoint, timeout, and retry policy. `api_key` is a Pydantic `SecretStr`, so dumps and
 representations mask it, but a configuration file still contains a secret. Prefer environment
 lookup or a caller-owned client when the file could be committed or shared.
+Every `base_url` must be an absolute `http://` or `https://` URL; a bare host name is rejected
+during configuration validation rather than at the first model request.
 
 Atomic capability declarations contain only `text`, `image`, `video`, and `audio`. OpenAI
 embedding requires at least one modality. Jina dimensions are `32`, `64`, `128`, `256`, `512`, or
@@ -176,6 +178,10 @@ Formation is one completion per `add`, or one batched completion per `add_many`,
 A failed call leaves the source observation committed, and retry tracking prevents duplicate
 proposals for sources already formed by the same recipe.
 
+The formation request carries a source observation's spatial `frame_id` and observer/subject
+`anchor`, so a model can preserve the coordinate system, but does not disclose metric `x`/`y`
+coordinates to the provider.
+
 MindBridge validates the response envelope and every proposal. Invalid envelopes fail the call;
 individual proposals the adapter cannot read are dropped and counted by
 `mindbridge.formation.dropped_proposals`, and proposals the kernel refuses to ground are counted
@@ -215,7 +221,8 @@ Three things bound what it costs and what it can do:
   it is left undescribed, silently and by design.
 - Video is described from four ordered stills decoded locally, never by uploading the file, so it
   costs four image parts per memory; that is why the default is `[image]` and video is opted into.
-  A clip with no readable video stream fails the write rather than falling back to sending it. The
+  A clip with no readable video stream is left without a caption rather than falling back to
+  sending it. The
   request marks such a visual with its still count (`Visual 2, as 4 ordered stills:`) and asks for
   one caption per visual, never one per still: asked over an unmarked clip, a measured endpoint
   returned four separate descriptions on every attempt, the one-caption-per-input contract below
@@ -223,7 +230,9 @@ Three things bound what it costs and what it can do:
   while still paying for the request.
 - The caption is derived text, so the request carries pixels and an ordinal only -- no memory ID,
   file name, or store path -- and a reply that does not return exactly one non-empty caption per
-  visual is rejected whole rather than mislabelling a memory with another's contents. One
+  visual is rejected whole rather than mislabelling a memory with another's contents. The 20 MiB
+  per-item and 64 MiB aggregate inline limits apply to these outbound image data URLs, including
+  decoded video stills, rather than to a video file that is never uploaded. One
   malformed reply is retried once, because an endpoint can answer `200 OK` with invalid JSON and
   an SDK retry policy never sees that; a second failure, or any other failure, leaves the memory
   stored **without** a caption rather than failing the write. Losing derived text must never lose

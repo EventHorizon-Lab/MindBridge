@@ -138,6 +138,16 @@ def register_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(MindBridgeError)
     async def public_error(_request: Request, error: MindBridgeError) -> JSONResponse:
+        return exception_response(error)
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(_request: Request, error: Exception) -> JSONResponse:
+        return exception_response(error)
+
+
+def exception_response(error: Exception) -> JSONResponse:
+    """Map an operation failure to the stable REST envelope, including during SSE."""
+    if isinstance(error, MindBridgeError):
         status_code, message = _public_error(error)
         return error_response(
             status_code,
@@ -153,18 +163,15 @@ def register_error_handlers(app: FastAPI) -> None:
                 else None
             ),
         )
-
-    @app.exception_handler(Exception)
-    async def unexpected_error(_request: Request, error: Exception) -> JSONResponse:
-        trace_id = _trace_id()
-        _LOGGER.error("unhandled API error", exc_info=error, extra={"trace_id": trace_id})
-        return error_response(
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "the request failed unexpectedly",
-            reason="unexpected",
-            trace_id=trace_id,
-        )
+    trace_id = _trace_id()
+    _LOGGER.error("unhandled API error", exc_info=error, extra={"trace_id": trace_id})
+    return error_response(
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        "internal_error",
+        "the request failed unexpectedly",
+        reason="unexpected",
+        trace_id=trace_id,
+    )
 
 
 def error_response(

@@ -50,7 +50,12 @@ Set credentials for the OpenAI-compatible generation endpoint, then select a tas
 ```bash
 export OPENAI_API_KEY="..."
 
-The JSON response reports `unit_count`, `question_count`, `dataset_sha256`, and
+uv run --frozen mindbridge-bench eval \
+  --tasks locomo-refined \
+  --output-path .benchmarks/results/locomo
+```
+
+The resulting `results.jsonl` reports `unit_count`, `question_count`, `dataset_sha256`, and
 `evaluation_sha256` for each selected task.
 
 ## Run a bounded evaluation
@@ -133,6 +138,10 @@ speech:
   provider: funasr
   device: cuda
 benchmark:
+  server_metrics:
+    generation_url: https://your-endpoint.example/metrics
+    embedding_url: http://127.0.0.1:8000/metrics
+    timeout_seconds: 5
   judge:
     model: qwen3.8-flash
     base_url: https://judge.example/v1
@@ -148,20 +157,23 @@ benchmark:
     arms: mindbridge
     limit: 10
     seed: 42
+    repeat_index: 0
 ```
 
 The `benchmark` mapping carries what `MindBridgeConfig` has no field for: judging, corpus
-acquisition, and, under `benchmark.run`, run tunables. Model endpoints, credentials, modalities,
-timeouts, token ceilings, and `extra_body` stay in the product block that owns them. See the
+acquisition, optional process-global server telemetry, performance budgets, and, under
+`benchmark.run`, run tunables. Model endpoints, credentials, modalities, timeouts, token ceilings,
+and `extra_body` stay in the product block that owns them. See the
 annotated [example configuration](examples/eval.example.yaml) for every field and its purpose.
 
 `benchmark.run` mirrors these flags: `tasks`, `arms`, `full_context_chars`, `compile_max_items`,
 `compile_max_chars`, `ingest`, `limit`, `offset`, `seed`, `bootstrap_samples`, `batch_size`,
-`max_batch_size`, `unit_concurrency`, `request_concurrency`, `judge_concurrency`, `recall_limit`,
-`device`, `device_lock`, `use_cache`, `run_id`, `output_path`, `overwrite`, `log_samples`,
-`predict_only`, `download`, `allow_unverified_data`, `verbosity`, `quiet`, `compare`,
-`fail_on_regression`, `regression_threshold`, `media_manifest`, `task_data`, `media_root`, and
-`num_fewshot`. Omitted keys retain the unset-flag defaults.
+`repeat_index`, `max_batch_size`, `unit_concurrency`,
+`request_concurrency`, `judge_concurrency`, `recall_limit`, `device`, `device_lock`, `use_cache`,
+`run_id`, `output_path`, `overwrite`, `log_samples`, `predict_only`, `download`,
+`allow_unverified_data`, `verbosity`, `quiet`, `compare`, `fail_on_regression`,
+`regression_threshold`, `media_manifest`, `task_data`, `media_root`, and `num_fewshot`. Omitted
+keys retain the unset-flag defaults.
 
 `--blind` and `--blind-baseline` remain command-line-only because they label or attach a whole
 no-memory control run rather than an arm sweep. `--blind` cannot be combined with an arm selection
@@ -221,7 +233,46 @@ completion and at roughly ten-percent intervals.
 integer for a count; a non-integral value above one is truncated to an integer by the current
 loader selection. Its unit is adapter-specific: OpenEQA limits episodes and retains every question
 in a selected episode, while EgoTempo limits questions. Use `--check-integrity` or the completed
-`results.json` instead of assuming that `--limit` equals `question_count`.
+`results.jsonl` instead of assuming that `--limit` equals `question_count`.
+
+## RTX 5090, Qwen3.8, and WeMM reference baseline
+
+Two checked-in profiles encode the reference composition without storing a credential:
+
+- [text profile](examples/baselines/rtx5090-qwen38-wemm9b-text.yaml) for the text memory suites;
+- [media profile](examples/baselines/rtx5090-qwen38-wemm9b-media.yaml) for native image, video,
+  and local FunASR paths.
+
+They use generation model `Qwen3.8-27B` at `http://xyrobot-vl.xyrobot.com/v1` and embedding model
+`tencent/WeMM-Embedding-9B` at `https://xyrobot-embed.xyrobot.com/v1`, dimension 4096. A bare host
+such as `xyrobot-embed.xyrobot.com` is deliberately rejected: every endpoint must name its scheme.
+Run one independent invocation per repeat:
+
+```bash
+export OPENAI_API_KEY=EMPTY
+
+for repeat in 0 1 2; do
+  uv run --frozen mindbridge-bench eval \
+    --config docs/examples/baselines/rtx5090-qwen38-wemm9b-text.yaml \
+    --repeat-index "$repeat" \
+    --run-id "rtx5090-text-r${repeat}" \
+    --output-path ".benchmarks/results/rtx5090-text-r${repeat}"
+done
+```
+
+Each invocation creates new physical stores. It performs one query-embedding warmup after model
+construction and before telemetry starts, performs no generation warmup, and records the actual
+warmup count. A vision-description cache, when configured, is shared only inside that invocation,
+so a later repeat cannot silently skip write-path model calls. Do not use `--use-cache` for a
+performance baseline; cached samples are excluded from performance denominators and cached runs
+are rejected by performance comparison.
+
+The RTX 5090 metadata and sampled GPU values describe the benchmark client. The configured VLM
+and embedding URLs are remote services, so their GPU hardware is not attributed to the 5090.
+Their configured `/metrics` endpoints instead provide process-global vLLM deltas and are marked
+non-exclusive because other traffic may occur in the same interval. For a publishable baseline,
+reserve both endpoints and the local GPU, record three or more repeats, and compare the same
+repeat protocol rather than treating one run as noise-free.
 
 ## Baseline arms
 
@@ -247,7 +298,7 @@ mindbridge-bench eval \
 | `compile` | `Memory.compile`'s rendered bundle, under `--compile-max-items`/`--compile-max-chars` | the compiler's own selection | answer metrics, plus `compile_bundle_chars` and `compile_bundle_items` per sample |
 
 The default is `mindbridge` alone. Each arm tags its samples and its task row with `arm`, and
-`results.json` records every selected arm's definition -- prompt version, budget, and random seed
+`results.jsonl` records every selected arm's definition -- prompt version, budget, and random seed
 -- under `arms`. Sample IDs of a non-default arm are prefixed with its name, so `samples.jsonl`
 stays one row per answered question per arm.
 
@@ -385,9 +436,10 @@ Coverage is deliberately asymmetric:
   cross-domain or world-knowledge breakdowns come from Video-MME and OpenEQA. Do not infer
   open-domain coverage from free-form answer format alone.
 
-EgoMemReason's public release has no answer key. A complete valid run writes an upload-ready
-`egomemreason_submission.json`; partial runs remain development artifacts. Video-MME-v2's grouped
-`rating` is on a 0--100 scale. Other 0--5 diagnostics are named explicitly in `results.json`.
+EgoMemReason's public release has no answer key. A complete valid run writes the upload-ready JSON
+array `egomemreason_submission.json`; partial runs remain development artifacts.
+Video-MME-v2's grouped `rating` is on a 0--100 scale. Other 0--5 diagnostics are named explicitly
+in `results.jsonl`.
 
 Protocol boundaries that affect interpretation are explicit rather than approximated:
 
@@ -433,9 +485,9 @@ with the pinned release.
 
 For a prepared causal stream, pass `--media-manifest FILE`. Causal tasks require source intervals;
 the runner ingests only observations ending at or before the question cutoff. Relative paths are
-resolved from the manifest file. When the runner prepares media itself, it writes
-`OUTPUT/media-manifest.json`; use that generated file as the format reference before supplying an
-operator-authored replacement.
+resolved from the manifest file. When the runner prepares media itself, it writes one manifest
+object to `OUTPUT/media-manifest.jsonl`; use that generated file as the format reference before
+supplying an operator-authored replacement.
 
 ## OpenEQA episode histories
 
@@ -537,42 +589,45 @@ number would measure the generator's prior knowledge of the scripts rather than 
 
 ## Reported performance and resource metrics
 
-Every task row in `results.json` carries a `performance` block with the metric families
-[the design principles](design-principles.md#end-to-end-memory-and-search-speed) require. Each
-block names the span it was measured from, so a number is never separated from its definition.
+Every task and arm row in `results.jsonl` carries a `performance` object. Distributions retain all
+observations and report count, average, p50, p95, and p99. Throughput divides successful work by
+the union of successful active intervals, so concurrency overlap is counted once and idle gaps do
+not inflate the denominator. A TTFT distribution also reports `retained_count`; when a successful
+answer has no observed first token, `complete` is false and `average` is null (the retained
+quantiles remain diagnostic only).
 
-| Block | Quantity | Measured from |
-| --- | --- | --- |
-| `ingest` | Accepted input to durable, searchable memory; item and call latency; sustained items per second | `mindbridge.benchmark.ingest`, one span per accepted `add_many`/`capture` batch |
-| `search` | Retrieval latency at p50, p95, and p99, plus queries per second | `mindbridge.retrieve`, one span per `ask` over the whole retrieval leg |
-| `answer` | End-to-end answer latency at p50, p95, and p99, and time to first token | `mindbridge.ask` and `mindbridge.model.generation` |
-| `asr` | Audio seconds per wall second and transcription inference latency | `mindbridge.model.transcription` |
-| `capture` | Capture-acknowledgement latency at p50, p95, and p99 | `mindbridge.capture`, one span per record; empty unless `--ingest capture` runs |
-| `time_to_searchable_ms` | Elapsed time from a record's capture commit to the `settle()` call that made it searchable | the `mindbridge.settle` span's batch-maximum wait, one sample per `settle()` call; empty unless `--ingest capture` runs |
-| `formation` | `settle()`'s own latency at p50, p95, and p99 -- the model-dependent enrichment work one call paid | `mindbridge.settle`; empty unless `--ingest capture` runs |
-| `compile` | `Memory.compile` latency at p50, p95, and p99, plus the compiled bundle's `bundle_chars`, `bundle_items`, and `bundle_media_items` (each p50/p95/p99) | `mindbridge.compile` for latency, a harness-owned `mindbridge.benchmark.compile` stage span for bundle size; empty unless the `compile` arm runs |
-| `nodes` | Count, total time, mean, and p50/p95/p99 for every traced stage | every operation, stage, and model span |
+| Block | Boundary and quantities |
+| --- | --- |
+| `duration_seconds` | Gap-free active wall-time unions for the product and judge phases. Its average denominator is the union of sample IDs measured in either phase, so a cached product answer judged by an uncached call is counted once. |
+| `ingest` | Attempt, success, and error counts; attempted and accepted items; durable/searchable batch latency; compute and active-wall throughput. |
+| `search_e2e` | Post-answer warm-store replay of public `Memory.search`. Its caller span starts before request admission and `sdk_operation` is the nested SDK boundary. Replay nodes and tokens remain isolated under `diagnostic`. |
+| `ask_retrieval_core` | The complete retrieval prerequisite inside `Memory.ask`: content preparation, temporal/scope handling, query speech, embedding, index lookup, and ranking. |
+| `answer` | Caller end-to-end completion latency and TTFT, plus nested SDK operation latency, generation TTFT, generation first-chunk time, and throughput. |
+| `asr` | Audio duration, inference duration, call success/error counts, standard real-time factor, speedup, and latency distribution. |
+| `capture` | Capture-acknowledgement latency from `mindbridge.capture`; empty unless `--ingest capture` runs. |
+| `time_to_searchable_ms` | Elapsed time from capture commit to the `settle()` call that made the record searchable; empty unless `--ingest capture` runs. |
+| `formation` | `settle()` latency for model-dependent enrichment; empty unless `--ingest capture` runs. |
+| `compile` | `Memory.compile` latency and the compiled bundle's character, item, and media-item distributions; empty unless the `compile` arm runs. |
+| `nodes` | Count, compute time, active time, throughput, average, p50/p95/p99, status, parent operation, purpose, model identity, response identity, fingerprint, embedding task, batch size, and modalities for every operation, stage, and model span. |
+| `token_usage` | Total and per-module request counts, exactness, input/output/cached/reasoning tokens, modality totals, per-call distribution, and observed output tokens per model-compute second. |
 
-`ingest` measures accepted input to durable and searchable memory rather than the time until the
-call returned. That is exact rather than approximate: under `--ingest add`, `add`/`add_many` return
-only after the SQLite commit, the Zvec flush, and the search-index outbox acknowledgement; under
-`--ingest capture`, the harness drains `settle()` before the ingest span closes, so the wall clock
-of the traced call already includes index visibility either way.
+`ingest` ends only after the SQLite commit, Zvec flush, and durable outbox acknowledgement, so an
+accepted item is searchable when its measured call completes. Failed attempts stay in attempt
+latency and error counts but never enter accepted-item throughput.
 
-`answer.latency_ms` and the per-task `answer_latency_ms` are timed after concurrency admission, so
-they are response latency and not queue depth. `answer.time_to_first_token_ms` is `null` unless the
-selected generation backend actually streamed a first token; a wall-clock number is never
-substituted for one.
+The three first-output clocks are intentionally distinct:
 
-`search` is measured from `mindbridge.retrieve`, one stage span per `ask` covering the whole
-retrieval leg: query embedding, content preparation, the index lookup, and ranking. It is not the
-index lookup alone, which appears separately under `nodes` as `mindbridge.index.search`. Because
-nodes are keyed by span name, the distribution never mixes that narrower stage in, and it excludes
-`search()`, which opens `mindbridge.search` instead -- so a run that only calls `search()`, and the
-harness's `search` fallback after a failed `ask`, report nothing under `search`.
+- `answer.end_to_end_time_to_first_token_ms` starts when the benchmark caller launches the answer,
+  before request-concurrency admission, and stops at the first non-empty text delta;
+- `answer.generation_time_to_first_token_ms` is the generation model's request-to-first-token
+  clock;
+- `answer.generation_time_to_first_chunk_ms` includes an empty first provider chunk when one is
+  emitted.
 
-`asr` is omitted when no transcription ran. Its `real_time_factor` is audio seconds divided by
-transcription wall seconds, so values above one mean faster than real time.
+The caller clock is `null` when no non-empty delta was observed. `answer.sdk_operation` exposes the
+nested `mindbridge.ask` service boundary. `AsyncMemory` includes executor queueing in its operation
+TTFT; the outer caller metric additionally includes time spent waiting for the harness request
+semaphore. Per-sample `latency_ms` starts after admission and therefore remains response latency.
 
 `capture`, `time_to_searchable_ms`, and `formation` name what [Context OS](context-os.md#fast-context-plane)
 calls the fast plane's acknowledge-then-enrich contract: `capture()` acknowledges after the SQLite
@@ -591,18 +646,11 @@ so that adding this measurement never touched product code. Pair `compile_bundle
 `compile_bundle_items` (in a sample's `metrics`) with that sample's answer-quality metric to compute
 "useful evidence per token" for one question; the run does not compute the ratio itself.
 
-The run-level `resources` block records CPU seconds and utilization, peak resident bytes, storage
-growth split into media, row, and vector bytes, per-device peak GPU utilization and memory when
-`nvidia-smi` answers, and an `energy` block. CPU and memory come from `resource.getrusage`, so they
-need no sampling; GPU utilization and disk growth are sampled directly (disk from the run's
-`data_dir`, before and after ingest). `storage.media_share` is the fraction of growth that is source
-media, which is the term that dominates long-run storage. `energy.cpu_package_joules` sums Intel
-RAPL package counters (`/sys/class/powercap/intel-rapl:*/energy_uj`) across the run when readable;
-`energy.gpu_joules` integrates `nvidia-smi --query-gpu=power.draw` samples over the poll interval,
-per device, when the card reports power. Neither is a calibrated meter -- RAPL is package-scope, not
-process-scope, and the GPU figure is a rectangle-rule estimate over periodic samples -- and both are
-absent with a `reason` (never a fabricated number) when their source cannot be read: no
-`intel-rapl` packages, no permission, or no GPU visible to `nvidia-smi`.
+The run-level `resources.energy` block adds host CPU-package energy from Intel RAPL counters
+(`/sys/class/powercap/intel-rapl:*/energy_uj`) and per-device GPU energy from the same time-integrated
+`nvidia-smi --query-gpu=power.draw` samples used by the GPU resource block. Neither is a calibrated
+per-process meter, and an unreadable source remains absent with a `reason` instead of a fabricated
+number.
 
 Each RAPL package is differenced against its own counter, because `energy_uj` wraps at that
 package's `max_energy_range_uj` -- tens of minutes on a busy package, well inside the length of a
@@ -610,9 +658,58 @@ sweep. A package that wrapped is corrected by its published range; one that wrap
 publishing a range makes `cpu_package_joules` absent with that as its `reason`, rather than a
 number nothing can correct.
 
+`search_e2e` and `ask_retrieval_core` must not be conflated. The former is a standalone,
+post-answer warm-store replay of each fresh product question through public `Memory.search`; it is
+the metric used by `retrieval_e2e_latency_p95` performance budgets. It does not claim to be the
+retrieval performed by the answer. `ask_retrieval_core` measures that real in-answer retrieval
+path. The old `performance.search` field remains only as a deprecated alias of
+`ask_retrieval_core`.
+
+`search_e2e.planned_count` is the number of eligible fresh product questions, including requests
+whose persisted unit could not be reopened. `attempt_count`, `success_count`, and `error_count`
+make that accounting explicit. `complete` is false when any planned replay lacks a successful
+measurement; such a run is `completed_with_errors` and cannot supply a
+`retrieval_e2e_latency_p95` regression comparison. Store-open time is setup and never enters a
+successful caller-latency observation.
+
+`asr.real_time_factor` is successful transcription compute seconds divided by the audio duration
+reported by the same successful calls, so lower is better and values below one are faster than real
+time. `asr.realtime_speedup` is the inverse. Both headline ratios are `null` unless every
+successful span reports a positive finite duration; `ratio_complete`, `ratio_call_count`, and the
+`reported_subset_*` ratios expose partial coverage without presenting it as complete. Failed-call
+latency remains visible in `inference_latency_ms` but cannot contaminate either ratio. Local FunASR
+uses the complete input audio-stream duration, including silence and tail, and counts the input
+again when an invalid batch reply triggers per-asset fallback inference. `invocation_count` counts
+transcription spans while `request_count` includes those internal fallback model calls;
+`call_count` remains a deprecated alias of `invocation_count`.
+
+Token totals are never estimated. `complete` covers total tokens, while input, output, cached
+input, and reasoning output each have their own `*_complete` flag. An unavailable component is
+`null`, not zero; its `reported_*` field is only the known lower bound. An incomplete per-call
+distribution has `average: null` and a separately named `retained_average`. Retrieval model usage
+is reported under `diagnostic.token_usage`; it is excluded from product nodes and
+`token_usage.product`, while judge usage stays visible in the top-level total and its own module.
+
+The run-level `resources` object has two attribution scopes:
+
+- client CPU uses process CPU time and the current CPU affinity; memory is the process-lifetime
+  resident high-water mark; storage growth is measured over the selected run directories;
+- local GPU utilization, memory, and power are sampled from `nvidia-smi`. Averages and energy use
+  time-weighted integration; peaks between polls may be missed. These are system-device readings,
+  not per-process values, and are marked non-exclusive.
+
+When `benchmark.server_metrics` supplies `/metrics` URLs, `resources.model_servers` records
+whitelisted vLLM counter and histogram deltas plus start/end gauges. Its window begins after the
+embedding warmup, includes product answers and the post-answer public-search replay, and ends
+before judging.
+Those metrics are process-global and explicitly warn that shared traffic may be included. If an
+endpoint is not configured or cannot be read, the artifact says `unavailable` rather than
+inventing remote GPU or server utilization. `storage.media_share` remains the fraction of storage
+growth due to source media.
+
 ## Mandatory controls
 
-A score is not interpretable on its own, so `results.json` reports three controls per task in a
+A score is not interpretable on its own, so `results.jsonl` reports three controls per task in a
 `controls` block and the console table renders each of them as its own column. Each of these has
 independently invalidated a conclusion on this project.
 
@@ -632,14 +729,14 @@ ranker over the same candidate pool, not a shuffled sample, so it adds no varian
 Measured recall and the random-ranker expectation are only available for tasks whose adapter
 carries gold evidence source IDs; when it does not, `retrieval.gold_evidence_key` is `null`,
 `retrieval.unavailable_reason` says so, and the controls are reported as missing rather than
-quietly omitted. `performance.token_usage` also carries a `product` block: the tokens MindBridge itself spent
-(embedding, generation, transcription, description), summed only over modules whose usage is
-complete. The console table prints those with a trailing `*` when the run total is null because the
-judge omitted usage on some requests; the cost axis needs the product number and it is measured.
-Recall scores the retriever's own ranked list, recorded per sample as
+quietly omitted. `performance.token_usage` also carries a `product` block: the tokens MindBridge
+itself spent (embedding, generation, transcription, description), summed only over modules whose
+usage is complete. The console table prints those with a trailing `*` when the run total is null
+because the judge omitted usage on some requests; the cost axis needs the product number and it is
+measured. Recall scores the retriever's own ranked list, recorded per sample as
 `ranked_source_ids` from a `search` at `RETRIEVAL_CANDIDATE_LIMIT`, never the evidence the
-generator cited; a labelled question whose run recorded no ranked list (a cached answer) is counted
-in `retrieval.unranked_labelled_question_count` instead of being scored as zero.
+generator cited. New response-cache entries preserve that list; a legacy cache entry without one
+is counted in `retrieval.unranked_labelled_question_count` instead of being scored as zero.
 
 ## Gold evidence per benchmark family
 
@@ -708,12 +805,12 @@ than that is inside the run-to-run noise band and is not a result. `--compare` r
 Each completed `eval` output directory contains:
 
 - `samples.jsonl`: one prediction and its native metrics, evidence intervals, retrieval diagnostics,
-  and structured failure fields per sample, per arm.
-- `results.json`: dataset and implementation pins, arm definitions, aggregate metrics, confidence
-  intervals, performance, token usage, abstentions, mandatory controls, the noise floor, resource
-  usage, and a digest of `samples.jsonl`.
-- `egomemreason_submission.json`: only for a complete, valid EgoMemReason run, from the
-  `mindbridge` arm.
+  `ranked_source_ids_complete`, and structured failure fields per sample, per arm.
+- `results.jsonl`: one aggregate record with dataset and implementation pins, arm definitions,
+  aggregate metrics, confidence intervals, performance, token usage, abstentions, mandatory
+  controls, the noise floor, resource usage, and a digest of `samples.jsonl`.
+- `egomemreason_submission.json`: the official JSON-array submission, only for a complete, valid
+  EgoMemReason run from the `mindbridge` arm.
 
 Three result fields carry a caveat that decides whether they can be quoted:
 
@@ -744,10 +841,12 @@ Three result fields carry a caveat that decides whether they can be quoted:
   a miss there is a retrieval failure. What the answer actually grounded on is separate:
   `evidence` is the answer's hits, and `dropped_hits` counts what the answerer's inline context
   budget removed. A gold that is in the candidate list but not in `evidence` is budget loss, not
-  retrieval loss. A replayed answer from `--use-cache` carries no retrieval metrics: the cache
-  stores answers, not candidate lists. `ref_at_300` stays a property of the answer's evidence.
+  retrieval loss. Current response-cache entries retain the ranked candidate IDs; legacy entries
+  that predate that field report the retrieval metric as unranked. `ref_at_300` stays a property of
+  the answer's evidence.
 
-`performance` is aggregated per task across every arm of that task, not per arm.
+`performance` is aggregated separately for each task and arm, and each task row carries only the
+measurements attributed to its own arm.
 
 Before reporting a number, check these task fields:
 
@@ -765,13 +864,15 @@ option as sensitive: benchmark artifacts can contain source content, retrieved e
 responses.
 
 The runner fixes seeds and generation temperature, records model endpoints and scorer protocols,
-and marks whether each metric used the required official judge. A provider may still change an
-unversioned model, so publishable runs should use immutable model identifiers and report hardware,
-dataset selection, retrieval limit, and whether the index was cold, warm, or optimized.
+and marks whether each metric used the required official judge. `measurement_protocol` records
+fresh-store state, actual embedding warmups, repeat index, cache exclusions, and uncontrolled
+remote-server state. A provider may still change an unversioned model, so publishable runs should
+use immutable model identifiers and report hardware, dataset selection, retrieval limit, and the
+measurement protocol.
 
 A quality claim has to identify the dataset and revision, the official split and evaluator, the
 input route, the model and runtime revisions, the retrieval settings, the hardware, and the
-measured latency and resource cost. `results.json` records each of those:
+measured latency and resource cost. `results.jsonl` records each of those:
 
 | Required field | Where it is recorded |
 | --- | --- |
@@ -782,7 +883,7 @@ measured latency and resource cost. `results.json` records each of those:
 | Retrieval settings | `recall_limit`, `tasks[].retrieval.recall_limit`, and the full `model.memory_config` dump |
 | Hardware | `environment.hardware` and the `resources` block |
 | Latency and resource cost | `tasks[].performance`, `tasks[].answer_latency_ms`, and `resources` |
-| Replay inputs | `run_id`, `seed`, `seeds`, `bootstrap_samples`, `limit`, `offset`, `batch_size`, `blind`, `blind_baseline`, `arms.ingest`, `arms.definitions.compile` |
+| Replay inputs | `run_id`, `seed`, `seeds`, `bootstrap_samples`, `repeat_index`, `measurement_protocol`, `limit`, `offset`, `batch_size`, `blind`, `blind_baseline`, `arms.ingest`, `arms.definitions.compile` |
 
 Scores are comparable only against runs of this harness at the same runner version, dataset
 revision, and scorer protocol. Every task row therefore carries `cross_harness_comparable: false`
@@ -817,6 +918,31 @@ mindbridge-bench eval \
 The comparison rejects incompatible dataset, scorer, or judge identities. Any answer or ingest
 failure also makes `--fail-on-regression` exit nonzero.
 
+Performance budgets use the same `--compare` artifact but apply only after stricter comparability
+checks: schema and runner, task/input digests, models and full memory composition, concurrency,
+warmup protocol, runtime versions, acceleration runtime, and hardware must match; neither result
+may use a response cache or contain a product or retrieval-diagnostic error.
+
+```bash
+mindbridge-bench eval \
+  --config docs/examples/baselines/rtx5090-qwen38-wemm9b-text.yaml \
+  --compare .benchmarks/results/rtx5090-text-r0 \
+  --performance-budget answer_e2e_ttft_p95=0.10 \
+  --performance-budget answer_e2e_latency_p95=0.10 \
+  --performance-budget retrieval_e2e_latency_p95=0.15 \
+  --performance-budget tokens_per_call=0.05 \
+  --performance-budget answer_throughput=0.10 \
+  --fail-on-regression \
+  --run-id rtx5090-text-candidate \
+  --output-path .benchmarks/results/rtx5090-text-candidate
+```
+
+The fraction is the maximum tolerated relative regression. Lower is better for latency and token
+budgets; higher is better for throughput. The rows are written to `performance_comparisons`, and a
+breach exits nonzero with `--fail-on-regression`. The same mapping can be stored under
+`benchmark.performance_budgets`; it requires `benchmark.run.compare` or `--compare`. A TTFT budget
+is rejected if either artifact's TTFT distribution is incomplete.
+
 Use `--use-cache .benchmarks/response-cache` to persist deterministic generation responses across
 isolated reruns. The cache is an optimization, not a substitute for the result artifacts.
 
@@ -834,10 +960,10 @@ uv run --frozen mindbridge-bench locomo-refined \
   --limit 1
 ```
 
-It writes the requested JSONL and a sibling `.manifest.json` containing dataset and prediction
-digests, model identities, counts, platform details, and relative isolated-store paths. Existing
-artifacts are protected unless `--overwrite` is passed; reuse of an existing run requires
-`--resume`.
+It writes the requested JSONL and a sibling `.manifest.jsonl` containing one manifest record with
+dataset and prediction digests, model identities, counts, platform details, and relative
+isolated-store paths. Existing artifacts are protected unless `--overwrite` is passed; reuse of an
+existing run requires `--resume`.
 
 ## Measure the local index
 

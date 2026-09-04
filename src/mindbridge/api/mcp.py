@@ -8,6 +8,7 @@ import logging
 from collections.abc import Callable, Mapping, Sequence
 from datetime import timedelta
 from functools import wraps
+from time import perf_counter_ns
 from typing import Annotated, Any, ParamSpec, TypeVar, cast
 from uuid import uuid4
 
@@ -15,7 +16,9 @@ from mcp.server import MCPServer
 from mcp.server.context import CallNext, HandlerResult, ServerMiddleware, ServerRequestContext
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
-from pydantic import AwareDatetime, BaseModel, Field, JsonValue, StringConstraints
+from opentelemetry import trace as otel_trace
+from opentelemetry.trace import SpanKind, StatusCode, Tracer
+from pydantic import AwareDatetime, BaseModel, Field, JsonValue, StringConstraints, field_validator
 
 from mindbridge import Memory
 from mindbridge.api.content import MAX_TEXT_CHARACTERS, Content, StrictModel, content_input
@@ -47,12 +50,13 @@ from mindbridge.types import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_MCP_TOTAL = "mindbridge.transport.server_total_ms"
 _Identifier = Annotated[str, StringConstraints(min_length=1, pattern=r"^\S(?:.*\S)?$")]
 _Limit = Annotated[int, Field(strict=True, ge=1, le=100)]
 _Cursor = Annotated[str, StringConstraints(min_length=1)]
 _Chars = Annotated[int, Field(strict=True, ge=1, le=MAX_TEXT_CHARACTERS)]
 _Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
-_Seconds = Annotated[float, Field(gt=0.0)]
+_Seconds = Annotated[float, Field(strict=True, gt=0.0, allow_inf_nan=False)]
 _Milliseconds = Annotated[int, Field(strict=True, ge=1)]
 # Zero is a real budget here -- a text-only bundle -- so this floor is not one.
 _MediaItems = Annotated[int, Field(strict=True, ge=0)]
@@ -316,6 +320,17 @@ class ContextBudgetInput(StrictModel):
     freshness_seconds: _Seconds | None = None
     max_latency_ms: _Milliseconds | None = None
 
+    @field_validator("freshness_seconds")
+    @classmethod
+    def validate_freshness_range(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            timedelta(seconds=value)
+        except OverflowError:
+            raise ValueError("freshness_seconds is outside the supported duration range") from None
+        return value
+
 
 class ContextBudgetResult(BaseModel):
     max_chars: int
@@ -390,6 +405,7 @@ def build_mcp_server(
     identity_operations: bool = True,
     embodied_operations: bool = True,
     write_operations: bool = True,
+    tracer: Tracer | None = None,
 ) -> MCPServer[None]:
     """Expose the typed agent tool surface without taking ownership of ``memory``.
 
@@ -430,7 +446,10 @@ def build_mcp_server(
             write_operations=write_operations,
         ),
         version="0.2.0",
-        middleware=[cast(ServerMiddleware[Any], _strict_tool_arguments)],
+        middleware=[
+            _request_telemetry(tracer or otel_trace.get_tracer("mindbridge.api.mcp")),
+            cast(ServerMiddleware[Any], _strict_tool_arguments),
+        ],
     )
 
     @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
@@ -1032,6 +1051,47 @@ async def _strict_tool_arguments(
             else _envelope("validation_error", "tool arguments are invalid", reason="input_invalid")
         )
     return result
+
+
+def _request_telemetry(tracer: Tracer) -> ServerMiddleware[Any]:
+    async def observe(
+        context: ServerRequestContext[Any, Any],
+        call_next: CallNext,
+    ) -> HandlerResult:
+        params = context.params or {}
+        attributes = {
+            "mindbridge.span.kind": "transport",
+            "rpc.system": "mcp",
+            "rpc.method": context.method,
+            "mindbridge.transport.response_mode": "buffered",
+        }
+        if context.method == "tools/call":
+            service = params.get("name")
+            if isinstance(service, str) and service in _TOOL_ARGUMENTS:
+                attributes["rpc.service"] = service
+        started = perf_counter_ns()
+        with tracer.start_as_current_span(
+            "mindbridge.mcp.request",
+            kind=SpanKind.SERVER,
+            attributes=attributes,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                result = await call_next(context)
+            except BaseException:
+                span.set_status(StatusCode.ERROR)
+                raise
+            finally:
+                span.set_attribute(_MCP_TOTAL, (perf_counter_ns() - started) / 1_000_000)
+            if (
+                isinstance(result, Mapping)
+                and (result.get("isError") is True or result.get("is_error") is True)
+            ) or getattr(result, "is_error", False) is True:
+                span.set_status(StatusCode.ERROR)
+            return result
+
+    return cast(ServerMiddleware[Any], observe)
 
 
 def _memory_result(record: MemoryRecord) -> MemoryResult:

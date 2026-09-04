@@ -1,0 +1,67 @@
+# Reference media profile for the RTX 5090 benchmark client.
+# ATM-Bench raw exercises image and video ingestion. EgoLifeQA adds video with audio, so the
+# FunASR path is measured as ASR rather than replaced by a caption-only/SGM variant.
+# Run from the repository root with OPENAI_API_KEY=EMPTY. No credential is stored here.
+
+embedding:
+  provider: openai
+  base_url: https://xyrobot-embed.xyrobot.com/v1
+  model: tencent/WeMM-Embedding-9B
+  dimension: 4096
+  modalities: [text, image, video]
+  request_format: messages
+  timeout: 300.0
+  max_retries: 3
+
+speech:
+  provider: funasr
+  device: cuda
+
+generation:
+  provider: openai
+  base_url: http://xyrobot-vl.xyrobot.com/v1
+  model: Qwen3.8-27B
+  modalities: [text, image, video]
+  timeout: 300.0
+  max_retries: 3
+  video_limit: 8
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+
+settings:
+  index_speech: true
+
+benchmark:
+  server_metrics:
+    generation_url: http://xyrobot-vl.xyrobot.com/metrics
+    embedding_url: https://xyrobot-embed.xyrobot.com/metrics
+    timeout_seconds: 5.0
+  judge:
+    model: Qwen3.8-27B
+    base_url: http://xyrobot-vl.xyrobot.com/v1
+    timeout_seconds: 300.0
+  download:
+    benchmarks_root: .benchmarks
+    data_root: .benchmarks/data
+  run:
+    tasks: atm-bench-main,egolifeqa
+    arms: mindbridge
+    limit: all
+    batch_size: "1"
+    max_batch_size: 1
+    unit_concurrency: 1
+    request_concurrency: 1
+    judge_concurrency: 1
+    recall_limit: 20
+    seed: [0, 1234, 1234, 1234]
+    bootstrap_samples: 2000
+    repeat_index: 0
+    device: cuda
+    device_lock: true
+    log_samples: true
+    predict_only: false
+    download: true
+    allow_unverified_data: false
+    overwrite: false
+    verbosity: INFO

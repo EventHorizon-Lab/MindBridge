@@ -2,7 +2,7 @@
 
 ## Surface
 
-The optional FastAPI adapter exposes twelve `Memory` operations under `/v1`, or twenty-two when
+The optional FastAPI adapter exposes thirteen `Memory` operations under `/v1`, or twenty-three when
 the host builds it with `identity_operations=True` and `embodied_operations=True`. It validates
 transport input, calls the injected synchronous memory, and serializes the public SDK values; it
 is not a separate storage or retrieval implementation.
@@ -52,7 +52,13 @@ app = create_app(memory=memory)
 ```
 
 ```text
-create_app(*, memory: Memory) -> fastapi.FastAPI
+create_app(
+    *,
+    memory: Memory,
+    identity_operations: bool = False,
+    embodied_operations: bool = False,
+    tracer: Tracer | None = None,
+) -> fastapi.FastAPI
 ```
 
 With the host running, the smallest write is:
@@ -125,6 +131,7 @@ SDK validator and error contract.
 | `GET /v1/memories/{memory_id}` | `getMemory` | non-empty path value | `200 MemoryResponse` |
 | `DELETE /v1/memories/{memory_id}` | `deleteMemory` | non-empty path value | `200 {"deleted":bool}` |
 | `POST /v1/answers` | `answer` | `AnswerRequest` | `200 AnswerResponse` |
+| `POST /v1/answers/stream` | `answerStream` | `AnswerRequest` | `200 text/event-stream` |
 | `POST /v1/context` | `compileContext` | `ContextRequest` | `200 ContextBundleResponse` |
 | `POST /v1/capture` | `captureMemory` | `MemoryCreate` | `201 MemoryResponse` |
 | `POST /v1/settle` | `settleCaptures` | `SettleRequest` | `200 {"settled":int}` |
@@ -164,11 +171,28 @@ Request fields and defaults are:
 | List query | `limit=100`; optional opaque `cursor` |
 
 All timestamps must include a timezone. An event end requires a start and must be later than it.
+`freshness_seconds` must be positive, finite, and small enough to represent as a Python
+`timedelta`; invalid values return the standard `validation_error` response.
 If a batch supplies a per-item array, it must contain exactly one value per content. Search event
 bounds are a half-open overlap filter; two bounds require `occurred_until > occurred_from`, and
 records without `occurred_at` do not match. Pass `next_cursor` back unchanged to continue listing.
 Time and role behavior is defined in
 [memory types, time, and decay](../memory-types-time-and-decay.md).
+
+`POST /v1/answers/stream` sends Server-Sent Events. Each incremental model delta is one
+`event: delta` carrying `{"text":"..."}`. The final `event: result` carries the complete
+`AnswerResponse`, including the grounded hits and abstention state. Concatenating delta text gives
+the final answer. The server waits for the first SDK chunk before committing the HTTP 200 response,
+so failures before generation still use the ordinary JSON error envelope and status code. After a
+delta has committed the response, a failure ends the stream with one `event: error` carrying that
+same envelope; a stream therefore always ends with either `result` or `error` unless its client
+disconnects.
+
+The REST adapter emits a `mindbridge.http.request` server span for every `/v1` request. It records
+server time to headers, first non-empty response body byte, total completion time, response bytes,
+status, the low-cardinality `http.route` template, and whether delivery was `buffered` or
+`streaming`. These are server-side transport times; client-to-server network latency remains the
+client's measurement.
 
 An input `context` is an optional typed observation. Its `place_id` is a trimmed symbolic place
 label independent of its metric `spatial` pose. `scope` is an optional retrieval filter:
@@ -397,7 +421,8 @@ one composition differently.
 
 ### Error envelope
 
-Every REST failure uses one flat JSON shape:
+Every REST failure before response streaming begins uses one flat JSON shape; a streaming `error`
+event carries the same object after HTTP 200 has been committed:
 
 ```json
 {
@@ -477,7 +502,6 @@ REST has no route for these Python operations:
 | Operation | Boundary |
 | --- | --- |
 | `add_stream` | Send each completed observation to `POST /v1/memories` |
-| `ask_stream` | Send `POST /v1/answers`, which returns the same grounded answer once it is complete |
 | `search_with_trace` | Send `POST /v1/memories/search` with `"explain": true` |
 | `register_speaker` | No route; has an [MCP tool](mcp.md#tools). REST names an identity, not a voice-only speaker |
 | `reindex`, `optimize` | Index maintenance an operator schedules |
@@ -508,9 +532,8 @@ the operations it gates, exactly as the table above describes for the operations
 turn on.
 
 Use the [Python SDK](python-sdk.md) in the owning process, or the MCP adapter where the table
-names a tool. Only `ask_stream` needs more than a route: incremental delivery needs a streaming
-response, so exposing it means choosing a wire format rather than binding an existing one. The
-rest are not REST limitations: the adapter runs in the process that owns `Memory`, so a route is
+names a tool. `ask_stream` is exposed as SSE at `POST /v1/answers/stream`. The remaining entries
+are not REST limitations: the adapter runs in the process that owns `Memory`, so a route is
 unwritten work rather than an impossibility.
 
 ### Input limits

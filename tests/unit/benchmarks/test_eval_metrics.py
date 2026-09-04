@@ -20,11 +20,13 @@ import pytest
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
 from mindbridge import AssetRef, ContextBudget, MemoryType, Modality, SearchHit
 from mindbridge._telemetry import (
     CAPTURE_TIME_TO_SEARCHABLE,
     MODEL_MODULE,
+    MODEL_REQUEST_COUNT,
     MODEL_TTFT,
     SPAN_KIND,
     TOKEN_AUDIO_SECONDS,
@@ -41,12 +43,15 @@ from mindbridge.benchmarks.eval_adapters import (
 from mindbridge.benchmarks.eval_cache import EvidenceInterval
 from mindbridge.benchmarks.eval_statistics import ScoredValue, percentile
 from mindbridge.benchmarks.eval_telemetry import (
+    BENCHMARK_ARM,
+    BENCHMARK_ARM_SPAN,
     BENCHMARK_COMPILE_CHARS,
     BENCHMARK_COMPILE_ITEMS,
     BENCHMARK_COMPILE_MEDIA_ITEMS,
     BENCHMARK_COMPILE_SPAN,
     BENCHMARK_INGEST_ITEMS,
     BENCHMARK_INGEST_SPAN,
+    BENCHMARK_JUDGE_SPAN,
     BENCHMARK_TASK,
     BENCHMARK_TASK_SPAN,
     SEARCH_SPAN,
@@ -65,15 +70,23 @@ def _span(
     kind: str = "stage",
     task: str = "fixture",
     attributes: Mapping[str, object] | None = None,
+    arm: str = "mindbridge",
+    error: bool = False,
 ) -> ReadableSpan:
     """Build the minimum ``ReadableSpan`` surface the span processor consumes."""
     return cast(
         ReadableSpan,
         SimpleNamespace(
             name=name,
-            attributes={BENCHMARK_TASK: task, SPAN_KIND: kind, **dict(attributes or {})},
+            attributes={
+                BENCHMARK_TASK: task,
+                BENCHMARK_ARM: arm,
+                SPAN_KIND: kind,
+                **dict(attributes or {}),
+            },
             start_time=int(start_ms * 1_000_000),
             end_time=int(end_ms * 1_000_000),
+            status=SimpleNamespace(status_code=StatusCode.ERROR if error else StatusCode.UNSET),
             get_span_context=lambda: None,
         ),
     )
@@ -119,6 +132,7 @@ def _sample(
         metadata={gold_key: list(gold), "unresolved_evidence_ids": list(unresolved)},
         evidence=tuple(EvidenceInterval(f"m-{name}", name, None, None) for name in sources),
         ranked_source_ids=tuple(sources),
+        ranked_source_ids_complete=True,
         metrics={"accuracy": score},
     )
 
@@ -159,15 +173,35 @@ def test_ingest_reports_durable_searchable_latency_and_sustained_throughput() ->
     assert ingest["span"] == BENCHMARK_INGEST_SPAN
     assert ingest["call_count"] == 2
     assert ingest["item_count"] == 8
-    # 300 ms of durable write time inside a 400 ms window: the two must not be interchanged.
+    # Throughput uses the union of successful intervals and excludes the 100 ms idle gap.
     assert cast(float, ingest["compute_seconds"]) == pytest.approx(0.3)
-    assert cast(float, ingest["wall_seconds"]) == pytest.approx(0.4)
-    assert cast(float, ingest["item_latency_ms"]) == pytest.approx(37.5)
-    assert cast(float, ingest["items_per_second"]) == pytest.approx(20.0)
+    assert cast(float, ingest["active_seconds"]) == pytest.approx(0.3)
+    assert ingest["item_latency_ms"] is None
+    assert cast(float, ingest["amortized_compute_ms_per_accepted_item"]) == pytest.approx(37.5)
+    assert cast(float, ingest["items_per_active_second"]) == pytest.approx(8 / 0.3)
     latency = cast(Mapping[str, object], ingest["call_latency_ms"])
     assert cast(float, latency["p50"]) == pytest.approx(150.0)
     assert "durable" in str(ingest["measures"])
     assert "outbox" in str(ingest["measures"])
+
+
+def test_task_duration_uses_interval_unions_for_concurrent_work() -> None:
+    result = _aggregate(
+        (
+            _span(BENCHMARK_ARM_SPAN, start_ms=0, end_ms=100, kind="benchmark"),
+            _span(BENCHMARK_ARM_SPAN, start_ms=50, end_ms=150, kind="benchmark"),
+            _span(BENCHMARK_JUDGE_SPAN, start_ms=200, end_ms=300, kind="model"),
+            _span(BENCHMARK_JUDGE_SPAN, start_ms=250, end_ms=400, kind="model"),
+        ),
+        question_count=2,
+    )
+
+    duration = cast(Mapping[str, object], result["duration_seconds"])
+    assert duration["mindbridge"] == pytest.approx(0.15)
+    assert duration["judge"] == pytest.approx(0.2)
+    assert duration["total"] == pytest.approx(0.35)
+    assert duration["average"] == pytest.approx(0.175)
+    assert duration["measured_question_count"] == 2
 
 
 async def test_ingest_traces_one_span_per_accepted_batch_with_its_item_count() -> None:
@@ -256,7 +290,11 @@ def test_asr_reports_audio_seconds_per_wall_second_and_inference_latency() -> No
                 start_ms=0,
                 end_ms=500,
                 kind="model",
-                attributes={MODEL_MODULE: "transcription", TOKEN_AUDIO_SECONDS: 5.0},
+                attributes={
+                    MODEL_MODULE: "transcription",
+                    MODEL_REQUEST_COUNT: 2,
+                    TOKEN_AUDIO_SECONDS: 5.0,
+                },
             ),
         )
     )
@@ -264,10 +302,63 @@ def test_asr_reports_audio_seconds_per_wall_second_and_inference_latency() -> No
     asr = cast(Mapping[str, object], result["asr"])
     assert cast(float, asr["audio_seconds"]) == pytest.approx(5.0)
     assert cast(float, asr["compute_seconds"]) == pytest.approx(0.5)
-    # Five seconds of audio transcribed in half a second of wall clock.
-    assert cast(float, asr["real_time_factor"]) == pytest.approx(10.0)
+    # Standard RTF is compute/audio; speedup is its reciprocal.
+    assert cast(float, asr["real_time_factor"]) == pytest.approx(0.1)
+    assert cast(float, asr["realtime_speedup"]) == pytest.approx(10.0)
     latency = cast(Mapping[str, object], asr["inference_latency_ms"])
     assert cast(float, latency["p99"]) == pytest.approx(500.0)
+
+
+def test_asr_hides_complete_ratio_when_a_successful_call_has_no_duration() -> None:
+    result = _aggregate(
+        (
+            _span(
+                "mindbridge.model.transcription",
+                start_ms=0,
+                end_ms=500,
+                kind="model",
+                attributes={
+                    MODEL_MODULE: "transcription",
+                    MODEL_REQUEST_COUNT: 2,
+                    TOKEN_AUDIO_SECONDS: 5.0,
+                },
+            ),
+            _span(
+                "mindbridge.model.transcription",
+                start_ms=500,
+                end_ms=1_500,
+                kind="model",
+                attributes={MODEL_MODULE: "transcription", MODEL_REQUEST_COUNT: 1},
+            ),
+            _span(
+                "mindbridge.model.transcription",
+                start_ms=1_500,
+                end_ms=2_000,
+                kind="model",
+                attributes={
+                    MODEL_MODULE: "transcription",
+                    MODEL_REQUEST_COUNT: 1,
+                    TOKEN_AUDIO_SECONDS: float("inf"),
+                },
+            ),
+        )
+    )
+
+    asr = cast(Mapping[str, object], result["asr"])
+    assert asr["invocation_count"] == 3
+    assert asr["request_count"] == 4
+    assert asr["call_count"] == 3
+    assert asr["success_count"] == 3
+    assert asr["ratio_call_count"] == 1
+    assert asr["audio_duration_missing_success_count"] == 2
+    assert asr["ratio_complete"] is False
+    assert cast(float, asr["audio_seconds"]) == pytest.approx(5.0)
+    assert cast(float, asr["compute_seconds"]) == pytest.approx(0.5)
+    assert cast(float, asr["successful_compute_seconds"]) == pytest.approx(2.0)
+    assert asr["real_time_factor"] is None
+    assert asr["realtime_speedup"] is None
+    assert cast(float, asr["reported_subset_real_time_factor"]) == pytest.approx(0.1)
+    assert cast(float, asr["reported_subset_realtime_speedup"]) == pytest.approx(10.0)
 
 
 def test_asr_block_is_absent_when_no_transcription_ran() -> None:
@@ -342,6 +433,32 @@ def test_resource_sampler_reports_cpu_memory_and_media_dominated_storage_growth(
     assert growth == {"media": 9_000, "rows": 0, "vectors": 1_000, "other": 0, "total": 10_000}
     assert cast(float, storage["media_share"]) == pytest.approx(0.9)
     assert resources["gpu"] is None
+
+
+def test_resource_sampler_reports_gpu_average_peak_power_and_estimated_energy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.eval_telemetry.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="0, 50, 1024, 200.5\n1, 25, 512, [N/A]\n",
+        ),
+    )
+
+    with ResourceSampler(interval_seconds=10.0) as sampler:
+        pass
+
+    resources = sampler.json(wall_seconds=99.0)
+    measurement = cast(Mapping[str, object], resources["measurement"])
+    assert measurement["scope"] == "client_process_and_system_devices"
+    assert cast(float, measurement["wall_seconds"]) < 99.0
+    gpu = cast(Mapping[str, Mapping[str, object]], resources["gpu"])
+    assert gpu["0"]["average_utilization_percent"] == 50.0
+    assert gpu["0"]["peak_memory_used_bytes"] == 1024 * 1_048_576
+    assert gpu["0"]["average_power_watts"] == 200.5
+    assert cast(float, gpu["0"]["estimated_energy_watt_hours"]) >= 0.0
+    assert gpu["1"]["average_power_watts"] is None
 
 
 def test_storage_bytes_separates_media_rows_and_vectors(tmp_path: Path) -> None:
@@ -927,7 +1044,7 @@ def _loaded_task(evaluation_sha256: str = "e" * 64) -> LoadedTask:
 
 
 def test_blind_baseline_is_read_from_a_blind_run_of_the_same_inputs(tmp_path: Path) -> None:
-    path = tmp_path / "results.json"
+    path = tmp_path / "results.jsonl"
     path.write_text(json.dumps(_blind_document()), encoding="utf-8")
 
     rows = eval_module._blind_baseline_rows(tmp_path, (_loaded_task(),))
@@ -937,7 +1054,7 @@ def test_blind_baseline_is_read_from_a_blind_run_of_the_same_inputs(tmp_path: Pa
 
 
 def test_blind_baseline_rejects_a_run_that_had_memory(tmp_path: Path) -> None:
-    path = tmp_path / "results.json"
+    path = tmp_path / "results.jsonl"
     path.write_text(json.dumps(_blind_document(blind=False)), encoding="utf-8")
 
     with pytest.raises(ValueError, match="--blind"):
@@ -945,7 +1062,7 @@ def test_blind_baseline_rejects_a_run_that_had_memory(tmp_path: Path) -> None:
 
 
 def test_blind_baseline_rejects_different_evaluation_inputs(tmp_path: Path) -> None:
-    path = tmp_path / "results.json"
+    path = tmp_path / "results.jsonl"
     path.write_text(json.dumps(_blind_document()), encoding="utf-8")
 
     with pytest.raises(ValueError, match="evaluation inputs differ"):
@@ -980,6 +1097,17 @@ def test_percentile_interpolates_and_reports_nothing_for_no_observations() -> No
     assert percentile((5.0,), 0.99) == pytest.approx(5.0)
 
 
+def test_scalar_metric_samples_do_not_truncate_late_observations() -> None:
+    samples = eval_telemetry_module._Samples()
+    for value in range(200_001):
+        samples.add(float(value))
+
+    result = samples.json()
+
+    assert result["count"] == 200_001
+    assert result["p99"] == pytest.approx(198_000.0)
+
+
 # --- reproducibility fields ------------------------------------------------------------------
 
 
@@ -1009,13 +1137,6 @@ def test_metric_breakdown_families_all_exist_in_the_single_family_table() -> Non
         "openeqa",
     ):
         assert family in known, family
-
-
-def test_hardware_and_runtime_revisions_are_recorded() -> None:
-    hardware = eval_module._hardware()
-
-    assert set(hardware) == {"machine", "processor", "logical_cores", "cuda_device_uuids"}
-    assert cast(int, hardware["logical_cores"]) >= 1
 
 
 def test_table_refuses_a_task_row_that_carries_no_controls() -> None:
@@ -1060,6 +1181,7 @@ def test_retrieval_recall_scores_the_ranked_list_not_the_cited_evidence() -> Non
     unranked = replace(
         _sample("q2", sources=("s1",), gold=("s1",), candidate_count=10),
         ranked_source_ids=(),
+        ranked_source_ids_complete=False,
     )
 
     retrieval = eval_module._retrieval_quality(

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from threading import Lock
@@ -21,9 +21,22 @@ TOKEN_REPORTED_REQUEST_COUNT = "mindbridge.token_usage.reported_request_count"
 TOKEN_TOTAL = "mindbridge.token_usage.total_tokens"
 TOKEN_COMPLETE = "mindbridge.token_usage.complete"
 TOKEN_AUDIO_SECONDS = "mindbridge.token_usage.audio_seconds"
+TOKEN_CACHED_INPUT = "gen_ai.usage.cache_read.input_tokens"
+TOKEN_REASONING_OUTPUT = "gen_ai.usage.reasoning.output_tokens"
+TOKEN_INPUT_COMPLETE = "mindbridge.token_usage.input_tokens.complete"
+TOKEN_OUTPUT_COMPLETE = "mindbridge.token_usage.output_tokens.complete"
+TOKEN_CACHED_INPUT_COMPLETE = "mindbridge.token_usage.cached_input_tokens.complete"
+TOKEN_REASONING_OUTPUT_COMPLETE = "mindbridge.token_usage.reasoning_output_tokens.complete"
 MODEL_TTFT = "mindbridge.model.time_to_first_token"
+OPERATION_TTFT = "mindbridge.operation.time_to_first_token_ms"
 GEN_AI_TTFC = "gen_ai.response.time_to_first_chunk"
 GEN_AI_FINISH_REASONS = "gen_ai.response.finish_reasons"
+GEN_AI_RESPONSE_MODEL = "gen_ai.response.model"
+GEN_AI_OPENAI_RESPONSE_SYSTEM_FINGERPRINT = "gen_ai.openai.response.system_fingerprint"
+MODEL_RESPONSE_MODELS = "mindbridge.model.response_models"
+MODEL_RESPONSE_SYSTEM_FINGERPRINTS = "mindbridge.model.response_system_fingerprints"
+EMBEDDING_TASK = "mindbridge.embedding.task"
+ASYNC_QUEUE_TIME = "mindbridge.async.queue_time_ms"
 CAPTURE_SETTLED = "mindbridge.capture.records_settled"
 CAPTURE_FAILED = "mindbridge.capture.records_failed"
 # The capture-to-searchable interval `docs/context-os.md` requires measured separately from the
@@ -61,9 +74,13 @@ class _ModelUsage:
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    reasoning_output_tokens: int | None = None
     input_by_modality: Mapping[str, int] = field(default_factory=dict)
     output_by_modality: Mapping[str, int] = field(default_factory=dict)
     audio_seconds: float | None = None
+    response_models: set[str] = field(default_factory=set)
+    response_system_fingerprints: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -75,8 +92,16 @@ class _OperationUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    cached_input_tokens: int = 0
+    reasoning_output_tokens: int = 0
     input_seen: bool = False
     output_seen: bool = False
+    cached_input_seen: bool = False
+    reasoning_output_seen: bool = False
+    input_complete: bool = True
+    output_complete: bool = True
+    cached_input_complete: bool = True
+    reasoning_output_complete: bool = True
     total_complete: bool = True
     input_by_modality: dict[str, int] = field(default_factory=dict)
     output_by_modality: dict[str, int] = field(default_factory=dict)
@@ -93,6 +118,20 @@ class _OperationUsage:
             if usage.output_tokens is not None:
                 self.output_tokens += usage.output_tokens
                 self.output_seen = True
+            if usage.cached_input_tokens is not None:
+                self.cached_input_tokens += usage.cached_input_tokens
+                self.cached_input_seen = True
+            if usage.reasoning_output_tokens is not None:
+                self.reasoning_output_tokens += usage.reasoning_output_tokens
+                self.reasoning_output_seen = True
+            if usage.expected_requests:
+                reported_all = usage.expected_requests == usage.reported_requests
+                self.input_complete &= reported_all and usage.input_tokens is not None
+                self.output_complete &= reported_all and usage.output_tokens is not None
+                self.cached_input_complete &= reported_all and usage.cached_input_tokens is not None
+                self.reasoning_output_complete &= (
+                    reported_all and usage.reasoning_output_tokens is not None
+                )
             self.total_tokens += usage.total_tokens or 0
             self.total_complete &= usage.reported_requests == 0 or usage.total_tokens is not None
             _sum_modalities(self.input_by_modality, usage.input_by_modality)
@@ -107,10 +146,34 @@ class _OperationUsage:
         span.set_attribute(TOKEN_COMPLETE, complete)
         if complete or (self.reported_requests and self.total_complete):
             span.set_attribute(TOKEN_TOTAL, self.total_tokens)
+        span.set_attribute(
+            TOKEN_INPUT_COMPLETE,
+            bool(self.expected_requests and self.input_seen and self.input_complete),
+        )
+        span.set_attribute(
+            TOKEN_OUTPUT_COMPLETE,
+            bool(self.expected_requests and self.output_seen and self.output_complete),
+        )
+        span.set_attribute(
+            TOKEN_CACHED_INPUT_COMPLETE,
+            bool(self.expected_requests and self.cached_input_seen and self.cached_input_complete),
+        )
+        span.set_attribute(
+            TOKEN_REASONING_OUTPUT_COMPLETE,
+            bool(
+                self.expected_requests
+                and self.reasoning_output_seen
+                and self.reasoning_output_complete
+            ),
+        )
         if self.input_seen:
             span.set_attribute("gen_ai.usage.input_tokens", self.input_tokens)
         if self.output_seen:
             span.set_attribute("gen_ai.usage.output_tokens", self.output_tokens)
+        if self.cached_input_seen:
+            span.set_attribute(TOKEN_CACHED_INPUT, self.cached_input_tokens)
+        if self.reasoning_output_seen:
+            span.set_attribute(TOKEN_REASONING_OUTPUT, self.reasoning_output_tokens)
         if self.audio_seconds:
             span.set_attribute(TOKEN_AUDIO_SECONDS, self.audio_seconds)
         _record_modalities(span, "input", self.input_by_modality)
@@ -145,6 +208,28 @@ _CURRENT_OPERATION_USAGE: ContextVar[_OperationUsage | None] = ContextVar(
 _CURRENT_FORMATION_REFUSALS: ContextVar[_FormationRefusals | None] = ContextVar(
     "mindbridge_formation_refusals", default=None
 )
+_RETRIEVAL_OBSERVER: ContextVar[Callable[[object], None] | None] = ContextVar(
+    "mindbridge_retrieval_observer", default=None
+)
+
+
+@contextmanager
+def _observe_retrieval_results(observer: Callable[[object], None]) -> Iterator[None]:
+    """Let an in-process benchmark observe the ranked list an answer already computed."""
+    token = _RETRIEVAL_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _RETRIEVAL_OBSERVER.reset(token)
+
+
+def _record_retrieval_results(results: object) -> None:
+    observer = _RETRIEVAL_OBSERVER.get()
+    if observer is None:
+        return
+    # Observability must not change a product answer; the harness marks the missing list.
+    with suppress(Exception):
+        observer(results)
 
 
 def token_modality_attribute(direction: str, modality: str) -> str:
@@ -210,16 +295,15 @@ def model_span(
     """Trace one model boundary and roll its final usage into the public operation."""
     with traced_span(tracer, name, attributes=attributes) as span:
         operation = _CURRENT_OPERATION_USAGE.get()
-        if operation is None:
-            yield span
-            return
         usage = _ModelUsage()
         token = _CURRENT_MODEL_USAGE.set(usage)
         try:
             yield span
         finally:
             try:
-                operation.add(usage)
+                _write_model_provenance(span, usage)
+                if operation is not None:
+                    operation.add(usage)
             finally:
                 _CURRENT_MODEL_USAGE.reset(token)
 
@@ -235,6 +319,8 @@ def mark_model_requests(count: int, *, token_usage_expected: int | None = None) 
         usage.input_tokens = None
         usage.output_tokens = None
         usage.total_tokens = None
+        usage.cached_input_tokens = None
+        usage.reasoning_output_tokens = None
         usage.input_by_modality = {}
         usage.output_by_modality = {}
         usage.audio_seconds = None
@@ -248,6 +334,13 @@ def mark_model_requests(count: int, *, token_usage_expected: int | None = None) 
     )
     span.set_attribute(TOKEN_REPORTED_REQUEST_COUNT, 0)
     span.set_attribute(TOKEN_COMPLETE, expected == 0)
+    for name in (
+        TOKEN_INPUT_COMPLETE,
+        TOKEN_OUTPUT_COMPLETE,
+        TOKEN_CACHED_INPUT_COMPLETE,
+        TOKEN_REASONING_OUTPUT_COMPLETE,
+    ):
+        span.set_attribute(name, False)
 
 
 def record_formation_refusals(count: int) -> None:
@@ -267,11 +360,33 @@ def current_model_request_count() -> int:
     return 0 if usage is None else usage.request_count
 
 
+def record_model_provenance(*, response_model: str | None, system_fingerprint: str | None) -> None:
+    """Attach every stable response identity without assigning a mixed batch to its last reply."""
+    model = None if response_model is None else response_model.strip()
+    fingerprint = None if system_fingerprint is None else system_fingerprint.strip()
+    usage = _CURRENT_MODEL_USAGE.get()
+    if usage is not None:
+        if model:
+            usage.response_models.add(model)
+        if fingerprint:
+            usage.response_system_fingerprints.add(fingerprint)
+        return
+    span = trace.get_current_span()
+    if model:
+        span.set_attribute(GEN_AI_RESPONSE_MODEL, model)
+        span.set_attribute(MODEL_RESPONSE_MODELS, (model,))
+    if fingerprint:
+        span.set_attribute(GEN_AI_OPENAI_RESPONSE_SYSTEM_FINGERPRINT, fingerprint)
+        span.set_attribute(MODEL_RESPONSE_SYSTEM_FINGERPRINTS, (fingerprint,))
+
+
 def record_model_usage(
     *,
     input_tokens: int | None,
     output_tokens: int | None,
     total_tokens: int | None,
+    cached_input_tokens: int | None = None,
+    reasoning_output_tokens: int | None = None,
     input_by_modality: Mapping[str, int] | None = None,
     output_by_modality: Mapping[str, int] | None = None,
     request_count: int = 1,
@@ -288,6 +403,8 @@ def record_model_usage(
         usage.input_tokens = input_tokens
         usage.output_tokens = output_tokens
         usage.total_tokens = total_tokens
+        usage.cached_input_tokens = cached_input_tokens
+        usage.reasoning_output_tokens = reasoning_output_tokens
         usage.input_by_modality = dict(input_by_modality or {})
         usage.output_by_modality = dict(output_by_modality or {})
         usage.audio_seconds = audio_seconds
@@ -302,12 +419,29 @@ def record_model_usage(
         expected_requests == reported_requests
         and (reported_requests == 0 or total_tokens is not None),
     )
+    components = (
+        (TOKEN_INPUT_COMPLETE, input_tokens),
+        (TOKEN_OUTPUT_COMPLETE, output_tokens),
+        (TOKEN_CACHED_INPUT_COMPLETE, cached_input_tokens),
+        (TOKEN_REASONING_OUTPUT_COMPLETE, reasoning_output_tokens),
+    )
+    for name, value in components:
+        span.set_attribute(
+            name,
+            bool(
+                expected_requests and expected_requests == reported_requests and value is not None
+            ),
+        )
     if input_tokens is not None:
         span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
     if output_tokens is not None:
         span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
     if total_tokens is not None:
         span.set_attribute(TOKEN_TOTAL, total_tokens)
+    if cached_input_tokens is not None:
+        span.set_attribute(TOKEN_CACHED_INPUT, cached_input_tokens)
+    if reasoning_output_tokens is not None:
+        span.set_attribute(TOKEN_REASONING_OUTPUT, reasoning_output_tokens)
     if audio_seconds is not None:
         span.set_attribute(TOKEN_AUDIO_SECONDS, audio_seconds)
     _record_modalities(span, "input", input_by_modality or {})
@@ -339,3 +473,19 @@ def _sum_modalities(target: dict[str, int], values: Mapping[str, int]) -> None:
     for modality, count in values.items():
         if modality in TOKEN_MODALITIES:
             target[modality] = target.get(modality, 0) + count
+
+
+def _write_model_provenance(span: Span, usage: _ModelUsage) -> None:
+    for scalar, plural, values in (
+        (GEN_AI_RESPONSE_MODEL, MODEL_RESPONSE_MODELS, usage.response_models),
+        (
+            GEN_AI_OPENAI_RESPONSE_SYSTEM_FINGERPRINT,
+            MODEL_RESPONSE_SYSTEM_FINGERPRINTS,
+            usage.response_system_fingerprints,
+        ),
+    ):
+        if not values:
+            continue
+        ordered = tuple(sorted(values))
+        span.set_attribute(scalar, ordered[0] if len(ordered) == 1 else "mixed")
+        span.set_attribute(plural, ordered)

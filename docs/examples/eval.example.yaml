@@ -150,8 +150,8 @@ settings:
 
 # =============================================================================================
 # Harness-only section. These have no field in `MindBridgeConfig` and must not gain one:
-# credentials are deliberately kept out of the product schema, and judging and corpus
-# acquisition exist only in the benchmark harness.
+# credentials are deliberately kept out of the product schema, and judging, corpus acquisition,
+# server observation, and regression budgets exist only in the benchmark harness.
 # =============================================================================================
 benchmark:
   # Nothing about the generation endpoint lives here -- not even the short-video floor, which is
@@ -165,6 +165,13 @@ benchmark:
     base_url: https://your-endpoint.example/v1
     api_key: replace-me
     timeout_seconds: 600
+
+  # Optional vLLM Prometheus endpoints. Deltas are process-global and therefore explicitly marked
+  # non-exclusive; leave either URL null when that server does not expose `/metrics`.
+  server_metrics:
+    generation_url: null
+    embedding_url: null
+    timeout_seconds: 5
 
   # Where corpora are read from and downloaded to.
   download:
@@ -180,6 +187,14 @@ benchmark:
     hf_endpoint: https://huggingface.co
     # Throttle between YouTube-sourced media fetches, in seconds.
     youtube_sleep_seconds: 30
+
+  # Optional maximum relative regressions. These require `run.compare` or `--compare`.
+  # performance_budgets:
+  #   answer_e2e_ttft_p95: 0.10
+  #   answer_e2e_latency_p95: 0.10
+  #   retrieval_e2e_latency_p95: 0.15
+  #   tokens_per_call: 0.05
+  #   answer_throughput: 0.10
 
   # Every run tunable the command line exposes, so one file can describe a whole sweep. A flag
   # still wins over anything here. Each key mirrors the flag of the same name; the value shown is
@@ -221,6 +236,8 @@ benchmark:
     # One integer, or three, or four. One value fills all four slots.
     seed: 0
     bootstrap_samples: 2000
+    # Zero-based label for this independent invocation; run at least three fresh-store repeats.
+    repeat_index: 0
 
     # Local model placement. `device` overrides the devices declared in the blocks above;
     # `device_lock` serialises pools that share one CUDA device.
@@ -255,7 +272,7 @@ benchmark:
     #   clbench: /corpus/clbench/custom.json
     # media_root:
     #   egolifeqa: /corpus/egolife/videos
-    # media_manifest: /corpus/.benchmarks/results/prepared/media-manifest.json
+    # media_manifest: /corpus/.benchmarks/results/prepared/media-manifest.jsonl
 
     # Zero-shot is the only supported setting for these benchmarks.
     num_fewshot: 0

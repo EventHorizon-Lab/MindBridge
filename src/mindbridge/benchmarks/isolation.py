@@ -23,11 +23,8 @@ class BenchmarkRun:
         self.benchmark = benchmark
         self.run_id = run_id
         self.resume = resume
-        self.relative_layout = Path(
-            _safe_component(benchmark, "benchmark"),
-            _safe_component(run_id, "run"),
-        )
-        self.path = self.data_root / self.relative_layout
+        self.path = self.path_for(self.data_root, benchmark, run_id)
+        self.relative_layout = self.path.relative_to(self.data_root)
 
         self.data_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.path.parent.mkdir(mode=0o700, exist_ok=True)
@@ -42,6 +39,15 @@ class BenchmarkRun:
                 raise FileExistsError(
                     f"benchmark run directory is not empty; pass resume=True to reuse it: {self.path}"
                 ) from None
+
+    @staticmethod
+    def path_for(data_root: str | Path, benchmark: str, run_id: str) -> Path:
+        """Return one run path without creating it, for scoped measurement and preflight."""
+        return (
+            Path(data_root).resolve()
+            / _safe_component(benchmark, "benchmark")
+            / _safe_component(run_id, "run")
+        )
 
     def unit_dir(self, unit_id: str) -> Path:
         """Atomically create and return one isolated unit data directory."""

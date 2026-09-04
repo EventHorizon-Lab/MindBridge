@@ -6,34 +6,49 @@ import json
 import os
 import stat
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Barrier, Event, Lock
+from time import sleep
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
 import mindbridge.benchmarks.eval as eval_module
+import mindbridge.benchmarks.eval_adapters as eval_adapters
 from mindbridge import MindBridgeConfig, Modality
+from mindbridge._telemetry import MODEL_MODULE, SPAN_KIND, mark_model_requests, model_span
 from mindbridge.benchmarks.atm_bench import ATM_BENCH_ADAPTER_VERSION
 from mindbridge.benchmarks.download import acquire_media
 from mindbridge.benchmarks.eval import _cache_task
-from mindbridge.benchmarks.eval_adapters import MediaResolver, load_task
+from mindbridge.benchmarks.eval_adapters import (
+    EvalQuestion,
+    EvalUnit,
+    MediaResolver,
+    MemoryItem,
+    load_task,
+)
 from mindbridge.benchmarks.eval_cache import (
     CachedAnswer,
     DescriptionCache,
     EvidenceInterval,
     ResponseCache,
 )
+from mindbridge.benchmarks.eval_telemetry import (
+    BENCHMARK_TASK,
+    BENCHMARK_TASK_SPAN,
+    EvaluationTelemetry,
+)
 from mindbridge.benchmarks.prepare_media import (
     _OPENEQA_FRAME_RATE,
     _egolife_manifest,
-    _lifelong_manifest,
+    _find_media,
     _m3_manifest,
     _openeqa_episode,
-    _openeqa_video,
+    _openeqa_segments,
     _segment_video,
     _selected_patterns,
     prepare_task_media,
@@ -132,6 +147,91 @@ def test_m3_timestamp_drives_preparation_without_before_clip(
     _m3_manifest(dataset, media, tmp_path / "cache", None, 0, None)
 
     assert observed == [10.0]
+
+
+def test_m3_manifest_reuses_one_lazy_nested_media_index(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dataset = tmp_path / "robot.json"
+    dataset.write_text(
+        json.dumps(
+            {
+                video_id: {
+                    "video_path": f"videos/{video_id}.mp4",
+                    "qa_list": [
+                        {
+                            "question": "Where?",
+                            "answer": "There.",
+                            "question_id": f"q-{video_id}",
+                            "type": ["recall"],
+                        }
+                    ],
+                }
+                for video_id in ("first", "second")
+            }
+        ),
+        encoding="utf-8",
+    )
+    media = tmp_path / "media"
+    for directory, name in (("one", "first.mov"), ("two", "second.webm")):
+        path = media / "nested" / directory / name
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"video")
+
+    original_rglob = Path.rglob
+    scans = 0
+
+    def rglob(path: Path, pattern: str) -> Iterator[Path]:
+        nonlocal scans
+        if path == media.resolve():
+            scans += 1
+            sleep(0.02)
+        return original_rglob(path, pattern)
+
+    monkeypatch.setattr(Path, "rglob", rglob)
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._PREPARATION_WORKERS", 2)
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._duration", lambda _path: 10.0)
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._segment_video",
+        lambda _source, boundaries, cache, _announce: (
+            (0.0, boundaries[-1], cache / "segment.mp4"),
+        ),
+    )
+
+    units = _m3_manifest(dataset, media, tmp_path / "cache", None, 0, None)
+
+    assert tuple(units) == ("first", "second")
+    assert scans == 1
+
+
+def test_media_lookup_keeps_direct_precedence_and_ambiguous_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    media = tmp_path / "media"
+    media.mkdir()
+    direct = media / "direct.mp4"
+    direct.write_bytes(b"direct")
+    for directory in ("one", "two"):
+        path = media / directory / "duplicate.mov"
+        path.parent.mkdir()
+        path.write_bytes(b"duplicate")
+
+    original_rglob = Path.rglob
+    scans = 0
+
+    def rglob(path: Path, pattern: str) -> Iterator[Path]:
+        nonlocal scans
+        scans += 1
+        return original_rglob(path, pattern)
+
+    monkeypatch.setattr(Path, "rglob", rglob)
+
+    assert _find_media(media, "missing/direct.mp4") == direct.resolve()
+    assert scans == 0
+    with pytest.raises(FileNotFoundError) as error:
+        _find_media(media, "duplicate.mp4")
+    assert str(error.value) == f"expected one of duplicate.mp4 under {media}"
+    assert scans == 1
 
 
 def test_egolife_ingests_reencoded_segments_at_the_declared_causal_window(
@@ -302,13 +402,24 @@ def test_response_cache_merges_run_shards_into_the_shared_cache(tmp_path: Path) 
         (EvidenceInterval("memory-1", "clip-1", 300.0, 420.0),),
         True,
         "insufficient_evidence",
+        ("clip-1", "clip-2"),
     )
     first = ResponseCache(tmp_path / "responses", "run-a", "namespace")
     first.put("task", "unit", "question", answer)
+    first.put("task", "unit", "empty-ranked", CachedAnswer("B", 0.5, (), ranked_source_ids=()))
+    first.put("task", "unit", "unrecorded-ranked", CachedAnswer("C", 0.5, ()))
     assert first.get("task", "unit", "question") == answer
+    empty_ranked = first.get("task", "unit", "empty-ranked")
+    unrecorded_ranked = first.get("task", "unit", "unrecorded-ranked")
+    assert empty_ranked is not None and empty_ranked.ranked_source_ids == ()
+    assert unrecorded_ranked is not None and unrecorded_ranked.ranked_source_ids is None
 
     second = ResponseCache(tmp_path / "responses", "run-b", "namespace")
     assert second.get("task", "unit", "question") == answer
+    empty_ranked = second.get("task", "unit", "empty-ranked")
+    unrecorded_ranked = second.get("task", "unit", "unrecorded-ranked")
+    assert empty_ranked is not None and empty_ranked.ranked_source_ids == ()
+    assert unrecorded_ranked is not None and unrecorded_ranked.ranked_source_ids is None
     second.close()
     first.close()
 
@@ -316,6 +427,36 @@ def test_response_cache_merges_run_shards_into_the_shared_cache(tmp_path: Path) 
     assert (tmp_path / "responses" / "runs" / "run-a" / "cache.db").is_file()
     if os.name == "posix":
         assert stat.S_IMODE((tmp_path / "responses" / "cache.db").stat().st_mode) == 0o600
+
+
+def test_response_cache_write_uses_the_selected_arm_namespace() -> None:
+    calls: list[tuple[str, str, str, CachedAnswer]] = []
+    cache = SimpleNamespace(put=lambda *values: calls.append(cast(Any, values)))
+    task = cast(
+        Any,
+        SimpleNamespace(
+            spec=SimpleNamespace(name="fixture", adapter_version="v1"),
+            evaluation_sha256="e" * 64,
+        ),
+    )
+    unit = EvalUnit(
+        "unit",
+        (),
+        (EvalQuestion("question", ("Question?",), references=("Answer",)),),
+    )
+    outcome = eval_module._AnswerOutcome("Answer", 1.0, 0.5, (), ())
+
+    eval_module._cache_outcome(
+        cast(Any, cache),
+        task,
+        unit,
+        unit.questions[0],
+        outcome,
+        0,
+        arm=eval_module._Arm("blind"),
+    )
+
+    assert calls[0][0] == f"blind:fixture:v1:{'e' * 64}"
 
 
 def test_lifelong_preparation_builds_one_ordered_segment_timeline(
@@ -326,11 +467,34 @@ def test_lifelong_preparation_builds_one_ordered_segment_timeline(
     for name in ("first.mp4", "second.mp4"):
         (media / name).write_bytes(b"video")
 
+    started = Barrier(2)
+    second_finished = Event()
+    callback_lock = Lock()
+    announcements: list[str] = []
+
+    def announce(message: str) -> None:
+        assert callback_lock.acquire(blocking=False)
+        try:
+            sleep(0.02)
+            announcements.append(message)
+        finally:
+            callback_lock.release()
+
     def segments(
         source: Path, cache: Path, _announce: object
     ) -> tuple[tuple[float, float, Path], ...]:
-        return ((0.0, 12.0, cache / source.name),)
+        started.wait(timeout=5)
+        assert callable(_announce)
+        _announce(source.name)
+        if source.stem == "first":
+            assert second_finished.wait(timeout=5)
+            duration = 12.0
+        else:
+            duration = 7.0
+            second_finished.set()
+        return ((0.0, duration, cache / source.name),)
 
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._PREPARATION_WORKERS", 2)
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._segments", segments)
     spec = TaskSpec(
         "mm-lifelong-fixture",
@@ -340,12 +504,109 @@ def test_lifelong_preparation_builds_one_ordered_segment_timeline(
         "owner/repo",
         "0" * 40,
         variant="day_test",
+        media_source=MediaSource("fixture-media"),
     )
 
-    manifest = _lifelong_manifest(spec, media, tmp_path / "cache", None)
-    parts = manifest["day_test"]
+    manifest = prepare_task_media(
+        spec,
+        root=tmp_path,
+        dataset_path=tmp_path / "fixture.json",
+        media_root=media,
+        manifest=None,
+        limit=None,
+        offset=0,
+        download=False,
+        announce=announce,
+    )
+    assert isinstance(manifest, dict)
+    units = cast(dict[str, list[dict[str, object]]], manifest["units"])
+    parts = units["day_test"]
+    assert set(announcements) == {"first.mp4", "second.mp4"}
     assert [part["start_seconds"] for part in parts] == [0.0, 12.0]
-    assert [part["end_seconds"] for part in parts] == [12.0, 24.0]
+    assert [part["end_seconds"] for part in parts] == [12.0, 19.0]
+
+
+def test_memory_digest_hashes_unique_media_in_parallel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    units = (
+        EvalUnit(
+            "unit",
+            (
+                MemoryItem("m1", ("before", first, first), end_seconds=1),
+                MemoryItem("m2", (second, "after"), start_seconds=1, end_seconds=2),
+            ),
+            (EvalQuestion("q", ("question",), ("answer",)),),
+        ),
+    )
+    original = eval_adapters.dataset_digest
+    started = Barrier(2)
+    hashed: list[Path] = []
+
+    def digest(path: Path) -> str:
+        hashed.append(path)
+        started.wait(timeout=5)
+        return original(path)
+
+    monkeypatch.setattr(eval_adapters, "_DIGEST_WORKERS", 8)
+    monkeypatch.setattr(eval_adapters, "dataset_digest", digest)
+
+    assert eval_adapters._memory_digest(units) == (
+        "462ce4676f3654f23dc20cfc81e743cb1830993c35cddb74c8af3b32ffa33623"
+    )
+    assert len(hashed) == 2
+    assert set(hashed) == {first.resolve(), second.resolve()}
+
+
+def test_directory_dataset_files_are_hashed_once_for_digest_and_layout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dataset = tmp_path / "dataset"
+    nested = dataset / "nested"
+    nested.mkdir(parents=True)
+    first = dataset / "a.txt"
+    second = nested / "b.txt"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    unit = EvalUnit(
+        "unit",
+        (),
+        (EvalQuestion("question", ("question",), ("answer",)),),
+    )
+    spec = TaskSpec(
+        "directory-fixture",
+        "Directory fixture",
+        "unused",
+        "v1",
+        "owner/repository",
+        "0" * 40,
+    )
+    monkeypatch.setitem(eval_adapters._LOADERS, spec.name, lambda *_args: (unit,))
+    original = eval_adapters.dataset_digest
+    started = Barrier(2)
+    hashed: list[Path] = []
+
+    def digest(path: Path) -> str:
+        hashed.append(path)
+        started.wait(timeout=5)
+        return original(path)
+
+    monkeypatch.setattr(eval_adapters, "_DIGEST_WORKERS", 2)
+    monkeypatch.setattr(eval_adapters, "dataset_digest", digest)
+
+    task = load_task(spec, root=tmp_path, dataset_path=dataset, verify_digest=False)
+
+    assert task.dataset_sha256 == "957e03e392a5b9f4efceb24cdfa3dadba11bca984f69efe831f98c0895e809a7"
+    assert task.input_sha256["dataset"] == task.dataset_sha256
+    assert task.input_sha256["dataset_layout"] == (
+        "13493870aedff78add88215a34482b96d932994f8bd5bb3666d669c1d097bac6"
+    )
+    assert len(hashed) == 2
+    assert set(hashed) == {first, second}
 
 
 def test_single_boundary_segmentation_avoids_the_segment_muxer(
@@ -462,7 +723,7 @@ def _openeqa_episode_frames(episode: Path, *names: str) -> Path:
     return episode
 
 
-def test_openeqa_encodes_episode_frames_at_one_frame_per_second(
+def test_openeqa_encodes_episode_frames_directly_into_causal_segments(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     episode = _openeqa_episode_frames(
@@ -477,25 +738,26 @@ def test_openeqa_encodes_episode_frames_at_one_frame_per_second(
 
     def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
         commands.append(tuple(command))
-        # Read the concat list while it still exists: it lives in a working
-        # directory the encoder removes once the output is in place.
         listings.append(Path(command[command.index("-i") + 1]).read_text(encoding="utf-8"))
-        Path(command[-1]).write_bytes(b"episode")
+        Path(command[-1]).write_bytes(b"segment")
 
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._run_ffmpeg", run)
 
-    video = _openeqa_video(episode, tmp_path / "cache", None)
+    segments = _openeqa_segments(episode, tmp_path / "cache", None)
 
-    assert video.read_bytes() == b"episode"
+    assert [(start, end) for start, end, _path in segments] == [(0.0, 3.0)]
+    assert segments[0][2].read_bytes() == b"segment"
     command = commands[0]
-    # Upstream publishes no evaluation encoding; 1 fps is the rate at which the
-    # segmenter's own `fps=1` filter becomes an identity step.
     assert _OPENEQA_FRAME_RATE == 1
     assert command[command.index("-r") + 1] == "1"
-    # Frame extractions are not guaranteed to have even dimensions, which
-    # `yuv420p` requires.
-    assert command[command.index("-vf") + 1] == "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    assert command[command.index("-t") + 1] == "3.000"
+    video_filter = command[command.index("-vf") + 1]
+    assert video_filter.startswith("fps=1:eof_action=pass,")
+    assert "min(640\\,iw)" in video_filter
+    assert command[command.index("-c:v") + 1] == "libx264"
+    assert command[command.index("-tune") + 1] == "zerolatency"
     assert command[command.index("-f") + 1] == "concat"
+    assert "-segment_times" not in command
 
     listing = listings[0]
     entries = [line for line in listing.splitlines() if line.startswith("file ")]
@@ -510,14 +772,51 @@ def test_openeqa_encodes_episode_frames_at_one_frame_per_second(
     ]
     assert listing.count("duration 1.000000") == 3
 
-    # A second call reuses the encode rather than paying for it again.
-    assert _openeqa_video(episode, tmp_path / "cache", None) == video
+    # A second call reuses the final segments rather than rebuilding an episode video.
+    assert _openeqa_segments(episode, tmp_path / "cache", None) == segments
     assert len(commands) == 1
 
     # Adding a frame changes the cache key, because the extraction changed.
     (episode / "00011-rgb.png").write_bytes(b"frame")
-    assert _openeqa_video(episode, tmp_path / "cache", None) != video
+    assert _openeqa_segments(episode, tmp_path / "cache", None) != segments
     assert len(commands) == 2
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "ends"),
+    (
+        (75, (30.0, 60.0, 75.0)),
+        (180, (30.0, 60.0, 90.0, 120.0, 150.0, 180.0)),
+    ),
+)
+def test_openeqa_segments_keep_every_frame_at_thirty_second_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    frame_count: int,
+    ends: tuple[float, ...],
+) -> None:
+    episode = tmp_path / "episode"
+    episode.mkdir()
+    for index in range(frame_count):
+        (episode / f"{index:05d}-rgb.png").write_bytes(b"frame")
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
+
+    def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
+        assert command[command.index("-segment_times") + 1] == ",".join(
+            f"{end:.3f}" for end in ends[:-1]
+        )
+        assert "fps=1:eof_action=pass" in command[command.index("-vf") + 1]
+        output = Path(command[-1])
+        for index in range(len(ends)):
+            Path(str(output).replace("%05d", f"{index:05d}")).write_bytes(b"segment")
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._run_ffmpeg", run)
+
+    segments = _openeqa_segments(episode, tmp_path / "cache", None)
+
+    assert tuple(end for _start, end, _path in segments) == ends
 
 
 def test_openeqa_media_root_accepts_either_frames_layout(tmp_path: Path) -> None:
@@ -543,7 +842,7 @@ def test_openeqa_refuses_frame_paths_it_cannot_quote(
     # An operator-supplied media root reaches ffmpeg's concat list verbatim, so
     # a quote there would silently truncate the frame list.
     with pytest.raises(ValueError, match="not safe to encode"):
-        _openeqa_video(episode, tmp_path / "cache", None)
+        _openeqa_segments(episode, tmp_path / "cache", None)
 
 
 def test_openeqa_selected_patterns_name_the_frames_an_operator_must_supply(
@@ -676,10 +975,6 @@ def test_openeqa_accepts_episode_histories_already_in_the_managed_root(
         "mindbridge.benchmarks.prepare_media._run_ffmpeg",
         lambda command, _source: Path(command[-1]).write_bytes(b"episode"),
     )
-    monkeypatch.setattr(
-        "mindbridge.benchmarks.prepare_media._segments",
-        lambda source, cache, announce: ((0.0, 2.0, source),),
-    )
 
     # Frames extracted into the catalog's own media root are enough on their
     # own, so `--media-root` is a convenience rather than the only way to run.
@@ -759,6 +1054,61 @@ def test_a_cached_description_is_reused_instead_of_described_again(tmp_path: Pat
     assert (cache.hits, cache.misses) == (3, 2)
 
 
+def test_description_cache_tracks_only_actual_model_misses(tmp_path: Path) -> None:
+    first_input = _description_input(tmp_path, "a" * 64)
+    second_input = _description_input(tmp_path, "b" * 64)
+    backend = _CountingDescriber()
+    cache = DescriptionCache(tmp_path / "descriptions.db", backend.vision_model)
+    telemetry = EvaluationTelemetry()
+    try:
+        describer = eval_module._CachedVisionDescriber(cast(Any, backend), cache)
+        assert describer.describe((first_input,)) == ("caption for aaaa",)
+        with telemetry.tracer.start_as_current_span(
+            BENCHMARK_TASK_SPAN,
+            attributes={BENCHMARK_TASK: "fixture", SPAN_KIND: "benchmark"},
+        ):
+            with model_span(
+                telemetry.tracer,
+                "mindbridge.model.vision",
+                attributes={
+                    SPAN_KIND: "model",
+                    MODEL_MODULE: "vision",
+                    "mindbridge.model.batch_size": 2,
+                    "mindbridge.input.modalities": ("image",),
+                },
+            ):
+                mark_model_requests(1)
+                assert describer.describe((first_input, second_input)) == (
+                    "caption for aaaa",
+                    "caption for bbbb",
+                )
+            with model_span(
+                telemetry.tracer,
+                "mindbridge.model.vision",
+                attributes={
+                    SPAN_KIND: "model",
+                    MODEL_MODULE: "vision",
+                    "mindbridge.model.batch_size": 2,
+                    "mindbridge.input.modalities": ("image",),
+                },
+            ):
+                mark_model_requests(1)
+                describer.describe((first_input, second_input))
+        performance = telemetry.result("fixture", question_count=1)
+    finally:
+        telemetry.close()
+        cache.close()
+
+    vision = cast(
+        dict[str, object], cast(dict[str, object], performance["nodes"])["mindbridge.model.vision"]
+    )
+    breakdown = cast(list[dict[str, object]], vision["breakdown"])
+    assert vision["count"] == 1
+    assert breakdown[0]["batch_size"] == 1
+    assert breakdown[0]["modalities"] == ("image",)
+    assert backend.calls == 2
+
+
 def test_a_description_cache_is_shared_across_unit_worker_threads(tmp_path: Path) -> None:
     """One cache serves every unit worker of a run, so it must accept calls from any thread.
 
@@ -801,7 +1151,7 @@ def test_a_description_cache_survives_the_process_that_wrote_it(tmp_path: Path) 
     finally:
         reopened.close()
 
-    # Same corpus, later run, zero description tokens, and the identical document.
+    # Reopening the same run shard reuses the identical document without another request.
     assert repeated == ("caption for cccc",)
     assert second_backend.calls == 0
 
@@ -838,7 +1188,12 @@ def test_the_description_cache_is_opened_only_for_a_configured_vision_slot(
     tmp_path: Path,
 ) -> None:
     arguments = cast(
-        Any, SimpleNamespace(data_root=tmp_path, use_cache=tmp_path / "cache" / "run.db")
+        Any,
+        SimpleNamespace(
+            data_root=tmp_path,
+            use_cache=tmp_path / "cache" / "run.db",
+            run_id="run-one",
+        ),
     )
     embedding = {"provider": "openai", "model": "tiny-test", "dimension": 4}
     without = MindBridgeConfig.model_validate({"data_dir": tmp_path, "embedding": embedding})
@@ -848,12 +1203,13 @@ def test_the_description_cache_is_opened_only_for_a_configured_vision_slot(
 
     assert eval_module._description_cache_path(arguments, None) is None
     assert eval_module._description_cache_path(arguments, without) is None
-    # Beside the response cache, and deliberately not namespaced by run: a later run has to read
-    # what an earlier one wrote.
+    # Shared across units in this run, but a later repeat must execute the same model workload.
     assert eval_module._description_cache_path(arguments, described) == (
-        tmp_path / "cache" / "descriptions.db"
+        tmp_path / "cache" / "run-one" / "descriptions.db"
     )
-    no_response_cache = cast(Any, SimpleNamespace(data_root=tmp_path, use_cache=None))
+    no_response_cache = cast(
+        Any, SimpleNamespace(data_root=tmp_path, use_cache=None, run_id="run-two")
+    )
     assert eval_module._description_cache_path(no_response_cache, described) == (
-        tmp_path / "cache" / "descriptions.db"
+        tmp_path / "cache" / "run-two" / "descriptions.db"
     )

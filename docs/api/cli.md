@@ -181,6 +181,9 @@ a configuration that has a [`retention` section](../configuration.md#retention-p
 deliberately has no flag for the ages: a policy that deletes should be reviewable in a file, not
 retyped on each invocation.
 
+`--freshness-seconds` must be positive, finite, and representable as a Python `timedelta`; invalid
+values use the CLI's `validation_error` exit status without sending a remote request.
+
 `forget` is cognitive forgetting, reversible with `rollback`; `delete` is erasure. With the
 default `reinforce_on_answer=True`, `ask` also reinforces the hits the answerer cites; use
 `--app` to construct a memory with that policy disabled.
