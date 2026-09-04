@@ -264,6 +264,7 @@ arguments, schemas, limits, and errors.
 | Search | `search` | `POST /v1/memories/search` | `search_memories` | `search` |
 | Explain search | `search_with_trace` | Search with `explain=true` | Search with `explain=true` | `search-with-trace` |
 | Answer | `ask` | `POST /v1/answers` | `ask_memory` | `ask` |
+| Answer incrementally | `ask_stream` | — | — | — |
 | Compile context | `compile` | `POST /v1/context` | `compile_context` | `compile` |
 | Get by ID | `get` | `GET /v1/memories/{memory_id}` | `get_memory` | `get` |
 | List newest | `list` | `GET /v1/memories` | `list_memories` | `list` |

@@ -64,6 +64,7 @@ from mindbridge.models.base import (
     SpeakerEmbedding,
     SpeechAnalysis,
     SpeechTurn,
+    StreamingGenerationBackend,
 )
 from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.types import (
@@ -4176,6 +4177,211 @@ def test_no_hit_ask_routes_media_and_cannot_accept_fabricated_hits(tmp_path: Pat
     assert models.answer_calls[-1][0].modalities == {Modality.TEXT}
 
 
+class _CountingStreamer(_FakeModels):
+    """A streaming answerer that reports how far the caller has pulled."""
+
+    generation_model = "fake-streaming-generation"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.emitted: list[str] = []
+
+    def stream_answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+    ) -> Generator[str, None, tuple[SearchHit, ...]]:
+        del question
+        for part in ("the red ", "toolbox is ", "on the bench"):
+            self.emitted.append(part)
+            yield part
+        return tuple(hits[:1])
+
+
+def test_ask_stream_yields_deltas_then_the_result_ask_would_have_returned(
+    tmp_path: Path,
+) -> None:
+    models = _CountingStreamer()
+    with _memory(tmp_path, models) as memory:
+        memory.add("the red toolbox is on the bench")
+        memory.add("the blue crate is in bay three")
+
+        chunks = list(memory.ask_stream("where is the red toolbox?"))
+        buffered = memory.ask("where is the red toolbox?")
+
+    deltas = [chunk.text for chunk in chunks if chunk.result is None]
+    finals = [chunk.result for chunk in chunks if chunk.result is not None]
+    assert deltas == ["the red ", "toolbox is ", "on the bench"]
+    # Exactly one terminal chunk, and it is the whole `ask()` contract: answer, grounding,
+    # and abstention, not just the joined text.
+    assert len(finals) == 1
+    assert "".join(deltas) == finals[0].answer == buffered.answer
+    assert [hit.id for hit in finals[0].hits] == [hit.id for hit in buffered.hits]
+    assert finals[0].abstained is buffered.abstained is False
+
+
+def test_ask_stream_delivers_each_delta_before_the_next_is_produced(tmp_path: Path) -> None:
+    models = _CountingStreamer()
+    with _memory(tmp_path, models) as memory:
+        memory.add("the red toolbox is on the bench")
+
+        stream = memory.ask_stream("where is the red toolbox?")
+        first = next(stream)
+
+        # The point of the operation: the caller holds text while the model is still producing.
+        assert first.text == "the red "
+        assert models.emitted == ["the red "]
+        stream.close()
+
+
+def test_ask_stream_yields_one_delta_when_the_backend_does_not_stream(tmp_path: Path) -> None:
+    models = _FakeModels()
+    assert not isinstance(models, StreamingGenerationBackend)
+    with _memory(tmp_path, models) as memory:
+        memory.add("the red toolbox is on the bench")
+
+        chunks = list(memory.ask_stream("where is the red toolbox?"))
+
+    deltas = [chunk.text for chunk in chunks if chunk.result is None]
+    finals = [chunk.result for chunk in chunks if chunk.result is not None]
+    assert len(deltas) == 1
+    assert deltas[0] == finals[0].answer
+
+
+def test_ask_stream_reinforces_before_it_hands_over_the_result(tmp_path: Path) -> None:
+    models = _CountingStreamer()
+    with _memory(tmp_path, models) as memory:
+        record = memory.add("the red toolbox is on the bench")
+
+        stream = memory.ask_stream("where is the red toolbox?")
+        next(stream)
+        mid = memory._store.read_memory(record.id)
+        assert mid is not None and mid.access_count == 0
+
+        result = next(chunk.result for chunk in stream if chunk.result is not None)
+        settled = memory._store.read_memory(record.id)
+
+        # Stopping on the terminal chunk is how a result is read, and a generator stays
+        # suspended wherever the caller stops. Nothing may still be open there, or every
+        # ordinary caller would pin an operation and hang `close()`.
+        assert memory._active_operations == 0
+
+    # A caller holding the result holds a settled store, so reading access counts straight
+    # after the answer cannot race the reinforcement the answer caused.
+    assert [hit.id for hit in result.hits] == [record.id]
+    assert settled is not None and settled.access_count == 1
+
+
+def test_ask_stream_validates_before_it_is_iterated(tmp_path: Path) -> None:
+    with _memory(tmp_path) as memory:
+        memory.add("the red toolbox is on the bench")
+
+        # A generator that defers validation to the first pull would report a bad limit from
+        # somewhere other than the call that made the mistake.
+        with pytest.raises(ValidationError, match="limit must be between 1 and 100"):
+            memory.ask_stream("where is it?", limit=0)
+
+
+def test_ask_stream_without_answerer_fails_at_the_call(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with Memory(tmp_path, embedder=models) as memory:
+        memory.add("the red toolbox is on the bench")
+
+        with pytest.raises(ModelError, match="answer backend is not configured") as unconfigured:
+            memory.ask_stream("where is it?")
+        assert unconfigured.value.reason == "backend_not_configured"
+
+
+def test_abandoning_ask_stream_releases_the_operation_it_holds(tmp_path: Path) -> None:
+    models = _CountingStreamer()
+    memory = _memory(tmp_path, models)
+    try:
+        memory.add("the red toolbox is on the bench")
+
+        stream = memory.ask_stream("where is the red toolbox?")
+        next(stream)
+        assert memory._active_operations == 1
+
+        # `close()` waits on open operations, so a stream that pinned one would hang shutdown
+        # rather than fail a test.
+        stream.close()
+        assert memory._active_operations == 0
+    finally:
+        memory.close()
+
+
+def test_abandoning_ask_stream_closes_the_generation_stream_inside_the_operation(
+    tmp_path: Path,
+) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    closed: list[bool] = []
+
+    class ClosingStreamer(_CountingStreamer):
+        def stream_answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+        ) -> Generator[str, None, tuple[SearchHit, ...]]:
+            try:
+                yield from super().stream_answer(question, hits)
+            finally:
+                # Where a real adapter releases the provider's streaming response.
+                closed.append(True)
+            return tuple(hits[:1])
+
+    models = ClosingStreamer()
+    memory = Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        tracer=provider.get_tracer("test"),
+    )
+    try:
+        memory.add("the red toolbox is on the bench")
+        stream = memory.ask_stream("where is the red toolbox?")
+        next(stream)
+        assert closed == []
+        stream.close()
+    finally:
+        memory.close()
+    provider.shutdown()
+
+    assert closed == [True]
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    generation_end = spans["mindbridge.model.generation"].end_time
+    ask_end = spans["mindbridge.ask"].end_time
+    assert generation_end is not None and ask_end is not None
+    # Left to the frame's last reference dropping, the generation stream would close after the
+    # operation that owns it, which loses its model usage and inverts the trace.
+    assert generation_end <= ask_end
+
+
+def test_ask_stream_records_time_to_first_token_on_the_generation_span(tmp_path: Path) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    models = _CountingStreamer()
+    with Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        memory.add("the red toolbox is on the bench")
+        for _chunk in memory.ask_stream("where is the red toolbox?"):
+            pass
+    provider.shutdown()
+
+    generation = next(
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.model.generation"
+    )
+    assert generation.attributes is not None
+    ttft = generation.attributes[MODEL_TTFT]
+    assert isinstance(ttft, int | float) and ttft >= 0
+
+
 def test_ask_returns_only_retrieved_hits_the_answerer_used(tmp_path: Path) -> None:
     class SelectingModels(_FakeModels):
         def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
@@ -4941,6 +5147,60 @@ async def test_async_add_stream_consumes_an_async_iterable(tmp_path: Path) -> No
         assert pulled == ["red async clip", "blue async clip"]
         assert len(records) == 2
         assert await memory.get(records[1].id) == records[1]
+
+
+@pytest.mark.asyncio
+async def test_async_ask_stream_yields_the_same_chunks_as_the_sync_stream(tmp_path: Path) -> None:
+    models = _CountingStreamer()
+    async with AsyncMemory(tmp_path, embedder=models, answerer=models) as memory:
+        await memory.add("the red toolbox is on the bench")
+
+        deltas: list[str] = []
+        final: AnswerResult | None = None
+        async for chunk in memory.ask_stream("where is the red toolbox?"):
+            if chunk.result is None:
+                deltas.append(chunk.text)
+            else:
+                final = chunk.result
+
+        assert deltas == ["the red ", "toolbox is ", "on the bench"]
+        assert final is not None
+        assert "".join(deltas) == final.answer
+        assert (await memory.ask("where is the red toolbox?")).answer == final.answer
+
+
+@pytest.mark.asyncio
+async def test_async_ask_stream_rejects_arguments_at_the_call_like_the_sync_stream(
+    tmp_path: Path,
+) -> None:
+    models = _CountingStreamer()
+    async with AsyncMemory(tmp_path, embedder=models, answerer=models) as memory:
+        # An `async def` generator would defer this to the first `__anext__`, so the two
+        # facades would report the same bad argument from two different places.
+        with pytest.raises(ValidationError, match="limit must be between 1 and 100"):
+            memory.ask_stream("where is it?", limit=0)
+
+
+@pytest.mark.asyncio
+async def test_async_ask_stream_releases_the_operation_when_the_caller_stops_early(
+    tmp_path: Path,
+) -> None:
+    models = _CountingStreamer()
+    memory = AsyncMemory(tmp_path, embedder=models, answerer=models)
+    try:
+        await memory.add("the red toolbox is on the bench")
+
+        stream = memory.ask_stream("where is the red toolbox?")
+        assert (await anext(stream)).text == "the red "
+        # Closing the async generator has to close the synchronous one behind it, off the
+        # event loop; otherwise `close()` waits on an operation nobody will finish.
+        await stream.aclose()
+
+        # `aclose()` awaits the synchronous close through the worker, so the operation is
+        # already released when it returns; a poll here would hide a leak behind a timeout.
+        assert memory._memory._active_operations == 0
+    finally:
+        await memory.close()
 
 
 @pytest.mark.asyncio

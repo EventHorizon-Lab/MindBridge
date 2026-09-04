@@ -180,6 +180,15 @@ and makes each line searchable before reading the next, but collects returned re
 CLI's single-document stdout result. It is therefore for finite JSONL; use
 [`Memory.add_stream`](python-sdk.md#memory-operations) for an unbounded source.
 
+### Operations without a command
+
+One Python operation has no command. `ask-stream` does not exist because the value of
+[`Memory.ask_stream`](python-sdk.md#memory-operations) is delivery of the answer while the model
+is still producing it, and this CLI emits one stable JSON document per invocation. Collecting the
+deltas to fit that contract would produce exactly what `ask` already prints, so the command would
+be a second spelling of `ask` rather than a streaming one. Use `ask` here, and the SDK when time
+to first token matters.
+
 ### Output
 
 On success, stdout contains one JSON document and a trailing newline. Local results use the same

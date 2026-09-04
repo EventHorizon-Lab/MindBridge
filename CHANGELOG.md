@@ -10,6 +10,20 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- `ask_stream()` on `Memory` and `AsyncMemory`, and the `AnswerChunk` value it yields. `ask()`
+  already consumed a provider's token stream, timed the first token into the
+  `mindbridge.model.time_to_first_token` span attribute, and then returned only the joined text,
+  so a caller waited for the last token to see the first. `ask_stream()` runs the identical path
+  — same retrieval, grounding, abstention, and reinforcement — and yields the generated text as
+  it arrives. Each `AnswerChunk` carries either `text` or `result`, never both: the deltas join
+  to the answer, and the single terminal chunk holds the same `AnswerResult` `ask()` returns.
+  `ask()` now drains that generator, so a buffered and a streamed answer cannot drift apart. A
+  backend without `stream_answer` yields its whole answer as one delta, so the shape does not
+  depend on the provider; `capabilities.streaming_generation` reports whether delivery is
+  actually incremental. Arguments are validated at the call rather than at the first pull, and
+  the operation the answer holds is released before the terminal chunk, so reading a result and
+  stopping there needs no cleanup. REST, MCP, and the CLI have no equivalent: each would have to
+  choose a streaming wire format, and all three gaps are documented on their own pages.
 - `capture()`, `settle()`, and `pending_captures()` on `Memory` and `AsyncMemory`, plus the
   `capture`, `settle`, and `pending-captures` CLI commands. `capture()` commits a record, its
   media, its observation context, and one durable enrichment queue row in a single SQLite

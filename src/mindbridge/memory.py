@@ -16,16 +16,18 @@ import unicodedata
 import wave
 from collections import Counter
 from collections.abc import (
+    AsyncGenerator,
     AsyncIterable,
     AsyncIterator,
     Callable,
+    Generator,
     Iterable,
     Iterator,
     Mapping,
     Sequence,
 )
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, contextmanager, suppress
+from contextlib import AbstractContextManager, closing, contextmanager, suppress
 from contextvars import copy_context
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
@@ -121,6 +123,7 @@ from mindbridge.plugins import MemoryConfig, MemoryPlugins
 from mindbridge.types import (
     AbstentionReason,
     AcousticBoundary,
+    AnswerChunk,
     AnswerResult,
     ASRPartial,
     AssetRef,
@@ -334,6 +337,8 @@ _NEGATION_TERMS = frozenset(
 )
 _NEGATED_CONTRACTION = re.compile(r"n['\u2019]t\b", re.IGNORECASE)
 _MAX_CONTENT_PARTS = 128
+# Returned by `next(..., default)` so an exhausted stream never raises across a future.
+_STREAM_EXHAUSTED = object()
 # Model span modules mapped onto the failure stage a caller sees.
 _MODEL_STAGES = {
     "consolidation": "consolidate",
@@ -1332,14 +1337,93 @@ class Memory:
         scope: RetrievalScope | None = None,
     ) -> AnswerResult:
         """Answer a native or mixed-modal question only from retrieved memories."""
+        # Draining `ask_stream()` keeps one implementation of the whole path, so a buffered and
+        # a streamed answer cannot drift apart in grounding, abstention, or reinforcement.
+        stream = self.ask_stream(
+            question,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            scope=scope,
+        )
+        while True:
+            try:
+                next(stream)
+            except StopIteration as complete:
+                return cast(AnswerResult, complete.value)
+
+    def ask_stream(
+        self,
+        question: ContentInput,
+        *,
+        limit: int = 5,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> Generator[AnswerChunk, None, AnswerResult]:
+        """Answer as `ask()` does, but yield the answer while the model is still producing it.
+
+        Retrieval runs to completion before the first chunk; only generation is incremental. The
+        terminal chunk carries the same `AnswerResult` `ask()` returns, and a backend without
+        `stream_answer` still yields its whole answer as one delta.
+
+        Reading to the terminal chunk releases everything the answer held, so stopping there
+        needs no cleanup. Abandoning the stream mid-answer leaves one operation open until the
+        generator is closed or collected, and `close()` waits for open operations.
+        """
+        _limit(limit, maximum=100)
+        self._require_answerer()
+        return self._ask_chunks(
+            question,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            scope=scope,
+        )
+
+    def _require_answerer(self) -> None:
+        if self._answerer is None:
+            raise ModelError(
+                "answer backend is not configured",
+                reason="backend_not_configured",
+                stage="generate",
+            )
+
+    def _ask_chunks(
+        self,
+        question: ContentInput,
+        *,
+        limit: int,
+        memory_type: MemoryType | None,
+        reference_at: datetime | None,
+        scope: RetrievalScope | None,
+    ) -> Generator[AnswerChunk, None, AnswerResult]:
+        answer = yield from self._ask_operation(
+            question,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            scope=scope,
+        )
+        # The operation and its span close before the result is handed over. A generator stays
+        # suspended at whichever yield the caller stops on, so a terminal chunk yielded inside
+        # the operation would pin it open for every caller that reads the result and stops --
+        # the ordinary way to consume this -- and `close()` waits on open operations.
+        yield AnswerChunk(result=answer)
+        return answer
+
+    def _ask_operation(
+        self,
+        question: ContentInput,
+        *,
+        limit: int,
+        memory_type: MemoryType | None,
+        reference_at: datetime | None,
+        scope: RetrievalScope | None,
+    ) -> Generator[AnswerChunk, None, AnswerResult]:
         with self._trace("mindbridge.ask", kind="operation"), self._operation() as assets:
             _limit(limit, maximum=100)
-            if self._answerer is None:
-                raise ModelError(
-                    "answer backend is not configured",
-                    reason="backend_not_configured",
-                    stage="generate",
-                )
+            self._require_answerer()
             with self._trace("mindbridge.content.prepare", kind="stage"):
                 prepared = self._prepare_content(question, assets)
             explicit_reference = _reference_at(reference_at)
@@ -1411,9 +1495,23 @@ class Memory:
             )
             routed_hits = self._route_generation_hits(hits, assets) if hits else ()
             self._persist_transcripts(assets)
-            result = self._answer(routed_question, routed_hits)
+            # `closing` rather than plain iteration: an abandoned stream throws `GeneratorExit`
+            # at the yield below, and without this the inner generator would only be closed
+            # when the cleared frame drops its last reference. That defers closing the
+            # provider's response and ends `mindbridge.model.generation` after its own parent,
+            # which loses the call's model usage and emits a malformed trace.
+            with closing(self._answer_chunks(routed_question, routed_hits)) as deltas:
+                while True:
+                    try:
+                        delta = next(deltas)
+                    except StopIteration as complete:
+                        result = complete.value
+                        break
+                    yield AnswerChunk(text=delta)
             used_ids = {hit.id for hit in result.hits}
             grounding = tuple(hit for hit in hits if hit.id in used_ids)
+            # Reinforcement is part of answering, so it stays inside the operation and runs
+            # before the terminal chunk: a caller that sees the result sees a settled store.
             self._reinforce_answered(grounding)
             return AnswerResult(
                 answer=result.answer,
@@ -5235,11 +5333,16 @@ class Memory:
                 _normalized_vector(vector, self._embedding_dimension) for vector in vectors
             )
 
-    def _answer(  # noqa: C901 - streaming and non-streaming validation share one model span
+    def _answer_chunks(  # noqa: C901 - streaming and non-streaming validation share one span
         self,
         question: ModelInput,
         hits: Sequence[SearchHit],
-    ) -> AnswerResult:
+    ) -> Generator[str, None, AnswerResult]:
+        """Yield answer deltas in provider order and return the validated grounded result.
+
+        A backend without `stream_answer` yields its whole answer as one delta, so every caller
+        sees the same shape and `ask_stream()` never requires a streaming provider.
+        """
         if self._answerer is None:
             raise ModelError(
                 "answer backend is not configured",
@@ -5259,6 +5362,7 @@ class Memory:
             ),
         ):
             mark_model_requests(1)
+            buffered = False
             try:
                 if isinstance(self._answerer, StreamingGenerationBackend):
                     started = perf_counter()
@@ -5282,6 +5386,7 @@ class Memory:
                                     MODEL_TTFT, perf_counter() - started
                                 )
                             parts.append(part)
+                            yield part
                     answer = "".join(parts)
                     if not answer.strip():
                         raise ModelError(
@@ -5323,6 +5428,7 @@ class Memory:
                         )
                 else:
                     result = self._answerer.answer(question, hits)
+                    buffered = True
             except MindBridgeError:
                 raise
             except Exception as error:
@@ -5333,6 +5439,8 @@ class Memory:
                 raise ModelError(
                     "generation model returned an invalid answer", reason="response_invalid"
                 )
+            if buffered:
+                yield result.answer
             return result
 
     def _memory_record(self, memory: StoredMemory) -> MemoryRecord:
@@ -6079,6 +6187,65 @@ class AsyncMemory:
             reference_at=reference_at,
             scope=scope,
         )
+
+    def ask_stream(
+        self,
+        question: ContentInput,
+        *,
+        limit: int = 5,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+    ) -> AsyncGenerator[AnswerChunk, None]:
+        """Answer as `ask()` does, yielding chunks as the model produces them.
+
+        Every step of the underlying synchronous stream runs in a worker thread, so the event
+        loop stays free while the provider is generating. Abandoning or cancelling the stream
+        closes it, which releases the operation the answer holds open.
+
+        This is a plain function returning an async generator, not an `async def` generator, so
+        that arguments are rejected at the call exactly as `Memory.ask_stream` rejects them; an
+        `async def` generator would defer them to the first `__anext__`.
+        """
+        # Validation and generator construction only, no I/O, so the event loop is not blocked.
+        stream = self._memory.ask_stream(
+            question,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            scope=scope,
+        )
+        return self._pump(stream)
+
+    async def _pump(
+        self,
+        stream: Generator[AnswerChunk, None, AnswerResult],
+    ) -> AsyncGenerator[AnswerChunk, None]:
+        loop = asyncio.get_running_loop()
+        # One worker, not `asyncio.to_thread`: every step has to run on the same thread so the
+        # span and operation contextvars the generator attaches on its first step are the ones
+        # it detaches on its last. `to_thread` runs each call in a fresh context copy, which
+        # would strand both. `next` is given a sentinel because a `StopIteration` crossing a
+        # future becomes `RuntimeError` rather than ending the loop.
+        #
+        # ponytail: thread affinity makes this one thread per in-flight stream, outside the cap
+        # the default executor puts on every other `AsyncMemory` call. Fine while concurrent
+        # streams are counted in tens; give the class a shared pool of pinned workers if a host
+        # ever runs enough of them for the thread count to bind before the provider does.
+        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mindbridge-ask")
+        try:
+            while True:
+                chunk = await loop.run_in_executor(worker, next, stream, _STREAM_EXHAUSTED)
+                if chunk is _STREAM_EXHAUSTED:
+                    return
+                yield cast(AnswerChunk, chunk)
+        finally:
+            # A running executor call cannot be cancelled, so the close always completes even
+            # when the awaiting task is gone; `wait=False` keeps that off the event loop.
+            closing_stream = loop.run_in_executor(worker, stream.close)
+            with suppress(asyncio.CancelledError):
+                await asyncio.shield(closing_stream)
+            worker.shutdown(wait=False)
 
     async def compile(
         self,
