@@ -10,6 +10,20 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- `ask_stream()` on `Memory` and `AsyncMemory`, and the `AnswerChunk` value it yields. `ask()`
+  already consumed a provider's token stream, timed the first token into the
+  `mindbridge.model.time_to_first_token` span attribute, and then returned only the joined text,
+  so a caller waited for the last token to see the first. `ask_stream()` runs the identical path
+  — same retrieval, grounding, abstention, and reinforcement — and yields the generated text as
+  it arrives. Each `AnswerChunk` carries either `text` or `result`, never both: the deltas join
+  to the answer, and the single terminal chunk holds the same `AnswerResult` `ask()` returns.
+  `ask()` now drains that generator, so a buffered and a streamed answer cannot drift apart. A
+  backend without `stream_answer` yields its whole answer as one delta, so the shape does not
+  depend on the provider; `capabilities.streaming_generation` reports whether delivery is
+  actually incremental. Arguments are validated at the call rather than at the first pull, and
+  the operation the answer holds is released before the terminal chunk, so reading a result and
+  stopping there needs no cleanup. REST, MCP, and the CLI have no equivalent: each would have to
+  choose a streaming wire format, and all three gaps are documented on their own pages.
 - `capture()`, `settle()`, and `pending_captures()` on `Memory` and `AsyncMemory`, plus the
   `capture`, `settle`, and `pending-captures` CLI commands. `capture()` commits a record, its
   media, its observation context, and one durable enrichment queue row in a single SQLite
@@ -554,6 +568,18 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- Two `add_stream` calls running at once no longer leave one of their threads permanently deferring
+  its index flushes. The deferral that batches a stream's index commits was one shared slot each
+  stream saved and restored, so the stream that finished second handed back the id of the thread
+  that had finished first; nothing cleared it again, and every later `add`, `delete`,
+  `forget_identity`, `reindex`, or `optimize` on that thread returned without flushing. The records
+  stayed durable in SQLite but were not searchable until some other caller forced a drain. Deferral
+  is now thread-local, so it cannot outlive the stream that opened it.
+- The `compile_context` MCP tool schema advertised the wrong default evidence ceiling. Its prose
+  said 6,000 characters while the field default it publishes beside it, and `ContextBudget`, have
+  been 16,000 since the per-modality cost function landed — enough of a gap for an agent that
+  budgets against the sentence to leave every video record out on purpose. The sentence now reads
+  the numbers off `ContextBudget`, so it cannot drift from them again.
 - The benchmark description cache accepts calls from every unit worker thread. It is opened once
   for a run while units ingest on worker threads, and SQLite's per-thread binding made every
   worker-side describe fail; the write path counted each as a failed batch and fell open, so a
