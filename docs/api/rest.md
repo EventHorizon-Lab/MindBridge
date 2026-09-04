@@ -240,11 +240,13 @@ still identify who appears in the evidence, but the bind is never committed.
 `compileContext` selects and structures existing evidence, reports conflicts without resolving
 them, calls no generation model, and stores no memory. It is not a pure read: it runs the same
 retrieval path `searchMemories` runs and can make the same one write, caching a transcript for
-spoken query media, which is a cache of the caller's own input rather than a new memory. Its
-request `budget` is the transport form of `ContextBudget`, with the `freshness` timedelta
-expressed as `freshness_seconds` and `max_latency_ms` a deadline the compiler checks between
-stages rather than a timeout that aborts. The bundle reports `elapsed_ms`, `deadline_exceeded`,
-and an `unknowns` array naming what the request implied and the bundle does not carry. The
+spoken query media, which is a cache of the caller's own input rather than a new memory. A
+compilation that finds nothing does record that, as the bounded signal the control plane's
+`QUERY_FAILURE` trigger reads, which changes no evidence and no memory. Its request `budget` is
+the transport form of `ContextBudget`, with the `freshness` timedelta expressed as
+`freshness_seconds` and `max_latency_ms` a deadline the compiler checks between stages rather than
+a timeout that aborts. The bundle reports `elapsed_ms`, `deadline_exceeded`, and an `unknowns`
+array naming what the request implied and the bundle does not carry. The
 [compiler reference](../context-compilation.md) owns section, selection, unknown, and conflict
 semantics.
 
