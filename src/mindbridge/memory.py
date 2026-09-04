@@ -7005,6 +7005,7 @@ def _prepared_from_stored(memory: StoredMemory) -> _PreparedMemory:
         occurred_at=memory.occurred_at,
         occurred_end=memory.occurred_end,
         memory_type=MemoryType(memory.memory_type),
+        place_id=memory.place_id,
     )
 
 
@@ -7268,13 +7269,8 @@ def _agreed_inheritance(
 ) -> tuple[str | None, Mapping[str, object] | None]:
     """The place and the metadata every cited source agrees on, or nothing.
 
-    Formation derives from one observation and inherits its record columns outright. A
-    consolidation rests on several, so it inherits only what they all say: a place is a hard
-    retrieval filter, and picking one source's room or one source's tag arbitrarily would file the
-    knowledge somewhere it was not observed. Disagreement inherits nothing rather than a majority.
+    A place is a hard retrieval filter, so disagreement inherits nothing rather than a majority.
     """
-    if not sources:
-        return (None, None)
     places = {source.place_id for source in sources}
     tags = {_metadata_json(source.metadata) for source in sources}
     return (
