@@ -460,6 +460,16 @@ the identity registry row, and every operation-log row that moved any of it. Med
 asset identity, size, and digest on each record; no bytes are inlined, so copying the files stays
 the host's decision. It reads only, and an unknown identity raises `IdentityNotFoundError`.
 
+**A record two people share is exported to both of them.** One recording containing two
+recognized people is held about each of them, so it appears in each subject's export -- with the
+other person's speech segments, face observations, and transcript attribution embedded in it.
+Trimming it would answer an access request with less than is held, and redacting the other person
+out of shared evidence is not something the kernel can do without rewriting the observation, which
+is the one thing it never does. A host that must hand an export to one subject alone therefore
+owes the second person's interest its own review; MindBridge tells the truth about what is stored
+and does not decide that question. Only shared records cross over: each subject's solo recordings,
+naming assertions, consent statements, and registry row stay theirs.
+
 `apply_retention` is deterministic physical forgetting under the declared
 [`retention` policy](../configuration.md#retention-policy): media older than `media_days` and
 every memory that still references it, records cognitively forgotten longer ago than

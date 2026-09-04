@@ -49,9 +49,18 @@ from mindbridge import (
 OCCURRED = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
 
 
+def _people(name: str | None) -> tuple[str, ...]:
+    """Return which people one asset contains, from the leading characters of its name.
+
+    `a-1.mp4` is one person, `b-1.mp4` is another, and `ab-1.wav` is a clip they share.
+    """
+    if name is not None and name.startswith("ab"):
+        return ("a", "b")
+    return ("b",) if name is not None and name.startswith("b") else ("a",)
+
+
 def _person(name: str | None) -> str:
-    """Return which person one asset belongs to, from the leading character of its name."""
-    return "b" if name is not None and name.startswith("b") else "a"
+    return _people(name)[0]
 
 
 def _drift(name: str | None) -> float:
@@ -74,15 +83,18 @@ class PersonSpeech:
     def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
         analyses = []
         for asset in assets:
-            base = (1.0, 0.0) if _person(asset.name) == "a" else (0.0, 1.0)
             drift = _drift(asset.name)
-            values = (base[0] + drift, base[1] + drift)
-            analyses.append(
-                SpeechAnalysis(
-                    turns=(SpeechTurn(0, 900, "I live next door", "0"),),
-                    speakers=(SpeakerEmbedding("0", values),),
+            heard = _people(asset.name)
+            speakers = []
+            turns = []
+            for index, person in enumerate(heard):
+                base = (1.0, 0.0) if person == "a" else (0.0, 1.0)
+                values = (base[0] + drift, base[1] + drift)
+                speakers.append(SpeakerEmbedding(str(index), values))
+                turns.append(
+                    SpeechTurn(index * 900, (index + 1) * 900, "I live next door", str(index))
                 )
-            )
+            analyses.append(SpeechAnalysis(turns=tuple(turns), speakers=tuple(speakers)))
         return tuple(analyses)
 
     def close(self) -> None:
@@ -408,6 +420,35 @@ def test_an_export_carries_the_whole_subject_and_nobody_else(tmp_path: Path) -> 
             memory.export(identity_id=subject_id, memory_ids=(first.id,))
         with pytest.raises(IdentityNotFoundError):
             memory.export(identity_id="identity_missing")
+
+
+def test_a_clip_two_people_share_is_exported_to_both_of_them(tmp_path: Path) -> None:
+    """Pinned, not accidental: a shared record is evidence for every subject in it.
+
+    One recording containing two people is held about both of them, so withholding it from
+    either subject's export would answer their access request with less than is held. The
+    consequence is that each export carries the other person's observations embedded in that
+    record, which `export()`'s contract states rather than silently trims.
+    """
+    with _memory(tmp_path) as memory:
+        alone = memory.add(Blob(b"a-1 speaking", "audio/wav", "a-1.wav"))
+        first_id = memory.speech(alone.id)[0].speaker_id
+        other = memory.add(Blob(b"b-1 speaking", "audio/wav", "b-1.wav"))
+        second_id = memory.speech(other.id)[0].speaker_id
+        assert first_id is not None and second_id is not None and first_id != second_id
+
+        shared = memory.add(Blob(b"ab-1 both speaking", "audio/wav", "ab-1.wav"))
+        heard = {segment.speaker_id for segment in memory.speech(shared.id)}
+        assert heard == {first_id, second_id}
+
+        for subject, neighbour in ((first_id, second_id), (second_id, first_id)):
+            bundle = memory.export(identity_id=subject)
+            exported = {record.id for record in bundle.records}
+            assert shared.id in exported, "a shared recording is held about both subjects"
+            assert bundle.identity_id == subject
+            # And only the shared one is: the other subject's solo recording stays theirs.
+            assert exported == {shared.id, alone.id if subject == first_id else other.id}
+            assert neighbour not in {profile.identity_id for profile in bundle.identities}
 
 
 # ---------------------------------------------------------------------------------------------

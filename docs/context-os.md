@@ -94,6 +94,13 @@ unknown. It does not restrain recognition against exemplars already held, becaus
 question from media the host already has is not new processing of a person -- destroying what is
 held is `forget_identity`, which is a different request with a different answer.
 
+One authority does not compose cleanly with another person's, and the honest place to say so is
+here: a recording two people share is held about both, so it appears in both their exports, each
+carrying the other's observations. Answering one subject with less than is held would be a false
+answer, and redacting the other person out of shared evidence would mean rewriting an
+observation, which is the invariant this system does not break. Deciding what a host may then do
+with that export is the host's, not the kernel's.
+
 ## Time scale is not memory type
 
 Fast and slow memory describe processing policy. Semantic, episodic, and procedural memory describe

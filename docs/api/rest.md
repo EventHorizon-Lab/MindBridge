@@ -480,6 +480,12 @@ data was processed and not only what is held. It is read-only and gated on `iden
 so nothing about the control plane's authority changes -- no route proposes, applies, or reverses
 an operation.
 
+A record containing two recognized people is returned for both of their exports, with the other
+person's observations embedded in it, for the reasons the
+[SDK contract](python-sdk.md#data-subject-rights) states. Over a network that matters more than it
+does in-process: a host serving this route decides who receives the response, and the response
+may contain a second person's data.
+
 `applyRetention` deletes irrecoverably. It is behind `identity_operations` rather than always on
 like `deleteMemory`, because it acts on a declared policy over the whole store rather than on one
 record the caller named. Send `{"dry_run": true}` first: it reports the same identifiers and
