@@ -16,6 +16,7 @@ import json
 import re
 import sys
 from collections.abc import Iterator, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
@@ -26,6 +27,7 @@ from urllib.request import Request
 import pytest
 from pydantic import TypeAdapter
 
+import mindbridge.cli as cli_module
 from mindbridge import Memory, recipes
 from mindbridge.api import app as rest
 from mindbridge.api import content as rest_content
@@ -40,7 +42,12 @@ from mindbridge.types import (
     AbstentionReason,
     AnswerResult,
     AssetRef,
+    IdentityChange,
+    MemoryIntent,
+    MemoryOperation,
+    MemoryOperationRecord,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
     Page,
@@ -243,6 +250,31 @@ def test_memory_documents_equal_the_rest_response_models() -> None:
         ),
     )
     assert document == rest.AnswerResponse.model_validate(answer).model_dump(mode="json")
+
+
+def test_ask_forwards_link_identities_and_defaults_it_when_absent() -> None:
+    """`--no-link-identities` must reach the SDK; a bare `Namespace` still defaults to True."""
+    from mindbridge.cli import _ask
+
+    seen: list[bool] = []
+
+    class RecordingMemory:
+        def ask(self, *_args: object, **kwargs: object) -> AnswerResult:
+            seen.append(cast(bool, kwargs["link_identities"]))
+            return AnswerResult("unknown", hits=())
+
+    memory = cast(Memory, RecordingMemory())
+    base = {
+        "content": ["question"],
+        "content_json": None,
+        "limit": 5,
+        "memory_type": None,
+        "reference_at": None,
+    }
+    _ask(memory, argparse.Namespace(**base, link_identities=False))
+    _ask(memory, argparse.Namespace(**base))
+
+    assert seen == [False, True]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1181,3 +1213,34 @@ def test_the_control_plane_loop_commands_only_translate(
     assert status == EXIT_CODES["validation_error"] == 3
     assert stdout is None
     assert cast(dict[str, object], stderr[0])["reason"] == "not_derived"
+
+
+def test_an_operation_row_names_the_people_a_merge_moved() -> None:
+    """An identity operation names people, not records, so the row has to carry them.
+
+    `merge`, the `correct` a split logs, and the `forget` an erasure logs all leave every
+    memory-ID field empty. Without `identity` the operator surface would print an intent with no
+    subject at all.
+    """
+    record = MemoryOperationRecord(
+        operation_id=7,
+        operation=MemoryOperation(
+            intent=MemoryIntent.MERGE,
+            identity=IdentityChange(identity_id="identity-1", moved_ids=("identity-2",)),
+        ),
+        trigger=MemoryTrigger.EVIDENCE,
+        applied_at=datetime(2026, 3, 1, 12, tzinfo=timezone.utc),
+    )
+
+    document = cli_module._operation_document(record)
+
+    assert document["intent"] == "merge"
+    assert document["identity"] == {
+        "identity_id": "identity-1",
+        "moved_ids": ["identity-2"],
+    }
+    assert document["target_ids"] == []
+    assert cli_module._operation_document(replace(record, operation=_A_FORGET))["identity"] is None
+
+
+_A_FORGET = MemoryOperation(intent=MemoryIntent.FORGET, target_ids=("memory-1",))

@@ -244,9 +244,11 @@ delete, answer, compile context, capture, settle, and pending captures. Six more
 register identity, get identity, unlink identity, and forget identity -- exist only when the host
 enables the matching `identity_operations` or `embodied_operations` switch on `create_app`,
 mirroring the same-named MCP switch. MCP exposes fifteen tools: the eight corresponding non-batch
-operations plus speech, face, and identity operations, or ten when the host builds it with
-`identity_operations=False`, because naming and erasing a person is host authority and the host
-decides whether it is on the wire at all. The local CLI exposes the 31 operations
+operations plus speech, face, and identity operations, or fewer when the host withholds a group
+with `identity_operations=False`, `embodied_operations=False`, or `write_operations=False`,
+because naming a person, binding a face to a voice, and changing durable state are host
+authority and the host decides whether each is on the wire at all. All three withheld leaves the
+five read tools. The local CLI exposes the 31 operations
 plus `doctor`; `--url` is limited to a fixed subset of operations regardless of what REST exposes,
 listed in [the CLI reference](api/cli.md#operations-without-a-remote-route).
 

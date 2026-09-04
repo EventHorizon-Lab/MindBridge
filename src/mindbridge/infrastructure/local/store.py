@@ -1909,6 +1909,8 @@ class LocalStore:
         clear_forgotten: Sequence[str] = (),
         delete_memory_ids: Sequence[str] = (),
         require_in_force: Sequence[str] = (),
+        split_identity: str | None = None,
+        merge_identities: tuple[str, str] | None = None,
     ) -> tuple[bool, tuple[StoredAsset, ...]]:
         """Apply the caller's reversal and mark one operation rolled back, atomically.
 
@@ -1925,6 +1927,13 @@ class LocalStore:
         operation has since superseded one of them, reversing this one would restore a version
         beside a newer one and delete a record that newer one supersedes, so the reversal is
         refused instead: operations on one lineage reverse newest first.
+
+        `split_identity` reverses a logged cross-modal merge by restoring that alias as its own
+        identity, and `merge_identities` reverses a logged split by re-merging `(survivor,
+        restored)` back under the survivor. Both are refused -- `(False, ())`, nothing written --
+        when the identity graph no longer admits the reversal, which is how identity operations
+        on one person also reverse newest first: a later split has already removed the alias a
+        merge would need, and an erasure has removed both.
         """
         _require_aware(rolled_back_at, "rolled_back_at")
         for memory_id in delete_memory_ids:
@@ -1941,6 +1950,20 @@ class LocalStore:
             if row is None:
                 return False, ()
             if any(_version_retired(connection, memory_id) for memory_id in require_in_force):
+                return False, ()
+            # Both identity reversals refuse before they write, so a refusal here leaves the
+            # transaction with nothing to undo. The merge plan is checked rather than trusted:
+            # re-merging under the wrong survivor would silently rename a person.
+            if merge_identities is not None:
+                survivor, restored = merge_identities
+                plan = self._identity_link_plan(connection, survivor, restored)
+                if plan is None or plan.target_id != survivor:
+                    return False, ()
+                self._merge_identities(connection, plan)
+            restored_id = (
+                None if split_identity is None else self._split_identity(connection, split_identity)
+            )
+            if split_identity is not None and restored_id is None:
                 return False, ()
             reverted_at = max(rolled_back_at, _parse_datetime(_row_text(row, "applied_at")))
             for memory_id in dict.fromkeys(delete_memory_ids):
@@ -3255,10 +3278,17 @@ class LocalStore:
         allow_shared_modality: bool = False,
         memories: Iterable[StoredMemory] = (),
         embeddings: Iterable[StoredEmbedding] = (),
+        operation: StoredOperation | None = None,
     ) -> str | None:
         """Merge two identities under one stable ID, recording a reversible alias.
 
         Pass allow_shared_modality to commit a plan obtained with the same intent.
+
+        `operation` logs the control-plane operation that committed this merge in the same
+        transaction, so a cross-modal bind is visible in the operation log and reversible
+        through it. The log row carries the naming assertions the merge moved onto the survivor
+        as `changed_ids`. Returns None, changing nothing, when that operation key is already
+        applied and not rolled back.
         """
         _require_identifier(first_id, "first identity_id")
         _require_identifier(second_id, "second identity_id")
@@ -3269,6 +3299,11 @@ class LocalStore:
             embeddings,
         )
         with self._transaction() as connection:
+            if (
+                operation is not None
+                and _active_operation_id(connection, operation.operation_key) is not None
+            ):
+                return None
             plan = self._identity_link_plan(
                 connection,
                 first_id,
@@ -3281,79 +3316,112 @@ class LocalStore:
                 return first if first is not None and first == second else None
             if expected is not None and plan != expected:
                 return None
-            target, source = plan.target_id, plan.source_id
-            contributed = _sole_identity_modality(connection, source)
-            now = _datetime_text(datetime.now(timezone.utc))
-            connection.execute(
-                "UPDATE speech_segments SET speaker_id = ? WHERE speaker_id = ?",
-                (target, source),
-            )
-            connection.execute(
-                "UPDATE face_observations SET identity_id = ? WHERE identity_id = ?",
-                (target, source),
-            )
-            _merge_identity_exemplars(connection, target, source)
-            connection.execute(
-                """
-                UPDATE identities
-                SET created_at = ?, updated_at = ?
-                WHERE identity_id = ?
-                """,
-                (plan.created_at, now, target),
-            )
-            # The source's naming assertions move to the survivor before the source row goes,
-            # or `ON DELETE SET NULL` would strand the name that was asserted about this person
-            # and the projection would go on reporting a name nothing supports. The name is a
-            # projection here too: recomputed from the assertions, never assigned.
-            connection.execute(
-                "UPDATE memory_semantics SET identity_id = ? WHERE identity_id = ?",
-                (target, source),
-            )
-            connection.execute(
-                "UPDATE identity_aliases SET identity_id = ? WHERE identity_id = ?",
-                (target, source),
-            )
-            # Re-point accumulated evidence by copying it onto the target first: the
-            # same asset may already carry a row for the target, and the primary key
-            # would reject a plain UPDATE.
-            connection.execute(
-                """
-                INSERT INTO identity_link_evidence (voice_id, face_id, asset_id, created_at)
-                SELECT CASE WHEN voice_id = ? THEN ? ELSE voice_id END,
-                       CASE WHEN face_id = ? THEN ? ELSE face_id END,
-                       asset_id,
-                       created_at
-                FROM identity_link_evidence
-                WHERE voice_id = ? OR face_id = ?
-                ON CONFLICT (voice_id, face_id, asset_id) DO NOTHING
-                """,
-                (source, target, source, target, source, source),
-            )
-            connection.execute(
-                "DELETE FROM identity_link_evidence WHERE voice_id = ? OR face_id = ?",
-                (source, source),
-            )
-            # Re-pointing turns this pair's own evidence into voice_id = face_id rows, which
-            # describe an identity co-occurring with itself and can never yield a plan.
-            connection.execute("DELETE FROM identity_link_evidence WHERE voice_id = face_id")
-            connection.execute(
-                """
-                INSERT INTO identity_aliases (
-                    alias_id, identity_id, created_at, contributed_modality
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (source, target, now, contributed),
-            )
-            connection.execute("DELETE FROM identities WHERE identity_id = ?", (source,))
-            if _has_naming_assertion(connection, target):
-                _reproject_identities(connection, (target,), changed_at=_parse_datetime(now))
+            moved_claims = self._merge_identities(connection, plan)
+            if operation is not None:
+                _insert_operation(connection, replace(operation, changed_ids=moved_claims))
             self._replace_memory_embeddings(
                 connection,
                 supplied_memories,
                 supplied_embeddings,
                 supplied_by_memory,
             )
-            return target
+            return plan.target_id
+
+    @staticmethod
+    def _merge_identities(
+        connection: sqlite3.Connection,
+        plan: IdentityLink,
+    ) -> tuple[str, ...]:
+        """Apply one validated merge inside an open transaction.
+
+        Returns the naming assertions that moved onto the survivor, which is the one effect a
+        merge has on memory records and therefore the one an operation log row can name.
+        """
+        target, source = plan.target_id, plan.source_id
+        contributed = _sole_identity_modality(connection, source)
+        now = _datetime_text(datetime.now(timezone.utc))
+        # Read before the source's `identities` row is deleted below, so the alias row can carry
+        # forward the absorbed identity's own creation time rather than the merge time. Rollback
+        # (`_split_identity`) restores the identity from this value; storing `now` here instead
+        # would make every merge-then-rollback cycle overwrite the original `created_at`.
+        source_created_at = _row_text(
+            connection.execute(
+                "SELECT created_at FROM identities WHERE identity_id = ?",
+                (source,),
+            ).fetchone(),
+            "created_at",
+        )
+        connection.execute(
+            "UPDATE speech_segments SET speaker_id = ? WHERE speaker_id = ?",
+            (target, source),
+        )
+        connection.execute(
+            "UPDATE face_observations SET identity_id = ? WHERE identity_id = ?",
+            (target, source),
+        )
+        _merge_identity_exemplars(connection, target, source)
+        connection.execute(
+            """
+            UPDATE identities
+            SET created_at = ?, updated_at = ?
+            WHERE identity_id = ?
+            """,
+            (plan.created_at, now, target),
+        )
+        moved_claims = tuple(
+            _row_text(row, "memory_id")
+            for row in connection.execute(
+                "SELECT memory_id FROM memory_semantics WHERE identity_id = ? ORDER BY memory_id",
+                (source,),
+            ).fetchall()
+        )
+        # The source's naming assertions move to the survivor before the source row goes,
+        # or `ON DELETE SET NULL` would strand the name that was asserted about this person
+        # and the projection would go on reporting a name nothing supports. The name is a
+        # projection here too: recomputed from the assertions, never assigned.
+        connection.execute(
+            "UPDATE memory_semantics SET identity_id = ? WHERE identity_id = ?",
+            (target, source),
+        )
+        connection.execute(
+            "UPDATE identity_aliases SET identity_id = ? WHERE identity_id = ?",
+            (target, source),
+        )
+        # Re-point accumulated evidence by copying it onto the target first: the
+        # same asset may already carry a row for the target, and the primary key
+        # would reject a plain UPDATE.
+        connection.execute(
+            """
+            INSERT INTO identity_link_evidence (voice_id, face_id, asset_id, created_at)
+            SELECT CASE WHEN voice_id = ? THEN ? ELSE voice_id END,
+                   CASE WHEN face_id = ? THEN ? ELSE face_id END,
+                   asset_id,
+                   created_at
+            FROM identity_link_evidence
+            WHERE voice_id = ? OR face_id = ?
+            ON CONFLICT (voice_id, face_id, asset_id) DO NOTHING
+            """,
+            (source, target, source, target, source, source),
+        )
+        connection.execute(
+            "DELETE FROM identity_link_evidence WHERE voice_id = ? OR face_id = ?",
+            (source, source),
+        )
+        # Re-pointing turns this pair's own evidence into voice_id = face_id rows, which
+        # describe an identity co-occurring with itself and can never yield a plan.
+        connection.execute("DELETE FROM identity_link_evidence WHERE voice_id = face_id")
+        connection.execute(
+            """
+            INSERT INTO identity_aliases (
+                alias_id, identity_id, created_at, contributed_modality
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (source, target, source_created_at, contributed),
+        )
+        connection.execute("DELETE FROM identities WHERE identity_id = ?", (source,))
+        if _has_naming_assertion(connection, target):
+            _reproject_identities(connection, (target,), changed_at=_parse_datetime(now))
+        return moved_claims
 
     def identity_alias_modality(self, alias_id: str) -> Literal["face", "voice"] | None:
         """Return the modality one merged alias contributed, or None when none is recorded.
@@ -3377,6 +3445,7 @@ class LocalStore:
         *,
         memories: Iterable[StoredMemory] = (),
         embeddings: Iterable[StoredEmbedding] = (),
+        operation: StoredOperation | None = None,
     ) -> str | None:
         """Reverse one recorded merge, restoring alias_id as an independent identity.
 
@@ -3405,80 +3474,21 @@ class LocalStore:
         transaction: one resting only on media that moved back is re-attributed to the
         restored identity, one resting on both people's media is unbound, and one that never
         involved the restored modality keeps its binding.
+
+        `operation` logs the control-plane operation that split this merge, in the same
+        transaction, so a split is visible in the operation log and reversible through it. It is
+        written only when the split actually commits.
         """
         _require_identifier(alias_id, "alias_id")
         supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
             memories,
             embeddings,
         )
-        now = _datetime_text(datetime.now(timezone.utc))
         with self._transaction() as connection:
-            alias = connection.execute(
-                """
-                SELECT identity_id, created_at, contributed_modality
-                FROM identity_aliases
-                WHERE alias_id = ?
-                """,
-                (alias_id,),
-            ).fetchone()
-            if alias is None or alias["contributed_modality"] is None:
+            if self._split_identity(connection, alias_id) is None:
                 return None
-            target = _row_text(alias, "identity_id")
-            modality = _identity_modality(alias["contributed_modality"])
-            modalities = {
-                _identity_modality(row["modality"])
-                for row in connection.execute(
-                    """
-                    SELECT DISTINCT modality
-                    FROM identity_exemplars
-                    WHERE identity_id = ?
-                    """,
-                    (target,),
-                ).fetchall()
-            }
-            if modalities != {"face", "voice"}:
-                return None
-            connection.execute(
-                """
-                INSERT INTO identities (identity_id, name, relationship, created_at, updated_at)
-                VALUES (?, NULL, NULL, ?, ?)
-                """,
-                (alias_id, _row_text(alias, "created_at"), now),
-            )
-            connection.execute(
-                """
-                UPDATE identity_exemplars
-                SET identity_id = ?
-                WHERE identity_id = ? AND modality = ?
-                """,
-                (alias_id, target, modality),
-            )
-            if modality == "face":
-                connection.execute(
-                    "UPDATE face_observations SET identity_id = ? WHERE identity_id = ?",
-                    (alias_id, target),
-                )
-            else:
-                connection.execute(
-                    "UPDATE speech_segments SET speaker_id = ? WHERE speaker_id = ?",
-                    (alias_id, target),
-                )
-            connection.execute("DELETE FROM identity_aliases WHERE alias_id = ?", (alias_id,))
-            connection.execute(
-                """
-                DELETE FROM identity_link_evidence
-                WHERE voice_id IN (?, ?) AND face_id IN (?, ?)
-                """,
-                (target, alias_id, target, alias_id),
-            )
-            _rebind_unlinked_claims(
-                connection,
-                target=target,
-                restored=alias_id,
-                modality=modality,
-            )
-            if _has_naming_assertion(connection, target):
-                _reproject_identities(connection, (target,), changed_at=_parse_datetime(now))
+            if operation is not None:
+                _insert_operation(connection, operation)
             self._replace_memory_embeddings(
                 connection,
                 supplied_memories,
@@ -3486,6 +3496,82 @@ class LocalStore:
                 supplied_by_memory,
             )
             return alias_id
+
+    @staticmethod
+    def _split_identity(connection: sqlite3.Connection, alias_id: str) -> str | None:
+        """Reverse one recorded merge inside an open transaction.
+
+        Returns the restored identity, or None -- having changed nothing -- when the alias has
+        no recorded split point or the survivor would be left with no exemplars.
+        """
+        now = _datetime_text(datetime.now(timezone.utc))
+        alias = connection.execute(
+            """
+            SELECT identity_id, created_at, contributed_modality
+            FROM identity_aliases
+            WHERE alias_id = ?
+            """,
+            (alias_id,),
+        ).fetchone()
+        if alias is None or alias["contributed_modality"] is None:
+            return None
+        target = _row_text(alias, "identity_id")
+        modality = _identity_modality(alias["contributed_modality"])
+        modalities = {
+            _identity_modality(row["modality"])
+            for row in connection.execute(
+                """
+                SELECT DISTINCT modality
+                FROM identity_exemplars
+                WHERE identity_id = ?
+                """,
+                (target,),
+            ).fetchall()
+        }
+        if modalities != {"face", "voice"}:
+            return None
+        connection.execute(
+            """
+            INSERT INTO identities (identity_id, name, relationship, created_at, updated_at)
+            VALUES (?, NULL, NULL, ?, ?)
+            """,
+            (alias_id, _row_text(alias, "created_at"), now),
+        )
+        connection.execute(
+            """
+            UPDATE identity_exemplars
+            SET identity_id = ?
+            WHERE identity_id = ? AND modality = ?
+            """,
+            (alias_id, target, modality),
+        )
+        if modality == "face":
+            connection.execute(
+                "UPDATE face_observations SET identity_id = ? WHERE identity_id = ?",
+                (alias_id, target),
+            )
+        else:
+            connection.execute(
+                "UPDATE speech_segments SET speaker_id = ? WHERE speaker_id = ?",
+                (alias_id, target),
+            )
+        connection.execute("DELETE FROM identity_aliases WHERE alias_id = ?", (alias_id,))
+        connection.execute(
+            """
+            DELETE FROM identity_link_evidence
+            WHERE voice_id IN (?, ?) AND face_id IN (?, ?)
+            """,
+            (target, alias_id, target, alias_id),
+        )
+        _rebind_unlinked_claims(
+            connection,
+            target=target,
+            restored=alias_id,
+            modality=modality,
+        )
+        if _has_naming_assertion(connection, target):
+            _reproject_identities(connection, (target,), changed_at=_parse_datetime(now))
+        return alias_id
 
     def identity_equivalence_class(self, identity_id: str) -> tuple[str, ...] | None:
         """Return every ID that names one identity: the canonical ID first, then its aliases.
@@ -3521,6 +3607,7 @@ class LocalStore:
         *,
         memories: Iterable[StoredMemory] = (),
         embeddings: Iterable[StoredEmbedding] = (),
+        operation: StoredOperation | None = None,
     ) -> IdentityErasure | None:
         """Erase one person's identity cluster, keeping the memories that mention them.
 
@@ -3545,6 +3632,11 @@ class LocalStore:
         Pass `memories` and `embeddings` to atomically replace indexed documents that named the
         person, exactly as `register_identity` does -- the erasure commits in SQLite before the
         outbox tells the projection.
+
+        `operation` logs, in the same transaction, that this erasure happened. The row is audit
+        history and nothing more: it names the identity and its aliases, and the naming
+        assertions the erasure deleted, so `operations()` can show that a person was erased
+        without holding anything a rollback could restore.
 
         Recoverability, stated plainly: freed cells are zero-filled (`PRAGMA secure_delete`) and
         the write-ahead log is checkpointed and truncated afterwards, so the exemplar bytes are
@@ -3591,16 +3683,26 @@ class LocalStore:
             # their vectors, which is exactly what erasure promises to remove. Deleting the
             # record cascades its semantics, versions, and embeddings, and the embedding trigger
             # queues the index deletions.
-            for row in connection.execute(
-                "SELECT memory_id FROM memory_semantics WHERE identity_id = ? AND kind = ?",
-                (resolved_id, MemoryKind.ENTITY.value),
-            ).fetchall():
+            erased_claims = tuple(
+                _row_text(row, "memory_id")
+                for row in connection.execute(
+                    """
+                    SELECT memory_id FROM memory_semantics
+                    WHERE identity_id = ? AND kind = ?
+                    ORDER BY memory_id
+                    """,
+                    (resolved_id, MemoryKind.ENTITY.value),
+                ).fetchall()
+            )
+            for memory_id in erased_claims:
                 connection.execute(
                     "DELETE FROM memory_records WHERE memory_id = ?",
-                    (_row_text(row, "memory_id"),),
+                    (memory_id,),
                 )
             # Cascades the aliases, exemplars and link evidence; NULLs the speech segments.
             connection.execute("DELETE FROM identities WHERE identity_id = ?", (resolved_id,))
+            if operation is not None:
+                _insert_operation(connection, replace(operation, changed_ids=erased_claims))
             self._replace_memory_embeddings(
                 connection,
                 supplied_memories,

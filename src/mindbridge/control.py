@@ -18,6 +18,7 @@ from typing import Any, cast
 from mindbridge.exceptions import StorageError
 from mindbridge.types import (
     FormationProposal,
+    IdentityChange,
     IdentityClaim,
     MemoryOperation,
     SpatialContext,
@@ -37,12 +38,14 @@ def load_operation(payload: str) -> MemoryOperation:
             raise ValueError
         proposal = value.get("proposal")
         claim = value.get("claim")
+        identity = value.get("identity")
         return MemoryOperation(
             intent=cast(Any, value["intent"]),
             evidence_ids=tuple(value.get("evidence_ids") or ()),
             target_ids=tuple(value.get("target_ids") or ()),
             proposal=None if proposal is None else _proposal(proposal),
             claim=None if claim is None else _claim(claim),
+            identity=None if identity is None else _identity_change(identity),
             rationale=cast(Any, value.get("rationale")),
         )
     except Exception as error:
@@ -58,6 +61,7 @@ def operation_key(operation: MemoryOperation, *, recipe: str | None) -> str:
 def _identity(operation: MemoryOperation) -> dict[str, object]:
     proposal = operation.proposal
     claim = operation.claim
+    change = operation.identity
     return {
         "intent": operation.intent.value,
         "evidence_ids": sorted(operation.evidence_ids),
@@ -66,7 +70,23 @@ def _identity(operation: MemoryOperation) -> dict[str, object]:
         # Part of the idempotency identity: renaming the same person supersedes rather than
         # replays, so two claims that differ only in the name must be two operations.
         "claim": None if claim is None else _claim_payload(claim),
+        # Part of the idempotency identity: merging or splitting a different pair of people is a
+        # different operation, so two merges of one pair stay one row and two pairs stay two.
+        "identity": None if change is None else _identity_change_payload(change),
     }
+
+
+def _identity_change_payload(change: IdentityChange) -> dict[str, object]:
+    return {"identity_id": change.identity_id, "moved_ids": sorted(change.moved_ids)}
+
+
+def _identity_change(value: object) -> IdentityChange:
+    if not isinstance(value, dict):
+        raise ValueError
+    return IdentityChange(
+        identity_id=cast(Any, value["identity_id"]),
+        moved_ids=cast(Any, tuple(value.get("moved_ids") or ())),
+    )
 
 
 def _claim_payload(claim: IdentityClaim) -> dict[str, object]:

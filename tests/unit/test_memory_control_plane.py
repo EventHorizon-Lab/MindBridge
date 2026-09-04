@@ -34,6 +34,7 @@ from mindbridge import (
     FaceEmbedding,
     FormationInput,
     FormationProposal,
+    IdentityChange,
     IdentityClaim,
     Memory,
     MemoryIntent,
@@ -988,6 +989,7 @@ def test_an_agent_names_a_person_only_from_evidence_that_contains_them(tmp_path:
         assert [record.operation.intent for record in memory.operations()] == [
             MemoryIntent.IDENTIFY,
             MemoryIntent.IDENTIFY,
+            MemoryIntent.MERGE,
         ]
 
         # Reversing the corroborating operation takes the projected name with it.
@@ -2286,3 +2288,26 @@ def test_an_abstention_and_a_thin_bundle_record_the_same_failure_signal(tmp_path
                 == ()
             )
         assert _trigger_rows(memory, MemoryTrigger.QUERY_FAILURE)
+
+
+def test_a_backend_may_not_propose_an_identity_merge(tmp_path: Path) -> None:
+    """Merge authority is the kernel's, not a proposal vocabulary item.
+
+    A cross-modal merge is committed from corroboration evidence the kernel counted itself, so
+    a model that asks to fuse two people is refused before anything is read or written. An
+    agent that can call ordinary recall must not be able to convert it into that authority.
+    """
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "merge", consolidator) as memory:
+        first, second = _observations(memory, "Ana waited", "Ana waited again")
+        proposed = MemoryOperation(
+            intent=MemoryIntent.MERGE,
+            identity=IdentityChange(identity_id="identity-1", moved_ids=("identity-2",)),
+        )
+        consolidator._scripts.append((proposed,))
+
+        report = memory.consolidate(evidence_ids=(first.id, second.id))
+
+        assert report.operations == ()
+        assert report.rejected == ((proposed, "unauthorized"),)
+        assert memory.operations() == ()

@@ -3,7 +3,7 @@
 ## Surface
 
 The optional MCP adapter exposes fifteen typed tools over one injected synchronous `Memory`, or
-ten when the host builds it with `identity_operations=False`.
+fewer when the host withholds a group of them.
 It validates tool input, calls the matching SDK operation, and returns structured public values.
 It does not own storage, provider selection, or the injected memory. Finalized media arrives
 through ordinary content parts; live audio and vision packet ingestion, and `StreamEvent`
@@ -18,11 +18,42 @@ embodied operation is no less reachable here than `add_memory` is.
 
 Naming a person is host authority. `register_speaker` and `register_identity` assert a name on
 the host's behalf: the assertion is a versioned memory record, it is written to the operation
-log, and it is reversible, and the tool descriptions say so. A host that does not want an agent
-holding that authority builds the server with `identity_operations=False`; then
-`register_speaker`, `register_identity`, `get_identity`, `unlink_identity` and `forget_identity`
-are never registered, calling one fails as an unknown tool, and the server instructions say the
-identity operations stay with the process that owns the memory.
+log, and it is reversible, and the tool descriptions say so. Splitting a wrong merge is written
+to the log and reversible too, and erasing a person leaves an irreversible row so the request
+stays auditable; `get_identity` reads and writes nothing.
+
+### Withholding a group of tools
+
+Three keyword switches decide which authority an agent holds. Each defaults to True, and each
+False withholds its group by never registering it, so calling one of its tools fails as an
+unknown tool rather than as a refusal. The server instructions name the missing groups, because
+an agent should not discover a boundary by failing.
+
+| Switch | Withholds | Why a host would |
+| --- | --- | --- |
+| `identity_operations` | `register_speaker`, `register_identity`, `get_identity`, `unlink_identity`, `forget_identity` | Naming and erasing a person is host authority |
+| `embodied_operations` | `analyze_speech`, `analyze_faces` | `analyze_faces` also commits the corroborated cross-modal identity merge, so leaving it registered keeps identity *binding* on the wire even with the identity tools withheld. `ask_memory` reaches the same merge through its own face recognition, so this switch also passes `link_identities=embodied_operations` into every `ask_memory` call |
+| `write_operations` | `add_memory`, `delete_memory`, `reinforce_memories` | The agent should consume context and change nothing |
+
+```python
+build_mcp_server(
+    memory,
+    identity_operations=False,
+    embodied_operations=False,
+    write_operations=False,
+)
+```
+
+With all three False the surface is exactly the five read tools -- `search_memories`,
+`ask_memory`, `compile_context`, `get_memory` and `list_memories` -- which is recall and compile
+alone. `ask_memory` stays because it is a recall surface; the reinforcement it records for the
+memories its answer cited is the owner's `reinforce_on_answer` setting rather than a capability
+these switches grant, so a host that wants a strictly read-only memory turns that off on the
+`Memory` it injects. `embodied_operations=False` also withholds the one write `ask_memory` could
+otherwise still reach: it passes `link_identities=False` into `Memory.ask`, so answering over a
+photo or video may still identify who appears in it, but a corroborated voice-and-face pair is
+never fused into one identity. Without that, "recall and compile alone" would be true of the tool
+list and false of what `ask_memory` could do.
 
 ## Start the adapter
 
@@ -47,7 +78,13 @@ with Memory.from_config(
 ```
 
 ```text
-build_mcp_server(memory: Memory) -> MCPServer[None]
+build_mcp_server(
+    memory: Memory,
+    *,
+    identity_operations: bool = True,
+    embodied_operations: bool = True,
+    write_operations: bool = True,
+) -> MCPServer[None]
 ```
 
 `build_mcp_server` reads `memory.capabilities` once and publishes it as the server `instructions`,
