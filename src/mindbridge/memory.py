@@ -1721,6 +1721,11 @@ class Memory:
         with (
             self._trace("mindbridge.unlink_identity", kind="operation"),
             self._operation() as operation,
+            # `_formation_lock` before `_write_lock`, the same order `consolidate()`'s apply
+            # phase and `add()`'s formation use: a split must not land while a consolidate apply
+            # pass is in progress, and taking the two locks in a different order here would
+            # deadlock against that path.
+            self._formation_lock,
             self._write_lock,
         ):
             requested_id = _identifier(alias_id, "alias_id")
@@ -1866,6 +1871,11 @@ class Memory:
         with (
             self._trace(f"mindbridge.{operation_name}", kind="operation"),
             self._operation() as operation,
+            # `_formation_lock` before `_write_lock`, the same order `consolidate()`'s apply
+            # phase and `add()`'s formation use: the IDENTIFY naming commit below must not land
+            # while a consolidate apply pass is in progress, and taking the two locks in a
+            # different order here would deadlock against that path.
+            self._formation_lock,
             self._write_lock,
         ):
             with _translate_storage_errors("read identity memories"):
@@ -1996,6 +2006,10 @@ class Memory:
         key = operation_key(proposed, recipe=_NAMING_RECIPE)
         with _translate_storage_errors("check a naming operation"):
             already_logged = bool(self._store.read_operations(operation_key=key))
+        # `_register_identity` holds `_formation_lock` for this whole call (the same lock
+        # `add()`'s automatic formation holds across its own `_commit_formation`, see
+        # `_form_sources`), so this IDENTIFY commit cannot land while a consolidate apply pass
+        # is in progress either.
         self._commit_formation(
             ((prepared, None, proposal.confidence),),
             (),
@@ -2038,6 +2052,11 @@ class Memory:
         with (
             self._trace("mindbridge.forget_identity", kind="operation"),
             self._operation() as operation,
+            # `_formation_lock` before `_write_lock`, the same order `consolidate()`'s apply
+            # phase and `add()`'s formation use: an irreversible erasure must not land while a
+            # consolidate apply pass is in progress, and taking the two locks in a different
+            # order here would deadlock against that path.
+            self._formation_lock,
             self._write_lock,
         ):
             with _translate_storage_errors("read identity memories"):
@@ -4957,7 +4976,15 @@ class Memory:
                     )
         analyzed = {asset.asset_id for asset in missing}
         if link_identities:
-            with self._write_lock, _translate_storage_errors("link face and voice identities"):
+            # `_formation_lock` before `_write_lock`, the same order `consolidate()`'s apply
+            # phase and `add()`'s formation use: a corroborated MERGE must not land while a
+            # consolidate apply pass is in progress, and taking the two locks in a different
+            # order here would deadlock against that path.
+            with (
+                self._formation_lock,
+                self._write_lock,
+                _translate_storage_errors("link face and voice identities"),
+            ):
                 for asset in face_assets:
                     self._link_asset_identity(asset.asset_id, operation)
         # Linking re-points these observations to the surviving identity, but every counted

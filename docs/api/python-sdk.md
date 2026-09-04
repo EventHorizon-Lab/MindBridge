@@ -495,7 +495,10 @@ records never reach the backend. The evidence gather and the applies hold the fo
 backend round trip deliberately does not, so slow reasoning over media evidence does not stall a
 concurrent `add()`. Correctness does not rest on that lock: every proposal is re-checked inside
 its own apply transaction and refused as `"stale"` if a target moved while the backend was
-thinking. The backend proposes `MemoryOperation` values; the kernel
+thinking. Kernel-committed identity operations -- the corroborated cross-modal merge, its
+`unlink_identity` split, `forget_identity`'s erasure, and `register_identity`/`register_speaker`'s
+naming assertion -- take the same formation lock around their own commit, so none of them lands
+while an apply pass is in progress either. The backend proposes `MemoryOperation` values; the kernel
 validates each one, applies only the effect its intent allows, and commits it in its own
 transaction with its own log row. A pass is therefore not atomic: `ConsolidationReport.operations`
 lists exactly what committed and `.rejected` exactly what the kernel refused, and a proposal

@@ -2198,6 +2198,51 @@ def test_a_thinking_backend_does_not_block_a_concurrent_add(tmp_path: Path) -> N
         assert errors == []
 
 
+def test_an_identity_merge_does_not_commit_while_a_consolidate_apply_pass_holds_the_lock(
+    tmp_path: Path,
+) -> None:
+    """The inverse of the test above: identity commits must serialize with formation too.
+
+    A corroborated cross-modal MERGE is authorized and committed by the kernel itself, from
+    `_link_asset_identity`, never through `consolidate()`'s own proposal pass -- so it is never
+    covered by `_apply_memory_operation`'s formation-lock scope unless it takes the lock itself.
+    Holding `_formation_lock` the way a consolidate apply pass does stands in for that pass here.
+    """
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        transcriber=OnePersonSpeech(),
+        face_analyzer=OnePersonFace(),
+        identity_link_min_assets=1,
+        minimum_relevance=0,
+    ) as memory:
+        record = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        errors: list[BaseException] = []
+
+        def merging() -> None:
+            try:
+                memory.faces(record.id)
+            except BaseException as error:  # pragma: no cover - reported below
+                errors.append(error)
+
+        memory._formation_lock.acquire()
+        try:
+            thread = threading.Thread(target=merging)
+            thread.start()
+            thread.join(timeout=0.5)
+            # The apply pass is "in progress" (simulated by holding its lock). Before this fix
+            # the merge committed anyway, since `_link_asset_identity` took no lock of its own.
+            assert thread.is_alive()
+            assert memory.operations() == ()
+        finally:
+            memory._formation_lock.release()
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+        assert errors == []
+        assert [record.operation.intent for record in memory.operations()] == [MemoryIntent.MERGE]
+        assert memory.faces(record.id)[0].identity_id == memory.speech(record.id)[0].speaker_id
+
+
 # ---------------------------------------------------------------------------------------------
 # Post-hoc outcome
 
