@@ -242,9 +242,10 @@ class FakeMemory:
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        link_identities: bool = True,
     ) -> AnswerResult:
         self._fail()
-        self.calls.append(("ask", question, limit, memory_type, reference_at))
+        self.calls.append(("ask", question, limit, memory_type, reference_at, link_identities))
         return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
 
     def get(self, memory_id: str) -> MemoryRecord:
@@ -485,7 +486,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
             OCCURRED_FROM,
             OCCURRED_UNTIL,
         ),
-        ("ask", "What color?", 5, MemoryType.PROCEDURAL, NOW),
+        ("ask", "What color?", 5, MemoryType.PROCEDURAL, NOW, True),
         ("get", "memory_1"),
         ("list", 7, "cursor_1"),
         ("delete", "memory_1"),
@@ -1152,6 +1153,23 @@ async def test_every_tool_belongs_to_exactly_one_withholdable_group() -> None:
         )
         == _READ_TOOLS
     )
+
+
+async def test_ask_memory_passes_embodied_operations_as_link_identities() -> None:
+    """`ask_memory` reaches the same face recognition `analyze_faces` commits a merge from.
+
+    Withholding `embodied_operations` must also withhold the one write `ask_memory` could
+    otherwise still reach on its own: `build_mcp_server` passes
+    `link_identities=embodied_operations` into every `Memory.ask` call it makes.
+    """
+    memory = FakeMemory()
+    async with Client(build_mcp_server(cast(Memory, memory), embodied_operations=False)) as client:
+        await client.call_tool("ask_memory", {"question": "who is this?"})
+    async with Client(build_mcp_server(cast(Memory, memory), embodied_operations=True)) as client:
+        await client.call_tool("ask_memory", {"question": "who is this?"})
+
+    link_identities_by_call = [call[-1] for call in memory.calls if call[0] == "ask"]
+    assert link_identities_by_call == [False, True]
 
 
 async def test_a_withheld_group_is_announced_and_its_tools_are_unknown() -> None:

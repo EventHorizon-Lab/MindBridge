@@ -5587,6 +5587,51 @@ def test_a_cross_modal_merge_is_logged_and_rollback_re_splits_the_two_identities
         assert len(standing) == 1
 
 
+def test_ask_link_identities_false_recognizes_faces_without_committing_a_merge(
+    tmp_path: Path,
+) -> None:
+    """`ask` can identify who is in a photo or video without gaining merge authority.
+
+    `_route_generation_hits` reaches the same face recognition `faces()` uses, and by default
+    commits the same corroborated cross-modal `MERGE` -- an agent with recall access alone would
+    otherwise acquire it merely by asking a question over a photo or video.
+    `link_identities=False` keeps recognition running so the question still gets answered, but
+    the bind itself is never committed: no `MERGE` row, and the two identities stay apart. This
+    is the mechanism `build_mcp_server(embodied_operations=False)` relies on for `ask_memory`.
+    """
+
+    def _identity_row_count(data_dir: Path) -> int:
+        with closing(sqlite3.connect(data_dir / "state.sqlite3")) as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM identities").fetchone()[0])
+
+    def _ask_over_a_face(data_dir: Path, *, link_identities: bool) -> bool:
+        with Memory(
+            data_dir,
+            embedder=_FakeEmbedder(),
+            answerer=_FakeModels(),
+            transcriber=_FakeSpeech(),
+            face_analyzer=_FakeFace(),
+            identity_link_min_assets=1,
+        ) as memory:
+            record = memory.add(Blob(b"one person video", "video/mp4", "person.mp4"))
+
+            result = memory.ask("who is in the video?", link_identities=link_identities)
+
+            assert result.hits and result.hits[0].id == record.id
+            merged = any(row.operation.intent is MemoryIntent.MERGE for row in memory.operations())
+        return merged
+
+    withheld = tmp_path / "withheld"
+    assert _ask_over_a_face(withheld, link_identities=False) is False
+    # Face and voice recognition still ran -- evidence exists -- but neither identity absorbed
+    # the other, so the store still holds both of them separately.
+    assert _identity_row_count(withheld) == 2
+
+    granted = tmp_path / "granted"
+    assert _ask_over_a_face(granted, link_identities=True) is True
+    assert _identity_row_count(granted) == 1
+
+
 def test_unlinking_a_merge_is_logged_as_a_split_and_rollback_re_links_it(tmp_path: Path) -> None:
     """`unlink_identity` is the split half of "correct or split", so it logs like one."""
     with _linking_memory(tmp_path) as memory:

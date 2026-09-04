@@ -32,7 +32,7 @@ an agent should not discover a boundary by failing.
 | Switch | Withholds | Why a host would |
 | --- | --- | --- |
 | `identity_operations` | `register_speaker`, `register_identity`, `get_identity`, `unlink_identity`, `forget_identity` | Naming and erasing a person is host authority |
-| `embodied_operations` | `analyze_speech`, `analyze_faces` | `analyze_faces` also commits the corroborated cross-modal identity merge, so leaving it registered keeps identity *binding* on the wire even with the identity tools withheld |
+| `embodied_operations` | `analyze_speech`, `analyze_faces` | `analyze_faces` also commits the corroborated cross-modal identity merge, so leaving it registered keeps identity *binding* on the wire even with the identity tools withheld. `ask_memory` reaches the same merge through its own face recognition, so this switch also passes `link_identities=embodied_operations` into every `ask_memory` call |
 | `write_operations` | `add_memory`, `delete_memory`, `reinforce_memories` | The agent should consume context and change nothing |
 
 ```python
@@ -49,7 +49,11 @@ With all three False the surface is exactly the five read tools -- `search_memor
 alone. `ask_memory` stays because it is a recall surface; the reinforcement it records for the
 memories its answer cited is the owner's `reinforce_on_answer` setting rather than a capability
 these switches grant, so a host that wants a strictly read-only memory turns that off on the
-`Memory` it injects.
+`Memory` it injects. `embodied_operations=False` also withholds the one write `ask_memory` could
+otherwise still reach: it passes `link_identities=False` into `Memory.ask`, so answering over a
+photo or video may still identify who appears in it, but a corroborated voice-and-face pair is
+never fused into one identity. Without that, "recall and compile alone" would be true of the tool
+list and false of what `ask_memory` could do.
 
 ## Start the adapter
 

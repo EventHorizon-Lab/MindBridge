@@ -301,6 +301,7 @@ ask(
     memory_type: MemoryType | None = None,
     reference_at: datetime | None = None,
     scope: RetrievalScope | None = None,
+    link_identities: bool = True,
 ) -> AnswerResult
 ```
 
@@ -319,6 +320,14 @@ candidate retrieval; see
 contains identifiers, score components, ranks, and rejection reasons, but no query, content,
 metadata, media, vectors, paths, or model output. `ask` requires an answerer and returns only the
 retrieved hits the answerer actually used.
+
+`ask` may run face recognition on a retrieved photo or video to identify who appears in it before
+answering. With the default `link_identities=True`, a voice-and-face pair corroborated across
+enough assets is fused into one identity the same way `analyze_faces` fuses it: a `MERGE` row in
+the operation log, reversible by `rollback()`. `link_identities=False` still runs face
+recognition to answer the question, but that bind is never committed -- no `MERGE` row, no new
+identity link -- so a caller with recall access alone cannot acquire merge authority through
+`ask`.
 
 ```text
 compile(

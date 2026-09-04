@@ -252,6 +252,31 @@ def test_memory_documents_equal_the_rest_response_models() -> None:
     assert document == rest.AnswerResponse.model_validate(answer).model_dump(mode="json")
 
 
+def test_ask_forwards_link_identities_and_defaults_it_when_absent() -> None:
+    """`--no-link-identities` must reach the SDK; a bare `Namespace` still defaults to True."""
+    from mindbridge.cli import _ask
+
+    seen: list[bool] = []
+
+    class RecordingMemory:
+        def ask(self, *_args: object, **kwargs: object) -> AnswerResult:
+            seen.append(cast(bool, kwargs["link_identities"]))
+            return AnswerResult("unknown", hits=())
+
+    memory = cast(Memory, RecordingMemory())
+    base = {
+        "content": ["question"],
+        "content_json": None,
+        "limit": 5,
+        "memory_type": None,
+        "reference_at": None,
+    }
+    _ask(memory, argparse.Namespace(**base, link_identities=False))
+    _ask(memory, argparse.Namespace(**base))
+
+    assert seen == [False, True]
+
+
 # ---------------------------------------------------------------------------------------------
 # Input parity with the REST discriminated part union
 

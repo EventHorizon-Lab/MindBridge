@@ -373,7 +373,11 @@ def build_mcp_server(
 
     - ``identity_operations``: naming, reading, unlinking and erasing a person.
     - ``embodied_operations``: ``analyze_speech`` and ``analyze_faces``. Withholding these also
-      withholds the cross-modal identity merge, which ``analyze_faces`` commits.
+      withholds the cross-modal identity merge, which ``analyze_faces`` commits -- and which
+      ``ask_memory`` can otherwise reach on its own, through the same face recognition it runs to
+      answer a question over a photo or video. ``build_mcp_server`` passes
+      ``link_identities=embodied_operations`` into every ``ask_memory`` call, so recall access
+      alone never carries merge authority.
     - ``write_operations``: ``add_memory``, ``delete_memory`` and ``reinforce_memories``.
 
     With all three False the surface is exactly the five read tools -- ``search_memories``,
@@ -522,7 +526,10 @@ def build_mcp_server(
         configured. Returns the answer with the hits it used; `abstained` is true when the answerer
         reported no usable evidence, and the answer is then a fixed sentence rather than a guess.
         Stores no memory, but each call spends another generation, so retry only on a retryable
-        error.
+        error. When this server was built with `embodied_operations=False`, answering over a
+        photo or video may still identify who appears in it, but a corroborated voice-and-face
+        pair is never fused into one identity: that merge authority stays withheld along with
+        `analyze_faces`.
         """
         result = memory.ask(
             content_input(question),
@@ -530,6 +537,7 @@ def build_mcp_server(
             memory_type=memory_type,
             reference_at=reference_at,
             scope=scope,
+            link_identities=embodied_operations,
         )
         return AnswerResponse(
             answer=result.answer,
@@ -1138,11 +1146,14 @@ def _instructions(
             (
                 "Embodied operations are not exposed here: transcribing who spoke, detecting who"
                 " was seen, and the cross-modal identity merge that follows stay with the process"
-                " that owns this memory."
+                " that owns this memory. ask_memory may still identify who is in a retrieved"
+                " photo or video to answer a question, but it will not fuse a voice and a face"
+                " into one identity while this is withheld."
                 if not embodied_operations
                 else "analyze_speech and analyze_faces resolve who was heard and seen;"
                 " analyze_faces may also bind one voice to one face, which is logged and"
-                " reversible by the owner."
+                " reversible by the owner. ask_memory can reach the same bind when it answers"
+                " over a photo or video."
             ),
             (
                 "This memory is read-only to you: adding, deleting and reinforcing stay with the"

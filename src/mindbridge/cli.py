@@ -639,6 +639,7 @@ def _ask(memory: Memory, arguments: argparse.Namespace) -> _Document:
         memory_type=_optional_memory_type(arguments),
         reference_at=_optional_time(arguments.reference_at, "reference_at"),
         scope=_retrieval_scope(_json_source(getattr(arguments, "scope", None))),
+        link_identities=getattr(arguments, "link_identities", True),
     )
     return {
         "answer": result.answer,
@@ -1815,6 +1816,16 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
         if operation != "ask":
             command.add_argument("--occurred-from", metavar="TIME", help="event overlap start")
             command.add_argument("--occurred-until", metavar="TIME", help="event overlap end")
+        else:
+            command.add_argument(
+                "--link-identities",
+                action=argparse.BooleanOptionalAction,
+                default=_default(operation, "link_identities"),
+                help=(
+                    "commit a corroborated cross-modal identity merge while answering "
+                    "(default: %(default)s)"
+                ),
+            )
     _compile_command(commands)
     for name, help_text in (
         ("get", "read one memory"),

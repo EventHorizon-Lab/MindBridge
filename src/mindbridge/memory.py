@@ -1266,8 +1266,17 @@ class Memory:
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        link_identities: bool = True,
     ) -> AnswerResult:
-        """Answer a native or mixed-modal question only from retrieved memories."""
+        """Answer a native or mixed-modal question only from retrieved memories.
+
+        `link_identities` gates the one write `ask` can otherwise reach: when a retrieved image
+        or video corroborates a voice-and-face pair, face recognition still runs to identify who
+        answers the question, but with `link_identities=False` the corroborated bind is never
+        committed -- no MERGE row, no new identity link. A host that withholds embodied MCP
+        tools passes `link_identities=False` here too, so recall access alone never carries
+        merge authority.
+        """
         with self._trace("mindbridge.ask", kind="operation"), self._operation() as assets:
             _limit(limit, maximum=100)
             if self._answerer is None:
@@ -1345,7 +1354,11 @@ class Memory:
                 ),
                 assets,
             )
-            routed_hits = self._route_generation_hits(hits, assets) if hits else ()
+            routed_hits = (
+                self._route_generation_hits(hits, assets, link_identities=link_identities)
+                if hits
+                else ()
+            )
             self._persist_transcripts(assets)
             result = self._answer(routed_question, routed_hits)
             used_ids = {hit.id for hit in result.hits}
@@ -4408,6 +4421,8 @@ class Memory:
         self,
         hits: Sequence[SearchHit],
         operation: _OperationAssets,
+        *,
+        link_identities: bool = True,
     ) -> tuple[SearchHit, ...]:
         asset_ids = tuple(asset.id for hit in hits for asset in hit.assets)
         with (
@@ -4460,11 +4475,13 @@ class Memory:
             tuple(asset for prepared in prepared_hits for asset in prepared.assets)
         )
         if face_assets:
-            self._recognize_faces(face_assets, operation)
+            self._recognize_faces(face_assets, operation, link_identities=link_identities)
         routed = []
         for hit, prepared in zip(hits, prepared_hits, strict=True):
             if self._answer_face_assets(prepared.assets):
-                prepared = self._with_face_identities(prepared, operation)
+                prepared = self._with_face_identities(
+                    prepared, operation, link_identities=link_identities
+                )
             model_input = self._route_generation(prepared, operation)
             routed.append(
                 replace(
@@ -4495,9 +4512,11 @@ class Memory:
         self,
         prepared: _PreparedContent,
         operation: _OperationAssets,
+        *,
+        link_identities: bool = True,
     ) -> _PreparedContent:
         face_assets = self._answer_face_assets(prepared.assets)
-        self._recognize_faces(face_assets, operation)
+        self._recognize_faces(face_assets, operation, link_identities=link_identities)
         text = _face_identity_text(prepared.text, face_assets, operation.face_observations)
         if len(text) > _MAX_TEXT_CHARACTERS:
             raise ModelError(
@@ -4510,6 +4529,8 @@ class Memory:
         self,
         assets: Sequence[StoredAsset],
         operation: _OperationAssets,
+        *,
+        link_identities: bool = True,
     ) -> None:
         if not isinstance(self._face_analyzer, FaceBackend):
             raise ModelError("no face backend is configured", reason="backend_not_configured")
@@ -4564,9 +4585,10 @@ class Memory:
                         minimum_margin=self._face_margin,
                     )
         analyzed = {asset.asset_id for asset in missing}
-        with self._write_lock, _translate_storage_errors("link face and voice identities"):
-            for asset in face_assets:
-                self._link_asset_identity(asset.asset_id, operation)
+        if link_identities:
+            with self._write_lock, _translate_storage_errors("link face and voice identities"):
+                for asset in face_assets:
+                    self._link_asset_identity(asset.asset_id, operation)
         # Linking re-points these observations to the surviving identity, but every counted
         # value here is merge-invariant: one face identity maps to one surviving identity, and
         # `identity_score` is carried through unchanged, so the counts do not depend on whether
@@ -6060,6 +6082,7 @@ class AsyncMemory:
         memory_type: MemoryType | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        link_identities: bool = True,
     ) -> AnswerResult:
         return await asyncio.to_thread(
             self._memory.ask,
@@ -6068,6 +6091,7 @@ class AsyncMemory:
             memory_type=memory_type,
             reference_at=reference_at,
             scope=scope,
+            link_identities=link_identities,
         )
 
     async def compile(

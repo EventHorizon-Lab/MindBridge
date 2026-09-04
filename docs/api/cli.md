@@ -96,7 +96,7 @@ credential behavior live in [configuration](../configuration.md).
 | `pending-captures` | optional `MEMORY_ID...`; `--limit` | `{"pending":[...]}` | no |
 | `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
 | `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | no |
-| `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope` | answer object | yes |
+| `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--link-identities`/`--no-link-identities` | answer object | yes (`--link-identities` is local-only) |
 | `compile` | content; `--max-chars`; `--max-items`; repeatable `--memory-type`; `--min-confidence`; `--freshness-seconds`; `--max-latency-ms`; `--reference-at`; `--scope` | context bundle plus `rendered` | yes |
 | `get` | `MEMORY_ID` | memory object | yes |
 | `speech` | `MEMORY_ID` | `{"segments":[...]}` | no |
@@ -140,6 +140,13 @@ logs -- and is `null` on every other row.
 `forget` is cognitive forgetting, reversible with `rollback`; `delete` is erasure. With the
 default `reinforce_on_answer=True`, `ask` also reinforces the hits the answerer cites; use
 `--app` to construct a memory with that policy disabled.
+
+`ask` may run face recognition on a retrieved photo or video before answering. With the default
+`--link-identities` (true), a voice-and-face pair corroborated across enough assets is fused into
+one identity and logged as a `merge` row, the same as `analyze_faces`; `--no-link-identities`
+still runs recognition to answer the question but never commits that bind. `--url` compositions
+send no such request to REST, so `--link-identities` has no effect there and the remote answerer
+always behaves as if it were true.
 
 ### Content and JSONL input
 

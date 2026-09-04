@@ -318,9 +318,12 @@ defaults or justify superiority claims.
    withhold naming and erasing a person, the two analysis tools -- and with them the
    cross-modal identity merge `analyze_faces` commits -- and adding, deleting and reinforcing.
    Each withholds by never registering the group, so a withheld tool is unknown rather than
-   refused, and the instructions name what is missing. All three False leaves exactly the five
-   read tools, which is recall and compile alone. The control-plane intents stay off REST and
-   MCP.
+   refused, and the instructions name what is missing. `ask_memory` reaches the same face
+   recognition `analyze_faces` uses to answer a question over a photo or video, so
+   `embodied_operations=False` also passes `Memory.ask(..., link_identities=False)`: recognition
+   may still run, but the corroborated bind never commits. All three False therefore leaves
+   exactly the five read tools with no path to merge authority, which is recall and compile
+   alone. The control-plane intents stay off REST and MCP.
 
 Fast capture is now independent of slow reasoning, the control plane governs the lifecycle through
 validated, logged, reversible operations, and the compiler produces budgeted task-ready context.
