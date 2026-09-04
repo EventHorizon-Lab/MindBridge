@@ -69,6 +69,7 @@ from mindbridge.benchmarks.eval_adapters import (
     _query_parts,
     load_task,
 )
+from mindbridge.benchmarks.eval_cache import ResponseCache
 from mindbridge.benchmarks.eval_statistics import (
     ScoredValue,
     paired_comparison,
@@ -1582,6 +1583,25 @@ async def test_ingest_announces_the_first_failure_once_with_its_message(
     assert "returned 2048 values but the configured dimension is 1536" in captured
 
 
+def test_progress_reporter_writes_milestones_to_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    report = eval_module._progress_reporter("running fixture", "samples")
+
+    report(1, 20)
+    report(2, 20)
+    report(3, 20)
+    report(20, 20)
+
+    assert capsys.readouterr().err.splitlines() == [
+        "mindbridge-bench eval: running fixture: 1/20 samples (5%)",
+        "mindbridge-bench eval: running fixture: 2/20 samples (10%)",
+        "mindbridge-bench eval: running fixture: 20/20 samples (100%)",
+    ]
+    eval_module._progress_reporter("running fixture", "samples", enabled=False)(1, 1)
+    assert capsys.readouterr().err == ""
+
+
 @pytest.mark.asyncio
 async def test_judge_skips_samples_with_ingest_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     sample = replace(_egomem_sample(1), ingest_failure_count=1)
@@ -1713,6 +1733,7 @@ async def test_runner_ingests_only_memory_available_at_each_cutoff(tmp_path: Pat
         ),
     )
     events: list[str] = []
+    progress: list[tuple[int, int]] = []
 
     def factory(_path: Path) -> _FakeContext:
         return _FakeContext(events)
@@ -1725,6 +1746,7 @@ async def test_runner_ingests_only_memory_available_at_each_cutoff(tmp_path: Pat
         unit_concurrency=1,
         request_concurrency=2,
         recall_limit=5,
+        on_progress=lambda completed, total: progress.append((completed, total)),
     )
 
     assert events == [
@@ -1733,6 +1755,7 @@ async def test_runner_ingests_only_memory_available_at_each_cutoff(tmp_path: Pat
         "add:[source_id: later]\nlater",
         "ask:second:5",
     ]
+    assert progress == [(1, 2), (2, 2)]
     assert [sample.score for sample in samples] == [1.0, 1.0]
 
 
@@ -1881,6 +1904,147 @@ async def test_answer_many_reports_each_completed_answer_immediately() -> None:
 
     release_slow.set()
     await pending
+
+
+@pytest.mark.asyncio
+async def test_answer_many_reports_escaped_failure_immediately() -> None:
+    completed = 0
+    failed = asyncio.Event()
+    release_slow = asyncio.Event()
+
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            del limit, reference_at
+            if question == "failed":
+                raise RuntimeError("answer failed")
+            await release_slow.wait()
+            return AnswerResult("A")
+
+        async def search(self, query: object, **_kwargs: object) -> tuple[SearchHit, ...]:
+            del query
+            raise RuntimeError("fallback failed")
+
+    def on_complete() -> None:
+        nonlocal completed
+        completed += 1
+        failed.set()
+
+    pending = asyncio.create_task(
+        _answer_many(
+            cast(AsyncMemory, Memory([])),
+            (
+                EvalQuestion("failed", ("failed",), references=("A",)),
+                EvalQuestion("slow", ("slow",), references=("A",)),
+            ),
+            request_concurrency=2,
+            recall_limit=1,
+            on_complete=on_complete,
+        )
+    )
+    await asyncio.wait_for(failed.wait(), timeout=1)
+
+    assert completed == 1
+    assert not pending.done()
+
+    release_slow.set()
+    outcomes = await pending
+    assert isinstance(outcomes[0], RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_runner_reports_cached_progress_before_pending_answer_finishes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first_reported = asyncio.Event()
+    release_slow = asyncio.Event()
+
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            del limit, reference_at
+            await release_slow.wait()
+            return AnswerResult("A")
+
+    class Cache:
+        def get(self, _task: str, _unit_id: str, question_id: str) -> object | None:
+            if question_id != "fast":
+                return None
+            return SimpleNamespace(
+                prediction="A",
+                confidence=0.0,
+                memory_ids=(),
+                evidence=(),
+                abstained=False,
+                abstention_reason=None,
+            )
+
+        def put(self, *_args: object) -> None:
+            pass
+
+    class Context:
+        async def __aenter__(self) -> AsyncMemory:
+            return cast(AsyncMemory, Memory([]))
+
+        async def __aexit__(self, *_error: object) -> None:
+            return None
+
+    task = LoadedTask(
+        TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        tmp_path / "fixture.json",
+        "1" * 64,
+        (
+            EvalUnit(
+                "unit",
+                (),
+                (
+                    EvalQuestion("fast", ("fast",), references=("A",)),
+                    EvalQuestion("slow", ("slow",), references=("A",)),
+                ),
+            ),
+        ),
+    )
+    report = eval_module._progress_reporter("running fixture", "samples")
+
+    def on_progress(completed: int, total: int) -> None:
+        report(completed, total)
+        if completed == 1:
+            first_reported.set()
+
+    pending = asyncio.create_task(
+        run_loaded_task(
+            task,
+            run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+            memory_factory=cast(MemoryFactory, lambda _path: Context()),
+            batch_size=1,
+            unit_concurrency=1,
+            request_concurrency=2,
+            recall_limit=1,
+            response_cache=cast(ResponseCache, Cache()),
+            on_progress=on_progress,
+        )
+    )
+    try:
+        await asyncio.wait_for(first_reported.wait(), timeout=1)
+        assert not pending.done()
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "running fixture: 1/2 samples (50%)" in captured.err
+    finally:
+        release_slow.set()
+
+    await asyncio.wait_for(pending, timeout=1)
+    assert "running fixture: 2/2 samples (100%)" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio
