@@ -31,7 +31,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from threading import Condition, RLock, get_ident
+from threading import Condition, RLock, local
 from time import perf_counter
 from typing import Protocol, TypeVar, cast
 
@@ -573,9 +573,12 @@ class Memory:
         self._owner_pid = os.getpid()
         self._write_lock = RLock()
         self._formation_lock = RLock()
-        # The thread currently inside an `add_stream` group, if any. Deferral is scoped to that
-        # thread so a concurrent `add` on another thread keeps flushing before it returns.
-        self._deferred_index_thread: int | None = None
+        # Whether *this* thread is inside an `add_stream` group, so a concurrent `add` on another
+        # thread keeps flushing before it returns. Thread-local rather than one shared slot: two
+        # threads streaming at once saved and restored each other's value, so the second to finish
+        # handed the first thread's id back and pinned deferral on a thread that had left the
+        # stream -- every later drain on it silently returned without flushing the index.
+        self._deferral = local()
         # Settlement is the one path that runs the expensive model stages over rows another
         # caller can already see queued, so two threads would otherwise embed the same record
         # twice and discover it only at the commit. Blocking, like the other two: a second
@@ -1179,9 +1182,9 @@ class Memory:
         # outbox work, so there is nothing for a group to batch. Deferring index commits for it
         # would only postpone work some other caller left pending, and the empty forced drain at
         # each boundary would put a Zvec lock back on the path capture exists to keep clear.
-        outer_deferral = self._deferred_index_thread
+        outer_deferral = self._deferring
         if not capture:
-            self._deferred_index_thread = get_ident()
+            self._deferral.active = True
         try:
             while True:
                 try:
@@ -1200,7 +1203,12 @@ class Memory:
             if grouped:
                 self._flush_stream_group()
         finally:
-            self._deferred_index_thread = outer_deferral
+            self._deferral.active = outer_deferral
+
+    @property
+    def _deferring(self) -> bool:
+        """Whether the calling thread has an `add_stream` group open."""
+        return bool(getattr(self._deferral, "active", False))
 
     def _add_stream_item(
         self,
@@ -5483,7 +5491,7 @@ class Memory:
         Skipped inside an `add_stream` group, whose own bounds force it. Skipping only leaves
         rows pending: they are still durable in SQLite and the next drain applies them.
         """
-        if not force and self._deferred_index_thread == get_ident():
+        if not force and self._deferring:
             return
         with self._trace("mindbridge.index.sync", kind="stage"):
             self._apply_outbox()

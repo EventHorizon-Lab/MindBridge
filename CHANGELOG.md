@@ -542,6 +542,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- Two `add_stream` calls running at once no longer leave one of their threads permanently deferring
+  its index flushes. The deferral that batches a stream's index commits was one shared slot each
+  stream saved and restored, so the stream that finished second handed back the id of the thread
+  that had finished first; nothing cleared it again, and every later `add`, `delete`,
+  `forget_identity`, `reindex`, or `optimize` on that thread returned without flushing. The records
+  stayed durable in SQLite but were not searchable until some other caller forced a drain. Deferral
+  is now thread-local, so it cannot outlive the stream that opened it.
 - The benchmark description cache accepts calls from every unit worker thread. It is opened once
   for a run while units ingest on worker threads, and SQLite's per-thread binding made every
   worker-side describe fail; the write path counted each as a failed batch and fell open, so a
