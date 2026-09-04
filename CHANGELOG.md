@@ -560,6 +560,18 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- Two `add_stream` calls running at once no longer leave one of their threads permanently deferring
+  its index flushes. The deferral that batches a stream's index commits was one shared slot each
+  stream saved and restored, so the stream that finished second handed back the id of the thread
+  that had finished first; nothing cleared it again, and every later `add`, `delete`,
+  `forget_identity`, `reindex`, or `optimize` on that thread returned without flushing. The records
+  stayed durable in SQLite but were not searchable until some other caller forced a drain. Deferral
+  is now thread-local, so it cannot outlive the stream that opened it.
+- The `compile_context` MCP tool schema advertised the wrong default evidence ceiling. Its prose
+  said 6,000 characters while the field default it publishes beside it, and `ContextBudget`, have
+  been 16,000 since the per-modality cost function landed — enough of a gap for an agent that
+  budgets against the sentence to leave every video record out on purpose. The sentence now reads
+  the numbers off `ContextBudget`, so it cannot drift from them again.
 - Withheld or withdrawn consent now omits a person from `actors` however the bundle would have
   named them. The restrained set was derived from the bound `ENTITY` hits retrieval returned, so a
   compilation that reached only somebody's photo or clip -- their naming assertion outside the
