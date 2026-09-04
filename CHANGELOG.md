@@ -769,6 +769,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   [configuration](docs/configuration.md).
 - Do not point `Memory` at an old database directory. Start with an empty path and keep the former
   deployment available until retrieval has been validated.
+- Records formed before this release keep the empty `place_id` and `metadata` they were written
+  with; nothing backfills them. A source is marked formed for its recipe, so re-adding the
+  observation forms nothing new: re-form by changing the formation recipe, or add the content
+  again as a fresh observation. For the same reason a refused proposal is final for that recipe —
+  the source is complete, and the proposal is not retried.
 
 ### Current limits
 

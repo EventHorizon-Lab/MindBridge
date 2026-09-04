@@ -151,7 +151,9 @@ whose source is already durable, because every retry would re-run the model and 
 Two proposals from one source that contradict each other — one record proposed twice with different
 content, or two overlapping states in one lineage — are refused the same way, and the first of the
 pair stands. Only damage to the batch envelope — a backend returning the wrong number of results,
-or a shape that is not a batch of proposals — fails the write.
+or a shape that is not a batch of proposals — fails the write. A refusal is final for that
+formation recipe: the source is marked formed, so nothing retries the proposal and re-adding the
+same content forms nothing new.
 
 Formation never rewrites the caller's source record. A derived record inherits its source's event
 time, valid interval, and metric pose, and inherits the symbolic `place_id` and the `metadata` that
@@ -161,9 +163,7 @@ too, because an `ENTITY`, `RELATION`, inferred `TRAIT`, or `RESPONSE_POLICY` is 
 later sources only add evidence to it: when a second source disagrees, the shared record keeps
 neither place nor metadata rather than the first source's, since a hard retrieval filter must not
 be guessed. A derived record carries no media assets of its own: it is text, and its evidence link
-points at the observation that holds the media. Deleting evidence recomputes derived confidence and
-visibility, and removes a derived record when no support remains. Source observations are deleted
-only by an explicit caller action.
+points at the observation that holds the media.
 
 ### Naming a person is a typed assertion
 
@@ -263,10 +263,9 @@ does not infer coordinate transforms.
 
 `ObservationContext(place_id="kitchen")` stores a trimmed symbolic label when metric localization is
 not available. `RetrievalScope(place_id="kitchen")` applies indexed equality in SQLite and excludes
-unlabelled records. Records formed from a labelled observation carry that label too, and a
-consolidated record carries it when all of its evidence agrees on one place, so the scope reaches
-derived entities, states, and relations as well as the observations. Symbolic and metric scopes are
-independent and both must match when combined.
+unlabelled records. Derived records inherit the label their evidence agrees on, so the scope
+reaches formed entities, states, and relations as well as observations. Symbolic and metric scopes
+are independent and both must match when combined.
 
 `get` and `list` expose the latest typed context even when it is retired or hidden, while default
 search uses only active visible versions. Forgetting is evidence-aware: deleting evidence
