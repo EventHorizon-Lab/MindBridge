@@ -603,6 +603,25 @@ def test_the_documented_count_of_operations_without_a_tool_is_the_real_one() -> 
     assert f"{_COUNT_WORDS[without_a_tool]} Python operations have no MCP tool." in page
 
 
+def test_the_documented_root_import_count_and_inventory_are_the_real_ones() -> None:
+    """`docs/api/python-sdk.md` states `len(mindbridge.__all__)` in prose and lists every name.
+
+    This drift has recurred for several rounds: a new public value lands in `__all__` without
+    the reference page's count or grouped tables following it. Parsing the sentence and scanning
+    the whole page for each name in backticks catches both, rather than one hand-picked table.
+    """
+    page = (Path(mindbridge.__file__).parents[2] / "docs" / "api" / "python-sdk.md").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"These are the (\d+) supported names exported by `mindbridge`:", page)
+
+    assert match is not None
+    assert int(match.group(1)) == len(mindbridge.__all__)
+    backticked = set(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", page))
+    missing = [name for name in mindbridge.__all__ if name not in backticked]
+    assert missing == []
+
+
 def test_both_transports_decode_content_parts_with_one_implementation() -> None:
     """The 83-line decoder existed twice; identical inputs must still normalize identically."""
     parts = [
