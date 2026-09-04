@@ -162,9 +162,10 @@ _BUDGET_DESCRIPTION = (
     " `freshness_seconds` keeps only memories anchored within that many seconds of the reference"
     " clock; `max_latency_ms` is a deadline after which optional work is skipped rather than a"
     " timeout that aborts, and the bundle reports `elapsed_ms` and `deadline_exceeded`. Null uses"
-    " the defaults, which are"
-    f" {_BUDGET.max_chars:,} characters and {_BUDGET.max_items} items with no"
-    " deadline."
+    # Read off `ContextBudget` rather than written out: the prose said 6,000 characters long after
+    # the default became 16,000, and an agent budgets against what this sentence claims.
+    f" the defaults, which are {_BUDGET.max_chars:,} characters and {_BUDGET.max_items} items"
+    " with no deadline."
 )
 _MEMORY_ID_DESCRIPTION = (
     "The `id` a previous `add_memory`, `search_memories`, or `list_memories` result returned."
