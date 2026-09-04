@@ -1372,6 +1372,7 @@ class LocalStore:
         *,
         evidence: Sequence[tuple[str, str, float]],
         source_memory_ids: Sequence[str],
+        narrowed: Sequence[tuple[str, str | None, str]] = (),
         recipe: str,
         completed_at: datetime,
         operation: StoredOperation | None = None,
@@ -1386,6 +1387,9 @@ class LocalStore:
         is written and the derived record stays open to further independent evidence.
         `forget_ids` is consolidation forgetting: sources the derived record replaces in ordinary
         recall, retired in this same commit and cleared again by rolling the operation back.
+        `narrowed` is `(memory_id, place_id, metadata_json)` for records already written whose
+        inherited columns no longer hold for all their evidence. Only those two columns change,
+        and neither reaches the search index, so nothing is queued for re-indexing.
         `require_active` names memories that must still exist and still be un-forgotten inside
         this transaction; if any moved since the caller validated it, nothing is written and
         `StaleOperationError` is raised. `require_unretired` names memories whose current version
@@ -1440,6 +1444,24 @@ class LocalStore:
                     superseded=superseded,
                 )
                 transaction_memory_ids.add(memory.memory_id)
+            connection.executemany(
+                """
+                UPDATE memory_records
+                SET place_id = ?,
+                    metadata_json = ?,
+                    updated_at = MAX(updated_at, ?)
+                WHERE memory_id = ?
+                """,
+                (
+                    (
+                        place_id,
+                        _canonical_object_json(metadata_json),
+                        _datetime_text(completed_at),
+                        memory_id,
+                    )
+                    for memory_id, place_id, metadata_json in narrowed
+                ),
+            )
             for embedding in supplied_embeddings:
                 self._write_embedding(connection, embedding)
             linked: list[tuple[str, str]] = []

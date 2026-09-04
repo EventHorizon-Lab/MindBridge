@@ -178,6 +178,7 @@ from mindbridge.types import (
 )
 
 _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
+_EMPTY_METADATA_JSON = "{}"
 # Naming a person is a claim the host asserts, so its recipe names the kernel rule that produced
 # it rather than a model space. That is what lets `register_identity` work with no former and no
 # consolidator configured.
@@ -3358,6 +3359,14 @@ class Memory:
         dropped = 0
         for source in formed_sources:
             proposals = proposals_by_id.get(source.id, ())
+            # Application data and the symbolic place travel with the knowledge formed from them:
+            # a host that filters recall by metadata expects the tag on the observation to hold
+            # for what was learned from it, and `place_id` is a hard filter, so knowledge formed
+            # from an observation in a room has to stand in that room too -- otherwise a
+            # place-scoped question sees the raw observation and none of the entities, states, or
+            # relations formed from it. One source agrees with itself; a record several sources
+            # share keeps only what they all say, which `_commit_formation` settles.
+            place_id, metadata = _agreed_inheritance((source,))
             for proposal in proposals:
                 try:
                     _validate_formation_proposal(proposal, inputs_by_id[source.id])
@@ -3376,10 +3385,7 @@ class Memory:
                     self._prepare_content(proposal.content, operation),
                     occurred_at=source.occurred_at,
                     occurred_end=source.occurred_end,
-                    # Application data travels with the knowledge formed from it: a host that
-                    # filters recall by metadata expects the tag on the observation to hold for
-                    # what was learned from it.
-                    metadata=source.metadata,
+                    metadata=metadata,
                     memory_type=_formation_memory_type(proposal.kind),
                 )
                 context = _formation_context(
@@ -3401,11 +3407,7 @@ class Memory:
                                 context=context,
                             ),
                             context=context,
-                            # `place_id` is a hard filter on the record, so knowledge formed
-                            # from an observation in a room has to stand in that room too --
-                            # otherwise a place-scoped question sees the raw observation and
-                            # none of the entities, states, or relations formed from it.
-                            place_id=source.place_id,
+                            place_id=place_id,
                         ),
                         source.id,
                         proposal.confidence,
@@ -3434,17 +3436,28 @@ class Memory:
         """
         recipe = self._formation_space if recipe is None else recipe
         ordered_pairs = tuple(sorted(pairs, key=lambda value: (value[0].memory_id, value[1] or "")))
-        unique = tuple(
-            {
-                prepared.memory_id: prepared
-                for prepared, _source, _score in reversed(ordered_pairs)
-            }.values()
-        )
-        unique = tuple(sorted(unique, key=lambda value: value.memory_id))
+        by_id: dict[str, builtins.list[_PreparedMemory]] = {}
+        for prepared, _source, _score in ordered_pairs:
+            by_id.setdefault(prepared.memory_id, []).append(prepared)
         with _translate_storage_errors("check formed memories"):
-            existing = self._store.read_memories(tuple(value.memory_id for value in unique))
-        existing_ids = {value.memory_id for value in existing}
-        missing = tuple(value for value in unique if value.memory_id not in existing_ids)
+            existing = self._store.read_memories(tuple(sorted(by_id)))
+        existing_by_id = {value.memory_id: value for value in existing}
+        unique = tuple(
+            _agreed_columns(values, existing_by_id.get(memory_id))
+            for memory_id, values in sorted(by_id.items())
+        )
+        # A record whose ID excludes its source -- an entity, a relation, an inferred trait -- is
+        # written once and every later source only adds evidence to it, so what the first source
+        # said would otherwise stand for evidence that disagrees. The columns it no longer agrees
+        # on are cleared on the stored row inside the same transaction; nothing is re-embedded,
+        # because neither column reaches the index.
+        narrowed = tuple(
+            (value.memory_id, value.place_id, value.metadata_json)
+            for value in unique
+            if (row := existing_by_id.get(value.memory_id)) is not None
+            and (value.place_id, value.metadata_json) != (row.place_id, row.metadata_json)
+        )
+        missing = tuple(value for value in unique if value.memory_id not in existing_by_id)
         parts = tuple(
             (memory, object_part, model_input)
             for memory in missing
@@ -3509,6 +3522,7 @@ class Memory:
                         if source_id is not None
                     ),
                     source_memory_ids=tuple(source.id for source in sources),
+                    narrowed=narrowed,
                     recipe=recipe,
                     completed_at=completed_at,
                     operation=operation,
@@ -7267,6 +7281,28 @@ def _agreed_inheritance(
     return (
         sources[0].place_id if len(places) == 1 else None,
         sources[0].metadata if len(tags) == 1 else None,
+    )
+
+
+def _agreed_columns(
+    values: Sequence[_PreparedMemory],
+    stored: StoredMemory | None,
+) -> _PreparedMemory:
+    """Return the first proposal of one derived record carrying only agreed inherited columns.
+
+    Same rule as `_agreed_inheritance`, applied where the sources arrive one write at a time: the
+    place and the metadata survive only while every proposal of this record -- and the row already
+    written for it -- says the same thing.
+    """
+    places = {value.place_id for value in values}
+    tags = {value.metadata_json for value in values}
+    if stored is not None:
+        places.add(stored.place_id)
+        tags.add(stored.metadata_json)
+    return replace(
+        values[0],
+        place_id=values[0].place_id if len(places) == 1 else None,
+        metadata_json=values[0].metadata_json if len(tags) == 1 else _EMPTY_METADATA_JSON,
     )
 
 

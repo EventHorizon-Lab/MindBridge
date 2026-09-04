@@ -329,6 +329,13 @@ def _formed(
     return [hit for hit in hits if hit.id != source_id]
 
 
+def _entities(memory: Memory, *, scope: RetrievalScope | None = None) -> list[SearchHit]:
+    hits = memory.search("entity user", limit=10, scope=scope)
+    return [
+        hit for hit in hits if hit.context is not None and hit.context.kind is MemoryKind.ENTITY
+    ]
+
+
 def test_formed_records_inherit_the_place_they_were_observed_in(tmp_path: Path) -> None:
     """ "What do we know about the kitchen?" must see the knowledge, not only the raw observation.
 
@@ -387,3 +394,56 @@ def test_a_formed_record_from_a_placeless_source_has_no_place(tmp_path: Path) ->
         assert formed
         assert all(hit.place_id is None for hit in formed)
         assert _formed(memory, source.id, scope=RetrievalScope(place_id="kitchen")) == []
+
+
+def test_a_shared_formed_record_keeps_only_what_its_sources_agree_on(tmp_path: Path) -> None:
+    """An ENTITY is written once and later sources only add evidence to it.
+
+    Its ID deliberately excludes the source, so the first observation's place and metadata would
+    otherwise stand for every later source, including one that disagrees -- filing knowledge in a
+    room half its evidence was never observed in. Agreement is the same condition consolidation
+    applies to several sources at once.
+    """
+    with Memory(
+        tmp_path / "disagree",
+        embedder=TinyEmbedder(),
+        former=PreferenceFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        memory.add(
+            "I prefer tea",
+            context=ObservationContext(place_id="kitchen"),
+            metadata={"household": "flat-2"},
+        )
+        memory.add(
+            "I still prefer tea",
+            context=ObservationContext(place_id="garage"),
+            metadata={"household": "flat-9"},
+        )
+
+        (entity,) = _entities(memory)
+        assert memory.get(entity.id).place_id is None
+        assert memory.get(entity.id).metadata == {}
+        assert _entities(memory, scope=RetrievalScope(place_id="kitchen")) == []
+        assert _entities(memory, scope=RetrievalScope(place_id="garage")) == []
+
+    with Memory(
+        tmp_path / "agree",
+        embedder=TinyEmbedder(),
+        former=PreferenceFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        memory.add(
+            "I prefer tea",
+            context=ObservationContext(place_id="kitchen"),
+            metadata={"household": "flat-2"},
+        )
+        memory.add(
+            "I still prefer tea",
+            context=ObservationContext(place_id="kitchen"),
+            metadata={"household": "flat-2"},
+        )
+
+        (entity,) = _entities(memory, scope=RetrievalScope(place_id="kitchen"))
+        assert memory.get(entity.id).place_id == "kitchen"
+        assert memory.get(entity.id).metadata == {"household": "flat-2"}

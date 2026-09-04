@@ -151,14 +151,16 @@ Only damage to the batch envelope — a backend returning the wrong number of re
 that is not a batch of proposals — fails the write.
 
 Formation never rewrites the caller's source record. A derived record inherits its source's event
-time, valid interval, metric pose, symbolic `place_id`, and `metadata`, so a place-scoped or
-metadata-filtered recall reaches the knowledge formed in a room and not only the raw observation it
-came from. It carries no media assets of its own: a formed record is text, and its evidence link
-points at the observation that holds the media. A consolidation rests on several sources, so it
-inherits the place and the metadata only when every cited source agrees; disagreeing evidence
-inherits neither rather than one picked arbitrarily. Deleting evidence recomputes derived
-confidence and visibility, and removes a derived record when no support remains. Source
-observations are deleted only by an explicit caller action.
+time, valid interval, and metric pose, and inherits the symbolic `place_id` and the `metadata` that
+every cited source agrees on, so a place-scoped or metadata-filtered recall reaches the knowledge
+formed in a room and not only the raw observation it came from. Agreement is the rule for formation
+too, because an `ENTITY`, `RELATION`, inferred `TRAIT`, or `RESPONSE_POLICY` is written once and
+later sources only add evidence to it: when a second source disagrees, the shared record keeps
+neither place nor metadata rather than the first source's, since a hard retrieval filter must not
+be guessed. A derived record carries no media assets of its own: it is text, and its evidence link
+points at the observation that holds the media. Deleting evidence recomputes derived confidence and
+visibility, and removes a derived record when no support remains. Source observations are deleted
+only by an explicit caller action.
 
 ### Naming a person is a typed assertion
 
