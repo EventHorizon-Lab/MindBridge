@@ -6,6 +6,7 @@ import math
 import re
 import sys
 from array import array
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from io import BytesIO
@@ -36,9 +37,13 @@ from mindbridge._telemetry import (
     MODEL_TTFT,
     TOKEN_AUDIO_SECONDS,
     TOKEN_CACHED_INPUT,
+    TOKEN_CACHED_INPUT_COMPLETE,
     TOKEN_COMPLETE,
     TOKEN_EXPECTED_REQUEST_COUNT,
+    TOKEN_INPUT_COMPLETE,
+    TOKEN_OUTPUT_COMPLETE,
     TOKEN_REASONING_OUTPUT,
+    TOKEN_REASONING_OUTPUT_COMPLETE,
     TOKEN_REPORTED_REQUEST_COUNT,
     TOKEN_TOTAL,
     model_span,
@@ -584,6 +589,30 @@ def test_description_rejects_an_oversized_image_before_reading_it(
             model.describe((ModelInput(assets=(picture,)),))
 
     assert failure.value.reason == "payload_too_large"
+
+
+def test_description_reuses_its_asset_integrity_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"pixels")
+    original = openai_backend._require_asset_integrity
+    calls: list[tuple[AssetRef, ...]] = []
+
+    def record(assets: Sequence[AssetRef]) -> tuple[tuple[AssetRef, int], ...]:
+        calls.append(tuple(assets))
+        return original(assets)
+
+    monkeypatch.setattr(openai_backend, "_require_asset_integrity", record)
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda _request: _caption_reply("a picture"))
+    ) as client:
+        result = _vision_model(
+            _sdk_client(client), capabilities=frozenset({Modality.IMAGE})
+        ).describe((ModelInput(assets=(picture,)),))
+
+    assert result == ("a picture",)
+    assert calls == [(picture,)]
 
 
 @pytest.mark.parametrize(
@@ -1921,6 +1950,50 @@ def test_cached_and_reasoning_tokens_roll_up_from_models_to_the_operation() -> N
     operation = spans["operation"].attributes or {}
     assert operation[TOKEN_CACHED_INPUT] == 7
     assert operation[TOKEN_REASONING_OUTPUT] == 10
+
+
+def test_batch_token_components_track_completeness_independently() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    with (
+        operation_span(tracer, "operation", attributes={}),
+        model_span(tracer, "model", attributes={}),
+    ):
+        openai_backend._record_usage_batch(
+            (
+                openai_backend._ModelUsage(
+                    True,
+                    input_tokens=5,
+                    output_tokens=3,
+                    total_tokens=8,
+                    cached_input_tokens=2,
+                ),
+                openai_backend._ModelUsage(
+                    True,
+                    input_tokens=7,
+                    output_tokens=4,
+                    total_tokens=11,
+                    reasoning_output_tokens=1,
+                ),
+            ),
+            request_count=2,
+        )
+    provider.shutdown()
+
+    spans = {span.name: span.attributes or {} for span in exporter.get_finished_spans()}
+    for name in ("model", "operation"):
+        attributes = spans[name]
+        assert attributes[TOKEN_COMPLETE] is True
+        assert attributes[TOKEN_INPUT_COMPLETE] is True
+        assert attributes[TOKEN_OUTPUT_COMPLETE] is True
+        assert attributes[TOKEN_CACHED_INPUT_COMPLETE] is False
+        assert attributes[TOKEN_REASONING_OUTPUT_COMPLETE] is False
+        assert attributes["gen_ai.usage.input_tokens"] == 12
+        assert attributes["gen_ai.usage.output_tokens"] == 7
+        assert attributes[TOKEN_CACHED_INPUT] == 2
+        assert attributes[TOKEN_REASONING_OUTPUT] == 1
 
 
 def test_answer_rejects_an_oversized_grounding_payload(

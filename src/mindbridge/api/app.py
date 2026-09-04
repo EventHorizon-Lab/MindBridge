@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable, Generator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Generator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from contextvars import Context, copy_context
@@ -1012,15 +1012,11 @@ def _v1_router(  # noqa: C901 - one literal public route registry
         if first is _STREAM_EXHAUSTED:
             worker.shutdown(wait=False)
             raise RuntimeError("answer stream ended without a terminal result")
-        return StreamingResponse(
-            _answer_events(
-                first,
-                chunks,
-                worker=worker,
-                context=context,
-            ),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        return _AnswerStreamingResponse(
+            first,
+            chunks,
+            worker=worker,
+            context=context,
         )
 
     _add_context_route(router, current_service, responses=model_errors)
@@ -1319,7 +1315,7 @@ async def _answer_events(
     *,
     worker: ThreadPoolExecutor,
     context: Context,
-) -> AsyncIterator[bytes]:
+) -> AsyncGenerator[bytes, None]:
     loop = asyncio.get_running_loop()
     chunk = first
 
@@ -1339,10 +1335,55 @@ async def _answer_events(
         trace.get_current_span().set_status(StatusCode.ERROR)
         response = exception_response(error)
         yield _sse_event("error", json.loads(bytes(response.body)))
-    finally:
-        closing_stream = loop.run_in_executor(worker, context.run, rest.close)
+
+
+class _AnswerStreamingResponse(StreamingResponse):
+    """Own the prefetched synchronous stream for the complete ASGI send lifecycle."""
+
+    def __init__(
+        self,
+        first: object,
+        rest: Generator[AnswerChunk, None, AnswerResult],
+        *,
+        worker: ThreadPoolExecutor,
+        context: Context,
+    ) -> None:
+        self._events = _answer_events(first, rest, worker=worker, context=context)
+        self._rest = rest
+        self._worker = worker
+        self._context = context
+        super().__init__(
+            self._events,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette sends `http.response.start` before it enters the body iterator. Closing only
+            # in `_answer_events` therefore leaks the already-prefetched Memory operation whenever
+            # headers or the first body frame cannot be sent.
+            try:
+                await self._events.aclose()
+            finally:
+                await _close_answer_stream(self._rest, worker=self._worker, context=self._context)
+
+
+async def _close_answer_stream(
+    stream: Generator[AnswerChunk, None, AnswerResult],
+    *,
+    worker: ThreadPoolExecutor,
+    context: Context,
+) -> None:
+    loop = asyncio.get_running_loop()
+    try:
+        closing = loop.run_in_executor(worker, context.run, stream.close)
+        closing.add_done_callback(_discard_future_result)
         with suppress(asyncio.CancelledError):
-            await asyncio.shield(closing_stream)
+            await asyncio.shield(closing)
+    finally:
         worker.shutdown(wait=False)
 
 

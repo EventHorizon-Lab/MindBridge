@@ -110,8 +110,8 @@ def summarize(
     interval = None
     if len(clusters) > 1:
         bootstrapped = _cluster_bootstrap(clusters, seed=seed, samples=bootstrap_samples)
-        low = cast(float, percentile(bootstrapped, 0.025))
-        high = cast(float, percentile(bootstrapped, 0.975))
+        low = cast(float, percentile(bootstrapped, 0.025, presorted=True))
+        high = cast(float, percentile(bootstrapped, 0.975, presorted=True))
         if clamp is not None:
             low, high = max(clamp[0], low), min(clamp[1], high)
         interval = [low, high]
@@ -232,11 +232,13 @@ def _cluster_bootstrap(
     return tuple(sorted(draws))
 
 
-def percentile(values: Sequence[float], probability: float) -> float | None:
+def percentile(
+    values: Sequence[float], probability: float, *, presorted: bool = False
+) -> float | None:
     """Return the linearly interpolated quantile, or ``None`` for no observations."""
     if not values:
         return None
-    ordered = sorted(values)
+    ordered = values if presorted else sorted(values)
     position = probability * (len(ordered) - 1)
     lower = int(position)
     upper = min(lower + 1, len(ordered) - 1)

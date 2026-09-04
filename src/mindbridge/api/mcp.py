@@ -13,8 +13,10 @@ from typing import Annotated, Any, ParamSpec, TypeVar, cast
 from uuid import uuid4
 
 from mcp.server import MCPServer
+from mcp.server._otel import OpenTelemetryMiddleware
 from mcp.server.context import CallNext, HandlerResult, ServerMiddleware, ServerRequestContext
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared._otel import extract_trace_context
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from opentelemetry import trace as otel_trace
 from opentelemetry.trace import SpanKind, StatusCode, Tracer
@@ -431,6 +433,7 @@ def build_mcp_server(
     ``ask_memory``, ``compile_context``, ``get_memory`` and ``list_memories`` -- which is
     recall and compile alone.
     """
+    transport_telemetry = _request_telemetry(tracer or otel_trace.get_tracer("mindbridge.api.mcp"))
     server: MCPServer[None] = MCPServer(
         "mindbridge",
         title="MindBridge Memory",
@@ -447,10 +450,22 @@ def build_mcp_server(
         ),
         version="0.2.0",
         middleware=[
-            _request_telemetry(tracer or otel_trace.get_tracer("mindbridge.api.mcp")),
+            transport_telemetry,
             cast(ServerMiddleware[Any], _strict_tool_arguments),
         ],
     )
+    # MCP 2 installs its generic OpenTelemetry middleware outside every user middleware. Keep the
+    # privacy-bounded MindBridge transport span as the sole server boundary: retaining both counts
+    # every request twice and lets the generic span publish arbitrary tool names and request IDs.
+    server.middleware[:] = [
+        transport_telemetry,
+        *(
+            middleware
+            for middleware in server.middleware
+            if middleware is not transport_telemetry
+            and not isinstance(middleware, OpenTelemetryMiddleware)
+        ),
+    ]
 
     @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
     @_stable_errors
@@ -1074,6 +1089,7 @@ def _request_telemetry(tracer: Tracer) -> ServerMiddleware[Any]:
             "mindbridge.mcp.request",
             kind=SpanKind.SERVER,
             attributes=attributes,
+            context=extract_trace_context(context.meta),
             record_exception=False,
             set_status_on_exception=False,
         ) as span:

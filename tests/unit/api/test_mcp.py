@@ -9,12 +9,12 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from mcp import Client
+from mcp import Client, MCPError
 from mcp.types import CallToolResult, TextContent
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.trace import StatusCode
+from opentelemetry.trace import SpanKind, StatusCode
 
 from mindbridge import Memory
 from mindbridge.api import content
@@ -894,6 +894,65 @@ async def test_mcp_records_buffered_completion_latency_without_claiming_ttft() -
     assert attributes["mindbridge.transport.response_mode"] == "buffered"
     assert cast(float, attributes["mindbridge.transport.server_total_ms"]) >= 0
     assert all("first" not in name or "token" not in name for name in attributes)
+
+
+async def test_mcp_emits_one_server_span_for_a_tool_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(
+        "mcp.shared._otel._tracer",
+        provider.get_tracer("test.mcp.sdk"),
+    )
+    server = build_mcp_server(
+        cast(Memory, FakeMemory()),
+        tracer=provider.get_tracer("test.mcp"),
+    )
+
+    async with Client(server) as client:
+        result = await client.call_tool("ask_memory", {"question": "What color is it?"})
+    provider.shutdown()
+
+    assert result.is_error is False
+    tool_spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if span.kind is SpanKind.SERVER
+        and (
+            (span.attributes or {}).get("rpc.service") == "ask_memory"
+            or (span.attributes or {}).get("gen_ai.tool.name") == "ask_memory"
+        )
+    ]
+    assert [span.name for span in tool_spans] == ["mindbridge.mcp.request"]
+
+
+async def test_mcp_traces_invalid_request_state_before_rejecting_it() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    server = build_mcp_server(
+        cast(Memory, FakeMemory()),
+        tracer=provider.get_tracer("test.mcp"),
+    )
+
+    async with Client(server) as client:
+        with pytest.raises(MCPError, match="Invalid or expired requestState"):
+            await client.call_tool(
+                "ask_memory",
+                {"question": "What color is it?"},
+                request_state="invalid",
+            )
+    provider.shutdown()
+
+    spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if (span.attributes or {}).get("rpc.method") == "tools/call"
+    ]
+    assert [span.name for span in spans] == ["mindbridge.mcp.request"]
+    assert spans[0].status.status_code is StatusCode.ERROR
 
 
 async def test_mcp_marks_tool_error_results_without_recording_exception_details() -> None:

@@ -39,7 +39,6 @@ from mindbridge import (
     ModelError,
     SearchHit,
 )
-from mindbridge._telemetry import _record_retrieval_results
 from mindbridge.benchmarks.eval import (
     MemoryFactory,
     SampleResult,
@@ -674,7 +673,8 @@ def test_benchmark_speech_backend_satisfies_the_runtime_protocol() -> None:
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v11"
+    assert eval_module.EVAL_SCHEMA_VERSION == 12
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v12"
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(
@@ -1231,24 +1231,22 @@ async def test_memlens_question_date_is_a_reference_clock_not_query_text(tmp_pat
 @pytest.mark.asyncio
 async def test_answer_failure_preserves_the_product_retrieval_ranking(tmp_path: Path) -> None:
     now = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    ranked = (
+        SearchHit(
+            id="memory-1",
+            content="supporting memory",
+            score=0.8,
+            created_at=now,
+            metadata={"source_id": "source-1"},
+        ),
+    )
 
     class Memory:
         async def ask(self, _question: object, **_kwargs: object) -> AnswerResult:
-            _record_retrieval_results(
-                (
-                    SearchHit(
-                        id="memory-1",
-                        content="supporting memory",
-                        score=0.8,
-                        created_at=now,
-                        metadata={"source_id": "source-1"},
-                    ),
-                )
-            )
             raise RuntimeError("generation unavailable")
 
         async def search(self, _query: object, **_kwargs: object) -> tuple[SearchHit, ...]:
-            raise AssertionError("answer failure issued a second scoring search")
+            return ranked
 
     question = EvalQuestion("q1", ("question",), references=("answer",))
     outcome = (
@@ -1782,6 +1780,99 @@ async def test_runner_ingests_only_memory_available_at_each_cutoff(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_runner_rejects_gold_retrieval_scoring_at_a_causal_cutoff(
+    tmp_path: Path,
+) -> None:
+    task = LoadedTask(
+        TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        tmp_path / "fixture.json",
+        "1" * 64,
+        (
+            EvalUnit(
+                "unit",
+                (),
+                (
+                    EvalQuestion(
+                        "q1",
+                        ("question",),
+                        references=("answer",),
+                        cutoff_seconds=10,
+                        metadata={"evidence_ids": ("gold",)},
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="isolated store snapshot"):
+        await run_loaded_task(
+            task,
+            run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+            memory_factory=cast(MemoryFactory, lambda _path: _FakeContext([])),
+            batch_size=1,
+            unit_concurrency=1,
+            request_concurrency=1,
+            recall_limit=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_runner_allows_random_retrieval_at_a_causal_cutoff(tmp_path: Path) -> None:
+    class Memory(_FakeMemory):
+        async def search(
+            self,
+            query: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> tuple[SearchHit, ...]:
+            del query, limit, reference_at
+            return ()
+
+    class Context:
+        async def __aenter__(self) -> AsyncMemory:
+            return cast(AsyncMemory, Memory([]))
+
+        async def __aexit__(self, *_error: object) -> None:
+            return None
+
+    task = LoadedTask(
+        TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        tmp_path / "fixture.json",
+        "1" * 64,
+        (
+            EvalUnit(
+                "unit",
+                (),
+                (
+                    EvalQuestion(
+                        "q1",
+                        ("question",),
+                        references=("answer",),
+                        cutoff_seconds=10,
+                        metadata={"evidence_ids": ("gold",)},
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    samples = await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+        memory_factory=cast(MemoryFactory, lambda _path: Context()),
+        batch_size=1,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=1,
+        arms=(eval_module._Arm("random", seed=7),),
+    )
+
+    assert len(samples) == 1
+    assert samples[0].arm == "random"
+
+
+@pytest.mark.asyncio
 async def test_runner_applies_request_concurrency_across_units(tmp_path: Path) -> None:
     active = 0
     peak = 0
@@ -1871,9 +1962,17 @@ async def test_standalone_search_reopens_warm_stores_after_every_answer(
             limit: int,
             reference_at: datetime | None = None,
         ) -> tuple[SearchHit, ...]:
-            del limit, reference_at
-            events.append(f"search:{question}")
-            return ()
+            del reference_at
+            events.append(f"search:{limit}:{question}")
+            return (
+                SearchHit(
+                    id="memory-gold",
+                    content="gold",
+                    score=1.0,
+                    created_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                    metadata={"source_id": "gold"},
+                ),
+            )
 
     class Context:
         def __init__(self, path: Path) -> None:
@@ -1924,6 +2023,121 @@ async def test_standalone_search_reopens_warm_stores_after_every_answer(
     search_e2e = cast(dict[str, object], performance["search_e2e"])
     assert search_e2e["measurement"] == "post_answer_warm_store_replay"
     assert search_e2e["attempt_count"] == search_e2e["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_run_arms_defers_replay_until_every_task_answer_finishes(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            del limit, reference_at
+            events.append(f"answer:{question}")
+            return AnswerResult("A")
+
+        async def search(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> tuple[SearchHit, ...]:
+            del reference_at
+            events.append(f"search:{limit}:{question}")
+            return (
+                SearchHit(
+                    id="memory-gold",
+                    content="gold",
+                    score=1.0,
+                    created_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                    metadata={"source_id": "gold"},
+                ),
+            )
+
+    class Context:
+        async def __aenter__(self) -> AsyncMemory:
+            return cast(AsyncMemory, Memory(events))
+
+        async def __aexit__(self, *_error: object) -> None:
+            return None
+
+    def task(name: str) -> LoadedTask:
+        return LoadedTask(
+            TaskSpec(name, "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+            tmp_path / f"{name}.json",
+            "1" * 64,
+            (
+                EvalUnit(
+                    "unit",
+                    (),
+                    (
+                        EvalQuestion(
+                            "q1",
+                            (f"question-{name}",),
+                            references=("A",),
+                            metadata={"evidence_ids": ("gold",)},
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    tasks = (task("task-a"), task("task-b"))
+    arguments = cast(
+        eval_module._Arguments,
+        SimpleNamespace(
+            compile_max_items=24,
+            compile_max_chars=16_000,
+            quiet=True,
+            data_root=tmp_path / "stores",
+            run_id="run",
+            unit_concurrency=1,
+            request_concurrency=1,
+            recall_limit=3,
+            predict_only=False,
+            log_samples=False,
+            arms=(eval_module.DEFAULT_ARM,),
+            full_context_chars=24_000,
+            ingest="add",
+        ),
+    )
+    telemetry = EvaluationTelemetry()
+    try:
+        samples = await eval_module._run_arms(
+            tasks,
+            arguments,
+            arms=(eval_module.PRODUCT_ARM,),
+            batch_sizes={task.spec.name: 1 for task in tasks},
+            memory_factory=cast(MemoryFactory, lambda _path: Context()),
+            response_cache=None,
+            tracer=telemetry.tracer,
+        )
+        performance = {
+            task.spec.name: telemetry.result(task.spec.name, question_count=1) for task in tasks
+        }
+    finally:
+        telemetry.close()
+
+    answers = [index for index, event in enumerate(events) if event.startswith("answer:")]
+    warm_searches = [index for index, event in enumerate(events) if event.startswith("search:3:")]
+    quality_searches = [
+        index for index, event in enumerate(events) if event.startswith("search:100:")
+    ]
+    assert len(samples) == len(answers) == len(warm_searches) == len(quality_searches) == 2
+    assert max(answers) < min(warm_searches)
+    assert max(warm_searches) < min(quality_searches)
+    assert all(sample.ranked_source_ids == ("gold",) for sample in samples)
+    for result in performance.values():
+        search_e2e = cast(dict[str, object], result["search_e2e"])
+        assert search_e2e["attempt_count"] == search_e2e["count"] == 1
 
 
 @pytest.mark.asyncio
@@ -2083,8 +2297,14 @@ async def test_answer_many_reports_failed_outcome_immediately() -> None:
             await release_slow.wait()
             return AnswerResult("A")
 
-        async def search(self, query: object, **_kwargs: object) -> tuple[SearchHit, ...]:
-            del query
+        async def search(
+            self,
+            query: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> tuple[SearchHit, ...]:
+            del query, limit, reference_at
             raise RuntimeError("fallback failed")
 
     def on_complete() -> None:

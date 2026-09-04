@@ -22,11 +22,13 @@ from mindbridge import (
     AsyncMemory,
     ContextBudget,
     EmbedTask,
+    MemoryConfig,
+    MindBridgeConfig,
     Modality,
     ModelInput,
     SearchHit,
 )
-from mindbridge._telemetry import SPAN_KIND, _record_retrieval_results
+from mindbridge._telemetry import SPAN_KIND
 from mindbridge.benchmarks.eval import (
     DEFAULT_ARM,
     PRODUCT_ARM,
@@ -54,6 +56,7 @@ from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.model_config import DEFAULT_TIMEOUT_SECONDS, ModelConfig
 from mindbridge.benchmarks.official_scorers import metric_is_official, retrieval_gold_ids
 from mindbridge.benchmarks.task_catalog import TaskSpec
+from mindbridge.configuration import OpenAIEmbeddingConfig
 
 _ATOMIC_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.AUDIO, Modality.VIDEO})
 
@@ -108,8 +111,10 @@ def _question(question_id: str = "q1", **metadata: object) -> EvalQuestion:
     )
 
 
-def _task(name: str = "atm-bench") -> tuple[LoadedTask, EvalUnit, EvalQuestion]:
-    question = _question(evidence_ids=["gold-1"])
+def _task(
+    name: str = "atm-bench", *, labelled: bool = True
+) -> tuple[LoadedTask, EvalUnit, EvalQuestion]:
+    question = _question(evidence_ids=["gold-1"]) if labelled else _question()
     unit = EvalUnit(
         "unit",
         (
@@ -138,7 +143,6 @@ class _RankedMemory:
 
     async def ask(self, _question: object, **_kwargs: object) -> AnswerResult:
         self.asked += 1
-        _record_retrieval_results(self._ranked)
         return AnswerResult("Ada.", self._answer_hits)
 
     async def search(
@@ -214,7 +218,7 @@ def test_retrieval_recall_scores_the_full_ranked_list_not_the_answer_hits() -> N
         arm=PRODUCT_ARM,
     )
 
-    assert memory.search_limits == []
+    assert memory.search_limits == [RETRIEVAL_CANDIDATE_LIMIT]
     assert len(ranked) == 12
     assert sample.retrieval_candidates == 12
     # Rank 8 of 12: inside recall@10, outside recall@5, and not the top-1.
@@ -244,7 +248,7 @@ def test_successful_empty_retrieval_diagnostic_scores_zero_recall() -> None:
         (sample,), seed=7, bootstrap_samples=32, recall_limit=20
     )
 
-    assert memory.search_limits == []
+    assert memory.search_limits == [RETRIEVAL_CANDIDATE_LIMIT]
     assert outcome.ranked_source_ids == ()
     assert outcome.ranked_source_ids_complete is True
     assert sample.metrics["retrieval_recall@1"] == 0.0
@@ -419,21 +423,23 @@ async def test_caller_answer_clock_includes_request_admission() -> None:
 
 
 @pytest.mark.asyncio
-async def test_product_ranking_is_captured_without_a_scoring_search() -> None:
+async def test_product_ranking_uses_a_public_scoring_search() -> None:
     answered = 0
+    searched = 0
 
     class Memory:
         async def ask_stream(
             self, _question: object, **_kwargs: object
         ) -> AsyncIterator[AnswerChunk]:
             nonlocal answered
-            _record_retrieval_results(())
             yield AnswerChunk(text="Ada")
             yield AnswerChunk(result=AnswerResult("Ada"))
             answered += 1
 
         async def search(self, _question: object, **_kwargs: object) -> tuple[SearchHit, ...]:
-            raise AssertionError("product retrieval issued a second scoring search")
+            nonlocal searched
+            searched += 1
+            return ()
 
     questions = tuple(_question(f"q{index}", evidence_ids=["gold-1"]) for index in range(3))
     telemetry = EvaluationTelemetry()
@@ -454,6 +460,7 @@ async def test_product_ranking_is_captured_without_a_scoring_search() -> None:
 
     assert all(not isinstance(outcome, BaseException) for outcome in outcomes)
     assert answered == 3
+    assert searched == 3
     assert all(
         isinstance(outcome, eval_module._AnswerOutcome) and outcome.ranked_source_ids_complete
         for outcome in outcomes
@@ -599,8 +606,6 @@ def test_every_arm_answers_the_same_questions_against_one_ingest(tmp_path: Path)
             return ()
 
         async def ask(self, _question: object, **_kwargs: object) -> AnswerResult:
-            hits = (_hit("s1", 0.9), _hit("gold-1", 0.5))
-            _record_retrieval_results(hits)
             return AnswerResult("Ada.", (_hit("gold-1", 0.5),))
 
         async def search(self, _query: object, **_kwargs: object) -> tuple[SearchHit, ...]:
@@ -862,11 +867,11 @@ def test_answer_span_attributes_name_the_task_and_the_sample() -> None:
 
 
 def test_results_report_each_arm_beside_the_product_arm() -> None:
-    task, _, _ = _task("atm-bench-main")
+    task, _, _ = _task("atm-bench-main", labelled=False)
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(
-            arms=(DEFAULT_ARM, "blind"),
+            arms=(DEFAULT_ARM, "blind", "random"),
             full_context_chars=24_000,
             ingest="add",
             compile_max_items=24,
@@ -905,6 +910,7 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
     samples = (
         _sample_with({"accuracy": 1.0, "retrieval_recall@10": 1.0}, task="atm-bench-main"),
         _sample_with({"accuracy": 0.0}, arm="blind", task="atm-bench-main"),
+        _sample_with({}, arm="random", task="atm-bench-main"),
     )
 
     results = eval_module._results(
@@ -927,6 +933,10 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
                     "duration_seconds": {"total": 0.5, "average": 0.5},
                     "token_usage": {"total_tokens": 4, "average_tokens": 4.0},
                 },
+                "random": {
+                    "duration_seconds": {"total": 0.25, "average": 0.25},
+                    "token_usage": {"total_tokens": 0, "average_tokens": 0.0},
+                },
             }
         },
     )
@@ -934,19 +944,41 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
     arms = cast(dict[str, object], results["arms"])
     table = eval_module._table(results)
 
-    assert [row["arm"] for row in rows] == [DEFAULT_ARM, "blind"]
-    assert [row["score"]["mean"] for row in rows] == [1.0, 0.0]  # type: ignore[index]
+    assert [row["arm"] for row in rows] == [DEFAULT_ARM, "blind", "random"]
+    assert [row["score"]["mean"] for row in rows] == [1.0, 0.0, None]  # type: ignore[index]
     assert rows[0]["official_metric"] is True
     assert rows[1]["official_metric"] is False
-    assert arms["selected"] == [DEFAULT_ARM, "blind"]
+    assert arms["selected"] == [DEFAULT_ARM, "blind", "random"]
     assert arms["retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
+    assert arms["retrieval_candidate_limit_arm"] == DEFAULT_ARM
     definitions = cast(dict[str, dict[str, object]], arms["definitions"])
-    assert set(definitions) == {DEFAULT_ARM, "blind"}
+    assert set(definitions) == {DEFAULT_ARM, "blind", "random"}
+    assert definitions[DEFAULT_ARM]["retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
+    assert definitions[DEFAULT_ARM]["answer_retrieval_candidate_limit"] == 60
+    assert definitions[DEFAULT_ARM]["retrieval"] == (
+        "dedicated public Memory.search after timed answer and search replay"
+    )
     assert definitions["blind"]["prompt"] == eval_module.BLIND_PROMPT_VERSION
     assert definitions["blind"]["official_metrics"] is False
+    retrieval = {row["arm"]: cast(dict[str, object], row["retrieval"]) for row in rows}
+    assert retrieval[DEFAULT_ARM]["retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
+    assert retrieval["random"]["retrieval_candidate_limit"] == arguments.recall_limit
+    assert "retrieval_candidate_limit" not in retrieval["blind"]
     assert results["status"] == "completed_with_errors"
     assert eval_module._execution_has_errors(samples, results)
     assert "atm-bench-main [blind]" in table
+
+
+def test_answer_retrieval_candidate_limit_matches_budget_policy() -> None:
+    budgeted = MindBridgeConfig(
+        embedding=OpenAIEmbeddingConfig(provider="openai"),
+        settings=MemoryConfig(evidence_budget_chars=4_242),
+    )
+
+    assert eval_module._answer_retrieval_candidate_limit(1, None) == 3
+    assert eval_module._answer_retrieval_candidate_limit(20, None) == 60
+    assert eval_module._answer_retrieval_candidate_limit(50, None) == RETRIEVAL_CANDIDATE_LIMIT
+    assert eval_module._answer_retrieval_candidate_limit(1, budgeted) == RETRIEVAL_CANDIDATE_LIMIT
 
 
 def test_baseline_generator_uses_the_configured_generation_model(
