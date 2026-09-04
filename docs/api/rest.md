@@ -149,7 +149,7 @@ Request fields and defaults are:
 | `ReinforceRequest` | required `memory_ids` with 1–100 IDs |
 | `AnswerRequest` | required `question`; `limit=5`; optional `memory_type`, `reference_at`, `scope` |
 | `ContextRequest` | required `goal`; optional `budget`, `reference_at`, `scope` |
-| `ContextBudgetRequest` | `max_chars=16000`; `max_items=24`; `min_confidence=0.0`; optional `memory_types` with at least one value; optional `freshness_seconds`; optional `max_latency_ms` |
+| `ContextBudgetRequest` | `max_chars=16000`; `max_items=24`; `min_confidence=0.0`; optional `max_media_items` (`0` for a text-only bundle); optional `memory_types` with at least one value; optional `freshness_seconds`; optional `max_latency_ms` |
 | `SettleRequest` | `limit=100`; `max_attempts=3`; optional `memory_ids` with 1–100 IDs |
 | `AnalyzeRequest` | required `memory_id` |
 | `IdentityRegisterRequest` | required `identity_id`, `name`; optional `relationship` |
@@ -311,7 +311,7 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 | `RegisterResponse` | `registered` |
 | `UnlinkResponse` | `restored_identity_id` |
 | `ForgetResponse` | `erasure`: `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`, `face_observations`, `speech_segments` |
-| `ContextBudgetResponse` | `max_chars`, `max_items`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
+| `ContextBudgetResponse` | `max_chars`, `max_items`, `max_media_items` or `null`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
 | `ContextConflictResponse` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknownResponse` | `kind`, `detail` |
 | `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, the mixed `actors` array of hits and `ProvisionalActorResponse` objects, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
@@ -485,6 +485,7 @@ names a tool. None of these is a REST limitation: the adapter runs in the proces
 | Search, answer, or page `limit` | 1 through 100 |
 | Context `budget.max_chars` | 1 through 65,536 |
 | Context `budget.max_items` | 1 through 100 |
+| Context `budget.max_media_items` | 0 or more, or `null` |
 | Context `budget.max_latency_ms` | 1 or greater |
 | Serialized metadata for one memory | 262,144 UTF-8 bytes |
 | `file_id` or `filename` | 255 characters |

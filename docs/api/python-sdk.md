@@ -340,8 +340,9 @@ compile(
 ```
 
 `compile` runs the same retrieval path once with a candidate limit of
-`max(100, 3 * budget.max_items)`, then partitions, filters, and budgets the result into a
-`ContextBundle`. It calls no generation model, stores no memory, and never resolves a conflict;
+`max(100, 3 * budget.max_items)` -- tripled when `budget.min_confidence` or `budget.freshness` is
+set, because only the compiler can apply those -- pushing `budget.memory_types` into the index as
+one route per type, then partitions, filters, and budgets the result into a `ContextBundle`. It calls no generation model, stores no memory, and never resolves a conflict;
 like `search`, and through the same helper, it may cache a transcript for spoken query media.
 `budget.max_latency_ms` is a deadline checked between stages, never a cancellation, and the bundle
 reports `elapsed_ms`, `deadline_exceeded`, and the `unknowns` the request implied but the bundle
@@ -763,13 +764,13 @@ semantics and complete examples.
 
 ### Root import inventory
 
-These are the 108 supported names exported by `mindbridge`:
+These are the 109 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `ProvisionalActor`, `IdentityChange`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate`, `DeliberationReport` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `NamedActor`, `ProvisionalActor`, `IdentityChange`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate`, `DeliberationReport` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask`, `MemoryOutcome` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
@@ -808,9 +809,10 @@ The principal immutable values are:
 | `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial`, `place_id` |
 | `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `identity_id`, `spatial`, `cue_modality`, `valence`, `arousal` |
 | `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m`, `place_id` |
-| `ContextBudget` | `max_chars`, `max_items`, `memory_types`, `min_confidence`, `freshness`, `max_latency_ms` |
+| `ContextBudget` | `max_chars`, `max_items`, `max_media_items`, `memory_types`, `min_confidence`, `freshness`, `max_latency_ms` |
 | `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknown` | `kind` (a `ContextUnknownKind`), `detail` |
+| `NamedActor` | `identity_id`, `name`, `memory_ids`, `naming_assertion_id`: an identity a currently visible naming assertion names, reached through a compiled bundle's `actors` evidence rather than the assertion itself |
 | `ProvisionalActor` | `identity_id`, `memory_ids` |
 | `ContextBundle` | `goal`, `reference_at`, `budget`, `actors`, `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`; `hits` property and `render()` |
 | `MemoryOperation` | `intent`, `evidence_ids`, `target_ids`, `proposal`, `claim`, `identity`, `rationale` |

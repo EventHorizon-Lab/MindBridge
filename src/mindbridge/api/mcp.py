@@ -36,6 +36,7 @@ from mindbridge.types import (
     MemoryRecord,
     MemoryType,
     Modality,
+    NamedActor,
     ObservationContext,
     ProvisionalActor,
     RetrievalScope,
@@ -52,6 +53,8 @@ _Chars = Annotated[int, Field(strict=True, ge=1, le=MAX_TEXT_CHARACTERS)]
 _Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 _Seconds = Annotated[float, Field(gt=0.0)]
 _Milliseconds = Annotated[int, Field(strict=True, ge=1)]
+# Zero is a real budget here -- a text-only bundle -- so this floor is not one.
+_MediaItems = Annotated[int, Field(strict=True, ge=0)]
 # Budget defaults are read from the SDK value, so the advertised tool default cannot drift from
 # `ContextBudget`.
 _BUDGET = ContextBudget()
@@ -290,6 +293,9 @@ class ReinforceResult(BaseModel):
 class ContextBudgetInput(StrictModel):
     max_chars: _Chars = _BUDGET.max_chars
     max_items: _Limit = _BUDGET.max_items
+    # Grounded media parts, not their price: 0 compiles a text-only bundle, null lets
+    # `max_chars` alone decide.
+    max_media_items: _MediaItems | None = None
     memory_types: Annotated[list[MemoryType], Field(min_length=1)] | None = None
     min_confidence: _Confidence = _BUDGET.min_confidence
     freshness_seconds: _Seconds | None = None
@@ -299,6 +305,7 @@ class ContextBudgetInput(StrictModel):
 class ContextBudgetResult(BaseModel):
     max_chars: int
     max_items: int
+    max_media_items: int | None
     memory_types: tuple[MemoryType, ...] | None
     min_confidence: float
     freshness_seconds: float | None
@@ -320,6 +327,15 @@ class ProvisionalActorResult(BaseModel):
     memory_ids: tuple[str, ...]
 
 
+class NamedActorResult(BaseModel):
+    """A person a currently visible naming assertion names, reached through other evidence."""
+
+    identity_id: str
+    name: str
+    memory_ids: tuple[str, ...]
+    naming_assertion_id: str | None
+
+
 class ContextUnknownResult(BaseModel):
     kind: ContextUnknownKind
     detail: str
@@ -329,10 +345,10 @@ class ContextBundleResult(BaseModel):
     goal: str
     reference_at: AwareDatetime
     budget: ContextBudgetResult
-    # An unnamed person present in the evidence is reported here beside the ranked entity
-    # hits, labelled, rather than omitted: what an agent may say depends on knowing they are
-    # there and that nobody has named them.
-    actors: tuple[SearchHitResult | ProvisionalActorResult, ...]
+    # Beside the ranked entity hits: a person a naming assertion names, reached through
+    # other evidence, and an unnamed person present in the evidence -- what an agent may say
+    # depends on knowing who is there, named or not.
+    actors: tuple[SearchHitResult | NamedActorResult | ProvisionalActorResult, ...]
     relationships: tuple[SearchHitResult, ...]
     scene: tuple[SearchHitResult, ...]
     episodes: tuple[SearchHitResult, ...]
@@ -564,8 +580,9 @@ def build_mcp_server(
         Prefer this tool whenever you need context to act on: it returns the actors, facts,
         episodes, procedures, affect cues and traits that matter, each with its provenance, inside
         a budget you declare, plus `rendered` text you can read straight into your own reasoning.
-        Every non-empty section gets a slot before any section gets a second one, so a small
-        budget still describes the whole scene, and `omitted` counts what did not fit. Lineage
+        Rank fills the top half of `max_items`; the bottom half gives a slot to each section the
+        top half missed, so a generous budget describes the whole scene while a small one stays
+        readable strictly by score. `omitted` counts what did not fit. Lineage
         disagreements are reported in `conflicts` and never resolved for you. `ask_memory` remains
         a convenience for when you want one grounded sentence instead of the evidence.
 
@@ -1084,7 +1101,16 @@ def _bundle_result(bundle: ContextBundle) -> ContextBundleResult:
     )
 
 
-def _actor_result(entry: SearchHit | ProvisionalActor) -> SearchHitResult | ProvisionalActorResult:
+def _actor_result(
+    entry: SearchHit | NamedActor | ProvisionalActor,
+) -> SearchHitResult | NamedActorResult | ProvisionalActorResult:
+    if isinstance(entry, NamedActor):
+        return NamedActorResult(
+            identity_id=entry.identity_id,
+            name=entry.name,
+            memory_ids=entry.memory_ids,
+            naming_assertion_id=entry.naming_assertion_id,
+        )
     if isinstance(entry, ProvisionalActor):
         return ProvisionalActorResult(
             identity_id=entry.identity_id,
@@ -1097,6 +1123,7 @@ def _budget_result(budget: ContextBudget) -> ContextBudgetResult:
     return ContextBudgetResult(
         max_chars=budget.max_chars,
         max_items=budget.max_items,
+        max_media_items=budget.max_media_items,
         memory_types=None if budget.memory_types is None else tuple(sorted(budget.memory_types)),
         min_confidence=budget.min_confidence,
         freshness_seconds=(None if budget.freshness is None else budget.freshness.total_seconds()),

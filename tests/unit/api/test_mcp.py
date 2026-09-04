@@ -1008,6 +1008,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
     assert bundle["budget"] == {
         "max_chars": 2_000,
         "max_items": 8,
+        "max_media_items": None,
         "memory_types": ["episodic", "semantic"],
         "min_confidence": 0.5,
         "freshness_seconds": 3_600.0,
@@ -1054,6 +1055,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
     assert defaulted.structured_content["budget"] == {
         "max_chars": 16_000,
         "max_items": 24,
+        "max_media_items": None,
         "memory_types": None,
         "min_confidence": 0.0,
         "freshness_seconds": None,

@@ -195,8 +195,9 @@ A context compilation request supplies a goal or query plus constraints such as 
 text or media budget, freshness, allowed sensitivity, spatial scope, and minimum evidence quality.
 The resulting bundle may contain:
 
-- current actors, relationships, and scene state, each in its own bundle section (identities
-  still need the asset-keyed identity edge, which no read path traverses yet);
+- current actors, relationships, and scene state, each in its own bundle section, with a named
+  actor's identity edge resolved through the same read path whether or not the naming assertion
+  itself ranked into the bundle;
 - relevant episodic, semantic, and procedural memories;
 - affect cues separated from longer-horizon traits;
 - temporal and spatial bounds, both metric frames and symbolic places;
@@ -252,10 +253,11 @@ reaches the control plane -- `consolidation_candidates`, `consolidate`, `forget`
 
 The compiler is that view's centre. `POST /v1/context` and the `compile_context` MCP tool return a
 budgeted bundle with provenance, and `GET /healthz` and the MCP server instructions advertise the
-configured modalities and backends so an agent does not discover them through failure. Both are
-read-only in the sense that matters: compiling context selects and structures existing evidence
-and resolves nothing. A compilation that finds nothing does record that, as the bounded signal
-the control plane's `QUERY_FAILURE` trigger reads, which changes no evidence and no memory.
+configured modalities and backends so an agent does not discover them through failure. Both
+resolve nothing and write no memory beyond the same query-audio transcript cache `search` writes,
+which is why neither is annotated read-only. A compilation that finds nothing does record that,
+as the bounded signal the control plane's `QUERY_FAILURE` trigger reads, which changes no
+evidence and no memory.
 Answering stays available as a convenience rather than the operating-system boundary.
 
 High-rate sensor streams stay on the embedded SDK boundary. Agents operate on completed
@@ -345,15 +347,17 @@ defaults or justify superiority claims.
    row an identity erasure leaves so the request is auditable without being recoverable. Open:
    companion-scenario privacy tests.
 4. Add a context compiler whose output improves downstream tasks within declared budgets. Done
-   for selection, budgeting, the latency deadline, and the explicit unknowns a thin bundle
-   reports: `compile()`. Open: a downstream-task measurement against the no-memory,
-   full-context, and retrieval-only baselines, and the person link, which needs an identity edge
-   the bundle cannot reach today. The [benchmark harness's `compile`
-   arm](benchmarking.md#baseline-arms) can now produce that comparison -- it answers from
-   `compile()`'s rendered bundle beside `blind`, `full-context`, and the product's own
-   `mindbridge` (retrieval-only) arm on the same questions, and reports each answered question's
-   bundle chars and item count as the numerator half of useful evidence per token. Running it
-   across the benchmark suite and publishing the result is still what closes the gate.
+   for selection, budgeting, the latency deadline, the explicit unknowns a thin bundle reports,
+   and the person link: `compile()` resolves a memory's identity edge -- its own bound semantic
+   assertion or its media's asset-keyed speech speaker or face observation -- into a `NamedActor`
+   or `ProvisionalActor`, whether or not the naming assertion itself ranked into the bundle. Open:
+   a downstream-task measurement against the no-memory, full-context, and retrieval-only
+   baselines. The [benchmark harness's `compile` arm](benchmarking.md#baseline-arms) can now
+   produce that comparison -- it answers from `compile()`'s rendered bundle beside `blind`,
+   `full-context`, and the product's own `mindbridge` (retrieval-only) arm on the same questions,
+   and reports each answered question's bundle chars and item count as the numerator half of
+   useful evidence per token. Running it across the benchmark suite and publishing the result is
+   still what closes the gate.
 5. Extend REST or MCP only after the Python contract and authority model are stable. Done: the
    compiler; one capability document rendered identically by `/healthz`, the MCP server
    instructions, and `mindbridge doctor`; and the three switches

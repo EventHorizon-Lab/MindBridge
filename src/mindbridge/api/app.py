@@ -71,6 +71,8 @@ _Chars = Annotated[int, Field(strict=True, ge=1, le=MAX_TEXT_CHARACTERS)]
 _Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 _Seconds = Annotated[float, Field(gt=0.0)]
 _Milliseconds = Annotated[int, Field(strict=True, ge=1)]
+# Zero is a real budget here -- a text-only bundle -- so this floor is not one.
+_MediaItems = Annotated[int, Field(strict=True, ge=0)]
 # Budget defaults are read from the SDK value, so the published transport default cannot drift
 # from `ContextBudget`.
 _BUDGET = ContextBudget()
@@ -130,6 +132,9 @@ class AnswerRequest(StrictModel):
 class ContextBudgetRequest(StrictModel):
     max_chars: _Chars = _BUDGET.max_chars
     max_items: _Limit = _BUDGET.max_items
+    # Grounded media parts, not their price: 0 compiles a text-only bundle, null lets
+    # `max_chars` alone decide.
+    max_media_items: _MediaItems | None = None
     memory_types: Annotated[list[MemoryType], Field(min_length=1)] | None = None
     min_confidence: _Confidence = _BUDGET.min_confidence
     # `ContextBudget.freshness` is a timedelta; JSON carries the same bound as seconds.
@@ -260,6 +265,7 @@ class ForgetResponse(_ResponseModel):
 class ContextBudgetResponse(_ResponseModel):
     max_chars: int
     max_items: int
+    max_media_items: int | None
     memory_types: tuple[MemoryType, ...] | None
     min_confidence: float
     freshness_seconds: float | None
@@ -279,6 +285,13 @@ class ProvisionalActorResponse(_ResponseModel):
     memory_ids: tuple[str, ...]
 
 
+class NamedActorResponse(_ResponseModel):
+    identity_id: str
+    name: str
+    memory_ids: tuple[str, ...]
+    naming_assertion_id: str | None
+
+
 class ContextUnknownResponse(_ResponseModel):
     kind: ContextUnknownKind
     detail: str
@@ -288,9 +301,10 @@ class ContextBundleResponse(_ResponseModel):
     goal: str
     reference_at: AwareDatetime
     budget: ContextBudgetResponse
-    # A recognized person in the evidence whom no visible naming assertion names is reported
-    # here beside the ranked entity hits, labelled, rather than omitted.
-    actors: tuple[SearchHitResponse | ProvisionalActorResponse, ...]
+    # Beside the ranked entity hits: a person a naming assertion names, reached through
+    # other evidence, and a recognized person no visible assertion names -- reported rather
+    # than omitted either way.
+    actors: tuple[SearchHitResponse | NamedActorResponse | ProvisionalActorResponse, ...]
     relationships: tuple[SearchHitResponse, ...]
     scene: tuple[SearchHitResponse, ...]
     episodes: tuple[SearchHitResponse, ...]
@@ -914,6 +928,7 @@ def _context_budget(request: ContextBudgetRequest | None) -> ContextBudget | Non
         return None
     return ContextBudget(
         max_chars=request.max_chars,
+        max_media_items=request.max_media_items,
         max_items=request.max_items,
         memory_types=None if request.memory_types is None else frozenset(request.memory_types),
         min_confidence=request.min_confidence,
@@ -933,6 +948,7 @@ def _bundle_response(bundle: ContextBundle) -> ContextBundleResponse:
             "reference_at": bundle.reference_at,
             "budget": {
                 "max_chars": bundle.budget.max_chars,
+                "max_media_items": bundle.budget.max_media_items,
                 "max_items": bundle.budget.max_items,
                 "memory_types": (
                     None

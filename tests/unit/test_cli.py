@@ -940,6 +940,7 @@ def test_remote_mode_compiles_over_v1(
                 "budget": {
                     "max_chars": 16000,
                     "max_items": 8,
+                    "max_media_items": None,
                     "memory_types": ["episodic"],
                     "min_confidence": 0.0,
                     "freshness_seconds": 3600.0,

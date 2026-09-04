@@ -28,6 +28,7 @@ from mindbridge import (
     MemoryType,
     Modality,
     ModelInput,
+    NamedActor,
     ObservationContext,
     ProvisionalActor,
     RetrievalScope,
@@ -37,7 +38,15 @@ from mindbridge import (
     ValidationError,
 )
 from mindbridge.cli import _LOCAL, _parser
-from mindbridge.context import compile_context, evidence_cost
+from mindbridge.context import (
+    _frame_cost,
+    _heading_cost,
+    bundle_cost,
+    compile_context,
+    evidence_cost,
+    named_actor_cost,
+    provisional_actor_cost,
+)
 from mindbridge.infrastructure.local.store import StoredAsset
 from mindbridge.memory import _PreparedContent
 
@@ -101,6 +110,12 @@ def _hit(
     )
 
 
+def _frame_and_headings(bundle: ContextBundle, sections: Sequence[str]) -> int:
+    return _frame_cost(bundle.goal, bundle.reference_at, bundle.budget) + sum(
+        _heading_cost(name) for name in sections
+    )
+
+
 def _compile(hits: Sequence[SearchHit], **budget: object) -> ContextBundle:
     return compile_context(
         "what is going on",
@@ -125,6 +140,9 @@ def _compile(hits: Sequence[SearchHit], **budget: object) -> ContextBundle:
         {"freshness": 60},
         {"memory_types": frozenset()},
         {"memory_types": frozenset({"semantic"})},
+        {"max_media_items": -1},
+        {"max_media_items": True},
+        {"max_media_items": 1.5},
         {"max_latency_ms": 0},
         {"max_latency_ms": 1.5},
         {"max_latency_ms": True},
@@ -204,8 +222,8 @@ def test_hits_partition_by_memory_type_and_kind() -> None:
     assert len(bundle.hits) == 8
 
 
-def test_every_non_empty_section_is_served_before_any_section_is_served_twice() -> None:
-    hits = (
+def _spanning_hits() -> tuple[SearchHit, ...]:
+    return (
         *(
             _hit(f"fact-{index}", score=0.9 - index / 100, kind=MemoryKind.STATE)
             for index in range(5)
@@ -214,12 +232,36 @@ def test_every_non_empty_section_is_served_before_any_section_is_served_twice() 
         _hit("cue-0", score=0.1, kind=MemoryKind.AFFECT),
     )
 
-    bundle = _compile(hits, max_items=3)
 
-    # The two lowest-ranked hits are the only members of their sections, so they take a slot
-    # before the second-ranked fact does.
-    assert {hit.id for hit in bundle.hits} == {"fact-0", "trait-0", "cue-0"}
+def test_a_small_budget_stays_in_pure_rank_order() -> None:
+    """Diversity never displaces rank when the budget cannot afford both.
+
+    Three sections and three slots would spend two of them on the two lowest-ranked candidates,
+    so the bundle would no longer be readable by score. Rank decides the whole of it instead.
+    """
+    bundle = _compile(_spanning_hits(), max_items=3)
+
+    assert [hit.id for hit in bundle.hits] == ["fact-0", "fact-1", "fact-2"]
+    assert (bundle.traits, bundle.affect) == ((), ())
     assert bundle.omitted == 4
+
+
+def test_a_budget_that_affords_both_seats_every_section_it_spans() -> None:
+    """Once the bottom half of `max_items` seats every spanned section, each one gets a slot."""
+    bundle = _compile(_spanning_hits(), max_items=6)
+
+    assert [hit.id for hit in bundle.hits] == [
+        "fact-0",
+        "fact-1",
+        "fact-2",
+        "fact-3",
+        "trait-0",
+        "cue-0",
+    ]
+    # The top half is rank alone; the floor round then buys the two sections it missed.
+    assert [hit.id for hit in bundle.traits] == ["trait-0"]
+    assert [hit.id for hit in bundle.affect] == ["cue-0"]
+    assert bundle.omitted == 1
 
 
 def test_selection_stays_in_rank_order_within_a_section() -> None:
@@ -244,10 +286,75 @@ def test_item_and_character_budgets_are_never_exceeded() -> None:
     assert len(items.hits) == 4
     assert items.omitted == 6
 
-    chars = _compile(hits, max_chars=250)
-    assert chars.chars == 200
+    # `max_chars` prices the rendered evidence: the header, the section heading, and each
+    # memory's whole `- [id] ... (confidence 1.00)` line, not `len(content)` alone.
+    chars = _compile(hits, max_chars=500)
     assert len(chars.hits) == 2
     assert chars.omitted == 8
+    assert chars.chars <= 500
+
+
+def test_max_chars_bounds_the_rendered_evidence_and_not_only_the_record_text() -> None:
+    """A bundle carrying no diagnostics renders inside `max_chars`, frame and headers included.
+
+    The old accounting charged `len(content)` alone, so the header, the section headings and
+    every `- [id] ... (confidence 1.00)` frame were spent outside the budget the caller declared
+    and the docstring told callers to measure `render()` themselves.
+    """
+    hits = tuple(
+        _hit(f"fact-{index}", score=0.9 - index / 100, content="x" * 60) for index in range(40)
+    )
+
+    for ceiling in (200, 400, 1000, 4000):
+        bundle = _compile(hits, max_chars=ceiling)
+        # `omitted` puts an unknown and a trailer below the evidence; measure the evidence.
+        rendered = bundle.render().split("\n\n## Unknowns")[0]
+        assert len(rendered) <= bundle.chars <= ceiling, ceiling
+
+    # With nothing omitted there are no diagnostics at all, so the whole text is bounded.
+    whole = _compile(hits[:2], max_chars=4000)
+    assert whole.unknowns == ()
+    assert len(whole.render()) <= whole.chars <= 4000
+
+
+def test_max_media_items_bounds_grounded_parts_instead_of_their_price() -> None:
+    """`0` compiles a text-only bundle; a positive bound caps the parts, not the characters."""
+    clips = tuple(
+        _hit(
+            f"clip-{index}",
+            score=0.9 - index / 100,
+            modality=Modality.IMAGE,
+            assets=(
+                AssetRef(
+                    id=f"asset-{index}",
+                    modality=Modality.IMAGE,
+                    media_type="image/png",
+                    size_bytes=1,
+                    sha256=f"{index}" * 64,
+                    path=Path(f"frame-{index}.png"),
+                ),
+            ),
+        )
+        for index in range(4)
+    )
+    hits = (*clips, _hit("note", score=0.1, content="a short note"))
+
+    # Unbounded: the default `max_chars` decides, and it buys some of the parts.
+    assert [hit.id for hit in _compile(hits).hits] == [
+        "clip-0",
+        "clip-1",
+        "clip-2",
+        "clip-3",
+        "note",
+    ]
+    # No media at all, whatever it costs and however it ranks.
+    text_only = _compile(hits, max_media_items=0)
+    assert [hit.id for hit in text_only.hits] == ["note"]
+    assert text_only.omitted == 4
+    # At most two image parts, and the text behind them still gets in.
+    two = _compile(hits, max_media_items=2)
+    assert [hit.id for hit in two.hits] == ["clip-0", "clip-1", "note"]
+    assert two.omitted == 2
 
 
 def test_a_media_hit_is_charged_far_above_its_record_text() -> None:
@@ -269,7 +376,7 @@ def test_a_media_hit_is_charged_far_above_its_record_text() -> None:
 
     assert evidence_cost(video) > evidence_cost(text)
     # The clip alone overruns a small budget, and the cheaper text still gets in behind it.
-    bundle = _compile((video, text), max_chars=100)
+    bundle = _compile((video, text), max_chars=300)
     assert [hit.id for hit in bundle.hits] == ["note"]
     assert bundle.omitted == 1
     # ... but the default budget must be able to buy the most expensive single grounded part,
@@ -461,7 +568,9 @@ def test_an_empty_retrieval_compiles_an_empty_bundle() -> None:
 
     assert bundle.hits == ()
     assert (bundle.occurred_from, bundle.occurred_until) == (None, None)
-    assert (bundle.frames, bundle.conflicts, bundle.omitted, bundle.chars) == ((), (), 0, 0)
+    assert (bundle.frames, bundle.conflicts, bundle.omitted) == ((), (), 0)
+    # An empty bundle still renders its header, so the header is what it charged.
+    assert bundle.chars >= len(bundle.render())
     assert "Omitted" not in bundle.render()
 
 
@@ -489,7 +598,17 @@ def test_every_budget_bound_that_removed_evidence_is_named_with_its_count() -> N
         ("budget_excluded", "1 candidates did not fit 1 items and 16000 chars"),
         ("budget_excluded", "1 candidates older than the requested freshness window"),
         ("budget_excluded", "1 candidates outside the requested memory types"),
-        ("section_empty", "no procedural memory was included"),
+        (
+            "section_empty",
+            "the affect section is empty: memory_types kept only procedural, semantic, and"
+            " affect carries only episodic memory",
+        ),
+        (
+            "section_empty",
+            "the episodes section is empty: memory_types kept only procedural, semantic, and"
+            " episodes carries only episodic memory",
+        ),
+        ("section_empty", "the procedures section is empty: no procedural memory was included"),
     ]
     # Ordering is stable, so a caller can diff two bundles.
     assert (
@@ -508,6 +627,34 @@ def test_every_budget_bound_that_removed_evidence_is_named_with_its_count() -> N
             freshness=timedelta(days=1),
         ).unknowns
     )
+
+
+def test_a_memory_type_filter_names_the_sections_it_emptied() -> None:
+    """A `{semantic}` request loses affect and procedures, and the bundle says which filter did.
+
+    Kind `affect` is stored `episodic` and kind `response_policy` `procedural`, so those two
+    sections cannot be filled under a `{semantic}` request however well their records rank. The
+    reader has to be able to map the loss back to the section, not only to the type.
+    """
+    bundle = _compile(
+        (
+            _hit("fact", score=0.9),
+            _hit("mood", score=0.8, kind=MemoryKind.AFFECT, memory_type=MemoryType.EPISODIC),
+            _hit("recipe", score=0.7, memory_type=MemoryType.PROCEDURAL),
+        ),
+        memory_types=frozenset({MemoryType.SEMANTIC}),
+    )
+
+    assert bundle.facts == (bundle.hits[0],)
+    assert (bundle.affect, bundle.procedures) == ((), ())
+    assert [item.detail for item in bundle.unknowns if item.kind.value == "section_empty"] == [
+        "the affect section is empty: memory_types kept only semantic, and affect carries only"
+        " episodic memory",
+        "the episodes section is empty: memory_types kept only semantic, and episodes carries"
+        " only episodic memory",
+        "the procedures section is empty: memory_types kept only semantic, and procedures"
+        " carries only procedural memory",
+    ]
 
 
 def test_a_full_candidate_window_is_named_beside_what_the_bundle_lost() -> None:
@@ -813,8 +960,42 @@ def test_compile_reuses_the_retrieval_path_and_structures_what_it_returns(tmp_pa
         assert [hit.id for hit in bundle.episodes] == [walk.id]
         assert [hit.id for hit in bundle.facts] == [note.id]
         assert bundle.occurred_from == REFERENCE - timedelta(hours=3)
-        assert bundle.chars == len(note.content) + len(walk.content)
+        assert len(bundle.render()) <= bundle.chars <= bundle.budget.max_chars
         assert note.id in bundle.render()
+
+
+def test_a_type_only_budget_reaches_past_the_window_the_common_types_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`memory_types` is pushed into the index, so a rare type gets its own candidate depth.
+
+    Filtering after retrieval let sixty episodes crowd the one procedural record out of the
+    window, and the bundle came back empty with only a `candidates_exhausted` unknown to explain
+    it. The narrowed rerank window here is what a real store reaches with more records.
+    """
+    monkeypatch.setattr("mindbridge.memory._RERANK_CANDIDATES", 4)
+    with _memory(tmp_path) as memory:
+        memory.add_many(
+            [f"we walked to the harbour on day {index}" for index in range(60)],
+            memory_type=MemoryType.EPISODIC,
+        )
+        recipe = memory.add(
+            "to open the toolbox, turn the blue latch twice",
+            memory_type=MemoryType.PROCEDURAL,
+        )
+
+        # The record is nowhere near the top of the unfiltered ranking for this goal.
+        ranked = memory.search("we walked to the harbour", limit=4)
+        assert recipe.id not in {hit.id for hit in ranked}
+
+        bundle = memory.compile(
+            "we walked to the harbour",
+            budget=ContextBudget(max_items=1, memory_types=frozenset({MemoryType.PROCEDURAL})),
+            reference_at=REFERENCE,
+        )
+
+        assert [hit.id for hit in bundle.procedures] == [recipe.id]
 
 
 def test_compile_rejects_a_budget_that_is_not_one(tmp_path: Path) -> None:
@@ -932,6 +1113,7 @@ def test_the_cli_command_serializes_the_bundle(tmp_path: Path) -> None:
     assert json.loads(json.dumps(document))["budget"] == {
         "max_chars": 16000,
         "max_items": 1,
+        "max_media_items": None,
         "memory_types": ["semantic"],
         "min_confidence": 0.0,
         "freshness_seconds": 86400.0,
@@ -946,7 +1128,7 @@ def test_the_cli_command_serializes_the_bundle(tmp_path: Path) -> None:
 
 
 def test_a_provisional_actor_joins_the_actors_without_taking_a_hit_slot() -> None:
-    """An unnamed person is reported beside the ranked actors, and costs nothing."""
+    """An unnamed person is reported beside the ranked actors, priced like everything else."""
     bundle = compile_context(
         "who is in the room",
         (
@@ -959,14 +1141,48 @@ def test_a_provisional_actor_joins_the_actors_without_taking_a_hit_slot() -> Non
     )
 
     assert [entry.id for entry in bundle.actors if isinstance(entry, SearchHit)] == ["actor"]
-    assert [
+    actors = [
         (entry.identity_id, entry.memory_ids)
         for entry in bundle.actors
         if isinstance(entry, ProvisionalActor)
-    ] == [("identity_1", ("episode",)), ("identity_2", ("episode",))]
-    # Not a hit, not a budgeted item, and not the reason anything was omitted.
+    ]
+    assert actors == [("identity_1", ("episode",)), ("identity_2", ("episode",))]
+    # Not a hit and not a budgeted item slot, but not the reason anything was omitted either.
     assert [hit.id for hit in bundle.hits] == ["actor", "episode"]
-    assert (bundle.omitted, bundle.chars) == (0, sum(evidence_cost(hit) for hit in bundle.hits))
+    assert bundle.omitted == 0
+    provisional_actors = [entry for entry in bundle.actors if isinstance(entry, ProvisionalActor)]
+    assert bundle.chars == (
+        sum(bundle_cost(hit) for hit in bundle.hits)
+        + sum(provisional_actor_cost(actor) for actor in provisional_actors)
+        + _frame_and_headings(bundle, ("actors", "episodes"))
+    )
+    assert len(bundle.render()) <= bundle.chars <= bundle.budget.max_chars
+
+
+def test_an_actor_line_is_dropped_rather_than_given_away_free_when_it_does_not_fit() -> None:
+    """A tight budget drops an actor line the same way it drops an oversized hit."""
+    hit = _hit("actor", kind=MemoryKind.ENTITY, content="short")
+    # The exact price of the hit alone, with no room left over for an actor line, which always
+    # costs at least one more character.
+    unnamed = compile_context(
+        "who is in the room", (hit,), budget=ContextBudget(), reference_at=REFERENCE
+    )
+    bundle = compile_context(
+        "who is in the room",
+        (hit,),
+        budget=ContextBudget(max_chars=unnamed.chars),
+        reference_at=REFERENCE,
+        provisional={"actor": ("identity_1",)},
+    )
+
+    assert bundle.actors == (hit,)
+    assert any(
+        unknown.kind.value == "budget_excluded" and "actor line" in unknown.detail
+        for unknown in bundle.unknowns
+    )
+    # The dropped actor never inflates `chars`; only the `## Unknowns` block that explains the
+    # drop sits outside the ceiling, same as it does for a dropped hit.
+    assert bundle.chars <= bundle.budget.max_chars
 
 
 def test_a_provisional_actor_of_omitted_evidence_is_not_reported() -> None:
@@ -997,4 +1213,123 @@ def test_rendering_labels_a_provisional_actor_plainly() -> None:
         "- [identity_1] unnamed person present (provisional identity; seen in [clip])"
     )
     assert "1/24 items" in bundle.render()
+    assert bundle.render() == bundle.render()
+
+
+# ---------------------------------------------------------------------------------------------
+# Named actors
+
+
+def test_a_named_actor_surfaces_without_its_naming_assertion_in_top_k() -> None:
+    """The identity edge names somebody even when the naming assertion itself lost its slot."""
+    episode = _hit("episode", kind=MemoryKind.EVENT, memory_type=MemoryType.EPISODIC, score=0.9)
+    naming = _hit("naming", kind=MemoryKind.ENTITY, score=0.1)
+    bundle = compile_context(
+        "who is in the room",
+        (episode, naming),
+        budget=ContextBudget(max_items=1),
+        reference_at=REFERENCE,
+        named={"episode": (("identity_1", "Li", "naming"),)},
+    )
+
+    assert [hit.id for hit in bundle.hits] == ["episode"]
+    named_actors = [entry for entry in bundle.actors if isinstance(entry, NamedActor)]
+    assert named_actors == [
+        NamedActor(
+            identity_id="identity_1",
+            name="Li",
+            memory_ids=("episode",),
+            naming_assertion_id="naming",
+        )
+    ]
+    assert not any(isinstance(entry, ProvisionalActor) for entry in bundle.actors)
+
+
+def test_an_unnamed_identity_still_yields_a_provisional_actor_beside_a_named_one() -> None:
+    """A named identity and an unrelated unnamed one coexist without interfering."""
+    bundle = compile_context(
+        "who is in the room",
+        (_hit("episode", kind=MemoryKind.EVENT, memory_type=MemoryType.EPISODIC),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        named={"episode": (("identity_1", "Li", "naming"),)},
+        provisional={"episode": ("identity_2",)},
+    )
+
+    assert [type(entry).__name__ for entry in bundle.actors] == ["NamedActor", "ProvisionalActor"]
+    assert bundle.actors[0].identity_id == "identity_1"  # type: ignore[union-attr]
+    assert bundle.actors[1].identity_id == "identity_2"  # type: ignore[union-attr]
+
+
+def test_a_named_identity_is_never_also_reported_provisional() -> None:
+    """A stale `provisional` entry for an identity `named` already reports is dropped."""
+    bundle = compile_context(
+        "who is in the room",
+        (_hit("episode", kind=MemoryKind.EVENT, memory_type=MemoryType.EPISODIC),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        named={"episode": (("identity_1", "Li", "naming"),)},
+        provisional={"episode": ("identity_1",)},
+    )
+
+    assert [type(entry).__name__ for entry in bundle.actors] == ["NamedActor"]
+
+
+def test_a_named_actor_aggregates_every_memory_that_carries_its_edge() -> None:
+    """The same identity observed by two included memories is one actor, not two."""
+    bundle = compile_context(
+        "who is in the room",
+        (
+            _hit("first", kind=MemoryKind.EVENT, memory_type=MemoryType.EPISODIC, score=0.9),
+            _hit("second", kind=MemoryKind.EVENT, memory_type=MemoryType.EPISODIC, score=0.8),
+        ),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        named={
+            "first": (("identity_1", "Li", "naming"),),
+            "second": (("identity_1", "Li", "naming"),),
+        },
+    )
+
+    named_actors = [entry for entry in bundle.actors if isinstance(entry, NamedActor)]
+    assert named_actors == [
+        NamedActor(
+            identity_id="identity_1",
+            name="Li",
+            memory_ids=("first", "second"),
+            naming_assertion_id="naming",
+        )
+    ]
+    # One actor line however many memories carried its edge, priced once.
+    assert bundle.chars == sum(bundle_cost(hit) for hit in bundle.hits) + named_actor_cost(
+        named_actors[0]
+    ) + _frame_and_headings(bundle, ("episodes",))
+
+
+def test_a_named_actor_of_omitted_evidence_is_not_reported() -> None:
+    """The bundle never claims a name for evidence the reader cannot see."""
+    bundle = compile_context(
+        "who is in the room",
+        (_hit("expensive", content="x" * 500),),
+        budget=ContextBudget(max_chars=10),
+        reference_at=REFERENCE,
+        named={"expensive": (("identity_1", "Li", "naming"),)},
+    )
+
+    assert bundle.actors == ()
+    assert bundle.omitted == 1
+
+
+def test_rendering_labels_a_named_actor_with_its_name_and_provenance() -> None:
+    bundle = compile_context(
+        "who is in the room",
+        (_hit("clip", kind=MemoryKind.ENTITY),),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        named={"clip": (("identity_1", "Li", "naming"),)},
+    )
+    rendered = bundle.render().splitlines()
+
+    # The ranked entity hit renders first, the named actor beside it in the same section.
+    assert rendered[-1] == "- [identity_1] Li present (seen in [clip]; named by [naming])"
     assert bundle.render() == bundle.render()
