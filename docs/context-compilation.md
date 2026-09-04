@@ -195,9 +195,15 @@ the line instead of leaving it in `context` for a caller who may never look.
 | `co-occurring events` | `AffectCue.event_ids` | Events formed from at least one of those same observations |
 
 `cue`, `valence`, `arousal`, and either ID list are omitted from the line when the record does
-not carry them. Each list names at most eight IDs and then a `+N more` count, so an affect
-line stays bounded by a constant even though these marks are not charged against
-`max_chars`. Non-affect sections keep the plain `[id] content (confidence; validity)` line.
+not carry them. Both lists name at most eight IDs, so an affect line stays bounded by a constant
+even though these marks are not charged against `max_chars`. They are bounded in different places,
+and the line reads differently as a result. `from` is the cue's own `context.evidence_ids`, which
+the compiler does not truncate, so the list is cut at render time and ends in a `+N more` count.
+`co-occurring events` is capped when the cue is built, so the hop the compiler resolves is bounded
+and not merely its rendering: the line names up to eight events and stops, without a count of the
+rest. A cue that names eight events therefore does not say whether the capture formed only those
+eight; read the cue's evidence with `get()` when the full co-occurrence set matters. Non-affect
+sections keep the plain `[id] content (confidence; validity)` line.
 
 ```text
 ## Affect
