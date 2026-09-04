@@ -7,6 +7,7 @@ version of these loaders rejected or mishandled.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -835,6 +836,48 @@ def test_locomo_refined_labels_the_dialogue_turns_that_hold_the_answer(tmp_path:
     # A question the release left unlabelled carries no label, so it is excluded
     # from recall rather than counted as a miss.
     assert labels["conv-1#q0002"]["evidence_ids"] == ()
+    # Undated questions are anchored at the conversation's last turn (see the test below).
+    assert {question.reference_at for question in unit.questions} == {
+        max(item.occurred_at for item in unit.memories if item.occurred_at is not None)
+    }
+
+
+def test_undated_questions_are_anchored_at_the_end_of_their_corpus() -> None:
+    """A relative date in a question must resolve the same way in a run and in its replay.
+
+    LoCoMo, ATM-Bench and Mem-Gallery date their memories but not their questions; without an
+    anchor `Memory.ask` used the wall clock, so "this year" meant the run's year, not the
+    corpus's. Questions that carry their own date keep it.
+    """
+    from mindbridge.benchmarks.eval_adapters import (
+        EvalQuestion,
+        EvalUnit,
+        MemoryItem,
+        _with_corpus_reference,
+    )
+
+    first = datetime(2023, 5, 20, 2, 21, tzinfo=timezone.utc)
+    last = datetime(2023, 6, 1, 9, 0, tzinfo=timezone.utc)
+    dated = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    unit = EvalUnit(
+        "conv",
+        (
+            MemoryItem("t1", ("first",), occurred_at=first),
+            MemoryItem("t2", ("second",), occurred_at=first, occurred_end=last),
+        ),
+        (
+            EvalQuestion("undated", ("What happened this year?",), ("nothing",)),
+            EvalQuestion("dated", ("And before?",), ("less",), reference_at=dated),
+        ),
+    )
+
+    anchored = _with_corpus_reference(unit)
+
+    assert anchored.questions[0].reference_at == last
+    assert anchored.questions[1].reference_at == dated
+    # A corpus without any event time offers no anchor and is left alone.
+    untimed = EvalUnit("u", (MemoryItem("t", ("x",)),), (EvalQuestion("q", ("q",), ("a",)),))
+    assert _with_corpus_reference(untimed) is untimed
 
 
 def test_longmemeval_labels_the_answer_turn_and_every_block_it_was_split_into(

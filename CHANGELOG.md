@@ -10,6 +10,21 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- `ask_stream()` on `Memory` and `AsyncMemory`, and the `AnswerChunk` value it yields. `ask()`
+  already consumed a provider's token stream, timed the first token into the
+  `mindbridge.model.time_to_first_token` span attribute, and then returned only the joined text,
+  so a caller waited for the last token to see the first. `ask_stream()` runs the identical path
+  — same retrieval, grounding, abstention, and reinforcement — and yields the generated text as
+  it arrives. Each `AnswerChunk` carries either `text` or `result`, never both: the deltas join
+  to the answer, and the single terminal chunk holds the same `AnswerResult` `ask()` returns.
+  `ask()` now drains that generator, so a buffered and a streamed answer cannot drift apart. A
+  backend without `stream_answer` yields its whole answer as one delta, so the shape does not
+  depend on the provider; `capabilities.streaming_generation` reports whether delivery is
+  actually incremental. `link_identities` means on `ask_stream()` what it means on `ask()`, which
+  is this generator drained. Arguments are validated at the call rather than at the first pull, and
+  the operation the answer holds is released before the terminal chunk, so reading a result and
+  stopping there needs no cleanup. REST, MCP, and the CLI have no equivalent: each would have to
+  choose a streaming wire format, and all three gaps are documented on their own pages.
 - `capture()`, `settle()`, and `pending_captures()` on `Memory` and `AsyncMemory`, plus the
   `capture`, `settle`, and `pending-captures` CLI commands. `capture()` commits a record, its
   media, its observation context, and one durable enrichment queue row in a single SQLite
@@ -106,6 +121,39 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   composition had ever produced a typed memory, and therefore none had ever revised a belief,
   because the supersession rules fire only on the `STATE` and user-stated `TRAIT` kinds that only
   formation emits. Formation stays absent by default: it adds a model round-trip per write.
+- A `vision` slot on the declarative configuration surface, and `describe` on `OpenAIModels`, so a
+  `VisionDescriptionBackend` exists and is reachable from `Memory.from_config()`. The protocol was
+  declared, accepted by `MemoryPlugins`, and called by `Memory` on every write, but no class
+  implemented it and no key selected one, so the derived-text write path returned its input
+  unchanged everywhere: on one measured corpus 38.9 % of records were images or video stored with
+  a 28-character body, matchable by the dense route alone because a full-text document that is
+  empty cannot be matched and scores zero for the lexical re-ranking bonus. The caption is unioned
+  into that document, never substituted for the caller's text, and the asset is still embedded
+  natively. Video is described from four locally decoded stills rather than by uploading the file.
+  A visual sent as several stills is marked with the count, and one caption per *visual* is asked
+  for explicitly: over an unmarked four-still clip a measured endpoint returned four separate
+  descriptions on every attempt, the one-caption-per-input contract rejected the reply whole, and
+  `modalities: [image, video]` therefore paid for every request and stored no caption at all.
+  Description stays absent by default: it adds a model call per visual on the write path, reported
+  under its own model module so its tokens are separable from answer tokens. A malformed reply is
+  retried once -- an endpoint can answer `200 OK` with invalid JSON, which an SDK retry policy
+  never sees -- and a describer failure leaves the memory stored without a caption instead of
+  failing the write, counted on the vision span as `mindbridge.vision.failed_batches`.
+- A store-side caption cache: a `visual_descriptions` table keyed by `(asset content SHA-256,
+  vision_space)` is read before any describe call and written with the memory, so a product caller
+  who ingests one corpus twice, or re-derives after a crash, pays once and gets the same indexed
+  documents. The measured describe endpoint returns a different caption for the same image on every
+  request even at temperature 0 with a fixed seed, and the caption is unioned into the memory's
+  full-text document, so without this a re-ingest silently rewrote what a memory said and paid for
+  every image again. One describe per asset *content*, so two memories over one picture in a single
+  write cost one call; the vision model span and its token counters only open when a call is
+  actually made. A failed batch is still never cached, so a later ingest retries it. Local schema
+  version 12 to 13, with a forward migration that adds the table and rewrites no existing row.
+- A description cache in the benchmark harness, keyed by asset SHA-256 and describer model, so two
+  ingests of one corpus build identical full-text documents and a repeat run spends no description
+  tokens. The measured generation endpoint returns a different caption for the same image on every
+  call even at temperature 0 with a fixed seed, which would otherwise make an arm incomparable
+  with itself. Opened only when the `vision` slot is configured.
 - `explain` on the search tool and the REST query, routing to `search_with_trace` and returning
   the per-candidate trace beside unchanged hits. An empty result over a transport was previously
   indistinguishable between nothing stored, everything below `minimum_relevance`, a `memory_type`
@@ -284,6 +332,32 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- **Breaking:** `VisionDescriptionBackend` now requires a `vision_space` property, mirroring
+  `embedding_space`, `transcription_space`, and `formation_space`. A custom describer without it
+  stops satisfying `MemoryPlugins`' `isinstance` check, because the protocol is `runtime_checkable`
+  and therefore validates on attribute presence. The store caches one caption per asset per space,
+  so the space -- not the model name -- is what keeps two describers from sharing captions:
+  `OpenAIModels.vision_space` digests the model, its generation controls, **and** the bundled
+  caption prompt, so editing the prompt invalidates captions written under the old one. Serving a
+  stale caption is the one failure nothing downstream can detect, since it is indistinguishable
+  from a fresh one once it is inside a searchable document.
+- `search_with_trace` orders its candidate list without going through a `set`, so two runs of one
+  query on one library print it in one order whatever the interpreter's string hash seed. The
+  ranking never depended on this and does not change: it sorts on `(-final_score, memory_id)`, and
+  the record read that hydrates it does not order by its argument. The reachable effect was on a
+  stale-index candidate's position in the trace.
+- `add_stream` now indexes its committed items in bounded groups (32 items or 250 ms) instead of
+  flushing the search index after every observation. Each item still commits to SQLite on its own
+  and the committed prefix survives a mid-stream failure; a group the process never reaches leaves
+  its outbox rows pending for the next drain, and a `search` on any thread closes the open group
+  before it reads. Measured on 300 observations: 25× faster, 10 flushes instead of 300.
+- A temporal phrase in a query now only boosts memories that overlap the asked range; memories
+  outside it and records without an event time keep the score their relevance earned instead of
+  being decayed toward the rank floor. Replayed on 810 paired validation questions the penalty
+  recovered no gold memory and only reordered; the boost alone won or tied on every one but one.
+- `search` counts the candidates that survive its scope predicates instead of hydrating their
+  records to count them, removing one of the two record reads per search (about 15 % of search
+  latency at depth 100). Results are identical.
 - **Breaking for existing stores:** the bundled OpenAI consolidation recipe is
   `mindbridge-consolidation-v2`. Its system prompt now describes the media parts attached to each
   evidence item, and the recipe is a digest of that prompt. The recipe salts `operation_key` and
@@ -298,10 +372,16 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   standing operation has built on. Operations that touched one lineage reverse newest first;
   reversing an older one out of order would restore a superseded version beside the current one.
 
-- The local schema is version 10. Version 9 directories upgrade in place, adding
+- The local schema is version 15. Version 9 directories upgrade in place through six steps:
+  version 10 adds `memory_records.place_id` and its index; version 11 adds
   `memory_records.forgotten_at`, the `capture_queue` table that makes deferred enrichment durable
   across a crash, and the append-only `memory_operations` log that makes a control-plane operation
-  replayable and reversible.
+  replayable and reversible; version 12 adds `memory_semantics.identity_id` and rebuilds the
+  operation-intent constraint so `identify` is an allowed intent; version 13 adds the
+  `visual_descriptions` caption cache; version 14 adds the scheduler's durable state
+  (`memory_deliberations`, `memory_deliberation_memories`, and `query_failures`), the post-hoc
+  `memory_operations.outcome` and `outcome_note` columns, and admits the `merge` intent; version
+  15 admits the `consent` intent so a data subject's own statement can be logged.
 
 - **Breaking:** `minimum_relevance` now gates evidence relevance — the cosine the dense route
   reports, or the demoted full-text contribution when only the lexical route matched, times the
@@ -480,6 +560,17 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- The benchmark description cache accepts calls from every unit worker thread. It is opened once
+  for a run while units ingest on worker threads, and SQLite's per-thread binding made every
+  worker-side describe fail; the write path counted each as a failed batch and fell open, so a
+  vision arm could build caption-less libraries while every other counter read as healthy.
+- Forgetting, retracting, or correcting a naming assertion with a timestamp older than the identity
+  row raised `sqlite3.IntegrityError` (`CHECK constraint failed: updated_at >= created_at`) out of
+  the store instead of applying. The name projection is rewritten in the same transaction and was
+  stamping `identities.updated_at` with the caller's semantic time — a record's `recorded_at`, an
+  operation's `applied_at`, a deliberately backdated `forgotten_at` — none of which says when the
+  row changed. It now stamps transaction time, like every other write to that row, and the
+  projection helpers no longer take a timestamp at all.
 - A control-plane operation that lost the idempotency race on the consolidation write path raised
   `StorageError` from a unique-index violation instead of being rejected as `"duplicate"`. The
   formation transaction now makes the same in-transaction key check the other write path already

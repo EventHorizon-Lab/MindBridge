@@ -71,7 +71,12 @@ from mindbridge.benchmarks.eval_adapters import (
     load_media_manifest,
     load_task,
 )
-from mindbridge.benchmarks.eval_cache import CachedAnswer, EvidenceInterval, ResponseCache
+from mindbridge.benchmarks.eval_cache import (
+    CachedAnswer,
+    DescriptionCache,
+    EvidenceInterval,
+    ResponseCache,
+)
 from mindbridge.benchmarks.eval_statistics import (
     ScoredValue,
     paired_comparison,
@@ -154,7 +159,7 @@ _GOLD_EVIDENCE_KEYS = ("evidence_ids", "clue_ids")
 _UNRESOLVED_EVIDENCE_KEY = "unresolved_evidence_ids"
 _RECALL_CUTOFFS = (1, 5, 10, 20)
 _MANDATORY_CONTROLS = ("random_ranker", "blind", "recall_at_20")
-EVAL_SCHEMA_VERSION = 9
+EVAL_SCHEMA_VERSION = 10
 EVAL_RUNNER_VERSION = "mindbridge_eval_official_v10"
 DEFAULT_ARM = "mindbridge"
 BASELINE_ARMS = ("blind", "full-context", "random", "compile")
@@ -345,6 +350,10 @@ class SampleResult:
     # `retrieval_candidates` is how deep the retriever's own ranked list actually went.
     candidate_count: int = 0
     retrieval_candidates: int = 0
+    # The retriever's own ranked source IDs, deepest first-party list the run produced. Task-level
+    # retrieval recall scores this list; `evidence` is what the generator cited, a different
+    # quantity that an earlier version of this harness scored under the same name.
+    ranked_source_ids: tuple[str, ...] = ()
     dropped_hits: int | None = None
     abstained: bool = False
     abstention_reason: str | None = None
@@ -376,6 +385,7 @@ class SampleResult:
             "sample_id": self.sample_id,
             "arm": self.arm,
             "retrieval_candidates": self.retrieval_candidates,
+            "ranked_source_ids": self.ranked_source_ids,
             "dropped_hits": self.dropped_hits,
             "task": self.task,
             "benchmark": self.benchmark,
@@ -580,6 +590,65 @@ class _BorrowedBackend:
         return None
 
 
+class _CachedVisionDescriber:
+    """Describe only the visuals no earlier run has described at this model.
+
+    The endpoint returns a different caption for the same image on every call, so without this
+    two ingests of one corpus build different full-text documents and a paired arm cannot be
+    compared with itself. Keyed on the asset's own SHA-256, so it is stable across runs, stores,
+    and machines, and a repeat run spends zero description tokens.
+    """
+
+    def __init__(self, backend: VisionDescriptionBackend, cache: DescriptionCache) -> None:
+        self._backend = backend
+        self._cache = cache
+
+    @property
+    def vision_capabilities(self) -> frozenset[Modality]:
+        return self._backend.vision_capabilities
+
+    @property
+    def vision_model(self) -> str:
+        return self._backend.vision_model
+
+    @property
+    def vision_space(self) -> str:
+        return self._backend.vision_space
+
+    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+        batch = tuple(inputs)
+        keys = tuple(_description_digest(value) for value in batch)
+        known = tuple(None if key is None else self._cache.get(key) for key in keys)
+        pending = tuple(value for value, found in zip(batch, known, strict=True) if found is None)
+        # One call for the whole miss set, so a partially cached batch still costs one request.
+        fresh = iter(() if not pending else self._backend.describe(pending))
+        described: list[str] = []
+        for key, found in zip(keys, known, strict=True):
+            if found is not None:
+                described.append(found)
+                continue
+            value = next(fresh)
+            if key is not None:
+                self._cache.put(key, value)
+            described.append(value)
+        return tuple(described)
+
+    def close(self) -> None:
+        return None
+
+
+def _description_digest(value: ModelInput) -> str | None:
+    """Identify one description input by the content of the assets it carries.
+
+    An input with no resolved digest is describable but not cacheable; it is passed through
+    rather than silently sharing a key with everything else in its shape.
+    """
+    digests = tuple(asset.sha256 for asset in value.assets if asset.sha256)
+    if not digests or len(digests) != len(value.assets):
+        return None
+    return ":".join((*digests, value.text))
+
+
 class _BorrowedGenerationBackend(_BorrowedBackend):
     """Lend one answerer without transferring ownership to a per-unit memory."""
 
@@ -663,9 +732,11 @@ class _BackendPool:
         gen_kwargs: str = "",
         memory_config: MindBridgeConfig | None = None,
         tracer: Tracer | None = None,
+        description_cache: Path | None = None,
     ) -> None:
         self.config = config
         self._resolved_config = None
+        self._description_cache: DescriptionCache | None = None
         self._tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
         if memory_config is not None:
             if memory_config.generation is not None:
@@ -717,11 +788,23 @@ class _BackendPool:
                 if plugins.consolidator is None
                 else cast(ConsolidationBackend, _BorrowedBackend(plugins.consolidator))
             )
-            self._vision_describer = (
-                None
-                if plugins.vision_describer is None
-                else cast(VisionDescriptionBackend, _BorrowedBackend(plugins.vision_describer))
-            )
+            if plugins.vision_describer is None:
+                self._vision_describer = None
+            else:
+                borrowed = cast(
+                    VisionDescriptionBackend, _BorrowedBackend(plugins.vision_describer)
+                )
+                # Opened only when `vision:` is configured, so a run without the slot touches no
+                # cache file at all and behaves exactly as it does today.
+                if description_cache is not None:
+                    self._description_cache = DescriptionCache(
+                        description_cache, plugins.vision_describer.vision_model
+                    )
+                    borrowed = cast(
+                        VisionDescriptionBackend,
+                        _CachedVisionDescriber(borrowed, self._description_cache),
+                    )
+                self._vision_describer = borrowed
             # Answer-time reinforcement is a product behaviour, not a measured one: it makes a
             # question's retrieval depend on which earlier questions ran, and under concurrency on
             # the order their updates committed, so a run stops being reproducible from its seed.
@@ -821,6 +904,10 @@ class _BackendPool:
         )
 
     def close(self) -> None:
+        if self._description_cache is not None:
+            with suppress(Exception):
+                self._description_cache.close()
+            self._description_cache = None
         if self._resolved_config is not None:
             self._resolved_config.close()
             return
@@ -1123,6 +1210,8 @@ def _execute(
 ) -> tuple[
     tuple[SampleResult, ...], float, Mapping[str, Mapping[str, object]], Mapping[str, object]
 ]:
+    global _first_ingest_failure_announced
+    _first_ingest_failure_announced = False
     needs_speech = any(
         isinstance(atom, Path)
         and _MODALITY_BY_SUFFIX.get(atom.suffix.casefold()) in {Modality.AUDIO, Modality.VIDEO}
@@ -1153,7 +1242,7 @@ def _execute(
         memory_factory: MemoryFactory
         arm_specs = tuple(_Arm(name) for name in arguments.arms)
         all_cached = response_cache is not None and _all_cached(response_cache, loaded, arm_specs)
-        devices = _evaluation_devices(arguments.device, memory_config)
+        devices = _evaluation_devices(arguments.device, memory_config, needs_speech=needs_speech)
         with ExitStack() as device_locks:
             for device in devices:
                 device_locks.enter_context(
@@ -1176,6 +1265,7 @@ def _execute(
                         gen_kwargs=arguments.gen_kwargs,
                         memory_config=memory_config,
                         tracer=telemetry.tracer,
+                        description_cache=_description_cache_path(arguments, memory_config),
                     )
                     memory_factory = pool.memory
                 with sampler:
@@ -1795,6 +1885,7 @@ async def _ingest(
         except IndexUnavailableError:
             raise
         except Exception as error:
+            _announce_first_ingest_failure(error, chunk[0].source_id)
             if on_failure is not None:
                 on_failure(_failure_detail(error, source_id=chunk[0].source_id))
             return 1
@@ -2107,6 +2198,11 @@ def _sample(
         # The response cache stores answers, not candidate lists, so a replayed answer cannot
         # carry a retrieval score. Reporting the empty list as recall zero would invent one.
         retrieval_available=arm.retrieves and not cached,
+        # A provider failure produced no answer. Scoring the empty prediction turned every 500
+        # into a confident zero, and because the arms fail at different rates the deflation was
+        # asymmetric: on one run the blind arm errored 3.4x more often than the product arm,
+        # so the naive "memory is worth +X" gap was inflated by the error-rate difference.
+        answer_failed=error_code is not None,
     )
     if (
         not isinstance(outcome, BaseException)
@@ -2155,6 +2251,7 @@ def _sample(
         scorer_protocol=scorer_protocol(task.spec.name),
         arm=arm.name,
         retrieval_candidates=len(ranked_source_ids),
+        ranked_source_ids=tuple(ranked_source_ids),
     )
 
 
@@ -2168,6 +2265,7 @@ def _score(
     predict_only: bool,
     arm: _Arm = PRODUCT_ARM,
     retrieval_available: bool = True,
+    answer_failed: bool = False,
 ) -> tuple[Mapping[str, float], float | None, float | None]:
     if predict_only:
         return {}, None, None
@@ -2183,6 +2281,15 @@ def _score(
         evidence_source_ids=tuple(ranked_source_ids),
     )
     metrics = _arm_metrics(metrics, arm, retrieval_available=retrieval_available)
+    if answer_failed:
+        # Keep what the run did measure -- the retriever ranked before the generator failed --
+        # and leave the answer unscored so it lands in `error_count`, not in the mean.
+        diagnostic = {
+            name: value
+            for name, value in metrics.items()
+            if name.startswith(("retrieval_", "joint_"))
+        }
+        return diagnostic, None, None
     score = metrics.get(sample_primary_metric(task_name), metrics.get("token_f1"))
     return metrics, score, metrics.get("exact_match")
 
@@ -2944,6 +3051,7 @@ def _metrics(
         "metrics": metric_rows,
         "exact_match": metric_rows.get("exact_match"),
         "question_count": len(samples),
+        "scored_question_count": len(scored),
         "error_count": error_count,
         "ingest_failure_count": ingest_failure_count,
         "abstentions": _abstentions(samples),
@@ -2958,7 +3066,13 @@ def _metrics(
             "p99": percentile(latencies, 0.99),
         },
         "retrieval": retrieval,
-        "controls": _controls(task.spec.name, retrieval, blind, is_blind_run=arguments.blind),
+        "controls": _controls(
+            task.spec.name,
+            retrieval,
+            blind,
+            is_blind_run=arguments.blind,
+            retrieves=_Arm(arm).retrieves,
+        ),
         "noise_floor": _noise_floor(scored, primary),
         "cross_harness_comparable": False,
         "comparability_note": (
@@ -3030,8 +3144,13 @@ def _metadata_ids(metadata: Mapping[str, object], key: str) -> tuple[str, ...]:
 
 
 def _retrieved_sources(sample: SampleResult) -> tuple[str, ...]:
-    """Return the retrieved source IDs in rank order, deduplicated."""
-    return tuple(dict.fromkeys(item.source_id for item in sample.evidence if item.source_id).keys())
+    """Return the retriever's ranked source IDs in rank order, deduplicated.
+
+    This is the list `search(limit=RETRIEVAL_CANDIDATE_LIMIT)` returned, not `sample.evidence`:
+    evidence is narrowed to the hits the generator cited, so scoring it reported the generator's
+    citation behaviour under the name of retrieval recall.
+    """
+    return tuple(dict.fromkeys(source for source in sample.ranked_source_ids if source))
 
 
 def _retrieval_quality(
@@ -3076,7 +3195,25 @@ def _retrieval_quality(
                 "cannot be measured at these retrieval settings"
             ),
         }
-    labelled = tuple(sample for sample in samples if _metadata_ids(sample.metadata, key))
+    labelled_all = tuple(sample for sample in samples if _metadata_ids(sample.metadata, key))
+    # A labelled question whose run recorded no ranked list (a cached answer, or a harness that
+    # never issued the ranked query) is excluded and counted, never scored as recall zero.
+    labelled = tuple(sample for sample in labelled_all if sample.ranked_source_ids)
+    unranked = len(labelled_all) - len(labelled)
+    if not labelled:
+        return {
+            "gold_evidence_key": key,
+            "recall_limit": recall_limit,
+            "labelled_question_count": 0,
+            "unranked_labelled_question_count": unranked,
+            "recall_at_k": {},
+            "random_ranker_recall_at_k": {},
+            "unresolved_gold_evidence_ids": unresolved,
+            "unavailable_reason": (
+                "no labelled question carries the retriever's ranked source list, so retrieval "
+                "quality cannot be measured from this run"
+            ),
+        }
     measured: dict[int, list[ScoredValue]] = {cutoff: [] for cutoff in _RECALL_CUTOFFS}
     random_ranker: dict[int, list[ScoredValue]] = {cutoff: [] for cutoff in _RECALL_CUTOFFS}
     pool_sizes = []
@@ -3114,6 +3251,7 @@ def _retrieval_quality(
         "gold_evidence_key": key,
         "recall_limit": recall_limit,
         "labelled_question_count": len(labelled),
+        "unranked_labelled_question_count": unranked,
         "unresolved_gold_evidence_ids": unresolved,
         "recall_at_k": rows(measured),
         "random_ranker_recall_at_k": rows(random_ranker),
@@ -3155,20 +3293,26 @@ def _controls(
     blind: Mapping[str, object] | None,
     *,
     is_blind_run: bool,
+    retrieves: bool = True,
 ) -> dict[str, object]:
     """Report the three controls that make a score interpretable, and which are absent.
 
     Each of these has independently invalidated a conclusion on this project: a random ranker
     reached R@10 = 0.9941 on one benchmark, blind answering already scores 0.383 on another,
     and R@1 moving without R@20 moving is noise.
+
+    An arm that never retrieves (blind, full-context) has no retrieval to control for, so the two
+    retrieval controls do not apply to it rather than being missing. Requiring them turned
+    `controls_complete` false on every run that carried a blind arm, which hid the difference
+    between a task with no gold labels and a healthy one.
     """
     recall = retrieval.get("recall_at_k")
     random_ranker = retrieval.get("random_ranker_recall_at_k")
     recall_rows = recall if isinstance(recall, Mapping) else {}
     random_rows = random_ranker if isinstance(random_ranker, Mapping) else {}
     present = {
-        "random_ranker": bool(random_rows),
-        "recall_at_20": "20" in recall_rows and "1" in recall_rows,
+        "random_ranker": not retrieves or bool(random_rows),
+        "recall_at_20": not retrieves or ("20" in recall_rows and "1" in recall_rows),
         "blind": is_blind_run or blind is not None,
     }
     missing = tuple(name for name in _MANDATORY_CONTROLS if not present[name])
@@ -3178,6 +3322,7 @@ def _controls(
         "recall_at_20": recall_rows.get("20"),
         "blind": None if blind is None else dict(blind),
         "is_blind_run": is_blind_run,
+        "retrieval_controls_applicable": retrieves,
         "missing": list(missing),
         "interpretable": not missing,
         "reason": (
@@ -3759,6 +3904,30 @@ def _announce(message: str) -> None:
     print(f"mindbridge-bench eval: {message}", file=sys.stderr)
 
 
+_first_ingest_failure_announced = False
+
+
+def _announce_first_ingest_failure(error: BaseException, source_id: str) -> None:
+    """Say once, immediately, that writes are failing.
+
+    Ingest failures are bisected, counted and reported in the final table's `unwritten` column,
+    which is right for a corpus with a few unreadable items and wrong for a misconfiguration that
+    fails every write: a run with an embedding dimension the model does not produce looked alive
+    for fourteen minutes while every store on the machine stayed empty. One line at the first
+    failure carries the error text the summary cannot.
+    """
+    global _first_ingest_failure_announced
+    if _first_ingest_failure_announced:
+        return
+    _first_ingest_failure_announced = True
+    detail = _failure_detail(error, source_id=source_id)
+    reason = "" if detail.reason is None else f"/{detail.reason}"
+    _announce(
+        f"first ingest failure at source {source_id} ({detail.code}{reason}): {error}"
+        " -- further failures are counted in the unwritten column"
+    )
+
+
 def _table(results: Mapping[str, object]) -> str:
     tasks = cast(Sequence[Mapping[str, object]], results["tasks"])
     rows = []
@@ -3774,6 +3943,18 @@ def _table(results: Mapping[str, object]) -> str:
         average_duration = duration.get("average")
         total_tokens = usage.get("total_tokens")
         average_tokens = usage.get("average_tokens")
+        # When the judge's usage is incomplete the task total is honestly null, but the product's
+        # own spend is usually complete; print that with a marker rather than a dash.
+        token_marker = ""
+        product = usage.get("product")
+        if (
+            total_tokens is None
+            and isinstance(product, Mapping)
+            and product.get("total_tokens") is not None
+        ):
+            total_tokens = product.get("total_tokens")
+            average_tokens = product.get("average_tokens")
+            token_marker = "*"
         valid = task.get("score_valid") is not False
         rows.append(
             (
@@ -3813,13 +3994,13 @@ def _table(results: Mapping[str, object]) -> str:
                 (
                     "—"
                     if isinstance(total_tokens, bool) or not isinstance(total_tokens, int)
-                    else str(total_tokens)
+                    else f"{total_tokens}{token_marker}"
                 ),
                 (
                     "—"
                     if isinstance(average_tokens, bool)
                     or not isinstance(average_tokens, int | float)
-                    else f"{float(average_tokens):.1f}"
+                    else f"{float(average_tokens):.1f}{token_marker}"
                 ),
                 _control_cell(controls.get("recall_at_1")),
                 _control_cell(controls.get("recall_at_20")),
@@ -4518,13 +4699,18 @@ def _evaluation_memory_config(
 def _evaluation_devices(
     explicit: str | None,
     config: MindBridgeConfig | None,
+    *,
+    needs_speech: bool = True,
 ) -> tuple[str | None, ...]:
     if config is None:
         return (explicit,)
     configured = []
     if config.embedding.provider in {"jina-omni", "sentence-transformers"}:
         configured.append(explicit or config.embedding.device or "auto")
-    if config.speech is not None and config.speech.provider == "funasr":
+    # The speech backend is only constructed when a unit carries audio or video, so a text-only
+    # run must not hold the GPU lock for a model it never loads: that lock serialized every
+    # text task behind one video run on a shared card.
+    if needs_speech and config.speech is not None and config.speech.provider == "funasr":
         configured.append(explicit or config.speech.device)
     devices: dict[str, str | None] = {}
     for device in sorted(set(configured)):
@@ -4547,6 +4733,24 @@ def _replace_config(config: ModelConfig, key: str, value: str) -> ModelConfig:
     if key == "generation_min_video_seconds":
         return replace(config, generation_min_video_seconds=float(value))
     raise AssertionError(f"unhandled model setting: {key}")
+
+
+def _description_cache_path(
+    arguments: _Arguments,
+    memory_config: MindBridgeConfig | None,
+) -> Path | None:
+    """Where descriptions persist between runs, or ``None`` when nothing describes.
+
+    Beside the response cache when one is configured, so both live under the same directory a
+    sweep already owns; otherwise under the corpus root. Deliberately not namespaced by run or
+    by task: the whole point is that a later run reads what an earlier one wrote.
+    """
+    if memory_config is None or memory_config.vision is None:
+        return None
+    directory = (
+        arguments.data_root / "cache" if arguments.use_cache is None else arguments.use_cache.parent
+    )
+    return directory / "descriptions.db"
 
 
 def _batch_size(arguments: _Arguments, task: LoadedTask) -> int:

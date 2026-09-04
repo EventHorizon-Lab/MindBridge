@@ -99,7 +99,8 @@ composition change keeps advertising the composition it was built with;
 
 `build_mcp_server` borrows `memory`; it neither opens nor closes it. The host must keep the owner
 alive for the server lifetime and close it during shutdown. Do not run another `Memory`, REST, or
-MCP owner against the same physical `data_dir`.
+MCP owner against the same physical `data_dir`. Composition and process ownership are defined in
+[architecture](../architecture.md) and [configuration](../configuration.md).
 
 MindBridge adds no authentication to any MCP transport. Stdio inherits local process permissions;
 an SSE or streamable-HTTP host must add authentication, authorization, TLS, request limits, and
@@ -303,13 +304,14 @@ details are still never serialized.
 
 ### Operations without a tool
 
-Twenty Python operations have no MCP tool. One is a transport limitation and the rest are
+Twenty-one Python operations have no MCP tool. Two are transport limitations and the rest are
 decisions; none is withheld because it touches owner-process state, since every tool already
 does.
 
 | Operation | Why, and what to call instead |
 | --- | --- |
 | `add_stream` | **Transport limitation.** It consumes a lazy iterable and yields records as it goes, and one tool call is a finite request with one response, so a stream cannot be started, fed, and drained through it. Call `add_memory` for each completed observation, or use the SDK for a live source. |
+| `ask_stream` | **Transport limitation.** It yields the answer while the model is still producing it, and one tool call is a finite request with one response, so the incremental delivery that justifies it cannot survive the hop. Call `ask_memory`, which returns the same grounded answer once it is complete, or use the SDK when time to first token matters. |
 | `add_many` | Every item is already reachable through `add_memory`, so this buys one model batch rather than a capability. Its parallel arrays must line up with `contents` position by position, and a misalignment stores real memories under the wrong timestamps, which is a worse failure than slower ingestion. Use `POST /v1/memories/batch` for bulk loading. |
 | `search_with_trace` | No tool of its own, because the same trace is reachable from the tool that produces the hits: call `search_memories` with `explain=true`. Use the SDK or the CLI when diagnosing retrieval outside an agent loop. |
 | `reindex` | Rebuilds the whole search projection from SQLite. The duration grows with the store and has no upper bound, so it does not belong behind a client that expects one timely response. It is also an operator decision, not a caller's. |
@@ -344,4 +346,5 @@ MCP has no aggregate framing budget, but each inline media value is bounded befo
 work. It has no local-path input, remote fetch, large-file upload tool, capture-stream tool,
 coordinate-frame transform, logical scope, or separate authentication policy; the MCP host owns
 transport access control. Configured model backends may
-impose a smaller aggregate budget, including the [OpenAI inline limits](python-sdk.md#bundled-adapters).
+impose a smaller aggregate budget, including the
+[OpenAI inline limits](python-sdk.md#bundled-adapters).

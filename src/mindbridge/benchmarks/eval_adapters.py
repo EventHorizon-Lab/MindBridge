@@ -377,7 +377,10 @@ def load_task(
         raise ValueError("limit must be -1, a positive count, or a fraction between zero and one")
     if offset < 0:
         raise ValueError("offset must not be negative")
-    units = _LOADERS[spec.name](spec, dataset, resolver, root, limit, offset)
+    units = tuple(
+        _with_corpus_reference(unit)
+        for unit in _LOADERS[spec.name](spec, dataset, resolver, root, limit, offset)
+    )
     if not units or any(not unit.questions for unit in units):
         raise ValueError(f"{spec.name} produced no evaluation questions")
     inputs = {
@@ -1484,6 +1487,38 @@ def _finite_number(value: object, name: str) -> float:
     if not math.isfinite(result):
         raise ValueError(f"media manifest {name} must be a finite number")
     return result
+
+
+def _with_corpus_reference(unit: EvalUnit) -> EvalUnit:
+    """Anchor questions that carry no date of their own at the end of the unit's corpus.
+
+    `Memory.ask` resolves a relative expression such as "last week" or "this year" against
+    `reference_at`, and with none given against the wall clock. A dataset that does not date its
+    questions therefore retrieved different memories for the same seed depending on when the run
+    started, and a replay hours later could not reproduce it. The one instant such a corpus
+    defines is the time of its last memory: the question is asked after everything it can
+    remember. Datasets that date their questions keep those dates untouched.
+    """
+    if all(question.reference_at is not None for question in unit.questions):
+        return unit
+    times = [
+        moment
+        for item in unit.memories
+        for moment in (item.occurred_end, item.occurred_at)
+        if moment is not None
+    ]
+    if not times:
+        return unit
+    latest = max(times)
+    return replace(
+        unit,
+        questions=tuple(
+            question
+            if question.reference_at is not None
+            else replace(question, reference_at=latest)
+            for question in unit.questions
+        ),
+    )
 
 
 def _selected(values: Sequence[_T], limit: Limit, offset: int) -> Sequence[_T]:

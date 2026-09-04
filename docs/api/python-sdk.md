@@ -89,20 +89,38 @@ supported provider configuration fields live in [configuration](../configuration
 A plain `TranscriptionBackend` transcribes supported audio/video during `add` regardless of
 `index_speech`; `SpeechBackend` analysis and identity resolution stay behind the explicit flag.
 
-`vision_describer` has no declarative provider and is reachable only through direct construction
-or `MemoryPlugins`. `former` proposes typed memories after a source observation commits; omitting
-it keeps ordinary add behavior and makes no formation model call. The bundled OpenAI former is
-selected by the declarative `formation` slot, which stays off unless it is configured; see
+`vision_describer` captions a visual memory so it has a full-text document at all; without one an
+image-only memory is reachable by the dense route alone. It is selected by the declarative `vision`
+slot, which stays off unless it is configured, or supplied directly through `MemoryPlugins`; see
+[configuration](../configuration.md#visual-descriptions). The bundled `OpenAIModels.describe`
+captions one batch per chat completion, sends a video as four locally decoded stills rather than
+the file, accepts only exactly one non-empty caption per input, and retries one malformed reply
+once. A describer failure never fails the write: the memory is stored without a caption and the
+batch is counted on the vision span as `mindbridge.vision.failed_batches`.
+
+`former` proposes typed memories after a source observation commits; omitting it keeps ordinary
+add behavior and makes no formation model call. The bundled OpenAI former is selected by the
+declarative `formation` slot, which stays off unless it is configured; see
 [configuration](../configuration.md#automatic-memory-formation). `consolidator` proposes the
 control-plane operations `consolidate()` applies; the bundled OpenAI backend is selected by the
 declarative `consolidation` slot, which stays off unless it is configured, and omitting it leaves
 `consolidate()` unavailable and every other operation unchanged. See
 [configuration](../configuration.md#agentic-memory-management).
 
-Use `index_speech=True` when transcripts and resolved speaker names should become retrieval text.
-`evidence_budget_chars=None` grounds `ask()` on exactly `limit` hits. A positive integer may admit
-more ranked evidence while its text-equivalent cost fits the budget: 2,000 characters per image,
-4,000 per audio asset, and 12,000 per video asset.
+`index_speech` is on by default and is a no-op unless `transcriber` is a `SpeechBackend`, whose
+analysis has already run by the time `add` reaches the index. Set it to `False` to keep transcripts
+and resolved speaker names out of retrieval text and out of `add`-time identity matching.
+
+`ask()` grounds on the top of the ranking, except that a modality present in the retrieved hits
+and absent from the first `limit` of them contributes its best hit in the last slot, so one
+modality cannot shut the others out.
+
+`evidence_budget_chars=None` grounds `ask()` on exactly `limit` hits. A positive integer keeps
+those hits and then admits more ranked evidence while its text-equivalent cost fits the budget:
+2,000 characters per image, 4,000 per audio asset, and 12,000 per video asset. It raises a floor
+rather than imposing a ceiling, so bound a prompt by lowering `limit` and leaving the budget unset.
+The per-setting semantics and calibration notes live in
+[configuration](../configuration.md#local-memory-settings).
 
 `reinforce_on_answer=True` records positive feedback for the hits an answerer actually cites.
 Set it to `False` for evaluations that require one question not to change later rankings.
@@ -303,6 +321,16 @@ ask(
     scope: RetrievalScope | None = None,
     link_identities: bool = True,
 ) -> AnswerResult
+
+ask_stream(
+    question: ContentInput,
+    *,
+    limit: int = 5,
+    memory_type: MemoryType | None = None,
+    reference_at: datetime | None = None,
+    scope: RetrievalScope | None = None,
+    link_identities: bool = True,
+) -> Iterator[AnswerChunk]
 ```
 
 `reference_at` is the timezone-aware clock for relative time and decay. The current UTC time is
@@ -328,6 +356,40 @@ the operation log, reversible by `rollback()`. `link_identities=False` still run
 recognition to answer the question, but that bind is never committed -- no `MERGE` row, no new
 identity link -- so a caller with recall access alone cannot acquire merge authority through
 `ask`.
+
+`ask_stream` runs the same path and yields the answer while the model is still producing it.
+Retrieval, grounding, and reinforcement are unchanged; only delivery of the generated text is
+incremental. Each `AnswerChunk` carries either `text` or `result`, never both: the deltas join to
+the answer, and the single terminal chunk holds the same `AnswerResult` `ask` returns, and
+`link_identities` means what it means on `ask`, which is this method drained.
+
+```python
+answer = None
+for chunk in memory.ask_stream("Where is the red toolbox?"):
+    if chunk.result is None:
+        print(chunk.text, end="", flush=True)
+    else:
+        answer = chunk.result
+```
+
+Arguments are validated when `ask_stream` is called, not when the stream is first pulled. A
+backend without `stream_answer` still works: it yields its whole answer as one delta. Reading to
+the terminal chunk releases everything the answer held, so stopping there needs no cleanup;
+abandoning the stream mid-answer leaves one operation open until the generator is closed or
+collected, and `close()` waits for open operations.
+
+Streaming is a property of the composed backend, reported by
+`capabilities.streaming_generation`. It changes when the answer becomes visible, not how long it
+takes: a model that reasons before it answers spends most of its generation time before the first
+visible token, and `ask_stream` recovers only what follows it. The
+`mindbridge.model.generation` span records `mindbridge.model.time_to_first_token` either way, so
+the split is measurable before it is designed around. That span stays open for the life of the
+stream, so with `ask_stream` its duration includes the time a caller spends between chunks.
+
+`AsyncMemory.ask_stream` is the same contract as an `AsyncGenerator[AnswerChunk, None]`,
+including validation at the call. Every step of the underlying stream runs in one worker thread,
+so the event loop stays free while the provider generates, at the cost of a thread per in-flight
+stream; `aclose()` closes the stream behind it.
 
 ```text
 compile(
@@ -863,13 +925,13 @@ semantics and complete examples.
 
 ### Root import inventory
 
-These are the 114 supported names exported by `mindbridge`:
+These are the 115 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `NamedActor`, `ProvisionalActor`, `IdentityChange`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate`, `DeliberationReport`, `ConsentClaim`, `ExportBundle`, `RetentionPolicy`, `RetentionReport` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `AnswerChunk`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `NamedActor`, `ProvisionalActor`, `IdentityChange`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate`, `DeliberationReport`, `ConsentClaim`, `ExportBundle`, `RetentionPolicy`, `RetentionReport` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask`, `MemoryOutcome`, `ConsentState` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
@@ -898,6 +960,7 @@ The principal immutable values are:
 | `PendingCapture` | `memory_id`, `enqueued_at`, `attempts`, `last_error`, `awaiting` |
 | `SearchHit` | all visible memory fields plus `score` |
 | `AnswerResult` | `answer`, `hits`, `abstained`, `abstention_reason` |
+| `AnswerChunk` | `text`, `result` |
 | `Page` | `items`, `next_cursor` |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |
 | `IdentityProfile` | `identity_id`, `name`, `relationship`, `confirmed`, `evidence_ids`; the last two are derived from the current visible naming assertion, never stored |
@@ -941,9 +1004,14 @@ The principal immutable values are:
 | `RetrievalCandidateTrace` | `memory_id`, `index_ids`, `dense_relevance`, `dense_confidence`, `lexical_relevance`, `lexical_rerank_bonus`, `lexical_match`, `gate_relevance`, `base_relevance`, `reinforcement_factor`, `temporal_factor`, `retention_factor`, `final_score`, `rank`, `rejected_by` |
 | `MemoryCapabilities` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `consolidation_model`, `speaker_recognition`, `streaming_generation`; `operations` property and `document()` |
 
-`abstained` is true only when the answerer returns MindBridge's reserved no-evidence sentence. A
-provider refusal expressed another way is an ordinary answer unless the adapter maps it to this
-protocol signal.
+`abstained` is a protocol signal, not a refusal rate. The bundled grounded prompt asks for the
+opaque token `[insufficient_evidence]`, and the adapter reports `abstained` when that bracketed
+token appears anywhere in the answer, when the bare token is the whole answer, or when the answer
+starts with the English fallback sentence. A model that refuses in its own words some other way is
+still an ordinary answer. `abstention_reason` is `no_evidence` when retrieval returned nothing and
+`insufficient_evidence` when hits were retrieved but could not ground an answer; the reported
+`answer` is the readable fallback sentence rather than the token. Measure refusal rate separately
+if that is the quantity needed.
 
 Enum values are:
 
@@ -1014,11 +1082,17 @@ ConsolidationBackend.consolidate(
 Required properties are `embedding_capabilities`, `embedding_model`, `embedding_space`, and
 `embedding_dimension` for embedding; `transcription_capabilities`, `transcription_model`, and
 `transcription_space` for transcription and speech; `face_capabilities`, `face_model`,
-`face_space`, and `face_analysis_space` for faces; `vision_capabilities` and `vision_model` for
-visual description; `formation_capabilities`, `formation_model`, and `formation_space` for
-formation; `consolidation_model` and `consolidation_recipe` for consolidation; and
-`generation_capabilities` for generation. Every base protocol except the optional
-streaming extension implements `close()`.
+`face_space`, and `face_analysis_space` for faces; `vision_capabilities`, `vision_model`, and
+`vision_space` for visual description; `formation_capabilities`, `formation_model`, and
+`formation_space` for formation; `consolidation_model` and `consolidation_recipe` for
+consolidation; and `generation_capabilities` for generation. Every base protocol except the
+optional streaming extension implements `close()`.
+
+A `*_space` value identifies the whole derivation recipe, not the model: `vision_space` must change
+when a describer's prompt changes, because captions are cached per `(asset content, vision_space)`
+in the local store and re-serving one written under a superseded prompt is invisible inside a
+searchable document. `OpenAIModels.vision_space` digests the model, its generation controls, and the
+bundled caption prompt.
 
 `form` receives one `FormationInput` per committed source and returns one proposal tuple per
 input, in the same order. A former never writes storage: the kernel validates each proposal

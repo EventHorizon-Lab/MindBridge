@@ -14,25 +14,27 @@ import re
 import shutil
 import unicodedata
 import wave
-from collections import Counter, deque
+from collections import Counter
 from collections.abc import (
+    AsyncGenerator,
     AsyncIterable,
     AsyncIterator,
     Callable,
+    Generator,
     Iterable,
     Iterator,
     Mapping,
     Sequence,
 )
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, contextmanager, suppress
+from contextlib import AbstractContextManager, closing, contextmanager, suppress
 from contextvars import copy_context
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from functools import partial
 from itertools import zip_longest
 from pathlib import Path
-from threading import Condition, RLock
+from threading import Condition, RLock, get_ident
 from time import perf_counter
 from typing import Protocol, TypeVar, cast
 
@@ -57,6 +59,7 @@ from mindbridge._telemetry import (
     MODEL_TTFT,
     SPAN_KIND,
     TRACER_NAME,
+    VISION_BATCHES_FAILED,
     current_model_request_count,
     mark_model_requests,
     model_span,
@@ -123,6 +126,7 @@ from mindbridge.types import (
     KIND_MEMORY_TYPES,
     AbstentionReason,
     AcousticBoundary,
+    AnswerChunk,
     AnswerResult,
     ASRPartial,
     AssetRef,
@@ -235,6 +239,14 @@ _LEGACY_INDEX_RECIPES = frozenset(
     }
 )
 _OUTBOX_BATCH_SIZE = 256
+# `add_stream` group commit bounds. Every item still commits to SQLite on its own, and the Zvec
+# flush that follows it is deferred until one of these two bounds is reached, so a stream pays one
+# fsync-class operation per group instead of one per observation. Both bounds are fixed rather
+# than configurable: a caller cannot choose better values without knowing what a Zvec flush costs,
+# and the visible behaviour they trade against - when a committed item enters the index - is
+# already forced by `search`, which drains before it reads.
+_STREAM_GROUP_ITEMS = 32
+_STREAM_GROUP_SECONDS = 0.25
 _REINDEX_PAGE_SIZE = 256
 _REEMBED_PAGE_SIZE = 32
 _RERANK_CANDIDATES = 100
@@ -248,6 +260,18 @@ _REPEATED_FAILURES = 2
 # again" would change meaning when the embedder was replaced.
 _QUERY_NOISE = re.compile(r"[^\w\s]+", re.UNICODE)
 _QUERY_SPACE = re.compile(r"\s+")
+# Depth of every index route, deliberately not a function of the requested `limit`. Each route
+# is truncated to it and a memory's dense relevance is the maximum over the routes that reached
+# it, so a `limit`-derived depth made the score -- and the lexical term weights computed over the
+# candidate pool -- properties of the request: at limit 20 against limit 100, 27-39 % of the
+# candidates present in both runs reported a different dense relevance and 78-100 % a different
+# lexical bonus, over adjacent-rank cosine gaps whose median is 0.0026-0.0077. Every public
+# `limit` is capped at 100, so one pool of `_RERANK_CANDIDATES` serves them all and the rerank
+# pool and the route depth are the same number. Widening it to the deepest previous pool
+# (`limit * 3` at limit 100) instead would have cost 2.3x the p50 of a `limit` 8 search, which
+# is the common one; a caller who needs more survivors than this pool holds still deepens it
+# through the widening loop below.
+_ROUTE_CANDIDATES = _RERANK_CANDIDATES
 _RANK_FLOOR = 0.3
 _RANK_CEILING = 1.5
 _DEFAULT_CONFIG = MemoryConfig()
@@ -347,6 +371,8 @@ _NEGATION_TERMS = frozenset(
 )
 _NEGATED_CONTRACTION = re.compile(r"n['\u2019]t\b", re.IGNORECASE)
 _MAX_CONTENT_PARTS = 128
+# Returned by `next(..., default)` so an exhausted stream never raises across a future.
+_STREAM_EXHAUSTED = object()
 # Model span modules mapped onto the failure stage a caller sees.
 _MODEL_STAGES = {
     "consolidation": "consolidate",
@@ -542,6 +568,7 @@ class _OperationAssets:
     speech_segments: dict[str, tuple[SpeakerSegment, ...]]
     speech_rollbacks: builtins.list[SpeechRollback]
     face_observations: dict[str, tuple[FaceObservation, ...]]
+    descriptions: dict[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -594,6 +621,9 @@ class Memory:
         self._owner_pid = os.getpid()
         self._write_lock = RLock()
         self._formation_lock = RLock()
+        # The thread currently inside an `add_stream` group, if any. Deferral is scoped to that
+        # thread so a concurrent `add` on another thread keeps flushing before it returns.
+        self._deferred_index_thread: int | None = None
         # Settlement is the one path that runs the expensive model stages over rows another
         # caller can already see queued, so two threads would otherwise embed the same record
         # twice and discover it only at the commit. Blocking, like the other two: a second
@@ -667,6 +697,7 @@ class Memory:
             (
                 self._vision_capabilities,
                 self._vision_model,
+                self._vision_space,
             ) = _vision_contract(self._vision_describer)
             (
                 self._face_capabilities,
@@ -1190,6 +1221,10 @@ class Memory:
     ) -> Iterator[MemoryRecord]:
         """Add a lazy omni stream one durable, searchable observation at a time.
 
+        Index commits are batched in bounded groups, so a fast source pays one Zvec flush per
+        group instead of one per item; a reader always drains first, so a committed item is
+        searchable before the group closes.
+
         With `capture=True` each item commits through `capture()` instead: every yielded record is
         durable and readable but has no vectors, so the stream keeps its acknowledgement off the
         model path and the host owes the matching `settle()` before anything is searchable.
@@ -1202,23 +1237,63 @@ class Memory:
         except TypeError:
             raise ValidationError("contents must be an iterable of memory inputs") from None
         index = 0
-        while True:
-            try:
-                content = next(iterator)
-            except StopIteration:
-                return
-            except MindBridgeError as error:
-                if error.subject is None:
-                    error.subject = f"contents[{index}]"
-                raise
-            try:
-                record = self._stream_record(content, capture=capture)
-            except MindBridgeError as error:
-                if error.subject is None:
-                    error.subject = f"contents[{index}]"
-                raise
-            yield record
-            index += 1
+        grouped = 0
+        group_started = perf_counter()
+        # A capture-routed item bypasses grouping: `capture()` writes no vectors and enqueues no
+        # outbox work, so there is nothing for a group to batch. Deferring index commits for it
+        # would only postpone work some other caller left pending, and the empty forced drain at
+        # each boundary would put a Zvec lock back on the path capture exists to keep clear.
+        outer_deferral = self._deferred_index_thread
+        if not capture:
+            self._deferred_index_thread = get_ident()
+        try:
+            while True:
+                try:
+                    content = next(iterator)
+                except StopIteration:
+                    break
+                except MindBridgeError as error:
+                    if error.subject is None:
+                        error.subject = f"contents[{index}]"
+                    raise
+                record = self._add_stream_item(content, index=index, capture=capture)
+                if not capture:
+                    grouped, group_started = self._advance_stream_group(grouped + 1, group_started)
+                yield record
+                index += 1
+            if grouped:
+                self._flush_stream_group()
+        finally:
+            self._deferred_index_thread = outer_deferral
+
+    def _add_stream_item(
+        self,
+        content: ContentInput | StreamInput,
+        *,
+        index: int,
+        capture: bool,
+    ) -> MemoryRecord:
+        try:
+            return self._stream_record(content, capture=capture)
+        except MindBridgeError as error:
+            if error.subject is None:
+                error.subject = f"contents[{index}]"
+            raise
+
+    def _advance_stream_group(self, grouped: int, group_started: float) -> tuple[int, float]:
+        """Close the group once either bound is reached, and report its new count and start."""
+        if (
+            grouped >= _STREAM_GROUP_ITEMS
+            or perf_counter() - group_started >= _STREAM_GROUP_SECONDS
+        ):
+            self._flush_stream_group()
+            return 0, perf_counter()
+        return grouped, group_started
+
+    def _flush_stream_group(self) -> None:
+        """Index and acknowledge exactly the outbox rows the group's commits left pending."""
+        with self._write_lock:
+            self._drain_outbox(force=True)
 
     def search(
         self,
@@ -1331,14 +1406,100 @@ class Memory:
         tools passes `link_identities=False` here too, so recall access alone never carries
         merge authority.
         """
+        # Draining `ask_stream()` keeps one implementation of the whole path, so a buffered and
+        # a streamed answer cannot drift apart in grounding, abstention, or reinforcement.
+        stream = self.ask_stream(
+            question,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            scope=scope,
+            link_identities=link_identities,
+        )
+        while True:
+            try:
+                next(stream)
+            except StopIteration as complete:
+                return cast(AnswerResult, complete.value)
+
+    def ask_stream(
+        self,
+        question: ContentInput,
+        *,
+        limit: int = 5,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+        link_identities: bool = True,
+    ) -> Generator[AnswerChunk, None, AnswerResult]:
+        """Answer as `ask()` does, but yield the answer while the model is still producing it.
+
+        Retrieval runs to completion before the first chunk; only generation is incremental. The
+        terminal chunk carries the same `AnswerResult` `ask()` returns, and a backend without
+        `stream_answer` still yields its whole answer as one delta. `link_identities` means what
+        it means on `ask()`, which is this method drained.
+
+        Reading to the terminal chunk releases everything the answer held, so stopping there
+        needs no cleanup. Abandoning the stream mid-answer leaves one operation open until the
+        generator is closed or collected, and `close()` waits for open operations.
+        """
+        _limit(limit, maximum=100)
+        self._require_answerer()
+        return self._ask_chunks(
+            question,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            scope=scope,
+            link_identities=link_identities,
+        )
+
+    def _require_answerer(self) -> None:
+        if self._answerer is None:
+            raise ModelError(
+                "answer backend is not configured",
+                reason="backend_not_configured",
+                stage="generate",
+            )
+
+    def _ask_chunks(
+        self,
+        question: ContentInput,
+        *,
+        limit: int,
+        memory_type: MemoryType | None,
+        reference_at: datetime | None,
+        scope: RetrievalScope | None,
+        link_identities: bool,
+    ) -> Generator[AnswerChunk, None, AnswerResult]:
+        answer = yield from self._ask_operation(
+            question,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            scope=scope,
+            link_identities=link_identities,
+        )
+        # The operation and its span close before the result is handed over. A generator stays
+        # suspended at whichever yield the caller stops on, so a terminal chunk yielded inside
+        # the operation would pin it open for every caller that reads the result and stops --
+        # the ordinary way to consume this -- and `close()` waits on open operations.
+        yield AnswerChunk(result=answer)
+        return answer
+
+    def _ask_operation(
+        self,
+        question: ContentInput,
+        *,
+        limit: int,
+        memory_type: MemoryType | None,
+        reference_at: datetime | None,
+        scope: RetrievalScope | None,
+        link_identities: bool,
+    ) -> Generator[AnswerChunk, None, AnswerResult]:
         with self._trace("mindbridge.ask", kind="operation"), self._operation() as assets:
             _limit(limit, maximum=100)
-            if self._answerer is None:
-                raise ModelError(
-                    "answer backend is not configured",
-                    reason="backend_not_configured",
-                    stage="generate",
-                )
+            self._require_answerer()
             with self._trace("mindbridge.content.prepare", kind="stage"):
                 prepared = self._prepare_content(question, assets)
             explicit_reference = _reference_at(reference_at)
@@ -1414,9 +1575,23 @@ class Memory:
                 else ()
             )
             self._persist_transcripts(assets)
-            result = self._answer(routed_question, routed_hits)
+            # `closing` rather than plain iteration: an abandoned stream throws `GeneratorExit`
+            # at the yield below, and without this the inner generator would only be closed
+            # when the cleared frame drops its last reference. That defers closing the
+            # provider's response and ends `mindbridge.model.generation` after its own parent,
+            # which loses the call's model usage and emits a malformed trace.
+            with closing(self._answer_chunks(routed_question, routed_hits)) as deltas:
+                while True:
+                    try:
+                        delta = next(deltas)
+                    except StopIteration as complete:
+                        result = complete.value
+                        break
+                    yield AnswerChunk(text=delta)
             used_ids = {hit.id for hit in result.hits}
             grounding = tuple(hit for hit in hits if hit.id in used_ids)
+            # Reinforcement is part of answering, so it stays inside the operation and runs
+            # before the terminal chunk: a caller that sees the result sees a settled store.
             self._reinforce_answered(grounding)
             # An abstention is the answering plane reporting that the evidence did not support
             # an answer, which is the same durable signal as an empty search: the memory the
@@ -3814,7 +3989,8 @@ class Memory:
                 # Derived visual text can rescue media this embedder cannot take, so it has to
                 # exist before the fallback guard below decides the write is impossible.
                 described = self._pending_visual_descriptions(
-                    tuple(memory.content for memory in missing)
+                    tuple(memory.content for memory in missing),
+                    operation,
                 )
                 missing = [
                     replace(
@@ -3924,6 +4100,7 @@ class Memory:
                 )
                 if operation.speech_updates:
                     self._persist_transcripts(operation)
+                self._persist_descriptions(operation)
         rows_by_id = {memory.memory_id: memory for memory in authoritative}
         if rows_by_id.keys() != unique.keys():
             raise StorageError("written memories could not be read from SQLite", reason="io_failed")
@@ -4037,7 +4214,7 @@ class Memory:
                 self._recognize_speech(speech_assets, operation, reversible=True)
             # Same order as `_add_prepared`: derived visual text has to exist before the fallback
             # guard decides whether this embedder can take the media at all.
-            described = self._pending_visual_descriptions((memory.content,))
+            described = self._pending_visual_descriptions((memory.content,), operation)
             memory = replace(
                 memory,
                 content=self._with_visual_descriptions(memory.content, described),
@@ -4098,6 +4275,7 @@ class Memory:
                 operation.persisted.update(asset.asset_id for asset in row.assets)
                 if operation.speech_updates:
                     self._persist_transcripts(operation)
+                self._persist_descriptions(operation)
         return enriched if committed else None
 
     def _form_sources(
@@ -4343,13 +4521,25 @@ class Memory:
             content=self._embedding_content(content, operation),
         )
 
-    def _pending_visual_descriptions(self, contents: Sequence[_PreparedContent]) -> dict[str, str]:
+    def _pending_visual_descriptions(
+        self,
+        contents: Sequence[_PreparedContent],
+        operation: _OperationAssets,
+    ) -> dict[str, str]:
         """Describe every yet-undescribed visual asset in one write, in one model call.
 
         Deriving the text is a paid call, so it follows from `vision_describer` being configured
         and from nothing else. Whether it is *indexed* is not a capability question -- see
         `_with_visual_descriptions`. Only the write path calls this: `_embedding_content` is
         shared with the query path, where describing an image query would buy a call per search.
+
+        An asset already described in this vision space is read back from SQLite instead of
+        described again, so two ingests of one corpus build identical documents and the second
+        spends nothing. The measured endpoint returns a different caption for the same image on
+        every call even at temperature 0 with a fixed seed, so without this a re-ingest -- or a
+        re-derive after a crash -- silently changes what a memory's full-text document says.
+        Freshly derived captions are staged on the operation and persisted after the asset rows
+        exist, exactly as transcripts are.
         """
         if self._vision_describer is None:
             return {}
@@ -4364,10 +4554,32 @@ class Memory:
         )
         if not assets:
             return {}
-        descriptions = self._vision_descriptions(
-            tuple(self._resolved_model_input(_asset_content(asset)) for asset in assets)
-        )
-        return dict(zip((asset.asset_id for asset in assets), descriptions, strict=True))
+        with _translate_storage_errors("read cached visual descriptions"):
+            cached = self._store.read_visual_descriptions(
+                tuple(asset.asset_id for asset in assets),
+                space_id=self._vision_space,
+            )
+        pending = tuple(asset for asset in assets if asset.asset_id not in cached)
+        if not pending:
+            # No request is made, so the vision span and its token counters never open: a run that
+            # re-ingests a described corpus reports zero vision cost because it paid none.
+            return dict(cached)
+        try:
+            descriptions = self._vision_descriptions(
+                tuple(self._resolved_model_input(_asset_content(asset)) for asset in pending)
+            )
+        except ModelError:
+            # A description is derived convenience, and the caller handed us an observation to
+            # store: losing the caption must never lose the memory. One malformed reply from the
+            # describer used to fail the whole `add`, which an ingesting caller then reports as
+            # unwritten memories -- a far larger loss than the empty document this leaves behind.
+            # The batch is counted on the vision span as `mindbridge.vision.failed_batches`, so
+            # how much derived text a run did not get is measurable rather than silent. A failed
+            # batch is never cached, so a later ingest retries it.
+            return dict(cached)
+        fresh = dict(zip((asset.asset_id for asset in pending), descriptions, strict=True))
+        operation.descriptions.update(fresh)
+        return {**cached, **fresh}
 
     def _with_visual_descriptions(
         self,
@@ -4618,11 +4830,14 @@ class Memory:
         lexical_query = focused_text
         if not _lexical_query_terms(lexical_query):
             lexical_query = ""
-        candidate_limit = max(_RERANK_CANDIDATES, limit * 3)
+        candidate_limit = _ROUTE_CANDIDATES
         candidate_ceiling = max(candidate_limit, limit * (_MAX_RETRIEVAL_KEYS + 1))
         seen_index_ids: set[str] = set()
         with self._write_lock:
-            self._drain_outbox()
+            # A read asks for the current truth, so it closes an `add_stream` group that is still
+            # open on this thread instead of skipping the drain with it: the consumer that searches
+            # between two yields must see the item it was just handed.
+            self._drain_outbox(force=True)
         while True:
             with _translate_index_errors("search memories"):
                 if temporal_range is None:
@@ -4711,23 +4926,24 @@ class Memory:
                 dict.fromkeys(document.memory_id for document in documents)
             )
             with _translate_storage_errors("apply search scope"):
-                active_count = len(
-                    self._store.read_memories(
-                        candidate_parent_ids,
-                        valid_at=None if scope is None else scope.valid_at,
-                        known_at=None if scope is None else scope.known_at,
-                        near=None if scope is None else scope.near,
-                        radius_m=None if scope is None else scope.radius_m,
-                        # Passed here for consistency with every other scope axis, which all
-                        # reach both reads. This one is the survivor count that drives candidate
-                        # widening; no constructed corpus (30 or 120 memories) could make its
-                        # absence change a result, so it is unproven rather than proven needed.
-                        # Kept because omitting one axis at one of two sites is the anomaly a
-                        # reader would have to explain, and because narrowing a count can only
-                        # widen the search. The hydration site below is mutation-covered.
-                        place_id=None if scope is None else scope.place_id,
-                        active_only=True,
-                    )
+                # Only the number of survivors decides whether to widen, so count them under
+                # the same predicates instead of hydrating content, media assets and typed
+                # context rows and calling `len()` on the records.
+                active_count = self._store.count_memories(
+                    candidate_parent_ids,
+                    valid_at=None if scope is None else scope.valid_at,
+                    known_at=None if scope is None else scope.known_at,
+                    near=None if scope is None else scope.near,
+                    radius_m=None if scope is None else scope.radius_m,
+                    # Passed here for consistency with every other scope axis, which all
+                    # reach both reads. This one is the survivor count that drives candidate
+                    # widening; no constructed corpus (30 or 120 memories) could make its
+                    # absence change a result, so it is unproven rather than proven needed.
+                    # Kept because omitting one axis at one of two sites is the anomaly a
+                    # reader would have to explain, and because narrowing a count can only
+                    # widen the search. The hydration site below is mutation-covered.
+                    place_id=None if scope is None else scope.place_id,
+                    active_only=True,
                 )
             if (
                 active_count >= limit
@@ -4757,7 +4973,16 @@ class Memory:
             lexical_relevance_by_rank,
             lexical_matches,
         ) = _parent_index_signals(candidates, documents)
-        parent_ids = tuple(dict.fromkeys((*dense_relevance, *lexical_matches)))
+        # `lexical_relevance_by_rank` rather than `lexical_matches`, which holds exactly the same
+        # memory ids and is a `set`. Both mappings are filled in one pass over `documents`, so
+        # this is the same ids in insertion order instead of an order that follows the
+        # interpreter's string hash seed. The visible effect is narrow -- `read_memories` does not
+        # order by its argument, so the ranking and the ranked part of the trace never depended on
+        # this, and the ranking sorts on `(-final_score, memory_id)` regardless -- but
+        # `_extend_missing_memory_traces` walks these ids directly, so a stale-index candidate's
+        # position in `search_with_trace` did. A trace is a debugging surface; two runs of one
+        # query on one library should print it in one order.
+        parent_ids = tuple(dict.fromkeys((*dense_relevance, *lexical_relevance_by_rank)))
         if not parent_ids:
             return _search_outcome(
                 (),
@@ -5892,6 +6117,36 @@ class Memory:
                             minimum_margin=self._speaker_margin,
                         )
 
+    def _persist_descriptions(self, operation: _OperationAssets) -> None:
+        """Cache captions derived in this operation, once their assets are stored.
+
+        Captions are derived before the `media_assets` rows exist -- they can rescue media the
+        embedder cannot take, so they have to precede the write -- which is why they are staged on
+        the operation and written here instead of where they are computed. An asset that did not
+        reach storage is skipped rather than failing the write: the caption is derived convenience
+        and its foreign key is the asset.
+        """
+        if not operation.descriptions:
+            return
+        pending = {
+            asset_id: description
+            for asset_id, description in operation.descriptions.items()
+            if asset_id in operation.persisted and description.strip()
+        }
+        operation.descriptions.clear()
+        if not pending:
+            return
+        with (
+            self._trace("mindbridge.storage.write", kind="stage"),
+            self._write_lock,
+            _translate_storage_errors("cache visual descriptions"),
+        ):
+            self._store.write_visual_descriptions(
+                pending,
+                model_id=self._vision_model,
+                space_id=self._vision_space,
+            )
+
     def _analyze_speech(
         self,
         assets: Sequence[AssetRef],
@@ -6022,27 +6277,20 @@ class Memory:
             model=self._vision_model,
             batch_size=len(inputs),
             modalities=(modality for value in inputs for modality in value.modalities),
-        ):
+        ) as span:
             mark_model_requests(1)
+            # Validated inside the span so that a reply the model did return but that cannot be
+            # used is counted as a failed batch too, and so that the count lands on a span the
+            # evaluation telemetry aggregates -- it reads counters only from model spans.
             try:
-                descriptions = self._vision_describer.describe(inputs)
-            except MindBridgeError:
-                raise
+                return _validated_descriptions(self._vision_describer.describe(inputs), inputs)
             except Exception as error:
+                span.set_attribute(VISION_BATCHES_FAILED, 1)
+                if isinstance(error, MindBridgeError):
+                    raise
                 raise ModelError(
                     "failed to describe vision input", reason="model_failed"
                 ) from error
-        if len(descriptions) != len(inputs) or any(
-            not isinstance(description, str) or not description.strip()
-            for description in descriptions
-        ):
-            raise ModelError("vision model returned invalid output", reason="response_invalid")
-        normalized = tuple(description.strip() for description in descriptions)
-        if any(len(description) > _MAX_TEXT_CHARACTERS for description in normalized):
-            raise ModelError(
-                "vision description exceeded the supported text length", reason="payload_too_large"
-            )
-        return normalized
 
     def _embed(
         self,
@@ -6073,11 +6321,16 @@ class Memory:
                 _normalized_vector(vector, self._embedding_dimension) for vector in vectors
             )
 
-    def _answer(  # noqa: C901 - streaming and non-streaming validation share one model span
+    def _answer_chunks(  # noqa: C901 - streaming and non-streaming validation share one span
         self,
         question: ModelInput,
         hits: Sequence[SearchHit],
-    ) -> AnswerResult:
+    ) -> Generator[str, None, AnswerResult]:
+        """Yield answer deltas in provider order and return the validated grounded result.
+
+        A backend without `stream_answer` yields its whole answer as one delta, so every caller
+        sees the same shape and `ask_stream()` never requires a streaming provider.
+        """
         if self._answerer is None:
             raise ModelError(
                 "answer backend is not configured",
@@ -6097,29 +6350,41 @@ class Memory:
             ),
         ):
             mark_model_requests(1)
+            buffered = False
             try:
                 if isinstance(self._answerer, StreamingGenerationBackend):
                     started = perf_counter()
                     parts: builtins.list[str] = []
                     stream = iter(self._answerer.stream_answer(question, hits))
                     used_hits: object = None
-                    while True:
-                        try:
-                            part = next(stream)
-                        except StopIteration as completed:
-                            used_hits = completed.value
-                            break
-                        if not isinstance(part, str):
-                            raise ModelError(
-                                "generation model returned an invalid answer chunk",
-                                reason="response_invalid",
-                            )
-                        if part:
-                            if not parts and current_model_request_count():
-                                trace.get_current_span().set_attribute(
-                                    MODEL_TTFT, perf_counter() - started
+                    try:
+                        while True:
+                            try:
+                                part = next(stream)
+                            except StopIteration as completed:
+                                used_hits = completed.value
+                                break
+                            if not isinstance(part, str):
+                                raise ModelError(
+                                    "generation model returned an invalid answer chunk",
+                                    reason="response_invalid",
                                 )
-                            parts.append(part)
+                            if part:
+                                if not parts and current_model_request_count():
+                                    trace.get_current_span().set_attribute(
+                                        MODEL_TTFT, perf_counter() - started
+                                    )
+                                parts.append(part)
+                                yield part
+                    finally:
+                        # This iterator owns the provider's streaming response. An abandoned
+                        # `ask_stream()` unwinds to here, and leaving the close to the cleared
+                        # frame's last reference is interpreter-dependent: 3.12 collects it at
+                        # once, 3.10 does not, so the response stayed open there. Closing it
+                        # here makes the release deterministic on every supported version.
+                        release = getattr(stream, "close", None)
+                        if callable(release):
+                            release()
                     answer = "".join(parts)
                     if not answer.strip():
                         raise ModelError(
@@ -6161,6 +6426,7 @@ class Memory:
                         )
                 else:
                     result = self._answerer.answer(question, hits)
+                    buffered = True
             except MindBridgeError:
                 raise
             except Exception as error:
@@ -6171,6 +6437,8 @@ class Memory:
                 raise ModelError(
                     "generation model returned an invalid answer", reason="response_invalid"
                 )
+            if buffered:
+                yield result.answer
             return result
 
     def _memory_record(self, memory: StoredMemory) -> MemoryRecord:
@@ -6315,8 +6583,14 @@ class Memory:
             with _translate_storage_errors("delete orphaned media metadata"):
                 self._store.delete_asset_if_unreferenced(asset.asset_id)
 
-    def _drain_outbox(self) -> None:
-        """Apply current SQLite truth, then acknowledge the exact durable operation batch."""
+    def _drain_outbox(self, *, force: bool = False) -> None:
+        """Apply current SQLite truth, then acknowledge the exact durable operation batch.
+
+        Skipped inside an `add_stream` group, whose own bounds force it. Skipping only leaves
+        rows pending: they are still durable in SQLite and the next drain applies them.
+        """
+        if not force and self._deferred_index_thread == get_ident():
+            return
         with self._trace("mindbridge.index.sync", kind="stage"):
             self._apply_outbox()
 
@@ -6566,6 +6840,7 @@ class Memory:
             speech_segments={},
             speech_rollbacks=[],
             face_observations={},
+            descriptions={},
         )
         try:
             yield assets
@@ -6924,6 +7199,67 @@ class AsyncMemory:
             scope=scope,
             link_identities=link_identities,
         )
+
+    def ask_stream(
+        self,
+        question: ContentInput,
+        *,
+        limit: int = 5,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+        link_identities: bool = True,
+    ) -> AsyncGenerator[AnswerChunk, None]:
+        """Answer as `ask()` does, yielding chunks as the model produces them.
+
+        Every step of the underlying synchronous stream runs in a worker thread, so the event
+        loop stays free while the provider is generating. Abandoning or cancelling the stream
+        closes it, which releases the operation the answer holds open.
+
+        This is a plain function returning an async generator, not an `async def` generator, so
+        that arguments are rejected at the call exactly as `Memory.ask_stream` rejects them; an
+        `async def` generator would defer them to the first `__anext__`.
+        """
+        # Validation and generator construction only, no I/O, so the event loop is not blocked.
+        stream = self._memory.ask_stream(
+            question,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+            scope=scope,
+            link_identities=link_identities,
+        )
+        return self._pump(stream)
+
+    async def _pump(
+        self,
+        stream: Generator[AnswerChunk, None, AnswerResult],
+    ) -> AsyncGenerator[AnswerChunk, None]:
+        loop = asyncio.get_running_loop()
+        # One worker, not `asyncio.to_thread`: every step has to run on the same thread so the
+        # span and operation contextvars the generator attaches on its first step are the ones
+        # it detaches on its last. `to_thread` runs each call in a fresh context copy, which
+        # would strand both. `next` is given a sentinel because a `StopIteration` crossing a
+        # future becomes `RuntimeError` rather than ending the loop.
+        #
+        # ponytail: thread affinity makes this one thread per in-flight stream, outside the cap
+        # the default executor puts on every other `AsyncMemory` call. Fine while concurrent
+        # streams are counted in tens; give the class a shared pool of pinned workers if a host
+        # ever runs enough of them for the thread count to bind before the provider does.
+        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mindbridge-ask")
+        try:
+            while True:
+                chunk = await loop.run_in_executor(worker, next, stream, _STREAM_EXHAUSTED)
+                if chunk is _STREAM_EXHAUSTED:
+                    return
+                yield cast(AnswerChunk, chunk)
+        finally:
+            # A running executor call cannot be cancelled, so the close always completes even
+            # when the awaiting task is gone; `wait=False` keeps that off the event loop.
+            closing_stream = loop.run_in_executor(worker, stream.close)
+            with suppress(asyncio.CancelledError):
+                await asyncio.shield(closing_stream)
+            worker.shutdown(wait=False)
 
     async def compile(
         self,
@@ -8792,15 +9128,16 @@ def _generation_contract(answerer: GenerationBackend | None) -> frozenset[Modali
 
 def _vision_contract(
     describer: VisionDescriptionBackend | None,
-) -> tuple[frozenset[Modality], str]:
+) -> tuple[frozenset[Modality], str, str]:
     if describer is None:
-        return frozenset(), "none"
+        return frozenset(), "none", "none"
     capabilities = _modalities(describer.vision_capabilities, "vision")
     if not capabilities or capabilities - {Modality.IMAGE, Modality.VIDEO}:
         raise ValidationError("vision capabilities must contain image or video")
     return (
         capabilities,
         _model_text(describer.vision_model, "vision model"),
+        _model_text(describer.vision_space, "vision space"),
     )
 
 
@@ -9079,7 +9416,7 @@ def declared_capabilities(
     """
     embedding, embedding_model, space_id, dimension = _embedding_contract(embedder)
     transcription, transcription_space = _transcription_contract(transcriber)
-    vision, vision_model = _vision_contract(vision_describer)
+    vision, vision_model, _vision_space = _vision_contract(vision_describer)
     face, face_model, _face_space, _face_analysis_space = _face_contract(face_analyzer)
     formation, formation_model, _formation_space = _formation_contract(former)
     consolidation_model, _consolidation_recipe = _consolidation_contract(consolidator)
@@ -9187,6 +9524,26 @@ def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _
     return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
 
 
+def _validated_descriptions(
+    descriptions: object,
+    inputs: Sequence[ModelInput],
+) -> tuple[str, ...]:
+    """Accept one non-empty, storable caption per input, in order, and nothing else."""
+    if not isinstance(descriptions, tuple | list):
+        raise ModelError("vision model returned invalid output", reason="response_invalid")
+    values = tuple(descriptions)
+    if len(values) != len(inputs) or any(
+        not isinstance(description, str) or not description.strip() for description in values
+    ):
+        raise ModelError("vision model returned invalid output", reason="response_invalid")
+    normalized = tuple(cast(str, description).strip() for description in values)
+    if any(len(description) > _MAX_TEXT_CHARACTERS for description in normalized):
+        raise ModelError(
+            "vision description exceeded the supported text length", reason="payload_too_large"
+        )
+    return normalized
+
+
 def _record_elided_parts(count: int) -> None:
     """Publish how many retrieval keys the embedding model could not carry, so no loss is silent."""
     if count <= 0:
@@ -9202,17 +9559,26 @@ def _grounding_hits(
     *,
     budget_chars: int | None = None,
 ) -> tuple[SearchHit, ...]:
-    queues: dict[Modality, deque[SearchHit]] = {}
+    """Ground on the ranking's own order, guaranteeing one hit per modality it contains.
+
+    This used to pop one hit per modality in turn, which capped every modality at
+    `ceil(limit / m)` however the scores fell, so the grounded window was the top of the
+    ranking only on a single-modality corpus. Measured on the round's mem-gallery library
+    (image 231 / text 962, `limit` 20): the rotation rebuilt 6.20 of the 20 slots -- 31 % --
+    out of lower-ranked hits, raised the window's media share from 17.7 % to 44.5 %, and gave
+    up 1.93 pp of the gold recall the ranking had already found (R@20 0.8320 against a window
+    at 0.8127). The intent it served -- one modality must not shut the others out -- is a floor,
+    not a rotation, so a modality that would otherwise be absent is promoted into the last
+    slots instead of displacing a third of the window.
+    """
+    best_by_modality: dict[Modality, SearchHit] = {}
     for hit in hits:
-        queues.setdefault(hit.modality, deque()).append(hit)
-    selected: list[SearchHit] = []
-    while queues and len(selected) < limit:
-        for modality in tuple(queues):
-            selected.append(queues[modality].popleft())
-            if not queues[modality]:
-                del queues[modality]
-            if len(selected) == limit:
-                break
+        best_by_modality.setdefault(hit.modality, hit)
+    selected = list(hits[:limit])
+    represented = {hit.modality for hit in selected}
+    promoted = [hit for modality, hit in best_by_modality.items() if modality not in represented]
+    if promoted:
+        selected = [*selected[: max(limit - len(promoted), 0)], *promoted[:limit]]
     if budget_chars is None:
         return tuple(selected)
     return (*selected, *_budgeted_hits(hits, selected, budget_chars))
@@ -9722,16 +10088,22 @@ def _temporal_factor(
     occurred_end: datetime | None,
     temporal_range: tuple[datetime, datetime],
 ) -> float:
-    if occurred_at is None:
-        return _RANK_FLOOR
-    start, until = temporal_range
-    event_until = occurred_end or occurred_at + timedelta(microseconds=1)
-    if _overlaps_temporal_range(occurred_at, occurred_end, temporal_range):
+    """Boost a memory that overlaps the asked time range; leave every other memory alone.
+
+    The factor used to decay from the ceiling to `_RANK_FLOOR` with distance from the range, and to
+    hand the floor to a memory with no event time at all. Replayed on the validation libraries
+    that penalty never recovered a gold memory and only reordered: making the factor additive --
+    ceiling on overlap, neutral otherwise -- won or tied on every paired question of 810 across
+    LoCoMo and ATM-Bench (R@5 +2.6 pp on ATM's temporal slice, one loss), left the questions
+    without a temporal phrase bit-identical, and needs one constant fewer. A memory that misses
+    the window is still ranked on how well it matches; it is no longer pushed under the memories
+    that merely happened at the right time.
+    """
+    if occurred_at is not None and _overlaps_temporal_range(
+        occurred_at, occurred_end, temporal_range
+    ):
         return _RANK_CEILING
-    distance = start - event_until if event_until <= start else occurred_at - until
-    window = max((until - start).total_seconds(), timedelta(days=1).total_seconds())
-    proximity = math.pow(2.0, -distance.total_seconds() / window)
-    return _RANK_FLOOR + (_RANK_CEILING - _RANK_FLOOR) * proximity
+    return 1.0
 
 
 def _overlaps_temporal_range(

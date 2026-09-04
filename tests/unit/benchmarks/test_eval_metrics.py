@@ -113,6 +113,7 @@ def _sample(
         error_code=None,
         metadata={gold_key: list(gold), "unresolved_evidence_ids": list(unresolved)},
         evidence=tuple(EvidenceInterval(f"m-{name}", name, None, None) for name in sources),
+        ranked_source_ids=tuple(sources),
         metrics={"accuracy": score},
     )
 
@@ -602,6 +603,18 @@ def test_controls_are_complete_only_with_all_three_baselines() -> None:
     }
 
     without_blind = eval_module._controls("fixture", retrieval, None, is_blind_run=False)
+    # A non-retrieving arm has nothing for the retrieval controls to check: they do not apply,
+    # so its row stays interpretable when the blind control is present.
+    non_retrieving = eval_module._controls(
+        "fixture",
+        {"recall_at_k": {}, "random_ranker_recall_at_k": {}},
+        {"mean": 0.1},
+        is_blind_run=False,
+        retrieves=False,
+    )
+    assert non_retrieving["retrieval_controls_applicable"] is False
+    assert non_retrieving["missing"] == []
+    assert non_retrieving["interpretable"] is True
     with_blind = eval_module._controls("fixture", retrieval, {"mean": 0.383}, is_blind_run=False)
     blind_run = eval_module._controls("fixture", retrieval, None, is_blind_run=True)
 
@@ -710,6 +723,45 @@ def test_table_shows_the_control_values_when_they_are_present() -> None:
     assert "0.3830" in table
     assert "ok" in table
     assert eval_module._uninterpretable_tasks(results) == ()
+
+
+def test_table_prints_the_product_token_cost_when_the_judge_left_the_total_null() -> None:
+    results = {
+        "tasks": [
+            {
+                "task": "fixture",
+                "primary_metric": "accuracy",
+                "score": {"mean": 0.9, "confidence_interval_95": None},
+                "question_count": 2,
+                "error_count": 0,
+                "performance": {
+                    "duration_seconds": {"total": 2.5, "average": 1.25},
+                    "token_usage": {
+                        "total_tokens": None,
+                        "average_tokens": None,
+                        "product": {"total_tokens": 80, "average_tokens": 40.0},
+                    },
+                },
+                "ingest_failure_count": 0,
+                "controls": {
+                    "random_ranker": None,
+                    "recall_at_1": None,
+                    "recall_at_20": None,
+                    "blind": None,
+                    "is_blind_run": False,
+                    "missing": [],
+                    "interpretable": True,
+                    "reason": None,
+                },
+            }
+        ]
+    }
+
+    table = eval_module._table(results)
+
+    # The marker says these are the product modules' tokens, not the run total.
+    assert "80*" in table
+    assert "40.0*" in table
 
 
 # --- blind baseline provenance ---------------------------------------------------------------
@@ -861,6 +913,33 @@ def test_retrieved_sources_are_deduplicated_in_rank_order() -> None:
     sample = _sample("q", sources=("s1", "s1", "s2"), gold=("s2",), candidate_count=3)
 
     assert eval_module._retrieved_sources(sample) == ("s1", "s2")
+
+
+def test_retrieval_recall_scores_the_ranked_list_not_the_cited_evidence() -> None:
+    """Citations are the generator's choice; recall is the retriever's.
+
+    A question whose gold was cited but never ranked scores zero, and one whose run recorded no
+    ranked list is counted as unranked rather than scored.
+    """
+    from dataclasses import replace
+
+    cited_not_ranked = replace(
+        _sample("q1", sources=("s9",), gold=("s1",), candidate_count=10),
+        evidence=(EvidenceInterval("m-s1", "s1", None, None),),
+    )
+    unranked = replace(
+        _sample("q2", sources=("s1",), gold=("s1",), candidate_count=10),
+        ranked_source_ids=(),
+    )
+
+    retrieval = eval_module._retrieval_quality(
+        (cited_not_ranked, unranked), seed=7, bootstrap_samples=32, recall_limit=20
+    )
+    measured = cast(Mapping[str, Mapping[str, object]], retrieval["recall_at_k"])
+
+    assert retrieval["labelled_question_count"] == 1
+    assert retrieval["unranked_labelled_question_count"] == 1
+    assert cast(float, measured["20"]["mean"]) == pytest.approx(0.0)
 
 
 def test_candidate_pool_stops_at_the_question_cutoff() -> None:

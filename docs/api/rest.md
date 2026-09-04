@@ -67,12 +67,14 @@ curl --fail-with-body \
 ## Lifecycle and ownership
 
 `create_app` borrows `memory`; it neither opens nor closes it. The host must keep that owner alive
-for the app lifetime and close it during shutdown. Run one process and one `Memory` for each
-physical `data_dir`; use a different directory for another owner.
+for the app lifetime and close it, together with its caller-owned provider clients, during
+shutdown. Run one process and one `Memory` for each physical `data_dir`; use a different directory
+for another owner.
 
 MindBridge adds no REST authentication. The host owns authentication, authorization, TLS, and
-request-rate policy. See [deployment](../deployment.md) for supported process shapes and
-[operations](../operations.md) for shutdown and recovery.
+request-rate policy, through its gateway, service mesh, or FastAPI/Starlette middleware. See
+[deployment](../deployment.md) for supported process shapes and [operations](../operations.md) for
+shutdown and recovery.
 
 ## Contract
 
@@ -335,8 +337,10 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 
 `modality` is `text`, `image`, `video`, `audio`, or `omni`. `memory_type` is `semantic`,
 `episodic`, or `procedural`. `abstention_reason` is `no_evidence`, `insufficient_evidence`, or
-`null`. `abstained` reports that the answerer returned the exact sentence reserved for having no
-usable evidence, not that the model declined to answer in its own words. A response `context` is
+`null`. `abstained` reports that the answerer emitted the reserved `[insufficient_evidence]`
+token, or that grounding found no usable evidence at all; a model that declines in its own words
+some other way is an ordinary answer. See
+[the SDK contract](python-sdk.md#public-values) for the exact rule. A response `context` is
 the authoritative `MemoryContext`: typed kind and basis, confidence, valid and transaction time,
 visibility, lineage/source/evidence/supersession IDs, model recipe, optional
 subject/predicate/value, spatial pose, and affect cue fields. It is `null` on a raw record formed
@@ -472,6 +476,7 @@ REST has no route for these Python operations:
 | Operation | Boundary |
 | --- | --- |
 | `add_stream` | Send each completed observation to `POST /v1/memories` |
+| `ask_stream` | Send `POST /v1/answers`, which returns the same grounded answer once it is complete |
 | `search_with_trace` | Send `POST /v1/memories/search` with `"explain": true` |
 | `register_speaker` | No route; has an [MCP tool](mcp.md#tools). REST names an identity, not a voice-only speaker |
 | `reindex`, `optimize` | Index maintenance an operator schedules |
@@ -502,8 +507,10 @@ the operations it gates, exactly as the table above describes for the operations
 turn on.
 
 Use the [Python SDK](python-sdk.md) in the owning process, or the MCP adapter where the table
-names a tool. None of these is a REST limitation: the adapter runs in the process that owns
-`Memory`, so a route is unwritten work rather than an impossibility.
+names a tool. Only `ask_stream` needs more than a route: incremental delivery needs a streaming
+response, so exposing it means choosing a wire format rather than binding an existing one. The
+rest are not REST limitations: the adapter runs in the process that owns `Memory`, so a route is
+unwritten work rather than an impossibility.
 
 ### Input limits
 
@@ -524,8 +531,8 @@ names a tool. None of these is a REST limitation: the adapter runs in the proces
 | `settleCaptures` or `pendingCaptures` `memory_ids` | 1 through 100 IDs |
 | `settleCaptures` `max_attempts` | 1 or greater |
 
-`file_data` is bounded by the complete HTTP body. A data URL is also bounded by the 8,192-character
-source field. The transport has no local-path input, remote fetch, upload endpoint, client-streaming capture
-route, coordinate-frame transform, logical scope, or authentication policy. The owner-side Python input ceiling is 512 MiB per asset, but configured
-backends may be lower; the [OpenAI adapter](python-sdk.md#bundled-adapters) has smaller inline
-request budgets.
+`file_data` is bounded by the complete HTTP body. A data URL is also bounded by the
+8,192-character source field. The transport has no local-path input, remote fetch, upload endpoint,
+client-streaming capture route, coordinate-frame transform, logical scope, or authentication
+policy. The owner-side Python input ceiling is 512 MiB per asset, but configured backends may be
+lower; the [OpenAI adapter](python-sdk.md#bundled-adapters) has smaller inline request budgets.

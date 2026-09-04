@@ -37,8 +37,8 @@ uv add "mindbridge[local,openai]"
 
 ## Declarative configuration
 
-`Memory.from_config()` validates pure data and constructs adapters from a closed provider catalog.
-`data_dir` defaults to `.mindbridge`; `embedding` is the only required slot.
+`Memory.from_config()` validates pure data and constructs adapters from a closed provider
+catalog. `data_dir` defaults to `.mindbridge`; `embedding` is the only required slot.
 
 ```python
 from mindbridge import Memory
@@ -84,6 +84,7 @@ In this table, connection fields are `base_url`, `api_key`, `timeout`, and `max_
 | `embedding: openai` | — | `model=text-embedding-3-small`, `dimension=1536`, `space=None`, `modalities=[text]` (at least one), `request_format=input`, plus connection fields |
 | `generation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `video_limit=8`, `min_video_seconds=None`, `extra_body=None`, plus connection fields |
 | `formation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
+| `vision: openai` | — | `model=gpt-5-mini`, `modalities=[image]` (image and/or video only), `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
 | `consolidation: openai` | — | `model=gpt-5-mini`, `modalities=[text]`, `temperature=None`, `seed=None`, `max_tokens=None`, `extra_body=None`, plus connection fields |
 | `speech: funasr` | — | `device=auto` |
 | `speech: openai` | — | `model=whisper-1`, `space=None`, plus connection fields |
@@ -105,9 +106,15 @@ priority, and `None` disables that count. `generation.min_video_seconds` sends a
 four ordered stills and requires image support. Formation and consolidation have neither field
 because they shape answer evidence, not proposals.
 
+`vision` takes the same completion fields as `formation`, but its `modalities` accepts only `image`
+and `video`, because it is the visual capability set rather than a generation one. `generation`,
+`formation`, `vision`, and `consolidation` are separate slots and separate clients: setting one
+never enables another. See [visual descriptions](#visual-descriptions) for the write-path cost of
+the vision slot.
+
 ## Embedding choices
 
-The embedding recipe is durable identity, not a per-query preference:
+The embedding model defines durable vector identity, so every memory requires one:
 
 - `jina-omni` is the pinned multimodal recipe used in project examples. Its weights are CC BY-NC
   4.0. Loading executes pinned upstream code with `trust_remote_code=True`; review that code and
@@ -175,6 +182,61 @@ invalid individual proposals are dropped and counted by
 [memory types, time, and decay](memory-types-time-and-decay.md) for the resulting typed records and
 visibility rules.
 
+## Visual descriptions
+
+The `vision` slot is omitted by default and, like `formation`, must stay omitted unless the
+deployment wants it. Configuring it adds one chat completion per write batch that carries a
+not-yet-described image or video, and buys the derived text that lets the lexical half of
+retrieval reach a visual memory at all.
+
+```python
+config = {
+    "embedding": {"provider": "jina-omni"},
+    "vision": {
+        "provider": "openai",
+        "model": "gpt-5-mini",
+        "modalities": ["image"],
+    },
+}
+```
+
+A memory whose content is one image has no words. Its full-text document is empty, so BM25 cannot
+match it, the lexical re-ranking bonus scores it zero, and the only route that reaches it is the
+dense one -- however capable the embedder is. Speech-bearing video escapes this through
+`index_speech`; nothing covers a silent image. The caption is unioned into that document beside
+whatever the caller wrote, each section carrying a `[visual description:<asset_id>]` marker so
+`get` shows which assets were described, and the asset is still embedded natively: the derived
+text is added to the record, never substituted for it.
+
+Three things bound what it costs and what it can do:
+
+- `modalities` is the visual capability set and accepts only `image` and `video`. An asset outside
+  it is left undescribed, silently and by design.
+- Video is described from four ordered stills decoded locally, never by uploading the file, so it
+  costs four image parts per memory; that is why the default is `[image]` and video is opted into.
+  A clip with no readable video stream fails the write rather than falling back to sending it. The
+  request marks such a visual with its still count (`Visual 2, as 4 ordered stills:`) and asks for
+  one caption per visual, never one per still: asked over an unmarked clip, a measured endpoint
+  returned four separate descriptions on every attempt, the one-caption-per-input contract below
+  rejected the reply whole, and `modalities: [image, video]` therefore stored no caption at all
+  while still paying for the request.
+- The caption is derived text, so the request carries pixels and an ordinal only -- no memory ID,
+  file name, or store path -- and a reply that does not return exactly one non-empty caption per
+  visual is rejected whole rather than mislabelling a memory with another's contents. One
+  malformed reply is retried once, because an endpoint can answer `200 OK` with invalid JSON and
+  an SDK retry policy never sees that; a second failure, or any other failure, leaves the memory
+  stored **without** a caption rather than failing the write. Losing derived text must never lose
+  an observation the caller handed over. Those batches are counted on the vision span as
+  `mindbridge.vision.failed_batches`, so the loss is measurable rather than silent.
+- Captions are not reproducible. The request pins `temperature` 0 and a fixed `seed` unless the
+  slot sets its own, but a measured endpoint returned four different completions for four
+  identical requests at those values. A caption becomes indexed text, so anything that needs two
+  ingests of one corpus to build the same documents has to cache descriptions by asset digest;
+  the benchmark harness does exactly that.
+
+Description tokens are reported under their own model module, so a deployment that meters usage
+can separate what captioning costs from what answering costs.
+
 ## Agentic memory management
 
 The optional `consolidation` slot builds the bundled OpenAI-compatible `ConsolidationBackend`,
@@ -219,23 +281,23 @@ consolidator may propose and what the kernel refuses.
 
 ## Local memory settings
 
-The `settings` mapping validates as `MemorySettings`. `MemoryConfig` is the compatible public name
-used by `Memory.from_plugins()`.
+The `settings` mapping is the value-only `MemorySettings` policy (`MemoryConfig` is a compatible
+alias):
 
-| Field | Default | Effect |
+| Field | Default | Meaning |
 | --- | --- | --- |
 | `index_speech` | `True` | Persist configured speech analysis during `add` |
 | `index_quantization` | `none` | Zvec projection mode: `none`, `fp16`, `int8`, or `rabitq` |
 | `minimum_relevance` | `0.10` | Floor on query-relevant evidence before retention and reinforcement ranking |
 | `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1` |
-| `evidence_budget_chars` | `None` | Admit evidence beyond `limit` while it fits this budget |
-| `decay_half_life_days` | `None` | Apply optional query-time retention decay |
-| `reinforce_on_answer` | `True` | Reinforce evidence cited by `ask()` |
-| `speaker_similarity` | `0.78` | Voice identity match threshold; calibrate before relying on it |
+| `evidence_budget_chars` | `None` | Widen `ask` grounding while the evidence fits this budget; raises a floor, never a ceiling; `None` grounds on exactly `limit` |
+| `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
+| `reinforce_on_answer` | `True` | Count the evidence `ask()` cited, so retrieval favours it later |
+| `speaker_similarity` | `0.78` | Voice identity match threshold (uncalibrated; see below) |
 | `speaker_margin` | `0.05` | Voice identity ambiguity margin |
 | `face_similarity` | `0.363` | Face identity match threshold |
 | `face_margin` | `0.05` | Face identity ambiguity margin |
-| `identity_link_min_assets` | `2` | Distinct assets required before voice and face identities merge |
+| `identity_link_min_assets` | `2` | Distinct assets a voice-and-face pair must share before they merge |
 | `memory_budget_records` | `None` | Active records this instance is meant to hold; the whole definition of the `PRESSURE` trigger, which derives nothing without it |
 | `query_failure_window_seconds` | `3600.0` | How far back the `QUERY_FAILURE` trigger counts near-equal empty recalls |
 | `query_failure_history` | `512` | How many empty recalls the store keeps at all; the oldest fall out |
@@ -246,33 +308,73 @@ model identities, and configured backends the routing layer reads, including
 `consolidation_model` when a consolidator is injected. `GET /healthz` and the MCP server
 instructions publish that same view.
 
-Thresholds and margins accept values from 0 through 1. A zero relevance floor disables weak-hit
-rejection; a zero ambiguity margin disables the corresponding tie rejection. Half-life and
-evidence-budget values must be positive when set, and `identity_link_min_assets` is positive.
+Thresholds and margins accept values from `0` through `1`. Relevance is floored at `0`, so
+`minimum_relevance=0` admits every candidate and disables the weak-evidence floor; a zero ambiguity margin disables the corresponding tie rejection. A zero
+speaker or face similarity is merely the most permissive threshold.
 
-`minimum_relevance` gates semantic relevance, requested temporal proximity, and observation
-confidence. Retention decay and reinforcement then change ordering, so an admitted
-`SearchHit.score` may be below the configured floor. Use `search_with_trace()` to inspect
-`gate_relevance`, `temporal_factor`, and `retention_factor` for one query.
+`minimum_relevance` gates the signals the query asked about, and only those. Retrieval relevance
+and temporal proximity are inside the gate: a caller who asks "in 2024" made the year part of the
+question, so overlapping it counts as evidence and missing it does not. Reinforcement and
+`decay_half_life_days` retention are outside it, because the query never mentioned them. They
+still shape `SearchHit.score` and the result order, so **an admitted hit can report a `score`
+below the floor you set**.
 
-`evidence_budget_chars=None` grounds `ask()` on exactly `limit` hits. A positive budget keeps those
-hits, then admits more ranked evidence while it fits; it widens the prompt rather than imposing a
-hard ceiling. To bound a prompt, lower `limit` and leave the budget unset.
+That asymmetry is deliberate. Both factors are bounded below by `0.3`, so with retention inside
+the gate a perfectly relevant memory would decay to `0.30`, and to `0.09` once a dated question's
+window also missed it — under the `0.10` default. A floor that included retention would turn
+"prefer recent" into "hide old" for precisely the deployment that enabled decay and then asked
+about last year. Ranking an old event last is fine; ceasing to return it is not.
 
-`index_speech` matters only with a `SpeechBackend` such as `speech: funasr`; the analysis already
-exists when indexing starts, so enabling it adds no model call. It does nothing without a speech
-backend or with a plain transcription backend such as `speech: openai`.
+Use `search_with_trace` to read the gated quantity as `gate_relevance`, beside the
+`retention_factor` and `temporal_factor` that moved `score` away from it. `decay_half_life_days` must be
+positive when set. `evidence_budget_chars` keeps the `limit` hits unconditionally and then admits
+further ranked memories while the evidence fits, charging each media asset its modality's text
+equivalent because a media part costs a model far more than its record's text. Because the `limit`
+hits are never dropped, this setting can only enlarge a prompt: to bound one, lower `limit` and
+leave the budget at `None`. Setting it also removes `limit`'s effect on prompt size, since the
+budget refills the window to the same width whatever `limit` was.
 
-The default `speaker_similarity=0.78` is deliberately conservative and is not calibrated for
-MindBridge's maximum-over-up-to-20-exemplars matcher. A threshold that is too high fragments one
-person; one that is too low can merge different people, which is the privacy-sensitive failure.
-Calibrate it on labelled audio from the deployment and retain a non-zero margin. The SFace-derived
-`face_similarity=0.363` can be calibrated the same way for deployment cameras.
+Pass an OpenTelemetry tracer through the separate `tracer=` argument of `Memory.from_config()` or
+`Memory(...)`; it is not a setting. See [operations](operations.md#telemetry) for exporter setup
+and [memory types, time, and decay](memory-types-time-and-decay.md#decay-and-reinforcement) for
+ranking semantics.
 
-Pass an OpenTelemetry tracer through the separate `tracer=` argument; it is not a setting. See
-[operations](operations.md#telemetry) for exporter setup and
-[memory types, time, and decay](memory-types-time-and-decay.md#decay-and-reinforcement) for ranking
-semantics.
+`index_speech` is on by default. It only has an effect when `transcriber` is a `SpeechBackend`
+(`speech: funasr`), which has already run its analysis by the time `add` reaches the index, so
+reusing that text costs no additional model call and no additional token; with no speech backend, or
+with a plain transcription backend such as `speech: openai`, the setting does nothing. Set it to
+`False` to keep speaker identities out of the index and out of `add`-time identity matching.
+
+### The identity thresholds are not calibrated
+
+`face_similarity` has provenance: `0.363` is upstream SFace's own `_threshold_cosine`, adopted
+verbatim. **`speaker_similarity` does not.** `0.78` has no upstream source, and it is knowingly
+wrong in the safe direction — it sits above CAM++'s same-speaker cosine, so voice identities
+fragment: one run turned 1667 voice segments into 1743 separate identities. Expect voice identity to
+be unreliable at the default until it is calibrated.
+
+It is left high on purpose. The failure modes are not symmetric: too high fragments one person into
+many, which costs recall, while too low merges two people into one identity, which hands one
+person's memories to another. Fragmentation is recoverable; a false merge is a correctness and
+privacy failure.
+
+The obvious fix does not work. The pinned CAM++ recipe publishes its own threshold — `yesOrno_thr`
+is `0.31` in the model's `configuration.json`, and ModelScope's speaker-verification pipeline uses
+exactly that value on a raw cosine, the same quantity MindBridge compares. But `0.31` is calibrated
+for **one pair** of embeddings, and MindBridge accepts on the **maximum over up to 20 stored
+exemplars**. A maximum over more samples can only rise, so a pair threshold is a lower bound on the
+correct max-over-many threshold, never the value itself: measured against this matcher, mutually
+orthogonal random impostor vectors already reach `0.28` at 20 exemplars. `speaker_margin` does not
+compensate, because it only breaks ties between two candidate identities — with a single enrolled
+identity it never applies, and with several the maximum inflates only the winner.
+
+To calibrate it for a deployment, embed a labelled set of that deployment's own audio with the
+configured recipe, then plot two distributions of the score MindBridge actually decides on — the
+maximum over an identity's exemplar bank — one for same-speaker pairs and one for
+different-speaker pairs. Set the threshold between them, and keep `speaker_margin` non-zero. Around
+30 utterances each from 4-8 speakers in the real acoustic environment is enough to see whether a gap
+exists. The same procedure applies to `face_similarity` if SFace's published value proves wrong on a
+deployment's cameras.
 
 ## Retention policy
 
@@ -340,8 +442,11 @@ OpenAI client open, so the outer client context remains the application's respon
 
 `former=` accepts a custom `FormationBackend` and `consolidator=` a `ConsolidationBackend`;
 declarative `formation: openai` and `consolidation: openai` supply the bundled adapter for those
-slots. `vision_describer=` accepts a `VisionDescriptionBackend` and is available only through
-direct injection or `MemoryPlugins`, because MindBridge bundles no declarative provider for it.
+slots. `vision_describer=` accepts a `VisionDescriptionBackend`, for a custom or non-bundled adapter;
+declarative `vision: openai` supplies the bundled one. `add` and `add_many` call it for every
+embedder whenever a visual asset has no description yet, and `AsyncVisionStream` additionally calls
+it at finality when the embedder lacks native image support and no external `VisionPartial`
+supplied a description, so speculative retrieval has a query before finality.
 
 `OpenAIModels` implements both reasoning protocols on its generation client, so one adapter can
 fill `answerer=`, `former=`, and `consolidator=`:

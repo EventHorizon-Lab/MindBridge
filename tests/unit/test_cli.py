@@ -27,6 +27,7 @@ from urllib.request import Request
 import pytest
 from pydantic import TypeAdapter
 
+import mindbridge
 import mindbridge.cli as cli_module
 from mindbridge import Memory, recipes
 from mindbridge.api import app as rest
@@ -135,14 +136,36 @@ def _run(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, object, l
 # Surface derivation
 
 
+# `docs/design-principles.md` lets the CLI omit an operation only when a transport limitation is
+# documented explicitly, so a gap needs an entry here and a row in `docs/api/cli.md` rather than
+# silence. Everything else must be a command.
+UNEXPOSED_OPERATIONS: dict[str, str] = {
+    "ask_stream": (
+        "incremental delivery cannot survive one stable JSON document per invocation; `ask` "
+        "returns the same answer"
+    ),
+}
+
+
 def test_commands_are_the_sdk_operations_kebab_cased() -> None:
     published = {
         name
         for name, value in inspect.getmembers(Memory, inspect.isfunction)
         if not name.startswith("_") and name != "close"
     }
-    assert set(OPERATIONS) == published
-    assert set(COMMANDS) == {name.replace("_", "-") for name in published} | {"doctor"}
+    assert set(OPERATIONS) | set(UNEXPOSED_OPERATIONS) == published
+    assert not set(OPERATIONS) & set(UNEXPOSED_OPERATIONS)
+    assert set(COMMANDS) == {name.replace("_", "-") for name in set(OPERATIONS)} | {"doctor"}
+
+
+def test_every_cli_gap_is_documented_with_its_reason() -> None:
+    """A command left out has to be visible on the page, not only in this file."""
+    page = (Path(mindbridge.__file__).parents[2] / "docs" / "api" / "cli.md").read_text(
+        encoding="utf-8"
+    )
+
+    for operation in UNEXPOSED_OPERATIONS:
+        assert f"`{operation.replace('_', '-')}`" in page
 
 
 def test_the_documented_commands_table_and_count_are_the_real_ones() -> None:

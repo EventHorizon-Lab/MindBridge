@@ -47,8 +47,13 @@ from mindbridge.models.base import (
     GenerationBackend,
     ModelInput,
     TranscriptionBackend,
+    VisionDescriptionBackend,
 )
-from mindbridge.models.openai_sdk import UNKNOWN_ANSWER, OpenAIModels
+from mindbridge.models.openai_sdk import (
+    DEFAULT_GENERATION_MODEL,
+    UNKNOWN_ANSWER,
+    OpenAIModels,
+)
 from mindbridge.types import (
     AbstentionReason,
     AssetRef,
@@ -422,6 +427,349 @@ def test_formation_batches_grounded_observations_and_validates_typed_output(
     assert state[0].valid_from == datetime(2026, 8, 27, tzinfo=timezone.utc)
     assert affect[0].kind is MemoryKind.AFFECT
     assert affect[0].cue_modality is Modality.AUDIO
+
+
+def _vision_model(client: OpenAI, *, capabilities: frozenset[Modality]) -> OpenAIModels:
+    return OpenAIModels(
+        client,
+        generation_model="caption-model",
+        generation_capabilities=capabilities,
+        embedding_dimension=2,
+    )
+
+
+def _caption_reply(*captions: str) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"content": json.dumps({"descriptions": list(captions)})},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 900, "completion_tokens": 30, "total_tokens": 930},
+        },
+    )
+
+
+def test_description_numbers_every_visual_in_one_request_and_sends_video_as_stills(
+    tmp_path: Path,
+) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    clip = _video_asset(tmp_path, "clip", 12)
+    seen: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return _caption_reply("a red bicycle", "a kitchen counter, then an open fridge")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(
+            _sdk_client(client),
+            capabilities=frozenset({Modality.IMAGE, Modality.VIDEO}),
+        )
+        captions = model.describe((ModelInput(assets=(picture,)), ModelInput(assets=(clip,))))
+
+    assert isinstance(model, VisionDescriptionBackend)
+    assert captions == ("a red bicycle", "a kitchen counter, then an open fridge")
+    assert len(seen) == 1
+    payload = seen[0]
+    assert payload["model"] == "caption-model"
+    assert payload["response_format"] == {"type": "json_object"}
+    parts = payload["messages"][1]["content"]
+    # Ordinals, not identifiers: the reply is matched to inputs by position, and the caption is
+    # stored in a searchable document, so nothing naming the asset may enter the prompt.
+    assert [part["type"] for part in parts] == [
+        "text",
+        "image_url",
+        "text",
+        *("image_url",) * 4,
+    ]
+    # A visual sent as several stills says so. Without the count, a measured endpoint answered a
+    # single four-still clip with four descriptions on every attempt, and the "one string per
+    # input" contract then rejected the whole reply -- billed, and no caption stored.
+    assert [part["text"] for part in parts if part["type"] == "text"] == [
+        "Visual 1:",
+        "Visual 2, as 4 ordered stills:",
+    ]
+    # The video travels as the four ordered stills the generation path samples, never as the file.
+    frames = [part["image_url"]["url"] for part in parts[3:]]
+    assert all(url.startswith("data:image/jpeg;base64,") for url in frames)
+    serialized = json.dumps(payload)
+    assert "clip.mp4" not in serialized
+    assert str(tmp_path) not in serialized
+    assert "video/mp4" not in serialized
+
+
+def test_description_reports_its_own_token_cost(tmp_path: Path) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        del request
+        return _caption_reply("a whiteboard covered in equations")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        with (
+            operation_span(tracer, "operation", attributes={}),
+            model_span(tracer, "model", attributes={}),
+        ):
+            model.describe((ModelInput(assets=(picture,)),))
+    provider.shutdown()
+
+    attributes = {span.name: span.attributes for span in exporter.get_finished_spans()}["model"]
+    assert attributes is not None
+    assert attributes[TOKEN_TOTAL] == 930
+    assert attributes["gen_ai.usage.input_tokens"] == 900
+    assert attributes["gen_ai.usage.output_tokens"] == 30
+    assert attributes[MODEL_REQUEST_COUNT] == 1
+    assert attributes[TOKEN_COMPLETE] is True
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not json at all",
+        json.dumps(["a red bicycle"]),
+        json.dumps({"captions": ["a red bicycle"]}),
+        json.dumps({"descriptions": "a red bicycle"}),
+        json.dumps({"descriptions": ["a red bicycle"]}),
+        json.dumps({"descriptions": ["a red bicycle", "a fence", "one too many"]}),
+        json.dumps({"descriptions": ["a red bicycle", "   "]}),
+        json.dumps({"descriptions": ["a red bicycle", 7]}),
+    ],
+)
+def test_description_rejects_output_it_cannot_align_with_its_inputs(
+    content: str, tmp_path: Path
+) -> None:
+    # A caption is written into a memory's document by position. A short, long, or non-string
+    # reply silently mislabels one memory with another's contents, so none of it is accepted.
+    first = _asset(tmp_path, "first", Modality.IMAGE, "image/png", b"one")
+    second = _asset(tmp_path, "second", Modality.IMAGE, "image/png", b"two")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"index": 0, "message": {"content": content}, "finish_reason": "stop"}]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        with pytest.raises(ModelError) as failure:
+            model.describe((ModelInput(assets=(first,)), ModelInput(assets=(second,))))
+
+    assert failure.value.reason == "response_invalid"
+    assert failure.value.stage == "describe"
+
+
+def test_a_truncated_description_is_reported_as_truncation(tmp_path: Path) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": '{"descriptions": ["a red bic'},
+                        "finish_reason": "length",
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        with pytest.raises(ModelOutputTruncatedError) as failure:
+            model.describe((ModelInput(assets=(picture,)),))
+
+    assert failure.value.stage == "describe"
+
+
+def test_description_refuses_a_modality_the_endpoint_does_not_declare(tmp_path: Path) -> None:
+    clip = _video_asset(tmp_path, "clip", 8)
+
+    with httpx.Client() as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        with pytest.raises(ModelError, match="does not support: video"):
+            model.describe((ModelInput(assets=(clip,)),))
+        assert model.describe(()) == ()
+
+
+def test_description_never_falls_back_to_sending_the_video_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # When the frames cannot be decoded the honest outcome is a refusal: uploading the clip
+    # itself to derive one index line is a different, much costlier contract.
+    clip = _video_asset(tmp_path, "clip", 8)
+    monkeypatch.setattr(openai_backend, "_video_frame_urls", lambda *_args, **_kwargs: None)
+
+    with httpx.Client(transport=httpx.MockTransport(_unreachable)) as client:
+        model = _vision_model(
+            _sdk_client(client),
+            capabilities=frozenset({Modality.IMAGE, Modality.VIDEO}),
+        )
+        with pytest.raises(ModelError) as failure:
+            model.describe((ModelInput(assets=(clip,)),))
+
+    assert failure.value.reason == "asset_unavailable"
+    assert failure.value.subject == "clip"
+
+
+def _unreachable(request: httpx.Request) -> httpx.Response:
+    raise AssertionError(f"no request should be sent, got {request.url}")
+
+
+def _malformed_reply() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "choices": [
+                {"index": 0, "message": {"content": '{"descriptions": ['}, "finish_reason": "stop"}
+            ],
+            "usage": {"prompt_tokens": 900, "completion_tokens": 5, "total_tokens": 905},
+        },
+    )
+
+
+def test_one_malformed_description_reply_is_retried_once(tmp_path: Path) -> None:
+    # Measured against the round's endpoint: 3 of 24 single-image calls returned HTTP 200 with
+    # truncated JSON, and the same image failed twice then succeeded four times running. The SDK's
+    # `max_retries` never sees this, because the transport call succeeded.
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    replies = [_malformed_reply(), _caption_reply("a red bicycle")]
+    sent: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return replies[len(sent) - 1]
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        captions = model.describe((ModelInput(assets=(picture,)),))
+
+    assert captions == ("a red bicycle",)
+    assert len(sent) == 2
+    # The retry repeats the identical request rather than reshaping it.
+    assert sent[0] == sent[1]
+
+
+def test_a_second_malformed_reply_is_not_retried_again(tmp_path: Path) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    sent: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return _malformed_reply()
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        with (
+            operation_span(tracer, "operation", attributes={}),
+            model_span(tracer, "model", attributes={}),
+            pytest.raises(ModelError) as failure,
+        ):
+            model.describe((ModelInput(assets=(picture,)),))
+    provider.shutdown()
+
+    assert failure.value.reason == "response_invalid"
+    assert len(sent) == 2
+    # Both attempts were billed, so both are metered: recording per attempt would report the
+    # last one only, and recording on success only would drop the wasted request entirely.
+    attributes = {span.name: span.attributes for span in exporter.get_finished_spans()}["model"]
+    assert attributes is not None
+    assert attributes[TOKEN_TOTAL] == 1_810
+    assert attributes[MODEL_REQUEST_COUNT] == 2
+
+
+def test_a_truncated_description_is_not_retried(tmp_path: Path) -> None:
+    # An identical second request cannot clear an output-token limit, so paying for one is waste.
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    sent: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": '{"descriptions": ["a red bic'},
+                        "finish_reason": "length",
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        with pytest.raises(ModelOutputTruncatedError):
+            model.describe((ModelInput(assets=(picture,)),))
+
+    assert len(sent) == 1
+
+
+def test_description_asks_the_endpoint_for_a_deterministic_sample(tmp_path: Path) -> None:
+    # Pinned so the sampler is not a cause of drift. This is not a reproducibility guarantee --
+    # the measured endpoint returns a different completion for identical requests anyway -- which
+    # is why the benchmark harness caches descriptions by asset digest instead.
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    sent: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return _caption_reply("a red bicycle")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        first = model.describe((ModelInput(assets=(picture,)),))
+        second = model.describe((ModelInput(assets=(picture,)),))
+
+    assert first == second
+    assert sent[0]["temperature"] == 0.0
+    assert sent[0]["seed"] == 0
+    # Byte-identical requests: a caption that reaches a text index must not depend on anything
+    # that varies between two calls with the same input.
+    assert sent[0] == sent[1]
+
+
+def test_a_configured_sampler_still_wins_over_the_pinned_default(tmp_path: Path) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    sent: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return _caption_reply("a red bicycle")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(
+            _sdk_client(client),
+            generation_model="caption-model",
+            generation_capabilities=frozenset({Modality.IMAGE}),
+            generation_temperature=0.7,
+            generation_seed=99,
+            embedding_dimension=2,
+        )
+        model.describe((ModelInput(assets=(picture,)),))
+
+    assert sent[0]["temperature"] == 0.7
+    assert sent[0]["seed"] == 99
 
 
 def test_formation_space_identifies_every_generation_control() -> None:
@@ -852,6 +1200,39 @@ def _consolidation_evidence() -> tuple[MemoryRecord, ...]:
             ),
         ),
     )
+
+
+def test_vision_space_identifies_the_prompt_as_well_as_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A store caches one caption per `vision_space`, so the space must cover the whole recipe.
+
+    The prompt decides what a caption contains and is still being iterated on, while the caption
+    itself lands inside a searchable document. A space that tracked only the model would make an
+    edited prompt serve captions written under the old one forever, with nothing to notice it.
+    """
+    baseline = OpenAIModels().vision_space
+    assert baseline.startswith(f"{DEFAULT_GENERATION_MODEL}:mindbridge-vision-v1:")
+    # Stable for one configuration: two identical compositions must share cached captions.
+    assert OpenAIModels().vision_space == baseline
+    # Distinct from `formation_space`, which digests the same knobs under a different prompt.
+    assert baseline != OpenAIModels().formation_space
+
+    variants = {
+        OpenAIModels(generation_model="other-model").vision_space,
+        OpenAIModels(generation_seed=7).vision_space,
+        OpenAIModels(generation_temperature=0.2).vision_space,
+        OpenAIModels(generation_max_tokens=128).vision_space,
+        OpenAIModels(generation_extra_body={"reasoning": {"effort": "low"}}).vision_space,
+        OpenAIModels(
+            generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE})
+        ).vision_space,
+    }
+    assert baseline not in variants
+    assert len(variants) == 6
+
+    monkeypatch.setattr(openai_backend, "_VISION_SYSTEM_PROMPT", "Describe it differently.")
+    assert OpenAIModels().vision_space != baseline
 
 
 def test_answer_marks_the_grounded_unknown_sentinel_as_insufficient_evidence() -> None:
@@ -2613,3 +2994,11 @@ def test_formation_prompt_states_every_source_rule_the_validator_enforces(
         memory_module._validate_formation_proposal(proposal, source)
 
     assert phrase in openai_backend._FORMATION_SYSTEM_PROMPT
+
+
+def test_embedding_width_mismatch_names_both_widths() -> None:
+    with pytest.raises(ModelError) as failure:
+        openai_backend._normalized((0.1, 0.2, 0.3), 2)
+
+    assert failure.value.reason == "response_invalid"
+    assert "returned 3 values but the configured dimension is 2" in str(failure.value)

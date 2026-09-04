@@ -13,12 +13,13 @@ except MindBridgeError as error:
 
 `code` is the stable family, `reason` narrows the cause, `stage` locates the failed pipeline step,
 `subject` identifies the affected item when available, and `retryable` states whether the identical
-request can succeed later. CLI, REST, and MCP envelopes add a `trace_id`; preserve it with request
-metadata. See the [REST error contract](api/rest.md#codes-and-reasons).
+request can succeed later. CLI, REST, and MCP envelopes return the same classification fields and
+add a `trace_id`; preserve it with request metadata. See the
+[REST error contract](api/rest.md#codes-and-reasons).
 
 For composition failures, run the same selection with `mindbridge ... doctor`. Bundled recipes
-exercise their loaders, `--app` verifies the import without calling a factory, and `--url` checks
-`/healthz`.
+exercise their loaders, `--app` verifies the import without calling a factory that could open the
+store, and `--url` checks `/healthz`.
 
 ## Error triage
 
@@ -40,39 +41,44 @@ Retry only when `retryable` is true. The closed retryable reasons are `connectio
 ### The directory is in use
 
 `reason="data_dir_in_use"` means a live `Memory` owns the physical directory. Close that owner,
-call its REST interface, or choose a different directory. Do not delete `.mindbridge.lock`: the
-file is only the operating-system lock target and deleting it does not release an owner.
+call its REST interface, or choose a different directory. Do not add a tenant field to share one
+directory: physical directories are the isolation boundary. Do not delete `.mindbridge.lock`
+either; the file is only the operating-system lock target and deleting it does not release an
+owner.
 
-Python, CLI, and MCP retain the local path in `subject`. REST redacts subjects for storage, index,
-and internal failures. Protect MCP envelopes when using a network transport.
+The error is retryable because the current owner may exit. Python, CLI, and MCP retain the local
+path in `subject`; unauthenticated REST redacts storage, index, and internal subjects. Protect MCP
+envelopes when the host uses a network transport.
 
 ### The schema is unsupported
 
-`reason="schema_unsupported"` means this MindBridge version cannot read the SQLite schema or
-required tables. Reopen the backup with a compatible version. Do not edit `state.sqlite3` or
-`PRAGMA user_version`.
+`reason="schema_unsupported"` means this MindBridge version cannot read the SQLite schema or its
+required tables. Use a version that supports the store, or reopen a backup with one. Do not edit
+`state.sqlite3` or its `PRAGMA user_version` by hand.
 
 ### Store metadata mismatch
 
-The store records embedding model, vector space and dimension, transcription space, configured
+The store records the embedding model, vector space and dimension, transcription space, configured
 face spaces, and the index recipe. Reopen with the original configuration, apply only a supported
-upgrade, or ingest source content into a new directory.
+upgrade, or ingest the source content into a new directory.
 
-`reindex()` cannot convert incompatible embeddings, transcripts, or face analyses. A known
-index-only recipe change, including quantization, rebuilds Zvec from SQLite. A recognized embedding
-recipe upgrade may re-embed before publishing its new compatibility marker.
+`reindex()` cannot convert incompatible embeddings, transcripts, or face analyses; it rebuilds the
+Zvec projection from the durable values already in SQLite. A known index-only recipe change,
+including quantization, rebuilds Zvec from stored vectors. A recognized embedding recipe upgrade
+may re-embed records before publishing its new compatibility marker.
 
 ### Zvec is missing or damaged
 
-A missing `zvec/` directory is rebuilt on open without re-embedding stored content. If Zvec is
-damaged, follow the [index repair runbook](operations.md#index-maintenance-and-repair): stop the
-owner, retain a backup, move only `zvec/` aside, and reopen. Never move `state.sqlite3` or `assets/`.
+A missing `zvec/` directory is rebuilt on the next open without re-embedding stored content. If
+Zvec is damaged, follow the [index repair runbook](operations.md#index-maintenance-and-repair):
+stop the owner, retain a backup, move only `zvec/` aside, and reopen. Keep the moved directory
+until a known search succeeds. Never move `state.sqlite3` or `assets/`; they are authoritative.
 
 ## A write returned an index error
 
 MindBridge commits SQLite before applying and flushing Zvec. An `index_unavailable` response can
 therefore mean the record or deletion is durable even though the call failed. The corresponding
-outbox rows remain pending until startup or another draining operation succeeds.
+outbox rows stay pending until startup or another draining operation succeeds.
 
 1. Preserve the error envelope and `trace_id`.
 2. Check authoritative state with `get()` or `list()` if the ID is known.
@@ -85,13 +91,13 @@ Do not delete SQLite rows or clear `search_index_queue` to make the error disapp
 
 ## Search returns no hits
 
-An empty tuple is a valid search result. Candidates whose gate confidence falls below
-`minimum_relevance` are rejected; an unresolved top-two tie may also be withheld when `limit=1`.
+An empty tuple is a valid result. Candidates below `minimum_relevance` are rejected, and an
+unresolved top-two tie may be withheld when `limit=1`.
 
 `minimum_relevance` is not compared against the `score` on a returned `SearchHit`. That score is
-the final ranking score, while the gate compares a separate gate confidence, so tuning the floor
-against observed scores gives the wrong value. `search_with_trace()` reports both per candidate;
-use it rather than inferring the threshold from hits that were returned.
+the final ranking score, while the gate compares the separate `gate_relevance` quantity, so tuning
+the floor against observed scores gives the wrong value. `search_with_trace()` reports both per
+candidate; use it rather than inferring the threshold from hits that were returned.
 
 Before changing thresholds, rule out a record that was captured but never settled:
 `pending_captures()` lists records that are durable and returned by `get()` and `list()` but hold
@@ -112,7 +118,7 @@ Then:
 5. If authoritative records exist but the projection is suspect, run the
    [index repair procedure](operations.md#index-maintenance-and-repair).
 
-SQLite hydration deliberately drops stale Zvec IDs. The defaults and ranges are in
+SQLite hydration deliberately drops stale Zvec IDs. The defaults and valid ranges are in
 [local memory settings](configuration.md#local-memory-settings).
 
 ## A stored media record fails to load
@@ -128,7 +134,8 @@ edit the SQLite descriptor.
 
 Every `Memory` needs an embedder. `ask()` also needs an answerer. `speech()` and `faces()` return
 `()` when a record has no corresponding media; otherwise they need their matching capability. Add
-the missing backend slot or use a configured operation. See [configuration](configuration.md).
+the missing declarative slot, inject the backend, or use a configured operation. See
+[configuration](configuration.md).
 
 ### Optional dependency is missing
 
@@ -144,22 +151,28 @@ image or video evidence.
 
 ### Provider request or output fails
 
-Inspect `reason` and `stage`, then check credentials, base URL, proxy, timeout, rate limit, provider
-status, and response shape. Provider exceptions remain available as the Python `__cause__`, but
-REST and MCP never serialize their bodies.
+Inspect `reason` and `stage`, then check credentials, base URL, proxy, timeout, rate limit,
+provider status, and response shape. MindBridge preserves the provider exception as the Python
+`__cause__` and classifies known SDK failures in `reason`, but REST and MCP never serialize
+provider bodies. Configure credentials, base URL, timeout, proxy, and provider retry policy on the
+provider SDK or the declarative OpenAI slot.
 
-For `code="model_output_truncated"`, raise the adapter's generation limit or reduce the `ask()`
-evidence limit. Provider-specific controls are in the
-[Python adapter reference](api/python-sdk.md#bundled-adapters).
+For `code="model_output_truncated"`, generation reached its output-token limit: raise the adapter's
+generation limit or reduce the `ask()` evidence limit. Retrying the identical request is not a fix.
+Provider-specific controls and media limits are in the
+[Python adapter reference](api/python-sdk.md#bundled-adapters) and
+[REST input limits](api/rest.md#input-limits).
 
 ## Content is rejected or not fetched
 
-MindBridge never fetches HTTP(S) content. In Python, a URL-shaped string is text. Download media
-with the application's HTTP client, then pass a `Blob` or regular local `Path`. REST and MCP reject
-remote URLs and server filesystem paths; use inline bytes or an existing asset ID.
+MindBridge never fetches HTTP(S) content. In Python, a URL-shaped string is application text.
+Download media with the application's HTTP client, then pass a `Blob` or a regular local `Path`.
+REST and MCP reject remote URLs and server filesystem paths; use inline bytes or an existing asset
+ID.
 
 REST rejects invalid content with 422 and request bodies over its limit with 413. Use the ordered
-part shapes and limits in the [REST reference](api/rest.md#input-limits).
+part shapes and limits in the [REST reference](api/rest.md#input-limits); do not send a local path
+from the client machine.
 
 ## REST or MCP cannot share the store
 
@@ -168,21 +181,23 @@ adapters around one constructed `Memory`, call the running REST owner, or alloca
 separate memory domains. REST has twelve product routes under `/v1`, or eighteen with both
 opt-in switches enabled; MCP has fifteen tools.
 
-Neither network adapter adds authentication. Apply the controls in
-[deployment](deployment.md#choose-a-topology).
+Neither network adapter adds MindBridge authentication, and stdio MCP inherits the host process
+principal. Apply the controls in [deployment](deployment.md#choose-a-topology).
 
 ## Latency or telemetry looks wrong
 
 `/healthz` is liveness, not a model or retrieval probe. Compare operation, stage, and model spans
 to separate model latency from SQLite, index synchronization, search, and ranking. If token totals
-look low, check `mindbridge.token_usage.complete`, expected requests, and reported requests;
-MindBridge does not estimate missing usage.
+look low, check `mindbridge.token_usage.complete`, the expected request count, and the reported
+request count; MindBridge does not estimate missing usage.
 
-For face or speaker recognition, compare `mindbridge.identity.observations`, `.matched_existing`,
-and `.created`. Zero observations means the analyzer ran and detected none. Many creations with
-few existing matches indicate identity fragmentation; changing a similarity threshold cannot fix
-an embedding model that does not separate the deployed material.
+For face or speaker recognition, read the `mindbridge.identity.faces` and
+`mindbridge.identity.speakers` spans and compare `mindbridge.identity.observations`,
+`.matched_existing`, and `.created`. Zero observations means the analyzer ran and detected none.
+Many creations with few existing matches indicate identity fragmentation; changing a similarity
+threshold cannot fix an embedding model that does not separate the deployed material. See
+[the identity thresholds](configuration.md#the-identity-thresholds-are-not-calibrated).
 
-`AsyncMemory` runs the synchronous core in worker threads. Backends must be thread-safe and own
-their network concurrency and timeouts. Tune or replace the backend; do not open a second owner on
-the same directory. See [telemetry](operations.md#telemetry) for the attribute contract.
+`AsyncMemory` runs the synchronous embedded core in worker threads. Backends must be thread-safe
+and own their network concurrency and timeouts. Tune or replace the backend; do not open a second
+owner on the same directory. See [telemetry](operations.md#telemetry) for the attribute contract.

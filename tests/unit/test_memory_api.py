@@ -65,6 +65,7 @@ from mindbridge.models.base import (
     SpeakerEmbedding,
     SpeechAnalysis,
     SpeechTurn,
+    StreamingGenerationBackend,
 )
 from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.types import (
@@ -285,6 +286,7 @@ class _FakeIndex:
         self.dense_hits_override: tuple[IndexHit, ...] | None = None
         self.lexical_hits_override: tuple[IndexHit, ...] | None = None
         self.upsert_calls: list[tuple[str, ...]] = []
+        self.flush_calls = 0
         self.delete_calls: list[tuple[str, ...]] = []
         self.dense_search_calls = 0
         self.lexical_search_calls = 0
@@ -402,6 +404,7 @@ class _FakeIndex:
         )
 
     def flush(self) -> None:
+        self.flush_calls += 1
         if self.fail_next_flush:
             self.fail_next_flush = False
             raise RuntimeError("simulated flush failure")
@@ -1364,29 +1367,39 @@ def test_lexical_candidate_confidence_does_not_decay_with_its_result_rank(
     assert [hit.id for hit in hits] == [exact.id]
 
 
-def test_ask_round_robins_modalities_before_filling_grounding_slots(tmp_path: Path) -> None:
+def test_ask_grounds_in_score_order_with_one_slot_per_present_modality(tmp_path: Path) -> None:
+    """The window is the top of the ranking, plus a floor for any modality it left out.
+
+    Grounding used to pop one hit per modality in turn, capping every modality at
+    `ceil(limit / m)` however the scores fell. On this round's mem-gallery library that rebuilt
+    31 % of a 20-hit window out of lower-ranked hits and cost 1.93 pp of gold recall the ranking
+    had already found, so the guarantee is now a floor rather than a rotation: exactly one image
+    is promoted here, into the last slot, and the nine best text hits keep theirs.
+    """
     models = _FakeModels()
-    with _memory(tmp_path, models) as memory:
+    with _memory(tmp_path / "mixed", models) as memory:
+        texts = tuple(memory.add(f"text evidence {index}") for index in range(15))
         images = tuple(
             memory.add((f"image evidence {index}", Blob(str(index).encode(), "image/png")))
-            for index in range(4)
+            for index in range(5)
         )
-        texts = tuple(memory.add(f"text evidence {index}") for index in range(2))
-        index = _FakeIndex.instances[-1]
-        index.dense_hits_override = tuple(
-            IndexHit(id=record.id, relevance=0.99 - rank / 100, confidence=0.9)
-            for rank, record in enumerate((*images, *texts))
-        )
-        index.lexical_hits_override = ()
+        _rank_all((*texts, *images))
 
-        result = memory.ask("find evidence", limit=4)
+        result = memory.ask("find evidence", limit=10)
 
-    assert [hit.modality for hit in result.hits] == [
-        Modality.IMAGE,
-        Modality.TEXT,
-        Modality.IMAGE,
-        Modality.TEXT,
+    assert [hit.modality for hit in result.hits] == [Modality.TEXT] * 9 + [Modality.IMAGE]
+    assert [hit.id for hit in result.hits] == [
+        *(record.id for record in texts[:9]),
+        images[0].id,
     ]
+
+    with _memory(tmp_path / "text-only", _FakeModels()) as memory:
+        records = tuple(memory.add(f"only text {index}") for index in range(6))
+        _rank_all(records)
+
+        single = memory.ask("find evidence", limit=3)
+
+    assert [hit.id for hit in single.hits] == [record.id for record in records[:3]]
 
 
 def _rank_all(records: Sequence[MemoryRecord]) -> None:
@@ -4174,6 +4187,211 @@ def test_no_hit_ask_routes_media_and_cannot_accept_fabricated_hits(tmp_path: Pat
     assert models.answer_calls[-1][0].modalities == {Modality.TEXT}
 
 
+class _CountingStreamer(_FakeModels):
+    """A streaming answerer that reports how far the caller has pulled."""
+
+    generation_model = "fake-streaming-generation"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.emitted: list[str] = []
+
+    def stream_answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+    ) -> Generator[str, None, tuple[SearchHit, ...]]:
+        del question
+        for part in ("the red ", "toolbox is ", "on the bench"):
+            self.emitted.append(part)
+            yield part
+        return tuple(hits[:1])
+
+
+def test_ask_stream_yields_deltas_then_the_result_ask_would_have_returned(
+    tmp_path: Path,
+) -> None:
+    models = _CountingStreamer()
+    with _memory(tmp_path, models) as memory:
+        memory.add("the red toolbox is on the bench")
+        memory.add("the blue crate is in bay three")
+
+        chunks = list(memory.ask_stream("where is the red toolbox?"))
+        buffered = memory.ask("where is the red toolbox?")
+
+    deltas = [chunk.text for chunk in chunks if chunk.result is None]
+    finals = [chunk.result for chunk in chunks if chunk.result is not None]
+    assert deltas == ["the red ", "toolbox is ", "on the bench"]
+    # Exactly one terminal chunk, and it is the whole `ask()` contract: answer, grounding,
+    # and abstention, not just the joined text.
+    assert len(finals) == 1
+    assert "".join(deltas) == finals[0].answer == buffered.answer
+    assert [hit.id for hit in finals[0].hits] == [hit.id for hit in buffered.hits]
+    assert finals[0].abstained is buffered.abstained is False
+
+
+def test_ask_stream_delivers_each_delta_before_the_next_is_produced(tmp_path: Path) -> None:
+    models = _CountingStreamer()
+    with _memory(tmp_path, models) as memory:
+        memory.add("the red toolbox is on the bench")
+
+        stream = memory.ask_stream("where is the red toolbox?")
+        first = next(stream)
+
+        # The point of the operation: the caller holds text while the model is still producing.
+        assert first.text == "the red "
+        assert models.emitted == ["the red "]
+        stream.close()
+
+
+def test_ask_stream_yields_one_delta_when_the_backend_does_not_stream(tmp_path: Path) -> None:
+    models = _FakeModels()
+    assert not isinstance(models, StreamingGenerationBackend)
+    with _memory(tmp_path, models) as memory:
+        memory.add("the red toolbox is on the bench")
+
+        chunks = list(memory.ask_stream("where is the red toolbox?"))
+
+    deltas = [chunk.text for chunk in chunks if chunk.result is None]
+    finals = [chunk.result for chunk in chunks if chunk.result is not None]
+    assert len(deltas) == 1
+    assert deltas[0] == finals[0].answer
+
+
+def test_ask_stream_reinforces_before_it_hands_over_the_result(tmp_path: Path) -> None:
+    models = _CountingStreamer()
+    with _memory(tmp_path, models) as memory:
+        record = memory.add("the red toolbox is on the bench")
+
+        stream = memory.ask_stream("where is the red toolbox?")
+        next(stream)
+        mid = memory._store.read_memory(record.id)
+        assert mid is not None and mid.access_count == 0
+
+        result = next(chunk.result for chunk in stream if chunk.result is not None)
+        settled = memory._store.read_memory(record.id)
+
+        # Stopping on the terminal chunk is how a result is read, and a generator stays
+        # suspended wherever the caller stops. Nothing may still be open there, or every
+        # ordinary caller would pin an operation and hang `close()`.
+        assert memory._active_operations == 0
+
+    # A caller holding the result holds a settled store, so reading access counts straight
+    # after the answer cannot race the reinforcement the answer caused.
+    assert [hit.id for hit in result.hits] == [record.id]
+    assert settled is not None and settled.access_count == 1
+
+
+def test_ask_stream_validates_before_it_is_iterated(tmp_path: Path) -> None:
+    with _memory(tmp_path) as memory:
+        memory.add("the red toolbox is on the bench")
+
+        # A generator that defers validation to the first pull would report a bad limit from
+        # somewhere other than the call that made the mistake.
+        with pytest.raises(ValidationError, match="limit must be between 1 and 100"):
+            memory.ask_stream("where is it?", limit=0)
+
+
+def test_ask_stream_without_answerer_fails_at_the_call(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with Memory(tmp_path, embedder=models) as memory:
+        memory.add("the red toolbox is on the bench")
+
+        with pytest.raises(ModelError, match="answer backend is not configured") as unconfigured:
+            memory.ask_stream("where is it?")
+        assert unconfigured.value.reason == "backend_not_configured"
+
+
+def test_abandoning_ask_stream_releases_the_operation_it_holds(tmp_path: Path) -> None:
+    models = _CountingStreamer()
+    memory = _memory(tmp_path, models)
+    try:
+        memory.add("the red toolbox is on the bench")
+
+        stream = memory.ask_stream("where is the red toolbox?")
+        next(stream)
+        assert memory._active_operations == 1
+
+        # `close()` waits on open operations, so a stream that pinned one would hang shutdown
+        # rather than fail a test.
+        stream.close()
+        assert memory._active_operations == 0
+    finally:
+        memory.close()
+
+
+def test_abandoning_ask_stream_closes_the_generation_stream_inside_the_operation(
+    tmp_path: Path,
+) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    closed: list[bool] = []
+
+    class ClosingStreamer(_CountingStreamer):
+        def stream_answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+        ) -> Generator[str, None, tuple[SearchHit, ...]]:
+            try:
+                yield from super().stream_answer(question, hits)
+            finally:
+                # Where a real adapter releases the provider's streaming response.
+                closed.append(True)
+            return tuple(hits[:1])
+
+    models = ClosingStreamer()
+    memory = Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        tracer=provider.get_tracer("test"),
+    )
+    try:
+        memory.add("the red toolbox is on the bench")
+        stream = memory.ask_stream("where is the red toolbox?")
+        next(stream)
+        assert closed == []
+        stream.close()
+    finally:
+        memory.close()
+    provider.shutdown()
+
+    assert closed == [True]
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    generation_end = spans["mindbridge.model.generation"].end_time
+    ask_end = spans["mindbridge.ask"].end_time
+    assert generation_end is not None and ask_end is not None
+    # Left to the frame's last reference dropping, the generation stream would close after the
+    # operation that owns it, which loses its model usage and inverts the trace.
+    assert generation_end <= ask_end
+
+
+def test_ask_stream_records_time_to_first_token_on_the_generation_span(tmp_path: Path) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    models = _CountingStreamer()
+    with Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        memory.add("the red toolbox is on the bench")
+        for _chunk in memory.ask_stream("where is the red toolbox?"):
+            pass
+    provider.shutdown()
+
+    generation = next(
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.model.generation"
+    )
+    assert generation.attributes is not None
+    ttft = generation.attributes[MODEL_TTFT]
+    assert isinstance(ttft, int | float) and ttft >= 0
+
+
 def test_ask_returns_only_retrieved_hits_the_answerer_used(tmp_path: Path) -> None:
     class SelectingModels(_FakeModels):
         def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
@@ -4942,6 +5160,60 @@ async def test_async_add_stream_consumes_an_async_iterable(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_async_ask_stream_yields_the_same_chunks_as_the_sync_stream(tmp_path: Path) -> None:
+    models = _CountingStreamer()
+    async with AsyncMemory(tmp_path, embedder=models, answerer=models) as memory:
+        await memory.add("the red toolbox is on the bench")
+
+        deltas: list[str] = []
+        final: AnswerResult | None = None
+        async for chunk in memory.ask_stream("where is the red toolbox?"):
+            if chunk.result is None:
+                deltas.append(chunk.text)
+            else:
+                final = chunk.result
+
+        assert deltas == ["the red ", "toolbox is ", "on the bench"]
+        assert final is not None
+        assert "".join(deltas) == final.answer
+        assert (await memory.ask("where is the red toolbox?")).answer == final.answer
+
+
+@pytest.mark.asyncio
+async def test_async_ask_stream_rejects_arguments_at_the_call_like_the_sync_stream(
+    tmp_path: Path,
+) -> None:
+    models = _CountingStreamer()
+    async with AsyncMemory(tmp_path, embedder=models, answerer=models) as memory:
+        # An `async def` generator would defer this to the first `__anext__`, so the two
+        # facades would report the same bad argument from two different places.
+        with pytest.raises(ValidationError, match="limit must be between 1 and 100"):
+            memory.ask_stream("where is it?", limit=0)
+
+
+@pytest.mark.asyncio
+async def test_async_ask_stream_releases_the_operation_when_the_caller_stops_early(
+    tmp_path: Path,
+) -> None:
+    models = _CountingStreamer()
+    memory = AsyncMemory(tmp_path, embedder=models, answerer=models)
+    try:
+        await memory.add("the red toolbox is on the bench")
+
+        stream = memory.ask_stream("where is the red toolbox?")
+        assert (await anext(stream)).text == "the red "
+        # Closing the async generator has to close the synchronous one behind it, off the
+        # event loop; otherwise `close()` waits on an operation nobody will finish.
+        await stream.aclose()
+
+        # `aclose()` awaits the synchronous close through the worker, so the operation is
+        # already released when it returns; a poll here would hide a leak behind a timeout.
+        assert memory._memory._active_operations == 0
+    finally:
+        await memory.close()
+
+
+@pytest.mark.asyncio
 async def test_async_add_stream_names_a_source_failure(tmp_path: Path) -> None:
     async def contents() -> AsyncIterator[str]:
         yield "red async clip"
@@ -5347,6 +5619,214 @@ def test_a_wearer_voice_binding_one_face_does_not_cascade_to_everybody(tmp_path:
     assert faces["b"] != faces["a"]
     assert voices["a"] != faces["a"]
     assert len(set(voices.values()) | set(faces.values())) == 3
+
+
+def test_scoped_survivor_count_returns_the_hits_the_discarded_hydration_did(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """`count_memories` stands in for a hydration whose only use was `len()`.
+
+    The candidate loop widens on that number, so the arm below re-runs the same searches with
+    the discarded hydration restored and compares whole `SearchHit` values, not just IDs.
+    """
+    near = SpatialContext(frame_id="home-map", anchor=SpatialAnchor.SUBJECT, x=1, y=1)
+    wrong = SpatialContext(frame_id="wrong-map", anchor=SpatialAnchor.SUBJECT, x=1, y=1)
+    searches: tuple[tuple[str, int, RetrievalScope | None], ...] = (
+        ("scoped target", 1, RetrievalScope(near=near, radius_m=0.1)),
+        ("scoped target", 5, RetrievalScope(near=near, radius_m=0.1)),
+        ("distractor 7", 10, None),
+        ("scoped target", 3, RetrievalScope(place_id="home")),
+        ("scoped target", 3, RetrievalScope(valid_at=datetime(2020, 1, 1, tzinfo=timezone.utc))),
+    )
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        distractors = tuple(
+            memory.add(f"distractor {index}", context=ObservationContext(spatial=wrong))
+            for index in range(140)
+        )
+        target = memory.add(
+            "scoped target",
+            context=ObservationContext(spatial=near, place_id="home"),
+        )
+        index = _FakeIndex.instances[-1]
+        aggregate_ids = {
+            document.embedding.memory_id: document.embedding.embedding_id
+            for document in index.documents.values()
+            if document.embedding.object_part == 0
+        }
+        index.dense_hits_override = tuple(
+            IndexHit(id=aggregate_ids[record.id], relevance=0.99)
+            for record in (*distractors[:120], target, *distractors[120:])
+        )
+        index.lexical_hits_override = ()
+
+        counted = tuple(
+            memory.search(query, limit=limit, scope=scope) for query, limit, scope in searches
+        )
+        store = memory._store
+        monkeypatch.setattr(
+            store,
+            "count_memories",
+            lambda memory_ids, **scope: len(store.read_memories(memory_ids, **scope)),
+        )
+        hydrated = tuple(
+            memory.search(query, limit=limit, scope=scope) for query, limit, scope in searches
+        )
+
+    # Non-degenerate: the scoped searches find the one in-frame record among 140 distractors,
+    # and the unscoped one fills its window.
+    assert [hit.id for hit in counted[0]] == [target.id]
+    assert len(counted[2]) == 10
+    assert counted == hydrated
+
+
+def _stream_log(memory: Memory, index: _FakeIndex) -> list[tuple[str, tuple[str, ...]]]:
+    """Record SQLite commits and Zvec mutations on one timeline."""
+    log: list[tuple[str, tuple[str, ...]]] = []
+    write_memories = memory._store.write_memories
+    upsert = index.upsert
+    flush = index.flush
+
+    def logged_write(
+        memories: Iterable[StoredMemory],
+        embeddings: Iterable[StoredEmbedding] = (),
+        *,
+        formation_pending_at: datetime | None = None,
+    ) -> tuple[bool, ...]:
+        batch = tuple(memories)
+        written: tuple[bool, ...] = write_memories(
+            batch, embeddings, formation_pending_at=formation_pending_at
+        )
+        log.append(("commit", tuple(memory.memory_id for memory in batch)))
+        return written
+
+    def logged_upsert(documents: Sequence[IndexDocument]) -> None:
+        upsert(documents)
+        log.append(("upsert", tuple(document.embedding.memory_id for document in documents)))
+
+    def logged_flush() -> None:
+        flush()
+        log.append(("flush", ()))
+
+    memory._store.write_memories = logged_write  # type: ignore[method-assign]
+    index.upsert = logged_upsert  # type: ignore[method-assign]
+    index.flush = logged_flush  # type: ignore[method-assign]
+    return log
+
+
+def test_add_stream_indexes_committed_items_in_bounded_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """One flush per group of 32, and every Zvec change follows its own SQLite commit."""
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        log = _stream_log(memory, index)
+        records = tuple(memory.add_stream(f"streamed clip {position}" for position in range(70)))
+        stream_flushes = index.flush_calls
+        found = memory.search("streamed clip", limit=100)
+
+    committed: set[str] = set()
+    for action, memory_ids in log:
+        if action == "commit":
+            committed.update(memory_ids)
+        elif action == "upsert":
+            # SQLite is authoritative: nothing reaches Zvec that is not already durable.
+            assert set(memory_ids) <= committed
+    assert [action for action, _ids in log].count("commit") == 70
+    # 32, 64, and the six left over when the source ends.
+    assert stream_flushes == 3
+    assert [action for action, _ids in log if action in {"upsert", "flush"}] == [
+        value for _group in range(3) for value in ["upsert", "flush"]
+    ]
+    assert {hit.id for hit in found} == {record.id for record in records}
+
+
+def test_add_stream_flushes_a_slow_source_on_the_time_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The elapsed bound is the one that fires when the source is slower than the group."""
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 0.0)
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        tuple(memory.add_stream(f"slow clip {position}" for position in range(4)))
+        assert index.flush_calls == 4
+
+
+def test_search_during_a_stream_sees_the_committed_items(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A group that has not flushed yet is still retrievable: `search` drains first."""
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        seen = []
+        for record in memory.add_stream(f"midstream clip {position}" for position in range(3)):
+            seen.append(record)
+            if len(seen) == 2:
+                break
+        assert index.flush_calls == 0
+        during = memory.search("midstream clip", limit=10)
+
+    assert {hit.id for hit in during} == {record.id for record in seen}
+
+
+def test_search_inside_a_live_stream_loop_sees_the_item_just_yielded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A consumer that searches between two yields is the case the open group must close for.
+
+    The stream defers its flushes on its own thread; a search on that same thread would otherwise
+    skip the drain and miss every item committed since the last group boundary.
+    """
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        visible: list[tuple[str, set[str]]] = []
+        for record in memory.add_stream(f"live clip {position}" for position in range(3)):
+            hits = memory.search("live clip", limit=10)
+            visible.append((record.id, {hit.id for hit in hits}))
+        flushes = index.flush_calls
+
+    for record_id, ids in visible:
+        assert record_id in ids
+    # Each in-loop search closed the group that held the item just yielded.
+    assert flushes >= 3
+
+
+def test_add_stream_source_failure_leaves_the_committed_prefix_searchable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+
+    def contents() -> Iterator[str]:
+        yield "first failing-stream clip"
+        yield "second failing-stream clip"
+        raise ModelError("the camera went away", reason="unavailable")
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        stream = memory.add_stream(contents())
+        prefix = [next(stream), next(stream)]
+        with pytest.raises(ModelError):
+            next(stream)
+        # The group never closed, so the projection work is still pending and durable.
+        assert index.flush_calls == 0
+        assert memory._store.pending_index_operations() != ()
+        assert [item.id for item in memory.list().items] == [prefix[1].id, prefix[0].id]
+        recovered = memory.search("failing-stream clip", limit=10)
+
+    assert {hit.id for hit in recovered} == {record.id for record in prefix}
 
 
 def test_deleting_a_naming_assertion_takes_the_name_out_of_the_registry_and_the_index(

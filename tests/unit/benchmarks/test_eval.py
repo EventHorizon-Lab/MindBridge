@@ -884,6 +884,19 @@ def test_configured_devices_are_locked_in_physical_order(
     assert eval_module._evaluation_devices(None, config) == ("cuda:1", "cuda:0")
 
 
+def test_text_only_runs_do_not_lock_the_speech_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = MindBridgeConfig.model_validate(
+        {
+            "embedding": {"provider": "openai", "model": "embed", "dimension": 4},
+            "speech": {"provider": "funasr", "device": "cuda:1"},
+        }
+    )
+    monkeypatch.setattr(eval_module, "_physical_cuda_identity", lambda device: device)
+
+    assert eval_module._evaluation_devices(None, config, needs_speech=True) == ("cuda:1",)
+    assert eval_module._evaluation_devices(None, config, needs_speech=False) == ()
+
+
 def test_model_base_url_override_replaces_environment_operation_urls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1254,6 +1267,48 @@ async def test_answer_failure_preserves_independent_retrieval_diagnostics(tmp_pa
     assert sample.evidence[0].source_id == "source-1"
 
 
+def test_a_provider_error_leaves_the_answer_unscored_but_keeps_retrieval(tmp_path: Path) -> None:
+    """A 500 is a missing answer, not a wrong one.
+
+    Scoring the empty prediction gave every provider failure an f1 of 0.0 and deflated the
+    arms unevenly (one run: blind errored 3.4x more than the product arm). The retriever
+    did rank before the generator failed, so its diagnostics stay.
+    """
+    question = EvalQuestion(
+        "q1",
+        ("question",),
+        references=("answer",),
+        metadata={"clue_ids": ("gold",)},
+    )
+    unit = EvalUnit("unit", (MemoryItem("gold", ("the answer",)),), (question,))
+    # Mem-Gallery scores answers deterministically (f1 of "" is 0.0), so this family shows
+    # the difference between "unscored" and "scored zero"; ATM's answer score is judge-only.
+    task = LoadedTask(
+        TaskSpec("mem-gallery", "Mem-Gallery", "fixture.json", "v1", "owner/repo", "0" * 40),
+        tmp_path / "fixture.json",
+        "1" * 64,
+        (unit,),
+    )
+    outcome = eval_module._AnswerOutcome(
+        "",
+        12.0,
+        0.0,
+        (),
+        (),
+        error=ModelError("upstream 500", reason="model_failed", stage="generate"),
+        ranked_source_ids=("gold", "other"),
+    )
+
+    sample = eval_module._sample(
+        task, unit, question, outcome, ingest_failures=0, predict_only=False, log_samples=False
+    )
+
+    assert sample.error_code == "model_error"
+    assert sample.score is None
+    assert sample.metrics and all(name.startswith("retrieval_") for name in sample.metrics)
+    assert "f1" not in sample.metrics
+
+
 def test_run_identifier_cannot_escape_the_default_output_root() -> None:
     with pytest.raises(ArgumentTypeError):
         _run_identifier("../escape")
@@ -1487,6 +1542,44 @@ async def test_ingest_records_the_failed_source_and_stable_error_detail() -> Non
             cause_type="TypeError",
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_ingest_announces_the_first_failure_once_with_its_message(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Memory(_FakeMemory):
+        async def add_many(
+            self, contents: Sequence[object], **_kwargs: object
+        ) -> tuple[object, ...]:
+            del contents
+            raise ModelError(
+                "embedding response was invalid: the model returned 2048 values but the "
+                "configured dimension is 1536",
+                reason="response_invalid",
+                stage="embed",
+            )
+
+        async def add(self, content: object, **_kwargs: object) -> object:
+            del content
+            raise ModelError(
+                "embedding response was invalid: the model returned 2048 values but the "
+                "configured dimension is 1536",
+                reason="response_invalid",
+                stage="embed",
+            )
+
+    monkeypatch.setattr(eval_module, "_first_ingest_failure_announced", False)
+    items = tuple(MemoryItem(f"turn-{index}", ("content",)) for index in range(3))
+
+    count = await _ingest(cast(AsyncMemory, Memory([])), items, batch_size=3)
+
+    captured = capsys.readouterr().err
+    assert count == 3
+    assert captured.count("first ingest failure") == 1
+    assert "turn-0" in captured
+    assert "model_error/response_invalid" in captured
+    assert "returned 2048 values but the configured dimension is 1536" in captured
 
 
 @pytest.mark.asyncio

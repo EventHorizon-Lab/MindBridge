@@ -805,8 +805,10 @@ def test_a_faithful_judge_cannot_bless_an_invented_metric() -> None:
     )
 
 
-def test_retrieval_gold_ids_names_each_family_key() -> None:
+def test_retrieval_gold_ids_come_from_any_labelled_question() -> None:
     assert retrieval_gold_ids("atm-bench", {"evidence_ids": ["a", "b", "a"]}) == ("a", "b")
     assert retrieval_gold_ids("mem-gallery", {"clue_ids": ["c"]}) == ("c",)
-    assert retrieval_gold_ids("mem-gallery", {"evidence_ids": ["c"]}) == ()
-    assert retrieval_gold_ids("locomo-refined", {"evidence_ids": ["c"]}) == ()
+    # LoCoMo and LongMemEval carry exact turn-level labels; they get the ranked query too.
+    assert retrieval_gold_ids("locomo-refined", {"evidence_ids": ["D1:3"]}) == ("D1:3",)
+    assert retrieval_gold_ids("longmemeval-s", {"evidence_ids": ["s1_T0002"]}) == ("s1_T0002",)
+    assert retrieval_gold_ids("memlens-32k", {"question_type": "temporal"}) == ()

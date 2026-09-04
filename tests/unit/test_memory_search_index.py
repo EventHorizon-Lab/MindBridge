@@ -13,8 +13,12 @@ wherever the suite runs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
+import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -74,6 +78,7 @@ class _Describer:
 
     vision_capabilities = frozenset({Modality.IMAGE, Modality.VIDEO})
     vision_model = "fake-describer"
+    vision_space = "fake-describer:caption-v1"
 
     def __init__(self, description: str = "a red bicycle leaning on the fence") -> None:
         self.description = description
@@ -86,6 +91,45 @@ class _Describer:
 
     def close(self) -> None:
         return None
+
+
+class _CountingDescriber:
+    """A describer that never repeats itself, so a reused caption is distinguishable from a call.
+
+    Modelled on the measured endpoint, which returns a different completion for the same image on
+    every request: a fixed-caption fake would pass every cache assertion under a broken cache.
+    """
+
+    vision_capabilities = frozenset({Modality.IMAGE, Modality.VIDEO})
+    vision_model = "fake-describer"
+
+    def __init__(self, prefix: str = "caption") -> None:
+        self.vision_space = "fake-describer:caption-v1"
+        self.calls = 0
+        self.described: list[str] = []
+        self.captions: list[str] = []
+        self._prefix = prefix
+
+    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+        batch = tuple(inputs)
+        self.calls += 1
+        self.described.extend(str(value.assets[0].sha256) for value in batch)
+        fresh = tuple(
+            f"{self._prefix} bicycle number {len(self.captions) + index}"
+            for index in range(len(batch))
+        )
+        self.captions.extend(fresh)
+        return fresh
+
+    def close(self) -> None:
+        return None
+
+
+def _caption(content: str) -> str:
+    """Read back the one derived caption a memory's stored document carries."""
+    marker = "[visual description:"
+    assert marker in content, content
+    return content.split("]\n", 1)[1].strip()
 
 
 class _DirectionalEmbedder:
@@ -325,6 +369,90 @@ def test_a_text_only_embedder_reaches_an_image_through_the_describer(tmp_path: P
         assert other.id not in matched
         # No key carries the image, because this embedder cannot take one.
         assert all(not value.assets for value in embedder.document_inputs)
+
+
+def test_a_second_ingest_of_the_same_image_reuses_the_stored_caption(tmp_path: Path) -> None:
+    """Two ingests of one picture must build the same document and pay once.
+
+    The measured describe endpoint returns a different caption for the same image on every call
+    even at temperature 0 with a fixed seed, so without a store-side cache a re-ingest -- or a
+    re-derive after a crash -- silently rewrites what a memory's full-text document says, and pays
+    for every image again. The caption is keyed by the asset's own SHA-256, so a *different*
+    memory over the same bytes reuses it too.
+    """
+    describer = _CountingDescriber()
+    picture = Blob(b"bicycle-frame", "image/png", "bicycle.png")
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        first = memory.add(("morning note", picture))
+        assert describer.calls == 1
+
+        repeat = memory.add(("afternoon note", picture))
+        second_instance = memory.add(picture)
+
+        assert describer.calls == 1, "the same bytes were described again"
+        first_caption = _caption(memory.get(first.id).content)
+        assert first_caption == describer.captions[0]
+        assert _caption(memory.get(repeat.id).content) == first_caption
+        assert _caption(memory.get(second_instance.id).content) == first_caption
+
+    # A fresh `Memory` over the same data_dir is the crash-and-re-derive case.
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as reopened:
+        after_restart = reopened.add(("evening note", picture))
+        assert describer.calls == 1
+        assert _caption(reopened.get(after_restart.id).content) == first_caption
+
+
+def test_a_describer_in_another_vision_space_does_not_reuse_captions(tmp_path: Path) -> None:
+    """The cache is keyed by recipe, not by model name, so a new prompt re-describes.
+
+    A caption lands inside the searchable document, where a stale one written under a superseded
+    prompt is invisible. Keying on the model alone would serve it forever.
+    """
+    first_describer = _CountingDescriber(prefix="early")
+    second_describer = _CountingDescriber(prefix="revised")
+    second_describer.vision_space = "fake-describer:caption-v2"
+    picture = Blob(b"bicycle-frame", "image/png", "bicycle.png")
+
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=first_describer) as memory:
+        original = memory.add(("morning note", picture))
+        assert _caption(memory.get(original.id).content).startswith("early")
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=second_describer) as memory:
+        revised = memory.add(("afternoon note", picture))
+        assert second_describer.calls == 1, "a new recipe must not read the old space"
+        assert _caption(memory.get(revised.id).content).startswith("revised")
+        # The first space keeps its own caption rather than being evicted by the second.
+        assert _caption(memory.get(original.id).content).startswith("early")
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=first_describer) as memory:
+        back = memory.add(("evening note", picture))
+        assert first_describer.calls == 1
+        assert _caption(memory.get(back.id).content).startswith("early")
+
+
+def test_two_memories_over_one_picture_cost_one_description(tmp_path: Path) -> None:
+    """Derive-early: one describe per asset *content* within a write, not per memory."""
+    describer = _CountingDescriber()
+    picture = Blob(b"bicycle-frame", "image/png", "bicycle.png")
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        records = memory.add_many([("morning note", picture), ("afternoon note", picture)])
+
+        assert describer.calls == 1
+        assert len(describer.described) == 1, "one visual reached the model, not two"
+        captions = {_caption(memory.get(record.id).content) for record in records}
+        assert captions == {describer.captions[0]}
+
+
+def test_reindexing_does_not_re_describe_stored_visuals(tmp_path: Path) -> None:
+    """Zvec is rebuildable from SQLite alone, so a rebuild must not spend description tokens."""
+    describer = _CountingDescriber()
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        record = memory.add(("morning note", Blob(b"bicycle-frame", "image/png", "bicycle.png")))
+        caption = _caption(memory.get(record.id).content)
+        assert describer.calls == 1
+
+        assert memory.reindex() == 1
+
+        assert describer.calls == 1
+        assert _caption(memory.get(record.id).content) == caption
 
 
 def test_decay_demotes_an_old_memory_without_evicting_it(tmp_path: Path) -> None:
@@ -570,3 +698,171 @@ def test_a_chinese_question_can_reach_full_lexical_coverage(tmp_path: Path) -> N
         assert coverage[answer.id] == pytest.approx(1.0)
         assert coverage[shuffled.id] < _LEXICAL_FULL_COVERAGE
         assert [hit.content for hit in traced.hits] == [_ANSWER, _DECOY, _SHUFFLED]
+
+
+def test_temporal_factor_boosts_overlap_and_never_penalises() -> None:
+    """A memory outside the asked range keeps its relevance; only an overlapping one is lifted.
+
+    The penalty this replaces pushed a perfectly relevant memory that happened at the wrong time
+    under merely well-timed ones and, inside the gate, could delete it; replay showed the penalty
+    recovered no gold on 810 paired questions while the boost alone won or tied on all of them.
+    """
+    from mindbridge.memory import _RANK_CEILING, _temporal_factor
+
+    start = datetime(2024, 3, 1, tzinfo=timezone.utc)
+    until = datetime(2024, 4, 1, tzinfo=timezone.utc)
+    inside = datetime(2024, 3, 15, tzinfo=timezone.utc)
+    far_before = datetime(2019, 1, 1, tzinfo=timezone.utc)
+
+    assert _temporal_factor(inside, None, (start, until)) == _RANK_CEILING
+    assert _temporal_factor(far_before, None, (start, until)) == 1.0
+    assert _temporal_factor(None, None, (start, until)) == 1.0
+
+
+class _HashedDense:
+    """Places each text at its own angle in the first quadrant, so ranks are not all ties."""
+
+    embedding_model = "fake-hashed"
+    embedding_space = "fake-hashed:2:test"
+    embedding_dimension = 2
+    embedding_capabilities = frozenset({Modality.TEXT})
+
+    def embed(
+        self,
+        inputs: Sequence[ModelInput],
+        task: EmbedTask = EmbedTask.DOCUMENT,
+    ) -> tuple[tuple[float, ...], ...]:
+        del task
+        vectors = []
+        for value in inputs:
+            digest = hashlib.blake2b(value.text.encode(), digest_size=2).digest()
+            angle = int.from_bytes(digest, "big") / 65536.0 * (math.pi / 3.0)
+            vectors.append((math.cos(angle), math.sin(angle)))
+        return tuple(vectors)
+
+    def close(self) -> None:
+        return None
+
+
+def test_a_narrow_limit_returns_the_prefix_of_a_wide_one_with_the_same_scores(
+    tmp_path: Path,
+) -> None:
+    """The requested `limit` selects results; it must not change what they are worth.
+
+    Both mechanisms that used to break this are in play here. Every index route was truncated
+    to `max(_RERANK_CANDIDATES, limit * 3)`, so a memory's dense relevance -- the maximum over
+    the routes that reached it -- depended on the depth; and `_lexical_relevance` counted its
+    document frequencies over the candidate pool that depth produced, so the rerank bonus moved
+    with `limit` even for a memory both runs found. With 200 records, limit 5 read 100 documents
+    per route and limit 100 read 300.
+    """
+    with Memory(tmp_path, embedder=_HashedDense()) as memory:
+        memory.add_many(
+            (
+                *(f"lantern harbour drift {index:03d}" for index in range(197)),
+                "lantern harbour ledger alpha",
+                "lantern harbour ledger beta",
+                "harbour ledger only",
+            )
+        )
+
+        narrow = memory.search("lantern harbour ledger", limit=5)
+        wide = memory.search("lantern harbour ledger", limit=100)
+
+    assert len(narrow) == 5
+    assert len(wide) == 100
+    assert [hit.id for hit in narrow] == [hit.id for hit in wide[:5]]
+    assert [hit.score for hit in narrow] == [hit.score for hit in wide[:5]]
+
+
+_TRACE_ORDER_PROBE = '''
+import hashlib
+import json
+import math
+import sys
+from pathlib import Path
+
+from mindbridge import Memory
+from mindbridge.models.base import EmbedTask, ModelInput
+from mindbridge.types import Modality
+
+
+class _Sha256Embedder:
+    """Deterministic across processes: the vector is a hash of the text, not of an object id."""
+
+    embedding_model = "fake-sha256"
+    embedding_space = "fake-sha256:8:test"
+    embedding_dimension = 8
+    embedding_capabilities = frozenset({Modality.TEXT})
+
+    def embed(self, inputs, task=EmbedTask.DOCUMENT):
+        del task
+        vectors = []
+        for value in inputs:
+            digest = hashlib.sha256(value.text.encode("utf-8")).digest()
+            raw = [byte / 255.0 - 0.5 for byte in digest[:8]]
+            norm = math.sqrt(sum(component * component for component in raw)) or 1.0
+            vectors.append(tuple(component / norm for component in raw))
+        return tuple(vectors)
+
+    def close(self):
+        return None
+
+
+directory = Path(sys.argv[1])
+query = "which note mentions the harbour wall"
+fresh = not directory.exists()
+with Memory(directory, embedder=_Sha256Embedder()) as memory:
+    if fresh:
+        memory.add_many(
+            [
+                f"note {index} about the harbour wall, ledger {index} and roadmap {index}"
+                for index in range(150)
+            ]
+        )
+    traced = memory.search_with_trace(query, limit=20)
+print(
+    json.dumps(
+        {
+            "candidates": [candidate.memory_id for candidate in traced.trace.candidates],
+            "hits": [hit.id for hit in traced.hits],
+        }
+    )
+)
+'''
+
+
+def test_the_candidate_trace_order_does_not_depend_on_the_process_hash_seed(
+    tmp_path: Path,
+) -> None:
+    """`search_with_trace`'s candidate order must be reproducible across processes.
+
+    A trace is a debugging surface and an arm-comparison input, so two runs of one query on one
+    library must print it in one order. Hydration used to be ordered through `lexical_matches`, a
+    `set` of memory ids, whose iteration order follows the interpreter's string hash seed.
+
+    This test is the reason that is stated narrowly. It was written to reproduce a candidate-dump
+    difference observed between two replays, and it **passes on the pre-fix code**: `read_memories`
+    does not order by its argument, so the ranked trace never followed the set, and the observed
+    difference turned out to be two genuinely different ranking rules rather than a seed effect.
+    What remains is the general guarantee, which is what is worth pinning: the corpus deliberately
+    exceeds the route depth so the union of the two routes is larger than either, which is the
+    only situation in which any set-derived ordering could reach the trace at all.
+    """
+    script = tmp_path / "probe.py"
+    script.write_text(_TRACE_ORDER_PROBE, encoding="utf-8")
+    library = tmp_path / "library"
+    runs = []
+    for seed in ("0", "1"):
+        completed = subprocess.run(
+            [sys.executable, str(script), str(library)],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**os.environ, "PYTHONHASHSEED": seed},
+        )
+        runs.append(json.loads(completed.stdout))
+
+    assert len(runs[0]["candidates"]) > 100, "the corpus must exceed the route depth"
+    assert runs[0]["hits"] == runs[1]["hits"], "the ranking must not depend on the hash seed"
+    assert runs[0]["candidates"] == runs[1]["candidates"]
