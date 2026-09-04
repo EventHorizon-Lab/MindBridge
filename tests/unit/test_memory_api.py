@@ -5805,6 +5805,45 @@ def test_a_stream_that_ended_stops_deferring_even_if_another_outlives_it(
     assert after_both == [1]
 
 
+def test_a_stream_pumped_across_threads_stops_deferring_on_the_thread_that_opened_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stream clears deferral on every thread it ran on, not just the one that ended it.
+
+    `add_stream` is a generator, so its body runs on whichever thread calls `next`. A consumer
+    that hands the iterator between workers -- what an executor-backed pump does -- opened the
+    group on one thread and closed it on another, so the exit cleared the finishing thread and
+    left the opener deferring forever: every later `add` or `delete` on that worker returned
+    without flushing the index and its rows stayed durable but unsearchable.
+    """
+    monkeypatch.setattr("mindbridge.memory._STREAM_GROUP_SECONDS", 1e9)
+    exhausted = object()
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        index = _FakeIndex.instances[-1]
+        stream = memory.add_stream(("clip the opener pumps", "clip the finisher pumps"))
+
+        def add_and_count_flushes() -> int:
+            before = index.flush_calls
+            memory.add("a note added on the thread that opened the stream")
+            return index.flush_calls - before
+
+        with (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="opener") as opener,
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="finisher") as finisher,
+        ):
+            # The opener runs the body up to the first yield, which is where the group opens.
+            assert opener.submit(next, stream, exhausted).result() is not exhausted
+            # Every remaining step, including the one that runs the exit, lands on the other
+            # worker.
+            while finisher.submit(next, stream, exhausted).result() is not exhausted:
+                pass
+            flushes = opener.submit(add_and_count_flushes).result()
+
+    assert flushes == 1
+
+
 def test_search_during_a_stream_sees_the_committed_items(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
