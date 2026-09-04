@@ -23,6 +23,8 @@ from mindbridge import (
     ObservationContext,
     RetrievalScope,
     SearchHit,
+    SpatialAnchor,
+    SpatialContext,
 )
 from mindbridge._telemetry import FORMATION_PROPOSALS_REFUSED
 
@@ -554,4 +556,63 @@ def test_refused_proposals_are_totalled_over_the_whole_settle(tmp_path: Path) ->
         if span.name == "mindbridge.settle"
         and span.attributes is not None
         and FORMATION_PROPOSALS_REFUSED in span.attributes
+    ] == [1]
+
+
+def test_a_pose_in_another_frame_is_refused_on_the_formation_path(tmp_path: Path) -> None:
+    """The spatial rule refuses like the affect rule: the proposal is lost, the write is not.
+
+    A pose the kernel cannot place -- another coordinate frame, another anchor, or a source that
+    was never localized -- would otherwise answer a metric scope with a position nothing observed.
+    """
+
+    class MisplacedPoseFormer(PreferenceFormer):
+        def form(
+            self, inputs: Sequence[FormationInput]
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            return tuple(
+                (
+                    FormationProposal(
+                        kind=MemoryKind.EVENT,
+                        content="The user poured tea in the study",
+                        subject="user",
+                        spatial=SpatialContext(
+                            frame_id="study",
+                            anchor=SpatialAnchor.OBSERVER,
+                            x=1.0,
+                            y=2.0,
+                        ),
+                        confidence=0.8,
+                    ),
+                )
+                for _value in inputs
+            )
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=MisplacedPoseFormer(),
+        minimum_relevance=0,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        source = memory.add(
+            "I poured tea",
+            context=ObservationContext(
+                spatial=SpatialContext(
+                    frame_id="kitchen", anchor=SpatialAnchor.OBSERVER, x=0.0, y=0.0
+                )
+            ),
+        )
+
+        assert memory.get(source.id).content == "I poured tea"
+        assert _formed(memory, source.id) == []
+        assert memory.pending_captures(memory_ids=(source.id,)) == ()
+
+    assert [
+        span.attributes[FORMATION_PROPOSALS_REFUSED]
+        for span in exporter.get_finished_spans()
+        if span.attributes is not None and FORMATION_PROPOSALS_REFUSED in span.attributes
     ] == [1]

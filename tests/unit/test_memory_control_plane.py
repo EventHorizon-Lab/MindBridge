@@ -8,7 +8,7 @@ can reverse it.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -165,14 +165,32 @@ def _memory(tmp_path: Path, consolidator: object | None = None, **kwargs: object
     )
 
 
-def _observations(memory: Memory, *contents: str) -> tuple[MemoryRecord, ...]:
+def _observations(
+    memory: Memory,
+    *contents: str,
+    places: Sequence[str | None] | None = None,
+    tags: Sequence[Mapping[str, object] | None] | None = None,
+) -> tuple[MemoryRecord, ...]:
+    """Add one observation per content, optionally placing and tagging them pairwise."""
     return tuple(
         memory.add(
             content,
             occurred_at=OCCURRED + timedelta(minutes=index),
-            context=ObservationContext(basis=EvidenceBasis.OBSERVATION, source_id=f"cam-{index}"),
+            context=ObservationContext(
+                basis=EvidenceBasis.OBSERVATION,
+                source_id=f"cam-{index}",
+                place_id=place,
+            ),
+            metadata=tag,
         )
-        for index, content in enumerate(contents)
+        for index, (content, place, tag) in enumerate(
+            zip(
+                contents,
+                places or (None,) * len(contents),
+                tags or (None,) * len(contents),
+                strict=True,
+            )
+        )
     )
 
 
@@ -1841,18 +1859,11 @@ def _consolidate_trait(
     *sources: tuple[str | None, str],
 ) -> MemoryRecord:
     """Consolidate one trait out of one observation per `(place_id, household tag)` pair."""
-    observed = tuple(
-        memory.add(
-            f"Ana waited calmly, time {index}",
-            occurred_at=OCCURRED + timedelta(minutes=index),
-            context=ObservationContext(
-                basis=EvidenceBasis.OBSERVATION,
-                source_id=f"cam-{index}",
-                place_id=place_id,
-            ),
-            metadata={"household": household},
-        )
-        for index, (place_id, household) in enumerate(sources)
+    observed = _observations(
+        memory,
+        *(f"Ana waited calmly, time {index}" for index in range(len(sources))),
+        places=[place_id for place_id, _household in sources],
+        tags=[{"household": household} for _place_id, household in sources],
     )
     evidence_ids = tuple(record.id for record in observed)
     consolidator._scripts.append(

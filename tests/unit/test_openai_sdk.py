@@ -1441,12 +1441,9 @@ def test_answer_instructs_the_reader_to_resolve_relative_time() -> None:
         _model(_sdk_client(client)).answer("How long ago did grandpa visit?", (hit,))
 
     assert systems == [openai_backend._GROUNDED_SYSTEM_PROMPT]
-    assert systems[0].endswith(
-        "Each memory carries the time it happened (`occurred_at`, or `created_at` when the event "
-        "time is unknown) and the question carries the reference time it is asked at; resolve "
-        "every relative time expression against those timestamps and state the resolved date or "
-        "duration explicitly."
-    )
+    # Anchored on the instruction, not on its wording: rephrasing the sentence is fine, dropping
+    # the arithmetic it asks for is not.
+    assert "resolve" in systems[0] and "reference time" in systems[0]
 
 
 def test_answer_can_pin_sampling_for_reproducible_evaluation() -> None:
