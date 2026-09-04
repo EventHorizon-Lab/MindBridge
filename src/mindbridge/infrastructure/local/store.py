@@ -21,6 +21,7 @@ from typing import Literal, NoReturn
 from mindbridge.infrastructure.local._lock import DataDirectoryLock
 from mindbridge.models.base import FaceAnalysis, SpeechAnalysis
 from mindbridge.types import (
+    ConsentState,
     EvidenceBasis,
     FaceObservation,
     IdentityErasure,
@@ -34,8 +35,22 @@ from mindbridge.types import (
     SpeakerSegment,
 )
 
-_SCHEMA_VERSION = 13
+_SCHEMA_VERSION = 14
 _SQLITE_PARAMETER_BATCH = 900
+# The predicate that makes one identity-bound STATE assertion a consent statement. Shared with
+# `mindbridge.memory`, which writes those assertions, so the writer and the projection can never
+# disagree about which records they are.
+CONSENT_PREDICATE = "consent"
+# The one basis a consent statement can carry, hardcoded by `_consent_proposal`. Both consent
+# reads below filter on it as well as on the predicate, so a row reaching this table by any
+# other route -- a future writer, a hand-edited database -- cannot be read as a person's own
+# statement. Defence in depth: `Memory._bound_identity` already reserves the predicate, so no
+# model-originated claim is bound to an identity in the first place.
+_CONSENT_BASIS = EvidenceBasis.USER_STATEMENT.value
+# Consent states under which the kernel stops enrolling new biometric exemplars for a person.
+# Recognition against exemplars already held is unaffected: erasing what is held is
+# `forget_identity`, and answering a question about a photo is not new processing of a person.
+_RESTRAINING_CONSENT = frozenset({ConsentState.WITHHELD.value, ConsentState.WITHDRAWN.value})
 # Kinds whose claims can contradict inside one lineage. This must stay the set the context
 # compiler reports conflicts for; `tests/unit/test_memory_control_plane.py` asserts they agree,
 # because the compiler is a product module and this is infrastructure.
@@ -382,7 +397,9 @@ CREATE TABLE IF NOT EXISTS memory_operations (
     operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
     operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
     intent TEXT NOT NULL CHECK (
-        intent IN ('reinforce', 'consolidate', 'correct', 'forget', 'identify', 'merge')
+        intent IN (
+            'reinforce', 'consolidate', 'correct', 'forget', 'identify', 'merge', 'consent'
+        )
     ),
     trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
     model_id TEXT,
@@ -535,6 +552,51 @@ _OPERATION_OUTCOME_REBUILD_DDL = (
     FROM memory_operations_v12
     """,
     "DROP TABLE memory_operations_v12",
+    """
+    CREATE UNIQUE INDEX memory_operations_active_key_idx
+        ON memory_operations (operation_key)
+        WHERE rolled_back_at IS NULL
+    """,
+)
+
+# v14 admits the `consent` intent. A consent statement is an identity-bound assertion the host
+# records for its subject, and the log row is what makes it auditable and reversible, so the
+# vocabulary the CHECK enforces has to name it.
+_OPERATION_CONSENT_REBUILD_DDL = (
+    "ALTER TABLE memory_operations RENAME TO memory_operations_v13",
+    "DROP INDEX IF EXISTS memory_operations_active_key_idx",
+    """
+    CREATE TABLE memory_operations (
+        operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
+        intent TEXT NOT NULL CHECK (
+            intent IN (
+                'reinforce', 'consolidate', 'correct', 'forget', 'identify', 'merge', 'consent'
+            )
+        ),
+        trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
+        model_id TEXT,
+        recipe TEXT,
+        operation_json TEXT NOT NULL,
+        effects_json TEXT NOT NULL,
+        applied_at TEXT NOT NULL,
+        rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at),
+        outcome TEXT CHECK (outcome IS NULL OR outcome IN ('confirmed', 'refuted')),
+        outcome_note TEXT CHECK (outcome_note IS NULL OR length(trim(outcome_note)) > 0),
+        CHECK (outcome IS NOT NULL OR outcome_note IS NULL)
+    )
+    """,
+    """
+    INSERT INTO memory_operations (
+        operation_id, operation_key, intent, trigger, model_id, recipe,
+        operation_json, effects_json, applied_at, rolled_back_at, outcome, outcome_note
+    )
+    SELECT
+        operation_id, operation_key, intent, trigger, model_id, recipe,
+        operation_json, effects_json, applied_at, rolled_back_at, outcome, outcome_note
+    FROM memory_operations_v13
+    """,
+    "DROP TABLE memory_operations_v13",
     """
     CREATE UNIQUE INDEX memory_operations_active_key_idx
         ON memory_operations (operation_key)
@@ -1331,7 +1393,11 @@ class LocalStore:
         return True
 
     def complete_captures(self, memory_ids: Sequence[str]) -> int:
-        """Remove captures from the queue after every deferred stage succeeded."""
+        """Remove captures from the queue after every deferred stage succeeded.
+
+        Retention also uses it, to abandon captures whose repeated failures have aged out: the
+        queue row is the promise to keep retrying, and that is all it drops.
+        """
         selected = tuple(dict.fromkeys(memory_ids))
         for memory_id in selected:
             _require_identifier(memory_id, "memory_id")
@@ -1998,8 +2064,13 @@ class LocalStore:
         limit: int = 100,
         operation_id: int | None = None,
         operation_key: str | None = None,
+        before_operation_id: int | None = None,
     ) -> tuple[StoredOperation, ...]:
-        """Return logged operations newest first, or the one matching an id or active key."""
+        """Return logged operations newest first, or the one matching an id or active key.
+
+        `before_operation_id` continues a newest-first scan, which is what lets a caller that
+        must see the whole log -- a data-subject export -- page it instead of truncating it.
+        """
         if not 1 <= limit <= 1_000:
             raise ValueError("limit must be between 1 and 1000")
         where = ""
@@ -2011,6 +2082,9 @@ class LocalStore:
             _require_identifier(operation_key, "operation_key")
             where = "WHERE operation_key = ? AND rolled_back_at IS NULL"
             parameters = (operation_key,)
+        elif before_operation_id is not None:
+            where = "WHERE operation_id < ?"
+            parameters = (before_operation_id,)
         with self._connection() as connection:
             rows = connection.execute(
                 f"""
@@ -3229,6 +3303,46 @@ class LocalStore:
             evidence_ids=evidence_ids,
         )
 
+    def identity_consent(self, identity_id: str) -> ConsentState | None:
+        """Return the consent state one identity's standing assertion projects, or None.
+
+        `None` is "nobody has recorded a statement", which is not consent and not a refusal.
+        A merged alias resolves to its canonical identity, like every other identity read.
+        """
+        _require_identifier(identity_id, "identity_id")
+        with self._connection() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            if resolved_id is None:
+                return None
+            value = _current_consent_state(connection, resolved_id)
+        return None if value is None else ConsentState(value)
+
+    def restrained_identities(self) -> frozenset[str]:
+        """Return every identity whose standing consent withholds or withdraws processing."""
+        with self._connection() as connection:
+            return _restrained_identities(connection)
+
+    def identity_assertion_memory_ids(self, identity_id: str) -> tuple[str, ...]:
+        """Return every record bound to one identity, standing or superseded.
+
+        This is the assertion half of what is held about a person -- their names and their
+        consent statements, every version of each -- which `identity_memory_ids` does not cover
+        because those records observe nobody.
+        """
+        _require_identifier(identity_id, "identity_id")
+        with self._connection() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            if resolved_id is None:
+                return ()
+            rows = connection.execute(
+                """
+                SELECT memory_id FROM memory_semantics
+                WHERE identity_id = ? ORDER BY memory_id
+                """,
+                (resolved_id,),
+            ).fetchall()
+        return tuple(_row_text(row, "memory_id") for row in rows)
+
     def record_identity_link_evidence(self, voice_id: str, face_id: str, asset_id: str) -> int:
         """Record one voice-and-face co-occurrence and count the pair's distinct assets.
 
@@ -3876,6 +3990,58 @@ class LocalStore:
             ).fetchall()
         return tuple(_asset_from_row(row) for row in rows)
 
+    def asset_memory_ids(self, asset_ids: Sequence[str]) -> tuple[str, ...]:
+        """Return every memory that references any of these assets, oldest memory first."""
+        selected = tuple(dict.fromkeys(asset_ids))
+        for asset_id in selected:
+            _sha256(asset_id)
+        if not selected:
+            return ()
+        found: list[str] = []
+        with self._connection() as connection:
+            for offset in range(0, len(selected), _SQLITE_PARAMETER_BATCH):
+                batch = selected[offset : offset + _SQLITE_PARAMETER_BATCH]
+                placeholders = ", ".join("?" for _asset_id in batch)
+                found.extend(
+                    _row_text(row, "memory_id")
+                    for row in connection.execute(
+                        f"""
+                        SELECT DISTINCT memory_id FROM memory_assets
+                        WHERE asset_id IN ({placeholders})
+                        ORDER BY memory_id
+                        """,
+                        batch,
+                    ).fetchall()
+                )
+        return tuple(dict.fromkeys(found))
+
+    def forgotten_memory_ids(
+        self,
+        *,
+        forgotten_before: datetime,
+        limit: int = 100,
+    ) -> tuple[str, ...]:
+        """Return memories cognitively forgotten before a moment, oldest forgetting first.
+
+        The read half of retention over `forget()`: cognitive forgetting is reversible by
+        design, so something has to decide when it becomes final, and only a declared policy or
+        a person may.
+        """
+        _require_aware(forgotten_before, "forgotten_before")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT memory_id FROM memory_records
+                WHERE forgotten_at IS NOT NULL AND forgotten_at < ?
+                ORDER BY forgotten_at, memory_id
+                LIMIT ?
+                """,
+                (_datetime_text(forgotten_before), limit),
+            ).fetchall()
+        return tuple(_row_text(row, "memory_id") for row in rows)
+
     def asset_storage_bytes(self) -> int:
         """Return the total size of every stored media asset descriptor."""
         with self._connection() as connection:
@@ -4200,6 +4366,9 @@ class LocalStore:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version == 12:
                 _migrate_v12(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 13:
+                _migrate_v13(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
@@ -4716,6 +4885,11 @@ class LocalStore:
         known_identities = set(existing)
         if preferred_exists and preferred_identity is not None:
             known_identities.add(preferred_identity)
+        # Consent restrains enrolment, not recognition. A person who withheld or withdrew it
+        # still matches the exemplars already held -- destroying those is `forget_identity` --
+        # but this observation adds nothing to their template, so the bank stops growing from
+        # the moment they said so.
+        restrained = _restrained_identities(connection)
         claimed: dict[int | None, set[str]] = {}
         matches: dict[str, tuple[str, float | None]] = {}
         changes: dict[str, _IdentityChange] = {}
@@ -4743,6 +4917,15 @@ class LocalStore:
                 identity_id, score = preferred_identity, None
             else:
                 identity_id, score = f"identity_{uuid.uuid4().hex}", None
+            if identity_id in restrained:
+                # Recognized, reported, and nothing written: no exemplar, no `identities` row
+                # update, and so nothing for a rollback to undo either.
+                matches[label] = (
+                    identity_id,
+                    None if score is None else max(0.0, min(1.0, score)),
+                )
+                group_claims.add(identity_id)
+                continue
             if identity_id not in changes:
                 previous = (
                     None
@@ -5204,6 +5387,28 @@ def _migrate_v12(connection: sqlite3.Connection) -> None:
             for statement in _OPERATION_OUTCOME_REBUILD_DDL:
                 connection.execute(statement)
         connection.execute("PRAGMA user_version = 13")
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def _migrate_v13(connection: sqlite3.Connection) -> None:
+    """Admit the `consent` intent, so a data subject's own statement can be logged.
+
+    A store created by a v12 development build ran `_CONTROL_SCHEMA`, which now declares the v14
+    vocabulary outright, so the rebuild is skipped when the constraint already names `consent`.
+    """
+    try:
+        declared = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memory_operations'"
+        ).fetchone()
+        connection.execute("BEGIN IMMEDIATE")
+        if declared is None or "'consent'" not in str(declared[0]):
+            for statement in _OPERATION_CONSENT_REBUILD_DDL:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 14")
         connection.commit()
     except BaseException:
         if connection.in_transaction:
@@ -5761,6 +5966,58 @@ def _current_naming_assertion(
         (identity_id, MemoryKind.ENTITY.value, *dropped),
     ).fetchone()
     return row
+
+
+def _current_consent_state(connection: sqlite3.Connection, identity_id: str) -> str | None:
+    """Return the consent state one identity's standing assertion projects, or None.
+
+    Consent is a bound STATE assertion rather than a bound ENTITY one, which is what keeps it
+    out of `_current_naming_assertion` above: the two live in separate lineages, so recording
+    consent never displaces a name and renaming somebody never disturbs their consent.
+    """
+    row: sqlite3.Row | None = connection.execute(
+        """
+        SELECT s.value
+        FROM memory_semantics AS s
+        JOIN memory_versions AS v ON v.memory_id = s.memory_id
+        JOIN memory_records AS r ON r.memory_id = s.memory_id
+        WHERE s.identity_id = ? AND s.kind = ? AND s.predicate = ? AND s.basis = ?
+          AND v.retired_at IS NULL AND v.visible = 1 AND r.forgotten_at IS NULL
+        ORDER BY v.recorded_at DESC, s.memory_id DESC
+        LIMIT 1
+        """,
+        (identity_id, MemoryKind.STATE.value, CONSENT_PREDICATE, _CONSENT_BASIS),
+    ).fetchone()
+    return None if row is None else _optional_row_text(row, "value")
+
+
+def _restrained_identities(connection: sqlite3.Connection) -> frozenset[str]:
+    """Return every identity whose standing consent assertion restrains the kernel.
+
+    Withheld and withdrawn restrain identically; the distinction between them is audit history,
+    not policy. Read fresh on each recognition rather than cached, because a person withdrawing
+    consent has to take effect on the next observation, not on the next process start.
+    """
+    # Ordered oldest-first per identity so the newest standing assertion is the one that
+    # survives the dict build, which is the same rule `_current_naming_assertion` applies.
+    standing: dict[str, str | None] = {
+        _row_text(row, "identity_id"): _optional_row_text(row, "value")
+        for row in connection.execute(
+            """
+            SELECT s.identity_id, s.value
+            FROM memory_semantics AS s
+            JOIN memory_versions AS v ON v.memory_id = s.memory_id
+            JOIN memory_records AS r ON r.memory_id = s.memory_id
+            WHERE s.kind = ? AND s.predicate = ? AND s.basis = ? AND s.identity_id IS NOT NULL
+              AND v.retired_at IS NULL AND v.visible = 1 AND r.forgotten_at IS NULL
+            ORDER BY s.identity_id, v.recorded_at, s.memory_id
+            """,
+            (MemoryKind.STATE.value, CONSENT_PREDICATE, _CONSENT_BASIS),
+        ).fetchall()
+    }
+    return frozenset(
+        identity_id for identity_id, value in standing.items() if value in _RESTRAINING_CONSENT
+    )
 
 
 def _visible_naming_assertions(connection: sqlite3.Connection) -> tuple[sqlite3.Row, ...]:

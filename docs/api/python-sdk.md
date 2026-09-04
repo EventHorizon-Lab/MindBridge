@@ -357,9 +357,22 @@ faces(memory_id: str) -> tuple[FaceObservation, ...]
 register_speaker(speaker_id: str, name: str, *, relationship: str | None = None) -> None
 register_identity(identity_id: str, name: str, *, relationship: str | None = None) -> None
 identity(identity_id: str) -> IdentityProfile | None
+record_consent(
+    identity_id: str,
+    state: ConsentState,
+    *,
+    note: str | None = None,
+) -> MemoryOperationRecord | None
+consent(identity_id: str) -> ConsentState | None
 forget_identity(identity_id: str) -> IdentityErasure
 unlink_identity(alias_id: str) -> str | None
 reinforce(memory_ids: Sequence[str]) -> int
+export(
+    *,
+    identity_id: str | None = None,
+    memory_ids: Sequence[str] | None = None,
+) -> ExportBundle
+apply_retention(*, dry_run: bool = False) -> RetentionReport
 list(*, limit: int = 100, cursor: str | None = None) -> Page
 delete(memory_id: str) -> bool
 reindex() -> int
@@ -390,10 +403,86 @@ and face that keep co-occurring are corroborated and merged again. Restoring a v
 the indexed transcript projection in the same commit, so search stops answering to the name the
 reversed merge had attributed to it. `reinforce`
 records explicit positive feedback and returns the number of existing distinct memories updated.
+`export` and `apply_retention` are the two remaining data-subject rights and have
+[their own section](#data-subject-rights) below.
 `list` uses an opaque keyset cursor. `delete` is idempotent and reports whether the record existed;
 what it removes is spelled out below. `reindex` rebuilds Zvec from authoritative SQLite embeddings
 without calling the embedder and returns the number of memories rebuilt. `optimize` merges and
 flushes staged index vectors. Repeated `close()` calls are harmless.
+
+#### Consent
+
+`record_consent` records what one recognized person said about being processed as a recognized
+person: `ConsentState.GRANTED`, `WITHHELD`, or `WITHDRAWN`, with an optional `note` in their own
+words. It raises `IdentityNotFoundError` for an unknown ID and returns `None` when the same
+statement already stands.
+
+A consent statement is an assertion in the same family as a name: an identity-bound, versioned
+`STATE` claim recorded with `EvidenceBasis.USER_STATEMENT`, so it is a searchable record, it
+appears in `operations()` as a `CONSENT` row carrying the claim, and `rollback()` of that row
+restores whatever was recorded before it. `consent` reads back the state the standing assertion
+projects, and `None` there means nobody has recorded a statement -- which is neither consent nor a
+refusal.
+
+Only a host may record one. A `ConsentBackend` does not exist and a `ConsolidationBackend` that
+proposes a `CONSENT` operation is refused as `unauthorized`, exactly as a proposed `MERGE` is: a
+model that could infer consent could manufacture permission to process a person. The control plane
+also may not `CORRECT`, `FORGET`, or `REINFORCE` a consent record; those are refused as
+`consent_assertion`.
+
+`consent` is therefore a **reserved predicate**. Ordinary formation does not pass through the
+control plane, so a `FormationBackend` or a consolidation proposal returning
+`FormationProposal(kind=STATE, predicate="consent", ...)` would otherwise have written the very
+row `consent()` reads. Such a proposal is never bound to an identity: it is stored as an ordinary
+`STATE` about its subject with `context.identity_id` unset, so it is searchable and auditable as
+what it is -- a model's inference -- and restrains nothing. Only `record_consent()` writes a bound
+consent assertion, and both consent reads additionally require `USER_STATEMENT` basis.
+
+`WITHHELD` and `WITHDRAWN` restrain the kernel identically from the next observation on. The
+difference between them is audit history, not policy:
+
+| Restrained | Untouched |
+| --- | --- |
+| `faces()`, `speech()`, and `ask(link_identities=True)` stop adding new face and voice exemplars to this person's template | Recognition against the exemplars already held, so an existing memory still answers questions about them |
+| The corroborated cross-modal `MERGE` that binds one voice to one face, on either side of the pair | Their memories, media, and transcripts, which record an event rather than a person |
+| `compile()` leaves them out of the bundle's `actors` and reports a `CONSENT_WITHHELD` unknown | Every other bundle section, so evidence they appear in is still selectable |
+
+Recognition is deliberately not restrained. Answering a question from media the host already holds
+is not new processing of a person, and destroying what is held is `forget_identity`, which
+consent is not: a person who wants the template gone asks for erasure, and a person who wants to
+stop being learned records a refusal.
+
+#### Data-subject rights
+
+`export` answers the right of access. Name exactly one subject -- `identity_id` for a recognized
+person or `memory_ids` for records a caller already knows -- and it returns an `ExportBundle`
+holding every version of every record involved, including retired and cognitively forgotten ones,
+the identity registry row, and every operation-log row that moved any of it. Media travels as
+asset identity, size, and digest on each record; no bytes are inlined, so copying the files stays
+the host's decision. It reads only, and an unknown identity raises `IdentityNotFoundError`.
+
+**A record two people share is exported to both of them.** One recording containing two
+recognized people is held about each of them, so it appears in each subject's export -- with the
+other person's speech segments, face observations, and transcript attribution embedded in it.
+Trimming it would answer an access request with less than is held, and redacting the other person
+out of shared evidence is not something the kernel can do without rewriting the observation, which
+is the one thing it never does. A host that must hand an export to one subject alone therefore
+owes the second person's interest its own review; MindBridge tells the truth about what is stored
+and does not decide that question. Only shared records cross over: each subject's solo recordings,
+naming assertions, consent statements, and registry row stay theirs.
+
+`apply_retention` is deterministic physical forgetting under the declared
+[`retention` policy](../configuration.md#retention-policy): media older than `media_days` and
+every memory that still references it, records cognitively forgotten longer ago than
+`forgotten_days`, and capture-queue rows whose repeated failures are older than
+`capture_failure_days`. Every deletion runs through `delete`, so the table below applies
+unchanged. An unset field is not a zero-day policy -- it does nothing -- so an instance that
+declares no policy makes this a no-op. `dry_run=True` reports the same identifiers and deletes
+nothing. One pass is bounded at a thousand records of each kind; run it again until it reports
+nothing.
+
+`RetentionReport` holds identifiers rather than counts of content, because `delete` leaves no
+operation-log row and this report is the only account of what a policy removed.
 
 #### What `delete` removes
 
@@ -518,6 +607,7 @@ back is rejected as `"duplicate"`.
 | `FORGET` | Every target in the window, existing, and not already forgotten | Sets `forgotten_at` | Clears `forgotten_at` |
 | `IDENTIFY` | Identity exists; every evidence ID shown and existing, each still standing; at least one cited memory contains that identity through a speech or face observation | Commits the `ENTITY` naming assertion the kernel builds from `claim`, recomputes `identities.name` and the indexed speech text | Retracts the assertion, restores the `superseded` version, and repaints both |
 | `MERGE` | Never accepted from a backend: rejected as `"unauthorized"` | Kernel-initiated only. `faces()` commits one under the corroboration rule below | Splits the absorbed identity back out and repaints both projections |
+| `CONSENT` | Never accepted from a backend: rejected as `"unauthorized"` | Host-initiated only. `record_consent()` commits the `STATE` assertion the kernel builds from `consent` | Retracts the assertion and restores the `superseded` statement |
 
 `MERGE` is the one intent the kernel initiates and never accepts: a cross-modal identity merge
 is committed from corroboration evidence the kernel counted itself, so a proposed `MERGE` is
@@ -536,7 +626,8 @@ destroyed can be restored. Which of the two a `FORGET` row names is the marker t
 cognitive forgetting from erasing a person: a row with `target_ids` is reversible, a row with an
 `identity` is not.
 
-`REINFORCE`, `CORRECT`, and `FORGET` refuse a bound naming assertion with `"naming_assertion"`.
+`REINFORCE`, `CORRECT`, and `FORGET` refuse a bound naming assertion with `"naming_assertion"`
+and a standing consent statement with `"consent_assertion"`.
 A name is not an inference to be corrected: reverse it with `rollback` of the `IDENTIFY` that
 asserted it, which is what recomputes the projection. `IDENTIFY` adds `"unknown_identity"` and
 `"identity_not_in_evidence"` to the rejection vocabulary. An `IDENTIFY` proposed by a backend
@@ -544,6 +635,11 @@ carries basis `MODEL_INFERENCE`, so it stays hidden, and out of `identities.name
 independent evidence groups support it, exactly like an inferred `TRAIT`. `register_identity` and
 `register_speaker` are the host entry points for the same intent: they assert the name on the
 host's authority with basis `USER_STATEMENT`, cite no evidence, and are visible immediately.
+
+`CONSENT` is the mirror of `MERGE`: the one intent only a host initiates, refused as
+`"unauthorized"` from a backend for the same reason -- a model that could state consent could
+manufacture it. `MemoryOperation.consent` is a `ConsentClaim` naming the subject and their state,
+and [consent](#consent) owns what the two restrained states change.
 
 Named targets and cited evidence are bounded by the window the kernel gathered: a proposal naming
 a target outside it is rejected as `"target_not_shown"` before any write. The window is the shown
@@ -767,15 +863,15 @@ semantics and complete examples.
 
 ### Root import inventory
 
-These are the 109 supported names exported by `mindbridge`:
+These are the 114 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
 | Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
-| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `NamedActor`, `ProvisionalActor`, `IdentityChange`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate`, `DeliberationReport` |
+| Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextConflict`, `ContextUnknown`, `NamedActor`, `ProvisionalActor`, `IdentityChange`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate`, `DeliberationReport`, `ConsentClaim`, `ExportBundle`, `RetentionPolicy`, `RetentionReport` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
-| Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask`, `MemoryOutcome` |
+| Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `AbstentionReason`, `IndexQuantization`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask`, `MemoryOutcome`, `ConsentState` |
 | Backend protocols and values | `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`, `SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, `ConsolidationBackend`, `ModelInput`, `FormationInput`, `SpeechTurn`, `SpeakerEmbedding`, `SpeechAnalysis`, `FaceEmbedding`, `FaceAnalysis` |
 | Bundled adapters | `JinaOmniEmbedder`, `SentenceTransformersEmbedder`, `OpenAIModels`, `OpenCVFaceAnalyzer`, `FunASRTranscriber`, `FunASRRecipe`, `DEFAULT_FUNASR_MODEL_ID`, `DEFAULT_FUNASR_RECIPE` |
 | Exceptions | `MindBridgeError`, `ValidationError`, `MemoryNotFoundError`, `SpeakerNotFoundError`, `IdentityNotFoundError`, `ModelError`, `ModelOutputTruncatedError`, `StorageError`, `IndexUnavailableError` |
@@ -807,6 +903,10 @@ The principal immutable values are:
 | `IdentityProfile` | `identity_id`, `name`, `relationship`, `confirmed`, `evidence_ids`; the last two are derived from the current visible naming assertion, never stored |
 | `ProvisionalActor` | `identity_id`, `memory_ids`: a recognized person in a compiled bundle's `actors` whom no visible naming assertion names |
 | `IdentityErasure` | `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`, `face_observations`, `speech_segments` |
+| `ConsentClaim` | `identity_id`, `state`, `note`: one person's own statement, carried on the `CONSENT` operation that records it |
+| `ExportBundle` | `exported_at`, `identity_id`, `identities`, `records`, `operations` |
+| `RetentionPolicy` | `media_days`, `forgotten_days`, `capture_failure_days`; every field optional, and unset means no policy rather than zero days |
+| `RetentionReport` | `dry_run`, `media_memory_ids`, `forgotten_memory_ids`, `asset_ids`, `capture_memory_ids`; `deleted` property |
 | `FaceObservation` | `asset_id`, `bounding_box`, `identity_id`, `identity_name`, `identity_score`, `observed_at_ms` |
 | `SpatialContext` | `frame_id`, `anchor`, `x`, `y`, `z`, `orientation_xyzw`, `position_uncertainty_m` |
 | `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial`, `place_id` |

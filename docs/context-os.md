@@ -69,6 +69,38 @@ An agent must not gain identity enrollment, irreversible merge, or physical dele
 merely because it can call ordinary recall tools. The host chooses whether to expose sensitive
 operations and when human confirmation is required.
 
+All six of the data subject's authorities are named calls, and each is an act a host performs on
+their behalf rather than a setting a model can reach:
+
+| Authority | Call | Reversible by |
+| --- | --- | --- |
+| Consent | `record_consent(identity_id, state, note=None)`, read back by `consent(identity_id)` | `rollback()` of its `CONSENT` row, or a later statement that supersedes it |
+| Identity naming | `register_identity` / `register_speaker` | `rollback()` of its `IDENTIFY` row |
+| Correction | `rollback(operation_id)`, and `unlink_identity` for a wrong cross-modal merge | Itself: `rollback()` of the split's `CORRECT` row re-merges |
+| Export | `export(identity_id=...)` or `export(memory_ids=...)` | Nothing to reverse; it reads only |
+| Retention | the declarative `retention` policy, applied by `apply_retention(dry_run=False)` | Nothing: it is physical deletion, and `dry_run=True` is the review step |
+| Physical deletion | `delete(memory_id)` and `forget_identity(identity_id)` | Nothing, by definition |
+
+Consent is an assertion in the same family as naming -- an identity-bound, versioned claim
+recorded as `USER_STATEMENT` -- and it is the one claim no backend may propose: a `CONSENT`
+operation reaching the kernel from a model is refused as `unauthorized`, exactly as a proposed
+`MERGE` is, because a model that could infer consent could manufacture permission to process a
+person. `consent` is a reserved predicate for the same reason: ordinary formation never passes
+through the control plane, so a model's typed proposal carrying it is stored unbound -- an
+inference about a subject rather than a statement by a person -- and binds to nobody. Withheld or withdrawn consent restrains the kernel from the next observation on: no new
+face or voice exemplar is enrolled for that person, no cross-modal merge binds their voice to
+their face, and `compile()` leaves them out of the bundle's actors with a `CONSENT_WITHHELD`
+unknown. It does not restrain recognition against exemplars already held, because answering a
+question from media the host already has is not new processing of a person -- destroying what is
+held is `forget_identity`, which is a different request with a different answer.
+
+One authority does not compose cleanly with another person's, and the honest place to say so is
+here: a recording two people share is held about both, so it appears in both their exports, each
+carrying the other's observations. Answering one subject with less than is held would be a false
+answer, and redacting the other person out of shared evidence would mean rewriting an
+observation, which is the invariant this system does not break. Deciding what a host may then do
+with that export is the host's, not the kernel's.
+
 ## Time scale is not memory type
 
 Fast and slow memory describe processing policy. Semantic, episodic, and procedural memory describe
@@ -175,8 +207,13 @@ recall, stays readable through `get()` and `list()` with its `forgotten_at`, and
 `rollback()`. Consolidation forgetting is a control-plane proposal over evidence lineage: a
 `CONSOLIDATE` may name sources of its own to retire, they leave recall in the same transaction that
 creates the derived record, the evidence links stay, and the log row carries them as
-`forgotten_ids` so the two halves reverse together. Physical forgetting remains `delete()` and
-`forget_identity()` under host authority and is not a proposal intent. Retention work must keep
+`forgotten_ids` so the two halves reverse together. Physical forgetting remains `delete()`,
+`forget_identity()`, and the declared retention policy `apply_retention()` runs under host
+authority, and is not a proposal intent. Retention is the deterministic half of the same
+authority: a policy names maximum ages for raw media, for records cognitive forgetting already
+moved out of recall, and for capture-queue rows whose failures have aged out, and every deletion
+it performs goes through `delete()`, so the completeness rules above hold unchanged. An unset age
+is not a zero-day policy; it does nothing. Retention work must keep
 these meanings separate in APIs, telemetry, and user-facing controls, and the operation log already
 does: `delete()` leaves no row, cognitive forgetting is a `FORGET` row over `target_ids`, and
 consolidation forgetting is a `CONSOLIDATE` row carrying `forgotten_ids`. Erasing a *person* is the
@@ -262,10 +299,19 @@ Answering stays available as a convenience rather than the operating-system boun
 
 High-rate sensor streams stay on the embedded SDK boundary. Agents operate on completed
 observations or stable asset identifiers. Cognitive forgetting, consolidation, operation rollback,
-retention policy, and physical deletion stay with the process that owns the memory; identity
+and applying a retention policy stay with the process that owns the memory; identity
 naming, merge reversal, and erasure are separate trusted tools that no ordinary recall or compile
 call grants, and a host withholds them, the two analysis tools, or every mutating tool by
 building the server without that group.
+
+The three data-subject rights that are not naming -- recording consent, exporting a subject, and
+applying retention -- reach REST behind the same `identity_operations` switch and reach MCP not at
+all. Consent is a statement its subject makes, so an agent that could record one could manufacture
+permission; an export is everything held about a person and retention physically deletes, so both
+are authority over a person's whole record rather than a request about the caller's own. The
+export route is the one place a control-plane value crosses a transport, because the right of
+access covers how the data was processed and not only what is held; it is read-only, and no route
+proposes, applies, or reverses an operation.
 
 All interfaces call one owner of one physical `data_dir`. Supporting several agents against that
 owner does not introduce logical account or request scope into the memory contract. A hosted

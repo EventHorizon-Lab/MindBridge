@@ -50,10 +50,12 @@ from mindbridge.memory import Memory, declared_capabilities
 from mindbridge.types import (
     AssetRef,
     Blob,
+    ConsentState,
     ContentAtom,
     ContentInput,
     ContextBudget,
     EvidenceBasis,
+    ExportBundle,
     FaceObservation,
     MemoryContext,
     MemoryOperation,
@@ -64,6 +66,7 @@ from mindbridge.types import (
     MemoryType,
     Modality,
     ObservationContext,
+    RetentionReport,
     RetrievalScope,
     SearchHit,
     SpatialAnchor,
@@ -110,6 +113,8 @@ OPERATIONS: tuple[str, ...] = (
     "register_speaker",
     "register_identity",
     "identity",
+    "record_consent",
+    "consent",
     "forget_identity",
     "unlink_identity",
     "reinforce",
@@ -121,6 +126,8 @@ OPERATIONS: tuple[str, ...] = (
     "forget",
     "rollback",
     "operations",
+    "export",
+    "apply_retention",
     "list",
     "delete",
     "reindex",
@@ -799,6 +806,63 @@ def _unlink_identity(memory: Memory, arguments: argparse.Namespace) -> _Document
     return {"restored_identity_id": memory.unlink_identity(arguments.alias_id)}
 
 
+def _record_consent(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    record = memory.record_consent(
+        arguments.identity_id,
+        ConsentState(arguments.state),
+        note=arguments.note,
+    )
+    return {"operation": None if record is None else _operation_document(record)}
+
+
+def _consent(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    state = memory.consent(arguments.identity_id)
+    return {"consent": None if state is None else state.value}
+
+
+def _export(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return _export_document(
+        memory.export(
+            identity_id=arguments.identity_id,
+            memory_ids=arguments.memory_ids or None,
+        )
+    )
+
+
+def _export_document(bundle: ExportBundle) -> _Document:
+    return {
+        "exported_at": _encode_time(bundle.exported_at),
+        "identity_id": bundle.identity_id,
+        "identities": [
+            {
+                "identity_id": profile.identity_id,
+                "name": profile.name,
+                "relationship": profile.relationship,
+                "confirmed": profile.confirmed,
+                "evidence_ids": list(profile.evidence_ids),
+            }
+            for profile in bundle.identities
+        ],
+        "records": [_memory_document(record) for record in bundle.records],
+        "operations": [_operation_document(record) for record in bundle.operations],
+    }
+
+
+def _apply_retention(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return _retention_document(memory.apply_retention(dry_run=arguments.dry_run))
+
+
+def _retention_document(report: RetentionReport) -> _Document:
+    return {
+        "dry_run": report.dry_run,
+        "media_memory_ids": list(report.media_memory_ids),
+        "forgotten_memory_ids": list(report.forgotten_memory_ids),
+        "asset_ids": list(report.asset_ids),
+        "capture_memory_ids": list(report.capture_memory_ids),
+        "deleted": report.deleted,
+    }
+
+
 def _settle(memory: Memory, arguments: argparse.Namespace) -> _Document:
     return {
         "settled": memory.settle(
@@ -934,6 +998,26 @@ def _operation_document(record: MemoryOperationRecord) -> _Document:
                 "moved_ids": list(record.operation.identity.moved_ids),
             }
         ),
+        # A naming or consent row asserts something about a person, so without these two its
+        # row would report an intent and no statement at all.
+        "claim": (
+            None
+            if record.operation.claim is None
+            else {
+                "identity_id": record.operation.claim.identity_id,
+                "name": record.operation.claim.name,
+                "relationship": record.operation.claim.relationship,
+            }
+        ),
+        "consent": (
+            None
+            if record.operation.consent is None
+            else {
+                "identity_id": record.operation.consent.identity_id,
+                "state": record.operation.consent.state.value,
+                "note": record.operation.consent.note,
+            }
+        ),
         "rationale": record.operation.rationale,
         "model_id": record.model_id,
         "recipe": record.recipe,
@@ -988,6 +1072,8 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "register-speaker": _register_speaker,
     "register-identity": _register_identity,
     "identity": _identity_profile,
+    "record-consent": _record_consent,
+    "consent": _consent,
     "forget-identity": _forget_identity,
     "unlink-identity": _unlink_identity,
     "reinforce": _reinforce,
@@ -999,6 +1085,8 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "forget": _forget,
     "rollback": _rollback,
     "operations": _operations,
+    "export": _export,
+    "apply-retention": _apply_retention,
     "list": _list,
     "delete": _delete,
     "reindex": _reindex,
@@ -1900,6 +1988,37 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     forget.add_argument("identity_id", metavar="IDENTITY_ID")
     unlink = commands.add_parser("unlink-identity", help="reverse one face/voice merge")
     unlink.add_argument("alias_id", metavar="ALIAS_ID")
+    consent = commands.add_parser(
+        "record-consent",
+        help="record what one person said about being processed as a recognized person",
+    )
+    consent.add_argument("identity_id", metavar="IDENTITY_ID")
+    consent.add_argument("state", choices=[item.value for item in ConsentState])
+    consent.add_argument("--note", help="the subject's own words about their decision")
+    stated = commands.add_parser("consent", help="read one identity's standing consent state")
+    stated.add_argument("identity_id", metavar="IDENTITY_ID")
+    export = commands.add_parser(
+        "export",
+        help="export everything held about one data subject, media by reference",
+    )
+    subject = export.add_mutually_exclusive_group(required=True)
+    subject.add_argument("--identity-id", metavar="IDENTITY_ID", help="one recognized person")
+    subject.add_argument(
+        "--memory-id",
+        dest="memory_ids",
+        action="append",
+        metavar="MEMORY_ID",
+        help="repeatable; export these records instead of one person",
+    )
+    retention = commands.add_parser(
+        "apply-retention",
+        help="delete what the declared retention policy says has outlived its purpose",
+    )
+    retention.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be deleted and delete nothing",
+    )
     reinforce = commands.add_parser("reinforce", help="record positive feedback")
     reinforce.add_argument("memory_ids", nargs="+", metavar="MEMORY_ID")
     candidates = commands.add_parser(

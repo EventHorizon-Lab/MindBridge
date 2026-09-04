@@ -238,24 +238,27 @@ gate in the [benchmark protocol](benchmarking.md#mandatory-controls).
 
 ## Public and trust boundaries
 
-Supported SDK values are imported from `mindbridge`. The `Memory` SDK exposes 31 product
+Supported SDK values are imported from `mindbridge`. The `Memory` SDK exposes 35 product
 operations. REST exposes twelve `/v1` routes: add, batch add, list, search, reinforce, get,
-delete, answer, compile context, capture, settle, and pending captures. Six more -- speech, face,
-register identity, get identity, unlink identity, and forget identity -- exist only when the host
+delete, answer, compile context, capture, settle, and pending captures. Ten more -- speech, face,
+register identity, get identity, unlink identity, forget identity, record consent, read consent,
+export a subject, and apply retention -- exist only when the host
 enables the matching `identity_operations` or `embodied_operations` switch on `create_app`,
 mirroring the same-named MCP switch. MCP exposes fifteen tools: the eight corresponding non-batch
 operations plus speech, face, and identity operations, or fewer when the host withholds a group
 with `identity_operations=False`, `embodied_operations=False`, or `write_operations=False`,
 because naming a person, binding a face to a voice, and changing durable state are host
 authority and the host decides whether each is on the wire at all. All three withheld leaves the
-five read tools. The local CLI exposes the 31 operations
+five read tools. The local CLI exposes the 35 operations
 plus `doctor`; `--url` is limited to a fixed subset of operations regardless of what REST exposes,
 listed in [the CLI reference](api/cli.md#operations-without-a-remote-route).
 
 Compiling context is a read-only view. The memory control plane — `consolidation_candidates()`,
 `consolidate()`, `deliberate()`, `apply()`, `record_outcome()`, `forget()`, `rollback()`, and
 `operations()` — and physical deletion stay in the owner process, which is also the process that
-can audit and reverse an operation through its log.
+can audit and reverse an operation through its log. `export()` is the one read that crosses that
+line, because a data subject's right of access covers the log rows that moved their records; it
+proposes and reverses nothing, and rides the `identity_operations` switch.
 
 `create_app(memory=...)` and `build_mcp_server(memory)` use a caller-owned instance and do not
 close it. They also do not add authentication, authorization, TLS, rate limits, quotas, or audit

@@ -18,12 +18,15 @@ from mindbridge.models.base import (
     TranscriptionBackend,
     VisionDescriptionBackend,
 )
-from mindbridge.types import IndexQuantization
+from mindbridge.types import IndexQuantization, RetentionPolicy
 
 _StrictBool = Annotated[bool, Field(strict=True)]
 _UnitInterval = Annotated[float, Field(strict=True, ge=0, le=1)]
 _PositiveFloat = Annotated[float, Field(strict=True, gt=0)]
 _PositiveInt = Annotated[int, Field(strict=True, gt=0)]
+# One shared immutable "no age is declared" value, so the constructor default and the settings
+# default are the same object rather than two that have to be kept equal.
+_NO_RETENTION = RetentionPolicy()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -169,6 +172,11 @@ class MemoryConfig:
     # How many recall failures the store keeps at all. The table is a bounded signal buffer, not
     # a query log: the oldest rows falling out is the retention policy.
     query_failure_history: _PositiveInt = 512
+    # What `apply_retention()` is allowed to delete. Declarative configuration spells it as its
+    # own `retention` section rather than a field in here, because every other setting shapes
+    # what recall returns and can be changed back, and this one deletes. Empty by default: no
+    # age is declared, so nothing ages out.
+    retention: RetentionPolicy = _NO_RETENTION
 
 
 # Clearer name for new code; keep the original public value intact for compatibility.

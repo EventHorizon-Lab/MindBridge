@@ -128,7 +128,7 @@ SDK validator and error contract.
 | `POST /v1/settle` | `settleCaptures` | `SettleRequest` | `200 {"settled":int}` |
 | `GET /v1/pending_captures` | `pendingCaptures` | `limit`, `memory_ids` query parameters | `200 {"items":[PendingCaptureResponse,...]}` |
 
-The next six exist only when the host enables the matching switch:
+The next ten exist only when the host enables the matching switch:
 
 | Method and path | Operation ID | Input | Success | Switch |
 | --- | --- | --- | --- | --- |
@@ -138,6 +138,10 @@ The next six exist only when the host enables the matching switch:
 | `GET /v1/identities/{identity_id}` | `getIdentity` | non-empty path value | `200 {"identity":IdentityProfile\|null}` | `identity_operations` |
 | `POST /v1/identities/{alias_id}/unlink` | `unlinkIdentity` | non-empty path value | `200 {"restored_identity_id":str\|null}` | `identity_operations` |
 | `DELETE /v1/identities/{identity_id}` | `forgetIdentity` | non-empty path value | `200 {"erasure":IdentityErasure}` | `identity_operations` |
+| `POST /v1/identities/{identity_id}/consent` | `recordConsent` | `ConsentRequest` | `200 {"operation":MemoryOperationResponse\|null}` | `identity_operations` |
+| `GET /v1/identities/{identity_id}/consent` | `getConsent` | non-empty path value | `200 {"consent":ConsentState\|null}` | `identity_operations` |
+| `GET /v1/export` | `exportSubject` | `identity_id` or `memory_ids` query parameters | `200 ExportResponse` | `identity_operations` |
+| `POST /v1/retention` | `applyRetention` | `RetentionRequest` | `200 RetentionResponse` | `identity_operations` |
 
 Request fields and defaults are:
 
@@ -148,6 +152,8 @@ Request fields and defaults are:
 | `QueryRequest` | required `query`; `limit=10`; `explain=false`; optional `memory_type`, `reference_at`, `occurred_from`, `occurred_until`, `scope` |
 | `ReinforceRequest` | required `memory_ids` with 1–100 IDs |
 | `AnswerRequest` | required `question`; `limit=5`; optional `memory_type`, `reference_at`, `scope` |
+| `ConsentRequest` | required `state` (`granted`, `withheld`, or `withdrawn`); optional `note` |
+| `RetentionRequest` | `dry_run=false` |
 | `ContextRequest` | required `goal`; optional `budget`, `reference_at`, `scope` |
 | `ContextBudgetRequest` | `max_chars=16000`; `max_items=24`; `min_confidence=0.0`; optional `max_media_items` (`0` for a text-only bundle); optional `memory_types` with at least one value; optional `freshness_seconds`; optional `max_latency_ms` |
 | `SettleRequest` | `limit=100`; `max_attempts=3`; optional `memory_ids` with 1–100 IDs |
@@ -313,11 +319,17 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 | `RegisterResponse` | `registered` |
 | `UnlinkResponse` | `restored_identity_id` |
 | `ForgetResponse` | `erasure`: `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`, `face_observations`, `speech_segments` |
+| `ConsentResponse` | `consent`: `granted`, `withheld`, `withdrawn`, or `null` when nobody has recorded a statement |
+| `MemoryOperationResponse` | `operation_id`, `intent`, `trigger`, `evidence_ids`, `target_ids`, `claim`, `consent`, `identity`, `rationale`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `superseded`, `applied_at`, `rolled_back_at`, `outcome`, `outcome_note` |
+| `RecordConsentResponse` | `operation`, or `null` when the same statement already stands |
+| `ExportResponse` | `exported_at`, `identity_id`, `identities`, `records`, `operations` |
+| `RetentionResponse` | `dry_run`, `media_memory_ids`, `forgotten_memory_ids`, `asset_ids`, `capture_memory_ids`, `deleted` |
 | `ContextBudgetResponse` | `max_chars`, `max_items`, `max_media_items` or `null`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
 | `ContextConflictResponse` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknownResponse` | `kind`, `detail` |
-| `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, the mixed `actors` array of hits and `ProvisionalActorResponse` objects, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
+| `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `affect`, `traits`, the mixed `actors` array of hits, `NamedActorResponse`, and `ProvisionalActorResponse` objects, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
 | `ProvisionalActorResponse` | `identity_id`, `memory_ids`: one recognized person in the included evidence whom no visible naming assertion names |
+| `NamedActorResponse` | `identity_id`, `name`, `memory_ids`, `naming_assertion_id`: one person a naming assertion names, reached through other evidence |
 | `CapabilitiesResponse` | `embedding`, `embedding_model`, `embedding_space`, `embedding_dimension`, `generation`, `transcription`, `vision`, `face`, `formation`, `generation_model`, `transcription_space`, `vision_model`, `face_model`, `formation_model`, `consolidation_model`, `speaker_recognition`, `streaming_generation`, `operations` |
 | `HealthResponse` | `status`, `capabilities` |
 
@@ -465,7 +477,25 @@ REST has no route for these Python operations:
 | `reindex`, `optimize` | Index maintenance an operator schedules |
 | `consolidation_candidates`, `consolidate`, `deliberate`, `apply`, `record_outcome`, `forget`, `rollback`, `operations` | No route and no MCP tool; the memory control plane stays under host authority |
 
-`speech`, `faces`, `register_identity`, `identity`, `unlink_identity`, and `forget_identity` do
+`exportSubject` is the one place a control-plane value reaches a transport: an export carries the
+operation-log rows that moved the subject's records, because the right of access covers how the
+data was processed and not only what is held. It is read-only and gated on `identity_operations`,
+so nothing about the control plane's authority changes -- no route proposes, applies, or reverses
+an operation.
+
+A record containing two recognized people is returned for both of their exports, with the other
+person's observations embedded in it, for the reasons the
+[SDK contract](python-sdk.md#data-subject-rights) states. Over a network that matters more than it
+does in-process: a host serving this route decides who receives the response, and the response
+may contain a second person's data.
+
+`applyRetention` deletes irrecoverably. It is behind `identity_operations` rather than always on
+like `deleteMemory`, because it acts on a declared policy over the whole store rather than on one
+record the caller named. Send `{"dry_run": true}` first: it reports the same identifiers and
+deletes nothing.
+
+`speech`, `faces`, `register_identity`, `identity`, `unlink_identity`, `forget_identity`,
+`record_consent`, `consent`, `export`, and `apply_retention` do
 have routes, listed in [Endpoints](#endpoints) -- but only when the host enables
 `embodied_operations` or `identity_operations`. A host that leaves a switch off gets no route for
 the operations it gates, exactly as the table above describes for the operations no switch can

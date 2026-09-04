@@ -27,17 +27,24 @@ from mindbridge.types import (
     AnswerResult,
     AssetRef,
     Blob,
+    ConsentClaim,
+    ConsentState,
     ContentInput,
     ContextBudget,
     ContextBundle,
     ContextConflict,
     ContextUnknown,
     ContextUnknownKind,
+    ExportBundle,
     FaceObservation,
     IdentityErasure,
     IdentityProfile,
     MemoryCapabilities,
+    MemoryIntent,
+    MemoryOperation,
+    MemoryOperationRecord,
     MemoryRecord,
+    MemoryTrigger,
     MemoryType,
     Modality,
     NamedActor,
@@ -45,6 +52,7 @@ from mindbridge.types import (
     Page,
     PendingCapture,
     ProvisionalActor,
+    RetentionReport,
     RetrievalCandidateTrace,
     RetrievalRejection,
     RetrievalScope,
@@ -140,6 +148,20 @@ PROFILE = IdentityProfile(
     relationship="daughter",
     confirmed=True,
     evidence_ids=("memory_1",),
+)
+CONSENT_OPERATION = MemoryOperationRecord(
+    operation_id=7,
+    operation=MemoryOperation(
+        intent=MemoryIntent.CONSENT,
+        consent=ConsentClaim(
+            identity_id="identity_1",
+            state=ConsentState.WITHDRAWN,
+            note="asked at the door",
+        ),
+    ),
+    trigger=MemoryTrigger.MANUAL,
+    applied_at=NOW,
+    created_ids=("memory_9",),
 )
 PENDING = PendingCapture(
     memory_id="memory_1",
@@ -402,6 +424,45 @@ class FakeMemory:
         self._fail()
         self.calls.append(("forget_identity", identity_id))
         return ERASURE
+
+    def record_consent(
+        self,
+        identity_id: str,
+        state: ConsentState,
+        *,
+        note: str | None = None,
+    ) -> MemoryOperationRecord | None:
+        self._fail()
+        self.calls.append(("record_consent", identity_id, state, note))
+        return CONSENT_OPERATION
+
+    def consent(self, identity_id: str) -> ConsentState | None:
+        self._fail()
+        self.calls.append(("consent", identity_id))
+        return ConsentState.WITHDRAWN
+
+    def export(
+        self,
+        *,
+        identity_id: str | None = None,
+        memory_ids: Sequence[str] | None = None,
+    ) -> ExportBundle:
+        self._fail()
+        self.calls.append(
+            ("export", identity_id, None if memory_ids is None else tuple(memory_ids))
+        )
+        return ExportBundle(
+            exported_at=NOW,
+            identity_id=identity_id,
+            identities=(PROFILE,),
+            records=(_record("memory_1", "Ann came by."),),
+            operations=(CONSENT_OPERATION,),
+        )
+
+    def apply_retention(self, *, dry_run: bool = False) -> RetentionReport:
+        self._fail()
+        self.calls.append(("apply_retention", dry_run))
+        return RetentionReport(dry_run=dry_run, forgotten_memory_ids=("mem_1",))
 
     def close(self) -> None:
         self.close_count += 1
@@ -1220,12 +1281,29 @@ def test_identity_and_embodied_routes_are_off_by_default_and_404_not_403() -> No
         got = client.get("/v1/identities/identity_1")
         unlinked = client.post("/v1/identities/identity_1/unlink")
         forgotten = client.delete("/v1/identities/identity_1")
+        stated = client.post("/v1/identities/identity_1/consent", json={"state": "withdrawn"})
+        consent = client.get("/v1/identities/identity_1/consent")
+        exported = client.get("/v1/export", params={"identity_id": "identity_1"})
+        retained = client.post("/v1/retention", json={"dry_run": True})
         openapi = client.get("/openapi.json").json()
 
-    for response in (speech, faces, registered, got, unlinked, forgotten):
+    for response in (
+        speech,
+        faces,
+        registered,
+        got,
+        unlinked,
+        forgotten,
+        stated,
+        consent,
+        exported,
+        retained,
+    ):
         assert response.status_code == 404
     assert "/v1/speech" not in openapi["paths"]
     assert "/v1/identities" not in openapi["paths"]
+    assert "/v1/export" not in openapi["paths"]
+    assert "/v1/retention" not in openapi["paths"]
     assert memory.calls == []
 
 
@@ -1346,6 +1424,52 @@ def test_register_identity_accepts_names_with_spaces_and_non_ascii_characters(
     assert response.json() == {"registered": True}
     # The SDK receives the name and relationship exactly as sent, unmodified.
     assert memory.calls == [("register_identity", "identity_1", name, relationship)]
+
+
+def test_the_data_subject_rights_dispatch_to_the_sdk_when_identities_are_enabled() -> None:
+    """Consent, export, and retention ride the same switch that gates naming and erasure."""
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory, identity_operations=True)) as client:
+        stated = client.post(
+            "/v1/identities/identity_1/consent",
+            json={"state": "withdrawn", "note": "asked at the door"},
+        )
+        consent = client.get("/v1/identities/identity_1/consent")
+        exported = client.get("/v1/export", params={"identity_id": "identity_1"})
+        retained = client.post("/v1/retention", json={"dry_run": True})
+
+    assert stated.status_code == 200
+    operation = stated.json()["operation"]
+    assert operation["intent"] == "consent"
+    assert operation["consent"] == {
+        "identity_id": "identity_1",
+        "state": "withdrawn",
+        "note": "asked at the door",
+    }
+    assert operation["created_ids"] == ["memory_9"]
+    assert consent.json() == {"consent": "withdrawn"}
+    assert exported.status_code == 200
+    bundle = exported.json()
+    assert bundle["identity_id"] == "identity_1"
+    assert [record["id"] for record in bundle["records"]] == ["memory_1"]
+    assert [profile["name"] for profile in bundle["identities"]] == ["Ann"]
+    assert [row["operation_id"] for row in bundle["operations"]] == [7]
+    assert retained.status_code == 200
+    assert retained.json() == {
+        "dry_run": True,
+        "media_memory_ids": [],
+        "forgotten_memory_ids": ["mem_1"],
+        "asset_ids": [],
+        "capture_memory_ids": [],
+        "deleted": 1,
+    }
+    assert memory.calls == [
+        ("record_consent", "identity_1", ConsentState.WITHDRAWN, "asked at the door"),
+        ("consent", "identity_1"),
+        ("export", "identity_1", None),
+        ("apply_retention", True),
+    ]
 
 
 def test_get_identity_reports_no_registered_profile_without_failing() -> None:

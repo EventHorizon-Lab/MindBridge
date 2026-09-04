@@ -239,6 +239,7 @@ used by `Memory.from_plugins()`.
 | `memory_budget_records` | `None` | Active records this instance is meant to hold; the whole definition of the `PRESSURE` trigger, which derives nothing without it |
 | `query_failure_window_seconds` | `3600.0` | How far back the `QUERY_FAILURE` trigger counts near-equal empty recalls |
 | `query_failure_history` | `512` | How many empty recalls the store keeps at all; the oldest fall out |
+| `retention` | empty | What `apply_retention()` may delete; spell it as the top-level `retention` section below |
 
 A memory declares its composition through `Memory.capabilities`, which reports the modalities,
 model identities, and configured backends the routing layer reads, including
@@ -272,6 +273,43 @@ Pass an OpenTelemetry tracer through the separate `tracer=` argument; it is not 
 [operations](operations.md#telemetry) for exporter setup and
 [memory types, time, and decay](memory-types-time-and-decay.md#decay-and-reinforcement) for ranking
 semantics.
+
+## Retention policy
+
+`retention` is its own top-level section rather than a `settings` field, because every other
+setting shapes what recall returns and can be changed back, and this one deletes.
+
+```python
+config = {
+    "embedding": {"provider": "jina-omni"},
+    "retention": {
+        "media_days": 30,
+        "forgotten_days": 90,
+        "capture_failure_days": 7,
+    },
+}
+```
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `media_days` | `None` | Delete media assets recorded longer ago than this, and every memory that still references them |
+| `forgotten_days` | `None` | Physically delete records that `forget()` moved out of recall longer ago than this |
+| `capture_failure_days` | `None` | Abandon capture-queue rows enqueued longer ago than this that have failed at least once; the memory itself stays |
+
+Every field is optional and every one defaults to `None`. `None` means "no policy", not "keep for
+zero days": nothing is ever deleted because a clock ticked and no age was declared. Ages are
+positive numbers of days, measured from the material's own recorded time rather than from the last
+time it was read, so traffic cannot reset a policy.
+
+Nothing here runs on its own. The policy is inert until a host calls
+[`Memory.apply_retention()`](api/python-sdk.md#data-subject-rights) or `mindbridge
+apply-retention`, which is what keeps physical deletion an explicit act with an auditable report.
+Start with `apply_retention(dry_run=True)`, which names exactly what a real pass would remove and
+removes nothing.
+
+`MemoryConfig`/`MemorySettings` carries the same value under the name `retention`, which is what
+`Memory.from_plugins()` and the `Memory(retention=...)` constructor argument read. Declaring it in
+both places is refused rather than silently resolved.
 
 ## Direct adapter injection
 

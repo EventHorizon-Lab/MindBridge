@@ -104,6 +104,8 @@ credential behavior live in [configuration](../configuration.md).
 | `register-speaker` | `SPEAKER_ID NAME`; `--relationship` | `{}` | no |
 | `register-identity` | `IDENTITY_ID NAME`; `--relationship` | `{}` | no |
 | `identity` | `IDENTITY_ID` | `{"identity":{...}}` or `{"identity":null}` | no |
+| `record-consent` | `IDENTITY_ID STATE`; `--note` | `{"operation":{...}}` or `{"operation":null}` | no |
+| `consent` | `IDENTITY_ID` | `{"consent":"granted"}` or `{"consent":null}` | no |
 | `forget-identity` | `IDENTITY_ID` | erasure counts | no |
 | `unlink-identity` | `ALIAS_ID` | `{"restored_identity_id":...}` | no |
 | `reinforce` | one or more `MEMORY_ID` values | `{"reinforced":int}` | no |
@@ -112,6 +114,8 @@ credential behavior live in [configuration](../configuration.md).
 | `forget` | one or more `MEMORY_ID` values | `{"operation":{...}}` or `{"operation":null}` | no |
 | `rollback` | `OPERATION_ID` | `{"rolled_back":bool}` | no |
 | `operations` | `--limit` | `{"operations":[...]}` | no |
+| `export` | exactly one of `--identity-id` or repeatable `--memory-id` | export bundle | no |
+| `apply-retention` | `--dry-run` | retention report | no |
 | `list` | `--limit`; `--cursor` | `{"items":[...],"next_cursor":...}` | yes |
 | `delete` | `MEMORY_ID` | `{"deleted":bool}` | yes |
 | `reindex` | none | `{"memories":int}` | no |
@@ -131,11 +135,32 @@ they require the matching capability. `compile` mirrors the
 more than one type; `--max-latency-ms` is a deadline the compiler checks between stages, and the
 printed bundle carries `elapsed_ms`, `deadline_exceeded`, and `unknowns` alongside its sections.
 Each row `operations` prints carries `operation_id`, `intent`, `trigger`, `evidence_ids`,
-`target_ids`, `identity`, `rationale`, `model_id`, `recipe`, `created_ids`, `changed_ids`,
-`forgotten_ids`, `superseded`, `applied_at`, and `rolled_back_at`. `identity` is set on the three
-rows that name a person instead of records -- the cross-modal `merge` the kernel commits, the
-`correct` that `unlink-identity` logs, and the irreversible `forget` that `forget-identity`
-logs -- and is `null` on every other row.
+`target_ids`, `claim`, `consent`, `identity`, `rationale`, `model_id`, `recipe`, `created_ids`,
+`changed_ids`, `forgotten_ids`, `superseded`, `applied_at`, and `rolled_back_at`. `identity` is
+set on the three rows that name a person instead of records -- the cross-modal `merge` the kernel
+commits, the `correct` that `unlink-identity` logs, and the irreversible `forget` that
+`forget-identity` logs -- and is `null` on every other row. `claim` carries the name an `identify`
+row asserted and `consent` the state a `consent` row recorded, so a row about a person always says
+what it said about them.
+
+`record-consent` takes `granted`, `withheld`, or `withdrawn`, and prints the logged operation, or
+`null` when that statement already stands. `consent` reads back the standing state, where `null`
+means nobody has recorded one. What the two restrained states change is listed under
+[consent](python-sdk.md#consent).
+
+`export` prints `exported_at`, `identity_id`, `identities`, `records`, and `operations` -- every
+version of every record the subject appears in or is named by, and every log row that moved any of
+it. Media is named by asset identity and digest; no bytes are printed, so a document stays safe to
+pipe. `apply-retention` prints `dry_run`, `media_memory_ids`, `forgotten_memory_ids`, `asset_ids`,
+`capture_memory_ids`, and `deleted`; it deletes through the same path as `delete`, so
+[what `delete` removes](python-sdk.md#what-delete-removes) applies unchanged. Start with
+`--dry-run`.
+
+`apply-retention` acts on the policy the composition declares. An `--embedder` composition
+declares none, so it deletes nothing and reports empty lists; use `--app` with a memory built from
+a configuration that has a [`retention` section](../configuration.md#retention-policy). The CLI
+deliberately has no flag for the ages: a policy that deletes should be reviewable in a file, not
+retyped on each invocation.
 
 `forget` is cognitive forgetting, reversible with `rollback`; `delete` is erasure. With the
 default `reinforce_on_answer=True`, `ask` also reinforces the hits the answerer cites; use
@@ -277,8 +302,9 @@ exit 130 use their conventional plain stderr diagnostics.
 With `--url`, only `add`, `add-many`, `search`, `ask`, `compile`, `get`, `list`, `delete`, and
 `doctor` are available. Other commands exit 10 with `unsupported_in_remote_mode`, whether or not
 their operation has a REST route: `reinforce`, `capture`, `settle`, and `pending-captures` always
-have one, and `speech`, `faces`, `register-identity`, `identity`, `unlink-identity`, and
-`forget-identity` have one when the owner enables the matching switch, but the CLI does not
+have one, and `speech`, `faces`, `register-identity`, `identity`, `unlink-identity`,
+`forget-identity`, `record-consent`, `consent`, `export`, and `apply-retention` have one when the
+owner enables the matching switch, but the CLI does not
 currently wire any of those routes into remote mode. The complete route boundary is listed in
 [REST operations without a route](rest.md#operations-without-a-route).
 
