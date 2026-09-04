@@ -79,6 +79,7 @@ SHARED_OPERATIONS: dict[str, tuple[str | None, str | None]] = {
 # someone deciding which of the two it belongs in.
 UNEXPOSED_OPERATIONS: dict[str, str] = {
     "add_stream": "a lazy generator does not fit one finite request or response",
+    "ask_stream": "incremental delivery needs a streaming transport; `ask` is the same answer",
     "search_with_trace": "candidate-level retrieval diagnostics with no agent or client action",
     "reindex": "unbounded index maintenance an operator schedules, not a caller",
     "optimize": "index maintenance an operator schedules, not a caller",
@@ -108,6 +109,7 @@ _COUNT_WORDS = {
     12: "Twelve",
     13: "Thirteen",
     14: "Fourteen",
+    15: "Fifteen",
 }
 # `search_with_trace` has no route or tool of its own; the search surfaces reach it through
 # `explain`, so the adapter protocol must still declare it exactly as the SDK does. The MCP-only

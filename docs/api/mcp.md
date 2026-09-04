@@ -264,13 +264,14 @@ details are still never serialized.
 
 ### Operations without a tool
 
-Thirteen Python operations have no MCP tool. One is a transport limitation and the rest are
+Fourteen Python operations have no MCP tool. Two are transport limitations and the rest are
 decisions; none is withheld because it touches owner-process state, since every tool already
 does.
 
 | Operation | Why, and what to call instead |
 | --- | --- |
 | `add_stream` | **Transport limitation.** It consumes a lazy iterable and yields records as it goes, and one tool call is a finite request with one response, so a stream cannot be started, fed, and drained through it. Call `add_memory` for each completed observation, or use the SDK for a live source. |
+| `ask_stream` | **Transport limitation.** It yields the answer while the model is still producing it, and one tool call is a finite request with one response, so the incremental delivery that justifies it cannot survive the hop. Call `ask_memory`, which returns the same grounded answer once it is complete, or use the SDK when time to first token matters. |
 | `add_many` | Every item is already reachable through `add_memory`, so this buys one model batch rather than a capability. Its parallel arrays must line up with `contents` position by position, and a misalignment stores real memories under the wrong timestamps, which is a worse failure than slower ingestion. Use `POST /v1/memories/batch` for bulk loading. |
 | `search_with_trace` | No tool of its own, because the same trace is reachable from the tool that produces the hits: call `search_memories` with `explain=true`. Use the SDK or the CLI when diagnosing retrieval outside an agent loop. |
 | `reindex` | Rebuilds the whole search projection from SQLite. The duration grows with the store and has no upper bound, so it does not belong behind a client that expects one timely response. It is also an operator decision, not a caller's. |

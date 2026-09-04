@@ -18,6 +18,7 @@ work: the application decides when an observation is complete and normalizes it 
 | Need | API |
 | --- | --- |
 | Lazily add completed independent observations | `Memory.add_stream()` or `AsyncMemory.add_stream()` |
+| Deliver an answer while the model is still writing it | `Memory.ask_stream()` or `AsyncMemory.ask_stream()` |
 | Acknowledge completed observations without waiting for models | `Memory.capture()` with `Memory.settle()`, or any stream API with `capture=True` |
 | Search while one query snapshot is changing | `AsyncOmniPrefetch` |
 | Associate speculative snapshots with final commits | `AsyncCaptureStream` |
@@ -28,6 +29,11 @@ Use `add_stream()` unless the application benefits from speculative recall. Use 
 reducers only when explicit finality is available. Every reducer takes an `AsyncMemory`, written
 `async_memory` below; the synchronous snippets assume an open `memory` plus already-read immutable
 media bytes.
+
+Everything on this page except `ask_stream()` streams input into memory; `ask_stream()` is the one
+that streams an answer out, and it is a delivery choice rather than a capture lifecycle. Its
+contract lives with the other recall operations in the
+[Python SDK reference](api/python-sdk.md#memory-operations).
 
 ## Add completed observations
 

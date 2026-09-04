@@ -390,6 +390,7 @@ REST has no route for these Python operations:
 | Operation | Boundary |
 | --- | --- |
 | `add_stream` | Send each completed observation to `POST /v1/memories` |
+| `ask_stream` | Send `POST /v1/answers`, which returns the same grounded answer once it is complete |
 | `search_with_trace` | Send `POST /v1/memories/search` with `"explain": true` |
 | `speech`, `faces` | No route; both have an [MCP tool](mcp.md#tools) |
 | `register_speaker`, `register_identity` | No route; both have an MCP tool |
@@ -399,8 +400,10 @@ REST has no route for these Python operations:
 | `consolidation_candidates`, `consolidate`, `forget`, `rollback`, `operations` | No route and no MCP tool; the memory control plane stays under host authority |
 
 Use the [Python SDK](python-sdk.md) in the owning process, or the MCP adapter where the table
-names a tool. None of these is a REST limitation: the adapter runs in the process that owns
-`Memory`, so a route is unwritten work rather than an impossibility.
+names a tool. Only `ask_stream` needs more than a route: incremental delivery needs a streaming
+response, so exposing it means choosing a wire format rather than binding an existing one. The
+rest are not REST limitations: the adapter runs in the process that owns `Memory`, so a route is
+unwritten work rather than an impossibility.
 
 ### Input limits
 
