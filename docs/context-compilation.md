@@ -72,7 +72,7 @@ character ceiling can only approximate them. The prices are fixed:
 | --- | --- |
 | One memory's rendered line | `len(render_hit_line(hit)) + 1` -- the `- [id]` frame, the squeezed record text, and the confidence and validity suffix |
 | The header | its four rendered lines, about 150 characters plus the goal |
-| One section heading | its blank line, `## `, and the name |
+| One section heading | its blank line, `##` marker plus space, and the name |
 | One `image` asset | 2000 |
 | One `audio` asset | 4000 |
 | One `video` asset | 12000 |
