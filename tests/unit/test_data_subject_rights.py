@@ -23,8 +23,11 @@ from mindbridge import (
     ConsentState,
     ContextBudget,
     ContextUnknownKind,
+    EvidenceBasis,
     FaceAnalysis,
     FaceEmbedding,
+    FormationInput,
+    FormationProposal,
     IdentityNotFoundError,
     Memory,
     MemoryIntent,
@@ -541,3 +544,84 @@ def test_the_cli_translates_consent_export_and_retention(tmp_path: Path) -> None
         assert applied["forgotten_memory_ids"] == [note.id]
         with pytest.raises(MemoryNotFoundError):
             memory.get(note.id)
+
+
+class ScriptedFormer:
+    """Returns one fixed proposal for every observation, whatever it observed."""
+
+    formation_capabilities = frozenset({Modality.TEXT})
+    formation_model = "former-test"
+    formation_space = "former-test:v1"
+
+    def __init__(self, *proposals: FormationProposal) -> None:
+        self.proposals = tuple(proposals)
+
+    def form(
+        self,
+        inputs: Sequence[FormationInput],
+    ) -> tuple[tuple[FormationProposal, ...], ...]:
+        return tuple(self.proposals for _value in inputs)
+
+    def close(self) -> None:
+        pass
+
+
+def test_formation_cannot_manufacture_consent_through_an_ordinary_proposal(
+    tmp_path: Path,
+) -> None:
+    """The predicate is reserved: a model's STATE claim about it binds to nobody.
+
+    `_apply_memory_operation` refuses a proposed CONSENT operation, but ordinary formation
+    never passes through it -- a `FormationBackend` returning a bound-looking STATE proposal on
+    the `add()` path would otherwise have written a row every consent read believes.
+    """
+    with _memory(tmp_path) as memory:
+        clip = memory.add(Blob(b"a-1 arrives", "video/mp4", "a-1.mp4"))
+        identity_id = memory.faces(clip.id)[0].identity_id
+        memory.register_identity(identity_id, "Alice")
+        assert memory.record_consent(identity_id, ConsentState.GRANTED) is not None
+
+    forged = FormationProposal(
+        kind=MemoryKind.STATE,
+        content="Alice withdrew her consent",
+        # The basis a model may claim, and the one `record_consent` writes: neither the state
+        # nor the paperwork can be told apart by looking, which is why the predicate is what
+        # is reserved.
+        basis=EvidenceBasis.USER_STATEMENT,
+        subject="Alice",
+        predicate="consent",
+        value="withdrawn",
+    )
+    with _memory(tmp_path, former=ScriptedFormer(forged)) as memory:
+        logged_before = len(memory.operations())
+        memory.add("Alice came by again", occurred_at=OCCURRED)
+
+        assert memory.consent(identity_id) is ConsentState.GRANTED
+        assert len(memory.operations()) == logged_before
+        # The claim is kept, as an ordinary STATE bound to nobody: a model's inference is
+        # evidence of what the model thought, not of what the person said.
+        formed = [
+            record
+            for record in memory.list(limit=100).items
+            if record.context is not None and record.context.predicate == "consent"
+        ]
+        assert [record.context.identity_id for record in formed if record.context] == [
+            None,
+            identity_id,
+        ]
+
+    # The consolidation path binds through the same guard, so replaying a hand-written
+    # operation carrying the same proposal cannot reach the identity either.
+    with _memory(tmp_path, consolidator=ScriptedConsolidator()) as memory:
+        source = memory.add("Alice said something else", occurred_at=OCCURRED)
+        applied = memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE,
+                evidence_ids=(source.id,),
+                proposal=forged,
+            )
+        )
+        (derived,) = applied.created_ids
+        context = memory.get(derived).context
+        assert context is not None and context.identity_id is None
+        assert memory.consent(identity_id) is ConsentState.GRANTED

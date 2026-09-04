@@ -2102,8 +2102,20 @@ class Memory:
         An ENTITY proposal is deliberately never bound. A bound ENTITY row *is* a naming
         assertion, so binding one here would let a model's proposal rename a person; naming
         stays with the host and with the identify path.
+
+        `consent` is a reserved predicate for the same reason and by the same route. A bound
+        STATE row carrying it *is* a consent statement -- it is what `consent()` reads and what
+        restrains enrolment and merging -- so binding one here would let a model manufacture or
+        retract permission to process a person without ever reaching the control plane, which
+        refuses a proposed `CONSENT` operation. The claim itself is kept, unbound: a model
+        inferring that somebody withdrew consent is evidence of what the model thought, and it
+        is recorded as an ordinary STATE about that subject with no identity attached.
         """
-        if proposal.kind is MemoryKind.ENTITY or proposal.subject is None:
+        if (
+            proposal.kind is MemoryKind.ENTITY
+            or proposal.subject is None
+            or proposal.predicate == CONSENT_PREDICATE
+        ):
             return None
         with _translate_storage_errors("resolve a claim's subject"):
             return self._store.identity_for_subject(proposal.subject)

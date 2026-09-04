@@ -41,6 +41,12 @@ _SQLITE_PARAMETER_BATCH = 900
 # `mindbridge.memory`, which writes those assertions, so the writer and the projection can never
 # disagree about which records they are.
 CONSENT_PREDICATE = "consent"
+# The one basis a consent statement can carry, hardcoded by `_consent_proposal`. Both consent
+# reads below filter on it as well as on the predicate, so a row reaching this table by any
+# other route -- a future writer, a hand-edited database -- cannot be read as a person's own
+# statement. Defence in depth: `Memory._bound_identity` already reserves the predicate, so no
+# model-originated claim is bound to an identity in the first place.
+_CONSENT_BASIS = EvidenceBasis.USER_STATEMENT.value
 # Consent states under which the kernel stops enrolling new biometric exemplars for a person.
 # Recognition against exemplars already held is unaffected: erasing what is held is
 # `forget_identity`, and answering a question about a photo is not new processing of a person.
@@ -5947,12 +5953,12 @@ def _current_consent_state(connection: sqlite3.Connection, identity_id: str) -> 
         FROM memory_semantics AS s
         JOIN memory_versions AS v ON v.memory_id = s.memory_id
         JOIN memory_records AS r ON r.memory_id = s.memory_id
-        WHERE s.identity_id = ? AND s.kind = ? AND s.predicate = ?
+        WHERE s.identity_id = ? AND s.kind = ? AND s.predicate = ? AND s.basis = ?
           AND v.retired_at IS NULL AND v.visible = 1 AND r.forgotten_at IS NULL
         ORDER BY v.recorded_at DESC, s.memory_id DESC
         LIMIT 1
         """,
-        (identity_id, MemoryKind.STATE.value, CONSENT_PREDICATE),
+        (identity_id, MemoryKind.STATE.value, CONSENT_PREDICATE, _CONSENT_BASIS),
     ).fetchone()
     return None if row is None else _optional_row_text(row, "value")
 
@@ -5974,11 +5980,11 @@ def _restrained_identities(connection: sqlite3.Connection) -> frozenset[str]:
             FROM memory_semantics AS s
             JOIN memory_versions AS v ON v.memory_id = s.memory_id
             JOIN memory_records AS r ON r.memory_id = s.memory_id
-            WHERE s.kind = ? AND s.predicate = ? AND s.identity_id IS NOT NULL
+            WHERE s.kind = ? AND s.predicate = ? AND s.basis = ? AND s.identity_id IS NOT NULL
               AND v.retired_at IS NULL AND v.visible = 1 AND r.forgotten_at IS NULL
             ORDER BY s.identity_id, v.recorded_at, s.memory_id
             """,
-            (MemoryKind.STATE.value, CONSENT_PREDICATE),
+            (MemoryKind.STATE.value, CONSENT_PREDICATE, _CONSENT_BASIS),
         ).fetchall()
     }
     return frozenset(

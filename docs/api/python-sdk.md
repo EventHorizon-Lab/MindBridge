@@ -429,6 +429,14 @@ model that could infer consent could manufacture permission to process a person.
 also may not `CORRECT`, `FORGET`, or `REINFORCE` a consent record; those are refused as
 `consent_assertion`.
 
+`consent` is therefore a **reserved predicate**. Ordinary formation does not pass through the
+control plane, so a `FormationBackend` or a consolidation proposal returning
+`FormationProposal(kind=STATE, predicate="consent", ...)` would otherwise have written the very
+row `consent()` reads. Such a proposal is never bound to an identity: it is stored as an ordinary
+`STATE` about its subject with `context.identity_id` unset, so it is searchable and auditable as
+what it is -- a model's inference -- and restrains nothing. Only `record_consent()` writes a bound
+consent assertion, and both consent reads additionally require `USER_STATEMENT` basis.
+
 `WITHHELD` and `WITHDRAWN` restrain the kernel identically from the next observation on. The
 difference between them is audit history, not policy:
 

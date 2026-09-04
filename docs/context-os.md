@@ -85,7 +85,9 @@ Consent is an assertion in the same family as naming -- an identity-bound, versi
 recorded as `USER_STATEMENT` -- and it is the one claim no backend may propose: a `CONSENT`
 operation reaching the kernel from a model is refused as `unauthorized`, exactly as a proposed
 `MERGE` is, because a model that could infer consent could manufacture permission to process a
-person. Withheld or withdrawn consent restrains the kernel from the next observation on: no new
+person. `consent` is a reserved predicate for the same reason: ordinary formation never passes
+through the control plane, so a model's typed proposal carrying it is stored unbound -- an
+inference about a subject rather than a statement by a person -- and binds to nobody. Withheld or withdrawn consent restrains the kernel from the next observation on: no new
 face or voice exemplar is enrolled for that person, no cross-modal merge binds their voice to
 their face, and `compile()` leaves them out of the bundle's actors with a `CONSENT_WITHHELD`
 unknown. It does not restrain recognition against exemplars already held, because answering a
