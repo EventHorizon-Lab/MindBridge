@@ -111,7 +111,7 @@ uvicorn my_application:app --host 127.0.0.1 --port 8000 --workers 1
 authorization, TLS, rate limiting, quota, or audit log. Bind to a trusted interface or put the app
 behind the deployment's existing gateway or middleware. Keep `/healthz` protected consistently; it
 reports liveness and the live composition's capability declaration, not model or retrieval
-readiness. The app publishes twelve product routes under `/v1`, or twenty-two when the host enables
+readiness. The app publishes thirteen product routes under `/v1`, or twenty-three when the host enables
 `identity_operations` and `embodied_operations`.
 
 Do not retry a timed-out request blindly. Adds are content-idempotent, but the SQLite commit can

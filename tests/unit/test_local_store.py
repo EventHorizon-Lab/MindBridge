@@ -2135,12 +2135,12 @@ _ADMITTED_INTENTS = (
 def test_schema_v12_migrates_straight_through_to_the_current_version_in_one_open(
     tmp_path: Path,
 ) -> None:
-    """A v12 store opened once lands on v15 with everything the three steps add.
+    """A v12 store opened once lands on v16 with everything the later steps add.
 
-    Each step is exercised on its own above (the caption cache, the scheduler log, the consent
-    intent); this pins that chaining them in a single `LocalStore(...)` open -- the only way a
-    store this old is ever actually opened -- reaches the same end state rather than stopping
-    on a rung.
+    Each step is exercised on its own above (the caption cache, scheduler log, consent intent,
+    and naming assertion); this pins that chaining them in a single `LocalStore(...)` open -- the
+    only way a store this old is ever actually opened -- reaches the same end state rather than
+    stopping on a rung.
     """
     applied_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
     with LocalStore(tmp_path) as store:
@@ -2213,7 +2213,7 @@ def test_schema_v12_migrates_straight_through_to_the_current_version_in_one_open
                 )
             ]
 
-    assert version == _SCHEMA_VERSION == 15
+    assert version == _SCHEMA_VERSION == 16
     assert "visual_descriptions" in tables
     assert {
         "memory_deliberations",
@@ -2226,6 +2226,55 @@ def test_schema_v12_migrates_straight_through_to_the_current_version_in_one_open
     assert [(row.operation_id, row.operation_key, row.intent) for row in logged] == [
         (1, "key-1", "forget")
     ]
+
+
+@pytest.mark.parametrize("schema_version", (11, 15))
+def test_registered_identity_migration_keeps_its_name_and_relationship(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    """The naming-assertion migration covers both old stores and the previous release."""
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory(),), (_embedding(),))
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.execute(
+            """
+            INSERT INTO identities (identity_id, name, relationship, created_at, updated_at)
+            VALUES ('identity-legacy', 'Alice', 'sister',
+                    '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+            """
+        )
+        connection.execute(f"PRAGMA user_version = {schema_version}")
+        connection.commit()
+
+    with LocalStore(tmp_path) as store:
+        assert store.identity_profile("identity-legacy") == IdentityProfile(
+            identity_id="identity-legacy",
+            name="Alice",
+            relationship="sister",
+            confirmed=True,
+        )
+        assert store.identity_for_subject("Alice") == "identity-legacy"
+        assert store.projected_identity_name("identity-legacy") == ("Alice", "sister")
+
+
+def test_pending_capture_filter_is_globally_oldest_first_across_sqlite_batches(
+    tmp_path: Path,
+) -> None:
+    newer_at = datetime(2026, 9, 4, 12, tzinfo=timezone.utc)
+    oldest_at = newer_at - timedelta(days=1)
+    newer = tuple(_memory(f"newer-{index:04d}") for index in range(900))
+    oldest = _memory("oldest")
+    with LocalStore(tmp_path) as store:
+        store.write_memories(newer, formation_pending_at=newer_at)
+        store.write_memories((oldest,), formation_pending_at=oldest_at)
+
+        pending = store.pending_captures(
+            limit=1,
+            memory_ids=(*(memory.memory_id for memory in newer), oldest.memory_id),
+        )
+
+    assert [row.memory_id for row in pending] == [oldest.memory_id]
 
 
 def test_forgotten_memories_leave_active_reads_but_stay_auditable(tmp_path: Path) -> None:
@@ -2639,6 +2688,72 @@ def _semantic_bindings(store: LocalStore) -> dict[str, str | None]:
             str(row[0]): None if row[1] is None else str(row[1])
             for row in connection.execute("SELECT memory_id, identity_id FROM memory_semantics")
         }
+
+
+def test_reactivated_deterministic_output_is_reindexed_and_retires_on_rollback(
+    tmp_path: Path,
+) -> None:
+    recorded_at = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    derived = replace(
+        _memory("derived", "the door is open", created_at=recorded_at),
+        context=MemoryContext(
+            kind=MemoryKind.STATE,
+            basis=EvidenceBasis.USER_STATEMENT,
+            confidence=1.0,
+            valid_from=None,
+            valid_until=None,
+            recorded_at=recorded_at,
+            lineage_id="door-state",
+            subject="door",
+            predicate="state",
+            value="open",
+        ),
+    )
+    with LocalStore(tmp_path) as store:
+        store.write_memories((derived,), (_embedding("e-derived", "derived"),))
+        store.acknowledge_index_operations(store.pending_index_operations(limit=100))
+        corrected = store.apply_control_operation(
+            StoredOperation(
+                operation_key="correct-derived",
+                intent="correct",
+                trigger="manual",
+                operation_json="{}",
+                applied_at=recorded_at + timedelta(minutes=1),
+            ),
+            correct_ids=(derived.memory_id,),
+        )
+        assert corrected is not None
+        assert store.read_memory(derived.memory_id).context.retired_at is not None  # type: ignore[union-attr]
+
+        assert store.apply_formation(
+            (replace(derived, updated_at=recorded_at + timedelta(minutes=2)),),
+            (),
+            evidence=(),
+            source_memory_ids=(),
+            recipe="test-restatement",
+            completed_at=recorded_at + timedelta(minutes=2),
+            operation=StoredOperation(
+                operation_key="restate-derived",
+                intent="consolidate",
+                trigger="manual",
+                operation_json="{}",
+                applied_at=recorded_at + timedelta(minutes=2),
+            ),
+        )
+        restated = store.read_operations(operation_key="restate-derived")[0]
+        assert restated.activated_ids == (derived.memory_id,)
+        assert store.read_memory(derived.memory_id).context.retired_at is None  # type: ignore[union-attr]
+        assert [
+            operation.embedding_id for operation in store.pending_index_operations(limit=100)
+        ] == ["e-derived"]
+
+        reverted, _assets = store.rollback_operation(
+            restated.operation_id,
+            rolled_back_at=recorded_at + timedelta(minutes=3),
+            retire_versions=restated.activated_ids,
+        )
+        assert reverted is True
+        assert store.read_memory(derived.memory_id).context.retired_at is not None  # type: ignore[union-attr]
 
 
 def test_the_projection_follows_every_visibility_change_of_a_naming_assertion(

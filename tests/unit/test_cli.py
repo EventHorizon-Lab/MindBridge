@@ -999,6 +999,29 @@ def test_remote_mode_compiles_over_v1(
     ]
 
 
+@pytest.mark.parametrize("freshness", ("inf", "1e100"))
+def test_compile_rejects_an_unrepresentable_freshness_before_a_remote_request(
+    freshness: str,
+    calls: list[tuple[str, str, object]],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    status, stdout, stderr = _run(
+        capsys,
+        "--url",
+        "http://owner:8000",
+        "-q",
+        "compile",
+        "what should I bring",
+        "--freshness-seconds",
+        freshness,
+    )
+
+    assert status == EXIT_CODES[ValidationError.code]
+    assert stdout is None
+    assert cast(dict[str, object], stderr[0])["code"] == ValidationError.code
+    assert calls == []
+
+
 def test_remote_mode_passes_the_cursor_through_unparsed(
     calls: list[tuple[str, str, object]], capsys: pytest.CaptureFixture[str]
 ) -> None:

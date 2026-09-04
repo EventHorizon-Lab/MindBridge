@@ -9,8 +9,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from mindbridge.benchmarks.eval_regression import PERFORMANCE_BUDGET_NAMES
+from mindbridge.configuration import _absolute_http_url
 from mindbridge.types import Modality
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
@@ -35,8 +37,8 @@ class ModelConfig:
     generation_min_video_seconds: float | None = None
 
     def __post_init__(self) -> None:
-        if not self.generation_base_url.strip():
-            raise ValueError("generation_base_url must not be blank")
+        if not _absolute_http_url(self.generation_base_url):
+            raise ValueError("generation_base_url must be an absolute http(s) URL")
         if not self.generation_model.strip():
             raise ValueError("generation_model must not be blank")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
@@ -119,6 +121,21 @@ class DownloadOverrides(_HarnessModel):
     youtube_sleep_seconds: Annotated[float, Field(strict=True, ge=0)] | None = None
 
 
+class ServerMetricsOverrides(_HarnessModel):
+    """Optional process-global vLLM metric endpoints for the measured product phase."""
+
+    generation_url: str | None = None
+    embedding_url: str | None = None
+    timeout_seconds: Annotated[float, Field(strict=True, gt=0)] = 5.0
+
+    @field_validator("generation_url", "embedding_url")
+    @classmethod
+    def _absolute_metrics_url(cls, value: str | None) -> str | None:
+        if value is not None and not _absolute_http_url(value):
+            raise ValueError("server metrics URL must be an absolute HTTP or HTTPS URL")
+        return value
+
+
 class RunOverrides(_HarnessModel):
     """Run tunables the command line also exposes, so one file can describe a whole sweep.
 
@@ -160,6 +177,7 @@ class RunOverrides(_HarnessModel):
     # One integer, or three, or four -- the shorter forms expand exactly as the flag expands them.
     seed: int | Sequence[int] | None = None
     bootstrap_samples: Annotated[int, Field(strict=True, gt=0)] | None = None
+    repeat_index: Annotated[int, Field(strict=True, ge=0)] | None = None
     device: str | None = None
     device_lock: bool | None = None
     use_cache: Path | None = None
@@ -188,7 +206,19 @@ class HarnessOverrides(_HarnessModel):
 
     judge: JudgeOverrides = Field(default_factory=JudgeOverrides)
     download: DownloadOverrides = Field(default_factory=DownloadOverrides)
+    server_metrics: ServerMetricsOverrides = Field(default_factory=ServerMetricsOverrides)
+    performance_budgets: Mapping[str, Annotated[float, Field(strict=True, ge=0)]] = Field(
+        default_factory=dict
+    )
     run: RunOverrides = Field(default_factory=RunOverrides)
+
+    @field_validator("performance_budgets")
+    @classmethod
+    def _known_performance_budgets(cls, value: Mapping[str, float]) -> Mapping[str, float]:
+        unknown = sorted(set(value) - set(PERFORMANCE_BUDGET_NAMES))
+        if unknown:
+            raise ValueError(f"unknown performance budget(s): {', '.join(unknown)}")
+        return value
 
 
 def default_benchmarks_root(start: Path | None = None) -> Path:

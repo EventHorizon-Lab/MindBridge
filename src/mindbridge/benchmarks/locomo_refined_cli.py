@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
-import json
 import os
 import platform
 from collections.abc import Sequence
@@ -14,7 +13,7 @@ from importlib import metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from mindbridge.benchmarks.eval import _BackendPool
+from mindbridge.benchmarks.eval import _BackendPool, _jsonl_bytes
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.locomo_refined import (
     LOCOMO_REFINED_ADAPTER_VERSION,
@@ -122,16 +121,7 @@ def _write_artifacts(
         raise RuntimeError("benchmark results do not match the loaded conversations")
     _require_writable(arguments.output, overwrite=arguments.overwrite)
 
-    rows = "".join(
-        json.dumps(
-            prediction.model_dump(mode="json"),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
-        for prediction in predictions
-    ).encode("utf-8")
+    rows = _jsonl_bytes(prediction.model_dump(mode="json") for prediction in predictions)
     config = ModelConfig.from_environment()
     manifest = {
         "adapter_version": LOCOMO_REFINED_ADAPTER_VERSION,
@@ -163,9 +153,7 @@ def _write_artifacts(
         "unit_concurrency": arguments.unit_concurrency,
         "zvec_version": metadata.version("zvec"),
     }
-    manifest_bytes = (
-        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-    ).encode("utf-8")
+    manifest_bytes = _jsonl_bytes((manifest,))
     _atomic_replace(
         (
             (arguments.output, rows),
@@ -210,7 +198,7 @@ def _require_writable(output: Path, *, overwrite: bool) -> None:
 
 
 def _manifest_path(output: Path) -> Path:
-    return output.with_suffix(output.suffix + ".manifest.json")
+    return output.with_suffix(output.suffix + ".manifest.jsonl")
 
 
 def _atomic_replace(files: tuple[tuple[Path, bytes], ...]) -> None:

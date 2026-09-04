@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, NonEmptyString
 
@@ -99,6 +99,9 @@ class _RawQuestion(BaseModel):
     haystack_sessions: list[list[_RawTurn] | _RawSession] = Field(min_length=1)
 
 
+_RAW_QUESTIONS = TypeAdapter(list[_RawQuestion])
+
+
 class _RawAgentSubset(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -130,12 +133,17 @@ def load_memlens_agent_subset(index_path: Path) -> tuple[Identifier, ...]:
 def _load_raw_questions(path: Path) -> list[_RawQuestion]:
     import json
 
-    payload = json.loads(path.read_bytes())
+    encoded = path.read_bytes()
+    root = next((byte for byte in encoded if byte not in b" \t\r\n"), None)
+    if root == ord("["):
+        return _RAW_QUESTIONS.validate_json(encoded)
+
+    payload = json.loads(encoded)
     if isinstance(payload, dict):
         payload = payload.get("data", payload)
     if not isinstance(payload, list):
         raise ValueError("MEMLENS dataset root must be a list or contain a data list")
-    return [_RawQuestion.model_validate(item) for item in payload]
+    return _RAW_QUESTIONS.validate_python(payload)
 
 
 def _question(raw: _RawQuestion) -> MemLensQuestion:

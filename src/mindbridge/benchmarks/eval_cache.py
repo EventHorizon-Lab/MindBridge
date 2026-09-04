@@ -55,6 +55,9 @@ class CachedAnswer:
     evidence: tuple[EvidenceInterval, ...] = ()
     abstained: bool = False
     abstention_reason: str | None = None
+    # None means an older cache entry did not retain the diagnostic. An empty tuple is a
+    # successful diagnostic that returned no candidates; those two cases score differently.
+    ranked_source_ids: tuple[str, ...] | None = None
 
 
 class ResponseCache:
@@ -93,6 +96,7 @@ class ResponseCache:
                 "evidence": tuple(item.json() for item in answer.evidence),
                 "abstained": answer.abstained,
                 "abstention_reason": answer.abstention_reason,
+                "ranked_source_ids": answer.ranked_source_ids,
             },
             ensure_ascii=False,
             allow_nan=False,
@@ -157,13 +161,22 @@ def _answer(payload: str) -> CachedAnswer:
     value = json.loads(payload)
     if not isinstance(value, dict):
         raise ValueError("response cache payload must be an object")
-    prediction, confidence, memory_ids, evidence, abstained, abstention_reason = (
+    (
+        prediction,
+        confidence,
+        memory_ids,
+        evidence,
+        abstained,
+        abstention_reason,
+        ranked_source_ids,
+    ) = (
         value.get("prediction"),
         value.get("confidence"),
         value.get("memory_ids"),
         value.get("evidence", []),
         value.get("abstained", False),
         value.get("abstention_reason"),
+        value.get("ranked_source_ids"),
     )
     if (
         not isinstance(prediction, str)
@@ -176,6 +189,13 @@ def _answer(payload: str) -> CachedAnswer:
         or not isinstance(abstained, bool)
         or (abstention_reason is not None and not isinstance(abstention_reason, str))
         or abstained != (abstention_reason is not None)
+        or (
+            ranked_source_ids is not None
+            and (
+                not isinstance(ranked_source_ids, list)
+                or any(not isinstance(item, str) for item in ranked_source_ids)
+            )
+        )
     ):
         raise ValueError("response cache payload is invalid")
     try:
@@ -189,6 +209,7 @@ def _answer(payload: str) -> CachedAnswer:
         intervals,
         abstained,
         abstention_reason,
+        None if ranked_source_ids is None else tuple(ranked_source_ids),
     )
 
 

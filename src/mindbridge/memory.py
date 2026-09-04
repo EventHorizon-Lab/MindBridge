@@ -28,7 +28,7 @@ from collections.abc import (
 )
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, closing, contextmanager, suppress
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from functools import partial
@@ -43,10 +43,12 @@ from opentelemetry.trace import Span, Tracer
 from opentelemetry.util.types import AttributeValue
 
 from mindbridge._telemetry import (
+    ASYNC_QUEUE_TIME,
     CAPTURE_FAILED,
     CAPTURE_SETTLED,
     CAPTURE_TIME_TO_SEARCHABLE,
     EMBEDDING_PARTS_ELIDED,
+    EMBEDDING_TASK,
     IDENTITY_CACHED,
     IDENTITY_CREATED,
     IDENTITY_EVIDENCE_ASSETS,
@@ -57,9 +59,11 @@ from mindbridge._telemetry import (
     IDENTITY_OBSERVATIONS,
     MODEL_MODULE,
     MODEL_TTFT,
+    OPERATION_TTFT,
     SPAN_KIND,
     TRACER_NAME,
     VISION_BATCHES_FAILED,
+    _record_retrieval_results,
     current_model_request_count,
     mark_model_requests,
     model_span,
@@ -375,6 +379,10 @@ _NEGATED_CONTRACTION = re.compile(r"n['\u2019]t\b", re.IGNORECASE)
 _MAX_CONTENT_PARTS = 128
 # Returned by `next(..., default)` so an exhausted stream never raises across a future.
 _STREAM_EXHAUSTED = object()
+_ASYNC_QUEUE_TIME_MS: ContextVar[float | None] = ContextVar(
+    "mindbridge_async_queue_time_ms",
+    default=None,
+)
 # Model span modules mapped onto the failure stage a caller sees.
 _MODEL_STAGES = {
     "consolidation": "consolidate",
@@ -837,6 +845,7 @@ class Memory:
         *,
         kind: str,
         attributes: Mapping[str, AttributeValue] | None = None,
+        failure_stage: str | None = None,
     ) -> AbstractContextManager[Span]:
         values = dict(attributes or {})
         values[SPAN_KIND] = kind
@@ -844,7 +853,7 @@ class Memory:
             return operation_span(self._tracer, name, attributes=values)
         return _staged(
             traced_span(self._tracer, name, attributes=values),
-            name.removeprefix("mindbridge."),
+            failure_stage or name.removeprefix("mindbridge."),
         )
 
     def _model_trace(
@@ -1528,67 +1537,72 @@ class Memory:
         scope: RetrievalScope | None,
         link_identities: bool,
     ) -> Generator[AnswerChunk, None, AnswerResult]:
-        with self._trace("mindbridge.ask", kind="operation"), self._operation() as assets:
+        started = perf_counter()
+        operation_ttft_recorded = False
+        with (
+            self._trace("mindbridge.ask", kind="operation") as span,
+            self._operation() as assets,
+        ):
+            queue_time_ms = _ASYNC_QUEUE_TIME_MS.get()
+            if queue_time_ms is not None:
+                span.set_attribute(ASYNC_QUEUE_TIME, queue_time_ms)
             _limit(limit, maximum=100)
             self._require_answerer()
-            with self._trace("mindbridge.content.prepare", kind="stage"):
-                prepared = self._prepare_content(question, assets)
-            explicit_reference = _reference_at(reference_at)
-            reference, temporal_text = _temporal_context(
-                prepared.text,
-                explicit_reference or datetime.now(timezone.utc),
-                infer_reference=explicit_reference is None,
-            )
-            temporal_range = _temporal_range(temporal_text, reference)
-            scope = _retrieval_scope(scope)
-            prepared_search = partial(
-                self._search_prepared,
-                prepared,
-                # Without a budget the answer grounds on `limit` hits, so ranking three times
-                # that is enough headroom for the modality round robin. With one, the budget is
-                # what decides depth, so the whole rerank pool has to be ranked for it to spend.
-                limit=(
-                    _RERANK_CANDIDATES if self._evidence_budget is not None else min(100, limit * 3)
-                ),
-                operation=assets,
-                memory_types=_pushed_memory_types(_optional_memory_type(memory_type)),
-                reference_at=reference,
-                temporal_range=temporal_range,
-                occurred_from=None,
-                occurred_until=None,
-                scope=scope,
-                require_unambiguous=limit == 1,
-                capture_trace=False,
-            )
-
-            def search() -> _SearchOutcome:
-                # `search()` opens a `mindbridge.search` operation span; `ask` reaches the same
-                # retrieval plane directly, so without this the only retrieval span inside `ask`
-                # is `mindbridge.index.search` -- the index lookup alone, excluding query
-                # embedding and content preparation. Reporting that as "search latency" would name
-                # a quantity nobody experiences, which is the failure the design doc's end-to-end
-                # rule exists to prevent. One stage span per `ask`, covering the whole leg.
-                with self._trace("mindbridge.retrieve", kind="stage"):
-                    return prepared_search()
-
-            speech_assets = self._answer_speech_assets(prepared.assets)
-            if speech_assets and all(
-                Modality(asset.modality) in self._embedding_capabilities for asset in speech_assets
-            ):
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    context = copy_context()
-                    identities = executor.submit(
-                        context.run,
-                        self._recognize_speech,
-                        speech_assets,
-                        assets,
-                    )
-                    hits = search().hits
-                    identities.result()
-            else:
-                if speech_assets:
-                    self._recognize_speech(speech_assets, assets)
-                hits = search().hits
+            # `search()` opens a `mindbridge.search` operation span; `ask` reaches the same
+            # retrieval plane directly. Keep its stage around every prerequisite through ranked
+            # hits so the reported leg matches what answering actually waits for.
+            with self._trace("mindbridge.retrieve", kind="stage"):
+                with self._trace("mindbridge.content.prepare", kind="stage"):
+                    prepared = self._prepare_content(question, assets)
+                explicit_reference = _reference_at(reference_at)
+                reference, temporal_text = _temporal_context(
+                    prepared.text,
+                    explicit_reference or datetime.now(timezone.utc),
+                    infer_reference=explicit_reference is None,
+                )
+                temporal_range = _temporal_range(temporal_text, reference)
+                scope = _retrieval_scope(scope)
+                prepared_search = partial(
+                    self._search_prepared,
+                    prepared,
+                    # Without a budget the answer grounds on `limit` hits, so ranking three times
+                    # that is enough headroom for the modality round robin. With one, the budget is
+                    # what decides depth, so the whole rerank pool has to be ranked for it to spend.
+                    limit=(
+                        _RERANK_CANDIDATES
+                        if self._evidence_budget is not None
+                        else min(100, limit * 3)
+                    ),
+                    operation=assets,
+                    memory_types=_pushed_memory_types(_optional_memory_type(memory_type)),
+                    reference_at=reference,
+                    temporal_range=temporal_range,
+                    occurred_from=None,
+                    occurred_until=None,
+                    scope=scope,
+                    require_unambiguous=limit == 1,
+                    capture_trace=False,
+                )
+                speech_assets = self._answer_speech_assets(prepared.assets)
+                if speech_assets and all(
+                    Modality(asset.modality) in self._embedding_capabilities
+                    for asset in speech_assets
+                ):
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        context = copy_context()
+                        identities = executor.submit(
+                            context.run,
+                            self._recognize_speech,
+                            speech_assets,
+                            assets,
+                        )
+                        hits = prepared_search().hits
+                        identities.result()
+                else:
+                    if speech_assets:
+                        self._recognize_speech(speech_assets, assets)
+                    hits = prepared_search().hits
+            _record_retrieval_results(hits)
             hits = _grounding_hits(hits, limit, budget_chars=self._evidence_budget)
             # Every question the answerer reads as text gets the reference time, not just the ones
             # whose phrasing a parser recognized. "How long ago did grandpa visit?" narrows no
@@ -1617,6 +1631,12 @@ class Memory:
                     except StopIteration as complete:
                         result = complete.value
                         break
+                    if delta.strip() and not operation_ttft_recorded:
+                        operation_ttft_ms = (perf_counter() - started) * 1_000.0
+                        if queue_time_ms is not None:
+                            operation_ttft_ms += queue_time_ms
+                        span.set_attribute(OPERATION_TTFT, operation_ttft_ms)
+                        operation_ttft_recorded = True
                     yield AnswerChunk(text=delta)
             used_ids = {hit.id for hit in result.hits}
             grounding = tuple(hit for hit in hits if hit.id in used_ids)
@@ -2359,9 +2379,9 @@ class Memory:
                 raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
             assert normalized_id is not None
             assert memory_ids is not None
-            # The assertion commits first because the projection reads it. Naming is now one
-            # auditable step: assert the claim, then recompute the name and the indexed text
-            # that must agree with it, in one commit.
+            # `_assert_identity_name` prepares the affected speech documents before it commits,
+            # then writes the assertion, registry projection, documents, vectors, and log in one
+            # SQLite transaction.
             self._assert_identity_name(
                 normalized_id,
                 normalized_name,
@@ -2372,23 +2392,6 @@ class Memory:
                 ),
                 operation=operation,
             )
-            projected, _relationship = self._projected_identity(normalized_id)
-            memories, embeddings = self._reindex_identity_speech(
-                normalized_id,
-                speaker_name=projected,
-                operation=operation,
-            )
-            with _translate_storage_errors("register identity"):
-                registered = self._store.refresh_identity_projection(
-                    normalized_id,
-                    memories=memories,
-                    embeddings=embeddings,
-                )
-            if registered is None:
-                if speaker:
-                    raise SpeakerNotFoundError(f"speaker does not exist: {requested_id}")
-                raise IdentityNotFoundError(f"identity does not exist: {requested_id}")
-            self._drain_outbox()
 
     def _bound_identity(self, proposal: FormationProposal) -> str | None:
         """Resolve which recognized person a proposed claim is about, or None.
@@ -2478,9 +2481,9 @@ class Memory:
             claim=IdentityClaim(identity_id=identity_id, name=name, relationship=relationship),
             rationale="the host registered this name",
         )
-        key = operation_key(proposed, recipe=_NAMING_RECIPE)
+        base_key = operation_key(proposed, recipe=_NAMING_RECIPE)
         with _translate_storage_errors("check a naming operation"):
-            already_logged = bool(self._store.read_operations(operation_key=key))
+            key = self._store.naming_operation_key(base_key, prepared.memory_id)
         # `_register_identity` holds `_formation_lock` for this whole call (the same lock
         # `add()`'s automatic formation holds across its own `_commit_formation`, see
         # `_form_sources`), so this IDENTIFY commit cannot land while a consolidate apply pass
@@ -2494,7 +2497,7 @@ class Memory:
             # key is already active and the log's unique index would refuse it anyway.
             operation=(
                 None
-                if already_logged
+                if key is None
                 else StoredOperation(
                     operation_key=key,
                     intent=proposed.intent.value,
@@ -2503,6 +2506,12 @@ class Memory:
                     operation_json=dump_operation(proposed),
                     applied_at=now,
                 )
+            ),
+            projection_identity_id=identity_id,
+            projection_factory=lambda: self._reindex_identity_speech(
+                identity_id,
+                speaker_name=name,
+                operation=operation,
             ),
         )
         return prepared.memory_id
@@ -3099,7 +3108,11 @@ class Memory:
                     ),
                     # An identity assertion is retracted rather than deleted: its own version
                     # is retired here and `restore_versions` brings back the one it displaced.
-                    retire_versions=row.created_ids if assertion else (),
+                    retire_versions=(
+                        *row.activated_ids,
+                        *(row.created_ids if assertion else ()),
+                    ),
+                    require_no_later_dependencies=((*row.created_ids, *row.activated_ids)),
                     require_in_force=(
                         (*row.created_ids, *row.changed_ids) if row.superseded else ()
                     ),
@@ -3256,6 +3269,7 @@ class Memory:
                 batch_size=len(evidence),
                 modalities=(record.modality for record in evidence),
             ):
+                mark_model_requests(1)
                 proposals = self._consolidator.consolidate(evidence, trigger=trigger)
         except MindBridgeError:
             raise
@@ -3580,21 +3594,39 @@ class Memory:
             ),
             context=context,
         )
-        logged = self._commit_formation(
-            tuple((prepared, source.id, proposal.confidence) for source in sources),
-            (),
-            completed_at=now,
-            recipe=self._consolidation_recipe,
-            operation=pending,
-            # Re-checked inside the apply transaction, because everything above was read before
-            # it opened: cited evidence a CORRECT retired in between makes the naming stale, and
-            # the dispatch turns that into a `stale` rejection.
-            require_active=operation.evidence_ids,
-            require_unretired=operation.evidence_ids,
-        )
+
+        def projection() -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
+            with _translate_storage_errors("preview an identity projection"):
+                projected, _relationship = self._store.naming_projection_after_assertion(
+                    identity_id,
+                    prepared.memory_id,
+                    context,
+                )
+            return self._reindex_identity_speech(
+                identity_id,
+                speaker_name=projected,
+                operation=assets,
+            )
+
+        # Hold the lock while `_commit_formation` prepares the assertion and projection vectors
+        # and commits both, so no concurrent naming write can invalidate the preview.
+        with self._write_lock:
+            logged = self._commit_formation(
+                tuple((prepared, source.id, proposal.confidence) for source in sources),
+                (),
+                completed_at=now,
+                recipe=self._consolidation_recipe,
+                operation=pending,
+                # Re-checked inside the apply transaction, because everything above was read
+                # before it opened: cited evidence a CORRECT retired in between makes the naming
+                # stale, and the dispatch turns that into a `stale` rejection.
+                require_active=operation.evidence_ids,
+                require_unretired=operation.evidence_ids,
+                projection_identity_id=identity_id,
+                projection_factory=projection,
+            )
         if logged is None:
             raise _RejectedOperation("duplicate")
-        self._reproject_identity(identity_id)
         return logged
 
     def _control_records(self, memory_ids: Sequence[str]) -> dict[str, StoredMemory]:
@@ -4408,6 +4440,7 @@ class Memory:
                 batch_size=len(inputs),
                 modalities=(modality for value in inputs for modality in value.content.modalities),
             ):
+                mark_model_requests(1)
                 proposals_by_source = self._former.form(inputs)
         except MindBridgeError:
             raise
@@ -4510,6 +4543,11 @@ class Memory:
         forget_ids: Sequence[str] = (),
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
+        projection_identity_id: str | None = None,
+        projection_factory: Callable[
+            [], tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]
+        ]
+        | None = None,
     ) -> StoredOperation | None:
         """Embed and commit derived records; return the log row when one was requested.
 
@@ -4564,7 +4602,10 @@ class Memory:
                 place_id=memory.place_id,
                 context=cast(MemoryContext, memory.context),
             )
-            for memory in missing
+            # Existing records travel too: they skip embedding, not the write. The store decides
+            # whether a standing assertion is a no-op or a retired deterministic assertion needs
+            # a new current version.
+            for memory in unique
         )
         embeddings = tuple(
             StoredEmbedding(
@@ -4593,6 +4634,12 @@ class Memory:
                     if memory_id not in set(created)
                 ),
             )
+        projection_memories: tuple[StoredMemory, ...] = ()
+        projection_embeddings: tuple[StoredEmbedding, ...] = ()
+        if projection_factory is not None:
+            # Derived assertion vectors are prepared first, then every speech document the new
+            # projection affects. Neither reaches SQLite until both model calls have succeeded.
+            projection_memories, projection_embeddings = projection_factory()
         with self._write_lock:
             with _translate_storage_errors("commit automatic memory formation"):
                 applied = self._store.apply_formation(
@@ -4611,6 +4658,9 @@ class Memory:
                     forget_ids=forget_ids,
                     require_active=require_active,
                     require_unretired=require_unretired,
+                    projection_identity_id=projection_identity_id,
+                    projection_memories=projection_memories,
+                    projection_embeddings=projection_embeddings,
                 )
             self._drain_outbox()
         if operation is None:
@@ -6419,7 +6469,8 @@ class Memory:
             model=self._embedding_model,
             batch_size=len(inputs),
             modalities=(modality for value in inputs for modality in value.modalities),
-        ):
+        ) as span:
+            span.set_attribute(EMBEDDING_TASK, task.value)
             mark_model_requests(1)
             try:
                 vectors = self._embedder.embed(inputs, task=task)
@@ -6711,26 +6762,31 @@ class Memory:
 
     def _apply_outbox(self) -> None:
         while True:
-            with _translate_storage_errors("read the search-index outbox"):
-                operations = self._store.pending_index_operations(limit=_OUTBOX_BATCH_SIZE)
-            if not operations:
-                return
-            last_by_embedding = {operation.embedding_id: operation for operation in operations}
-            current = sorted(
-                last_by_embedding.values(), key=lambda operation: operation.operation_id
-            )
-            with _translate_storage_errors("hydrate the search-index outbox"):
-                hydrated = self._store.read_index_documents(
-                    tuple(operation.embedding_id for operation in current)
+            with self._trace(
+                "mindbridge.index.sync.sqlite.read",
+                kind="stage",
+                failure_stage="index.sync",
+            ):
+                with _translate_storage_errors("read the search-index outbox"):
+                    operations = self._store.pending_index_operations(limit=_OUTBOX_BATCH_SIZE)
+                if not operations:
+                    return
+                last_by_embedding = {operation.embedding_id: operation for operation in operations}
+                current = sorted(
+                    last_by_embedding.values(), key=lambda operation: operation.operation_id
                 )
-                identity_memory_ids = tuple(
-                    dict.fromkeys(
-                        document.embedding.memory_id
-                        for document in hydrated
-                        if "[speech identities:" in document.content
+                with _translate_storage_errors("hydrate the search-index outbox"):
+                    hydrated = self._store.read_index_documents(
+                        tuple(operation.embedding_id for operation in current)
                     )
-                )
-                memories = self._store.read_memories(identity_memory_ids)
+                    identity_memory_ids = tuple(
+                        dict.fromkeys(
+                            document.embedding.memory_id
+                            for document in hydrated
+                            if "[speech identities:" in document.content
+                        )
+                    )
+                    memories = self._store.read_memories(identity_memory_ids)
             by_id = {document.embedding.embedding_id: document for document in hydrated}
             asset_ids = {
                 memory.memory_id: frozenset(asset.asset_id for asset in memory.assets)
@@ -6752,14 +6808,44 @@ class Memory:
                 for operation in current
                 if operation.embedding_id not in by_id
             ]
-            with _translate_index_errors("update the search index"):
+            with (
+                self._trace(
+                    "mindbridge.index.sync.zvec.apply",
+                    kind="stage",
+                    failure_stage="index.sync",
+                ),
+                _translate_index_errors("update the search index"),
+            ):
                 if deleted_ids:
                     self._index.delete(deleted_ids)
                 if documents:
                     self._index.upsert(documents)
+            with (
+                self._trace(
+                    "mindbridge.index.sync.zvec.flush",
+                    kind="stage",
+                    failure_stage="index.sync",
+                ),
+                _translate_index_errors("update the search index"),
+            ):
                 self._index.flush()
+            with (
+                self._trace(
+                    "mindbridge.index.sync.zvec.optimize",
+                    kind="stage",
+                    failure_stage="index.sync",
+                ),
+                _translate_index_errors("update the search index"),
+            ):
                 self._index.optimize_if_needed()
-            with _translate_storage_errors("acknowledge the search-index outbox"):
+            with (
+                self._trace(
+                    "mindbridge.index.sync.sqlite.ack",
+                    kind="stage",
+                    failure_stage="index.sync",
+                ),
+                _translate_storage_errors("acknowledge the search-index outbox"),
+            ):
                 acknowledged = self._store.acknowledge_index_operations(operations)
             if acknowledged != len(operations):
                 raise StorageError(
@@ -7305,15 +7391,23 @@ class AsyncMemory:
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
     ) -> AnswerResult:
-        return await asyncio.to_thread(
-            self._memory.ask,
-            question,
-            limit=limit,
-            memory_type=memory_type,
-            reference_at=reference_at,
-            scope=scope,
-            link_identities=link_identities,
-        )
+        queued_at = perf_counter()
+
+        def answer() -> AnswerResult:
+            token = _ASYNC_QUEUE_TIME_MS.set((perf_counter() - queued_at) * 1_000.0)
+            try:
+                return self._memory.ask(
+                    question,
+                    limit=limit,
+                    memory_type=memory_type,
+                    reference_at=reference_at,
+                    scope=scope,
+                    link_identities=link_identities,
+                )
+            finally:
+                _ASYNC_QUEUE_TIME_MS.reset(token)
+
+        return await asyncio.to_thread(answer)
 
     def ask_stream(
         self,
@@ -7351,6 +7445,7 @@ class AsyncMemory:
         stream: Generator[AnswerChunk, None, AnswerResult],
     ) -> AsyncGenerator[AnswerChunk, None]:
         loop = asyncio.get_running_loop()
+        context = copy_context()
         # One worker, not `asyncio.to_thread`: every step has to run on the same thread so the
         # span and operation contextvars the generator attaches on its first step are the ones
         # it detaches on its last. `to_thread` runs each call in a fresh context copy, which
@@ -7362,16 +7457,37 @@ class AsyncMemory:
         # streams are counted in tens; give the class a shared pool of pinned workers if a host
         # ever runs enough of them for the thread count to bind before the provider does.
         worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mindbridge-ask")
+        first_advance = True
+
+        def advance(queued_at: float, record_queue: bool) -> object:
+            token = None
+            if record_queue:
+                token = _ASYNC_QUEUE_TIME_MS.set((perf_counter() - queued_at) * 1_000.0)
+            try:
+                return next(stream, _STREAM_EXHAUSTED)
+            finally:
+                if token is not None:
+                    _ASYNC_QUEUE_TIME_MS.reset(token)
+
         try:
             while True:
-                chunk = await loop.run_in_executor(worker, next, stream, _STREAM_EXHAUSTED)
+                queued_at = perf_counter()
+                record_queue = first_advance
+                first_advance = False
+                chunk = await loop.run_in_executor(
+                    worker,
+                    context.run,
+                    advance,
+                    queued_at,
+                    record_queue,
+                )
                 if chunk is _STREAM_EXHAUSTED:
                     return
                 yield cast(AnswerChunk, chunk)
         finally:
             # A running executor call cannot be cancelled, so the close always completes even
             # when the awaiting task is gone; `wait=False` keeps that off the event loop.
-            closing_stream = loop.run_in_executor(worker, stream.close)
+            closing_stream = loop.run_in_executor(worker, context.run, stream.close)
             with suppress(asyncio.CancelledError):
                 await asyncio.shield(closing_stream)
             worker.shutdown(wait=False)
@@ -8338,6 +8454,8 @@ def _observation_context_identity(context: ObservationContext) -> dict[str, obje
             None if context.valid_until is None else _datetime_text(context.valid_until)
         ),
     }
+    if context.place_id is not None:
+        value["place_id"] = context.place_id
     if spatial is not None:
         value["spatial"] = {
             "frame_id": spatial.frame_id,

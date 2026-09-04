@@ -10,9 +10,11 @@ import re
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile, mkdtemp
+from threading import Lock
 from typing import TYPE_CHECKING, TypeAlias, TypeVar
 from urllib.parse import urlparse
 
@@ -23,10 +25,14 @@ if TYPE_CHECKING:
     from mindbridge.benchmarks.supermemory_vqa import SuperMemoryQuestion
 
 _SEGMENT_SECONDS = 30
-_VIDEO_FILTER = (
-    "fps=1,scale=w='min(640\\,iw)':h='min(360\\,ih)':"
+_VIDEO_SCALE_FILTER = (
+    "scale=w='min(640\\,iw)':h='min(360\\,ih)':"
     "force_original_aspect_ratio=decrease:force_divisible_by=2"
 )
+_VIDEO_FILTER = f"fps=1,{_VIDEO_SCALE_FILTER}"
+# The concat demuxer has no following packet from which the fps filter can infer
+# the final frame's duration. Passing it through keeps N official frames as N seconds.
+_OPENEQA_VIDEO_FILTER = f"fps=1:eof_action=pass,{_VIDEO_SCALE_FILTER}"
 _EGOLIFE_NAME = re.compile(r"^DAY([1-9][0-9]*)_[^_]+_[^_]+_([0-9]{8})$")
 # OpenEQA episode histories are directories of RGB frames with no published
 # video encoding for evaluation -- upstream's `data/frames2videos.py` writes at
@@ -37,8 +43,31 @@ _EGOLIFE_NAME = re.compile(r"^DAY([1-9][0-9]*)_[^_]+_[^_]+_([0-9]{8})$")
 # would silently discard 29 of every 30. Raise it only to deliberately thin a
 # scene's history.
 _OPENEQA_FRAME_RATE = 1
+# ponytail: ffmpeg is already multithreaded; bound source-level fan-out at four unless profiling
+# on supported hardware demonstrates that a public tuning knob pays for itself.
+_PREPARATION_WORKERS = min(4, os.cpu_count() or 1)
 _T = TypeVar("_T")
+_R = TypeVar("_R")
 Limit: TypeAlias = int | float | None
+
+
+def _prepare_many(function: Callable[[_T], _R], values: Sequence[_T]) -> tuple[_R, ...]:
+    if len(values) < 2 or _PREPARATION_WORKERS == 1:
+        return tuple(map(function, values))
+    with ThreadPoolExecutor(max_workers=min(_PREPARATION_WORKERS, len(values))) as pool:
+        return tuple(pool.map(function, values))
+
+
+def _serialized_announce(callback: Callable[[str], None] | None) -> Callable[[str], None] | None:
+    if callback is None:
+        return None
+    lock = Lock()
+
+    def call(message: str) -> None:
+        with lock:
+            callback(message)
+
+    return call
 
 
 def prepare_task_media(
@@ -57,6 +86,7 @@ def prepare_task_media(
     source = spec.media_source
     if source is None or _manifest_has_task(manifest, spec.name):
         return None
+    announce = _serialized_announce(announce)
     managed_root = spec.media_root(root)
     effective_root = media_root or managed_root
     if effective_root is None:
@@ -249,11 +279,12 @@ def _m3_manifest(
     offset: int,
     announce: Callable[[str], None] | None,
 ) -> dict[str, list[dict[str, object]]]:
-    from mindbridge.benchmarks.m3_bench import load_m3_bench
+    from mindbridge.benchmarks.m3_bench import M3BenchVideo, load_m3_bench
 
-    units: dict[str, list[dict[str, object]]] = {}
-    for video in _selected(load_m3_bench(dataset), limit, offset):
-        source = _find_media(media_root, video.video_path, f"{video.video_id}.mp4")
+    find_media = _MediaFinder(media_root)
+
+    def prepare(video: M3BenchVideo) -> tuple[str, list[dict[str, object]]]:
+        source = find_media(video.video_path, f"{video.video_id}.mp4")
         cutoffs = tuple(question.cutoff_seconds for question in video.questions)
         duration = _duration(source)
         causal_cutoffs = tuple(value for value in cutoffs if value is not None)
@@ -262,11 +293,16 @@ def _m3_manifest(
         )
         boundaries = _grid(min(duration, horizon), causal_cutoffs)
         segments = _segment_video(source, boundaries, cache / _component(video.video_id), announce)
-        units[video.video_id] = [
-            _path_part(path, f"{video.video_id}-{index:05d}", start, end)
-            for index, (start, end, path) in enumerate(segments)
-        ]
-    return units
+        return (
+            video.video_id,
+            [
+                _path_part(path, f"{video.video_id}-{index:05d}", start, end)
+                for index, (start, end, path) in enumerate(segments)
+            ],
+        )
+
+    videos = tuple(_selected(load_m3_bench(dataset), limit, offset))
+    return dict(_prepare_many(prepare, videos))
 
 
 def _video_manifest(
@@ -278,6 +314,7 @@ def _video_manifest(
     offset: int,
     announce: Callable[[str], None] | None,
 ) -> dict[str, list[dict[str, object]]]:
+    find_media = _MediaFinder(media_root)
     sources: tuple[tuple[str, Path], ...]
     if task_name == "video-mme":
         from mindbridge.benchmarks.video_mme import load_video_mme
@@ -285,7 +322,7 @@ def _video_manifest(
         sources = tuple(
             (
                 video.video_id,
-                _find_media(media_root, f"{video.source_video_id}.mp4"),
+                find_media(f"{video.source_video_id}.mp4"),
             )
             for video in _selected(load_video_mme(dataset), limit, offset)
         )
@@ -293,22 +330,24 @@ def _video_manifest(
         from mindbridge.benchmarks.video_mme_v2 import load_video_mme_v2
 
         sources = tuple(
-            (group.video_id, _find_media(media_root, f"{group.video_id}.mp4"))
+            (group.video_id, find_media(f"{group.video_id}.mp4"))
             for group in _selected(load_video_mme_v2(dataset), limit, offset)
         )
     else:
         from mindbridge.benchmarks.egotempo import load_egotempo
 
         sources = tuple(
-            (clip_id, _find_media(media_root, f"{clip_id}.mp4"))
+            (clip_id, find_media(f"{clip_id}.mp4"))
             for clip_id in dict.fromkeys(
                 question.clip_id for question in _selected(load_egotempo(dataset), limit, offset)
             )
         )
-    return {
-        unit_id: _video_parts(unit_id, source, cache / _component(unit_id), announce)
-        for unit_id, source in sources
-    }
+
+    def prepare(item: tuple[str, Path]) -> tuple[str, list[dict[str, object]]]:
+        unit_id, source = item
+        return unit_id, _video_parts(unit_id, source, cache / _component(unit_id), announce)
+
+    return dict(_prepare_many(prepare, sources))
 
 
 def _lifelong_manifest(
@@ -324,12 +363,15 @@ def _lifelong_manifest(
     )
     if not files:
         raise FileNotFoundError(f"{spec.name} has no videos under {media_root}")
-    parts: list[dict[str, object]] = []
-    timeline = 0.0
-    for source in files:
+
+    def prepare(source: Path) -> tuple[str, tuple[tuple[float, float, Path], ...]]:
         relative = source.relative_to(media_root).as_posix()
         key = hashlib.sha256(relative.encode()).hexdigest()[:20]
-        segments = _segments(source, cache / key, announce)
+        return relative, _segments(source, cache / key, announce)
+
+    parts: list[dict[str, object]] = []
+    timeline = 0.0
+    for relative, segments in _prepare_many(prepare, files):
         for index, (start, end, path) in enumerate(segments):
             parts.append(
                 _path_part(
@@ -362,15 +404,19 @@ def _openeqa_manifest(
         limit,
         offset,
     )
-    return {
-        episode: _video_parts(
-            episode,
-            _openeqa_video(_openeqa_episode(media_root, split, episode), cache, announce),
+
+    def prepare(episode: str) -> tuple[str, list[dict[str, object]]]:
+        segments = _openeqa_segments(
+            _openeqa_episode(media_root, split, episode),
             cache / _component(episode),
             announce,
         )
-        for episode in episodes
-    }
+        return episode, [
+            _path_part(path, f"{episode}-{index:05d}", start, end)
+            for index, (start, end, path) in enumerate(segments)
+        ]
+
+    return dict(_prepare_many(prepare, episodes))
 
 
 def _openeqa_episode(media_root: Path, split: str, episode: str) -> Path:
@@ -384,95 +430,84 @@ def _openeqa_episode(media_root: Path, split: str, episode: str) -> Path:
     )
 
 
-def _openeqa_video(
+def _openeqa_segments(
     episode: Path,
     cache: Path,
     announce: Callable[[str], None] | None,
-) -> Path:
-    """Encode one episode's official frame order into a cached 1 fps video."""
+) -> tuple[tuple[float, float, Path], ...]:
+    """Encode one episode's official frame order directly into cached causal segments."""
     from mindbridge.benchmarks.openeqa import episode_frames
 
     frames = episode_frames(episode)
     unquotable = tuple(frame for frame in frames if "'" in str(frame) or "\n" in str(frame))
     if unquotable:
         raise ValueError(f"OpenEQA frame path is not safe to encode: {unquotable[0]}")
+    boundaries = _grid(len(frames) / _OPENEQA_FRAME_RATE, ())
     key = hashlib.sha256(
         json.dumps(
             [
-                "openeqa-frames-v1",
+                "openeqa-segments-v1",
                 str(episode.resolve()),
                 len(frames),
                 frames[0].name,
                 frames[-1].name,
                 sum(frame.stat().st_size for frame in frames),
                 _OPENEQA_FRAME_RATE,
+                boundaries,
                 _ffmpeg_id(),
             ],
             separators=(",", ":"),
         ).encode()
     ).hexdigest()[:20]
-    target = cache / f"episode-{key}.mp4"
-    if target.is_file() and target.stat().st_size:
-        return target.resolve()
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if announce is not None:
-        announce(f"encoding {len(frames)} frames from {episode.name} at {_OPENEQA_FRAME_RATE} fps")
     seconds = 1 / _OPENEQA_FRAME_RATE
     # The concat demuxer takes the frame order this adapter resolved rather than
     # ffmpeg's own globbing. The usual "repeat the final entry" workaround is
-    # not applied: with `-r` forcing a constant rate, the last `duration` line
-    # is honoured, and repeating it measurably adds a phantom frame (76 encoded
-    # from 75 extracted).
+    # not applied: `eof_action=pass` preserves the last frame's duration, while
+    # repeating the final entry measurably adds a phantom frame (76 encoded from
+    # 75 extracted).
     listing = "ffconcat version 1.0\n" + "".join(
         f"file '{frame.resolve()}'\nduration {seconds:.6f}\n" for frame in frames
     )
-    working = Path(mkdtemp(prefix=f".{key}.", dir=target.parent))
-    temporary: Path | None = working
-    try:
+
+    def command(working: Path) -> list[str]:
         index = working / "frames.ffconcat"
         index.write_text(listing, encoding="utf-8")
-        output = working / target.name
-        _run_ffmpeg(
-            (
-                _executable("ffmpeg"),
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(index),
-                "-r",
-                str(_OPENEQA_FRAME_RATE),
-                # Frame extractions are not guaranteed to have even dimensions,
-                # which `yuv420p` requires.
-                "-vf",
-                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "18",
-                "-pix_fmt",
-                "yuv420p",
-                "-map_metadata",
-                "-1",
-                str(output),
-            ),
-            episode,
-        )
-        if not output.stat().st_size:
-            raise RuntimeError(f"ffmpeg wrote an empty episode video for {episode}")
-        os.replace(output, target)
-    finally:
-        if temporary is not None:
-            shutil.rmtree(temporary, ignore_errors=True)
-    return target.resolve()
+        return [
+            _executable("ffmpeg"),
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(index),
+            "-r",
+            str(_OPENEQA_FRAME_RATE),
+            "-t",
+            f"{boundaries[-1]:.3f}",
+            "-map",
+            "0:v:0",
+            "-vf",
+            _OPENEQA_VIDEO_FILTER,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-map_metadata",
+            "-1",
+        ]
+
+    return _cached_segments(episode, boundaries, cache, key, command, announce)
 
 
 def _video_parts(
@@ -530,26 +565,35 @@ def _egolife_manifest(
                 horizons.get(question.identity, 0), question.query_offset_ms
             )
     units: dict[str, list[dict[str, object]]] = {}
+    jobs: list[tuple[str, Path, float, float]] = []
     for identity, horizon_ms in sorted(horizons.items()):
         _component(identity)
-        parts = []
+        identity_jobs = []
         for path in sorted((media_root / identity).glob("DAY*/*.mp4")):
             start = _egolife_start(path)
             end = start + _SEGMENT_SECONDS
             if end * 1_000 > horizon_ms:
                 continue
-            segments = _segment_video(
-                path,
-                (float(_SEGMENT_SECONDS),),
-                cache / _component(identity),
-                announce,
-            )
-            parts.append(_path_part(segments[0][2], path.stem, start, end))
-        if not parts:
+            identity_jobs.append((identity, path, start, end))
+        if not identity_jobs:
             raise FileNotFoundError(
                 f"no complete EgoLife clip for {identity} precedes the selected query horizon"
             )
-        units[identity] = parts
+        units[identity] = []
+        jobs.extend(identity_jobs)
+
+    def prepare(job: tuple[str, Path, float, float]) -> tuple[str, dict[str, object]]:
+        identity, path, start, end = job
+        segments = _segment_video(
+            path,
+            (float(_SEGMENT_SECONDS),),
+            cache / _component(identity),
+            announce,
+        )
+        return identity, _path_part(segments[0][2], path.stem, start, end)
+
+    for identity, part in _prepare_many(prepare, jobs):
+        units[identity].append(part)
     return units
 
 
@@ -570,8 +614,8 @@ def _supermemory_manifest(
         for video_id, started in sorted(starts.items(), key=lambda item: (item[1], item[0]))
         if started < horizon
     )
-    parts: list[dict[str, object]] = []
-    for video_id in video_ids:
+
+    def prepare(video_id: str) -> tuple[dict[str, object], ...]:
         component = _component(video_id)
         started = starts[video_id]
         local_horizon = horizon - started
@@ -586,8 +630,9 @@ def _supermemory_manifest(
         transcript_end = max((_number(line["end"]) for line in transcript), default=0.0)
         end = min(local_horizon, max((media_end, transcript_end, *question_cuts, 0.0)))
         if end <= 0:
-            continue
+            return ()
         boundaries = _grid(end, question_cuts)
+        prepared: list[dict[str, object]] = []
         if media_end > 0:
             media_boundaries = tuple(value for value in boundaries if value < media_end)
             if not media_boundaries or media_boundaries[-1] != media_end:
@@ -595,7 +640,7 @@ def _supermemory_manifest(
             for index, (start, stop, path) in enumerate(
                 _segment_video(source, media_boundaries, cache / component, announce)
             ):
-                parts.append(
+                prepared.append(
                     _path_part(
                         path,
                         f"{video_id}-video-{index:05d}",
@@ -607,7 +652,7 @@ def _supermemory_manifest(
         for index, stop in enumerate(boundaries):
             text = _transcript_text(transcript, previous, stop)
             if text:
-                parts.append(
+                prepared.append(
                     {
                         "text": text,
                         "source_id": f"{video_id}-transcript-{index:05d}",
@@ -616,6 +661,9 @@ def _supermemory_manifest(
                     }
                 )
             previous = stop
+        return tuple(prepared)
+
+    parts = [part for prepared in _prepare_many(prepare, video_ids) for part in prepared]
     if not parts:
         raise FileNotFoundError("SuperMemory-VQA selected no released video or transcript media")
     parts.sort(key=lambda part: (_number(part["end_seconds"]), str(part["source_id"])))
@@ -872,7 +920,8 @@ def _acquire_ego4d(
                 f"AWS profile {profile!r} before retrying"
             )
     destination.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for clip_id in pending:
+
+    def cut(clip_id: str) -> None:
         question = questions[clip_id]
         if announce is not None:
             announce(f"cutting EgoTempo clip {clip_id}")
@@ -883,33 +932,58 @@ def _acquire_ego4d(
             question.clip_end_seconds,
         )
 
+    _prepare_many(cut, pending)
+
+
+class _MediaFinder:
+    """Resolve direct media names, indexing a nested tree only if a fallback needs it."""
+
+    def __init__(self, root: Path) -> None:
+        self._display_root = root
+        self._root = root.resolve()
+        self._index: dict[str, tuple[Path, ...]] | None = None
+        self._lock = Lock()
+
+    def __call__(self, *names: str) -> Path:
+        for name in names:
+            supplied = Path(name)
+            candidates = tuple(
+                candidate
+                for candidate in (
+                    (self._root / supplied).resolve(),
+                    (self._root / supplied.name).resolve(),
+                )
+                if candidate.is_relative_to(self._root)
+            )
+            for candidate in candidates:
+                if candidate.is_file():
+                    return candidate
+        stems = {Path(name).stem.casefold() for name in names}
+        index = self._fallback_index()
+        matches = tuple(path for stem in stems for path in index.get(stem, ()))
+        if len(matches) != 1:
+            raise FileNotFoundError(
+                f"expected one of {', '.join(names)} under {self._display_root}"
+            )
+        return matches[0]
+
+    def _fallback_index(self) -> dict[str, tuple[Path, ...]]:
+        if self._index is None:
+            with self._lock:
+                if self._index is None:
+                    grouped: dict[str, list[Path]] = {}
+                    for path in self._root.rglob("*"):
+                        if path.is_file() and (resolved := path.resolve()).is_relative_to(
+                            self._root
+                        ):
+                            grouped.setdefault(path.stem.casefold(), []).append(resolved)
+                    # ponytail: this is one manifest's snapshot; the next manifest gets a fresh one.
+                    self._index = {stem: tuple(paths) for stem, paths in grouped.items()}
+        return self._index
+
 
 def _find_media(root: Path, *names: str) -> Path:
-    resolved_root = root.resolve()
-    for name in names:
-        supplied = Path(name)
-        candidates = tuple(
-            candidate
-            for candidate in (
-                (resolved_root / supplied).resolve(),
-                (resolved_root / supplied.name).resolve(),
-            )
-            if candidate.is_relative_to(resolved_root)
-        )
-        for candidate in candidates:
-            if candidate.is_file():
-                return candidate
-    stems = {Path(name).stem.casefold() for name in names}
-    matches = tuple(
-        resolved
-        for path in resolved_root.rglob("*")
-        if path.is_file()
-        and path.stem.casefold() in stems
-        and (resolved := path.resolve()).is_relative_to(resolved_root)
-    )
-    if len(matches) != 1:
-        raise FileNotFoundError(f"expected one of {', '.join(names)} under {root}")
-    return matches[0]
+    return _MediaFinder(root)(*names)
 
 
 def _egolife_start(path: Path) -> float:
@@ -955,21 +1029,10 @@ def _segment_video(
             separators=(",", ":"),
         ).encode()
     ).hexdigest()[:20]
-    target = cache / key
-    expected = tuple(target / f"segment-{index:05d}.mp4" for index in range(len(ordered)))
-    if all(path.is_file() and path.stat().st_size for path in expected):
-        return _timed_paths(ordered, expected)
-    executable = _executable("ffmpeg")
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if announce is not None:
-        announce(f"preparing {len(ordered)} causal segments from {source.name}")
-    working = Path(mkdtemp(prefix=f".{key}.", dir=target.parent))
-    temporary_path: Path | None = working
-    try:
-        output = working / "segment-%05d.mp4"
-        cuts = ordered[:-1]
-        command = [
-            executable,
+
+    def command(_working: Path) -> list[str]:
+        return [
+            _executable("ffmpeg"),
             "-nostdin",
             "-hide_banner",
             "-loglevel",
@@ -1002,6 +1065,31 @@ def _segment_video(
             "-map_metadata",
             "-1",
         ]
+
+    return _cached_segments(source, ordered, cache, key, command, announce)
+
+
+def _cached_segments(
+    source: Path,
+    boundaries: Sequence[float],
+    cache: Path,
+    key: str,
+    build_command: Callable[[Path], list[str]],
+    announce: Callable[[str], None] | None,
+) -> tuple[tuple[float, float, Path], ...]:
+    target = cache / key
+    expected = tuple(target / f"segment-{index:05d}.mp4" for index in range(len(boundaries)))
+    if all(path.is_file() and path.stat().st_size for path in expected):
+        return _timed_paths(boundaries, expected)
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if announce is not None:
+        announce(f"preparing {len(boundaries)} causal segments from {source.name}")
+    working = Path(mkdtemp(prefix=f".{key}.", dir=target.parent))
+    temporary_path: Path | None = working
+    try:
+        output = working / "segment-%05d.mp4"
+        cuts = boundaries[:-1]
+        command = build_command(working)
         if cuts:
             times = ",".join(f"{value:.3f}" for value in cuts)
             command.extend(
@@ -1041,7 +1129,7 @@ def _segment_video(
     finally:
         if temporary_path is not None:
             shutil.rmtree(temporary_path)
-    return _timed_paths(ordered, expected)
+    return _timed_paths(boundaries, expected)
 
 
 def _timed_paths(

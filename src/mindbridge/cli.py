@@ -676,13 +676,20 @@ def _budget(arguments: argparse.Namespace) -> ContextBudget:
             else frozenset(MemoryType(value) for value in arguments.memory_type)
         ),
         min_confidence=arguments.min_confidence,
-        freshness=(
-            None
-            if arguments.freshness_seconds is None
-            else timedelta(seconds=arguments.freshness_seconds)
-        ),
+        freshness=_freshness_delta(arguments.freshness_seconds),
         max_latency_ms=arguments.max_latency_ms,
     )
+
+
+def _freshness_delta(seconds: float | None) -> timedelta | None:
+    if seconds is None:
+        return None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValidationError("freshness_seconds must be a positive finite number")
+    try:
+        return timedelta(seconds=seconds)
+    except OverflowError:
+        raise ValidationError("freshness_seconds is outside the supported duration range") from None
 
 
 def _compile(memory: Memory, arguments: argparse.Namespace) -> _Document:

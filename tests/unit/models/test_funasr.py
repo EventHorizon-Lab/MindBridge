@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import wave
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -61,6 +63,7 @@ def test_funasr_delegates_execution_to_official_automodel_and_maps_speech(
         "record_unmetered_model_usage",
         lambda **kwargs: usage.append(kwargs),
     )
+    monkeypatch.setattr(funasr_module, "media_duration_seconds", lambda *_args, **_kwargs: 0.7)
     transcriber = FunASRTranscriber()
     digest = sha256(audio.read_bytes()).hexdigest()
     asset = AssetRef(
@@ -100,6 +103,106 @@ def test_funasr_delegates_execution_to_official_automodel_and_maps_speech(
     transcriber.close()
     with pytest.raises(ModelError, match="closed"):
         transcriber.analyze((asset,))
+
+
+def test_funasr_usage_counts_full_media_duration_for_batch_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    audio = tmp_path / "voice.wav"
+    with wave.open(str(audio), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16_000)
+        output.writeframes(b"\0\0" * 32_000)
+    monkeypatch.setitem(sys.modules, "av", None)
+
+    class _Pipeline:
+        calls = 0
+
+        def generate(self, **_kwargs: object) -> list[dict[str, object]]:
+            self.calls += 1
+            if self.calls == 1:
+                return []
+            return [
+                {
+                    "text": "hello",
+                    "sentence_info": [{"start": 100, "end": 700, "text": "hello", "spk": 0}],
+                    "spk_embedding_center": [[1.0]],
+                }
+            ]
+
+    usage: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        funasr_module,
+        "record_unmetered_model_usage",
+        lambda **kwargs: usage.append(kwargs),
+    )
+    transcriber = FunASRTranscriber()
+    transcriber._pipeline = _Pipeline()
+    digest = sha256(audio.read_bytes()).hexdigest()
+    result = transcriber.analyze(
+        (
+            AssetRef(
+                digest,
+                modality=Modality.AUDIO,
+                media_type="audio/wav",
+                size_bytes=audio.stat().st_size,
+                sha256=digest,
+                name=audio.name,
+                path=audio,
+            ),
+        )
+    )[0]
+
+    assert result.turns[-1].end_ms == 700
+    assert usage == [{"request_count": 2, "audio_seconds": pytest.approx(4.0)}]
+
+
+def test_funasr_counts_a_failed_fallback_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    audio = tmp_path / "voice.wav"
+    audio.write_bytes(b"fake wav")
+    counts: list[int] = []
+
+    class _Pipeline:
+        calls = 0
+
+        def generate(self, **_kwargs: object) -> list[dict[str, object]]:
+            self.calls += 1
+            if self.calls == 1:
+                return []
+            raise RuntimeError("fallback failed")
+
+    monkeypatch.setattr(
+        funasr_module,
+        "mark_model_requests",
+        lambda count, **_kwargs: counts.append(count),
+    )
+    monkeypatch.setattr(
+        funasr_module,
+        "current_model_request_count",
+        lambda: counts[-1] if counts else 0,
+    )
+    transcriber = FunASRTranscriber()
+    transcriber._pipeline = _Pipeline()
+    digest = sha256(audio.read_bytes()).hexdigest()
+    asset = AssetRef(
+        digest,
+        modality=Modality.AUDIO,
+        media_type="audio/wav",
+        size_bytes=audio.stat().st_size,
+        sha256=digest,
+        name=audio.name,
+        path=audio,
+    )
+
+    with pytest.raises(ModelError, match="failed to analyze speech"):
+        transcriber.analyze((asset,))
+
+    assert counts == [0, 1, 2]
 
 
 def test_funasr_supports_timestamp_only_transcription_without_speaker_model(
