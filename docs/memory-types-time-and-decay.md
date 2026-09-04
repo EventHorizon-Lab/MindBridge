@@ -147,8 +147,10 @@ source never carried, a pose in another coordinate frame — is dropped, counted
 `mindbridge.formation.dropped_proposals` span attribute, and costs only itself: the observation's
 remaining proposals commit and the write succeeds. One badly grounded opinion must not fail a write
 whose source is already durable, because every retry would re-run the model and fail the same way.
-Only damage to the batch envelope — a backend returning the wrong number of results, or a shape
-that is not a batch of proposals — fails the write.
+Two proposals from one source that contradict each other — one record proposed twice with different
+content, or two overlapping states in one lineage — are refused the same way, and the first of the
+pair stands. Only damage to the batch envelope — a backend returning the wrong number of results,
+or a shape that is not a batch of proposals — fails the write.
 
 Formation never rewrites the caller's source record. A derived record inherits its source's event
 time, valid interval, and metric pose, and inherits the symbolic `place_id` and the `metadata` that

@@ -3413,9 +3413,9 @@ class Memory:
                         proposal.confidence,
                     )
                 )
-        _record_dropped_proposals(dropped)
-        _validate_formation_pairs(pairs)
-        self._commit_formation(pairs, formed_sources, completed_at=now)
+        grounded, refused = _grounded_formation_pairs(pairs)
+        _record_dropped_proposals(dropped + refused)
+        self._commit_formation(grounded, formed_sources, completed_at=now)
 
     def _commit_formation(
         self,
@@ -7214,42 +7214,46 @@ def _operation_record(logged: StoredOperation) -> MemoryOperationRecord:
     )
 
 
-def _validate_formation_pairs(
+def _grounded_formation_pairs(
     pairs: Sequence[tuple[_PreparedMemory, str | None, float]],
-) -> None:
+) -> tuple[tuple[tuple[_PreparedMemory, str | None, float], ...], int]:
+    """Keep the first of each conflicting proposal from one source; return the rest as refused.
+
+    Two proposals of one record that disagree, and two contradictory states in one lineage, are
+    grounding faults inside a single model response -- not damage to the envelope. The source is
+    already committed when formation runs, so failing the write would report a stored observation
+    as unwritten and every retry would re-run the model and fail identically.
+    """
+    kept: builtins.list[tuple[_PreparedMemory, str | None, float]] = []
+    refused = 0
     seen: dict[tuple[str, str | None], _PreparedMemory] = {}
     states: dict[tuple[str | None, str], builtins.list[MemoryContext]] = {}
-    for prepared, source_id, _confidence in pairs:
-        key = (prepared.memory_id, source_id)
-        prior = seen.setdefault(key, prepared)
-        if prior != prepared:
-            raise ModelError(
-                "formation returned conflicting duplicates for one source",
-                reason="response_invalid",
-                stage="form",
-            )
+    for pair in pairs:
+        prepared, source_id, _confidence = pair
+        if seen.setdefault((prepared.memory_id, source_id), prepared) != prepared:
+            refused += 1
+            continue
         context = prepared.context
         if isinstance(context, MemoryContext) and context.kind is MemoryKind.STATE:
-            states.setdefault((source_id, context.lineage_id or prepared.memory_id), []).append(
-                context
+            lineage = states.setdefault(
+                (source_id, context.lineage_id or prepared.memory_id),
+                [],
             )
-    for values in states.values():
-        for index, left in enumerate(values):
             if any(
-                left.value != right.value
+                standing.value != context.value
                 and _valid_intervals_overlap(
-                    left.valid_from,
-                    left.valid_until,
-                    right.valid_from,
-                    right.valid_until,
+                    standing.valid_from,
+                    standing.valid_until,
+                    context.valid_from,
+                    context.valid_until,
                 )
-                for right in values[index + 1 :]
+                for standing in lineage
             ):
-                raise ModelError(
-                    "formation returned conflicting states for one source",
-                    reason="response_invalid",
-                    stage="form",
-                )
+                refused += 1
+                continue
+            lineage.append(context)
+        kept.append(pair)
+    return tuple(kept), refused
 
 
 def _valid_intervals_overlap(

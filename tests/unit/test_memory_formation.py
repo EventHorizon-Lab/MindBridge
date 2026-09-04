@@ -447,3 +447,59 @@ def test_a_shared_formed_record_keeps_only_what_its_sources_agree_on(tmp_path: P
         (entity,) = _entities(memory, scope=RetrievalScope(place_id="kitchen"))
         assert memory.get(entity.id).place_id == "kitchen"
         assert memory.get(entity.id).metadata == {"household": "flat-2"}
+
+
+def test_two_contradictory_states_from_one_source_cost_only_the_later_one(
+    tmp_path: Path,
+) -> None:
+    """Two proposals that contradict each other are one model response's grounding fault.
+
+    Both come from a single source the caller already committed, so failing the write reports an
+    observation as unwritten that is in fact stored, and every retry re-runs the model and fails
+    the same way. The first claim stands, the contradicting one is refused.
+    """
+
+    class ContradictingFormer(PreferenceFormer):
+        def form(
+            self, inputs: Sequence[FormationInput]
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            return tuple(
+                tuple(
+                    FormationProposal(
+                        kind=MemoryKind.STATE,
+                        content=f"The user's preferred drink is {drink}",
+                        subject="user",
+                        predicate="preferred_drink",
+                        value=drink,
+                        confidence=0.9,
+                    )
+                    for drink in ("tea", "coffee")
+                )
+                for _value in inputs
+            )
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=ContradictingFormer(),
+        minimum_relevance=0,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        source = memory.add("I prefer tea")
+
+        states = [
+            hit.context.value
+            for hit in _formed(memory, source.id)
+            if hit.context is not None and hit.context.kind is MemoryKind.STATE
+        ]
+        assert states == ["tea"]
+        assert memory.pending_captures(memory_ids=(source.id,)) == ()
+
+    assert [
+        span.attributes[FORMATION_PROPOSALS_DROPPED]
+        for span in exporter.get_finished_spans()
+        if span.attributes is not None and FORMATION_PROPOSALS_DROPPED in span.attributes
+    ] == [1]

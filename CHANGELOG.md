@@ -567,7 +567,10 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   reported records as unwritten that were in fact stored and searchable. Such a proposal is now
   dropped and counted on the `mindbridge.formation.dropped_proposals` span attribute while its
   siblings commit, which is the policy the model adapter already applied to a malformed proposal
-  and consolidation already applied to this same rule. Damage to the batch envelope still raises.
+  and consolidation already applied to this same rule. Two proposals from one source that
+  contradict each other — one record proposed twice with different content, or two overlapping
+  states in one lineage — are refused the same way, keeping the first of the pair, instead of
+  failing the write. Damage to the batch envelope still raises.
 - A formed record no longer drops the symbolic place and the metadata of the observation it was
   formed from, and a `capture()` no longer drops the place it was captured in. `place_id` is a hard
   SQL filter, so a place-scoped `search()`, `ask()`, or `compile()` could previously return only
