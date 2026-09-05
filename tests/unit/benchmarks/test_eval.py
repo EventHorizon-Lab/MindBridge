@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import re
@@ -3900,6 +3901,36 @@ def test_configure_logging_opens_the_whole_process_for_debug(
         "WARNING httpx",
         "INFO mindbridge.benchmarks.eval",
     ]
+
+
+def test_configure_logging_still_filters_while_a_bar_is_live(
+    monkeypatch: pytest.MonkeyPatch, restored_logging: None
+) -> None:
+    """The filter has to survive the progress bar, which is up for the whole of every task.
+
+    Routing console logging through `tqdm.contrib.logging.logging_redirect_tqdm` instead would
+    hand the records to a handler of tqdm's own; carrying the filters across is a detail tqdm
+    only started honouring in 4.69.1, so below that the dependency INFO came straight back for
+    the duration of the bar.
+    """
+
+    class Terminal(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    terminal = Terminal()
+    monkeypatch.setattr(sys, "stderr", terminal)
+    eval_module._configure_logging("INFO")
+
+    with eval_module._progress("running fixture", "sample", total=4) as report:
+        _emit_from_every_source()
+        report(1, 4)
+
+    drawn = terminal.getvalue()
+    assert "HTTP Request" not in drawn
+    assert "loading model configuration" not in drawn
+    assert "WARNING httpx: connection reset, retrying" in drawn
+    assert "INFO mindbridge.benchmarks.eval: ingest finished" in drawn
 
 
 def test_configure_logging_silences_mindbridge_too_at_error(

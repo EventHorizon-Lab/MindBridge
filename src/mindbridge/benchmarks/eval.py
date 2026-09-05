@@ -31,7 +31,6 @@ from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode, Tracer
 from pydantic import SecretStr
 from tqdm import tqdm
-from tqdm.contrib.logging import logging_redirect_tqdm
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
@@ -1013,6 +1012,23 @@ class _BackendPool:
 _ROOT_PACKAGE = __name__.split(".", 1)[0]
 
 
+class _TqdmHandler(logging.Handler):
+    """Emit every record through `tqdm.write`, so a live progress bar survives a log line.
+
+    The alternative, wrapping the run in `tqdm.contrib.logging.logging_redirect_tqdm`, swaps this
+    handler out for one of tqdm's own for the duration of the bar, and carrying the filters across
+    is a detail tqdm only started honouring in 4.69.1. Owning the handler keeps `_VerbosityFilter`
+    attached to the thing that actually emits, at every version, bar or no bar. `sys.stderr` is
+    read per record rather than captured, so redirecting it after configuration still works.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            tqdm.write(self.format(record), file=sys.stderr)
+        except Exception:  # logging must never raise into the run it is reporting on
+            self.handleError(record)
+
+
 class _VerbosityFilter(logging.Filter):
     """Admit MindBridge's records at the requested level and everyone else's at ``third_party``.
 
@@ -1045,7 +1061,12 @@ def _configure_logging(verbosity: str) -> None:
     """
     level: int = logging.getLevelName(verbosity)
     third_party = level if verbosity == "DEBUG" else max(level, logging.WARNING)
-    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s", force=True)
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s %(name)s: %(message)s",
+        handlers=[_TqdmHandler()],
+        force=True,
+    )
     for handler in logging.getLogger().handlers:
         handler.addFilter(_VerbosityFilter(level, third_party))
 
@@ -4738,10 +4759,7 @@ def _progress(
         yield _ignore_progress
         return
     if sys.stderr.isatty():
-        with (
-            logging_redirect_tqdm(),
-            tqdm(total=total, desc=stage, unit=noun, file=sys.stderr, leave=False) as bar,
-        ):
+        with tqdm(total=total, desc=stage, unit=noun, file=sys.stderr, leave=False) as bar:
 
             def advance(completed: int, _total: int) -> None:
                 bar.update(completed - bar.n)
