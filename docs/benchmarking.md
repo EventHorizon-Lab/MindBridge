@@ -245,10 +245,13 @@ unreadable, the same counts and ETA are written as one line at most once a minut
 and the last completion, so a stalled run says so immediately and the log always ends on the
 final count.
 
-`--verbosity` sets the library log level for the run and claims the root handler before an
-imported dependency can raise it. HTTP transport loggers stay at `WARNING` below `DEBUG`, so a
-successful request logs nothing and only warnings and errors reach stderr. The results table is
-printed regardless; `--quiet` (or `--verbosity ERROR`) is what suppresses it.
+`--verbosity` sets the log level for the run and claims the root handler before an imported
+dependency can raise it: `funasr`, `modelscope`, `numba` and others each turn their own logging
+up when imported. It applies to MindBridge's own loggers; a dependency has to reach `WARNING` to
+be heard, so a successful HTTP request logs nothing and a benchmark run does not carry anyone
+else's INFO. `--verbosity DEBUG` is the exception and opens the whole process, per-request
+transport lines included. The results table is printed regardless; `--quiet` (or
+`--verbosity ERROR`) is what suppresses it.
 
 `--limit` accepts `-1`, a fraction between zero and one, or an absolute adapter-unit count. Use an
 integer for a count; a non-integral value above one is truncated to an integer by the current

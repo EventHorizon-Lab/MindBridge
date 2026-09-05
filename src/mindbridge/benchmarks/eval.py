@@ -1008,18 +1008,46 @@ class _BackendPool:
                     resource.close()
 
 
+# The log namespace this harness is allowed to be verbose about: everything under the
+# installed package, derived so a rename cannot leave a stale literal behind.
+_ROOT_PACKAGE = __name__.split(".", 1)[0]
+
+
+class _VerbosityFilter(logging.Filter):
+    """Admit MindBridge's records at the requested level and everyone else's at ``third_party``.
+
+    A root level alone does not hold: `modelscope`, `numba`, `jieba` and `torch.__trace` each set
+    their own logger level when imported, and a logger with an explicit level never consults the
+    root's, so their INFO and DEBUG records reach the root handler whatever it was configured
+    with. Deciding per record on the handler is the one place no dependency can reach around, and
+    it needs no list of names to keep up to date.
+    """
+
+    def __init__(self, level: int, third_party: int) -> None:
+        super().__init__()
+        self._level = level
+        self._third_party = third_party
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        own = record.name.split(".", 1)[0] == _ROOT_PACKAGE
+        return record.levelno >= (self._level if own else self._third_party)
+
+
 def _configure_logging(verbosity: str) -> None:
     """Claim the root handler before an imported dependency installs a noisier one.
 
     `import funasr` runs `logging.basicConfig(level=INFO)` at module scope, which switches every
     library in the process to INFO: each successful model call then prints its own
     `HTTP Request: ... 200 OK` line and buries the warnings worth reading. Configuring first makes
-    that call a no-op, and the per-request transport chatter stays off below DEBUG.
+    that call a no-op. `--verbosity` then applies to MindBridge only; a dependency has to reach
+    WARNING to be heard, because a benchmark run is not the place to read anyone else's INFO.
+    `DEBUG` is the exception that opens the whole process, transport chatter included.
     """
-    logging.basicConfig(level=verbosity, format="%(levelname)s %(name)s: %(message)s", force=True)
-    if verbosity != "DEBUG":
-        for transport in ("httpx", "httpcore", "openai", "urllib3"):
-            logging.getLogger(transport).setLevel(logging.WARNING)
+    level: int = logging.getLevelName(verbosity)
+    third_party = level if verbosity == "DEBUG" else max(level, logging.WARNING)
+    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s", force=True)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(_VerbosityFilter(level, third_party))
 
 
 def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point

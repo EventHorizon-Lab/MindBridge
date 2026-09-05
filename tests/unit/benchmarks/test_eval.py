@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from argparse import ArgumentTypeError
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import fields, replace
 from datetime import datetime, timezone
 from inspect import getattr_static, signature
@@ -3846,32 +3846,70 @@ def test_eval_run_section_reports_bad_values_as_usage_errors(body: str, tmp_path
         eval_module._arguments(parser, parsed, overrides=overrides)
 
 
-def test_configure_logging_silences_per_request_transport_lines() -> None:
-    """A later `basicConfig(INFO)` from a dependency must not resurrect httpx's 200 lines."""
+@pytest.fixture
+def restored_logging() -> Iterator[None]:
+    """`_configure_logging` claims the root handler, so give it back to pytest afterwards."""
     root = logging.getLogger()
-    saved = (root.level, list(root.handlers))
+    saved = (root.level, list(root.handlers), list(root.filters))
     try:
-        eval_module._configure_logging("INFO")
-        # What `import funasr` does at module scope; it must not take effect any more.
-        logging.basicConfig(level=logging.INFO)
-
-        assert logging.getLogger("httpx").getEffectiveLevel() == logging.WARNING
-        assert logging.getLogger("mindbridge").getEffectiveLevel() == logging.INFO
+        yield
     finally:
-        logging.getLogger("httpx").setLevel(logging.NOTSET)
         root.setLevel(saved[0])
         root.handlers[:] = saved[1]
+        root.filters[:] = saved[2]
 
 
-def test_configure_logging_keeps_transport_detail_for_debug_runs() -> None:
-    """`--verbosity DEBUG` is the one setting that asks for the per-request lines."""
-    root = logging.getLogger()
-    saved = (root.level, list(root.handlers))
-    try:
-        eval_module._configure_logging("DEBUG")
+def _emit_from_every_source() -> None:
+    # httpx logs one of these per successful call; modelscope and jieba set their own logger
+    # level when imported, so they escape a root threshold entirely.
+    logging.getLogger("httpx").info('HTTP Request: POST /v1/chat "HTTP/1.1 200 OK"')
+    logging.getLogger("modelscope").setLevel(logging.INFO)
+    logging.getLogger("modelscope").info("loading model configuration")
+    logging.getLogger("jieba").setLevel(logging.DEBUG)
+    logging.getLogger("jieba").debug("building prefix dict")
+    logging.getLogger("httpx").warning("connection reset, retrying")
+    logging.getLogger("mindbridge.benchmarks.eval").info("ingest finished")
 
-        assert logging.getLogger("httpx").getEffectiveLevel() == logging.DEBUG
-    finally:
-        logging.getLogger("httpx").setLevel(logging.NOTSET)
-        root.setLevel(saved[0])
-        root.handlers[:] = saved[1]
+
+def test_configure_logging_keeps_dependency_info_out_of_the_run(
+    capsys: pytest.CaptureFixture[str], restored_logging: None
+) -> None:
+    """Only MindBridge is verbose at INFO; a dependency has to reach WARNING to be heard."""
+    eval_module._configure_logging("INFO")
+    # What `import funasr` does at module scope. It must not lift anything back up.
+    logging.basicConfig(level=logging.INFO)
+    _emit_from_every_source()
+
+    assert [line.split(": ", 1)[0] for line in capsys.readouterr().err.splitlines()] == [
+        "WARNING httpx",
+        "INFO mindbridge.benchmarks.eval",
+    ]
+
+
+def test_configure_logging_opens_the_whole_process_for_debug(
+    capsys: pytest.CaptureFixture[str], restored_logging: None
+) -> None:
+    """`--verbosity DEBUG` is the one setting that asks for everyone else's detail too."""
+    eval_module._configure_logging("DEBUG")
+    _emit_from_every_source()
+
+    assert [line.split(": ", 1)[0] for line in capsys.readouterr().err.splitlines()] == [
+        "INFO httpx",
+        "INFO modelscope",
+        "DEBUG jieba",
+        "WARNING httpx",
+        "INFO mindbridge.benchmarks.eval",
+    ]
+
+
+def test_configure_logging_silences_mindbridge_too_at_error(
+    capsys: pytest.CaptureFixture[str], restored_logging: None
+) -> None:
+    """A raised floor applies to the harness as well, not just to its dependencies."""
+    eval_module._configure_logging("ERROR")
+    _emit_from_every_source()
+    logging.getLogger("mindbridge.benchmarks.eval").error("run failed")
+
+    assert [line.split(": ", 1)[0] for line in capsys.readouterr().err.splitlines()] == [
+        "ERROR mindbridge.benchmarks.eval",
+    ]
