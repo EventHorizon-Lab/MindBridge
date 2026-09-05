@@ -70,7 +70,7 @@ from mindbridge.benchmarks.eval_adapters import (
     _query_parts,
     load_task,
 )
-from mindbridge.benchmarks.eval_cache import ResponseCache
+from mindbridge.benchmarks.eval_cache import CachedAnswer, ResponseCache
 from mindbridge.benchmarks.eval_statistics import (
     ScoredValue,
     paired_comparison,
@@ -3784,3 +3784,307 @@ def test_eval_run_section_reports_bad_values_as_usage_errors(body: str, tmp_path
 
     with pytest.raises(SystemExit):
         eval_module._arguments(parser, parsed, overrides=overrides)
+
+
+def _streaming_arguments(output_path: Path, **overrides: object) -> eval_module._Arguments:
+    values: dict[str, object] = {
+        "arms": ("mindbridge",),
+        "blind": False,
+        "blind_baseline": None,
+        "bootstrap_samples": 32,
+        "output_path": output_path,
+        "predict_only": True,
+        "quiet": False,
+        "log_samples": False,
+        "recall_limit": 20,
+        "run_id": "run",
+        "seed": 7,
+        "stream_results": False,
+        "use_cache": None,
+    }
+    values.update(overrides)
+    return cast(eval_module._Arguments, SimpleNamespace(**values))
+
+
+async def _completion(
+    completed: eval_module._TaskCompletion,
+    task: LoadedTask,
+    samples: tuple[SampleResult, ...],
+) -> tuple[SampleResult, ...]:
+    """Wrap the per-task callback for `asyncio.run`, which wants a coroutine.
+
+    `_TaskCompletion` promises only an awaitable, which is the right contract for a hook whose
+    implementations the caller does not own. Typeshed before Python 3.14 types `asyncio.run` as
+    taking a `Coroutine`, so the tests do the narrowing rather than the production alias.
+    """
+    return await completed(task, samples)
+
+
+def _streaming_judge() -> eval_module._JudgeConfig:
+    return eval_module._JudgeConfig("judge", "http://judge.invalid", api_key="test")
+
+
+def _streaming_task(name: str) -> tuple[LoadedTask, SampleResult]:
+    # `open_end` is what makes `judge_plan` produce a plan for this family; without it every
+    # judging assertion below would pass on an empty plan set and prove nothing.
+    question = EvalQuestion(
+        f"{name}-q",
+        ("Who signed?",),
+        ("Ada",),
+        metadata={"qtype": "open_end"},
+        source_question="Who signed?",
+    )
+    unit = EvalUnit("unit", (MemoryItem("gold-1", ("Ada signed the contract",)),), (question,))
+    task = LoadedTask(
+        TaskSpec(name, "ATM-Bench", "fixture.json", "v1", "owner/repo", "0" * 40),
+        Path("fixture.json"),
+        "1" * 64,
+        (unit,),
+    )
+    sample = SampleResult(
+        task=name,
+        benchmark="ATM-Bench",
+        dataset_sha256="1" * 64,
+        evaluation_sha256=task.evaluation_sha256,
+        unit_id="unit",
+        question_id=question.question_id,
+        prediction="Ada",
+        parsed_choice=None,
+        score=1.0,
+        exact_match=1.0,
+        latency_ms=1.0,
+        confidence=1.0,
+        memory_ids=(),
+        ingest_failure_count=0,
+        error_code=None,
+        metadata={},
+        metrics={"accuracy": 1.0},
+    )
+    return task, sample
+
+
+def test_each_task_lands_in_the_crash_copy_before_the_run_ends(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A multi-task run must not hold every answer until the last task finishes."""
+    first, first_sample = _streaming_task("atm-bench")
+    second, second_sample = _streaming_task("locomo-refined")
+    arguments = _streaming_arguments(tmp_path / "output")
+    partial = arguments.output_path / eval_module._PARTIAL_SAMPLES_FILE
+    telemetry = EvaluationTelemetry()
+    try:
+        completed = eval_module._task_completion(
+            arguments,
+            judge_config=eval_module._JudgeConfig("judge", "http://judge.invalid"),
+            batch_sizes={"atm-bench": 1, "locomo-refined": 1},
+            telemetry=telemetry,
+            memory_config=None,
+            streamed=set(),
+        )
+        assert asyncio.run(_completion(completed, first, (first_sample,))) == (first_sample,)
+        # The point of the file: task one is durable while task two has not started answering.
+        after_first = partial.read_bytes()
+        assert json.loads(after_first)["sample_id"] == "atm-bench/unit/atm-bench-q"
+        assert asyncio.run(_completion(completed, second, (second_sample,))) == (second_sample,)
+    finally:
+        telemetry.close()
+
+    written = [json.loads(line) for line in partial.read_bytes().splitlines()]
+    assert [row["task"] for row in written] == ["atm-bench", "locomo-refined"]
+    # It can hold prompts and judge responses under --log-samples, so it is as private as the
+    # artifacts it stands in for.
+    assert partial.stat().st_mode & 0o777 == 0o600
+    # Persisting is not reporting: without --stream-results nothing is scored or printed early.
+    assert "atm-bench" not in capsys.readouterr().out
+
+
+def test_stream_results_judges_one_task_before_printing_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    task, sample = _streaming_task("atm-bench")
+    arguments = _streaming_arguments(tmp_path / "output", stream_results=True, predict_only=False)
+    streamed: set[str] = set()
+
+    async def judge(answered: SampleResult, plan: object, **_kwargs: object) -> SampleResult:
+        assert plan is not None
+        return replace(answered, score=0.5, metrics={"accuracy": 0.5})
+
+    monkeypatch.setattr(eval_module, "_judge_sample", judge)
+    telemetry = EvaluationTelemetry()
+    try:
+        completed = eval_module._task_completion(
+            arguments,
+            judge_config=_streaming_judge(),
+            batch_sizes={"atm-bench": 1},
+            telemetry=telemetry,
+            memory_config=None,
+            streamed=streamed,
+        )
+        scored = asyncio.run(_completion(completed, task, (sample,)))
+    finally:
+        telemetry.close()
+
+    # The judged score, not the unjudged 1.0 the sample carried in: judging ran, it ran before
+    # the table was rendered, and the table was rendered from its output.
+    assert [answer.score for answer in scored] == [0.5]
+    printed = capsys.readouterr().out
+    assert "atm-bench" in printed
+    assert "0.5000" in printed and "1.0000" not in printed
+    # The final judging pass must not spend a second call on an answer this already scored.
+    assert streamed == {"atm-bench/unit/atm-bench-q"}
+
+
+def test_the_crash_copy_survives_a_judging_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Answers cost an ingest to produce; a missing judge extra must not take them down."""
+    task, sample = _streaming_task("atm-bench")
+    arguments = _streaming_arguments(
+        tmp_path / "output", stream_results=True, predict_only=False, quiet=True
+    )
+
+    async def unavailable(*_args: object, **_kwargs: object) -> tuple[SampleResult, ...]:
+        raise RuntimeError("official LLM scorers require mindbridge[openai]")
+
+    monkeypatch.setattr(eval_module, "_apply_judges", unavailable)
+    telemetry = EvaluationTelemetry()
+    try:
+        completed = eval_module._task_completion(
+            arguments,
+            judge_config=_streaming_judge(),
+            batch_sizes={"atm-bench": 1},
+            telemetry=telemetry,
+            memory_config=None,
+            streamed=set(),
+        )
+        with pytest.raises(RuntimeError, match="mindbridge\\[openai\\]"):
+            asyncio.run(_completion(completed, task, (sample,)))
+    finally:
+        telemetry.close()
+
+    partial = arguments.output_path / eval_module._PARTIAL_SAMPLES_FILE
+    assert json.loads(partial.read_bytes())["prediction"] == "Ada"
+
+
+def test_a_rerun_does_not_silently_discard_a_leftover_crash_copy(tmp_path: Path) -> None:
+    """The retry after a crash is exactly when the recovery file must not be deleted."""
+    (tmp_path / eval_module._PARTIAL_SAMPLES_FILE).write_bytes(b"{}\n")
+
+    with pytest.raises(FileExistsError, match=eval_module._PARTIAL_SAMPLES_FILE):
+        eval_module._require_output(tmp_path, overwrite=False)
+
+    # `--overwrite` remains the one way through, as it is for every other artifact.
+    eval_module._require_output(tmp_path, overwrite=True)
+
+
+def test_final_judging_skips_answers_already_judged_while_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task, sample = _streaming_task("atm-bench")
+    arguments = _streaming_arguments(Path("unused"), predict_only=False)
+    plans: list[object] = []
+
+    async def judge(answered: SampleResult, plan: object, **_kwargs: object) -> SampleResult:
+        plans.append(plan)
+        return answered
+
+    monkeypatch.setattr(eval_module, "_judge_sample", judge)
+
+    def apply(**overrides: object) -> tuple[SampleResult, ...]:
+        return asyncio.run(
+            eval_module._apply_judges(
+                (task,),
+                (sample,),
+                arguments=arguments,
+                config=_streaming_judge(),
+                **overrides,  # type: ignore[arg-type]
+            )
+        )
+
+    # Control: left alone, this answer is planned and judged. Without it the assertion below
+    # would hold for a sample that was never judgeable in the first place.
+    assert apply() == (sample,)
+    assert [plan is not None for plan in plans] == [True]
+
+    plans.clear()
+    judged = apply(already_judged={sample.sample_id})
+
+    assert judged == (sample,)
+    # Nothing was planned, so `_apply_judges` returned before it built a judge client at all.
+    assert plans == []
+
+
+def test_the_crash_copy_is_removed_once_the_real_artifacts_land(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    partial = output / eval_module._PARTIAL_SAMPLES_FILE
+    partial.write_bytes(b'{"sample_id": "atm-bench/unit/q"}\n')
+    _, sample = _streaming_task("atm-bench")
+
+    eval_module._write_artifacts(
+        _streaming_arguments(output, overwrite=True),
+        (sample,),
+        {"run_id": "run", "tasks": []},
+        None,
+    )
+
+    assert not partial.exists()
+    assert (output / "samples.jsonl").exists()
+
+
+def test_run_arms_hands_every_task_to_the_completion_callback(tmp_path: Path) -> None:
+    """The per-task tail runs between tasks, and its samples are the ones the run keeps."""
+    first, _ = _streaming_task("atm-bench")
+    second, _ = _streaming_task("locomo-refined")
+    arguments = _streaming_arguments(
+        tmp_path / "output",
+        compile_max_chars=4096,
+        compile_max_items=8,
+        data_root=tmp_path / "stores",
+        full_context_chars=4096,
+        ingest="add",
+        log_samples=False,
+        quiet=True,
+        request_concurrency=1,
+        unit_concurrency=1,
+    )
+    seen: list[tuple[str, int]] = []
+
+    class Cache:
+        def get(self, _name: str, _unit: str, _question: str) -> CachedAnswer:
+            return CachedAnswer("Ada", 0.0, (), ranked_source_ids=("gold-1",))
+
+        def put(self, *_args: object) -> None:
+            raise AssertionError("a cache-only run attempted to write its response cache")
+
+    async def completed(
+        task: LoadedTask, samples: tuple[SampleResult, ...]
+    ) -> tuple[SampleResult, ...]:
+        seen.append((task.spec.name, len(samples)))
+        return tuple(replace(sample, prediction="rewritten") for sample in samples)
+
+    telemetry = EvaluationTelemetry()
+    try:
+        samples = asyncio.run(
+            eval_module._run_arms(
+                (first, second),
+                arguments,
+                arms=(eval_module._Arm("mindbridge"),),
+                batch_sizes={"atm-bench": 1, "locomo-refined": 1},
+                memory_factory=cast(
+                    MemoryFactory,
+                    lambda _path: (_ for _ in ()).throw(
+                        AssertionError("a cache-only run opened a memory store")
+                    ),
+                ),
+                response_cache=cast(ResponseCache, Cache()),
+                tracer=telemetry.tracer,
+                on_task_complete=completed,
+            )
+        )
+    finally:
+        telemetry.close()
+
+    # Called once per task, in task order, before the next task starts.
+    assert seen == [("atm-bench", 1), ("locomo-refined", 1)]
+    assert [sample.prediction for sample in samples] == ["rewritten", "rewritten"]

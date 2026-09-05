@@ -16,7 +16,15 @@ import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Container,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
@@ -227,6 +235,11 @@ _FULL_CONTEXT_SYSTEM_PROMPT = (
 DEFAULT_BOOTSTRAP_SAMPLES = 2_000
 _RESULTS_FILE = "results.jsonl"
 _SAMPLES_FILE = "samples.jsonl"
+# Written task by task while the run is still going, and removed once the real artifacts land. A
+# multi-task run used to hold every sample in memory until the last task finished, so an upstream
+# outage during task five threw away four tasks of answers. This file is never an evaluation
+# artifact -- it carries no results document and no digest -- it is the crash copy.
+_PARTIAL_SAMPLES_FILE = "samples.partial.jsonl"
 _EGOMEM_SUBMISSION_FILE = "egomemreason_submission.json"
 _MEDIA_MANIFEST_FILE = "media-manifest.jsonl"
 _EGOMEM_SUBMISSION_COUNT = 500
@@ -316,6 +329,7 @@ class _Arguments:
     regression_threshold: float
     predict_only: bool
     log_samples: bool
+    stream_results: bool
     allow_unverified_data: bool
     download: bool
     overwrite: bool
@@ -482,6 +496,11 @@ class _MemoryContext(Protocol):
 
 MemoryFactory = Callable[[Path], _MemoryContext]
 _SearchReplay = Callable[[], Awaitable[None]]
+# Called once per task, the moment that task has answered every question, and returns the samples
+# to keep. It is what lets a run persist and report a finished task without waiting for the rest.
+_TaskCompletion = Callable[
+    ["LoadedTask", tuple["SampleResult", ...]], Awaitable[tuple["SampleResult", ...]]
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1396,7 +1415,16 @@ def _execute(
     )
     metrics_settings = ServerMetricsOverrides() if server_metrics is None else server_metrics
     embedding_warmup_count = 0
+    streamed: set[str] = set()
     try:
+        task_completed = _task_completion(
+            arguments,
+            judge_config=judge_config,
+            batch_sizes=batch_sizes,
+            telemetry=telemetry,
+            memory_config=memory_config,
+            streamed=streamed,
+        )
         response_cache = (
             None
             if arguments.use_cache is None
@@ -1461,6 +1489,7 @@ def _execute(
                             tracer=telemetry.tracer,
                             config=config,
                             memory_config=memory_config,
+                            on_task_complete=task_completed,
                         )
                     )
                 model_servers = _server_metric_results(
@@ -1489,29 +1518,113 @@ def _execute(
                     arguments=arguments,
                     config=judge_config,
                     tracer=telemetry.tracer,
+                    already_judged=streamed,
                 )
             )
         samples = _with_grounding_loss(samples, telemetry)
-        performance = {
-            task.spec.name: {
-                arm: telemetry.result(
-                    task.spec.name,
-                    arm=arm,
-                    question_count=sum(
-                        sample.task == task.spec.name and sample.arm == arm and not sample.cached
-                        for sample in samples
-                    ),
-                )
-                for arm in arguments.arms
-            }
-            for task in loaded
-        }
+        performance = _task_performance(telemetry, loaded, samples, arguments.arms)
         duration = time.perf_counter() - started
         resources = sampler.json(wall_seconds=duration)
         resources["model_servers"] = model_servers
         return samples, duration, performance, resources, embedding_warmup_count
     finally:
         telemetry.close()
+
+
+def _task_completion(
+    arguments: _Arguments,
+    *,
+    judge_config: _JudgeConfig,
+    batch_sizes: Mapping[str, int],
+    telemetry: EvaluationTelemetry,
+    memory_config: MindBridgeConfig | None,
+    streamed: set[str],
+) -> _TaskCompletion:
+    """Build the per-task tail: always persist, and under `--stream-results` also score and print.
+
+    Answering every task before anything is written or scored made a multi-task run silent until
+    the last task finished, and made an outage during the last task discard every earlier task's
+    answers. The crash copy costs nothing and is always written; judging early is opt-in because
+    its traffic overlaps later tasks' answers and moves their latency and token measurements.
+    """
+    partial_path = arguments.output_path / _PARTIAL_SAMPLES_FILE
+    partial_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    partial_path.unlink(missing_ok=True)
+
+    async def completed(
+        task: LoadedTask, task_samples: tuple[SampleResult, ...]
+    ) -> tuple[SampleResult, ...]:
+        # Persist before anything that can fail. Judging raises on a missing extra or an
+        # unreachable judge, and it must not be able to take the answers down with it: those cost
+        # a full ingest to produce, the scores cost one more model call. Writing here also makes
+        # the copy identical whether or not the run streams -- predictions, not scores.
+        # Same 0o600 as the real artifacts, and fsynced: a copy that survives only a clean exit
+        # would not survive the failures it exists for.
+        descriptor = os.open(partial_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(descriptor, "wb") as partial:
+            partial.write(_jsonl_bytes(sample.json() for sample in task_samples))
+            partial.flush()
+            os.fsync(partial.fileno())
+        if arguments.stream_results:
+            task_samples = _with_grounding_loss(task_samples, telemetry)
+            if not arguments.predict_only:
+                task_samples = await _apply_judges(
+                    (task,),
+                    task_samples,
+                    arguments=arguments,
+                    config=judge_config,
+                    tracer=telemetry.tracer,
+                )
+            streamed.update(sample.sample_id for sample in task_samples)
+            if not arguments.quiet:
+                _announce(f"interim results for {task.spec.name} (later tasks still running)")
+                print(
+                    _table(
+                        {
+                            "tasks": _task_rows(
+                                arguments,
+                                (task,),
+                                task_samples,
+                                batch_sizes,
+                                _task_performance(telemetry, (task,), task_samples, arguments.arms),
+                                None,
+                                memory_config=memory_config,
+                            )
+                        }
+                    )
+                )
+        return task_samples
+
+    return completed
+
+
+def _task_performance(
+    telemetry: EvaluationTelemetry,
+    tasks: Sequence[LoadedTask],
+    samples: Sequence[SampleResult],
+    arms: Sequence[str],
+) -> dict[str, dict[str, Mapping[str, object]]]:
+    """Read each (task, arm)'s aggregated spans.
+
+    `EvaluationTelemetry.result` is a non-destructive read, so a task that has just finished can
+    be summarised mid-run and summarised again in the final document. A mid-run read is missing
+    the run-global standalone search replay, which by design runs only once every task has
+    answered; the final read is the complete one.
+    """
+    return {
+        task.spec.name: {
+            arm: telemetry.result(
+                task.spec.name,
+                arm=arm,
+                question_count=sum(
+                    sample.task == task.spec.name and sample.arm == arm and not sample.cached
+                    for sample in samples
+                ),
+            )
+            for arm in arms
+        }
+        for task in tasks
+    }
 
 
 def _with_grounding_loss(
@@ -1537,6 +1650,7 @@ async def _run_all(
     tracer: Tracer,
     config: ModelConfig | None = None,
     memory_config: MindBridgeConfig | None = None,
+    on_task_complete: _TaskCompletion | None = None,
 ) -> tuple[SampleResult, ...]:
     generated_arms = {"blind", "full-context", "compile"}
     generator = (
@@ -1567,6 +1681,7 @@ async def _run_all(
             memory_factory=memory_factory,
             response_cache=response_cache,
             tracer=tracer,
+            on_task_complete=on_task_complete,
         )
     finally:
         if generator is not None:
@@ -1582,6 +1697,7 @@ async def _run_arms(
     memory_factory: MemoryFactory,
     response_cache: ResponseCache | None,
     tracer: Tracer,
+    on_task_complete: _TaskCompletion | None = None,
 ) -> tuple[SampleResult, ...]:
     compile_budget = ContextBudget(
         max_items=arguments.compile_max_items,
@@ -1611,27 +1727,28 @@ async def _run_arms(
                 task.spec.name,
                 arguments.run_id,
             )
-            results.extend(
-                await run_loaded_task(
-                    task,
-                    run=run,
-                    memory_factory=memory_factory,
-                    batch_size=batch_sizes[task.spec.name],
-                    unit_concurrency=arguments.unit_concurrency,
-                    request_concurrency=arguments.request_concurrency,
-                    recall_limit=arguments.recall_limit,
-                    predict_only=arguments.predict_only,
-                    log_samples=arguments.log_samples,
-                    response_cache=response_cache,
-                    arms=arms,
-                    full_context_chars=arguments.full_context_chars,
-                    compile_budget=compile_budget,
-                    ingest_mode=arguments.ingest,
-                    tracer=tracer,
-                    on_progress=progress,
-                    on_search_replay_ready=deferred_searches.append,
-                )
+            task_samples = await run_loaded_task(
+                task,
+                run=run,
+                memory_factory=memory_factory,
+                batch_size=batch_sizes[task.spec.name],
+                unit_concurrency=arguments.unit_concurrency,
+                request_concurrency=arguments.request_concurrency,
+                recall_limit=arguments.recall_limit,
+                predict_only=arguments.predict_only,
+                log_samples=arguments.log_samples,
+                response_cache=response_cache,
+                arms=arms,
+                full_context_chars=arguments.full_context_chars,
+                compile_budget=compile_budget,
+                ingest_mode=arguments.ingest,
+                tracer=tracer,
+                on_progress=progress,
+                on_search_replay_ready=deferred_searches.append,
             )
+        if on_task_complete is not None:
+            task_samples = await on_task_complete(task, task_samples)
+        results.extend(task_samples)
     # This is deliberately a run-global second pass. Replaying one task while a later task is
     # still answering changes shared model-service load and contaminates both latency families.
     for search_replay in deferred_searches:
@@ -2860,6 +2977,7 @@ async def _apply_judges(
     arguments: _Arguments,
     config: _JudgeConfig,
     tracer: Tracer | None = None,
+    already_judged: Container[str] = (),
 ) -> tuple[SampleResult, ...]:
     selected_tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
     questions = {
@@ -2874,6 +2992,9 @@ async def _apply_judges(
             sample.error_code is not None
             or sample.ingest_failure_count
             or not _Arm(sample.arm).generates
+            # `--stream-results` already judged this one when its task finished. Re-judging would
+            # spend the calls twice and let a non-deterministic judge overwrite a published score.
+            or sample.sample_id in already_judged
         ):
             continue
         question = questions[(sample.task, sample.unit_id, sample.question_id)]
@@ -3303,21 +3424,21 @@ def _incomplete_search_replay(rows: Sequence[Mapping[str, object]]) -> bool:
     return False
 
 
-def _results(
+def _task_rows(
     arguments: _Arguments,
-    config: ModelConfig,
-    judge_config: _JudgeConfig,
     tasks: Sequence[LoadedTask],
     samples: Sequence[SampleResult],
-    duration_seconds: float,
     batch_sizes: Mapping[str, int],
-    submission_status: Mapping[str, object] | None,
     performance: Mapping[str, Mapping[str, Mapping[str, object]]],
+    submission_status: Mapping[str, object] | None,
     *,
-    memory_config: MindBridgeConfig | None = None,
-    resources: Mapping[str, object] | None = None,
-    embedding_warmup_count: int | None = None,
-) -> dict[str, object]:
+    memory_config: MindBridgeConfig | None,
+) -> list[dict[str, object]]:
+    """Score one row per (task, arm).
+
+    Separate from `_results` so a task that has finished answering can be scored and printed on
+    its own, with exactly the arithmetic the final document uses, while later tasks still run.
+    """
     # A blind arm run here is the same control as an external `--blind` document, measured on the
     # same inputs, so it satisfies the blind control too. An explicitly supplied document still
     # wins: the caller named it.
@@ -3391,6 +3512,34 @@ def _results(
                 **metrics,
             }
         )
+
+    return task_rows
+
+
+def _results(
+    arguments: _Arguments,
+    config: ModelConfig,
+    judge_config: _JudgeConfig,
+    tasks: Sequence[LoadedTask],
+    samples: Sequence[SampleResult],
+    duration_seconds: float,
+    batch_sizes: Mapping[str, int],
+    submission_status: Mapping[str, object] | None,
+    performance: Mapping[str, Mapping[str, Mapping[str, object]]],
+    *,
+    memory_config: MindBridgeConfig | None = None,
+    resources: Mapping[str, object] | None = None,
+    embedding_warmup_count: int | None = None,
+) -> dict[str, object]:
+    task_rows = _task_rows(
+        arguments,
+        tasks,
+        samples,
+        batch_sizes,
+        performance,
+        submission_status,
+        memory_config=memory_config,
+    )
     media_roots = {}
     for name in arguments.tasks:
         path = arguments.media_overrides.get(name) or TASKS[name].media_root(
@@ -4576,6 +4725,8 @@ def _write_artifacts(
     if submission is not None:
         files.append((submission_path, submission))
     _atomic_replace(files)
+    # The real samples file now holds everything the crash copy did.
+    (arguments.output_path / _PARTIAL_SAMPLES_FILE).unlink(missing_ok=True)
 
 
 def _atomic_replace(files: Sequence[tuple[Path, bytes]]) -> None:
@@ -5007,6 +5158,17 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     parser.add_argument("--regression-threshold", type=_nonnegative_float, default=None)
     parser.add_argument("--predict-only", "--predict_only", "-x", action="store_true", default=None)
     parser.add_argument("--log-samples", "--log_samples", action="store_true", default=None)
+    parser.add_argument(
+        "--stream-results",
+        "--stream_results",
+        action="store_true",
+        default=None,
+        help=(
+            "judge and print each task's table as soon as that task finishes answering, instead "
+            "of only after the last task; the judging traffic then overlaps later tasks' answers, "
+            "so their latency and token measurements are no longer comparable with a normal run"
+        ),
+    )
     parser.add_argument("--allow-unverified-data", action="store_true", default=None)
     parser.add_argument(
         "--download",
@@ -5092,6 +5254,7 @@ def _arguments(
     regression_threshold = _picked(parsed.regression_threshold, run.regression_threshold, 0.0)
     predict_only = _picked(parsed.predict_only, run.predict_only, False)
     log_samples = _picked(parsed.log_samples, run.log_samples, False)
+    stream_results = _picked(parsed.stream_results, run.stream_results, False)
     allow_unverified = _picked(parsed.allow_unverified_data, run.allow_unverified_data, False)
     download_inputs = _picked(parsed.download, run.download, True)
     overwrite = _picked(parsed.overwrite, run.overwrite, False)
@@ -5181,6 +5344,7 @@ def _arguments(
         regression_threshold=regression_threshold,
         predict_only=predict_only,
         log_samples=log_samples,
+        stream_results=stream_results,
         allow_unverified_data=allow_unverified,
         download=download_inputs,
         overwrite=overwrite,
@@ -5626,7 +5790,10 @@ def _assignments(values: Sequence[str], selected: Sequence[str]) -> dict[str, Pa
 
 
 def _require_output(path: Path, *, overwrite: bool) -> None:
-    for name in (_RESULTS_FILE, _SAMPLES_FILE, _EGOMEM_SUBMISSION_FILE):
+    # The crash copy is guarded like the artifacts it stands in for. A run that died leaves one
+    # behind and no `results.jsonl`, so without this a same-`--run-id` retry would pass the guard
+    # and delete the only record of the tasks that did finish, before answering anything.
+    for name in (_RESULTS_FILE, _SAMPLES_FILE, _PARTIAL_SAMPLES_FILE, _EGOMEM_SUBMISSION_FILE):
         target = path / name
         if target.exists() and not overwrite:
             raise FileExistsError(f"evaluation artifact already exists: {target}")
