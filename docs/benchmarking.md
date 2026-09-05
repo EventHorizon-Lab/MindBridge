@@ -183,7 +183,8 @@ annotated [example configuration](examples/eval.example.yaml) for every field an
 `compile_max_chars`, `ingest`, `limit`, `offset`, `seed`, `bootstrap_samples`, `batch_size`,
 `repeat_index`, `max_batch_size`, `unit_concurrency`,
 `request_concurrency`, `judge_concurrency`, `recall_limit`, `device`, `device_lock`, `use_cache`,
-`run_id`, `output_path`, `overwrite`, `log_samples`, `predict_only`, `download`,
+`run_id`, `output_path`, `overwrite`, `log_samples`, `predict_only`, `stream_results`,
+`download`,
 `allow_unverified_data`, `verbosity`, `quiet`, `compare`, `fail_on_regression`,
 `regression_threshold`, `media_manifest`, `task_data`, `media_root`, and `num_fewshot`. Omitted
 keys retain the unset-flag defaults.
@@ -832,6 +833,31 @@ Each completed `eval` output directory contains:
   controls, the noise floor, resource usage, and a digest of `samples.jsonl`.
 - `egomemreason_submission.json`: the official JSON-array submission, only for a complete, valid
   EgoMemReason run from the `mindbridge` arm.
+
+A run in progress also holds `samples.partial.jsonl`, appended as each task finishes answering and
+removed when the real artifacts land. It is a crash copy, not an artifact: it carries no results
+document and no digest, and a leftover file means the run it belongs to did not finish. Read it to
+recover the answers of the tasks that completed before an interruption.
+
+### Reporting cadence
+
+A multi-task run answers its tasks in order and reports every task at the end, because judging and
+the standalone search replay are deliberately run-global second passes: replaying or judging one
+task while a later task is still answering changes the load on the shared model service and moves
+both tasks' latency and token measurements.
+
+`--stream-results` (`benchmark.run.stream_results`) trades that away for feedback. Each task is
+judged and printed as soon as it stops answering, so a six-task run shows its first table after the
+first task instead of after the last. The interim tables are the same arithmetic as the final
+document, minus the standalone search replay, which still runs once at the end, and every answer is
+judged exactly once: the scores, controls, and confidence intervals in the final `results.jsonl` are
+what the same run would have produced without the flag.
+
+Performance is a different matter, and it is the reason the flag is opt-in. Later tasks answer while
+earlier tasks are being judged, so their `performance` blocks -- `avg ms`, token usage, throughput --
+describe a contended model service and are not comparable with a normal run or with each other.
+Leave the flag off for any run whose latency numbers will be quoted, or fed to `--compare` with
+`--performance-budget`.
 
 Three result fields carry a caveat that decides whether they can be quoted:
 
