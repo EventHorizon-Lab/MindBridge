@@ -1,19 +1,31 @@
 """Focused contract checks for the local FastAPI adapter."""
 
+import asyncio
 import base64
 import inspect
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
+from typing import cast
 
 import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
+from starlette.requests import Request
+from starlette.types import Message, Scope
 
 import mindbridge
+from mindbridge.api import app as app_module
 from mindbridge.api.app import create_app
 from mindbridge.exceptions import (
     IdentityNotFoundError,
@@ -27,6 +39,7 @@ from mindbridge.exceptions import (
 )
 from mindbridge.types import (
     AffectCue,
+    AnswerChunk,
     AnswerResult,
     AssetRef,
     Blob,
@@ -346,6 +359,26 @@ class FakeMemory:
         self.calls.append(("ask", question, limit, memory_type, reference_at, link_identities))
         return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
 
+    def ask_stream(
+        self,
+        question: ContentInput,
+        *,
+        limit: int = 5,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+        link_identities: bool = True,
+    ) -> Generator[AnswerChunk, None, AnswerResult]:
+        self._fail()
+        self.calls.append(
+            ("ask_stream", question, limit, memory_type, reference_at, link_identities)
+        )
+        result = AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
+        yield AnswerChunk(text="The toolbox ")
+        yield AnswerChunk(text="is blue.")
+        yield AnswerChunk(result=result)
+        return result
+
     def get(self, memory_id: str) -> MemoryRecord:
         self._fail()
         self.calls.append(("get", memory_id))
@@ -591,6 +624,280 @@ def test_resource_routes_map_the_public_memory_values() -> None:
     assert all(name not in serialized_schema for name in ("tenant_id", "user_id", "run_id"))
 
 
+def test_answer_stream_sends_deltas_then_one_grounded_result_with_transport_timing() -> None:
+    memory = FakeMemory()
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    with TestClient(create_app(memory=memory, tracer=provider.get_tracer("test.rest"))) as client:
+        response = client.post(
+            "/v1/answers/stream",
+            json={"question": " What color is it? ", "limit": 4},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.text.count("event: delta\n") == 2
+    assert 'data: {"text":"The toolbox "}' in response.text
+    assert 'data: {"text":"is blue."}' in response.text
+    assert response.text.count("event: result\n") == 1
+    assert '"answer":"The toolbox is blue."' in response.text
+    assert memory.calls == [("ask_stream", "What color is it?", 4, None, None, False)]
+
+    span = next(
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.http.request"
+    )
+    attributes = span.attributes or {}
+    assert attributes["http.route"] == "/v1/answers/stream"
+    assert attributes["mindbridge.transport.response_mode"] == "streaming"
+    assert attributes["http.response.status_code"] == 200
+    time_to_headers = cast(float, attributes["mindbridge.transport.server_time_to_headers_ms"])
+    time_to_body = cast(float, attributes["mindbridge.transport.server_time_to_first_body_byte_ms"])
+    total = cast(float, attributes["mindbridge.transport.server_total_ms"])
+    assert time_to_headers >= 0
+    assert time_to_headers <= time_to_body <= total
+
+
+def test_answer_stream_failure_before_first_delta_keeps_the_json_error_contract() -> None:
+    failure = ModelError("provider is busy", reason="rate_limited", stage="generate")
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    with TestClient(
+        create_app(memory=FakeMemory(failure), tracer=provider.get_tracer("test.rest"))
+    ) as client:
+        response = client.post("/v1/answers/stream", json={"question": "Where is it?"})
+    provider.shutdown()
+
+    assert response.status_code == 503
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["reason"] == "rate_limited"
+    assert response.json()["stage"] == "generate"
+    span = next(
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.http.request"
+    )
+    assert span.status.status_code is StatusCode.ERROR
+    assert not span.events
+
+
+def test_answer_stream_failure_after_a_delta_ends_with_an_error_event() -> None:
+    class MidstreamFailure(FakeMemory):
+        def ask_stream(
+            self,
+            question: ContentInput,
+            *,
+            limit: int = 5,
+            memory_type: MemoryType | None = None,
+            reference_at: datetime | None = None,
+            scope: RetrievalScope | None = None,
+            link_identities: bool = True,
+        ) -> Generator[AnswerChunk, None, AnswerResult]:
+            del question, limit, memory_type, reference_at, scope, link_identities
+            yield AnswerChunk(text="partial answer")
+            failure = ModelError(
+                "generation request failed", reason="rate_limited", stage="generate"
+            )
+            failure.__cause__ = RuntimeError("private provider detail")
+            raise failure
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with TestClient(
+        create_app(memory=MidstreamFailure(), tracer=provider.get_tracer("test.rest"))
+    ) as client:
+        response = client.post("/v1/answers/stream", json={"question": "Where is it?"})
+    provider.shutdown()
+
+    assert response.status_code == 200
+    assert response.text.count("event: delta\n") == 1
+    assert response.text.count("event: error\n") == 1
+    assert "event: result\n" not in response.text
+    assert '"reason":"rate_limited"' in response.text
+    assert "private provider detail" not in response.text
+    span = next(
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.http.request"
+    )
+    assert span.status.status_code is StatusCode.ERROR
+    assert not span.events
+
+
+@pytest.mark.parametrize("failed_message", ["http.response.start", "http.response.body"])
+@pytest.mark.asyncio
+async def test_answer_stream_closes_after_the_transport_send_fails(
+    failed_message: str,
+) -> None:
+    closed = Event()
+
+    class CloseTrackedMemory(FakeMemory):
+        def ask_stream(
+            self,
+            question: ContentInput,
+            *,
+            limit: int = 5,
+            memory_type: MemoryType | None = None,
+            reference_at: datetime | None = None,
+            scope: RetrievalScope | None = None,
+            link_identities: bool = True,
+        ) -> Generator[AnswerChunk, None, AnswerResult]:
+            del question, limit, memory_type, reference_at, scope, link_identities
+            result = AnswerResult(answer="answer")
+            try:
+                yield AnswerChunk(text="answer")
+                yield AnswerChunk(result=result)
+                return result
+            finally:
+                closed.set()
+
+    app = create_app(memory=CloseTrackedMemory())
+    endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if isinstance(route, APIRoute) and route.path == "/v1/answers/stream"
+    )
+    never_disconnect = asyncio.Event()
+
+    async def receive() -> Message:
+        await never_disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/v1/answers/stream", "headers": []},
+        receive,
+    )
+    response = await endpoint(app_module.AnswerRequest(question="Where is it?"), request)
+
+    async def send(message: Message) -> None:
+        if message["type"] == failed_message:
+            raise RuntimeError("transport send failed")
+
+    response_scope = cast(
+        Scope,
+        {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "method": "POST",
+            "path": "/v1/answers/stream",
+            "headers": [],
+        },
+    )
+    with pytest.raises(RuntimeError, match="transport send failed"):
+        await response(response_scope, receive, send)
+
+    assert await asyncio.to_thread(closed.wait, 0.5)
+
+
+@pytest.mark.asyncio
+async def test_answer_stream_closes_after_disconnect_while_waiting_for_first_chunk() -> None:
+    entered = Event()
+    release = Event()
+    closed = Event()
+
+    def delayed_stream() -> Generator[AnswerChunk, None, AnswerResult]:
+        try:
+            entered.set()
+            release.wait(timeout=2)
+            yield AnswerChunk(text="late")
+            return AnswerResult(answer="late")
+        finally:
+            closed.set()
+
+    async def receive() -> dict[str, str]:
+        return {"type": "http.disconnect"}
+
+    connection = Request(
+        {"type": "http", "method": "POST", "path": "/v1/answers/stream", "headers": []},
+        receive,
+    )
+    worker = ThreadPoolExecutor(max_workers=1)
+    stream = delayed_stream()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(
+                app_module._first_chunk_or_disconnect(
+                    stream,
+                    connection=connection,
+                    worker=worker,
+                    context=copy_context(),
+                ),
+                timeout=0.5,
+            )
+        assert await asyncio.to_thread(entered.wait, 0.5)
+        release.set()
+        assert await asyncio.to_thread(closed.wait, 0.5)
+    finally:
+        release.set()
+        worker.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_answer_stream_closes_when_first_chunk_task_is_cancelled() -> None:
+    entered = Event()
+    release = Event()
+    closed = Event()
+    wait_for_request = asyncio.Event()
+
+    def delayed_stream() -> Generator[AnswerChunk, None, AnswerResult]:
+        try:
+            entered.set()
+            release.wait(timeout=2)
+            yield AnswerChunk(text="late")
+            return AnswerResult(answer="late")
+        finally:
+            closed.set()
+
+    async def receive() -> dict[str, str]:
+        await wait_for_request.wait()
+        return {"type": "http.request"}
+
+    connection = Request(
+        {"type": "http", "method": "POST", "path": "/v1/answers/stream", "headers": []},
+        receive,
+    )
+    worker = ThreadPoolExecutor(max_workers=1)
+    stream = delayed_stream()
+    pending = asyncio.create_task(
+        app_module._first_chunk_or_disconnect(
+            stream,
+            connection=connection,
+            worker=worker,
+            context=copy_context(),
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 0.5)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        release.set()
+        assert await asyncio.to_thread(closed.wait, 0.5)
+    finally:
+        release.set()
+        worker.shutdown(wait=False)
+
+
+def test_transport_trace_uses_the_route_template_instead_of_a_memory_id() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    secret_id = "customer-secret-123"
+
+    with TestClient(
+        create_app(memory=FakeMemory(), tracer=provider.get_tracer("test.rest"))
+    ) as client:
+        assert client.get(f"/v1/memories/{secret_id}").status_code == 200
+    provider.shutdown()
+
+    span = next(
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.http.request"
+    )
+    attributes = span.attributes or {}
+    assert attributes["http.route"] == "/v1/memories/{memory_id}"
+    assert secret_id not in repr(attributes)
+
+
 def test_ordered_content_parts_map_to_public_inputs_without_exposing_asset_paths() -> None:
     memory = FakeMemory()
     image_data = base64.b64encode(b"png").decode()
@@ -717,29 +1024,37 @@ def test_content_parts_reject_ambiguous_or_untrusted_sources_before_memory(
 
 def test_memory_routes_are_sync_for_fastapi_threadpool_execution() -> None:
     app = create_app(memory=FakeMemory())
-    endpoints = [
-        route.endpoint
+    routes = [
+        route
         for route in app.routes
         if isinstance(route, APIRoute) and route.path.startswith("/v1/")
     ]
 
-    assert endpoints
-    assert all(not inspect.iscoroutinefunction(endpoint) for endpoint in endpoints)
+    assert routes
+    assert {
+        route.operation_id for route in routes if inspect.iscoroutinefunction(route.endpoint)
+    } == {"answerStream"}
 
 
 def test_the_documented_v1_route_counts_are_the_real_ones() -> None:
     """`docs/api/rest.md` spells out the always-on and gated `/v1` route counts in prose.
 
-    Parses "twelve ... or twenty-two when" from the doc and checks each number against the
+    Parses "thirteen ... or twenty-three when" from the doc and checks each number against the
     routes `create_app` actually registers, once with both opt-in switches off and once with
     both on, so a route added or removed without a doc update fails here. A tiny local map
     stands in for `test_surface_parity._COUNT_WORDS`: that module has no `__init__.py`, so
     importing it by dotted path here collides with mypy's own file-based module discovery.
     """
-    count_words = {12: "twelve", 22: "twenty-two"}
+    count_words = {13: "thirteen", 23: "twenty-three"}
 
-    def v1_route_count(**kwargs: bool) -> int:
-        app = create_app(memory=FakeMemory(), **kwargs)
+    def v1_route_count(
+        *, identity_operations: bool = False, embodied_operations: bool = False
+    ) -> int:
+        app = create_app(
+            memory=FakeMemory(),
+            identity_operations=identity_operations,
+            embodied_operations=embodied_operations,
+        )
         return sum(
             1
             for route in app.routes
@@ -1184,6 +1499,21 @@ def test_the_context_route_defaults_to_the_sdk_budget() -> None:
     }
 
 
+@pytest.mark.parametrize("freshness", ("1e309", "1e100"))
+def test_the_context_route_rejects_an_unrepresentable_freshness(freshness: str) -> None:
+    memory = FakeMemory()
+    body = f'{{"goal":"What should I bring?","budget":{{"freshness_seconds":{freshness}}}}}'
+
+    with TestClient(create_app(memory=memory)) as client:
+        response = client.post(
+            "/v1/context", content=body, headers={"Content-Type": "application/json"}
+        )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "validation_error"
+    assert memory.calls == []
+
+
 def test_unexpected_and_framework_errors_keep_the_flat_envelope() -> None:
     app = create_app(memory=FakeMemory(RuntimeError("private implementation detail")))
     with TestClient(app, raise_server_exceptions=False) as client:
@@ -1388,8 +1718,8 @@ def test_embodied_routes_dispatch_to_the_sdk_when_enabled() -> None:
     assert memory.calls == [("speech", "memory_1"), ("faces", "memory_1")]
 
 
-def test_answer_only_links_identities_when_embodied_operations_is_enabled() -> None:
-    """A caller with recall access alone must not acquire merge authority through `/v1/answers`.
+def test_answers_only_link_identities_when_embodied_operations_is_enabled() -> None:
+    """Recall access alone must not acquire merge authority through either answer route.
 
     `embodied_operations` gates `analyze_faces`, which commits the corroborated cross-modal
     identity merge; `ask` reaches the same merge through its own face recognition, so REST must
@@ -1399,12 +1729,16 @@ def test_answer_only_links_identities_when_embodied_operations_is_enabled() -> N
     memory = FakeMemory()
     with TestClient(create_app(memory=memory)) as client:
         client.post("/v1/answers", json={"question": "What color is it?"})
+        client.post("/v1/answers/stream", json={"question": "What color is it?"})
     assert memory.calls[-1][-1] is False
+    assert memory.calls[-2][-1] is False
 
     memory = FakeMemory()
     with TestClient(create_app(memory=memory, embodied_operations=True)) as client:
         client.post("/v1/answers", json={"question": "What color is it?"})
+        client.post("/v1/answers/stream", json={"question": "What color is it?"})
     assert memory.calls[-1][-1] is True
+    assert memory.calls[-2][-1] is True
 
 
 def test_embodied_routes_map_memory_not_found() -> None:

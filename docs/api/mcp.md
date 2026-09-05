@@ -84,6 +84,7 @@ build_mcp_server(
     identity_operations: bool = True,
     embodied_operations: bool = True,
     write_operations: bool = True,
+    tracer: Tracer | None = None,
 ) -> MCPServer[None]
 ```
 
@@ -140,6 +141,11 @@ rejected. The MCP-specific media bounds are listed below.
 | `forget_identity` | required `identity_id` | `{"erasure":IdentityErasure}` | destructive, not idempotent |
 
 All timestamps must be timezone-aware. An event end requires a start and must be later than it.
+
+MCP tool calls have one finite response and therefore expose completion latency, not TTFT. The
+adapter emits a `mindbridge.mcp.request` server span with the method, tool name, error status and
+total server time. Use Python `ask_stream` or REST `POST /v1/answers/stream` when first-token
+delivery is part of the performance contract.
 Search event bounds are a half-open overlap filter; two bounds require
 `occurred_until > occurred_from`. `memory_type` is `semantic`, `episodic`, or `procedural`.
 Pagination cursors are opaque and must be passed back unchanged.
@@ -155,7 +161,8 @@ retrieval.
 answer, compile, and the two analysis tools are not marked read-only because their SDK path
 persists lazy transcript caches, identity evidence, and -- when a recall comes back with nothing,
 an answer abstains, or a bundle carries no evidence -- the bounded recall-failure signal the
-control plane's `QUERY_FAILURE` trigger reads; they are also not advertised as idempotent. Every tool has `open_world_hint=false`. `ask_memory` requires an answerer in the
+control plane's `QUERY_FAILURE` trigger reads; they are also not advertised as idempotent. Every
+tool has `open_world_hint=false`. `ask_memory` requires an answerer in the
 injected memory; without one it returns `model_error/backend_not_configured`. With the default
 `reinforce_on_answer=True`, it also reinforces the hits the answerer cites.
 
@@ -167,9 +174,11 @@ holds no evidence -- which is why neither is annotated read-only. It
 reports lineage conflicts and never resolves them, and names in `unknowns` what the request
 implied that the bundle does not carry. `ask_memory` remains a convenience for one grounded
 answer. The optional `budget` object is the transport form of `ContextBudget` with the
-`freshness` timedelta expressed as `freshness_seconds`; `max_chars`
-accepts 1 through 65,536, `max_items` 1 through 100, `max_media_items` any non-negative count
-or `null`, and `max_latency_ms` is a deadline the
+`freshness` timedelta expressed as `freshness_seconds`; omitting it uses 16,000 characters and 24
+items. `freshness_seconds` must be positive, finite, and representable as a Python `timedelta`, or
+the tool returns `validation_error`; `max_chars`
+accepts 1 through 65,536, `max_items` 1 through 100, `max_media_items` any non-negative count or
+`null`, and `max_latency_ms` is a deadline the
 compiler checks between stages rather than a timeout that aborts. The
 [compiler reference](../context-compilation.md) owns section, selection, and conflict semantics.
 
@@ -312,7 +321,7 @@ does.
 | Operation | Why, and what to call instead |
 | --- | --- |
 | `add_stream` | **Transport limitation.** It consumes a lazy iterable and yields records as it goes, and one tool call is a finite request with one response, so a stream cannot be started, fed, and drained through it. Call `add_memory` for each completed observation, or use the SDK for a live source. |
-| `ask_stream` | **Transport limitation.** It yields the answer while the model is still producing it, and one tool call is a finite request with one response, so the incremental delivery that justifies it cannot survive the hop. Call `ask_memory`, which returns the same grounded answer once it is complete, or use the SDK when time to first token matters. |
+| `ask_stream` | **Transport limitation.** One MCP tool call has one finite response. Call `ask_memory` for the completed answer, or use the Python SDK or REST `POST /v1/answers/stream` when time to first token matters. |
 | `add_many` | Every item is already reachable through `add_memory`, so this buys one model batch rather than a capability. Its parallel arrays must line up with `contents` position by position, and a misalignment stores real memories under the wrong timestamps, which is a worse failure than slower ingestion. Use `POST /v1/memories/batch` for bulk loading. |
 | `search_with_trace` | No tool of its own, because the same trace is reachable from the tool that produces the hits: call `search_memories` with `explain=true`. Use the SDK or the CLI when diagnosing retrieval outside an agent loop. |
 | `reindex` | Rebuilds the whole search projection from SQLite. The duration grows with the store and has no upper bound, so it does not belong behind a client that expects one timely response. It is also an operator decision, not a caller's. |

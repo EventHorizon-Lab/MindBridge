@@ -266,8 +266,8 @@ gate in the [benchmark protocol](benchmarking.md#mandatory-controls).
 ## Public and trust boundaries
 
 Supported SDK values are imported from `mindbridge`. The `Memory` SDK exposes 35 product
-operations. REST exposes twelve `/v1` routes: add, batch add, list, search, reinforce, get,
-delete, answer, compile context, capture, settle, and pending captures. Ten more -- speech, face,
+operations. REST exposes thirteen `/v1` routes: add, batch add, list, search, reinforce, get,
+delete, answer, streamed answer, compile context, capture, settle, and pending captures. Ten more -- speech, face,
 register identity, get identity, unlink identity, forget identity, record consent, read consent,
 export a subject, and apply retention -- exist only when the host
 enables the matching `identity_operations` or `embodied_operations` switch on `create_app`,

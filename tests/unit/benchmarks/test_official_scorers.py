@@ -13,6 +13,8 @@ import pytest
 import mindbridge.benchmarks.eval as eval_module
 from mindbridge.benchmarks.eval import SampleResult, _apply_judges, _metrics
 from mindbridge.benchmarks.eval_adapters import EvalQuestion, EvalUnit, LoadedTask
+from mindbridge.benchmarks.eval_cache import CachedAnswer
+from mindbridge.benchmarks.eval_telemetry import BENCHMARK_JUDGE_SPAN, EvaluationTelemetry
 from mindbridge.benchmarks.official_scorers import (
     JudgeMessage,
     JudgePlan,
@@ -245,6 +247,63 @@ async def test_atm_official_judge_uses_minimal_reasoning() -> None:
     assert scores == {"accuracy": 1.0}
     assert calls[0]["reasoning"] == {"effort": "minimal"}
     assert calls[0]["max_output_tokens"] == 600
+
+
+@pytest.mark.asyncio
+async def test_judge_cache_hit_does_not_create_a_model_node() -> None:
+    class Cache:
+        def get(self, *_args: object) -> CachedAnswer:
+            return CachedAnswer('{"accuracy": true}', 0.0, ())
+
+    plan = judge_plan(
+        "atm-bench-main",
+        question="What happened?",
+        references=("An event.",),
+        prediction="An event occurred.",
+        metadata={"qtype": "open_end"},
+    )
+    assert plan is not None
+    sample = SampleResult(
+        task="atm-bench-main",
+        benchmark="ATM-Bench",
+        dataset_sha256="1" * 64,
+        evaluation_sha256="2" * 64,
+        unit_id="u1",
+        question_id="q1",
+        prediction="An event occurred.",
+        parsed_choice=None,
+        score=None,
+        exact_match=None,
+        latency_ms=1.0,
+        confidence=0.0,
+        memory_ids=(),
+        ingest_failure_count=0,
+        error_code=None,
+        metadata={"qtype": "open_end"},
+    )
+    telemetry = EvaluationTelemetry()
+    try:
+        scores, _, cached = await eval_module._traced_judge_call(
+            cast(Any, SimpleNamespace()),
+            plan.calls[0],
+            sample=sample,
+            plan=plan,
+            call_index=0,
+            cache=cast(Any, Cache()),
+            semaphore=asyncio.Semaphore(1),
+            config=eval_module._JudgeConfig(
+                model="gpt-5-mini",
+                base_url="https://api.openai.com/v1",
+            ),
+            tracer=telemetry.tracer,
+        )
+        performance = telemetry.result("atm-bench-main", question_count=1)
+    finally:
+        telemetry.close()
+
+    assert scores == {"accuracy": 1.0}
+    assert cached is True
+    assert BENCHMARK_JUDGE_SPAN not in cast(dict[str, object], performance["nodes"])
 
 
 def test_locomo_uses_all_metrics_from_the_llm_selected_reference() -> None:

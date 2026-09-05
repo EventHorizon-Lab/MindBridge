@@ -7,6 +7,7 @@ from contextlib import ExitStack, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Annotated, Literal, cast
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -56,6 +57,22 @@ _UnitInterval = Annotated[float, Field(strict=True, ge=0, le=1)]
 _DISCRIMINATED_SLOTS = frozenset({"embedding", "speech"})
 
 
+def _absolute_http_url(value: str) -> bool:
+    """Return whether an OpenAI-compatible base URL is safe to hand to httpx."""
+    if any(character.isspace() for character in value) or "\\" in value:
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.casefold() in {"http", "https"}
+        and parsed.hostname is not None
+        and (port is None or 1 <= port <= 65_535)
+    )
+
+
 class _ConfigModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -76,6 +93,15 @@ class _OpenAIConfig(_ConfigModel):
     api_key: SecretStr | None = None
     timeout: _PositiveFloat | None = None
     max_retries: _NonNegativeInt | None = None
+
+    @field_validator("base_url")
+    @classmethod
+    def _absolute_http_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not _absolute_http_url(value):
+            raise ValueError("base_url must be an absolute HTTP or HTTPS URL")
+        return value
 
 
 class OpenAIEmbeddingConfig(_OpenAIConfig):

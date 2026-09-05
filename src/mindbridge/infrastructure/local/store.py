@@ -795,8 +795,11 @@ CREATE TABLE identity_exemplars (
 INSERT INTO identity_exemplars (
     identity_id, modality, position, model_id, space_id, dimension, vector, created_at
 )
+-- A legacy name-only speaker is still authoritative identity data. Preserve its identity above,
+-- but do not invent a biometric vector merely to satisfy the new exemplar schema.
 SELECT speaker_id, 'voice', 0, model_id, space_id, dimension, centroid, created_at
-FROM speaker_identities;
+FROM speaker_identities
+WHERE centroid IS NOT NULL;
 
 CREATE INDEX identity_exemplars_space_idx
     ON identity_exemplars (modality, space_id, dimension, identity_id, position);
@@ -1096,6 +1099,9 @@ class StoredOperation:
     operation_id: int = 0
     created_ids: tuple[str, ...] = ()
     changed_ids: tuple[str, ...] = ()
+    # Existing deterministic records whose retired version this operation restated. Rollback
+    # retires this operation's new version without pretending the physical record was created.
+    activated_ids: tuple[str, ...] = ()
     # Records this operation moved out of ordinary recall, whether as a FORGET intent or as the
     # consolidation forgetting a CONSOLIDATE carried. Rollback clears exactly these.
     forgotten_ids: tuple[str, ...] = ()
@@ -1122,7 +1128,7 @@ class StoredOperation:
             _require_aware(self.rolled_back_at, "rolled_back_at")
         if self.operation_id < 0:
             raise ValueError("operation_id must not be negative")
-        for name in ("created_ids", "changed_ids", "forgotten_ids"):
+        for name in ("created_ids", "changed_ids", "activated_ids", "forgotten_ids"):
             for memory_id in getattr(self, name):
                 _require_identifier(memory_id, name)
         for memory_id, source_memory_id in self.linked:
@@ -1737,7 +1743,7 @@ class LocalStore:
             )
         return cursor.rowcount > 0
 
-    def apply_formation(
+    def apply_formation(  # noqa: C901 - one atomic formation transaction
         self,
         memories: Iterable[StoredMemory],
         embeddings: Iterable[StoredEmbedding],
@@ -1751,6 +1757,9 @@ class LocalStore:
         forget_ids: Sequence[str] = (),
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
+        projection_identity_id: str | None = None,
+        projection_memories: Iterable[StoredMemory] = (),
+        projection_embeddings: Iterable[StoredEmbedding] = (),
     ) -> bool:
         """Commit derived records, evidence, and source completion in one transaction.
 
@@ -1778,6 +1787,14 @@ class LocalStore:
             memories,
             embeddings,
         )
+        projected_memories, projected_embeddings, projected_by_memory = _prepare_write_batch(
+            projection_memories,
+            projection_embeddings,
+        )
+        if projection_identity_id is not None:
+            _require_identifier(projection_identity_id, "projection_identity_id")
+        elif projected_memories:
+            raise ValueError("projection memories require projection_identity_id")
         sources = tuple(dict.fromkeys(source_memory_ids))
         _require_identifier(recipe, "recipe")
         _require_aware(completed_at, "completed_at")
@@ -1814,6 +1831,11 @@ class LocalStore:
                 for memory_id, source_memory_id, _confidence in evidence
                 if _memory_evidence_linked(connection, memory_id, source_memory_id)
             }
+            activated = tuple(
+                memory.memory_id
+                for memory in supplied_memories
+                if memory.context is not None and _version_retired(connection, memory.memory_id)
+            )
             transaction_memory_ids: set[str] = set()
             superseded: list[tuple[str, int]] = []
             for memory in supplied_memories:
@@ -1874,6 +1896,17 @@ class LocalStore:
                 + tuple(memory_id for memory_id, _source, _confidence in evidence)
                 + tuple(forget_ids),
             )
+            if projection_identity_id is not None:
+                if _resolve_identity_id(connection, projection_identity_id) is None:
+                    raise StaleOperationError(
+                        f"{projection_identity_id} is no longer an active identity"
+                    )
+                self._replace_memory_embeddings(
+                    connection,
+                    projected_memories,
+                    projected_embeddings,
+                    projected_by_memory,
+                )
             connection.executemany(
                 """
                 INSERT INTO formation_runs (source_memory_id, recipe, completed_at)
@@ -1889,6 +1922,7 @@ class LocalStore:
                     connection,
                     replace(
                         operation,
+                        activated_ids=activated,
                         forgotten_ids=forgotten,
                         linked=tuple(linked),
                         superseded=tuple(dict.fromkeys(superseded)),
@@ -2056,6 +2090,7 @@ class LocalStore:
         require_in_force: Sequence[str] = (),
         split_identity: str | None = None,
         merge_identities: tuple[str, str] | None = None,
+        require_no_later_dependencies: Sequence[str] = (),
     ) -> tuple[bool, tuple[StoredAsset, ...]]:
         """Apply the caller's reversal and mark one operation rolled back, atomically.
 
@@ -2079,6 +2114,10 @@ class LocalStore:
         when the identity graph no longer admits the reversal, which is how identity operations
         on one person also reverse newest first: a later split has already removed the alias a
         merge would need, and an erasure has removed both.
+
+        `require_no_later_dependencies` names deterministic outputs this operation introduced or
+        restated. A later standing log row that cites or changes one makes this operation no
+        longer independently reversible.
         """
         _require_aware(rolled_back_at, "rolled_back_at")
         for memory_id in delete_memory_ids:
@@ -2093,6 +2132,12 @@ class LocalStore:
                 (operation_id,),
             ).fetchone()
             if row is None:
+                return False, ()
+            if _later_operation_depends_on(
+                connection,
+                operation_id,
+                require_no_later_dependencies,
+            ):
                 return False, ()
             if any(_version_retired(connection, memory_id) for memory_id in require_in_force):
                 return False, ()
@@ -2177,6 +2222,29 @@ class LocalStore:
                 (*parameters, limit),
             ).fetchall()
         return tuple(_operation_from_row(row) for row in rows)
+
+    def naming_operation_key(self, operation_key: str, memory_id: str) -> str | None:
+        """Return a log key for a naming attempt, or None for a standing duplicate.
+
+        A superseded deterministic assertion still has an active historical operation with the
+        base key. Restating that retired assertion is a new auditable operation, keyed by the
+        version it is about to create; repeating a currently standing assertion remains a no-op.
+        """
+        _require_identifier(operation_key, "operation_key")
+        _require_identifier(memory_id, "memory_id")
+        with self._connection() as connection:
+            if _active_operation_id(connection, operation_key) is None:
+                return operation_key
+            if not _version_retired(connection, memory_id):
+                return None
+            row = connection.execute(
+                "SELECT COALESCE(MAX(version), 0) AS version FROM memory_versions WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("failed to read naming assertion version")
+        payload = f"mindbridge-operation-restatement-v1:{operation_key}:{int(row['version']) + 1}"
+        return hashlib.sha256(payload.encode()).hexdigest()
 
     def read_memory(self, memory_id: str) -> StoredMemory | None:
         """Return one memory, or none when it does not exist."""
@@ -3344,6 +3412,59 @@ class LocalStore:
         if row is None:
             return None, None
         return _optional_row_text(row, "subject"), _optional_row_text(row, "value")
+
+    def naming_projection_after_assertion(
+        self,
+        identity_id: str,
+        memory_id: str,
+        context: MemoryContext,
+    ) -> tuple[str | None, str | None]:
+        """Preview the projection after applying one bound naming assertion.
+
+        The caller uses this while holding its write lock to build speech documents before the
+        assertion transaction. The store remains the source of the evidence-group visibility
+        rule, so the preview and the commit cannot disagree about corroboration.
+        """
+        _require_identifier(identity_id, "identity_id")
+        _require_identifier(memory_id, "memory_id")
+        if context.kind is not MemoryKind.ENTITY or context.identity_id != identity_id:
+            raise ValueError("context must be a naming assertion for identity_id")
+        with self._connection() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            if resolved_id is None:
+                return None, None
+            groups = {
+                _row_text(row, "source_group_id")
+                for row in connection.execute(
+                    """
+                    SELECT source_group_id FROM memory_evidence
+                    WHERE memory_id = ? AND retired_at IS NULL
+                    """,
+                    (memory_id,),
+                ).fetchall()
+            }
+            for source_memory_id in context.evidence_ids:
+                source = connection.execute(_SOURCE_GROUP_QUERY, (source_memory_id,)).fetchone()
+                if source is None:
+                    raise sqlite3.IntegrityError("evidence source memory does not exist")
+                groups.add(_row_text(source, "source_group_id"))
+            visible = _semantic_visibility(
+                connection,
+                memory_id=memory_id,
+                lineage_id=context.lineage_id or memory_id,
+                kind=context.kind.value,
+                basis=context.basis.value,
+                identity_id=context.identity_id,
+                evidence_count=len(groups),
+                valid_from=context.valid_from,
+                valid_until=context.valid_until,
+            )
+            if visible:
+                return context.subject, context.value
+            current = _current_naming_assertion(connection, resolved_id)
+        if current is None:
+            return None, None
+        return _optional_row_text(current, "subject"), _optional_row_text(current, "value")
 
     def refresh_identity_projection(
         self,
@@ -4845,6 +4966,7 @@ class LocalStore:
             ).fetchall()
         )
         supplied_asset_ids = tuple(asset.asset_id for asset in memory.assets)
+        reactivating = memory.context is not None and _version_retired(connection, memory.memory_id)
         index_content_changed = existing is not None and (
             _row_text(existing, "content") != memory.content
             or _row_text(existing, "modality") != memory.modality
@@ -4903,7 +5025,7 @@ class LocalStore:
                     for position, asset_id in enumerate(supplied_asset_ids)
                 ),
             )
-        if index_content_changed:
+        if index_content_changed or reactivating:
             self._queue_memory_embeddings(
                 connection,
                 memory.memory_id,
@@ -5751,6 +5873,7 @@ def _migrate_v14(connection: sqlite3.Connection) -> None:
             for statement in _OPERATION_CONSENT_REBUILD_DDL:
                 connection.execute(statement)
         connection.execute("PRAGMA user_version = 15")
+
         connection.commit()
     except BaseException:
         if connection.in_transaction:
@@ -5765,9 +5888,9 @@ def _migrate_v15(connection: sqlite3.Connection) -> None:
     """
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _v15_accessed_index(connection)
-        _v15_rekey_operations(connection)
-        _v15_backfill_naming_assertions(connection)
+        _v16_accessed_index(connection)
+        _v16_rekey_operations(connection)
+        _v16_backfill_naming_assertions(connection)
         connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         connection.commit()
     except BaseException:
@@ -5776,7 +5899,7 @@ def _migrate_v15(connection: sqlite3.Connection) -> None:
         raise
 
 
-def _v15_accessed_index(connection: sqlite3.Connection) -> None:
+def _v16_accessed_index(connection: sqlite3.Connection) -> None:
     indexes = {
         str(row[1])
         for row in connection.execute("PRAGMA index_list(memory_records)")
@@ -5786,7 +5909,7 @@ def _v15_accessed_index(connection: sqlite3.Connection) -> None:
         connection.execute(_ACCESSED_INDEX_DDL)
 
 
-def _v15_rekey_operations(connection: sqlite3.Connection) -> None:
+def _v16_rekey_operations(connection: sqlite3.Connection) -> None:
     """Recompute every logged `operation_key` under the current algorithm.
 
     Adding `claim` to the key payload without re-keying stopped deduplication dead on an existing
@@ -5864,7 +5987,7 @@ def _canonical_json(payload: Mapping[str, object]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _v15_backfill_naming_assertions(connection: sqlite3.Connection) -> None:
+def _v16_backfill_naming_assertions(connection: sqlite3.Connection) -> None:
     """Give every name registered before #151 the assertion its projection now rests on.
 
     Naming used to be a column somebody wrote. Every read path derives that column from a visible
@@ -6078,6 +6201,8 @@ def _write_memory_context(
         "SELECT COALESCE(MAX(version), 0) AS version FROM memory_versions WHERE memory_id = ?",
         (memory_id,),
     ).fetchone()
+    if latest is None:
+        raise RuntimeError("failed to allocate a memory version")
     connection.execute(
         """
         INSERT INTO memory_versions (
@@ -7470,6 +7595,44 @@ def _active_operation_id(connection: sqlite3.Connection, operation_key: str) -> 
     return None if row is None else int(row["operation_id"])
 
 
+def _later_operation_depends_on(
+    connection: sqlite3.Connection,
+    operation_id: int,
+    memory_ids: Sequence[str],
+) -> bool:
+    """Return whether a later standing operation names one of these outputs."""
+    ids = tuple(dict.fromkeys(memory_ids))
+    for memory_id in ids:
+        _require_identifier(memory_id, "memory_id")
+    for offset in range(0, len(ids), _SQLITE_PARAMETER_BATCH - 1):
+        batch = ids[offset : offset + _SQLITE_PARAMETER_BATCH - 1]
+        placeholders = ", ".join("?" for _memory_id in batch)
+        if (
+            connection.execute(
+                f"""
+            SELECT 1
+            FROM memory_operations AS o
+            JOIN json_tree(json_array(
+                json_extract(o.operation_json, '$.evidence_ids'),
+                json_extract(o.operation_json, '$.target_ids'),
+                json_extract(o.effects_json, '$.created_ids'),
+                json_extract(o.effects_json, '$.changed_ids'),
+                json_extract(o.effects_json, '$.activated_ids'),
+                json_extract(o.effects_json, '$.linked'),
+                json_extract(o.effects_json, '$.superseded')
+            )) AS j
+            WHERE o.operation_id > ? AND o.rolled_back_at IS NULL
+              AND j.type = 'text' AND j.value IN ({placeholders})
+            LIMIT 1
+            """,
+                (operation_id, *batch),
+            ).fetchone()
+            is not None
+        ):
+            return True
+    return False
+
+
 def _insert_operation(connection: sqlite3.Connection, operation: StoredOperation) -> int:
     cursor = connection.execute(
         """
@@ -7489,6 +7652,7 @@ def _insert_operation(connection: sqlite3.Connection, operation: StoredOperation
                 {
                     "created_ids": list(operation.created_ids),
                     "changed_ids": list(operation.changed_ids),
+                    "activated_ids": list(operation.activated_ids),
                     "forgotten_ids": list(operation.forgotten_ids),
                     "linked": [list(pair) for pair in operation.linked],
                     "superseded": [list(pair) for pair in operation.superseded],
@@ -7519,6 +7683,7 @@ def _operation_from_row(row: sqlite3.Row) -> StoredOperation:
         operation_json=_row_text(row, "operation_json"),
         created_ids=tuple(effects.get("created_ids") or ()),
         changed_ids=tuple(effects.get("changed_ids") or ()),
+        activated_ids=tuple(effects.get("activated_ids") or ()),
         forgotten_ids=tuple(effects.get("forgotten_ids") or ()),
         linked=tuple((pair[0], pair[1]) for pair in effects.get("linked") or ()),
         superseded=tuple((pair[0], int(pair[1])) for pair in effects.get("superseded") or ()),

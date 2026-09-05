@@ -16,7 +16,14 @@ import binascii
 from datetime import timedelta
 from typing import Annotated, Literal, TypeAlias, cast
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from mindbridge.types import AssetRef, Blob, ContentInput, ContextBudget, MemoryType, Modality
 
@@ -183,6 +190,17 @@ class ContextBudgetInput(StrictModel):
     # `ContextBudget.freshness` is a timedelta; JSON carries the same bound as seconds.
     freshness_seconds: Seconds | None = None
     max_latency_ms: Milliseconds | None = None
+
+    @field_validator("freshness_seconds")
+    @classmethod
+    def validate_freshness_range(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            timedelta(seconds=value)
+        except OverflowError:
+            raise ValueError("freshness_seconds is outside the supported duration range") from None
+        return value
 
 
 def context_budget(request: ContextBudgetInput | None) -> ContextBudget | None:

@@ -64,6 +64,7 @@ SHARED_OPERATIONS: dict[str, tuple[str | None, str | None]] = {
     "add_many": ("createMemories", None),
     "search": ("searchMemories", "search_memories"),
     "ask": ("answer", "ask_memory"),
+    "ask_stream": ("answerStream", None),
     "compile": ("compileContext", "compile_context"),
     "get": ("getMemory", "get_memory"),
     "list": ("listMemories", "list_memories"),
@@ -99,7 +100,6 @@ SHARED_OPERATIONS: dict[str, tuple[str | None, str | None]] = {
 # someone deciding which of the two it belongs in.
 UNEXPOSED_OPERATIONS: dict[str, str] = {
     "add_stream": "a lazy generator does not fit one finite request or response",
-    "ask_stream": "incremental delivery needs a streaming transport; `ask` is the same answer",
     "search_with_trace": "candidate-level retrieval diagnostics with no agent or client action",
     "reindex": "unbounded index maintenance an operator schedules, not a caller",
     "optimize": "index maintenance an operator schedules, not a caller",
@@ -160,6 +160,7 @@ REST_REQUEST_MODELS: dict[str, type[BaseModel]] = {
     "createMemories": rest.MemoryBatchCreate,
     "searchMemories": rest.QueryRequest,
     "answer": rest.AnswerRequest,
+    "answerStream": rest.AnswerRequest,
     "reinforceMemories": rest.ReinforceRequest,
     "compileContext": rest.ContextRequest,
     "captureMemory": rest.MemoryCreate,

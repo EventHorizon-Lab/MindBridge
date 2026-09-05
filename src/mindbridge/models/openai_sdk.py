@@ -30,9 +30,11 @@ from mindbridge._telemetry import (
     GROUNDING_MEDIA_ELIDED,
     MODEL_TTFT,
     mark_model_requests,
+    record_model_provenance,
     record_model_usage,
 )
 from mindbridge.exceptions import ModelError, ModelOutputTruncatedError, ValidationError
+from mindbridge.models._media import container_duration_seconds
 from mindbridge.models.base import EmbedTask, FormationInput, ModelInput, _modalities
 from mindbridge.types import (
     AbstentionReason,
@@ -198,6 +200,10 @@ _GENERATION_MODALITY_BY_PART_TYPE = {
     "video_url": Modality.VIDEO,
     "input_audio": Modality.AUDIO,
 }
+
+
+class _InvalidStructuredResponse(ModelError):
+    """A successful provider response whose structured payload can be retried once."""
 
 
 class OpenAIModels:
@@ -509,7 +515,8 @@ class OpenAIModels:
         _require_inline_size(embedding_assets)
 
         client = self._client("embedding")
-        mark_model_requests(1)
+        request_count = 1
+        mark_model_requests(request_count)
         try:
             response = self._embedding_response(client, batch, sample_video=False)
         except ModelError as error:
@@ -520,7 +527,8 @@ class OpenAIModels:
             # to the refusal that prompted the retry.
             if not _is_context_length_rejection(error.__cause__) or not _has_video(batch):
                 raise
-            mark_model_requests(1)
+            request_count = 2
+            mark_model_requests(request_count)
             sampled: list[int] = []
             response = self._embedding_response(client, batch, sample_video=True, sampled=sampled)
             _record_video_sampling(len(sampled))
@@ -530,6 +538,7 @@ class OpenAIModels:
                 modality for value in batch for modality in value.modalities
             ),
             output_modalities=frozenset(),
+            request_count=request_count,
         )
         return _embedding_vectors(response, len(batch), self.embedding_dimension)
 
@@ -636,8 +645,20 @@ class OpenAIModels:
         _require_capabilities("vision", modalities, self.vision_capabilities)
         assets = tuple(asset for value in batch for asset in value.assets)
         _require_consistent_assets(assets)
-        _require_inline_size(assets, size_video=False)
-        request = self._json_request(_VISION_SYSTEM_PROMPT, _vision_content(batch))
+        # Video files are never uploaded by this operation. Verify the source descriptors first,
+        # reject oversized source images before reading them, then enforce provider limits against
+        # the image data URLs the request actually carries.
+        verified_assets = _require_asset_integrity(assets)
+        _require_verified_inline_size(
+            tuple(
+                verified
+                for verified in verified_assets
+                if verified[0].modality is not Modality.VIDEO
+            )
+        )
+        content = _vision_content(batch)
+        _require_inline_image_size(content)
+        request = self._json_request(_VISION_SYSTEM_PROMPT, content)
         request.setdefault("temperature", 0.0)
         request.setdefault("seed", _VISION_SEED)
         return self._json_completion(
@@ -667,9 +688,12 @@ class OpenAIModels:
         """
         create_completion = cast(Any, self._client("generation").chat.completions.create)
         usages: list[_ModelUsage | None] = []
+        attempted = 0
 
         def attempt() -> _JsonResult:
-            mark_model_requests(len(usages) + 1)
+            nonlocal attempted
+            attempted += 1
+            mark_model_requests(attempted)
             try:
                 response = create_completion(**request)
             except ModelError:
@@ -687,17 +711,17 @@ class OpenAIModels:
                     output_modalities=frozenset({Modality.TEXT}),
                 )
             )
+            _record_openai_provenance(response)
             return parse(_json_completion_text(response, subject=subject, stage=stage))
 
         try:
             try:
                 return attempt()
-            except ModelError as error:
-                if error.reason != "response_invalid":
-                    raise
+            except _InvalidStructuredResponse:
+                pass
             return attempt()
         finally:
-            _record_usage_batch(usages, request_count=max(len(usages), 1))
+            _record_usage_batch(usages, request_count=attempted)
 
     def _json_request(
         self,
@@ -825,6 +849,7 @@ class OpenAIModels:
             for response in cast(Any, responses):
                 elapsed = time.perf_counter() - started
                 span = trace.get_current_span()
+                _record_openai_provenance(response)
                 if not first_chunk:
                     span.set_attribute(GEN_AI_TTFC, elapsed)
                     first_chunk = True
@@ -1107,6 +1132,7 @@ class OpenAIModels:
                         output_modalities=frozenset({Modality.TEXT}),
                     )
                 )
+                _record_openai_provenance(response)
                 text = getattr(response, "text", None)
                 if not isinstance(text, str):
                     raise ModelError(
@@ -1167,6 +1193,7 @@ def _record_openai_usage(
     output_modalities: frozenset[Modality],
     request_count: int = 1,
 ) -> None:
+    _record_openai_provenance(response)
     _record_usage_batch(
         (
             _model_usage(
@@ -1179,6 +1206,16 @@ def _record_openai_usage(
     )
 
 
+def _record_openai_provenance(response: object) -> None:
+    """Keep only stable response identity, never provider request or response bodies."""
+    model = _member(response, "model")
+    fingerprint = _member(response, "system_fingerprint")
+    record_model_provenance(
+        response_model=model if isinstance(model, str) else None,
+        system_fingerprint=fingerprint if isinstance(fingerprint, str) else None,
+    )
+
+
 def _record_usage_batch(
     usages: Sequence[_ModelUsage | None],
     *,
@@ -1188,30 +1225,41 @@ def _record_usage_batch(
     token_usages = tuple(usage for usage in available if usage.token_based)
     reported = tuple(usage for usage in token_usages if usage.total_tokens is not None)
     missing = request_count - len(available)
-    input_tokens = _sum_known(token_usages, "input_tokens")
-    output_tokens = _sum_known(token_usages, "output_tokens")
-    total_tokens = _sum_optional(reported, "total_tokens")
+    expected = len(token_usages) + missing
+    input_tokens = _sum_reported(token_usages, "input_tokens")
+    output_tokens = _sum_reported(token_usages, "output_tokens")
+    total_tokens = _sum_reported(reported, "total_tokens")
+    cached_input_tokens = _sum_reported(token_usages, "cached_input_tokens")
+    reasoning_output_tokens = _sum_reported(token_usages, "reasoning_output_tokens")
     input_by_modality = _sum_modalities(token_usages, "input_by_modality")
     output_by_modality = _sum_modalities(token_usages, "output_by_modality")
-    audio_seconds = sum(usage.audio_seconds or 0.0 for usage in available)
+    audio_seconds = (
+        sum(cast(float, usage.audio_seconds) for usage in available)
+        if len(available) == request_count
+        and all(usage.audio_seconds is not None for usage in available)
+        else None
+    )
     record_model_usage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
+        cached_input_tokens=cached_input_tokens,
+        reasoning_output_tokens=reasoning_output_tokens,
         input_by_modality=input_by_modality,
         output_by_modality=output_by_modality,
         request_count=request_count,
-        expected_requests=len(token_usages) + missing,
+        expected_requests=expected,
         reported_requests=len(reported),
+        input_tokens_complete=_component_complete(token_usages, "input_tokens", expected),
+        output_tokens_complete=_component_complete(token_usages, "output_tokens", expected),
+        cached_input_tokens_complete=_component_complete(
+            token_usages, "cached_input_tokens", expected
+        ),
+        reasoning_output_tokens_complete=_component_complete(
+            token_usages, "reasoning_output_tokens", expected
+        ),
         audio_seconds=audio_seconds or None,
     )
-    span = trace.get_current_span()
-    cached = _sum_known(token_usages, "cached_input_tokens")
-    reasoning = _sum_known(token_usages, "reasoning_output_tokens")
-    if cached is not None:
-        span.set_attribute("gen_ai.usage.cache_read.input_tokens", cached)
-    if reasoning is not None:
-        span.set_attribute("gen_ai.usage.reasoning.output_tokens", reasoning)
 
 
 def _model_usage(
@@ -1298,18 +1346,17 @@ def _modality_tokens(
     return exact
 
 
-def _sum_optional(usages: Sequence[_ModelUsage], name: str) -> int | None:
-    values = tuple(getattr(usage, name) for usage in usages)
-    return (
-        sum(cast(tuple[int, ...], values))
-        if values and all(v is not None for v in values)
-        else None
-    )
-
-
-def _sum_known(usages: Sequence[_ModelUsage], name: str) -> int | None:
+def _sum_reported(usages: Sequence[_ModelUsage], name: str) -> int | None:
     values = tuple(value for usage in usages if (value := getattr(usage, name)) is not None)
     return sum(cast(tuple[int, ...], values)) if values else None
+
+
+def _component_complete(usages: Sequence[_ModelUsage], name: str, expected: int) -> bool:
+    return bool(
+        expected
+        and len(usages) == expected
+        and all(getattr(usage, name) is not None for usage in usages)
+    )
 
 
 def _sum_modalities(
@@ -1707,7 +1754,13 @@ def _json_completion_text(response: object, *, subject: str, stage: str) -> str:
             stage=stage,
         )
     if finish_reason == "content_filter":
-        raise _invalid_json_response(subject, stage)
+        # A policy refusal cannot be cleared by repeating the identical request. Keep the public
+        # error classification while leaving it outside the malformed-structured-output retry.
+        raise ModelError(
+            f"{subject} response was invalid",
+            reason="response_invalid",
+            stage=stage,
+        )
     content = getattr(getattr(choices[0], "message", None), "content", None)
     if not isinstance(content, str) or not content.strip():
         raise _invalid_json_response(subject, stage)
@@ -1749,6 +1802,7 @@ def _formation_input_payload(
     media_aliases: Sequence[str],
 ) -> dict[str, object]:
     context = value.context
+    spatial = context.spatial
     return {
         "observation_id": observation_id,
         "content": value.content.text,
@@ -1759,6 +1813,14 @@ def _formation_input_payload(
             "valid_from": (None if context.valid_from is None else context.valid_from.isoformat()),
             "valid_until": (
                 None if context.valid_until is None else context.valid_until.isoformat()
+            ),
+            # Formation may reuse the source coordinate vocabulary, but the provider does not need
+            # the observation's metric pose to know which frame an inferred spatial value belongs
+            # to. Keep those coordinates local.
+            "spatial": (
+                None
+                if spatial is None
+                else {"frame_id": spatial.frame_id, "anchor": spatial.anchor.value}
             ),
         },
     }
@@ -1876,7 +1938,7 @@ def _formation_spatial(value: object) -> SpatialContext | None:
 
 
 def _invalid_json_response(subject: str, stage: str) -> ModelError:
-    return ModelError(
+    return _InvalidStructuredResponse(
         f"{subject} response was invalid",
         reason="response_invalid",
         stage=stage,
@@ -2303,20 +2365,36 @@ def _json_text(value: object) -> str:
         raise ModelError("grounding evidence is not JSON-compatible") from None
 
 
-def _require_inline_size(
-    assets: Sequence[AssetRef],
-    *,
-    size_video: bool = True,
-) -> None:
-    """Bound the base64 a request will carry, checking every asset is present and unchanged.
+def _require_inline_size(assets: Sequence[AssetRef]) -> None:
+    """Bound the base64 a request will carry, checking every asset is present and unchanged."""
+    _require_verified_inline_size(_require_asset_integrity(assets))
 
-    ``size_video`` is False where the caller substitutes decoded stills for the clip, as
-    ``describe`` does: the file's own bytes never reach the wire there, and sizing them refused
-    ordinary video memories a caption they could have had.
-    """
+
+def _require_verified_inline_size(
+    assets: Sequence[tuple[AssetRef, int]],
+) -> None:
     size = 0
+    for asset, actual_size in assets:
+        encoded_size = _encoded_size(actual_size)
+        if _inline_item_size(asset, actual_size) > _MAX_INLINE_MODEL_ITEM_BYTES:
+            raise ModelError(
+                "encoded inline model media item exceeds 20 MiB; use a provider upload adapter",
+                reason="payload_too_large",
+            )
+        size += encoded_size
+    if size > _MAX_INLINE_MODEL_BYTES:
+        raise ModelError(
+            "encoded inline model media exceeds 64 MiB; use a provider upload adapter",
+            reason="payload_too_large",
+        )
+
+
+def _require_asset_integrity(
+    assets: Sequence[AssetRef],
+) -> tuple[tuple[AssetRef, int], ...]:
+    verified = []
     for asset in assets:
-        modality, _media_type, path = _resolved_asset(asset)
+        _modality, _media_type, path = _resolved_asset(asset)
         try:
             actual_size = path.resolve(strict=True).stat().st_size
         except OSError:
@@ -2331,16 +2409,20 @@ def _require_inline_size(
                 reason="asset_changed",
                 subject=asset.id,
             )
-        if not size_video and modality is Modality.VIDEO:
-            continue
-        encoded_size = _encoded_size(actual_size)
-        if _inline_item_size(asset, actual_size) > _MAX_INLINE_MODEL_ITEM_BYTES:
+        verified.append((asset, actual_size))
+    return tuple(verified)
+
+
+def _require_inline_image_size(parts: Sequence[Mapping[str, object]]) -> None:
+    image_parts = tuple(part for part in parts if part.get("type") == "image_url")
+    for part in image_parts:
+        url = cast(Mapping[str, str], part["image_url"])["url"]
+        if len(url.encode()) > _MAX_INLINE_MODEL_ITEM_BYTES:
             raise ModelError(
                 "encoded inline model media item exceeds 20 MiB; use a provider upload adapter",
                 reason="payload_too_large",
             )
-        size += encoded_size
-    if size > _MAX_INLINE_MODEL_BYTES:
+    if _image_parts_size(image_parts) > _MAX_INLINE_MODEL_BYTES:
         raise ModelError(
             "encoded inline model media exceeds 64 MiB; use a provider upload adapter",
             reason="payload_too_large",
@@ -2591,16 +2673,8 @@ def _video_frame_urls(
         _modality, _media_type, path = _resolved_asset(asset)
         with av.open(str(path)) as container:
             stream = container.streams.video[0]
-            duration = (
-                float(stream.duration * stream.time_base)
-                if stream.duration is not None and stream.time_base is not None
-                else (
-                    float(container.duration / av.time_base)
-                    if container.duration is not None
-                    else None
-                )
-            )
-            if duration is None or duration <= 0:
+            duration = container_duration_seconds(container, stream)
+            if duration is None:
                 return None
             if below_seconds is not None and duration >= below_seconds:
                 return None

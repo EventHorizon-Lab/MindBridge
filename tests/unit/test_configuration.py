@@ -117,6 +117,23 @@ def test_declarative_config_does_not_coerce_boolean_or_numeric_fields(
         MindBridgeConfig.model_validate(config)
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    (
+        "xyrobot-embed.xyrobot.com",
+        "/v1",
+        "ftp://models.example.test/v1",
+        "http://example.com:bad/v1",
+        "http://example.com:99999/v1",
+        "http://exa mple.com/v1",
+        "http://example.com\\private/v1",
+    ),
+)
+def test_openai_base_url_requires_an_absolute_http_url(base_url: str) -> None:
+    with pytest.raises(PydanticValidationError, match="absolute HTTP or HTTPS URL"):
+        MindBridgeConfig.model_validate({"embedding": {"provider": "openai", "base_url": base_url}})
+
+
 def test_declarative_memory_settings_validate_every_range() -> None:
     invalid = {
         "minimum_relevance": 2,

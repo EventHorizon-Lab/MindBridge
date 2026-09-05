@@ -201,10 +201,13 @@ def test_artifacts_are_official_reproducible_and_protected_by_default(tmp_path: 
 
     first_manifest_path = locomo_refined_cli._manifest_path(first.output)
     second_manifest_path = locomo_refined_cli._manifest_path(second.output)
+    assert first_manifest_path.name == "predictions.jsonl.manifest.jsonl"
     assert first.output.read_bytes() == second.output.read_bytes()
     assert first_manifest_path.read_bytes() == second_manifest_path.read_bytes()
-    row = json.loads(first.output.read_text(encoding="utf-8"))
-    manifest = json.loads(first_manifest_path.read_text(encoding="utf-8"))
+    (row,) = (json.loads(line) for line in first.output.read_text(encoding="utf-8").splitlines())
+    (manifest,) = (
+        json.loads(line) for line in first_manifest_path.read_text(encoding="utf-8").splitlines()
+    )
     assert row["qa_id"] == "sample#q0000"
     assert row["predicted_answer"] == "Hello"
     assert "mindbridge_trace_id" not in row

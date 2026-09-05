@@ -26,12 +26,18 @@ import mindbridge.configuration as configuration_module
 import mindbridge.memory as memory_module
 from mindbridge import MemoryConfig, MemoryPlugins, RetrievalRejection
 from mindbridge._telemetry import (
+    ASYNC_QUEUE_TIME,
+    EMBEDDING_TASK,
     IDENTITY_MATCHED,
     IDENTITY_OBSERVATIONS,
     MODEL_REQUEST_COUNT,
     MODEL_TTFT,
+    OPERATION_TTFT,
     TOKEN_COMPLETE,
+    TOKEN_EXPECTED_REQUEST_COUNT,
+    TOKEN_REPORTED_REQUEST_COUNT,
     TOKEN_TOTAL,
+    _observe_retrieval_results,
     mark_model_requests,
     record_model_usage,
     record_unmetered_model_usage,
@@ -81,6 +87,7 @@ from mindbridge.types import (
     IndexQuantization,
     MemoryIntent,
     MemoryKind,
+    MemoryOperation,
     MemoryOperationRecord,
     MemoryRecord,
     MemoryTrigger,
@@ -510,6 +517,105 @@ def test_crud_search_ask_and_stable_duplicate(tmp_path: Path) -> None:
     assert models.close_calls == 1
 
 
+def test_ask_observes_the_pre_grounding_ranking_without_affecting_answers(
+    tmp_path: Path,
+) -> None:
+    models = _FakeModels()
+    observed: list[object] = []
+
+    def broken_observer(_results: object) -> None:
+        raise RuntimeError("observer failure")
+
+    with _memory(tmp_path, models, reinforce_on_answer=False) as memory:
+        memory.add_many(tuple(f"red evidence {index}" for index in range(9)))
+        with _observe_retrieval_results(observed.append):
+            result = memory.ask("red", limit=3)
+        with _observe_retrieval_results(broken_observer):
+            unaffected = memory.ask("red", limit=3)
+
+    assert len(observed) == 1
+    ranking = cast(tuple[SearchHit, ...], observed[0])
+    assert len(ranking) == 9
+    assert result.hits == ranking[:3]
+    assert unaffected == result
+
+
+def test_ask_observes_ranking_before_parallel_speech_failure(tmp_path: Path) -> None:
+    class FailingSpeech(_FakeSpeech):
+        def analyze(self, _assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+            raise RuntimeError("speech unavailable")
+
+    observed: list[object] = []
+    with _memory(
+        tmp_path,
+        _FakeModels(),
+        transcriber=FailingSpeech(),
+        index_speech=False,
+        reinforce_on_answer=False,
+    ) as memory:
+        memory.add_many(tuple(f"red evidence {index}" for index in range(3)))
+        with (
+            _observe_retrieval_results(observed.append),
+            pytest.raises(ModelError, match="failed to analyze speech"),
+        ):
+            memory.ask(("red", Blob(b"spoken question", "audio/wav", "question.wav")), limit=1)
+
+    ranking = cast(tuple[SearchHit, ...], observed[0])
+    assert len(ranking) == 3
+
+
+@pytest.mark.parametrize("write_method", ("add", "capture"))
+def test_legacy_placed_memory_keeps_its_id_without_crossing_places(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_method: str,
+) -> None:
+    context = ObservationContext(place_id="kitchen")
+    current_identity = memory_module._observation_context_identity
+
+    def legacy_identity(value: ObservationContext) -> dict[str, object]:
+        identity = current_identity(value)
+        identity.pop("place_id", None)
+        return identity
+
+    with monkeypatch.context() as legacy:
+        legacy.setattr(memory_module, "_observation_context_identity", legacy_identity)
+        with _memory(tmp_path, _FakeModels()) as memory:
+            original = getattr(memory, write_method)("red toolbox", context=context)
+            if write_method == "capture":
+                assert memory.settle() == 1
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        duplicate = getattr(memory, write_method)("red toolbox", context=context)
+        other = getattr(memory, write_method)(
+            "red toolbox",
+            context=ObservationContext(place_id="garage"),
+        )
+        if write_method == "capture":
+            assert memory.settle() == 1
+        assert duplicate.id == original.id
+        assert other.id != original.id
+        assert memory.get(original.id).place_id == "kitchen"
+        assert memory.get(other.id).place_id == "garage"
+        assert [
+            hit.id
+            for hit in memory.search(
+                "red toolbox",
+                scope=RetrievalScope(place_id="kitchen"),
+            )
+        ] == [original.id]
+        assert [
+            hit.id
+            for hit in memory.search(
+                "red toolbox",
+                scope=RetrievalScope(place_id="garage"),
+            )
+        ] == [other.id]
+        assert memory.delete(original.id) is True
+        with pytest.raises(MemoryNotFoundError):
+            memory.get(original.id)
+
+
 def test_memory_traces_end_to_end_stages_and_streaming_ttft(tmp_path: Path) -> None:
     class StreamingModels(_FakeModels):
         generation_model = "fake-generation"
@@ -554,22 +660,135 @@ def test_memory_traces_end_to_end_stages_and_streaming_ttft(tmp_path: Path) -> N
         "mindbridge.add",
         "mindbridge.ask",
         "mindbridge.content.prepare",
+        "mindbridge.retrieve",
         "mindbridge.model.embedding",
+        "mindbridge.index.sync",
+        "mindbridge.index.sync.sqlite.read",
+        "mindbridge.index.sync.zvec.apply",
+        "mindbridge.index.sync.zvec.flush",
+        "mindbridge.index.sync.zvec.optimize",
+        "mindbridge.index.sync.sqlite.ack",
         "mindbridge.index.search",
         "mindbridge.storage.write",
         "mindbridge.retrieval.rank",
         "mindbridge.model.generation",
     } <= names
     generation = next(span for span in spans if span.name == "mindbridge.model.generation")
+    add = next(span for span in spans if span.name == "mindbridge.add")
     ask = next(span for span in spans if span.name == "mindbridge.ask")
+    retrieve = next(span for span in spans if span.name == "mindbridge.retrieve")
     assert generation.attributes is not None
     ttft = generation.attributes[MODEL_TTFT]
     assert isinstance(ttft, int | float) and ttft >= 0
     assert generation.parent is not None
     assert generation.parent.span_id == ask.context.span_id
+    assert retrieve.parent is not None
+    assert retrieve.parent.span_id == ask.context.span_id
+    retrieve_children = {
+        span.name
+        for span in spans
+        if span.parent is not None and span.parent.span_id == retrieve.context.span_id
+    }
+    assert {
+        "mindbridge.content.prepare",
+        "mindbridge.model.embedding",
+        "mindbridge.index.sync",
+        "mindbridge.index.search",
+        "mindbridge.retrieval.rank",
+    } <= retrieve_children
+    query_embedding = next(
+        span
+        for span in spans
+        if span.name == "mindbridge.model.embedding"
+        and span.attributes is not None
+        and span.attributes[EMBEDDING_TASK] == EmbedTask.QUERY.value
+    )
+    assert query_embedding.parent is not None
+    assert query_embedding.parent.span_id == retrieve.context.span_id
+    add_index_sync = next(
+        span
+        for span in spans
+        if span.name == "mindbridge.index.sync"
+        and span.parent is not None
+        and span.parent.span_id == add.context.span_id
+    )
+    index_sync_children = {
+        span.name
+        for span in spans
+        if span.parent is not None and span.parent.span_id == add_index_sync.context.span_id
+    }
+    assert {
+        "mindbridge.index.sync.sqlite.read",
+        "mindbridge.index.sync.zvec.apply",
+        "mindbridge.index.sync.zvec.flush",
+        "mindbridge.index.sync.zvec.optimize",
+        "mindbridge.index.sync.sqlite.ack",
+    } <= index_sync_children
     assert ask.attributes is not None
+    operation_ttft = ask.attributes[OPERATION_TTFT]
+    assert isinstance(operation_ttft, int | float) and operation_ttft >= 0
+    assert operation_ttft >= cast(float, ttft) * 1_000.0
     assert ask.attributes[TOKEN_COMPLETE] is True
     assert ask.attributes[TOKEN_TOTAL] == 8
+    embedding_tasks = {
+        span.attributes[EMBEDDING_TASK]
+        for span in spans
+        if span.name == "mindbridge.model.embedding" and span.attributes is not None
+    }
+    assert embedding_tasks == {EmbedTask.DOCUMENT.value, EmbedTask.QUERY.value}
+
+
+def test_formation_and_consolidation_report_unmetered_requests_as_incomplete(
+    tmp_path: Path,
+) -> None:
+    class ReasoningModels:
+        formation_capabilities = frozenset({Modality.TEXT})
+        formation_model = "formation-test"
+        formation_space = "formation-test:empty-v1"
+        consolidation_model = "consolidation-test"
+        consolidation_recipe = "consolidation-test:empty-v1"
+
+        def form(
+            self,
+            inputs: Sequence[FormationInput],
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            return tuple(() for _value in inputs)
+
+        def consolidate(
+            self,
+            evidence: Sequence[MemoryRecord],
+            *,
+            trigger: MemoryTrigger,
+        ) -> tuple[MemoryOperation, ...]:
+            del evidence, trigger
+            return ()
+
+        def close(self) -> None:
+            pass
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    reasoners = ReasoningModels()
+    with Memory(
+        tmp_path,
+        embedder=_FakeModels(),
+        former=reasoners,
+        consolidator=reasoners,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        record = memory.add("red formation evidence")
+        memory.consolidate(evidence_ids=(record.id,))
+    provider.shutdown()
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    for name in ("mindbridge.model.formation", "mindbridge.model.consolidation"):
+        attributes = spans[name].attributes
+        assert attributes is not None
+        assert attributes[MODEL_REQUEST_COUNT] == 1
+        assert attributes[TOKEN_EXPECTED_REQUEST_COUNT] == 1
+        assert attributes[TOKEN_REPORTED_REQUEST_COUNT] == 0
+        assert attributes[TOKEN_COMPLETE] is False
 
 
 def test_trace_errors_never_export_exception_details(tmp_path: Path) -> None:
@@ -609,11 +828,24 @@ def test_empty_stream_is_invalid_model_output(tmp_path: Path, chunks: tuple[str,
             del question, hits
             yield from chunks
 
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
     models = EmptyStreamModels()
-    with _memory(tmp_path, models) as memory:
+    with Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
         memory.add("red evidence")
         with pytest.raises(ModelError, match="invalid answer"):
             memory.ask("what is red?")
+    provider.shutdown()
+
+    ask = next(span for span in exporter.get_finished_spans() if span.name == "mindbridge.ask")
+    assert ask.attributes is not None
+    assert OPERATION_TTFT not in ask.attributes
 
 
 def test_stream_ttft_requires_an_actual_model_request(tmp_path: Path) -> None:
@@ -644,6 +876,9 @@ def test_stream_ttft_requires_an_actual_model_request(tmp_path: Path) -> None:
     assert generation.attributes is not None
     assert generation.attributes[MODEL_REQUEST_COUNT] == 0
     assert MODEL_TTFT not in generation.attributes
+    ask = next(span for span in exporter.get_finished_spans() if span.name == "mindbridge.ask")
+    assert ask.attributes is not None
+    assert cast(float, ask.attributes[OPERATION_TTFT]) >= 0
 
 
 def test_streaming_answer_reports_only_the_hits_the_stream_used(tmp_path: Path) -> None:
@@ -3096,6 +3331,102 @@ def test_speaker_registration_rolls_back_when_refresh_embedding_fails(tmp_path: 
         assert '"speaker_name":null' in memory.get(record.id).content
 
 
+def test_naming_commit_waits_for_the_speech_projection_embedding(tmp_path: Path) -> None:
+    """A successful assertion embed followed by a speech embed failure commits nothing."""
+
+    class FailSecondEmbedding(_FakeModels):
+        def __init__(self) -> None:
+            super().__init__()
+            self.armed = False
+            self.calls_after_arm = 0
+            self.attempted_batches: list[tuple[str, ...]] = []
+
+        def embed(
+            self,
+            inputs: Sequence[ModelInput],
+            task: EmbedTask = EmbedTask.DOCUMENT,
+        ) -> tuple[tuple[float, ...], ...]:
+            if self.armed:
+                self.calls_after_arm += 1
+                self.attempted_batches.append(tuple(value.text for value in inputs))
+                if self.calls_after_arm == 2:
+                    raise RuntimeError("simulated projection embedding failure")
+            return super().embed(inputs, task)
+
+    models = FailSecondEmbedding()
+    with Memory(
+        tmp_path,
+        embedder=models,
+        transcriber=_FakeSpeech(),
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"speech", "audio/wav", "speech.wav"))
+        speaker_id = memory.speech(record.id)[0].speaker_id
+        assert speaker_id is not None
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+            before = (
+                connection.execute(
+                    "SELECT name, relationship FROM identities WHERE identity_id = ?",
+                    (speaker_id,),
+                ).fetchone(),
+                connection.execute(
+                    "SELECT content FROM memory_records WHERE memory_id = ?", (record.id,)
+                ).fetchone(),
+                connection.execute(
+                    """
+                    SELECT embedding_id, object_part, model_id, space_id, task,
+                           dimension, normalized, vector, created_at
+                    FROM embeddings WHERE memory_id = ?
+                    ORDER BY object_part, embedding_id
+                    """,
+                    (record.id,),
+                ).fetchall(),
+                connection.execute("SELECT COUNT(*) FROM memory_semantics").fetchone(),
+                connection.execute("SELECT COUNT(*) FROM memory_operations").fetchone(),
+                connection.execute(
+                    "SELECT operation_id, embedding_id, action FROM search_index_queue ORDER BY 1"
+                ).fetchall(),
+            )
+        models.armed = True
+
+        with pytest.raises(ModelError, match="embed memory input"):
+            memory.register_speaker(speaker_id, "Alice")
+
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+            after = (
+                connection.execute(
+                    "SELECT name, relationship FROM identities WHERE identity_id = ?",
+                    (speaker_id,),
+                ).fetchone(),
+                connection.execute(
+                    "SELECT content FROM memory_records WHERE memory_id = ?", (record.id,)
+                ).fetchone(),
+                connection.execute(
+                    """
+                    SELECT embedding_id, object_part, model_id, space_id, task,
+                           dimension, normalized, vector, created_at
+                    FROM embeddings WHERE memory_id = ?
+                    ORDER BY object_part, embedding_id
+                    """,
+                    (record.id,),
+                ).fetchall(),
+                connection.execute("SELECT COUNT(*) FROM memory_semantics").fetchone(),
+                connection.execute("SELECT COUNT(*) FROM memory_operations").fetchone(),
+                connection.execute(
+                    "SELECT operation_id, embedding_id, action FROM search_index_queue ORDER BY 1"
+                ).fetchall(),
+            )
+
+        assert models.calls_after_arm == 2
+        assert "Alice is a recognized person." in models.attempted_batches[0]
+        assert any(
+            "Alice" in text and "spoken red wrench" in text for text in models.attempted_batches[1]
+        )
+        assert after == before
+        assert memory.identity(speaker_id) == IdentityProfile(identity_id=speaker_id)
+        assert memory.speech(record.id)[0].speaker_name is None
+
+
 def test_composite_memory_uses_max_over_aggregate_and_atomic_vectors(tmp_path: Path) -> None:
     models = _FakeModels()
     with _memory(tmp_path, models) as memory:
@@ -4450,6 +4781,9 @@ def test_ask_stream_records_time_to_first_token_on_the_generation_span(tmp_path:
     assert generation.attributes is not None
     ttft = generation.attributes[MODEL_TTFT]
     assert isinstance(ttft, int | float) and ttft >= 0
+    ask = next(span for span in exporter.get_finished_spans() if span.name == "mindbridge.ask")
+    assert ask.attributes is not None
+    assert cast(float, ask.attributes[OPERATION_TTFT]) >= 0
 
 
 def test_ask_returns_only_retrieved_hits_the_answerer_used(tmp_path: Path) -> None:
@@ -5237,6 +5571,62 @@ async def test_async_ask_stream_yields_the_same_chunks_as_the_sync_stream(tmp_pa
         assert final is not None
         assert "".join(deltas) == final.answer
         assert (await memory.ask("where is the red toolbox?")).answer == final.answer
+
+
+@pytest.mark.asyncio
+async def test_async_ask_stream_propagates_trace_context_and_reports_queue_time(
+    tmp_path: Path,
+) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    models = _CountingStreamer()
+    async with AsyncMemory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        tracer=tracer,
+    ) as memory:
+        await memory.add("the red toolbox is on the bench")
+        with tracer.start_as_current_span("caller") as caller:
+            chunks = [chunk async for chunk in memory.ask_stream("where is the red toolbox?")]
+    provider.shutdown()
+
+    assert "".join(chunk.text for chunk in chunks) == "the red toolbox is on the bench"
+    ask = next(span for span in exporter.get_finished_spans() if span.name == "mindbridge.ask")
+    assert ask.parent is not None
+    assert ask.parent.span_id == caller.get_span_context().span_id
+    assert ask.attributes is not None
+    queue_time = cast(float, ask.attributes[ASYNC_QUEUE_TIME])
+    assert queue_time >= 0
+    assert cast(float, ask.attributes[OPERATION_TTFT]) >= queue_time
+
+
+@pytest.mark.asyncio
+async def test_async_buffered_ask_reports_executor_queue_in_end_to_end_ttft(
+    tmp_path: Path,
+) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    models = _CountingStreamer()
+    async with AsyncMemory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        await memory.add("the red toolbox is on the bench")
+        answer = await memory.ask("where is the red toolbox?")
+    provider.shutdown()
+
+    assert answer.answer == "the red toolbox is on the bench"
+    span = next(item for item in exporter.get_finished_spans() if item.name == "mindbridge.ask")
+    assert span.attributes is not None
+    queue_time = cast(float, span.attributes[ASYNC_QUEUE_TIME])
+    assert queue_time >= 0
+    assert cast(float, span.attributes[OPERATION_TTFT]) >= queue_time
 
 
 @pytest.mark.asyncio

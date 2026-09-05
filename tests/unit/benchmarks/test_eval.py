@@ -39,6 +39,7 @@ from mindbridge import (
     ModelError,
     SearchHit,
 )
+from mindbridge._telemetry import _record_retrieval_results
 from mindbridge.benchmarks.eval import (
     MemoryFactory,
     SampleResult,
@@ -76,6 +77,7 @@ from mindbridge.benchmarks.eval_statistics import (
     parse_choice,
     summarize,
 )
+from mindbridge.benchmarks.eval_telemetry import EvaluationTelemetry
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.mem_gallery import MemGalleryRound, MemGallerySession
 from mindbridge.benchmarks.model_config import (
@@ -266,7 +268,9 @@ def test_integrity_check_is_an_offline_json_gate(
         == 0
     )
 
-    assert json.loads(capsys.readouterr().out) == {
+    printed = capsys.readouterr().out
+    assert len(printed.splitlines()) == 1
+    assert json.loads(printed) == {
         "status": "ok",
         "tasks": [
             {
@@ -593,6 +597,13 @@ def test_egomem_submission_is_upload_ready_only_when_complete(tmp_path: Path) ->
     eval_module._write_artifacts(arguments, samples[:1], {}, content)
     submission_path = tmp_path / "egomemreason_submission.json"
     assert submission_path.read_bytes() == content
+    assert {path.name for path in tmp_path.iterdir()} == {
+        "egomemreason_submission.json",
+        "results.jsonl",
+        "samples.jsonl",
+    }
+    for path in (tmp_path / "results.jsonl", tmp_path / "samples.jsonl"):
+        assert all(isinstance(json.loads(line), dict) for line in path.read_bytes().splitlines())
     eval_module._write_artifacts(arguments, samples[:1], {}, None)
     assert not submission_path.exists()
 
@@ -663,7 +674,8 @@ def test_benchmark_speech_backend_satisfies_the_runtime_protocol() -> None:
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v10"
+    assert eval_module.EVAL_SCHEMA_VERSION == 13
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v13"
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(
@@ -1218,23 +1230,25 @@ async def test_memlens_question_date_is_a_reference_clock_not_query_text(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_answer_failure_preserves_independent_retrieval_diagnostics(tmp_path: Path) -> None:
+async def test_answer_failure_preserves_the_product_retrieval_ranking(tmp_path: Path) -> None:
     now = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    ranked = (
+        SearchHit(
+            id="memory-1",
+            content="supporting memory",
+            score=0.8,
+            created_at=now,
+            metadata={"source_id": "source-1"},
+        ),
+    )
 
     class Memory:
         async def ask(self, _question: object, **_kwargs: object) -> AnswerResult:
+            _record_retrieval_results(ranked)
             raise RuntimeError("generation unavailable")
 
         async def search(self, _query: object, **_kwargs: object) -> tuple[SearchHit, ...]:
-            return (
-                SearchHit(
-                    id="memory-1",
-                    content="supporting memory",
-                    score=0.8,
-                    created_at=now,
-                    metadata={"source_id": "source-1"},
-                ),
-            )
+            raise AssertionError("an answer failure triggered a fallback search")
 
     question = EvalQuestion("q1", ("question",), references=("answer",))
     outcome = (
@@ -1266,6 +1280,8 @@ async def test_answer_failure_preserves_independent_retrieval_diagnostics(tmp_pa
     assert sample.error_code == "RuntimeError"
     assert sample.memory_ids == ("memory-1",)
     assert sample.evidence[0].source_id == "source-1"
+    assert sample.ranked_source_ids == ("source-1",)
+    assert sample.ranked_source_ids_complete is True
 
 
 def test_a_provider_error_leaves_the_answer_unscored_but_keeps_retrieval(tmp_path: Path) -> None:
@@ -1298,6 +1314,7 @@ def test_a_provider_error_leaves_the_answer_unscored_but_keeps_retrieval(tmp_pat
         (),
         error=ModelError("upstream 500", reason="model_failed", stage="generate"),
         ranked_source_ids=("gold", "other"),
+        ranked_source_ids_complete=True,
     )
 
     sample = eval_module._sample(
@@ -1659,18 +1676,25 @@ async def test_runner_records_index_failure_without_recursive_ingest(tmp_path: P
         ),
     )
 
-    samples = await run_loaded_task(
-        task,
-        run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
-        memory_factory=cast(MemoryFactory, lambda _path: Context()),
-        batch_size=4,
-        unit_concurrency=1,
-        request_concurrency=1,
-        recall_limit=1,
-    )
+    telemetry = EvaluationTelemetry()
+    try:
+        samples = await run_loaded_task(
+            task,
+            run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+            memory_factory=cast(MemoryFactory, lambda _path: Context()),
+            batch_size=4,
+            unit_concurrency=1,
+            request_concurrency=1,
+            recall_limit=1,
+            tracer=telemetry.tracer,
+        )
+        performance = telemetry.result("fixture", question_count=1)
+    finally:
+        telemetry.close()
 
     assert calls == 1
     assert samples[0].error_code == "index_unavailable"
+    assert cast(dict[str, object], performance["search_e2e"])["attempt_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -1760,6 +1784,136 @@ async def test_runner_ingests_only_memory_available_at_each_cutoff(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_runner_scores_the_actual_ranking_at_a_causal_cutoff(
+    tmp_path: Path,
+) -> None:
+    ranked = SearchHit(
+        id="memory-gold",
+        content="gold",
+        score=1.0,
+        created_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        metadata={"source_id": "gold"},
+    )
+
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            del question, limit, reference_at
+            _record_retrieval_results((ranked,))
+            return AnswerResult("answer", (ranked,))
+
+    class Context:
+        async def __aenter__(self) -> AsyncMemory:
+            return cast(AsyncMemory, Memory([]))
+
+        async def __aexit__(self, *_error: object) -> None:
+            return None
+
+    task = LoadedTask(
+        TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        tmp_path / "fixture.json",
+        "1" * 64,
+        (
+            EvalUnit(
+                "unit",
+                (),
+                (
+                    EvalQuestion(
+                        "q1",
+                        ("question",),
+                        references=("answer",),
+                        cutoff_seconds=10,
+                        metadata={"evidence_ids": ("gold",)},
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    samples = await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+        memory_factory=cast(MemoryFactory, lambda _path: Context()),
+        batch_size=1,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=1,
+    )
+
+    assert len(samples) == 1
+    assert samples[0].ranked_source_ids == ("gold",)
+    retrieval = eval_module._retrieval_quality(
+        samples,
+        seed=7,
+        bootstrap_samples=32,
+        recall_limit=1,
+        retrieval_candidate_limit=3,
+    )
+    assert cast(dict[str, dict[str, float]], retrieval["recall_at_k"])["1"]["mean"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_runner_allows_random_retrieval_at_a_causal_cutoff(tmp_path: Path) -> None:
+    class Memory(_FakeMemory):
+        async def search(
+            self,
+            query: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> tuple[SearchHit, ...]:
+            del query, limit, reference_at
+            return ()
+
+    class Context:
+        async def __aenter__(self) -> AsyncMemory:
+            return cast(AsyncMemory, Memory([]))
+
+        async def __aexit__(self, *_error: object) -> None:
+            return None
+
+    task = LoadedTask(
+        TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        tmp_path / "fixture.json",
+        "1" * 64,
+        (
+            EvalUnit(
+                "unit",
+                (),
+                (
+                    EvalQuestion(
+                        "q1",
+                        ("question",),
+                        references=("answer",),
+                        cutoff_seconds=10,
+                        metadata={"evidence_ids": ("gold",)},
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    samples = await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+        memory_factory=cast(MemoryFactory, lambda _path: Context()),
+        batch_size=1,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=1,
+        arms=(eval_module._Arm("random", seed=7),),
+    )
+
+    assert len(samples) == 1
+    assert samples[0].arm == "random"
+
+
+@pytest.mark.asyncio
 async def test_runner_applies_request_concurrency_across_units(tmp_path: Path) -> None:
     active = 0
     peak = 0
@@ -1820,6 +1974,272 @@ async def test_runner_applies_request_concurrency_across_units(tmp_path: Path) -
     )
 
     assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_standalone_search_reopens_warm_stores_after_every_answer(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            del limit, reference_at
+            events.append(f"answer-start:{question}")
+            await asyncio.sleep(0)
+            events.append(f"answer-end:{question}")
+            return AnswerResult("A")
+
+        async def search(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> tuple[SearchHit, ...]:
+            del reference_at
+            events.append(f"search:{limit}:{question}")
+            return (
+                SearchHit(
+                    id="memory-gold",
+                    content="gold",
+                    score=1.0,
+                    created_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                    metadata={"source_id": "gold"},
+                ),
+            )
+
+    class Context:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        async def __aenter__(self) -> AsyncMemory:
+            events.append(f"open:{self.path.name}")
+            return cast(AsyncMemory, Memory(events))
+
+        async def __aexit__(self, *_error: object) -> None:
+            events.append(f"close:{self.path.name}")
+
+    task = LoadedTask(
+        TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        tmp_path / "fixture.json",
+        "1" * 64,
+        tuple(
+            EvalUnit(
+                f"unit-{index}",
+                (),
+                (EvalQuestion(f"q{index}", (f"question-{index}",), references=("A",)),),
+            )
+            for index in range(2)
+        ),
+    )
+    telemetry = EvaluationTelemetry()
+    try:
+        samples = await run_loaded_task(
+            task,
+            run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+            memory_factory=cast(MemoryFactory, lambda path: Context(path)),
+            batch_size=1,
+            unit_concurrency=2,
+            request_concurrency=1,
+            recall_limit=3,
+            tracer=telemetry.tracer,
+        )
+        performance = telemetry.result("fixture", question_count=2)
+    finally:
+        telemetry.close()
+
+    answer_ends = [index for index, event in enumerate(events) if event.startswith("answer-end:")]
+    searches = [index for index, event in enumerate(events) if event.startswith("search:")]
+    assert len(samples) == 2
+    assert len(answer_ends) == len(searches) == 2
+    assert max(answer_ends) < min(searches)
+    assert sum(event.startswith("open:") for event in events) == 4
+    search_e2e = cast(dict[str, object], performance["search_e2e"])
+    assert search_e2e["measurement"] == "post_answer_warm_store_replay"
+    assert search_e2e["attempt_count"] == search_e2e["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_run_arms_defers_replay_until_every_task_answer_finishes(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            del limit, reference_at
+            events.append(f"answer:{question}")
+            _record_retrieval_results(
+                (
+                    SearchHit(
+                        id="memory-gold",
+                        content="gold",
+                        score=1.0,
+                        created_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                        metadata={"source_id": "gold"},
+                    ),
+                )
+            )
+            return AnswerResult("A")
+
+        async def search(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> tuple[SearchHit, ...]:
+            del reference_at
+            events.append(f"search:{limit}:{question}")
+            return (
+                SearchHit(
+                    id="memory-gold",
+                    content="gold",
+                    score=1.0,
+                    created_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                    metadata={"source_id": "gold"},
+                ),
+            )
+
+    class Context:
+        async def __aenter__(self) -> AsyncMemory:
+            return cast(AsyncMemory, Memory(events))
+
+        async def __aexit__(self, *_error: object) -> None:
+            return None
+
+    def task(name: str) -> LoadedTask:
+        return LoadedTask(
+            TaskSpec(name, "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+            tmp_path / f"{name}.json",
+            "1" * 64,
+            (
+                EvalUnit(
+                    "unit",
+                    (),
+                    (
+                        EvalQuestion(
+                            "q1",
+                            (f"question-{name}",),
+                            references=("A",),
+                            metadata={"evidence_ids": ("gold",)},
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    tasks = (task("task-a"), task("task-b"))
+    arguments = cast(
+        eval_module._Arguments,
+        SimpleNamespace(
+            compile_max_items=24,
+            compile_max_chars=16_000,
+            quiet=True,
+            data_root=tmp_path / "stores",
+            run_id="run",
+            unit_concurrency=1,
+            request_concurrency=1,
+            recall_limit=3,
+            predict_only=False,
+            log_samples=False,
+            arms=(eval_module.DEFAULT_ARM,),
+            full_context_chars=24_000,
+            ingest="add",
+        ),
+    )
+    telemetry = EvaluationTelemetry()
+    try:
+        samples = await eval_module._run_arms(
+            tasks,
+            arguments,
+            arms=(eval_module.PRODUCT_ARM,),
+            batch_sizes={task.spec.name: 1 for task in tasks},
+            memory_factory=cast(MemoryFactory, lambda _path: Context()),
+            response_cache=None,
+            tracer=telemetry.tracer,
+        )
+        performance = {
+            task.spec.name: telemetry.result(task.spec.name, question_count=1) for task in tasks
+        }
+    finally:
+        telemetry.close()
+
+    answers = [index for index, event in enumerate(events) if event.startswith("answer:")]
+    warm_searches = [index for index, event in enumerate(events) if event.startswith("search:3:")]
+    assert len(samples) == len(answers) == len(warm_searches) == 2
+    assert max(answers) < min(warm_searches)
+    assert not any(event.startswith("search:100:") for event in events)
+    assert all(sample.ranked_source_ids == ("gold",) for sample in samples)
+    for result in performance.values():
+        search_e2e = cast(dict[str, object], result["search_e2e"])
+        assert search_e2e["attempt_count"] == search_e2e["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_standalone_search_reports_planned_error_when_store_reopen_fails(
+    tmp_path: Path,
+) -> None:
+    task = LoadedTask(
+        TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        tmp_path / "fixture.json",
+        "1" * 64,
+        (
+            EvalUnit(
+                "unit",
+                (),
+                (EvalQuestion("q1", ("question",), references=("A",)),),
+            ),
+        ),
+    )
+    sample = replace(
+        _egomem_sample(1),
+        task="fixture",
+        unit_id="unit",
+        question_id="q1",
+        cached=False,
+    )
+
+    def failed_factory(_path: Path) -> object:
+        raise RuntimeError("store cannot be reopened")
+
+    telemetry = EvaluationTelemetry()
+    try:
+        await eval_module._measure_standalone_searches(
+            task,
+            slots=((sample,),),
+            unit_paths=(tmp_path / "store",),
+            stores_ready=(True,),
+            memory_factory=cast(MemoryFactory, failed_factory),
+            unit_concurrency=1,
+            request_semaphore=asyncio.Semaphore(1),
+            recall_limit=3,
+            arms=(eval_module.PRODUCT_ARM,),
+            tracer=telemetry.tracer,
+        )
+        performance = telemetry.result("fixture", question_count=1)
+    finally:
+        telemetry.close()
+
+    search_e2e = cast(dict[str, object], performance["search_e2e"])
+    assert search_e2e["planned_count"] == search_e2e["attempt_count"] == 1
+    assert search_e2e["success_count"] == 0
+    assert search_e2e["error_count"] == 1
+    assert search_e2e["complete"] is False
+    assert search_e2e["latency_ms"] is None
 
 
 @pytest.mark.asyncio
@@ -1907,7 +2327,7 @@ async def test_answer_many_reports_each_completed_answer_immediately() -> None:
 
 
 @pytest.mark.asyncio
-async def test_answer_many_reports_escaped_failure_immediately() -> None:
+async def test_answer_many_reports_failed_outcome_immediately() -> None:
     completed = 0
     failed = asyncio.Event()
     release_slow = asyncio.Event()
@@ -1926,8 +2346,14 @@ async def test_answer_many_reports_escaped_failure_immediately() -> None:
             await release_slow.wait()
             return AnswerResult("A")
 
-        async def search(self, query: object, **_kwargs: object) -> tuple[SearchHit, ...]:
-            del query
+        async def search(
+            self,
+            query: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> tuple[SearchHit, ...]:
+            del query, limit, reference_at
             raise RuntimeError("fallback failed")
 
     def on_complete() -> None:
@@ -1954,7 +2380,8 @@ async def test_answer_many_reports_escaped_failure_immediately() -> None:
 
     release_slow.set()
     outcomes = await pending
-    assert isinstance(outcomes[0], RuntimeError)
+    assert isinstance(outcomes[0], eval_module._AnswerOutcome)
+    assert isinstance(outcomes[0].error, RuntimeError)
 
 
 @pytest.mark.asyncio
@@ -1987,7 +2414,7 @@ async def test_runner_reports_cached_progress_before_pending_answer_finishes(
                 evidence=(),
                 abstained=False,
                 abstention_reason=None,
-                ranked_source_ids=(),
+                ranked_source_ids=None,
             )
 
         def put(self, *_args: object) -> None:
@@ -3015,6 +3442,7 @@ benchmark:
     recall_limit: 50
     seed: 7
     bootstrap_samples: 500
+    repeat_index: 3
     batch_size: "8"
     max_batch_size: 16
     device: cuda:1
@@ -3045,6 +3473,7 @@ benchmark:
     assert arguments.seed == 7
     assert arguments.seeds == (7, 7, 7, 7)
     assert arguments.bootstrap_samples == 500
+    assert arguments.repeat_index == 3
     assert arguments.batch_size == "8"
     assert arguments.max_batch_size == 16
     assert arguments.device == "cuda:1"
@@ -3059,6 +3488,55 @@ benchmark:
     assert "seed=7" in arguments.gen_kwargs
 
 
+def test_performance_budget_flags_override_named_config_values(tmp_path: Path) -> None:
+    path = tmp_path / "eval.yaml"
+    path.write_text(
+        """
+benchmark:
+  performance_budgets:
+    answer_e2e_ttft_p95: 0.10
+  run:
+    tasks: clbench
+    compare: baseline
+    repeat_index: 2
+""",
+        encoding="utf-8",
+    )
+    _, overrides = _load_memory_config(path)
+    parser = eval_module._build_parser("eval")
+    parsed = parser.parse_args(
+        [
+            "--config",
+            str(path),
+            "--repeat-index",
+            "4",
+            "--performance-budget",
+            "answer_e2e_ttft_p95=0.20",
+            "--performance-budget",
+            "retrieval_e2e_latency_p95=0.15",
+        ]
+    )
+
+    arguments = eval_module._arguments(parser, parsed, overrides=overrides)
+
+    assert arguments.repeat_index == 4
+    assert arguments.performance_budgets == {
+        "answer_e2e_ttft_p95": 0.2,
+        "retrieval_e2e_latency_p95": 0.15,
+    }
+    assert arguments.compare == (Path.cwd() / "baseline").resolve()
+
+
+def test_performance_budget_requires_a_comparison_result() -> None:
+    parser = eval_module._build_parser("eval")
+    parsed = parser.parse_args(
+        ["--tasks", "clbench", "--performance-budget", "answer_e2e_latency_p95=0.1"]
+    )
+
+    with pytest.raises(SystemExit):
+        eval_module._arguments(parser, parsed)
+
+
 class _StopResolving(Exception):
     """Cut `_BackendPool.__init__` short once the document it would resolve has been captured."""
 
@@ -3070,7 +3548,7 @@ def test_backend_pool_hands_the_configured_video_floor_to_the_resolved_models(
 
     `--config` always resolves a memory configuration, so the configured branch is the only one a
     file-driven run takes. A floor recorded on `ModelConfig` alone would be reported in
-    `results.json` while short videos still went to the endpoint whole.
+    `results.jsonl` while short videos still went to the endpoint whole.
     """
     configured: list[MindBridgeConfig] = []
 

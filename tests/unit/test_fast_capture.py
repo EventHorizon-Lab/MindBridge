@@ -162,6 +162,30 @@ def test_repeating_a_capture_is_idempotent_and_still_calls_no_model(tmp_path: Pa
         assert [hit.id for hit in memory.search("red screwdriver")] == [first.id]
 
 
+def test_capture_preserves_place_and_uses_it_in_the_stable_id(tmp_path: Path) -> None:
+    with Memory(tmp_path, embedder=CountingEmbedder(), minimum_relevance=0) as memory:
+        kitchen = memory.capture(
+            "the red toolbox is beside the door",
+            context=ObservationContext(place_id="kitchen"),
+        )
+        garage = memory.capture(
+            "the red toolbox is beside the door",
+            context=ObservationContext(place_id="garage"),
+        )
+
+        assert kitchen.id != garage.id
+        assert kitchen.place_id == "kitchen"
+        assert garage.place_id == "garage"
+        assert memory.settle() == 2
+        assert [
+            hit.id
+            for hit in memory.search(
+                "red toolbox",
+                scope=RetrievalScope(place_id="kitchen"),
+            )
+        ] == [kitchen.id]
+
+
 def test_adding_captured_content_settles_it_under_the_same_id(tmp_path: Path) -> None:
     embedder = CountingEmbedder()
     former = CountingFormer()

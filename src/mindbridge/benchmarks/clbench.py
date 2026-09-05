@@ -25,7 +25,9 @@ on the answer prompt whichever branch produced it.
 
 from __future__ import annotations
 
+import math
 import re
+from itertools import islice
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
@@ -124,17 +126,42 @@ def load_clbench(dataset_path: Path) -> tuple[CLBenchTask, ...]:
     treats as line breaks even though JSON does not, cutting those records in
     half mid-string so they fail to parse.
     """
-    records = tuple(
-        _RECORD.validate_json(line)
-        for line in dataset_path.read_text(encoding="utf-8").split("\n")
-        if line.strip()
-    )
-    tasks = tuple(_task(record) for record in records)
+    tasks = _load_tasks(dataset_path)
     if not tasks:
         raise ValueError("CL-Bench annotations must not be empty")
+    _require_unique_task_ids(tasks)
+    return tasks
+
+
+def _load_clbench_selected(
+    dataset_path: Path, limit: int | float, offset: int
+) -> tuple[CLBenchTask, ...]:
+    """Parse only the JSONL records selected by one finite evaluation slice."""
+    count = max(1, math.ceil(_record_count(dataset_path) * limit)) if limit < 1 else int(limit)
+    tasks = _load_tasks(dataset_path, offset=offset, count=count)
+    _require_unique_task_ids(tasks)
+    return tasks
+
+
+def _load_tasks(
+    dataset_path: Path, *, offset: int = 0, count: int | None = None
+) -> tuple[CLBenchTask, ...]:
+    # `newline="\n"` preserves the release's bare U+2028 characters and keeps
+    # the physical newline as the only record separator.
+    with dataset_path.open(encoding="utf-8", newline="\n") as stream:
+        lines = (line for line in stream if line.strip())
+        selected = islice(lines, offset, None if count is None else offset + count)
+        return tuple(_task(_RECORD.validate_json(line)) for line in selected)
+
+
+def _record_count(dataset_path: Path) -> int:
+    with dataset_path.open(encoding="utf-8", newline="\n") as stream:
+        return sum(1 for line in stream if line.strip())
+
+
+def _require_unique_task_ids(tasks: tuple[CLBenchTask, ...]) -> None:
     if len({task.task_id for task in tasks}) != len(tasks):
         raise ValueError("CL-Bench annotations contain duplicate task IDs")
-    return tasks
 
 
 def _task(record: _RawRecord) -> CLBenchTask:

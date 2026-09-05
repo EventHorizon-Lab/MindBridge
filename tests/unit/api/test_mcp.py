@@ -9,8 +9,12 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from mcp import Client
+from mcp import Client, MCPError
 from mcp.types import CallToolResult, TextContent
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind, StatusCode
 
 from mindbridge import Memory
 from mindbridge.api import content
@@ -409,6 +413,11 @@ async def test_mcp_publishes_only_the_flat_local_tools() -> None:
     # Compiling reads only, but may cache a transcript, so it cannot claim to be read-only.
     assert tools["compile_context"].annotations is not None
     assert tools["compile_context"].annotations.read_only_hint is False
+    budget_description = tools["compile_context"].input_schema["properties"]["budget"][
+        "description"
+    ]
+    budget = ContextBudget()
+    assert f"{budget.max_chars:,} characters and {budget.max_items} items" in budget_description
     assert tools["get_identity"].annotations is not None
     assert tools["get_identity"].annotations.read_only_hint is True
     assert tools["register_speaker"].annotations is not None
@@ -861,6 +870,144 @@ async def test_mcp_envelope_reports_reason_stage_subject_and_retryability() -> N
     assert cast(str, envelope["trace_id"]).startswith("trace_")
 
 
+async def test_mcp_records_buffered_completion_latency_without_claiming_ttft() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    server = build_mcp_server(
+        cast(Memory, FakeMemory()),
+        tracer=provider.get_tracer("test.mcp"),
+    )
+
+    async with Client(server) as client:
+        result = await client.call_tool("ask_memory", {"question": "What color is it?"})
+
+    assert result.is_error is False
+    spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if span.name == "mindbridge.mcp.request"
+        and (span.attributes or {}).get("rpc.service") == "ask_memory"
+    ]
+    assert len(spans) == 1
+    attributes = spans[0].attributes or {}
+    assert attributes["mindbridge.transport.response_mode"] == "buffered"
+    assert cast(float, attributes["mindbridge.transport.server_total_ms"]) >= 0
+    assert all("first" not in name or "token" not in name for name in attributes)
+
+
+async def test_mcp_emits_one_server_span_for_a_tool_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(
+        "mcp.shared._otel._tracer",
+        provider.get_tracer("test.mcp.sdk"),
+    )
+    server = build_mcp_server(
+        cast(Memory, FakeMemory()),
+        tracer=provider.get_tracer("test.mcp"),
+    )
+
+    async with Client(server) as client:
+        result = await client.call_tool("ask_memory", {"question": "What color is it?"})
+    provider.shutdown()
+
+    assert result.is_error is False
+    tool_spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if span.kind is SpanKind.SERVER
+        and (
+            (span.attributes or {}).get("rpc.service") == "ask_memory"
+            or (span.attributes or {}).get("gen_ai.tool.name") == "ask_memory"
+        )
+    ]
+    assert [span.name for span in tool_spans] == ["mindbridge.mcp.request"]
+
+
+async def test_mcp_traces_invalid_request_state_before_rejecting_it() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    server = build_mcp_server(
+        cast(Memory, FakeMemory()),
+        tracer=provider.get_tracer("test.mcp"),
+    )
+
+    async with Client(server) as client:
+        with pytest.raises(MCPError, match="Invalid or expired requestState"):
+            await client.call_tool(
+                "ask_memory",
+                {"question": "What color is it?"},
+                request_state="invalid",
+            )
+    provider.shutdown()
+
+    spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if (span.attributes or {}).get("rpc.method") == "tools/call"
+    ]
+    assert [span.name for span in spans] == ["mindbridge.mcp.request"]
+    assert spans[0].status.status_code is StatusCode.ERROR
+
+
+async def test_mcp_marks_tool_error_results_without_recording_exception_details() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    server = build_mcp_server(
+        cast(
+            Memory,
+            FakeMemory(ModelError("private provider detail", reason="rate_limited")),
+        ),
+        tracer=provider.get_tracer("test.mcp"),
+    )
+
+    async with Client(server) as client:
+        result = await client.call_tool("ask_memory", {"question": "What color is it?"})
+    provider.shutdown()
+
+    assert result.is_error is True
+    span = next(
+        span
+        for span in exporter.get_finished_spans()
+        if span.name == "mindbridge.mcp.request"
+        and (span.attributes or {}).get("rpc.service") == "ask_memory"
+    )
+    assert span.status.status_code is StatusCode.ERROR
+    assert not span.events
+
+
+async def test_mcp_transport_trace_does_not_record_an_unknown_tool_name() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    secret_name = "customer-secret-token-123"
+
+    async with Client(
+        build_mcp_server(
+            cast(Memory, FakeMemory()),
+            tracer=provider.get_tracer("test.mcp"),
+        )
+    ) as client:
+        result = await client.call_tool(secret_name, {})
+    provider.shutdown()
+
+    assert result.is_error is True
+    span = next(
+        span
+        for span in exporter.get_finished_spans()
+        if span.name == "mindbridge.mcp.request"
+        and (span.attributes or {}).get("rpc.method") == "tools/call"
+    )
+    assert "rpc.service" not in (span.attributes or {})
+    assert secret_name not in repr(span.attributes)
+
+
 async def test_mcp_names_the_unknown_argument_instead_of_only_rejecting_the_call() -> None:
     async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
         result = await client.call_tool(
@@ -1132,6 +1279,25 @@ async def test_the_compile_tool_reports_a_named_actor_too() -> None:
     ]
 
 
+def test_the_compile_tool_schema_rejects_non_finite_freshness() -> None:
+    with pytest.raises(ValueError):
+        content.ContextBudgetInput.model_validate({"freshness_seconds": float("inf")})
+
+
+async def test_the_compile_tool_rejects_an_unrepresentable_freshness() -> None:
+    memory = FakeMemory()
+
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        result = await client.call_tool(
+            "compile_context",
+            {"goal": "What should I bring?", "budget": {"freshness_seconds": 1e100}},
+        )
+
+    assert result.is_error is True
+    assert _error_envelope(result)["code"] == "validation_error"
+    assert memory.calls == []
+
+
 async def test_the_server_greeting_advertises_the_configured_composition() -> None:
     """An agent learns what this instance supports on connect, without spending a tool call."""
     async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
@@ -1192,8 +1358,19 @@ _IDENTITY_TOOLS = {
 }
 
 
-async def _exposed(**switches: bool) -> set[str]:
-    async with Client(build_mcp_server(cast(Memory, FakeMemory()), **switches)) as client:
+async def _exposed(
+    *,
+    identity_operations: bool = True,
+    embodied_operations: bool = True,
+    write_operations: bool = True,
+) -> set[str]:
+    server = build_mcp_server(
+        cast(Memory, FakeMemory()),
+        identity_operations=identity_operations,
+        embodied_operations=embodied_operations,
+        write_operations=write_operations,
+    )
+    async with Client(server) as client:
         return {tool.name for tool in (await client.list_tools()).tools}
 
 

@@ -23,8 +23,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   actually incremental. `link_identities` means on `ask_stream()` what it means on `ask()`, which
   is this generator drained. Arguments are validated at the call rather than at the first pull, and
   the operation the answer holds is released before the terminal chunk, so reading a result and
-  stopping there needs no cleanup. REST, MCP, and the CLI have no equivalent: each would have to
-  choose a streaming wire format, and all three gaps are documented on their own pages.
+  stopping there needs no cleanup. REST exposes the same stream as SSE at
+  `POST /v1/answers/stream`; MCP remains a finite buffered tool response and reports completion
+  latency instead of claiming TTFT.
 - `AffectCue`, the entry type of the compiled `affect` section on `ContextBundle`, exported from
   `mindbridge`: every `SearchHit` field plus `event_ids`, the active events formed from the same
   observations the cue already cites in `context.evidence_ids` -- co-occurrence inside one capture,
@@ -162,11 +163,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   write cost one call; the vision model span and its token counters only open when a call is
   actually made. A failed batch is still never cached, so a later ingest retries it. Local schema
   version 12 to 13, with a forward migration that adds the table and rewrites no existing row.
-- A description cache in the benchmark harness, keyed by asset SHA-256 and describer model, so two
-  ingests of one corpus build identical full-text documents and a repeat run spends no description
-  tokens. The measured generation endpoint returns a different caption for the same image on every
-  call even at temperature 0 with a fixed seed, which would otherwise make an arm incomparable
-  with itself. Opened only when the `vision` slot is configured.
+- A run-scoped description cache in the benchmark harness, keyed by asset SHA-256 and describer
+  model, so units sharing an asset build identical full-text documents without silently warming a
+  later performance repeat. The measured generation endpoint returns a different caption for the
+  same image on every call even at temperature 0 with a fixed seed. Opened only when the `vision`
+  slot is configured.
 - `explain` on the search tool and the REST query, routing to `search_with_trace` and returning
   the per-candidate trace beside unchanged hits. An empty result over a transport was previously
   indistinguishable between nothing stored, everything below `minimum_relevance`, a `memory_type`
@@ -345,6 +346,20 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- **Breaking:** benchmark result schema v11 separates public `search_e2e` from
+  `ask_retrieval_core`, measures caller answer latency and TTFT before concurrency admission,
+  computes concurrent durations and throughput from interval unions, excludes cached samples from
+  product denominators, unions product/judge samples for combined averages, and isolates retrieval
+  diagnostics into their own caller latency, SDK-node, and token blocks. Incomplete TTFT
+  distributions cannot pass a performance budget; ASR ratios use matching successful-call sets;
+  zero-request cache paths are absent from model inference nodes. Model
+  usage now reports per-component completeness instead of treating unknown input, output, cached,
+  or reasoning tokens as zero; retry attempts and mixed response provenance remain attributable.
+  Result artifacts also include fresh-store/warmup/repeat protocol, client hardware and sampled
+  power/energy, optional process-global vLLM `/metrics` deltas, and comparable performance budgets.
+- **Breaking:** MindBridge-generated benchmark results, media manifests, and LoCoMo sibling
+  manifests are now JSONL artifacts with `.jsonl` filenames. The externally specified
+  EgoMemReason submission remains a JSON array named `egomemreason_submission.json`.
 - **Breaking:** `VisionDescriptionBackend` now requires a `vision_space` property, mirroring
   `embedding_space`, `transcription_space`, and `formation_space`. A custom describer without it
   stops satisfying `MemoryPlugins`' `isinstance` check, because the protocol is `runtime_checkable`
@@ -397,7 +412,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   standing operation has built on. Operations that touched one lineage reverse newest first;
   reversing an older one out of order would restore a superseded version beside the current one.
 
-- The local schema is version 15. Version 9 directories upgrade in place through six steps:
+- The local schema is version 16. Version 9 directories upgrade in place through seven steps:
   version 10 adds `memory_records.place_id` and its index; version 11 adds
   `memory_records.forgotten_at`, the `capture_queue` table that makes deferred enrichment durable
   across a crash, and the append-only `memory_operations` log that makes a control-plane operation
@@ -406,7 +421,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `visual_descriptions` caption cache; version 14 adds the scheduler's durable state
   (`memory_deliberations`, `memory_deliberation_memories`, and `query_failures`), the post-hoc
   `memory_operations.outcome` and `outcome_note` columns, and admits the `merge` intent; version
-  15 admits the `consent` intent so a data subject's own statement can be logged.
+  15 admits the `consent` intent so a data subject's own statement can be logged; version 16
+  backfills a visible naming assertion for identities registered before names became versioned
+  claims.
 
 - **Breaking:** `minimum_relevance` now gates evidence relevance — the cosine the dense route
   reports, or the demoted full-text contribution when only the lexical route matched, times the

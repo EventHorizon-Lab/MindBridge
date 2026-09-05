@@ -7,13 +7,18 @@ import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from functools import wraps
+from time import perf_counter_ns
 from typing import Annotated, Any, ParamSpec, TypeVar, cast
 from uuid import uuid4
 
 from mcp.server import MCPServer
+from mcp.server._otel import OpenTelemetryMiddleware
 from mcp.server.context import CallNext, HandlerResult, ServerMiddleware, ServerRequestContext
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared._otel import extract_trace_context
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from opentelemetry import trace as otel_trace
+from opentelemetry.trace import SpanKind, StatusCode, Tracer
 from pydantic import AwareDatetime, BaseModel, Field, JsonValue, StringConstraints
 
 from mindbridge import Memory
@@ -53,6 +58,7 @@ from mindbridge.types import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_MCP_TOTAL = "mindbridge.transport.server_total_ms"
 _Identifier = Annotated[str, StringConstraints(min_length=1, pattern=r"^\S(?:.*\S)?$")]
 _Cursor = Annotated[str, StringConstraints(min_length=1)]
 # The advertised tool defaults are read from the SDK value, so the prose and the schema cannot
@@ -377,6 +383,7 @@ def build_mcp_server(
     identity_operations: bool = True,
     embodied_operations: bool = True,
     write_operations: bool = True,
+    tracer: Tracer | None = None,
 ) -> MCPServer[None]:
     """Expose the typed agent tool surface without taking ownership of ``memory``.
 
@@ -402,6 +409,7 @@ def build_mcp_server(
     ``ask_memory``, ``compile_context``, ``get_memory`` and ``list_memories`` -- which is
     recall and compile alone.
     """
+    transport_telemetry = _request_telemetry(tracer or otel_trace.get_tracer("mindbridge.api.mcp"))
     server: MCPServer[None] = MCPServer(
         "mindbridge",
         title="MindBridge Memory",
@@ -417,8 +425,23 @@ def build_mcp_server(
             write_operations=write_operations,
         ),
         version="0.2.0",
-        middleware=[cast(ServerMiddleware[Any], _strict_tool_arguments)],
+        middleware=[
+            transport_telemetry,
+            cast(ServerMiddleware[Any], _strict_tool_arguments),
+        ],
     )
+    # MCP 2 installs its generic OpenTelemetry middleware outside every user middleware. Keep the
+    # privacy-bounded MindBridge transport span as the sole server boundary: retaining both counts
+    # every request twice and lets the generic span publish arbitrary tool names and request IDs.
+    server.middleware[:] = [
+        transport_telemetry,
+        *(
+            middleware
+            for middleware in server.middleware
+            if middleware is not transport_telemetry
+            and not isinstance(middleware, OpenTelemetryMiddleware)
+        ),
+    ]
 
     @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
     @_stable_errors
@@ -1019,6 +1042,48 @@ async def _strict_tool_arguments(
             else _envelope("validation_error", "tool arguments are invalid", reason="input_invalid")
         )
     return result
+
+
+def _request_telemetry(tracer: Tracer) -> ServerMiddleware[Any]:
+    async def observe(
+        context: ServerRequestContext[Any, Any],
+        call_next: CallNext,
+    ) -> HandlerResult:
+        params = context.params or {}
+        attributes = {
+            "mindbridge.span.kind": "transport",
+            "rpc.system": "mcp",
+            "rpc.method": context.method,
+            "mindbridge.transport.response_mode": "buffered",
+        }
+        if context.method == "tools/call":
+            service = params.get("name")
+            if isinstance(service, str) and service in _TOOL_ARGUMENTS:
+                attributes["rpc.service"] = service
+        started = perf_counter_ns()
+        with tracer.start_as_current_span(
+            "mindbridge.mcp.request",
+            kind=SpanKind.SERVER,
+            attributes=attributes,
+            context=extract_trace_context(context.meta),
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                result = await call_next(context)
+            except BaseException:
+                span.set_status(StatusCode.ERROR)
+                raise
+            finally:
+                span.set_attribute(_MCP_TOTAL, (perf_counter_ns() - started) / 1_000_000)
+            if (
+                isinstance(result, Mapping)
+                and (result.get("isError") is True or result.get("is_error") is True)
+            ) or getattr(result, "is_error", False) is True:
+                span.set_status(StatusCode.ERROR)
+            return result
+
+    return cast(ServerMiddleware[Any], observe)
 
 
 def _memory_result(record: MemoryRecord) -> MemoryResult:

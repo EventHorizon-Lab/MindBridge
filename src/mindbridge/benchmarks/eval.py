@@ -16,7 +16,7 @@ import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast, overload
 
 import yaml
 from opentelemetry import trace
-from opentelemetry.trace import Tracer
+from opentelemetry.trace import Span, StatusCode, Tracer
 from pydantic import SecretStr
 
 if TYPE_CHECKING:
@@ -57,8 +57,11 @@ from mindbridge import (
 )
 from mindbridge._telemetry import (
     MODEL_MODULE,
+    OPERATION_TTFT,
     SPAN_KIND,
+    _observe_retrieval_results,
     mark_model_requests,
+    model_span,
     record_unmetered_model_usage,
     traced_span,
 )
@@ -77,6 +80,22 @@ from mindbridge.benchmarks.eval_cache import (
     EvidenceInterval,
     ResponseCache,
 )
+from mindbridge.benchmarks.eval_environment import (
+    acceleration_runtime_metadata,
+    hardware_metadata,
+    source_metadata,
+    unavailable_server_resources,
+)
+from mindbridge.benchmarks.eval_regression import (
+    PERFORMANCE_BUDGET_NAMES,
+    load_result,
+    performance_comparisons,
+)
+from mindbridge.benchmarks.eval_server_metrics import (
+    MetricsSnapshot,
+    capture_metrics,
+    metrics_window,
+)
 from mindbridge.benchmarks.eval_statistics import (
     ScoredValue,
     paired_comparison,
@@ -86,16 +105,24 @@ from mindbridge.benchmarks.eval_statistics import (
 )
 from mindbridge.benchmarks.eval_telemetry import (
     BENCHMARK_ANSWER_SPAN,
+    BENCHMARK_ARM,
+    BENCHMARK_ARM_SPAN,
     BENCHMARK_COMPILE_CHARS,
     BENCHMARK_COMPILE_ITEMS,
     BENCHMARK_COMPILE_MEDIA_ITEMS,
     BENCHMARK_COMPILE_SPAN,
+    BENCHMARK_DIAGNOSTIC_SPAN,
     BENCHMARK_INGEST_ITEMS,
     BENCHMARK_INGEST_SPAN,
     BENCHMARK_JUDGE_SPAN,
+    BENCHMARK_PURPOSE,
     BENCHMARK_SAMPLE,
     BENCHMARK_TASK,
     BENCHMARK_TASK_SPAN,
+    DIAGNOSTIC_PURPOSE,
+    JUDGE_PURPOSE,
+    PRODUCT_PURPOSE,
+    SHARED_BENCHMARK_ARM,
     EvaluationTelemetry,
     ResourceSampler,
 )
@@ -105,6 +132,7 @@ from mindbridge.benchmarks.model_config import (
     DownloadSettings,
     HarnessOverrides,
     ModelConfig,
+    ServerMetricsOverrides,
 )
 from mindbridge.benchmarks.official_scorers import (
     SCORER_VERSION,
@@ -130,6 +158,7 @@ from mindbridge.benchmarks.task_catalog import (
     expand,
     listing,
 )
+from mindbridge.configuration import _absolute_http_url
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError, DataDirectoryLock
 from mindbridge.models.base import (
     ConsolidationBackend,
@@ -149,7 +178,11 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_MODEL_ID,
     DEFAULT_JINA_REVISION,
 )
-from mindbridge.models.openai_sdk import _model_usage, _record_usage_batch
+from mindbridge.models.openai_sdk import (
+    _model_usage,
+    _record_openai_provenance,
+    _record_usage_batch,
+)
 
 # Measured on this harness: a per-benchmark difference under three points is inside the run to
 # run noise band, whose per-question standard deviation is about seventeen points.
@@ -159,8 +192,8 @@ _GOLD_EVIDENCE_KEYS = ("evidence_ids", "clue_ids")
 _UNRESOLVED_EVIDENCE_KEY = "unresolved_evidence_ids"
 _RECALL_CUTOFFS = (1, 5, 10, 20)
 _MANDATORY_CONTROLS = ("random_ranker", "blind", "recall_at_20")
-EVAL_SCHEMA_VERSION = 11
-EVAL_RUNNER_VERSION = "mindbridge_eval_official_v10"
+EVAL_SCHEMA_VERSION = 13
+EVAL_RUNNER_VERSION = "mindbridge_eval_official_v13"
 DEFAULT_ARM = "mindbridge"
 BASELINE_ARMS = ("blind", "full-context", "random", "compile")
 ARMS = (DEFAULT_ARM, *BASELINE_ARMS)
@@ -170,10 +203,9 @@ INGEST_MODES = (DEFAULT_INGEST_MODE, "capture")
 # A frozen dataclass instance is a safe default argument value; naming it once avoids repeating
 # the call (and the linter's objection to a call in a default) at every threading site below.
 DEFAULT_COMPILE_BUDGET = ContextBudget()
-# The retriever's own ranked depth. Retrieval diagnostics score this list, not the modality
-# round robin and inline budget that `ask` applies on top of it, so that a missing gold reads
-# as a retrieval failure and a gold the answer never saw reads as budget loss.
+# The largest ranked window requested by an answer or the random retrieval control.
 RETRIEVAL_CANDIDATE_LIMIT = 100
+_BENCHMARK_SEARCH_REPLAY_SETUP_SPAN = "mindbridge.benchmark.search_replay_setup"
 # Baseline prompts belong to the harness, not to the product: `Memory.ask` refuses to generate
 # without evidence by design, so a no-evidence arm cannot reuse its grounded prompt. Version
 # them so a published baseline number names the prompt that produced it.
@@ -193,9 +225,10 @@ _FULL_CONTEXT_SYSTEM_PROMPT = (
 # `ContextBundle.render()` instead of the raw stuffed corpus, but it is still context handed to
 # the same generator the same way, so it is honestly the same prompt, not a new one to version.
 DEFAULT_BOOTSTRAP_SAMPLES = 2_000
-_RESULTS_FILE = "results.json"
+_RESULTS_FILE = "results.jsonl"
 _SAMPLES_FILE = "samples.jsonl"
 _EGOMEM_SUBMISSION_FILE = "egomemreason_submission.json"
+_MEDIA_MANIFEST_FILE = "media-manifest.jsonl"
 _EGOMEM_SUBMISSION_COUNT = 500
 _MODALITY_BY_SUFFIX = {
     ".aac": Modality.AUDIO,
@@ -259,6 +292,7 @@ class _Arguments:
     seed: int
     seeds: tuple[int, int, int, int]
     bootstrap_samples: int
+    repeat_index: int
     model: str
     arms: tuple[str, ...]
     full_context_chars: int
@@ -275,6 +309,7 @@ class _Arguments:
     device: str | None
     device_lock: bool
     compare: Path | None
+    performance_budgets: Mapping[str, float]
     blind: bool
     blind_baseline: Path | None
     fail_on_regression: bool
@@ -296,8 +331,10 @@ class _JudgeConfig:
     concurrency: int = 4
 
     def __post_init__(self) -> None:
-        if not self.model.strip() or not self.base_url.strip():
-            raise ValueError("judge model and base URL must not be blank")
+        if not self.model.strip():
+            raise ValueError("judge model must not be blank")
+        if not _absolute_http_url(self.base_url):
+            raise ValueError("judge base URL must be an absolute http(s) URL")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("judge timeout must be positive")
         if self.concurrency <= 0:
@@ -354,6 +391,7 @@ class SampleResult:
     # retrieval recall scores this list; `evidence` is what the generator cited, a different
     # quantity that an earlier version of this harness scored under the same name.
     ranked_source_ids: tuple[str, ...] = ()
+    ranked_source_ids_complete: bool = False
     dropped_hits: int | None = None
     abstained: bool = False
     abstention_reason: str | None = None
@@ -361,6 +399,7 @@ class SampleResult:
     error_reason: str | None = None
     error_stage: str | None = None
     error_cause_type: str | None = None
+    retrieval_diagnostic_error: FailureDetail | None = None
     cached: bool = False
     prompt: tuple[str, ...] | None = None
     references: tuple[str, ...] | None = None
@@ -386,6 +425,7 @@ class SampleResult:
             "arm": self.arm,
             "retrieval_candidates": self.retrieval_candidates,
             "ranked_source_ids": self.ranked_source_ids,
+            "ranked_source_ids_complete": self.ranked_source_ids_complete,
             "dropped_hits": self.dropped_hits,
             "task": self.task,
             "benchmark": self.benchmark,
@@ -415,6 +455,11 @@ class SampleResult:
             "error_reason": self.error_reason,
             "error_stage": self.error_stage,
             "error_cause_type": self.error_cause_type,
+            "retrieval_diagnostic_error": (
+                None
+                if self.retrieval_diagnostic_error is None
+                else self.retrieval_diagnostic_error.json()
+            ),
             "abstained": self.abstained,
             "abstention_reason": self.abstention_reason,
             "cached": self.cached,
@@ -436,6 +481,7 @@ class _MemoryContext(Protocol):
 
 
 MemoryFactory = Callable[[Path], _MemoryContext]
+_SearchReplay = Callable[[], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,9 +495,11 @@ class _AnswerOutcome:
     abstention_reason: str | None = None
     cached: bool = False
     error: BaseException | None = None
-    # The retriever's own ranked list, in score order, before `ask` interleaves modalities and
-    # spends its inline budget. Retrieval metrics score this; `evidence` stays the answer's.
+    # The answer's ranked list before grounding, in score order. Retrieval metrics score this;
+    # `evidence` stays the answer's grounded hits.
     ranked_source_ids: tuple[str, ...] = ()
+    ranked_source_ids_complete: bool = False
+    retrieval_diagnostic_error: BaseException | None = None
     # Set only by the `compile` arm: the bundle's own size, so "useful evidence per token" is
     # computable per answered question without a second call to reconstruct it.
     compiled_chars: int | None = None
@@ -497,6 +545,7 @@ class _BaselineGenerator:
         seed: int,
         gen_kwargs: str,
         generation: MindBridgeConfig | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
         try:
             from openai import AsyncOpenAI
@@ -507,6 +556,7 @@ class _BaselineGenerator:
             base_url=config.generation_base_url,
             timeout=config.timeout_seconds,
         )
+        self._tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
         options = dict(item.split("=", 1) for item in gen_kwargs.split(",") if "=" in item)
         self._model = config.generation_model
         self._seed = seed
@@ -551,20 +601,33 @@ class _BaselineGenerator:
             request["max_tokens"] = self._max_tokens
         if self._extra_body is not None:
             request["extra_body"] = self._extra_body
-        usages = []
-        try:
-            mark_model_requests(1)
-            response = await self._client.chat.completions.create(**request)
-            usages.append(
-                _model_usage(
-                    response,
-                    input_modalities=frozenset({Modality.TEXT}),
-                    output_modalities=frozenset({Modality.TEXT}),
+        with model_span(
+            self._tracer,
+            "mindbridge.model.generation",
+            attributes={
+                SPAN_KIND: "model",
+                MODEL_MODULE: "generation",
+                "gen_ai.operation.name": "chat",
+                "gen_ai.request.model": self._model,
+                "mindbridge.model.batch_size": 1,
+                "mindbridge.input.modalities": (Modality.TEXT.value,),
+            },
+        ):
+            usages = []
+            try:
+                mark_model_requests(1)
+                response = await self._client.chat.completions.create(**request)
+                _record_openai_provenance(response)
+                usages.append(
+                    _model_usage(
+                        response,
+                        input_modalities=frozenset({Modality.TEXT}),
+                        output_modalities=frozenset({Modality.TEXT}),
+                    )
                 )
-            )
-            return str(response.choices[0].message.content or "").strip()
-        finally:
-            _record_usage_batch(usages, request_count=1)
+                return str(response.choices[0].message.content or "").strip()
+            finally:
+                _record_usage_batch(usages, request_count=1)
 
     async def close(self) -> None:
         await self._client.close()
@@ -591,12 +654,12 @@ class _BorrowedBackend:
 
 
 class _CachedVisionDescriber:
-    """Describe only the visuals no earlier run has described in this vision space.
+    """Describe only the visuals not yet described in this benchmark invocation.
 
     The endpoint returns a different caption for the same image on every call, so without this
     two ingests of one corpus build different full-text documents and a paired arm cannot be
-    compared with itself. Keyed on the asset's own SHA-256, so it is stable across runs, stores,
-    and machines, and a repeat run spends zero description tokens.
+    compared with itself. Keys use the asset's own SHA-256, while the cache path is namespaced by
+    run so a repeat still executes the same measured model workload.
     """
 
     def __init__(self, backend: VisionDescriptionBackend, cache: DescriptionCache) -> None:
@@ -620,6 +683,17 @@ class _CachedVisionDescriber:
         keys = tuple(_description_digest(value) for value in batch)
         known = tuple(None if key is None else self._cache.get(key) for key in keys)
         pending = tuple(value for value, found in zip(batch, known, strict=True) if found is None)
+        span = trace.get_current_span()
+        if span.is_recording():
+            span.set_attribute("mindbridge.model.batch_size", len(pending))
+            span.set_attribute(
+                "mindbridge.input.modalities",
+                tuple(
+                    sorted({modality.value for value in pending for modality in value.modalities})
+                ),
+            )
+        if not pending:
+            mark_model_requests(0, token_usage_expected=0)
         # One call for the whole miss set, so a partially cached batch still costs one request.
         fresh = iter(() if not pending else self._backend.describe(pending))
         described: list[str] = []
@@ -742,6 +816,7 @@ class _BackendPool:
         self._resolved_config = None
         self._description_cache: DescriptionCache | None = None
         self._tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
+        self.embedding_warmup_count = 0
         if memory_config is not None:
             if memory_config.generation is not None:
                 # The harness owns both of these for a run: `--model-args` and the environment
@@ -813,6 +888,13 @@ class _BackendPool:
             # question's retrieval depend on which earlier questions ran, and under concurrency on
             # the order their updates committed, so a run stops being reproducible from its seed.
             self._settings = replace(resolved.settings, reinforce_on_answer=False)
+            configured_embed = getattr(self._embedder, "embed", None)
+            if callable(configured_embed):
+                configured_embed(
+                    (ModelInput(text="MindBridge benchmark warmup"),),
+                    task=EmbedTask.QUERY,
+                )
+                self.embedding_warmup_count = 1
             return
         try:
             from openai import OpenAI
@@ -851,6 +933,7 @@ class _BackendPool:
         )
         self.embedder = JinaOmniEmbedder(device=device, batch_size=batch_size)
         self.embedder.embed((ModelInput(text="MindBridge benchmark warmup"),), task=EmbedTask.QUERY)
+        self.embedding_warmup_count = 1
         self.transcriber = (
             FunASRTranscriber(
                 recipe=replace(
@@ -952,21 +1035,22 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         manifest, manifest_directory = load_media_manifest(arguments.media_manifest)
         loaded = _load_tasks(arguments, manifest, manifest_directory)
         print(
-            _json_bytes(
-                {
-                    "status": "ok",
-                    "tasks": [
-                        {
-                            "task": task.spec.name,
-                            "dataset_sha256": task.dataset_sha256,
-                            "evaluation_sha256": task.evaluation_sha256,
-                            "unit_count": len(task.units),
-                            "question_count": sum(len(unit.questions) for unit in task.units),
-                        }
-                        for task in loaded
-                    ],
-                },
-                pretty=True,
+            _jsonl_bytes(
+                (
+                    {
+                        "status": "ok",
+                        "tasks": [
+                            {
+                                "task": task.spec.name,
+                                "dataset_sha256": task.dataset_sha256,
+                                "evaluation_sha256": task.evaluation_sha256,
+                                "unit_count": len(task.units),
+                                "question_count": sum(len(unit.questions) for unit in task.units),
+                            }
+                            for task in loaded
+                        ],
+                    },
+                )
             ).decode(),
             end="",
         )
@@ -1009,22 +1093,23 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
             generated_manifest[name] = prepared
     if generated_manifest:
         manifest = _merged_manifest(manifest, manifest_directory, generated_manifest)
-        effective_manifest = arguments.output_path / "media-manifest.json"
+        effective_manifest = arguments.output_path / _MEDIA_MANIFEST_FILE
         effective_manifest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        _atomic_replace(((effective_manifest, _json_bytes(manifest, pretty=True)),))
+        _atomic_replace(((effective_manifest, _jsonl_bytes((manifest,))),))
         arguments = replace(arguments, media_manifest=effective_manifest)
         manifest_directory = effective_manifest.parent
     loaded = _load_tasks(arguments, manifest, manifest_directory)
     config = _evaluation_config(base_config, loaded)
     memory_config = _evaluation_memory_config(memory_config, config, arguments)
     batch_sizes = {task.spec.name: _batch_size(arguments, task) for task in loaded}
-    samples, duration, performance, resources = _execute(
+    samples, duration, performance, resources, embedding_warmup_count = _execute(
         loaded,
         arguments,
         config,
         judge_config,
         batch_sizes,
         memory_config=memory_config,
+        server_metrics=overrides.server_metrics,
     )
     submission_bytes, submission_status = _egomem_submission(
         samples,
@@ -1043,24 +1128,48 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         performance,
         memory_config=memory_config,
         resources=resources,
+        embedding_warmup_count=embedding_warmup_count,
     )
     comparisons = _comparisons(arguments, loaded, samples)
     if comparisons:
         results["comparisons"] = comparisons
+    performance_rows = (
+        []
+        if not arguments.performance_budgets
+        else performance_comparisons(
+            results,
+            load_result(cast(Path, arguments.compare)),
+            arguments.performance_budgets,
+        )
+    )
+    if performance_rows:
+        results["performance_comparisons"] = performance_rows
     _write_artifacts(arguments, samples, results, submission_bytes)
     _announce_submission(arguments, submission_status)
     for reason in _uninterpretable_tasks(results):
         _announce(f"UNINTERPRETABLE: {reason}")
     if not arguments.quiet:
         print(_table(results))
-    has_errors = any(
-        sample.error_code is not None or sample.ingest_failure_count for sample in samples
-    )
+    has_errors = _execution_has_errors(samples, results)
     regressed = arguments.fail_on_regression and _regressed(
         comparisons, threshold=arguments.regression_threshold
     )
+    performance_regressed = arguments.fail_on_regression and any(
+        row["regressed"] is True for row in performance_rows
+    )
     submission_invalid = submission_status is not None and submission_status["status"] == "invalid"
-    return int(has_errors or regressed or submission_invalid)
+    return int(has_errors or regressed or performance_regressed or submission_invalid)
+
+
+def _execution_has_errors(samples: Sequence[SampleResult], results: Mapping[str, object]) -> bool:
+    sample_errors = any(
+        sample.error_code is not None
+        or sample.ingest_failure_count
+        or sample.retrieval_diagnostic_error is not None
+        for sample in samples
+    )
+    rows = cast(Sequence[Mapping[str, object]], results["tasks"])
+    return sample_errors or _incomplete_search_replay(rows)
 
 
 def _load_tasks(
@@ -1203,6 +1312,54 @@ def _release_device_memory(device: str | None) -> None:
             torch.cuda.empty_cache()
 
 
+def _server_metrics_endpoints(settings: ServerMetricsOverrides) -> dict[str, str]:
+    return {
+        name: url
+        for name, url in (
+            ("generation", settings.generation_url),
+            ("embedding", settings.embedding_url),
+        )
+        if url is not None
+    }
+
+
+def _server_metric_results(
+    settings: ServerMetricsOverrides,
+    starts: Mapping[str, MetricsSnapshot],
+    *,
+    config: ModelConfig,
+    memory_config: MindBridgeConfig | None,
+    cache_only: bool,
+) -> dict[str, object]:
+    endpoints = _server_metrics_endpoints(settings)
+    result: dict[str, object] = {}
+    for name, url in endpoints.items():
+        if cache_only:
+            result[name] = {
+                "scope": "server_process_global",
+                "exclusive_attribution": False,
+                "metrics_url": url,
+                "status": "skipped",
+                "reason": "the response cache issued no product model requests",
+            }
+        else:
+            result[name] = {
+                **metrics_window(
+                    url,
+                    starts[name],
+                    timeout_seconds=settings.timeout_seconds,
+                ),
+                "phase": "product_execution_including_post_answer_search_replay",
+            }
+    if "generation" not in result:
+        result["generation"] = unavailable_server_resources(base_url=config.generation_base_url)
+    if "embedding" not in result and memory_config is not None:
+        embedding = memory_config.embedding
+        if embedding.provider == "openai" and embedding.base_url is not None:
+            result["embedding"] = unavailable_server_resources(base_url=embedding.base_url)
+    return result
+
+
 def _execute(
     loaded: Sequence[LoadedTask],
     arguments: _Arguments,
@@ -1211,8 +1368,13 @@ def _execute(
     batch_sizes: Mapping[str, int],
     *,
     memory_config: MindBridgeConfig | None,
+    server_metrics: ServerMetricsOverrides | None = None,
 ) -> tuple[
-    tuple[SampleResult, ...], float, Mapping[str, Mapping[str, object]], Mapping[str, object]
+    tuple[SampleResult, ...],
+    float,
+    Mapping[str, Mapping[str, Mapping[str, object]]],
+    Mapping[str, object],
+    int,
 ]:
     global _first_ingest_failure_announced
     _first_ingest_failure_announced = False
@@ -1226,7 +1388,14 @@ def _execute(
     )
     started = time.perf_counter()
     telemetry = EvaluationTelemetry()
-    sampler = ResourceSampler(storage_root=arguments.data_root)
+    sampler = ResourceSampler(
+        storage_roots=tuple(
+            BenchmarkRun.path_for(arguments.data_root, task.spec.name, arguments.run_id)
+            for task in loaded
+        )
+    )
+    metrics_settings = ServerMetricsOverrides() if server_metrics is None else server_metrics
+    embedding_warmup_count = 0
     try:
         response_cache = (
             None
@@ -1272,6 +1441,15 @@ def _execute(
                         description_cache=_description_cache_path(arguments, memory_config),
                     )
                     memory_factory = pool.memory
+                    embedding_warmup_count = pool.embedding_warmup_count
+                metric_starts = (
+                    {}
+                    if all_cached
+                    else {
+                        name: capture_metrics(url, timeout_seconds=metrics_settings.timeout_seconds)
+                        for name, url in _server_metrics_endpoints(metrics_settings).items()
+                    }
+                )
                 with sampler:
                     samples = asyncio.run(
                         _run_all(
@@ -1285,6 +1463,13 @@ def _execute(
                             memory_config=memory_config,
                         )
                     )
+                model_servers = _server_metric_results(
+                    metrics_settings,
+                    metric_starts,
+                    config=config,
+                    memory_config=memory_config,
+                    cache_only=all_cached,
+                )
             finally:
                 if pool is not None:
                     closing = pool
@@ -1308,14 +1493,23 @@ def _execute(
             )
         samples = _with_grounding_loss(samples, telemetry)
         performance = {
-            task.spec.name: telemetry.result(
-                task.spec.name,
-                question_count=sum(len(unit.questions) for unit in task.units),
-            )
+            task.spec.name: {
+                arm: telemetry.result(
+                    task.spec.name,
+                    arm=arm,
+                    question_count=sum(
+                        sample.task == task.spec.name and sample.arm == arm and not sample.cached
+                        for sample in samples
+                    ),
+                )
+                for arm in arguments.arms
+            }
             for task in loaded
         }
         duration = time.perf_counter() - started
-        return samples, duration, performance, sampler.json(wall_seconds=duration)
+        resources = sampler.json(wall_seconds=duration)
+        resources["model_servers"] = model_servers
+        return samples, duration, performance, resources, embedding_warmup_count
     finally:
         telemetry.close()
 
@@ -1353,6 +1547,7 @@ async def _run_all(
             seed=arguments.seed,
             gen_kwargs=arguments.gen_kwargs,
             generation=memory_config,
+            tracer=tracer,
         )
     )
     arms = tuple(
@@ -1393,6 +1588,7 @@ async def _run_arms(
         max_chars=arguments.compile_max_chars,
     )
     results: list[SampleResult] = []
+    deferred_searches: list[_SearchReplay] = []
     for task in tasks:
         sample_count = sum(len(unit.questions) for unit in task.units) * len(arms)
         if not arguments.quiet:
@@ -1403,7 +1599,12 @@ async def _run_arms(
         with traced_span(
             tracer,
             BENCHMARK_TASK_SPAN,
-            attributes={BENCHMARK_TASK: task.spec.name, SPAN_KIND: "benchmark"},
+            attributes={
+                BENCHMARK_TASK: task.spec.name,
+                BENCHMARK_ARM: SHARED_BENCHMARK_ARM,
+                BENCHMARK_PURPOSE: "orchestration",
+                SPAN_KIND: "benchmark",
+            },
         ):
             run = BenchmarkRun(
                 arguments.data_root,
@@ -1428,12 +1629,17 @@ async def _run_arms(
                     ingest_mode=arguments.ingest,
                     tracer=tracer,
                     on_progress=progress,
+                    on_search_replay_ready=deferred_searches.append,
                 )
             )
+    # This is deliberately a run-global second pass. Replaying one task while a later task is
+    # still answering changes shared model-service load and contaminates both latency families.
+    for search_replay in deferred_searches:
+        await search_replay()
     return tuple(results)
 
 
-async def run_loaded_task(
+async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated replay barrier
     task: LoadedTask,
     *,
     run: BenchmarkRun,
@@ -1451,6 +1657,7 @@ async def run_loaded_task(
     ingest_mode: str = DEFAULT_INGEST_MODE,
     tracer: Tracer | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    on_search_replay_ready: Callable[[_SearchReplay], None] | None = None,
 ) -> tuple[SampleResult, ...]:
     """Run normalized units with bounded workers while preserving release order."""
     if min(batch_size, unit_concurrency, request_concurrency, recall_limit) <= 0:
@@ -1458,6 +1665,8 @@ async def run_loaded_task(
     if recall_limit > 100:
         raise ValueError("recall limit must not exceed 100")
     slots: list[tuple[SampleResult, ...] | None] = [None] * len(task.units)
+    unit_paths: list[Path | None] = [None] * len(task.units)
+    stores_ready = [False] * len(task.units)
     queue: asyncio.Queue[tuple[int, EvalUnit]] = asyncio.Queue()
     request_semaphore = asyncio.Semaphore(request_concurrency)
     completed = 0
@@ -1473,6 +1682,7 @@ async def run_loaded_task(
             except asyncio.QueueEmpty:
                 return
             data_dir = run.unit_dir(unit.unit_id)
+            unit_paths[index] = data_dir
             reported = 0
 
             def sample_completed() -> None:
@@ -1480,6 +1690,9 @@ async def run_loaded_task(
                 completed += 1
                 reported += 1
                 notify_progress(completed, total)
+
+            def store_ready(unit_index: int = index) -> None:
+                stores_ready[unit_index] = True
 
             samples = await _run_unit(
                 task,
@@ -1499,6 +1712,7 @@ async def run_loaded_task(
                 ingest_mode=ingest_mode,
                 tracer=tracer,
                 on_sample_completed=sample_completed,
+                on_store_ready=store_ready,
             )
             slots[index] = samples
             for _ in range(len(samples) - reported):
@@ -1509,10 +1723,141 @@ async def run_loaded_task(
     await asyncio.gather(*workers)
     if any(group is None for group in slots):
         raise RuntimeError("evaluation worker exited before every unit completed")
+
+    async def replay_searches() -> None:
+        await _measure_standalone_searches(
+            task,
+            slots=slots,
+            unit_paths=unit_paths,
+            stores_ready=stores_ready,
+            memory_factory=memory_factory,
+            unit_concurrency=unit_concurrency,
+            request_semaphore=request_semaphore,
+            recall_limit=recall_limit,
+            arms=arms,
+            tracer=tracer,
+        )
+
+    if on_search_replay_ready is None:
+        await replay_searches()
+    else:
+        on_search_replay_ready(replay_searches)
     return tuple(sample for group in slots if group is not None for sample in group)
 
 
-async def _run_unit(
+async def _measure_standalone_searches(  # noqa: C901 - setup failures need per-plan accounting
+    task: LoadedTask,
+    *,
+    slots: Sequence[tuple[SampleResult, ...] | None],
+    unit_paths: Sequence[Path | None],
+    stores_ready: Sequence[bool],
+    memory_factory: MemoryFactory,
+    unit_concurrency: int,
+    request_semaphore: asyncio.Semaphore,
+    recall_limit: int,
+    arms: Sequence[_Arm],
+    tracer: Tracer | None,
+) -> None:
+    """Replay public searches only after every formal answer has finished.
+
+    Store opening is setup, not caller latency. Each caller span starts immediately before the
+    shared request semaphore so the measured latency includes benchmark admission, while the
+    nested ``mindbridge.search`` span remains the public SDK boundary. The diagnostic purpose
+    keeps replay embedding work out of product answer nodes and token totals.
+    """
+    if tracer is None or not any(arm.name == DEFAULT_ARM for arm in arms):
+        return
+    selected_tracer = tracer
+    store_semaphore = asyncio.Semaphore(unit_concurrency)
+
+    def span_attributes(sample: SampleResult) -> dict[str, str]:
+        return {
+            BENCHMARK_TASK: task.spec.name,
+            BENCHMARK_SAMPLE: sample.sample_id,
+            BENCHMARK_ARM: DEFAULT_ARM,
+            BENCHMARK_PURPOSE: DIAGNOSTIC_PURPOSE,
+            SPAN_KIND: "benchmark",
+        }
+
+    async def measure_one(
+        memory: AsyncMemory,
+        question: EvalQuestion,
+        sample: SampleResult,
+    ) -> None:
+        try:
+            with traced_span(
+                selected_tracer,
+                BENCHMARK_DIAGNOSTIC_SPAN,
+                attributes=span_attributes(sample),
+            ):
+                async with request_semaphore:
+                    await memory.search(
+                        _content(question.content),
+                        limit=recall_limit,
+                        reference_at=question.reference_at,
+                    )
+        except Exception:
+            # The span records an error attempt. Search replay is diagnostic and must not replace
+            # or invalidate the already-completed product answer.
+            return
+
+    async def measure_unit(index: int, unit: EvalUnit) -> None:
+        path = unit_paths[index]
+        samples = slots[index]
+        if path is None or samples is None or not stores_ready[index]:
+            return
+        product_samples = tuple(sample for sample in samples if sample.arm == DEFAULT_ARM)
+        # A partial ingest is not a valid warm store. Cache-only units likewise have no fresh
+        # product question to replay and never reach the memory factory here.
+        if any(sample.ingest_failure_count for sample in product_samples):
+            return
+        pending = {sample.question_id: sample for sample in product_samples if not sample.cached}
+        questions = tuple(
+            (question, pending[question.question_id])
+            for question in unit.questions
+            if question.question_id in pending
+        )
+        if not questions:
+            return
+        async with store_semaphore:
+            opened = False
+            try:
+                with traced_span(
+                    selected_tracer,
+                    _BENCHMARK_SEARCH_REPLAY_SETUP_SPAN,
+                    attributes={
+                        BENCHMARK_TASK: task.spec.name,
+                        BENCHMARK_ARM: DEFAULT_ARM,
+                        BENCHMARK_PURPOSE: DIAGNOSTIC_PURPOSE,
+                        SPAN_KIND: "benchmark",
+                    },
+                ):
+                    async with memory_factory(path) as memory:
+                        opened = True
+                        await asyncio.gather(
+                            *(
+                                measure_one(memory, question, sample)
+                                for question, sample in questions
+                            )
+                        )
+            except Exception:
+                if not opened:
+                    # Store-open time is setup rather than caller latency. Still emit one
+                    # zero-work error attempt per planned question so missing measurements cannot
+                    # masquerade as a complete successful distribution.
+                    for _question, sample in questions:
+                        with traced_span(
+                            selected_tracer,
+                            BENCHMARK_DIAGNOSTIC_SPAN,
+                            attributes=span_attributes(sample),
+                        ) as span:
+                            span.set_status(StatusCode.ERROR)
+                return
+
+    await asyncio.gather(*(measure_unit(index, unit) for index, unit in enumerate(task.units)))
+
+
+async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one lifecycle
     task: LoadedTask,
     unit: EvalUnit,
     data_dir: Path,
@@ -1531,8 +1876,10 @@ async def _run_unit(
     ingest_mode: str = DEFAULT_INGEST_MODE,
     tracer: Tracer | None = None,
     on_sample_completed: Callable[[], None] | None = None,
+    on_store_ready: Callable[[], None] | None = None,
 ) -> tuple[SampleResult, ...]:
     ordered = tuple((arm, question) for arm in arms for question in unit.questions)
+    notify_store_ready = on_store_ready or _ignore_store_ready
     results: dict[tuple[str, str], SampleResult] = {}
     for arm in arms:
         results.update(
@@ -1565,8 +1912,20 @@ async def _run_unit(
             ),
         )
     )
-    stuffs_context = any(arm.name == "full-context" for arm in arms)
-    reads_memory = any(arm.reads_memory for arm in arms)
+    stuffs_context = any(arm.name == "full-context" and pending_questions[arm.name] for arm in arms)
+    reading_arms = tuple(
+        arm.name for arm in arms if arm.reads_memory and pending_questions[arm.name]
+    )
+    reads_memory = bool(reading_arms)
+    # Ingestion is product setup whenever the product arm is present. This must not change when a
+    # caller merely reorders the same arms; a random-only run still owns its required setup.
+    memory_arm = (
+        DEFAULT_ARM
+        if DEFAULT_ARM in reading_arms
+        else reading_arms[0]
+        if len(reading_arms) == 1
+        else SHARED_BENCHMARK_ARM
+    )
     pending = 0
     ingest_failures = 0
     ingest_failure_details: list[FailureDetail] = []
@@ -1585,6 +1944,7 @@ async def _run_unit(
                         on_failure=ingest_failure_details.append,
                         tracer=tracer,
                         mode=ingest_mode,
+                        arm=memory_arm,
                     )
                 pending = end
                 context = (
@@ -1633,6 +1993,8 @@ async def _run_unit(
                     arm=arm,
                 ),
             )
+    else:
+        notify_store_ready()
     return tuple(results[(arm.name, question.question_id)] for arm, question in ordered)
 
 
@@ -1663,23 +2025,12 @@ async def _answer_arms(
         if not questions:
             continue
 
-        def cache_completed(
-            question: EvalQuestion,
-            outcome: _AnswerOutcome,
-            failure_count: int = ingest_failures,
-            selected: _Arm = arm,
-        ) -> None:
-            _cache_outcome(
-                response_cache, task, unit, question, outcome, failure_count, arm=selected
-            )
-
         answered = await _answer_many(
             memory,
             questions,
             request_concurrency=request_concurrency,
             request_semaphore=request_semaphore,
             recall_limit=recall_limit,
-            on_answer=cache_completed,
             arm=arm,
             task_name=task.spec.name,
             unit_id=unit.unit_id,
@@ -1689,6 +2040,15 @@ async def _answer_arms(
             on_complete=on_sample_completed,
         )
         for question, outcome in zip(questions, answered, strict=True):
+            _cache_outcome(
+                response_cache,
+                task,
+                unit,
+                question,
+                outcome,
+                ingest_failures,
+                arm=arm,
+            )
             results[(arm.name, question.question_id)] = _sample(
                 task,
                 unit,
@@ -1727,7 +2087,8 @@ def _cached_results(
                 abstained=answer.abstained,
                 abstention_reason=answer.abstention_reason,
                 cached=True,
-                ranked_source_ids=answer.ranked_source_ids,
+                ranked_source_ids=answer.ranked_source_ids or (),
+                ranked_source_ids_complete=answer.ranked_source_ids is not None,
             )
             results[(arm.name, question.question_id)] = _sample(
                 task,
@@ -1778,10 +2139,16 @@ def _cache_outcome(
         or ingest_failures
         or not isinstance(outcome, _AnswerOutcome)
         or not outcome.prediction.strip()
+        or outcome.retrieval_diagnostic_error is not None
+        or (
+            arm.name == DEFAULT_ARM
+            and retrieval_gold_ids(task.spec.name, question.metadata)
+            and not outcome.ranked_source_ids_complete
+        )
     ):
         return
     cache.put(
-        _cache_task(task),
+        _cache_task(task, arm),
         unit.unit_id,
         question.question_id,
         CachedAnswer(
@@ -1791,13 +2158,18 @@ def _cache_outcome(
             outcome.evidence,
             outcome.abstained,
             outcome.abstention_reason,
-            outcome.ranked_source_ids,
+            outcome.ranked_source_ids if outcome.ranked_source_ids_complete else None,
         ),
     )
 
 
 @contextmanager
-def _durable_write(tracer: Tracer | None, count: int) -> Iterator[None]:
+def _durable_write(
+    tracer: Tracer | None,
+    count: int,
+    *,
+    arm: str = DEFAULT_ARM,
+) -> Iterator[None]:
     """Time one accepted batch through to durable, searchable memory.
 
     ``add``/``add_many`` return only after SQLite commits, Zvec flushes, and the search-index
@@ -1810,7 +2182,12 @@ def _durable_write(tracer: Tracer | None, count: int) -> Iterator[None]:
     with traced_span(
         tracer,
         BENCHMARK_INGEST_SPAN,
-        attributes={SPAN_KIND: "stage", BENCHMARK_INGEST_ITEMS: count},
+        attributes={
+            SPAN_KIND: "stage",
+            BENCHMARK_ARM: arm,
+            BENCHMARK_PURPOSE: PRODUCT_PURPOSE,
+            BENCHMARK_INGEST_ITEMS: count,
+        },
     ):
         yield
 
@@ -1828,6 +2205,7 @@ async def _capture_chunk(
     *,
     on_failure: Callable[[FailureDetail], None] | None,
     tracer: Tracer | None,
+    arm: str = DEFAULT_ARM,
 ) -> int:
     """Ingest one chunk through `capture()` + `settle()`, so both produce real
     `mindbridge.capture` and `mindbridge.settle` spans -- the only way `--ingest capture` makes
@@ -1835,7 +2213,7 @@ async def _capture_chunk(
     unmeasurable.
     """
     failures = 0
-    with _durable_write(tracer, len(chunk)):
+    with _durable_write(tracer, len(chunk), arm=arm):
         for item in chunk:
             try:
                 await memory.capture(
@@ -1878,6 +2256,7 @@ async def _ingest(
     on_failure: Callable[[FailureDetail], None] | None = None,
     tracer: Tracer | None = None,
     mode: str = DEFAULT_INGEST_MODE,
+    arm: str = DEFAULT_ARM,
 ) -> int:
     # An arm that reads no memory never reaches here: `_run_unit` skips ingestion for it, so the
     # blind control cannot accidentally score a store it was supposed to run without.
@@ -1887,7 +2266,7 @@ async def _ingest(
     async def add_chunk(chunk: Sequence[MemoryItem]) -> int:
         contents = tuple(_memory_content(item) for item in chunk)
         try:
-            with _durable_write(tracer, len(chunk)):
+            with _durable_write(tracer, len(chunk), arm=arm):
                 await memory.add_many(
                     contents,
                     occurred_at=tuple(item.occurred_at for item in chunk),
@@ -1903,7 +2282,7 @@ async def _ingest(
                 middle = len(chunk) // 2
                 return await add_chunk(chunk[:middle]) + await add_chunk(chunk[middle:])
         try:
-            with _durable_write(tracer, 1):
+            with _durable_write(tracer, 1, arm=arm):
                 await memory.add(
                     contents[0],
                     occurred_at=chunk[0].occurred_at,
@@ -1921,7 +2300,13 @@ async def _ingest(
         return 0
 
     async def capture_chunk(chunk: Sequence[MemoryItem]) -> int:
-        return await _capture_chunk(memory, chunk, on_failure=on_failure, tracer=tracer)
+        return await _capture_chunk(
+            memory,
+            chunk,
+            on_failure=on_failure,
+            tracer=tracer,
+            arm=arm,
+        )
 
     chunk_ingest = capture_chunk if mode == "capture" else add_chunk
     return sum(
@@ -1956,33 +2341,84 @@ async def _answer_many(
 ) -> tuple[_AnswerOutcome | BaseException, ...]:
     semaphore = request_semaphore or asyncio.Semaphore(request_concurrency)
 
+    def sample_identity(question: EvalQuestion) -> str:
+        identity = f"{task_name}/{unit_id}/{question.question_id}"
+        return identity if arm.name == DEFAULT_ARM else f"{arm.name}:{identity}"
+
     async def answer(question: EvalQuestion) -> _AnswerOutcome:
         try:
-            async with semaphore:
-                identity = f"{task_name}/{unit_id}/{question.question_id}"
-                sample_id = identity if arm.name == DEFAULT_ARM else f"{arm.name}:{identity}"
-                with _answer_span(tracer, task_name, sample_id):
-                    outcome = await _arm_outcome(
+            sample_id = sample_identity(question)
+            if not arm.generates:
+                async with semaphore:
+                    outcome = await _arm_answer(
                         memory,
                         question,
                         arm=arm,
                         task_name=task_name,
-                        sample_id=sample_id,
                         recall_limit=recall_limit,
                         context=context,
                         compile_budget=compile_budget,
                         tracer=tracer,
+                        sample_id=sample_id,
+                        started=time.perf_counter(),
+                        answer_span=None,
                     )
-            if on_answer is not None:
+            else:
+                # This caller span starts before request admission. Its latency and TTFT therefore
+                # include benchmark queueing; nested SDK/model spans expose service time.
+                with _answer_span(tracer, task_name, sample_id, arm.name) as (
+                    answer_span,
+                    started,
+                ):
+                    async with semaphore:
+                        outcome = await _arm_answer(
+                            memory,
+                            question,
+                            arm=arm,
+                            task_name=task_name,
+                            recall_limit=recall_limit,
+                            context=context,
+                            compile_budget=compile_budget,
+                            tracer=tracer,
+                            sample_id=sample_id,
+                            started=started,
+                            answer_span=answer_span,
+                        )
+                        if outcome.error is not None and answer_span is not None:
+                            answer_span.set_status(StatusCode.ERROR)
+            if arm.generates and on_answer is not None:
                 on_answer(question, outcome)
             return outcome
         finally:
             if on_complete is not None:
                 on_complete()
 
-    return tuple(
-        await asyncio.gather(*(answer(question) for question in questions), return_exceptions=True)
+    with _arm_run_span(tracer, task_name, arm.name):
+        answered = tuple(
+            await asyncio.gather(
+                *(answer(question) for question in questions), return_exceptions=True
+            )
+        )
+
+    diagnosed = tuple(
+        replace(
+            outcome,
+            retrieval_diagnostic_error=RuntimeError(
+                "the ranked retrieval list from the product answer was not observed"
+            ),
+        )
+        if isinstance(outcome, _AnswerOutcome)
+        and arm.retrieves
+        and retrieval_gold_ids(task_name, question.metadata)
+        and not outcome.ranked_source_ids_complete
+        else outcome
+        for question, outcome in zip(questions, answered, strict=True)
     )
+    if not arm.generates and on_answer is not None:
+        for question, outcome in zip(questions, diagnosed, strict=True):
+            if isinstance(outcome, _AnswerOutcome):
+                on_answer(question, outcome)
+    return diagnosed
 
 
 @contextmanager
@@ -2013,60 +2449,101 @@ def _compile_span(tracer: Tracer | None, bundle: ContextBundle) -> Iterator[None
 
 
 @contextmanager
-def _answer_span(tracer: Tracer | None, task_name: str, sample_id: str) -> Iterator[None]:
-    """Scope one answer's model spans so grounding loss can be attributed to its sample."""
+def _arm_run_span(tracer: Tracer | None, task_name: str, arm: str) -> Iterator[None]:
     if tracer is None:
         yield
         return
     with traced_span(
         tracer,
-        BENCHMARK_ANSWER_SPAN,
+        BENCHMARK_ARM_SPAN,
         attributes={
             BENCHMARK_TASK: task_name,
-            BENCHMARK_SAMPLE: sample_id,
+            BENCHMARK_ARM: arm,
+            BENCHMARK_PURPOSE: PRODUCT_PURPOSE,
             SPAN_KIND: "benchmark",
         },
     ):
         yield
 
 
-async def _arm_outcome(
+@contextmanager
+def _answer_span(
+    tracer: Tracer | None,
+    task_name: str,
+    sample_id: str,
+    arm: str | None = None,
+) -> Iterator[tuple[Span | None, float]]:
+    """Scope one answer's model spans so grounding loss can be attributed to its sample."""
+    if tracer is None:
+        yield None, time.perf_counter()
+        return
+    selected_arm = (
+        sample_id.split(":", 1)[0]
+        if arm is None and ":" in sample_id
+        else DEFAULT_ARM
+        if arm is None
+        else arm
+    )
+    with traced_span(
+        tracer,
+        BENCHMARK_ANSWER_SPAN,
+        attributes={
+            BENCHMARK_TASK: task_name,
+            BENCHMARK_SAMPLE: sample_id,
+            BENCHMARK_ARM: selected_arm,
+            BENCHMARK_PURPOSE: PRODUCT_PURPOSE,
+            SPAN_KIND: "benchmark",
+        },
+    ) as span:
+        yield span, time.perf_counter()
+
+
+async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share one clock
     memory: AsyncMemory,
     question: EvalQuestion,
     *,
     arm: _Arm,
     task_name: str,
-    sample_id: str,
     recall_limit: int,
     context: str,
+    sample_id: str,
+    started: float,
+    answer_span: Span | None,
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     tracer: Tracer | None = None,
 ) -> _AnswerOutcome:
-    started = time.perf_counter()
+    latency_started = time.perf_counter()
     content = _content(question.content)
     ranked: tuple[SearchHit, ...] = ()
+    ranked_complete = False
+
+    def observe_retrieval(value: object) -> None:
+        nonlocal ranked, ranked_complete
+        if isinstance(value, tuple) and all(isinstance(hit, SearchHit) for hit in value):
+            ranked = value
+            ranked_complete = True
+
     try:
-        if arm.retrieves and retrieval_gold_ids(task_name, question.metadata):
+        if arm.name == "random":
             ranked = await memory.search(
                 content,
-                limit=RETRIEVAL_CANDIDATE_LIMIT,
+                limit=(
+                    RETRIEVAL_CANDIDATE_LIMIT
+                    if retrieval_gold_ids(task_name, question.metadata)
+                    else recall_limit
+                ),
                 reference_at=question.reference_at,
             )
-            if arm.generates:
-                # This query exists only to score retrieval; a deployment never issues it. Timing
-                # the answer from here keeps it out of the reported latency, which would otherwise
-                # be inflated on exactly the two tasks that carry retrieval gold.
-                started = time.perf_counter()
-        if arm.name == "random":
             order = list(ranked)
             random.Random(f"{arm.seed}:{sample_id}").shuffle(order)
             return _AnswerOutcome(
                 "",
-                (time.perf_counter() - started) * 1_000,
+                (time.perf_counter() - latency_started) * 1_000,
                 0.0,
                 tuple(hit.id for hit in order),
                 tuple(_evidence(hit) for hit in order),
                 ranked_source_ids=_source_ids(order),
+                ranked_source_ids_complete=True,
             )
         if arm.name == "compile":
             bundle = await memory.compile(
@@ -2081,7 +2558,7 @@ async def _arm_outcome(
             prediction = await arm.generator.answer(_question_text(question), rendered)
             return _AnswerOutcome(
                 prediction,
-                (time.perf_counter() - started) * 1_000,
+                (time.perf_counter() - latency_started) * 1_000,
                 0.0,
                 tuple(hit.id for hit in bundle.hits),
                 tuple(_evidence(hit) for hit in bundle.hits),
@@ -2096,45 +2573,57 @@ async def _arm_outcome(
             )
             return _AnswerOutcome(
                 prediction,
-                (time.perf_counter() - started) * 1_000,
+                (time.perf_counter() - latency_started) * 1_000,
                 0.0,
                 (),
                 (),
-                ranked_source_ids=_source_ids(ranked),
             )
-        result = await memory.ask(
-            content,
-            limit=recall_limit,
-            reference_at=question.reference_at,
-        )
+        result: AnswerResult | None = None
+        with _observe_retrieval_results(observe_retrieval):
+            ask_stream = getattr(memory, "ask_stream", None)
+            if ask_stream is None:
+                result = await memory.ask(
+                    content,
+                    limit=recall_limit,
+                    reference_at=question.reference_at,
+                )
+            else:
+                first_token_seen = False
+                async for chunk in ask_stream(
+                    content,
+                    limit=recall_limit,
+                    reference_at=question.reference_at,
+                ):
+                    if chunk.text.strip() and not first_token_seen:
+                        first_token_seen = True
+                        if answer_span is not None:
+                            answer_span.set_attribute(
+                                OPERATION_TTFT,
+                                (time.perf_counter() - started) * 1_000,
+                            )
+                    if chunk.result is not None:
+                        result = chunk.result
+                if result is None:
+                    raise RuntimeError("answer stream ended without a terminal result")
     except Exception as error:
-        if not arm.retrieves:
-            return _AnswerOutcome(
-                "", (time.perf_counter() - started) * 1_000, 0.0, (), (), error=error
-            )
-        hits = await memory.search(
-            content,
-            limit=recall_limit,
-            reference_at=question.reference_at,
-        )
         return _AnswerOutcome(
             "",
-            (time.perf_counter() - started) * 1_000,
-            max((hit.score for hit in hits), default=0.0),
-            tuple(hit.id for hit in hits),
-            tuple(_evidence(hit) for hit in hits),
+            (time.perf_counter() - latency_started) * 1_000,
+            max((hit.score for hit in ranked), default=0.0),
+            tuple(hit.id for hit in ranked),
+            tuple(_evidence(hit) for hit in ranked),
             error=error,
-            # Never the recall-limited fallback hits: those are a different set, and passing
-            # them off as the ranked list is the confusion this metric exists to remove.
             ranked_source_ids=_source_ids(ranked),
+            ranked_source_ids_complete=ranked_complete,
         )
+    assert result is not None
     # `_declined` stays on this path: the product cannot recognise a refusal a task worded
     # itself, so the harness counts it. It is deliberately not extended to the baseline arms
     # here, which would be new behaviour rather than a merge of the two intents.
     declined = _declined(result.answer, question)
     return _AnswerOutcome(
         result.answer,
-        (time.perf_counter() - started) * 1_000,
+        (time.perf_counter() - latency_started) * 1_000,
         max((hit.score for hit in result.hits), default=0.0),
         tuple(hit.id for hit in result.hits),
         tuple(_evidence(hit) for hit in result.hits),
@@ -2145,6 +2634,7 @@ async def _arm_outcome(
             else (AbstentionReason.INSUFFICIENT_EVIDENCE.value if declined else None)
         ),
         ranked_source_ids=_source_ids(ranked),
+        ranked_source_ids_complete=ranked_complete,
     )
 
 
@@ -2195,7 +2685,9 @@ def _sample(
     evidence: tuple[EvidenceInterval, ...]
     error_code: str | None
     error_detail: FailureDetail | None
+    retrieval_diagnostic_error: FailureDetail | None = None
     ranked_source_ids: tuple[str, ...] = ()
+    ranked_source_ids_complete = False
     if isinstance(outcome, BaseException):
         prediction, latency_ms, confidence, memory_ids, evidence, cached = (
             "",
@@ -2217,7 +2709,13 @@ def _sample(
         evidence = outcome.evidence
         cached = outcome.cached
         ranked_source_ids = outcome.ranked_source_ids
+        ranked_source_ids_complete = outcome.ranked_source_ids_complete
         error_detail = None if outcome.error is None else _failure_detail(outcome.error)
+        retrieval_diagnostic_error = (
+            None
+            if outcome.retrieval_diagnostic_error is None
+            else _failure_detail(outcome.retrieval_diagnostic_error)
+        )
         error_code = None if error_detail is None else error_detail.code
         abstained = outcome.abstained
         abstention_reason = outcome.abstention_reason
@@ -2233,12 +2731,13 @@ def _sample(
         ranked_source_ids,
         predict_only=predict_only,
         arm=arm,
-        # A question whose run recorded no ranked list -- a replay from a cache written before
-        # the list was stored, or a harness that never issued the ranked query -- carries no
-        # retrieval score. Reporting the empty list as recall zero would invent one, and the
-        # task's `retrieval` block excludes exactly the same samples, so both surfaces report
-        # over one denominator.
-        retrieval_available=arm.retrieves and bool(ranked_source_ids),
+        # A question whose run recorded no complete ranked list -- a replay from a cache
+        # written before the list was stored -- carries no retrieval score. Reporting the empty
+        # list as recall zero would invent one, and the task's `retrieval` block excludes exactly
+        # the same samples, so both surfaces report over one denominator.
+        retrieval_available=(
+            arm.retrieves and ranked_source_ids_complete and retrieval_diagnostic_error is None
+        ),
         # A provider failure produced no answer. Scoring the empty prediction turned every 500
         # into a confident zero, and because the arms fail at different rates the deflation was
         # asymmetric: on one run the blind arm errored 3.4x more often than the product arm,
@@ -2278,6 +2777,7 @@ def _sample(
         error_reason=None if error_detail is None else error_detail.reason,
         error_stage=None if error_detail is None else error_detail.stage,
         error_cause_type=None if error_detail is None else error_detail.cause_type,
+        retrieval_diagnostic_error=retrieval_diagnostic_error,
         abstained=abstained,
         abstention_reason=abstention_reason,
         cached=cached,
@@ -2293,6 +2793,7 @@ def _sample(
         arm=arm.name,
         retrieval_candidates=len(ranked_source_ids),
         ranked_source_ids=tuple(ranked_source_ids),
+        ranked_source_ids_complete=ranked_source_ids_complete,
     )
 
 
@@ -2323,10 +2824,10 @@ def _score(
     )
     metrics = _arm_metrics(metrics, arm, retrieval_available=retrieval_available)
     if answer_failed:
-        # Keep what the run did measure -- the retriever ranked before the generator failed --
-        # and leave the answer unscored so it lands in `error_count`, not in the mean. The
-        # `joint_*` metrics go with it: they are accuracy times recall, so scoring the empty
-        # prediction would put a confident zero back in under another name.
+        # Keep the separately measured retrieval diagnostic and leave the failed answer unscored
+        # so it lands in `error_count`, not in the mean. The `joint_*` metrics go with it: they
+        # are accuracy times recall, so scoring the empty prediction would put a confident zero
+        # back in under another name.
         diagnostic = {
             name: value for name, value in metrics.items() if name.startswith("retrieval_")
         }
@@ -2507,11 +3008,19 @@ async def _traced_judge_call(
     config: _JudgeConfig,
     tracer: Tracer,
 ) -> tuple[Mapping[str, float], str, bool]:
-    with traced_span(
+    cached = _cached_judge_call(
+        cache, messages, sample=sample, plan=plan, call_index=call_index, config=config
+    )
+    if cached is not None:
+        return cached
+    with model_span(
         tracer,
         BENCHMARK_JUDGE_SPAN,
         attributes={
             BENCHMARK_TASK: sample.task,
+            BENCHMARK_SAMPLE: sample.sample_id,
+            BENCHMARK_ARM: sample.arm,
+            BENCHMARK_PURPOSE: JUDGE_PURPOSE,
             SPAN_KIND: "model",
             MODEL_MODULE: "judge",
             "gen_ai.operation.name": "chat",
@@ -2527,6 +3036,7 @@ async def _traced_judge_call(
             cache=cache,
             semaphore=semaphore,
             config=config,
+            read_cache=False,
         )
 
 
@@ -2540,23 +3050,25 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
     cache: ResponseCache | None,
     semaphore: asyncio.Semaphore,
     config: _JudgeConfig,
+    read_cache: bool = True,
 ) -> tuple[Mapping[str, float], str, bool]:
-    key = hashlib.sha256(
-        _json_bytes(
-            {
-                "version": SCORER_VERSION,
-                "model": config.model,
-                "protocol": plan.protocol,
-                "call": call_index,
-                "messages": tuple((message.role, message.content) for message in messages),
-            }
+    cache_task, key = _judge_cache_coordinates(
+        messages,
+        plan=plan,
+        call_index=call_index,
+        config=config,
+    )
+    if read_cache:
+        cached = _cached_judge_call(
+            cache,
+            messages,
+            sample=sample,
+            plan=plan,
+            call_index=call_index,
+            config=config,
         )
-    ).hexdigest()
-    cache_task = f"judge:{plan.protocol}:{config.model}"
-    if cache is not None:
-        cached = cache.get(cache_task, sample.unit_id, key)
         if cached is not None:
-            return parse_judge_response(plan, cached.prediction), cached.prediction, True
+            return cached
     request: dict[str, Any] = {
         "model": config.model,
         "messages": [{"role": message.role, "content": message.content} for message in messages],
@@ -2593,6 +3105,7 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
                     else:
                         response = await client.chat.completions.create(**request)
                         text = str(response.choices[0].message.content or "").strip()
+                _record_openai_provenance(response)
                 usages.append(
                     _model_usage(
                         response,
@@ -2616,6 +3129,50 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
         raise last_error
     finally:
         _record_usage_batch(usages, request_count=attempted)
+
+
+def _judge_cache_coordinates(
+    messages: Sequence[JudgeMessage],
+    *,
+    plan: JudgePlan,
+    call_index: int,
+    config: _JudgeConfig,
+) -> tuple[str, str]:
+    key = hashlib.sha256(
+        _json_bytes(
+            {
+                "version": SCORER_VERSION,
+                "model": config.model,
+                "protocol": plan.protocol,
+                "call": call_index,
+                "messages": tuple((message.role, message.content) for message in messages),
+            }
+        )
+    ).hexdigest()
+    return f"judge:{plan.protocol}:{config.model}", key
+
+
+def _cached_judge_call(
+    cache: ResponseCache | None,
+    messages: Sequence[JudgeMessage],
+    *,
+    sample: SampleResult,
+    plan: JudgePlan,
+    call_index: int,
+    config: _JudgeConfig,
+) -> tuple[Mapping[str, float], str, bool] | None:
+    if cache is None:
+        return None
+    cache_task, key = _judge_cache_coordinates(
+        messages,
+        plan=plan,
+        call_index=call_index,
+        config=config,
+    )
+    cached = cache.get(cache_task, sample.unit_id, key)
+    if cached is None:
+        return None
+    return parse_judge_response(plan, cached.prediction), cached.prediction, True
 
 
 def _unsupported_extra_body(error: Exception) -> bool:
@@ -2735,6 +3292,17 @@ def _parsed_choice(task_name: str, prediction: str, choices: Sequence[str]) -> s
     return parse_choice(prediction, choices)
 
 
+def _incomplete_search_replay(rows: Sequence[Mapping[str, object]]) -> bool:
+    for row in rows:
+        if row.get("arm") != DEFAULT_ARM:
+            continue
+        performance = row.get("performance")
+        search = performance.get("search_e2e") if isinstance(performance, Mapping) else None
+        if isinstance(search, Mapping) and search.get("complete") is False:
+            return True
+    return False
+
+
 def _results(
     arguments: _Arguments,
     config: ModelConfig,
@@ -2744,10 +3312,11 @@ def _results(
     duration_seconds: float,
     batch_sizes: Mapping[str, int],
     submission_status: Mapping[str, object] | None,
-    performance: Mapping[str, Mapping[str, object]],
+    performance: Mapping[str, Mapping[str, Mapping[str, object]]],
     *,
     memory_config: MindBridgeConfig | None = None,
     resources: Mapping[str, object] | None = None,
+    embedding_warmup_count: int | None = None,
 ) -> dict[str, object]:
     # A blind arm run here is the same control as an external `--blind` document, measured on the
     # same inputs, so it satisfies the blind control too. An explicitly supplied document still
@@ -2756,12 +3325,34 @@ def _results(
         **_in_run_blind_rows(arguments, tasks, samples),
         **_blind_baseline_rows(arguments.blind_baseline, tasks),
     }
+    product_candidate_limit = _answer_retrieval_candidate_limit(
+        arguments.recall_limit,
+        memory_config,
+    )
     task_rows = []
     for task, arm in ((task, arm) for task in tasks for arm in arguments.arms):
         selected = tuple(
             sample for sample in samples if sample.task == task.spec.name and sample.arm == arm
         )
-        metrics = _metrics(task, selected, arguments, blind_rows.get(task.spec.name), arm=arm)
+        metrics = _metrics(
+            task,
+            selected,
+            arguments,
+            blind_rows.get(task.spec.name),
+            arm=arm,
+            retrieval_candidate_limit=(
+                product_candidate_limit
+                if arm == DEFAULT_ARM
+                else RETRIEVAL_CANDIDATE_LIMIT
+                if (
+                    arm == "random"
+                    and any(
+                        retrieval_gold_ids(task.spec.name, sample.metadata) for sample in selected
+                    )
+                )
+                else arguments.recall_limit
+            ),
+        )
         if (
             task.spec.name == "egomemreason"
             and submission_status is not None
@@ -2796,7 +3387,7 @@ def _results(
                 "evaluation_sha256": task.evaluation_sha256,
                 "batch_size": batch_sizes[task.spec.name],
                 "input_modalities": _task_modalities(task),
-                "performance": dict(performance.get(task.spec.name, {})),
+                "performance": dict(performance.get(task.spec.name, {}).get(arm, {})),
                 **metrics,
             }
         )
@@ -2813,8 +3404,12 @@ def _results(
         "status": (
             "completed_with_errors"
             if any(
-                sample.error_code is not None or sample.ingest_failure_count for sample in samples
+                sample.error_code is not None
+                or sample.ingest_failure_count
+                or sample.retrieval_diagnostic_error is not None
+                for sample in samples
             )
+            or _incomplete_search_replay(task_rows)
             or (submission_status is not None and submission_status["status"] == "invalid")
             else "completed"
         ),
@@ -2847,8 +3442,18 @@ def _results(
         "unit_concurrency": arguments.unit_concurrency,
         "request_concurrency": arguments.request_concurrency,
         "recall_limit": arguments.recall_limit,
-        "arms": _arm_provenance(arguments),
-        "model": _model_result(arguments, config, memory_config),
+        "arms": _arm_provenance(arguments, memory_config),
+        "measurement_protocol": _measurement_protocol(
+            arguments,
+            samples,
+            embedding_warmup_count=embedding_warmup_count,
+        ),
+        "model": _model_result(
+            arguments,
+            config,
+            memory_config,
+            embedding_warmup_count=embedding_warmup_count,
+        ),
         "judge": {
             "model": judge_config.model,
             "base_url": judge_config.base_url,
@@ -2865,19 +3470,95 @@ def _results(
             },
             "python_version": platform.python_version(),
             "platform": platform.platform(),
-            "hardware": _hardware(),
+            "hardware": hardware_metadata(),
+            "acceleration_runtime": acceleration_runtime_metadata(),
+            "source": source_metadata(),
         },
         "resources": None if resources is None else dict(resources),
         "tasks": task_rows,
     }
 
 
-def _arm_provenance(arguments: _Arguments) -> dict[str, object]:
+def _measurement_protocol(
+    arguments: _Arguments,
+    samples: Sequence[SampleResult],
+    *,
+    embedding_warmup_count: int | None,
+) -> dict[str, object]:
+    cached = sum(sample.cached for sample in samples)
+    state = (
+        "fresh_store"
+        if arguments.use_cache is None
+        else "response_cache_only"
+        if cached == len(samples)
+        else "mixed_fresh_store_and_response_cache"
+        if cached
+        else "fresh_store_with_response_cache_enabled"
+    )
+    return {
+        "state": state,
+        "store": "one newly-created physical data directory per benchmark unit",
+        "repeat_index": getattr(arguments, "repeat_index", 0),
+        "repeat_execution": "independent_eval_invocation",
+        "measured_response_count": len(samples) - cached,
+        "cached_responses_excluded_from_performance_denominators": True,
+        "embedding_warmup": {
+            "count": embedding_warmup_count,
+            "task": EmbedTask.QUERY.value,
+            "included_in_product_measurement": False,
+        },
+        "generation_warmup": {"count": 0},
+        "vision_description_cache": "shared_within_run_only; cold_again_for_each_repeat",
+        "remote_server_state": "uncontrolled",
+        "answer_e2e_includes_request_admission": True,
+        "post_answer_search_replay_in_client_resource_window": True,
+        "judge_in_client_resource_window": False,
+    }
+
+
+def _answer_retrieval_candidate_limit(
+    recall_limit: int,
+    memory_config: MindBridgeConfig | None,
+) -> int:
+    """Mirror the ranked window ``Memory.ask`` requests from the retrieval kernel."""
+    evidence_budget_chars = (
+        None if memory_config is None else memory_config.settings.evidence_budget_chars
+    )
+    return (
+        RETRIEVAL_CANDIDATE_LIMIT
+        if evidence_budget_chars is not None
+        else min(RETRIEVAL_CANDIDATE_LIMIT, recall_limit * 3)
+    )
+
+
+def _arm_provenance(
+    arguments: _Arguments,
+    memory_config: MindBridgeConfig | None = None,
+) -> dict[str, object]:
     """Describe every arm precisely enough that a reader can attribute each number to one."""
+    answer_candidate_limit = _answer_retrieval_candidate_limit(
+        arguments.recall_limit,
+        memory_config,
+    )
+    evidence_budget_chars = (
+        None if memory_config is None else memory_config.settings.evidence_budget_chars
+    )
     definitions: dict[str, object] = {
         DEFAULT_ARM: {
             "answers_from": "retrieved memories",
-            "retrieval": "Memory.ask",
+            "retrieval": "Memory.ask in-answer ranked list; no second scoring search",
+            "retrieval_candidate_limit": answer_candidate_limit,
+            "retrieval_candidate_limit_basis": (
+                "full rerank pool because evidence_budget_chars is configured"
+                if evidence_budget_chars is not None
+                else "min(100, recall_limit * 3)"
+            ),
+            "answer_retrieval_candidate_limit": answer_candidate_limit,
+            "answer_retrieval_candidate_limit_basis": (
+                "full rerank pool because evidence_budget_chars is configured"
+                if evidence_budget_chars is not None
+                else "min(100, recall_limit * 3)"
+            ),
             "official_metrics": True,
         },
         "blind": {
@@ -2897,7 +3578,14 @@ def _arm_provenance(arguments: _Arguments) -> dict[str, object]:
         },
         "random": {
             "answers_from": "nothing; retrieval metrics only",
-            "retrieval": f"uniform shuffle of the top {RETRIEVAL_CANDIDATE_LIMIT} ranked candidates",
+            "retrieval": (
+                f"uniform shuffle of the top {RETRIEVAL_CANDIDATE_LIMIT} ranked candidates for "
+                "gold-labelled questions; recall_limit otherwise"
+            ),
+            "retrieval_candidate_limit": {
+                "gold_labelled_questions": RETRIEVAL_CANDIDATE_LIMIT,
+                "questions_without_gold_labels": arguments.recall_limit,
+            },
             "seed": arguments.seed,
             "official_metrics": False,
         },
@@ -2912,7 +3600,12 @@ def _arm_provenance(arguments: _Arguments) -> dict[str, object]:
     }
     return {
         "selected": list(arguments.arms),
-        "retrieval_candidate_limit": RETRIEVAL_CANDIDATE_LIMIT,
+        "retrieval_candidate_limit": answer_candidate_limit,
+        "retrieval_candidate_limit_arm": DEFAULT_ARM,
+        "retrieval_candidate_source": "Memory.ask in-answer ranked list",
+        "search_e2e_limit": arguments.recall_limit,
+        "search_e2e_source": "post-answer public Memory.search replay",
+        "evidence_budget_chars": evidence_budget_chars,
         "ingest": arguments.ingest,
         "definitions": {name: definitions[name] for name in arguments.arms},
     }
@@ -2922,13 +3615,19 @@ def _model_result(
     arguments: _Arguments,
     config: ModelConfig,
     memory_config: MindBridgeConfig | None,
+    *,
+    embedding_warmup_count: int | None = None,
 ) -> dict[str, object]:
     result: dict[str, object] = {
         "adapter": arguments.model,
         "embedding_model": DEFAULT_JINA_MODEL_ID,
         "embedding_revision": DEFAULT_JINA_REVISION,
         "embedding_dimension": DEFAULT_JINA_DIMENSION,
-        "embedding_warmup": {"count": 1, "task": EmbedTask.QUERY.value},
+        "embedding_warmup": {
+            "count": embedding_warmup_count,
+            "task": EmbedTask.QUERY.value,
+            "included_in_product_measurement": False,
+        },
         "device": arguments.device or "auto",
         "generation_model": config.generation_model,
         "generation_base_url": config.generation_base_url,
@@ -2941,6 +3640,7 @@ def _model_result(
         "generation_min_video_seconds": config.generation_min_video_seconds,
         "transcription_model": DEFAULT_FUNASR_MODEL_ID,
         "timeout_seconds": config.timeout_seconds,
+        "memory_config": None,
     }
     if memory_config is None:
         return result
@@ -2988,16 +3688,6 @@ def _task_modalities(task: LoadedTask) -> list[str]:
     return sorted(modalities)
 
 
-def _hardware() -> dict[str, object]:
-    """Record the hardware facts a quality claim has to identify."""
-    return {
-        "machine": platform.machine(),
-        "processor": platform.processor(),
-        "logical_cores": os.cpu_count(),
-        "cuda_device_uuids": {str(index): uuid for index, uuid in _nvidia_device_uuids().items()},
-    }
-
-
 def _configured_device_label(explicit: str | None, config: MindBridgeConfig) -> str:
     if explicit is not None:
         return explicit
@@ -3023,6 +3713,7 @@ def _metrics(
     blind: Mapping[str, object] | None = None,
     *,
     arm: str = DEFAULT_ARM,
+    retrieval_candidate_limit: int | None = None,
 ) -> dict[str, object]:
     seed = _task_seed(arguments.seed, task.spec.name)
 
@@ -3070,10 +3761,21 @@ def _metrics(
             ),
         }
     latencies = sorted(sample.latency_ms for sample in samples if sample.latency_ms > 0)
-    retrieval = _retrieval_quality(
-        samples, seed=seed, bootstrap_samples=arguments.bootstrap_samples
+    retrieval = (
+        _retrieval_quality(
+            samples,
+            seed=seed,
+            bootstrap_samples=arguments.bootstrap_samples,
+            recall_limit=arguments.recall_limit,
+            retrieval_candidate_limit=retrieval_candidate_limit,
+        )
+        if _Arm(arm).retrieves
+        else {"unavailable_reason": f"the {arm} arm does not run ranked retrieval"}
     )
     error_count = sum(sample.error_code is not None for sample in samples)
+    retrieval_diagnostic_error_count = sum(
+        sample.retrieval_diagnostic_error is not None for sample in samples
+    )
     ingest_failure_count = sum(
         max(sample.ingest_failure_count for sample in samples if sample.unit_id == unit_id)
         for unit_id in {sample.unit_id for sample in samples}
@@ -3093,12 +3795,15 @@ def _metrics(
             else len(judge_models) == 1 and judge_model_is_official(task.spec.name, judge_models[0])
         ),
         "score": primary,
-        "score_valid": error_count == 0 and ingest_failure_count == 0,
+        "score_valid": (
+            error_count == 0 and ingest_failure_count == 0 and retrieval_diagnostic_error_count == 0
+        ),
         "metrics": metric_rows,
         "exact_match": metric_rows.get("exact_match"),
         "question_count": len(samples),
         "scored_question_count": len(scored),
         "error_count": error_count,
+        "retrieval_diagnostic_error_count": retrieval_diagnostic_error_count,
         "ingest_failure_count": ingest_failure_count,
         "abstentions": _abstentions(samples),
         "answer_latency_ms": {
@@ -3107,9 +3812,9 @@ def _metrics(
                 "is response latency and not queue depth"
             ),
             "count": len(latencies),
-            "p50": percentile(latencies, 0.50),
-            "p95": percentile(latencies, 0.95),
-            "p99": percentile(latencies, 0.99),
+            "p50": percentile(latencies, 0.50, presorted=True),
+            "p95": percentile(latencies, 0.95, presorted=True),
+            "p99": percentile(latencies, 0.99, presorted=True),
         },
         "retrieval": retrieval,
         "controls": _controls(
@@ -3192,9 +3897,9 @@ def _metadata_ids(metadata: Mapping[str, object], key: str) -> tuple[str, ...]:
 def _retrieved_sources(sample: SampleResult) -> tuple[str, ...]:
     """Return the retriever's ranked source IDs in rank order, deduplicated.
 
-    This is the list `search(limit=RETRIEVAL_CANDIDATE_LIMIT)` returned, not `sample.evidence`:
-    evidence is narrowed to the hits the generator cited, so scoring it reported the generator's
-    citation behaviour under the name of retrieval recall.
+    This is the ranked list observed inside ``Memory.ask``, not ``sample.evidence``. Evidence is
+    narrowed to the hits the generator saw, so scoring it would report grounding behaviour under
+    the name of retrieval recall.
     """
     return tuple(dict.fromkeys(source for source in sample.ranked_source_ids if source))
 
@@ -3204,6 +3909,8 @@ def _retrieval_quality(
     *,
     seed: int,
     bootstrap_samples: int,
+    recall_limit: int,
+    retrieval_candidate_limit: int | None = None,
 ) -> dict[str, object]:
     """Report recall at every cutoff next to the random-ranker expectation.
 
@@ -3212,6 +3919,11 @@ def _retrieval_quality(
     expectation for a uniform ranker over the same candidate pool, which is what makes a high
     recall interpretable: a pool of ten candidates already gives R@10 = 1.0 by chance.
     """
+    ranked_limit = (
+        min(RETRIEVAL_CANDIDATE_LIMIT, recall_limit * 3)
+        if retrieval_candidate_limit is None
+        else retrieval_candidate_limit
+    )
     key = next(
         (
             name
@@ -3230,7 +3942,8 @@ def _retrieval_quality(
     if key is None:
         return {
             "gold_evidence_key": None,
-            "ranked_candidate_limit": RETRIEVAL_CANDIDATE_LIMIT,
+            "recall_limit": recall_limit,
+            "retrieval_candidate_limit": ranked_limit,
             "labelled_question_count": 0,
             "unranked_labelled_question_count": 0,
             "recall_at_k": {},
@@ -3242,14 +3955,15 @@ def _retrieval_quality(
             ),
         }
     labelled_all = tuple(sample for sample in samples if _metadata_ids(sample.metadata, key))
-    # A labelled question whose run recorded no ranked list (a cached answer, or a harness that
-    # never issued the ranked query) is excluded and counted, never scored as recall zero.
-    labelled = tuple(sample for sample in labelled_all if sample.ranked_source_ids)
+    # A labelled question whose run never completed the ranked query is excluded and counted.
+    # A completed query with zero hits is measured recall zero, not mistaken for missing data.
+    labelled = tuple(sample for sample in labelled_all if sample.ranked_source_ids_complete)
     unranked = len(labelled_all) - len(labelled)
     if not labelled:
         return {
             "gold_evidence_key": key,
-            "ranked_candidate_limit": RETRIEVAL_CANDIDATE_LIMIT,
+            "recall_limit": recall_limit,
+            "retrieval_candidate_limit": ranked_limit,
             "labelled_question_count": 0,
             "unranked_labelled_question_count": unranked,
             "recall_at_k": {},
@@ -3295,10 +4009,8 @@ def _retrieval_quality(
 
     return {
         "gold_evidence_key": key,
-        # The bound recall is measured under: `search(limit=RETRIEVAL_CANDIDATE_LIMIT)` fills the
-        # ranked list. `--recall-limit` bounds what `memory.ask` reads and is reported in the run
-        # metadata; it does not truncate these cutoffs.
-        "ranked_candidate_limit": RETRIEVAL_CANDIDATE_LIMIT,
+        "recall_limit": recall_limit,
+        "retrieval_candidate_limit": ranked_limit,
         "labelled_question_count": len(labelled),
         "unranked_labelled_question_count": unranked,
         "unresolved_gold_evidence_ids": unresolved,
@@ -3312,9 +4024,7 @@ def _retrieval_quality(
             "max": max(pool_sizes, default=None),
             "mean": statistics.fmean(pool_sizes) if pool_sizes else None,
         },
-        "truncated_cutoffs": [
-            cutoff for cutoff in _RECALL_CUTOFFS if cutoff > RETRIEVAL_CANDIDATE_LIMIT
-        ],
+        "truncated_cutoffs": [cutoff for cutoff in _RECALL_CUTOFFS if cutoff > ranked_limit],
     }
 
 
@@ -3427,7 +4137,7 @@ def _blind_baseline_rows(
         raise FileNotFoundError(f"blind baseline does not exist: {document_path}")
     document = json.loads(document_path.read_text(encoding="utf-8"))
     if not isinstance(document, dict):
-        raise ValueError("blind baseline must be a results.json document")
+        raise ValueError("blind baseline must be a results.jsonl document")
     if document.get("blind") is not True:
         raise ValueError("blind baseline must come from a run started with --blind")
     if document.get("schema_version") != EVAL_SCHEMA_VERSION:
@@ -3833,8 +4543,7 @@ def _egomem_submission(
         [
             {"example_id": example_id, "predicted_answer": answer}
             for example_id, answer in sorted(predictions)
-        ],
-        pretty=True,
+        ]
     )
     status.update(
         {
@@ -3852,29 +4561,10 @@ def _write_artifacts(
     results: Mapping[str, object],
     submission: bytes | None,
 ) -> None:
-    samples_bytes = "".join(
-        json.dumps(
-            sample.json(),
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
-        for sample in samples
-    ).encode("utf-8")
+    samples_bytes = _jsonl_bytes(sample.json() for sample in samples)
     document = dict(results)
     document["samples_sha256"] = hashlib.sha256(samples_bytes).hexdigest()
-    results_bytes = (
-        json.dumps(
-            document,
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
-    ).encode("utf-8")
+    results_bytes = _jsonl_bytes((document,))
     arguments.output_path.mkdir(mode=0o700, parents=True, exist_ok=True)
     submission_path = arguments.output_path / _EGOMEM_SUBMISSION_FILE
     if submission is None and arguments.overwrite:
@@ -3937,18 +4627,21 @@ def _absolute_manifest_paths(value: object, directory: Path | None) -> object:
     return result
 
 
-def _json_bytes(value: object, *, pretty: bool = False) -> bytes:
+def _json_bytes(value: object) -> bytes:
     return (
         json.dumps(
             value,
             ensure_ascii=False,
             allow_nan=False,
             sort_keys=True,
-            indent=2 if pretty else None,
-            separators=None if pretty else (",", ":"),
+            separators=(",", ":"),
         )
         + "\n"
     ).encode("utf-8")
+
+
+def _jsonl_bytes(values: Iterable[object]) -> bytes:
+    return b"".join(_json_bytes(value) for value in values)
 
 
 def _announce(message: str) -> None:
@@ -3963,6 +4656,10 @@ def _report_completions(callback: Callable[[], None] | None, count: int) -> None
     if callback is not None:
         for _ in range(count):
             callback()
+
+
+def _ignore_store_ready() -> None:
+    pass
 
 
 def _progress_reporter(
@@ -4261,6 +4958,12 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     parser.add_argument("--recall-limit", type=_positive_int, default=None)
     parser.add_argument("--seed", type=_seed_values, default=None)
     parser.add_argument("--bootstrap-samples", type=_positive_int, default=None)
+    parser.add_argument(
+        "--repeat-index",
+        type=_nonnegative_int,
+        default=None,
+        help="zero-based index of this independent baseline invocation",
+    )
     parser.add_argument("--device", help="local embedding/FunASR device: cpu, cuda, or cuda:N")
     parser.add_argument(
         "--device-lock",
@@ -4277,6 +4980,16 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     )
     parser.add_argument("--compare", type=Path, help="prior result directory or samples.jsonl")
     parser.add_argument(
+        "--performance-budget",
+        action="append",
+        default=None,
+        metavar="METRIC=FRACTION",
+        help=(
+            "maximum relative performance regression; repeatable; metrics: "
+            + ", ".join(PERFORMANCE_BUDGET_NAMES)
+        ),
+    )
+    parser.add_argument(
         "--blind",
         action="store_true",
         help=(
@@ -4288,7 +5001,7 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         "--blind-baseline",
         "--blind_baseline",
         type=Path,
-        help="results.json from a --blind run of the same evaluation inputs",
+        help="results.jsonl from a --blind run of the same evaluation inputs",
     )
     parser.add_argument("--fail-on-regression", action="store_true", default=None)
     parser.add_argument("--regression-threshold", type=_nonnegative_float, default=None)
@@ -4341,7 +5054,8 @@ def _arguments(
 ) -> _Arguments:
     if parsed.model != "mindbridge":
         parser.error("--model must be mindbridge")
-    run = (HarnessOverrides() if overrides is None else overrides).run
+    harness = HarnessOverrides() if overrides is None else overrides
+    run = harness.run
     arms = _selected_arms(parser, parsed, _picked(parsed.arms, run.arms, DEFAULT_ARM))
     tasks_value = parsed.tasks or run.tasks
     if not tasks_value:
@@ -4369,6 +5083,7 @@ def _arguments(
     bootstrap_samples = _picked(
         parsed.bootstrap_samples, run.bootstrap_samples, DEFAULT_BOOTSTRAP_SAMPLES
     )
+    repeat_index = _picked(parsed.repeat_index, run.repeat_index, 0)
     device = _picked(parsed.device, run.device, None)
     device_lock = _picked(parsed.device_lock, run.device_lock, True)
     use_cache = _picked(parsed.use_cache, run.use_cache, None)
@@ -4402,6 +5117,10 @@ def _arguments(
         media_overrides = _assignments(_overridden_paths(parsed.media_root, run.media_root), tasks)
         _parse_batch_size(batch_size)
         gen_kwargs = _generation_kwargs(parsed.gen_kwargs, seeds[0])
+        performance_budgets = _resolved_performance_budgets(
+            parsed.performance_budget,
+            harness.performance_budgets,
+        )
     except (ValueError, argparse.ArgumentTypeError) as error:
         parser.error(str(error))
     settings = (
@@ -4413,6 +5132,8 @@ def _arguments(
         parsed.run_id or declared_run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     )
     output = parsed.output_path or run.output_path or settings.benchmarks_root / "results" / run_id
+    if performance_budgets and compare is None:
+        parser.error("--performance-budget requires --compare")
     return _Arguments(
         tasks=tasks,
         benchmarks_root=settings.benchmarks_root.expanduser().resolve(),
@@ -4432,6 +5153,7 @@ def _arguments(
         seed=seeds[0],
         seeds=seeds,
         bootstrap_samples=bootstrap_samples,
+        repeat_index=repeat_index,
         model=parsed.model,
         arms=arms,
         full_context_chars=full_context_chars,
@@ -4449,7 +5171,8 @@ def _arguments(
         use_cache=(None if use_cache is None else use_cache.expanduser().resolve()),
         device=device,
         device_lock=device_lock,
-        compare=compare,
+        compare=None if compare is None else compare.expanduser().resolve(),
+        performance_budgets=performance_budgets,
         blind=parsed.blind,
         blind_baseline=(
             None if parsed.blind_baseline is None else parsed.blind_baseline.expanduser().resolve()
@@ -4545,6 +5268,30 @@ def _overridden_paths(
     if not declared:
         return ()
     return tuple(f"{task}={path}" for task, path in declared.items())
+
+
+def _resolved_performance_budgets(
+    flags: Sequence[str] | None,
+    declared: Mapping[str, float],
+) -> dict[str, float]:
+    budgets = dict(declared)
+    seen: set[str] = set()
+    for item in flags or ():
+        name, separator, raw = item.partition("=")
+        name = name.strip()
+        if not separator or name not in PERFORMANCE_BUDGET_NAMES or not raw.strip():
+            raise ValueError(
+                "performance budgets must use METRIC=FRACTION; metric must be one of: "
+                + ", ".join(PERFORMANCE_BUDGET_NAMES)
+            )
+        if name in seen:
+            raise ValueError(f"performance budget repeats metric: {name}")
+        seen.add(name)
+        try:
+            budgets[name] = _nonnegative_float(raw.strip())
+        except (ValueError, argparse.ArgumentTypeError) as error:
+            raise ValueError(f"invalid performance budget for {name}: {raw.strip()}") from error
+    return budgets
 
 
 def _load_memory_config(
@@ -4819,18 +5566,10 @@ def _description_cache_path(
     arguments: _Arguments,
     memory_config: MindBridgeConfig | None,
 ) -> Path | None:
-    """Where descriptions persist between runs, or ``None`` when nothing describes.
-
-    Beside the response cache when one is configured, so both live under the same directory a
-    sweep already owns; otherwise under the corpus root. Deliberately not namespaced by run or
-    by task: the whole point is that a later run reads what an earlier one wrote.
-    """
+    """Share descriptions inside one run without warming later performance repeats."""
     if memory_config is None or memory_config.vision is None:
         return None
-    directory = (
-        arguments.data_root / "cache" if arguments.use_cache is None else arguments.use_cache.parent
-    )
-    return directory / "descriptions.db"
+    return arguments.data_root / "cache" / arguments.run_id / "descriptions.db"
 
 
 def _batch_size(arguments: _Arguments, task: LoadedTask) -> int:

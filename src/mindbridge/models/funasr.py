@@ -14,8 +14,13 @@ from pathlib import Path
 from threading import RLock
 from typing import Protocol, cast
 
-from mindbridge._telemetry import mark_model_requests, record_unmetered_model_usage
+from mindbridge._telemetry import (
+    current_model_request_count,
+    mark_model_requests,
+    record_unmetered_model_usage,
+)
 from mindbridge.exceptions import ModelError, ValidationError
+from mindbridge.models._media import media_duration_seconds
 from mindbridge.models.base import SpeakerEmbedding, SpeechAnalysis, SpeechTurn
 from mindbridge.types import AssetRef, Modality
 
@@ -163,8 +168,8 @@ class FunASRTranscriber:
                 or asset.modality not in self.transcription_capabilities
             ):
                 raise ValidationError("assets must contain resolved audio or video AssetRef values")
-        # One batch is one AutoModel call, so the request count is calls issued, not assets sent.
-        mark_model_requests(1 if batch else 0, token_usage_expected=0)
+        # Each `_pipeline_output` increments immediately before model I/O, including fallbacks.
+        mark_model_requests(0, token_usage_expected=0)
         if not batch:
             return ()
         with self._lock:
@@ -180,11 +185,23 @@ class FunASRTranscriber:
                     or self._recipe.punctuation_model is not None
                 ),
             )
+        durations = []
+        for asset in batch:
+            path = asset.path
+            if path is None:  # AssetRef.is_resolved was checked above.
+                raise ValidationError("speech asset path is missing")
+            durations.append(
+                media_duration_seconds(
+                    path,
+                    stream_kind="audio",
+                )
+            )
         record_unmetered_model_usage(
             request_count=calls,
-            audio_seconds=sum(
-                max((turn.end_ms for turn in analysis.turns), default=0) / 1_000
-                for analysis in analyses
+            audio_seconds=(
+                None
+                if any(duration is None for duration in durations)
+                else sum(cast(float, duration) for duration in durations) * (2 if calls > 1 else 1)
             ),
         )
         return analyses
@@ -318,6 +335,7 @@ def _pipeline_output(
     speaker_analysis: bool = True,
     sentence_timestamp: bool = True,
 ) -> object:
+    mark_model_requests(current_model_request_count() + 1, token_usage_expected=0)
     try:
         return pipeline.generate(
             input=value,

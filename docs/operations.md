@@ -173,17 +173,36 @@ with Memory("./data", embedder=JinaOmniEmbedder()) as memory:
 provider.shutdown()
 ```
 
-Every span sets `mindbridge.span.kind` to `operation`, `stage`, or `model`.
+Every span sets `mindbridge.span.kind` to `operation`, `stage`, `model`, or `transport`.
 
 | Level | Useful span names |
 | --- | --- |
 | Operation | `mindbridge.add`, `.add_many`, `.search`, `.ask`, `.delete`, `.reindex`, `.optimize` |
-| Stage | `mindbridge.content.prepare`, `.storage.*`, `.index.*`, `.retrieval.rank`, `.identity.*` |
+| Stage | `mindbridge.content.prepare`, `.retrieve`, `.storage.*`, `.index.*`, `.retrieval.rank`, `.identity.*` |
 | Model | `mindbridge.model.embedding`, `.transcription`, `.face`, `.generation`, `.formation`, `.vision` |
+| Transport | `mindbridge.http.request`, `mindbridge.mcp.request` |
 
 Each `add_stream()` item creates an ordinary `mindbridge.add` span. `search_with_trace()` and
 speculative prefetch use `mindbridge.search`. `AsyncMemory` preserves tracing context across its
-worker thread.
+worker thread. Both buffered `AsyncMemory.ask()` and `AsyncMemory.ask_stream()` record their
+initial executor queue delay.
+
+Inside `mindbridge.ask`, `mindbridge.retrieve` measures the complete prerequisite-to-ranked-hits
+leg: question content preparation, reference-time and temporal parsing, scope normalization,
+required query speech work, query embedding, index lookup, and ranking. Its existing
+`mindbridge.content.prepare`, model, `mindbridge.index.search`, and `mindbridge.retrieval.rank`
+children remain available for attribution.
+
+`mindbridge.index.sync` retains one parent span and separates its durable stages without changing
+the SQLite-before-Zvec-before-ack order:
+
+| Child stage | Work measured |
+| --- | --- |
+| `mindbridge.index.sync.sqlite.read` | Read and hydrate the durable SQLite outbox batch. |
+| `mindbridge.index.sync.zvec.apply` | Delete or upsert the derived Zvec documents. |
+| `mindbridge.index.sync.zvec.flush` | Flush the applied Zvec changes. |
+| `mindbridge.index.sync.zvec.optimize` | Run the conditional Zvec optimization check. |
+| `mindbridge.index.sync.sqlite.ack` | Acknowledge the flushed outbox batch in SQLite. |
 
 Capture acknowledgement, settle duration, and time to settled are three different numbers and
 are measured separately. `mindbridge.capture` and `mindbridge.settle` are distinct operation
@@ -198,20 +217,56 @@ spans, and the settle span carries the capture-to-settled interval its batch clo
 Model spans include request model, module, batch size, modalities, and
 `mindbridge.model.request_count`. Provider-reported usage is recorded without estimation:
 
+`mindbridge.model.request_count` counts logical adapter calls issued by MindBridge. Retries hidden
+inside a third-party SDK transport remain included in latency, but cannot be counted separately;
+token totals and completeness cover observable logical responses, not an earlier hidden attempt for
+which the provider returned no usage.
+
 | Attribute | Meaning |
 | --- | --- |
 | `mindbridge.token_usage.expected_request_count` | Requests expected to report token usage. |
 | `mindbridge.token_usage.reported_request_count` | Requests that supplied usage. |
 | `mindbridge.token_usage.complete` | Every expected request supplied a usable total. |
 | `mindbridge.token_usage.total_tokens` | Exact total when complete; otherwise only an exact reported lower bound. |
+| `mindbridge.token_usage.input_tokens.complete` | Every expected request supplied an input-token component. |
+| `mindbridge.token_usage.output_tokens.complete` | Every expected request supplied an output-token component. |
+| `mindbridge.token_usage.cached_input_tokens.complete` | Every expected request supplied a cached-input component. |
+| `mindbridge.token_usage.reasoning_output_tokens.complete` | Every expected request supplied a reasoning-output component. |
 | `mindbridge.token_usage.input_tokens.<modality>` | Exact input tokens for text, image, video, audio, or unattributed input. |
 | `mindbridge.token_usage.output_tokens.<modality>` | Exact output tokens for the same modality set. |
+| `gen_ai.usage.cache_read.input_tokens` | Provider-reported cached input tokens. |
+| `gen_ai.usage.reasoning.output_tokens` | Provider-reported reasoning output tokens. |
 | `mindbridge.token_usage.audio_seconds` | Provider- or runtime-reported processed audio duration. |
 
 Operation spans roll up descendant model usage. Local backends report request counts and available
-audio duration but do not invent token counts. Streaming generation records
-`mindbridge.model.time_to_first_token` after its first non-empty text delta. Providers may also
-record `gen_ai.response.time_to_first_chunk` and `gen_ai.response.finish_reasons`.
+audio duration but do not invent token counts. Cached-input and reasoning-output tokens participate
+in the same model-to-operation rollup. Embedding model spans set `mindbridge.embedding.task` to
+`retrieval.document` or `retrieval.query`, so ingest and retrieval inference can be separated.
+
+OpenAI-compatible model spans record `gen_ai.response.model` and
+`gen_ai.openai.response.system_fingerprint` only when the response supplies a non-empty value.
+Streaming inspects the final usage chunk too. `mindbridge.model.response_models` and
+`mindbridge.model.response_system_fingerprints` retain all distinct values when one span covers
+several responses; the scalar field is `mixed` instead of silently assigning the whole span to the
+last response. These are response provenance, not a copy of the request or response body.
+
+The first-output clocks deliberately use different scopes and units:
+
+| Attribute | Unit | Boundary |
+| --- | --- | --- |
+| `mindbridge.operation.time_to_first_token_ms` | Milliseconds | Start of the complete `mindbridge.ask` operation through its first non-empty visible text yield, including retrieval and generation setup. Absent if no visible text is yielded. |
+| `mindbridge.model.time_to_first_token` | Seconds | Generation-model request through its first non-empty text delta. This preserves the generation-only model baseline and is absent when no model token is produced. |
+| `gen_ai.response.time_to_first_chunk` | Seconds | OpenAI-compatible streaming request through the first provider chunk, even when that chunk carries no visible text. |
+| `mindbridge.async.queue_time_ms` | Milliseconds | Initial buffered or streaming `AsyncMemory.ask*` executor queue delay. It is also included in the operation TTFT, while remaining available for decomposition. |
+
+Transport spans measure server-side delivery separately from model and operation timing:
+
+| Transport | Attributes and boundary |
+| --- | --- |
+| REST | `mindbridge.http.request` records the low-cardinality `http.route` template, `mindbridge.transport.response_mode`, `mindbridge.transport.server_time_to_headers_ms`, `mindbridge.transport.server_time_to_first_body_byte_ms` when a non-empty body is sent, and `mindbridge.transport.server_total_ms`. All three times are milliseconds from server request handling; they are not client-observed network latency. |
+| MCP | `mindbridge.mcp.request` records buffered `mindbridge.transport.server_total_ms` in milliseconds. MCP does not stream tool results, so it does not claim TTFT, first-chunk, or first-body timing. |
+
+Providers may also record `gen_ai.response.finish_reasons` on generation model spans.
 
 Watch these degradation and recognition attributes:
 
@@ -227,9 +282,10 @@ Watch these degradation and recognition attributes:
 - `mindbridge.identity.faces` and `mindbridge.identity.speakers` report observations, distinct
   identities, existing matches, creations, and cache status for each analyzed asset.
 
-Spans never record memory text, media bytes, paths, IDs, metadata, model responses, or exception
-details. A failed span receives only error status. Use `search_with_trace()` for one retrieval
-investigation and the structured error envelope for failures.
+Spans never record memory text, media bytes, paths, IDs, metadata, request or response bodies, or
+exception details. Apart from the non-content response model and fingerprint above, a failed span
+receives only generic error status. Use `search_with_trace()` for one retrieval investigation and
+the structured error envelope for failures.
 
 ## Upgrade
 

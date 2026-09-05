@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +28,9 @@ from mindbridge.benchmarks.task_catalog import TaskSpec
 ScoreKind = Literal["choice", "text", "submission"]
 Limit: TypeAlias = int | float | None
 _T = TypeVar("_T")
+# ponytail: eight readers saturate the benchmark NVMe without unbounded file descriptors; expose
+# this only if supported storage profiles demonstrate a materially different optimum.
+_DIGEST_WORKERS = min(8, os.cpu_count() or 1)
 _MEDIA_SUFFIXES = frozenset(
     {
         ".aac",
@@ -366,7 +371,11 @@ def load_task(
         raise FileNotFoundError(
             f"{spec.name} auxiliary input does not exist: {', '.join(map(str, missing))}"
         )
-    digest = dataset_digest(dataset)
+    if dataset.is_dir():
+        digest, dataset_layout = _directory_input_digests(dataset)
+    else:
+        digest = dataset_digest(dataset)
+        dataset_layout = None
     if verify_digest and spec.digest is not None and digest != spec.digest:
         raise ValueError(
             f"{spec.name} dataset digest mismatch: expected {spec.digest}, found {digest}"
@@ -377,23 +386,29 @@ def load_task(
         raise ValueError("limit must be -1, a positive count, or a fraction between zero and one")
     if offset < 0:
         raise ValueError("offset must not be negative")
-    units = tuple(
-        _with_corpus_reference(unit)
-        for unit in _LOADERS[spec.name](spec, dataset, resolver, root, limit, offset)
+    loader = _LOADERS[spec.name]
+    loaded_units = (
+        _clbench(
+            spec,
+            dataset,
+            resolver,
+            root,
+            limit,
+            offset,
+            validate_all=not (verify_digest and spec.digest is not None),
+        )
+        if loader is _clbench
+        else loader(spec, dataset, resolver, root, limit, offset)
     )
+    units = tuple(_with_corpus_reference(unit) for unit in loaded_units)
     if not units or any(not unit.questions for unit in units):
         raise ValueError(f"{spec.name} produced no evaluation questions")
     inputs = {
         "dataset": digest,
         **{path: dataset_digest(root / path) for path in spec.auxiliary},
     }
-    if dataset.is_dir():
-        layout = "".join(
-            f"{path.relative_to(dataset).as_posix()}\0{dataset_digest(path)}\n"
-            for path in sorted(dataset.rglob("*"))
-            if path.is_file()
-        )
-        inputs["dataset_layout"] = hashlib.sha256(layout.encode()).hexdigest()
+    if dataset_layout is not None:
+        inputs["dataset_layout"] = dataset_layout
     task_manifest = _task_manifest(media_manifest, spec.name)
     if task_manifest:
         encoded = json.dumps(
@@ -411,11 +426,7 @@ def load_task(
 def dataset_digest(path: Path) -> str:
     """Hash one file or the concatenated file digests of a sorted directory tree."""
     if path.is_dir():
-        files = tuple(item for item in sorted(path.rglob("*")) if item.is_file())
-        if not files:
-            raise ValueError(f"benchmark dataset contains no files: {path}")
-        joined = "".join(dataset_digest(item) for item in files)
-        return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+        return _directory_input_digests(path)[0]
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -423,15 +434,42 @@ def dataset_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _file_digests(paths: Sequence[Path]) -> dict[Path, str]:
+    if len(paths) < 2:
+        return {path: dataset_digest(path) for path in paths}
+    with ThreadPoolExecutor(max_workers=min(_DIGEST_WORKERS, len(paths))) as pool:
+        return dict(zip(paths, pool.map(dataset_digest, paths), strict=True))
+
+
+def _directory_input_digests(path: Path) -> tuple[str, str]:
+    files = tuple(item for item in sorted(path.rglob("*")) if item.is_file())
+    if not files:
+        raise ValueError(f"benchmark dataset contains no files: {path}")
+    file_digests = _file_digests(files)
+    joined = "".join(file_digests[item] for item in files)
+    digest = hashlib.sha256(joined.encode("utf-8")).hexdigest()
+    layout = "".join(
+        f"{item.relative_to(path).as_posix()}\0{file_digests[item]}\n" for item in files
+    )
+    return digest, hashlib.sha256(layout.encode()).hexdigest()
+
+
 def _memory_digest(units: Sequence[EvalUnit]) -> str:
-    file_digests: dict[Path, str] = {}
+    paths = tuple(
+        dict.fromkeys(
+            content.resolve()
+            for unit in units
+            for memory in unit.memories
+            for content in memory.content
+            if isinstance(content, Path)
+        )
+    )
+    file_digests = _file_digests(paths)
 
     def identity(value: str | Path) -> tuple[str, ...]:
         if isinstance(value, str):
             return ("text", hashlib.sha256(value.encode("utf-8")).hexdigest())
         path = value.resolve()
-        if path not in file_digests:
-            file_digests[path] = dataset_digest(path)
         return ("file", path.name, file_digests[path])
 
     payload = tuple(
@@ -760,7 +798,7 @@ def _openeqa(
             # No `source_ids` fallback: an episode history is a directory of
             # frames, not a file the resolver can match, and asking it to look
             # would index every PNG under a 12-62 GB tree before failing. The
-            # frames reach the runner as prepared per-episode video, so the
+            # frames reach the runner as prepared per-episode video segments, so the
             # manifest is the only path.
             media.parts(episode_name),
             tuple(
@@ -1233,12 +1271,19 @@ def _clbench(
     _root: Path,
     limit: Limit,
     offset: int,
+    *,
+    validate_all: bool = False,
 ) -> tuple[EvalUnit, ...]:
-    from mindbridge.benchmarks.clbench import load_clbench
+    from mindbridge.benchmarks.clbench import _load_clbench_selected, load_clbench
     from mindbridge.benchmarks.prompts import CLBENCH_QUERY_PROMPT
 
+    tasks = (
+        _load_clbench_selected(dataset, limit, offset)
+        if not validate_all and limit is not None and limit != -1
+        else _selected(load_clbench(dataset), limit, offset)
+    )
     units = []
-    for task in _selected(load_clbench(dataset), limit, offset):
+    for task in tasks:
         memories = tuple(
             item for turn in task.turns for item in _text_memories(turn.turn_id, turn.content)
         )

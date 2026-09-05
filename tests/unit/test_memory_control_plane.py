@@ -1017,6 +1017,67 @@ def test_an_agent_names_a_person_only_from_evidence_that_contains_them(tmp_path:
         assert _asserted_name(memory, identity_id) is None
 
 
+def test_identify_creation_cannot_be_rolled_back_before_its_later_reinforcement(
+    tmp_path: Path,
+) -> None:
+    """A later active operation depends on the deterministic assertion the first one created."""
+    consolidator = ScriptedConsolidator()
+    with _identity_memory(tmp_path / "identify-order", consolidator) as memory:
+        first = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        second = memory.add(Blob(b"stranger returns", "video/mp4", "two.mp4"))
+        identity_id = memory.faces(first.id)[0].identity_id
+
+        def identify(source_id: str) -> MemoryOperation:
+            return MemoryOperation(
+                intent=MemoryIntent.IDENTIFY,
+                claim=IdentityClaim(identity_id=identity_id, name="Li"),
+                evidence_ids=(source_id,),
+                rationale=f"evidence from {source_id}",
+            )
+
+        operations = []
+        for source in (first, second):
+            consolidator._scripts.append((identify(source.id),))
+            operations.append(memory.consolidate(evidence_ids=(source.id,)).operations[0])
+
+        # The second operation changes the same deterministic assertion, so deleting/retracting
+        # the first operation's output would strand that still-active log row.
+        assert memory.rollback(operations[0].operation_id) is False
+        assert memory.identity(identity_id).name == "Li"  # type: ignore[union-attr]
+
+        # Newest-first succeeds. Once both evidence-adding operations are gone, the first
+        # assertion is retired and no evidence link from its creation survives.
+        assert memory.rollback(operations[1].operation_id) is True
+        assert memory.rollback(operations[0].operation_id) is True
+        assertion = next(
+            item
+            for item in memory.list(limit=100).items
+            if item.context is not None and item.context.identity_id == identity_id
+        )
+        assert assertion.context is not None
+        assert assertion.context.retired_at is not None
+        assert assertion.context.evidence_ids == ()
+
+
+def test_a_historical_name_can_become_current_again_and_be_rolled_back(
+    tmp_path: Path,
+) -> None:
+    consolidator = ScriptedConsolidator()
+    with _identity_memory(tmp_path / "rename-back", consolidator) as memory:
+        record = memory.add(Blob(b"stranger arrives", "video/mp4", "one.mp4"))
+        identity_id = memory.faces(record.id)[0].identity_id
+
+        memory.register_identity(identity_id, "Alice")
+        memory.register_identity(identity_id, "Bob")
+        memory.register_identity(identity_id, "Alice")
+
+        assert memory.identity(identity_id).name == "Alice"  # type: ignore[union-attr]
+        newest = memory.operations()[0]
+        assert newest.operation.claim is not None and newest.operation.claim.name == "Alice"
+        assert memory.rollback(newest.operation_id) is True
+        assert memory.identity(identity_id).name == "Bob"  # type: ignore[union-attr]
+
+
 def test_control_operations_refuse_to_touch_a_bound_naming_assertion(tmp_path: Path) -> None:
     """A name is not an inference to reinforce, correct, or forget behind the projection.
 

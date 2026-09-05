@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+import asyncio
+import json
+from collections.abc import AsyncGenerator, Callable, Generator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
+from contextvars import Context, copy_context
 from datetime import datetime
-from typing import Annotated, Any, Literal, Protocol
+from time import perf_counter_ns
+from typing import Annotated, Any, Literal, Protocol, cast
 
-from fastapi import APIRouter, FastAPI, Query, Response, status
+from fastapi import APIRouter, FastAPI, Query, Request, Response, status
 from fastapi import Path as PathParameter
+from fastapi.responses import StreamingResponse
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, StatusCode, Tracer
 from pydantic import (
     AwareDatetime,
     BaseModel,
@@ -31,10 +40,12 @@ from mindbridge.api.errors import (
     REASON_STATUS,
     error_response,
     error_responses,
+    exception_response,
     register_error_handlers,
 )
 from mindbridge.types import (
     AbstentionReason,
+    AnswerChunk,
     AnswerResult,
     ConsentState,
     ContentInput,
@@ -75,6 +86,10 @@ _BodyMemoryId = Annotated[str, StringConstraints(min_length=1, pattern=r"^\S(?:.
 # `_BodyMemoryId` so a future ID-specific tightening of that type cannot silently start rejecting
 # names too.
 _PersonText = _BodyMemoryId
+_HTTP_TTFH = "mindbridge.transport.server_time_to_headers_ms"
+_HTTP_TTFB = "mindbridge.transport.server_time_to_first_body_byte_ms"
+_HTTP_TOTAL = "mindbridge.transport.server_total_ms"
+_STREAM_EXHAUSTED = object()
 
 
 class MemoryCreate(StrictModel):
@@ -551,6 +566,17 @@ class _Memory(Protocol):
         link_identities: bool = True,
     ) -> AnswerResult: ...
 
+    def ask_stream(
+        self,
+        question: ContentInput,
+        *,
+        limit: int = 5,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+        scope: RetrievalScope | None = None,
+        link_identities: bool = True,
+    ) -> Generator[AnswerChunk, None, AnswerResult]: ...
+
     def compile(
         self,
         goal: ContentInput,
@@ -675,11 +701,77 @@ class _RequestBodyLimit:
         await self.app(scope, replay, send)
 
 
+class _RequestTelemetry:
+    """Measure the server side of one `/v1` request, including streamed delivery."""
+
+    def __init__(self, app: ASGIApp, *, tracer: Tracer) -> None:
+        self.app = app
+        self.tracer = tracer
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = str(scope.get("path", ""))
+        if scope["type"] != "http" or not _is_api_path(path):
+            await self.app(scope, receive, send)
+            return
+
+        started = perf_counter_ns()
+        response_started = False
+        first_body_sent = False
+        response_bytes = 0
+        attributes = {
+            "mindbridge.span.kind": "transport",
+            "http.request.method": str(scope.get("method", "")),
+            "mindbridge.transport.response_mode": (
+                "streaming" if path == "/v1/answers/stream" else "buffered"
+            ),
+        }
+        with self.tracer.start_as_current_span(
+            "mindbridge.http.request",
+            kind=SpanKind.SERVER,
+            attributes=attributes,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+
+            async def observed_send(message: Message) -> None:
+                nonlocal response_started, first_body_sent, response_bytes
+                now = perf_counter_ns()
+                if message["type"] == "http.response.start":
+                    response_started = True
+                    status_code = int(message["status"])
+                    span.set_attribute("http.response.status_code", status_code)
+                    span.set_attribute(_HTTP_TTFH, (now - started) / 1_000_000)
+                    if status_code >= 500:
+                        span.set_status(StatusCode.ERROR)
+                elif message["type"] == "http.response.body":
+                    body = message.get("body", b"")
+                    response_bytes += len(body)
+                    if body and not first_body_sent:
+                        first_body_sent = True
+                        span.set_attribute(_HTTP_TTFB, (now - started) / 1_000_000)
+                await send(message)
+
+            try:
+                await self.app(scope, receive, observed_send)
+            except BaseException:
+                span.set_status(StatusCode.ERROR)
+                raise
+            finally:
+                route = scope.get("route")
+                route_path = getattr(route, "path", None)
+                if isinstance(route_path, str):
+                    span.set_attribute("http.route", route_path)
+                span.set_attribute(_HTTP_TOTAL, (perf_counter_ns() - started) / 1_000_000)
+                span.set_attribute("http.response.body.size", response_bytes)
+                span.set_attribute("mindbridge.transport.response_started", response_started)
+
+
 def create_app(
     *,
     memory: _Memory,
     identity_operations: bool = False,
     embodied_operations: bool = False,
+    tracer: Tracer | None = None,
 ) -> FastAPI:
     """Create an unauthenticated API over one caller-owned memory instance.
 
@@ -692,6 +784,10 @@ def create_app(
     app = FastAPI(title="MindBridge", version="0.2.0")
     register_error_handlers(app)
     app.add_middleware(_RequestBodyLimit)
+    app.add_middleware(
+        _RequestTelemetry,
+        tracer=tracer or trace.get_tracer("mindbridge.api"),
+    )
 
     @app.get(
         "/healthz",
@@ -714,7 +810,7 @@ def create_app(
     return app
 
 
-def _v1_router(
+def _v1_router(  # noqa: C901 - one literal public route registry
     memory: _Memory,
     *,
     identity_operations: bool,
@@ -739,6 +835,13 @@ def _v1_router(
         status.HTTP_502_BAD_GATEWAY,
     )
     not_found_errors = error_responses(*standard_statuses, status.HTTP_404_NOT_FOUND)
+    streaming_errors = {
+        **model_errors,
+        status.HTTP_200_OK: {
+            "description": "SSE answer deltas followed by one grounded result event",
+            "content": {"text/event-stream": {"schema": {"type": "string"}}},
+        },
+    }
 
     @router.post(
         "/memories",
@@ -847,6 +950,46 @@ def _v1_router(
                 # opted in to embodied operations.
                 link_identities=embodied_operations,
             )
+        )
+
+    @router.post(
+        "/answers/stream",
+        operation_id="answerStream",
+        responses=streaming_errors,
+        response_class=StreamingResponse,
+    )
+    async def answer_stream(request: AnswerRequest, connection: Request) -> StreamingResponse:
+        chunks = iter(
+            current_service().ask_stream(
+                content_input(request.question),
+                limit=request.limit,
+                memory_type=request.memory_type,
+                reference_at=request.reference_at,
+                scope=request.scope,
+                link_identities=embodied_operations,
+            )
+        )
+        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mindbridge-rest-answer")
+        context = copy_context()
+
+        try:
+            first = await _first_chunk_or_disconnect(
+                chunks,
+                connection=connection,
+                worker=worker,
+                context=context,
+            )
+        except BaseException:
+            worker.shutdown(wait=False)
+            raise
+        if first is _STREAM_EXHAUSTED:
+            worker.shutdown(wait=False)
+            raise RuntimeError("answer stream ended without a terminal result")
+        return _AnswerStreamingResponse(
+            first,
+            chunks,
+            worker=worker,
+            context=context,
         )
 
     _add_context_route(router, current_service, responses=model_errors)
@@ -1093,6 +1236,146 @@ def _add_identity_routes(
         return RetentionResponse.model_validate(
             current_service().apply_retention(dry_run=request.dry_run)
         )
+
+
+async def _first_chunk_or_disconnect(
+    stream: Generator[AnswerChunk, None, AnswerResult],
+    *,
+    connection: Request,
+    worker: ThreadPoolExecutor,
+    context: Context,
+) -> object:
+    loop = asyncio.get_running_loop()
+
+    def first_chunk() -> object:
+        return next(stream, _STREAM_EXHAUSTED)
+
+    async def wait_for_disconnect() -> None:
+        while (await connection.receive()).get("type") != "http.disconnect":
+            pass
+
+    pending_chunk = loop.run_in_executor(worker, context.run, first_chunk)
+    disconnected = asyncio.create_task(wait_for_disconnect())
+    try:
+        done, _pending = await asyncio.wait(
+            (pending_chunk, disconnected),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if disconnected not in done:
+            return pending_chunk.result()
+        raise asyncio.CancelledError
+    except BaseException:
+        # A running synchronous provider call cannot be interrupted safely. Queue close on its
+        # pinned worker so disconnects and task cancellation release the response after it returns.
+        pending_chunk.add_done_callback(_discard_future_result)
+        closing = loop.run_in_executor(worker, context.run, stream.close)
+        closing.add_done_callback(_discard_future_result)
+        raise
+    finally:
+        disconnected.cancel()
+        with suppress(asyncio.CancelledError):
+            await disconnected
+
+
+def _discard_future_result(future: asyncio.Future[Any]) -> None:
+    with suppress(BaseException):
+        future.result()
+
+
+async def _answer_events(
+    first: object,
+    rest: Generator[AnswerChunk, None, AnswerResult],
+    *,
+    worker: ThreadPoolExecutor,
+    context: Context,
+) -> AsyncGenerator[bytes, None]:
+    loop = asyncio.get_running_loop()
+    chunk = first
+
+    def next_chunk() -> object:
+        return next(rest, _STREAM_EXHAUSTED)
+
+    terminal = False
+    try:
+        while chunk is not _STREAM_EXHAUSTED:
+            answer_chunk = cast(AnswerChunk, chunk)
+            terminal = answer_chunk.result is not None
+            yield _answer_event(answer_chunk)
+            chunk = await loop.run_in_executor(worker, context.run, next_chunk)
+        if not terminal:
+            raise RuntimeError("answer stream ended without a terminal result")
+    except Exception as error:
+        trace.get_current_span().set_status(StatusCode.ERROR)
+        response = exception_response(error)
+        yield _sse_event("error", json.loads(bytes(response.body)))
+
+
+class _AnswerStreamingResponse(StreamingResponse):
+    """Own the prefetched synchronous stream for the complete ASGI send lifecycle."""
+
+    def __init__(
+        self,
+        first: object,
+        rest: Generator[AnswerChunk, None, AnswerResult],
+        *,
+        worker: ThreadPoolExecutor,
+        context: Context,
+    ) -> None:
+        self._events = _answer_events(first, rest, worker=worker, context=context)
+        self._rest = rest
+        self._worker = worker
+        self._context = context
+        super().__init__(
+            self._events,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette sends `http.response.start` before it enters the body iterator. Closing only
+            # in `_answer_events` therefore leaks the already-prefetched Memory operation whenever
+            # headers or the first body frame cannot be sent.
+            try:
+                await self._events.aclose()
+            finally:
+                await _close_answer_stream(self._rest, worker=self._worker, context=self._context)
+
+
+async def _close_answer_stream(
+    stream: Generator[AnswerChunk, None, AnswerResult],
+    *,
+    worker: ThreadPoolExecutor,
+    context: Context,
+) -> None:
+    loop = asyncio.get_running_loop()
+    try:
+        closing = loop.run_in_executor(worker, context.run, stream.close)
+        closing.add_done_callback(_discard_future_result)
+        with suppress(asyncio.CancelledError):
+            await asyncio.shield(closing)
+    finally:
+        worker.shutdown(wait=False)
+
+
+def _answer_event(chunk: AnswerChunk) -> bytes:
+    if chunk.result is None:
+        payload: dict[str, object] = {"text": chunk.text}
+        event = "delta"
+    else:
+        payload = AnswerResponse.model_validate(chunk.result).model_dump(mode="json")
+        event = "result"
+    return _sse_event(event, payload)
+
+
+def _sse_event(event: str, payload: object) -> bytes:
+    return (
+        f"event: {event}\ndata: "
+        + json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        + "\n\n"
+    ).encode("utf-8")
 
 
 def _add_context_route(
