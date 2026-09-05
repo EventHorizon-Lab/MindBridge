@@ -3806,6 +3806,20 @@ def _streaming_arguments(output_path: Path, **overrides: object) -> eval_module.
     return cast(eval_module._Arguments, SimpleNamespace(**values))
 
 
+async def _completion(
+    completed: eval_module._TaskCompletion,
+    task: LoadedTask,
+    samples: tuple[SampleResult, ...],
+) -> tuple[SampleResult, ...]:
+    """Wrap the per-task callback for `asyncio.run`, which wants a coroutine.
+
+    `_TaskCompletion` promises only an awaitable, which is the right contract for a hook whose
+    implementations the caller does not own. Typeshed before Python 3.14 types `asyncio.run` as
+    taking a `Coroutine`, so the tests do the narrowing rather than the production alias.
+    """
+    return await completed(task, samples)
+
+
 def _streaming_judge() -> eval_module._JudgeConfig:
     return eval_module._JudgeConfig("judge", "http://judge.invalid", api_key="test")
 
@@ -3867,11 +3881,11 @@ def test_each_task_lands_in_the_crash_copy_before_the_run_ends(
             memory_config=None,
             streamed=set(),
         )
-        assert asyncio.run(completed(first, (first_sample,))) == (first_sample,)
+        assert asyncio.run(_completion(completed, first, (first_sample,))) == (first_sample,)
         # The point of the file: task one is durable while task two has not started answering.
         after_first = partial.read_bytes()
         assert json.loads(after_first)["sample_id"] == "atm-bench/unit/atm-bench-q"
-        assert asyncio.run(completed(second, (second_sample,))) == (second_sample,)
+        assert asyncio.run(_completion(completed, second, (second_sample,))) == (second_sample,)
     finally:
         telemetry.close()
 
@@ -3906,7 +3920,7 @@ def test_stream_results_judges_one_task_before_printing_it(
             memory_config=None,
             streamed=streamed,
         )
-        scored = asyncio.run(completed(task, (sample,)))
+        scored = asyncio.run(_completion(completed, task, (sample,)))
     finally:
         telemetry.close()
 
@@ -3944,7 +3958,7 @@ def test_the_crash_copy_survives_a_judging_failure(
             streamed=set(),
         )
         with pytest.raises(RuntimeError, match="mindbridge\\[openai\\]"):
-            asyncio.run(completed(task, (sample,)))
+            asyncio.run(_completion(completed, task, (sample,)))
     finally:
         telemetry.close()
 
