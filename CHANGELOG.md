@@ -758,15 +758,37 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   interval is unbounded in both directions and now passes at every instant, matching how the
   semantic path already treats a NULL interval. The spatial `near` filter still excludes records
   with no pose, which is correct: they are not at any location.
-- Chinese, Japanese and Korean lexical retrieval. Term extraction matched an entire unsegmented
-  run as one token, so a multi-character Chinese query carried a highest-weight term that could
-  never match and could never reach full lexical coverage -- the one signal that performs
-  cross-route fusion. Runs are now removed before word splitting and re-emitted as characters and
-  adjacent bigrams, and 47 Chinese function characters join the noise set that previously held
-  only English stopwords. Separately, the index routed Japanese kanji to a Chinese word segmenter,
-  which returned nothing for them, and routed Korean to an English stemmer, which cannot match an
-  agglutinated eojeol; the full-text field for these scripts is now character bigrams, which
-  measured correct for all three languages with no cross-language false positives.
+- Lexical retrieval outside English. Term extraction matched an entire unsegmented run as one
+  token, so a multi-character Chinese query carried a highest-weight term that could never match
+  and could never reach full lexical coverage -- the one signal that performs cross-route fusion.
+  Runs are now removed before word splitting and re-emitted as adjacent character bigrams, and 47
+  Chinese function characters join the noise set that previously held only English stopwords.
+  Separately, the index routed Japanese kanji to a Chinese word segmenter, which returned nothing
+  for them, and routed Korean to an English stemmer, which cannot match an agglutinated eojeol; a
+  script-agnostic character-bigram full-text field answers all three.
+- Full-text search no longer picks one field per query by detecting the query's script, which cost
+  it three separate ways. A single CJK character anywhere in a query sent the whole query to the
+  bigram field, and only documents containing a listed script were admitted to that field, so
+  `Alice 星期二 bakery` could not reach a Latin-only memory at all even though `Alice bakery`
+  matched it exactly. And the listed scripts were an open set that never included Thai, Lao,
+  Khmer or Myanmar, none of which any tokenizer here can split into words either: a query quoting
+  a Thai memory verbatim reached neither field and returned nothing, silently. What goes to the
+  bigram field is now decided by what the stemmed field can already answer rather than by which
+  script it is: Latin words are stripped from it on both the write and the query side -- bigrams
+  over them are close to information-free, "kitchen" and "the garden at noon" sharing "he" and
+  "en" -- and everything else is kept. Both fields then answer every query that has something for
+  each, fused by reciprocal rank at the same rank constant the route already used, and a purely
+  Latin query still runs the single stemmed route it always did. The remaining failure direction
+  is noise rather than silence: a script this misjudges keeps its bigrams. Rerank-side term
+  extraction gained Thai, Lao, Khmer and Myanmar and now breaks bigrams at combining marks, which
+  is where the index's tokenizer breaks them, so a Thai query's terms are the ones the index can
+  actually answer. It also stops emitting the single characters of a run alongside the bigrams:
+  the index cannot produce a one-character term at `ngram_min` 2, so those were weight in the
+  coverage denominator that no document could answer, and they made the denominator
+  language-dependent -- eleven terms for `爱丽丝面包店` against three for
+  `Alice bakery Tuesday`, which put full coverage out of reach for Chinese at a length it stayed
+  reachable for English. The index recipe is `context-keys-v11`; an existing store rebuilds its
+  disposable index from SQLite on open and re-embeds nothing.
 - `ask()` now reinforces the evidence its answer cited, closing the loop the ranking signals were
   written for. Reinforcement failures are suppressed: bookkeeping must not discard an answer that
   has already been paid for. The new `reinforce_on_answer` setting turns it off, and the benchmark

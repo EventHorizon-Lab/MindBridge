@@ -22,7 +22,7 @@ from mindbridge.types import IndexQuantization
 
 _COLLECTION_NAME = "mindbridge_memory_index"
 _CONTENT_FIELD = "content"
-_CONTENT_CJK_FIELD = "content_cjk"
+_CONTENT_NGRAM_FIELD = "content_ngram"
 _MEMORY_ID_FIELD = "memory_id"
 _MEMORY_TYPE_FIELD = "memory_type"
 _OCCURRED_AT_FIELD = "occurred_at"
@@ -33,7 +33,7 @@ _VECTOR_FIELD = "embedding"
 _SCALAR_FIELDS = frozenset(
     {
         _CONTENT_FIELD,
-        _CONTENT_CJK_FIELD,
+        _CONTENT_NGRAM_FIELD,
         _MEMORY_ID_FIELD,
         _MEMORY_TYPE_FIELD,
         _OCCURRED_AT_FIELD,
@@ -57,32 +57,39 @@ _FILE_DESCRIPTOR_RESERVE = 128
 _GROUP_OVERSAMPLE = 2
 _GROUP_FALLBACK_MINIMUM = 50
 _MAX_EMBEDDINGS_PER_MEMORY = 129
-# Scripts the `standard` tokenizer cannot split into words: Han and kana are written without
-# spaces, and Korean agglutinates particles onto the eojeol so whole-token matching misses.
-# Zvec offers only "standard", "whitespace", "ngram" and "jieba", and jieba segments Chinese only,
-# so everything here routes to the character-bigram field instead.
-_CJK_CHARACTER = re.compile(
-    "["
-    "\u1100-\u11ff"  # Hangul Jamo
-    "\u3040-\u30ff"  # Hiragana and Katakana
-    "\u3130-\u318f"  # Hangul Compatibility Jamo
-    "\u31f0-\u31ff"  # Katakana Phonetic Extensions
-    "\u3400-\u4dbf"  # CJK Unified Ideographs Extension A
-    "\u4e00-\u9fff"  # CJK Unified Ideographs
-    "\ua960-\ua97f"  # Hangul Jamo Extended-A
-    "\uac00-\ud7a3"  # Hangul Syllables
-    "\ud7b0-\ud7ff"  # Hangul Jamo Extended-B
-    "\uf900-\ufaff"  # CJK Compatibility Ideographs
-    "\uff66-\uff9f"  # Halfwidth Katakana
-    "\U00020000-\U0003ffff"  # CJK Unified Ideographs Extension B and later
-    "]"
-)
-# ponytail: bigrams only, so a one-character query matches nothing in the CJK field. Add
+# Two full-text views of the same content, fused by reciprocal rank when both can answer. The
+# stemmed field answers space-delimited scripts; the character-bigram field is script-agnostic
+# and is the only route that reaches Han, kana, Thai, Lao, Khmer and Myanmar, none of which the
+# tokenizers Zvec offers ("standard", "whitespace", "ngram", "jieba") can split into words.
+#
+# Choosing one field per query by detecting the query's script used to replace the fusion, and it
+# failed three ways. A single CJK character anywhere in a query sent the whole query to the
+# bigram field, so "Alice 星期二 bakery" could not reach a Latin-only memory at all even though
+# "Alice bakery" matched it exactly. Documents were admitted to the bigram field only when they
+# contained a listed script, so a query had nothing to match in an unlisted one. And the listed
+# scripts were an open set that never included Thai, whose documents were therefore unreachable
+# by any query at all.
+#
+# What each field holds is now decided by what the stemmed field can already answer rather than
+# by which script it is. Bigrams over Latin words are close to information-free -- "kitchen" and
+# "the garden at noon" share "he" and "en" -- so they buy no recall the stemmer does not have and
+# cost precision on every English query; `_ngram_text` strips them from both what is written to
+# the bigram field and what is asked of it, and keeps everything else. A query left with nothing
+# for the bigram field runs the single stemmed route it always did. The failure direction is
+# inverted from the script test: a script this misjudges keeps its bigrams, which is noise, where
+# the script test made whole languages silently unreachable.
+_STEMMED_WORD = re.compile(r"[A-Za-z0-9]+")
+# What survives that strip and can still become a bigram: a run of two or more of the letters and
+# digits the ngram tokenizer accepts. Anything shorter is dropped so the field and the sub-query
+# are empty rather than punctuation -- "What did Alice buy?" would otherwise leave "?", which is
+# truthy, and cost every punctuated English query a second FTS route that tokenizes to nothing.
+_NGRAM_RUN = re.compile(r"[^\W_]{2,}")
+# ponytail: bigrams only, so a one-character query matches nothing in the bigram field. Add
 # "ngram_min": 1 if single-character recall ever matters more than the precision it costs.
 _FTS_FIELDS = (
     (_CONTENT_FIELD, "standard", ("lowercase", "ascii_folding", "stemmer"), ""),
     (
-        _CONTENT_CJK_FIELD,
+        _CONTENT_NGRAM_FIELD,
         "ngram",
         ("lowercase",),
         '{"ngram_min": 2, "ngram_max": 2, "token_chars": ["letter", "digit"]}',
@@ -262,11 +269,8 @@ class ZvecIndex:
                         # Only the aggregate vector participates in BM25. Repeating one memory's
                         # text for every part would let multi-vector records crowd out neighbors.
                         _CONTENT_FIELD: document.content if embedding.object_part == 0 else "",
-                        _CONTENT_CJK_FIELD: (
-                            document.content
-                            if embedding.object_part == 0
-                            and _CJK_CHARACTER.search(document.content) is not None
-                            else ""
+                        _CONTENT_NGRAM_FIELD: (
+                            _ngram_text(document.content) if embedding.object_part == 0 else ""
                         ),
                         _MEMORY_ID_FIELD: embedding.memory_id,
                         _MEMORY_TYPE_FIELD: document.memory_type,
@@ -344,7 +348,14 @@ class ZvecIndex:
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
     ) -> tuple[IndexHit, ...]:
-        """Return BM25 matches with scores normalized against the best candidate."""
+        """Return full-text matches with fused scores normalized against the best candidate.
+
+        A query that has something for both full-text fields runs both, and Zvec fuses them by
+        reciprocal rank, so a score here is a fusion score rather than one field's BM25. Only the
+        ratio to the best candidate leaves this method, and `_LEXICAL_RANK_CONSTANT` sets both the
+        fusion constant and the rank fallback below, so the two agree on how fast rank stops
+        mattering.
+        """
         if not text.strip():
             raise ValueError("lexical query text must not be empty")
         _require_positive(limit, "limit")
@@ -657,18 +668,25 @@ class ZvecIndex:
         occurred_from: datetime | None,
         occurred_until: datetime | None,
     ) -> list[object]:
+        ngram_text = _ngram_text(text)
+        queries = [
+            self._zvec.Query(field_name=name, fts=self._zvec.Fts(match_string=match))
+            for name, match in (
+                (_CONTENT_FIELD, text),
+                (_CONTENT_NGRAM_FIELD, ngram_text),
+            )
+            if match
+        ]
         return cast(
             list[object],
             cast(Any, self._require_collection()).query(
-                queries=self._zvec.Query(
-                    field_name=(
-                        _CONTENT_CJK_FIELD
-                        if _CJK_CHARACTER.search(text) is not None
-                        else _CONTENT_FIELD
-                    ),
-                    fts=self._zvec.Fts(match_string=text),
-                ),
+                queries=queries,
                 topk=limit,
+                reranker=(
+                    self._zvec.RrfReRanker(rank_constant=_LEXICAL_RANK_CONSTANT)
+                    if len(queries) > 1
+                    else None
+                ),
                 filter=_filter_expression(
                     space_id=space_id,
                     task=task,
@@ -1049,6 +1067,11 @@ def _indexed_document_count(stats: object) -> int:
 def _require_positive(value: int, name: str) -> None:
     if isinstance(value, bool) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
+
+
+def _ngram_text(text: str) -> str:
+    """Drop the Latin words the stemmed field answers, leaving what only bigrams can reach."""
+    return " ".join(_NGRAM_RUN.findall(_STEMMED_WORD.sub(" ", text)))
 
 
 def _schema_mismatch(detail: str) -> NoReturn:

@@ -4100,23 +4100,36 @@ def test_index_quantization_change_rebuilds_without_reembedding(tmp_path: Path) 
         assert recipe.endswith("quantization-int8")
 
 
-def test_a_full_text_tokenizer_change_rebuilds_without_reembedding(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "superseded",
+    [
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
+        "context-keys-v9:quantization-none",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:"
+        "context-keys-v10:quantization-none",
+    ],
+)
+def test_a_full_text_tokenizer_change_rebuilds_without_reembedding(
+    tmp_path: Path,
+    superseded: str,
+) -> None:
     """A tokenizer change rewrites derived documents and leaves every stored vector correct.
 
     Version 9 ran a Chinese segmenter over the CJK full-text field, which returned nothing for
-    Japanese or Korean, so version 10 tokenizes that field into script-agnostic character
-    bigrams. Filing the superseded recipe alongside the ones that also invalidate the embeddings
-    would charge every existing store a full re-embed to fix a tokenizer, and the storage rules
-    require a missing index to rebuild without re-embedding stored content.
+    Japanese or Korean. Version 10 tokenized that field into script-agnostic character bigrams
+    but filled it only for documents whose script was listed, and chose one field per query by
+    detecting the query's script. Version 11 decides what enters that field by what the stemmed
+    field already answers -- Latin words go to the stemmer, everything else to bigrams -- and
+    fuses both routes on any query with something for each. Both changes are derived-document
+    changes: filing either recipe alongside the
+    ones that also invalidate the embeddings would charge every existing store a full re-embed to
+    fix a tokenizer, and the storage rules require a missing index to rebuild without
+    re-embedding stored content.
     """
     with Memory(tmp_path, embedder=_FakeModels()) as memory:
         record = memory.add("preserved memory")
     with LocalStore(tmp_path) as store:
-        store.set_metadata(
-            "index.recipe",
-            "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
-            "context-keys-v9:quantization-none",
-        )
+        store.set_metadata("index.recipe", superseded)
 
     reopened_models = _FakeModels()
     with Memory(tmp_path, embedder=reopened_models):
@@ -4126,8 +4139,8 @@ def test_a_full_text_tokenizer_change_rebuilds_without_reembedding(tmp_path: Pat
     with LocalStore(tmp_path) as store:
         recipe = store.get_metadata("index.recipe")
         assert recipe is not None
-        assert ":fts-stemmed-plus-bigram:" in recipe
-        assert recipe.endswith("context-keys-v10:quantization-none")
+        assert ":fts-bigram-fused:" in recipe
+        assert recipe.endswith("context-keys-v11:quantization-none")
 
 
 def test_index_quantization_requires_the_public_enum(tmp_path: Path) -> None:
