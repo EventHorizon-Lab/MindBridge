@@ -30,6 +30,8 @@ import yaml
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode, Tracer
 from pydantic import SecretStr
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
@@ -1609,18 +1611,23 @@ async def _run_arms(
         sample_count = sum(len(unit.questions) for unit in task.units) * len(arms)
         if not arguments.quiet:
             _announce(f"running {task.spec.name} ({len(task.units)} units, {sample_count} samples)")
-        progress = _progress_reporter(
-            f"running {task.spec.name}", "samples", enabled=not arguments.quiet
-        )
-        with traced_span(
-            tracer,
-            BENCHMARK_TASK_SPAN,
-            attributes={
-                BENCHMARK_TASK: task.spec.name,
-                BENCHMARK_ARM: SHARED_BENCHMARK_ARM,
-                BENCHMARK_PURPOSE: "orchestration",
-                SPAN_KIND: "benchmark",
-            },
+        with (
+            _progress(
+                f"running {task.spec.name}",
+                "sample",
+                total=sample_count,
+                enabled=not arguments.quiet,
+            ) as progress,
+            traced_span(
+                tracer,
+                BENCHMARK_TASK_SPAN,
+                attributes={
+                    BENCHMARK_TASK: task.spec.name,
+                    BENCHMARK_ARM: SHARED_BENCHMARK_ARM,
+                    BENCHMARK_PURPOSE: "orchestration",
+                    SPAN_KIND: "benchmark",
+                },
+            ),
         ):
             run = BenchmarkRun(
                 arguments.data_root,
@@ -2925,9 +2932,6 @@ async def _apply_judges(
         )
     )
     semaphore = asyncio.Semaphore(config.concurrency)
-    progress = _progress_reporter(
-        f"judging with {config.model}", "answers", enabled=not arguments.quiet
-    )
     completed = 0
 
     async def judge(sample: SampleResult) -> SampleResult:
@@ -2949,7 +2953,13 @@ async def _apply_judges(
         return result
 
     try:
-        judged = await asyncio.gather(*(judge(sample) for sample in samples))
+        with _progress(
+            f"judging with {config.model}",
+            "answer",
+            total=len(planned),
+            enabled=not arguments.quiet,
+        ) as progress:
+            judged = await asyncio.gather(*(judge(sample) for sample in samples))
     finally:
         await client.close()
         if cache is not None:
@@ -4661,7 +4671,10 @@ def _jsonl_bytes(values: Iterable[object]) -> bytes:
 
 
 def _announce(message: str) -> None:
-    print(f"mindbridge-bench eval: {message}", file=sys.stderr)
+    # `tqdm.write` is how a bar and a message share one stream: it erases the bar, writes the
+    # line, and redraws. With no bar live it is a `print` with a flush, so every caller is
+    # bar-safe without knowing whether one is running.
+    tqdm.write(f"mindbridge-bench eval: {message}", file=sys.stderr)
 
 
 def _ignore_progress(_completed: int, _total: int) -> None:
@@ -4678,23 +4691,60 @@ def _ignore_store_ready() -> None:
     pass
 
 
-def _progress_reporter(
-    stage: str, noun: str, *, enabled: bool = True
-) -> Callable[[int, int], None]:
-    """Report the first completion and each new ten-percent milestone."""
-    if not enabled:
-        return _ignore_progress
-    last_decile = 0
+# How long a non-interactive run may stay silent between progress lines.
+_PROGRESS_LOG_SECONDS = 60.0
+# tqdm's own meter with the bar glyphs removed. A redrawn bar in a log file is one unreadable
+# line of carriage returns, but the counts and the ETA are the ones a terminal would have shown,
+# so both modes report identical numbers.
+_PROGRESS_LOG_FORMAT = (
+    "{desc}: {n_fmt}/{total_fmt} ({percentage:3.0f}%) [{elapsed}<{remaining}, {rate_fmt}]"
+)
 
-    def report(completed: int, total: int) -> None:
-        nonlocal last_decile
-        decile = completed * 10 // total
-        if completed != 1 and completed != total and decile <= last_decile:
+
+@contextmanager
+def _progress(
+    stage: str, noun: str, *, total: int, enabled: bool = True
+) -> Iterator[Callable[[int, int], None]]:
+    """Report progress as a live bar on a terminal and as throttled lines anywhere else."""
+    if not enabled or total <= 0:
+        yield _ignore_progress
+        return
+    if sys.stderr.isatty():
+        with (
+            logging_redirect_tqdm(),
+            tqdm(total=total, desc=stage, unit=noun, file=sys.stderr, leave=False) as bar,
+        ):
+
+            def advance(completed: int, _total: int) -> None:
+                bar.update(completed - bar.n)
+
+            yield advance
+        return
+    started = time.monotonic()
+    last = 0.0
+
+    def report(completed: int, _total: int) -> None:
+        # Throttle on elapsed time, not on a fraction of the work: a tenth of a forty-minute task
+        # and a tenth of a twenty-second one are not the same amount of silence. The first and
+        # the last completion always report, so a run that stalls at the start says so at once
+        # and the log always ends on the final count.
+        nonlocal last
+        now = time.monotonic()
+        if completed not in {1, total} and now - last < _PROGRESS_LOG_SECONDS:
             return
-        last_decile = decile
-        _announce(f"{stage}: {completed}/{total} {noun} ({completed / total:.0%})")
+        last = now
+        _announce(
+            tqdm.format_meter(
+                completed,
+                total,
+                now - started,
+                prefix=stage,
+                unit=noun,
+                bar_format=_PROGRESS_LOG_FORMAT,
+            )
+        )
 
-    return report
+    yield report
 
 
 _first_ingest_failure_announced = False

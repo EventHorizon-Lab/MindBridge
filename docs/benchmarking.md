@@ -239,8 +239,11 @@ repository rather than the process directory; `--data-root` defaults to
 `<benchmarks-root>/data`. Run `mindbridge-bench eval --help` for the full concurrency, cache,
 generation, and comparison options.
 
-Unless `--quiet` is set, `eval` reports sample and judge progress to stderr after the first
-completion and at roughly ten-percent intervals.
+Unless `--quiet` is set, `eval` reports sample and judge progress to stderr. On a terminal that
+is a live progress bar with an ETA. When stderr is a file or a pipe, where a redrawn bar is
+unreadable, the same counts and ETA are written as one line at most once a minute, plus the first
+and the last completion, so a stalled run says so immediately and the log always ends on the
+final count.
 
 `--verbosity` sets the library log level for the run and claims the root handler before an
 imported dependency can raise it. HTTP transport loggers stay at `WARNING` below `DEBUG`, so a

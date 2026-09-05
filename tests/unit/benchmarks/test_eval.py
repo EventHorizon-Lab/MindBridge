@@ -8,6 +8,7 @@ import logging
 import re
 import subprocess
 import sys
+import time
 from argparse import ArgumentTypeError
 from collections.abc import Sequence
 from dataclasses import fields, replace
@@ -1601,22 +1602,80 @@ async def test_ingest_announces_the_first_failure_once_with_its_message(
     assert "returned 2048 values but the configured dimension is 1536" in captured
 
 
-def test_progress_reporter_writes_milestones_to_stderr(
+def test_progress_throttles_a_non_interactive_run_by_elapsed_time(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under capture stderr is not a terminal, which is the log-line path."""
+    now = 0.0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+
+    with eval_module._progress("running fixture", "sample", total=20) as report:
+        report(1, 20)  # the first completion always reports
+        now = 1.0
+        report(2, 20)  # too soon
+        now = eval_module._PROGRESS_LOG_SECONDS + 1.0
+        report(3, 20)
+        now += 1.0
+        report(4, 20)  # too soon again
+        report(20, 20)  # the last completion always reports
+
+    lines = capsys.readouterr().err.splitlines()
+    assert [line.split(" (")[0] for line in lines] == [
+        "mindbridge-bench eval: running fixture: 1/20",
+        "mindbridge-bench eval: running fixture: 3/20",
+        "mindbridge-bench eval: running fixture: 20/20",
+    ]
+    # tqdm formats the meter, so the log line carries the same elapsed/ETA a bar would show.
+    assert re.search(r"\( 15%\) \[01:01<\d\d:\d\d, +\d+", lines[1]) is not None
+
+
+def test_progress_reports_nothing_when_disabled_or_empty(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    report = eval_module._progress_reporter("running fixture", "samples")
+    with eval_module._progress("running fixture", "sample", total=20, enabled=False) as report:
+        report(1, 20)
+    with eval_module._progress("running fixture", "sample", total=0) as report:
+        report(1, 0)
 
-    report(1, 20)
-    report(2, 20)
-    report(3, 20)
-    report(20, 20)
+    assert capsys.readouterr().err == ""
 
-    assert capsys.readouterr().err.splitlines() == [
-        "mindbridge-bench eval: running fixture: 1/20 samples (5%)",
-        "mindbridge-bench eval: running fixture: 2/20 samples (10%)",
-        "mindbridge-bench eval: running fixture: 20/20 samples (100%)",
-    ]
-    eval_module._progress_reporter("running fixture", "samples", enabled=False)(1, 1)
+
+def test_progress_drives_a_bar_on_a_terminal(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal gets a bar fed with deltas, not the throttled log lines."""
+    updates: list[int] = []
+    closed: list[bool] = []
+
+    class Bar:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            self.n = 0
+
+        def __enter__(self) -> Bar:
+            return self
+
+        def __exit__(self, *_error: object) -> None:
+            closed.append(True)
+
+        def update(self, delta: int) -> None:
+            self.n += delta
+            updates.append(delta)
+
+    class Terminal:
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(sys, "stderr", Terminal())
+    monkeypatch.setattr(eval_module, "tqdm", Bar)
+
+    with eval_module._progress("running fixture", "sample", total=3) as report:
+        report(1, 3)
+        report(3, 3)
+
+    # The callbacks carry an absolute count; tqdm wants the delta since the last draw.
+    assert updates == [1, 2]
+    assert closed == [True]
     assert capsys.readouterr().err == ""
 
 
@@ -2443,37 +2502,37 @@ async def test_runner_reports_cached_progress_before_pending_answer_finishes(
             ),
         ),
     )
-    report = eval_module._progress_reporter("running fixture", "samples")
+    with eval_module._progress("running fixture", "sample", total=2) as report:
 
-    def on_progress(completed: int, total: int) -> None:
-        report(completed, total)
-        if completed == 1:
-            first_reported.set()
+        def on_progress(completed: int, total: int) -> None:
+            report(completed, total)
+            if completed == 1:
+                first_reported.set()
 
-    pending = asyncio.create_task(
-        run_loaded_task(
-            task,
-            run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
-            memory_factory=cast(MemoryFactory, lambda _path: Context()),
-            batch_size=1,
-            unit_concurrency=1,
-            request_concurrency=2,
-            recall_limit=1,
-            response_cache=cast(ResponseCache, Cache()),
-            on_progress=on_progress,
+        pending = asyncio.create_task(
+            run_loaded_task(
+                task,
+                run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+                memory_factory=cast(MemoryFactory, lambda _path: Context()),
+                batch_size=1,
+                unit_concurrency=1,
+                request_concurrency=2,
+                recall_limit=1,
+                response_cache=cast(ResponseCache, Cache()),
+                on_progress=on_progress,
+            )
         )
-    )
-    try:
-        await asyncio.wait_for(first_reported.wait(), timeout=1)
-        assert not pending.done()
-        captured = capsys.readouterr()
-        assert captured.out == ""
-        assert "running fixture: 1/2 samples (50%)" in captured.err
-    finally:
-        release_slow.set()
+        try:
+            await asyncio.wait_for(first_reported.wait(), timeout=1)
+            assert not pending.done()
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert "running fixture: 1/2 ( 50%)" in captured.err
+        finally:
+            release_slow.set()
 
-    await asyncio.wait_for(pending, timeout=1)
-    assert "running fixture: 2/2 samples (100%)" in capsys.readouterr().err
+        await asyncio.wait_for(pending, timeout=1)
+        assert "running fixture: 2/2 (100%)" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio
