@@ -24,12 +24,16 @@ def test_5090_baseline_has_exact_models_endpoints_and_no_secret(name: str) -> No
     assert config.embedding.model == "tencent/WeMM-Embedding-9B"
     assert config.embedding.dimension == 4096
     assert config.embedding.base_url == "https://xyrobot-embed.xyrobot.com/v1"
-    assert config.embedding.api_key is None
+    assert config.embedding.api_key is not None
+    assert config.embedding.api_key.get_secret_value() == "EMPTY"
+    assert config.embedding.max_retries == 0
     assert config.generation is not None
     assert config.generation.model == "Qwen3.8-27B"
     assert config.generation.base_url == "http://xyrobot-vl.xyrobot.com/v1"
-    assert config.generation.api_key is None
-    assert overrides.judge.api_key is None
+    assert config.generation.api_key is not None
+    assert config.generation.api_key.get_secret_value() == "EMPTY"
+    assert config.generation.max_retries == 0
+    assert overrides.judge.api_key == "EMPTY"
     assert overrides.server_metrics.generation_url == "http://xyrobot-vl.xyrobot.com/metrics"
     assert overrides.server_metrics.embedding_url == "https://xyrobot-embed.xyrobot.com/metrics"
     assert overrides.run.repeat_index == 0

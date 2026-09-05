@@ -28,7 +28,7 @@ from mindbridge import (
     ModelInput,
     SearchHit,
 )
-from mindbridge._telemetry import SPAN_KIND
+from mindbridge._telemetry import SPAN_KIND, _record_retrieval_results
 from mindbridge.benchmarks.eval import (
     DEFAULT_ARM,
     PRODUCT_ARM,
@@ -143,6 +143,7 @@ class _RankedMemory:
 
     async def ask(self, _question: object, **_kwargs: object) -> AnswerResult:
         self.asked += 1
+        _record_retrieval_results(self._ranked)
         return AnswerResult("Ada.", self._answer_hits)
 
     async def search(
@@ -218,7 +219,7 @@ def test_retrieval_recall_scores_the_full_ranked_list_not_the_answer_hits() -> N
         arm=PRODUCT_ARM,
     )
 
-    assert memory.search_limits == [RETRIEVAL_CANDIDATE_LIMIT]
+    assert memory.search_limits == []
     assert len(ranked) == 12
     assert sample.retrieval_candidates == 12
     # Rank 8 of 12: inside recall@10, outside recall@5, and not the top-1.
@@ -248,7 +249,7 @@ def test_successful_empty_retrieval_diagnostic_scores_zero_recall() -> None:
         (sample,), seed=7, bootstrap_samples=32, recall_limit=20
     )
 
-    assert memory.search_limits == [RETRIEVAL_CANDIDATE_LIMIT]
+    assert memory.search_limits == []
     assert outcome.ranked_source_ids == ()
     assert outcome.ranked_source_ids_complete is True
     assert sample.metrics["retrieval_recall@1"] == 0.0
@@ -423,23 +424,21 @@ async def test_caller_answer_clock_includes_request_admission() -> None:
 
 
 @pytest.mark.asyncio
-async def test_product_ranking_uses_a_public_scoring_search() -> None:
+async def test_product_ranking_is_captured_without_a_scoring_search() -> None:
     answered = 0
-    searched = 0
 
     class Memory:
         async def ask_stream(
             self, _question: object, **_kwargs: object
         ) -> AsyncIterator[AnswerChunk]:
             nonlocal answered
+            _record_retrieval_results(())
             yield AnswerChunk(text="Ada")
             yield AnswerChunk(result=AnswerResult("Ada"))
             answered += 1
 
         async def search(self, _question: object, **_kwargs: object) -> tuple[SearchHit, ...]:
-            nonlocal searched
-            searched += 1
-            return ()
+            raise AssertionError("product retrieval issued a second scoring search")
 
     questions = tuple(_question(f"q{index}", evidence_ids=["gold-1"]) for index in range(3))
     telemetry = EvaluationTelemetry()
@@ -460,7 +459,6 @@ async def test_product_ranking_uses_a_public_scoring_search() -> None:
 
     assert all(not isinstance(outcome, BaseException) for outcome in outcomes)
     assert answered == 3
-    assert searched == 3
     assert all(
         isinstance(outcome, eval_module._AnswerOutcome) and outcome.ranked_source_ids_complete
         for outcome in outcomes
@@ -606,6 +604,7 @@ def test_every_arm_answers_the_same_questions_against_one_ingest(tmp_path: Path)
             return ()
 
         async def ask(self, _question: object, **_kwargs: object) -> AnswerResult:
+            _record_retrieval_results((_hit("s1", 0.9), _hit("gold-1", 0.5)))
             return AnswerResult("Ada.", (_hit("gold-1", 0.5),))
 
         async def search(self, _query: object, **_kwargs: object) -> tuple[SearchHit, ...]:
@@ -949,19 +948,20 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
     assert rows[0]["official_metric"] is True
     assert rows[1]["official_metric"] is False
     assert arms["selected"] == [DEFAULT_ARM, "blind", "random"]
-    assert arms["retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
+    assert arms["retrieval_candidate_limit"] == 60
     assert arms["retrieval_candidate_limit_arm"] == DEFAULT_ARM
+    assert arms["search_e2e_limit"] == arguments.recall_limit
     definitions = cast(dict[str, dict[str, object]], arms["definitions"])
     assert set(definitions) == {DEFAULT_ARM, "blind", "random"}
-    assert definitions[DEFAULT_ARM]["retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
+    assert definitions[DEFAULT_ARM]["retrieval_candidate_limit"] == 60
     assert definitions[DEFAULT_ARM]["answer_retrieval_candidate_limit"] == 60
     assert definitions[DEFAULT_ARM]["retrieval"] == (
-        "dedicated public Memory.search after timed answer and search replay"
+        "Memory.ask in-answer ranked list; no second scoring search"
     )
     assert definitions["blind"]["prompt"] == eval_module.BLIND_PROMPT_VERSION
     assert definitions["blind"]["official_metrics"] is False
     retrieval = {row["arm"]: cast(dict[str, object], row["retrieval"]) for row in rows}
-    assert retrieval[DEFAULT_ARM]["retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
+    assert retrieval[DEFAULT_ARM]["retrieval_candidate_limit"] == 60
     assert retrieval["random"]["retrieval_candidate_limit"] == arguments.recall_limit
     assert "retrieval_candidate_limit" not in retrieval["blind"]
     assert results["status"] == "completed_with_errors"

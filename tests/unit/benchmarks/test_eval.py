@@ -39,6 +39,7 @@ from mindbridge import (
     ModelError,
     SearchHit,
 )
+from mindbridge._telemetry import _record_retrieval_results
 from mindbridge.benchmarks.eval import (
     MemoryFactory,
     SampleResult,
@@ -673,8 +674,8 @@ def test_benchmark_speech_backend_satisfies_the_runtime_protocol() -> None:
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_module.EVAL_SCHEMA_VERSION == 12
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v12"
+    assert eval_module.EVAL_SCHEMA_VERSION == 13
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v13"
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(
@@ -1243,10 +1244,11 @@ async def test_answer_failure_preserves_the_product_retrieval_ranking(tmp_path: 
 
     class Memory:
         async def ask(self, _question: object, **_kwargs: object) -> AnswerResult:
+            _record_retrieval_results(ranked)
             raise RuntimeError("generation unavailable")
 
         async def search(self, _query: object, **_kwargs: object) -> tuple[SearchHit, ...]:
-            return ranked
+            raise AssertionError("an answer failure triggered a fallback search")
 
     question = EvalQuestion("q1", ("question",), references=("answer",))
     outcome = (
@@ -1278,6 +1280,8 @@ async def test_answer_failure_preserves_the_product_retrieval_ranking(tmp_path: 
     assert sample.error_code == "RuntimeError"
     assert sample.memory_ids == ("memory-1",)
     assert sample.evidence[0].source_id == "source-1"
+    assert sample.ranked_source_ids == ("source-1",)
+    assert sample.ranked_source_ids_complete is True
 
 
 def test_a_provider_error_leaves_the_answer_unscored_but_keeps_retrieval(tmp_path: Path) -> None:
@@ -1780,9 +1784,36 @@ async def test_runner_ingests_only_memory_available_at_each_cutoff(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_runner_rejects_gold_retrieval_scoring_at_a_causal_cutoff(
+async def test_runner_scores_the_actual_ranking_at_a_causal_cutoff(
     tmp_path: Path,
 ) -> None:
+    ranked = SearchHit(
+        id="memory-gold",
+        content="gold",
+        score=1.0,
+        created_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        metadata={"source_id": "gold"},
+    )
+
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            del question, limit, reference_at
+            _record_retrieval_results((ranked,))
+            return AnswerResult("answer", (ranked,))
+
+    class Context:
+        async def __aenter__(self) -> AsyncMemory:
+            return cast(AsyncMemory, Memory([]))
+
+        async def __aexit__(self, *_error: object) -> None:
+            return None
+
     task = LoadedTask(
         TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
         tmp_path / "fixture.json",
@@ -1804,16 +1835,26 @@ async def test_runner_rejects_gold_retrieval_scoring_at_a_causal_cutoff(
         ),
     )
 
-    with pytest.raises(ValueError, match="isolated store snapshot"):
-        await run_loaded_task(
-            task,
-            run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
-            memory_factory=cast(MemoryFactory, lambda _path: _FakeContext([])),
-            batch_size=1,
-            unit_concurrency=1,
-            request_concurrency=1,
-            recall_limit=1,
-        )
+    samples = await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+        memory_factory=cast(MemoryFactory, lambda _path: Context()),
+        batch_size=1,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=1,
+    )
+
+    assert len(samples) == 1
+    assert samples[0].ranked_source_ids == ("gold",)
+    retrieval = eval_module._retrieval_quality(
+        samples,
+        seed=7,
+        bootstrap_samples=32,
+        recall_limit=1,
+        retrieval_candidate_limit=3,
+    )
+    assert cast(dict[str, dict[str, float]], retrieval["recall_at_k"])["1"]["mean"] == 1.0
 
 
 @pytest.mark.asyncio
@@ -2041,6 +2082,17 @@ async def test_run_arms_defers_replay_until_every_task_answer_finishes(
         ) -> AnswerResult:
             del limit, reference_at
             events.append(f"answer:{question}")
+            _record_retrieval_results(
+                (
+                    SearchHit(
+                        id="memory-gold",
+                        content="gold",
+                        score=1.0,
+                        created_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                        metadata={"source_id": "gold"},
+                    ),
+                )
+            )
             return AnswerResult("A")
 
         async def search(
@@ -2128,12 +2180,9 @@ async def test_run_arms_defers_replay_until_every_task_answer_finishes(
 
     answers = [index for index, event in enumerate(events) if event.startswith("answer:")]
     warm_searches = [index for index, event in enumerate(events) if event.startswith("search:3:")]
-    quality_searches = [
-        index for index, event in enumerate(events) if event.startswith("search:100:")
-    ]
-    assert len(samples) == len(answers) == len(warm_searches) == len(quality_searches) == 2
+    assert len(samples) == len(answers) == len(warm_searches) == 2
     assert max(answers) < min(warm_searches)
-    assert max(warm_searches) < min(quality_searches)
+    assert not any(event.startswith("search:100:") for event in events)
     assert all(sample.ranked_source_ids == ("gold",) for sample in samples)
     for result in performance.values():
         search_e2e = cast(dict[str, object], result["search_e2e"])

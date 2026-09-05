@@ -36,15 +36,11 @@ from mindbridge.benchmarks.eval_telemetry import (
     BENCHMARK_TASK,
     BENCHMARK_TASK_SPAN,
     DIAGNOSTIC_PURPOSE,
-    RETRIEVAL_QUALITY_PURPOSE,
     EvaluationTelemetry,
 )
 
 
-def test_telemetry_distribution_retention_is_bounded(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(eval_telemetry, "_MAX_RETAINED_DURATIONS", 2)
+def test_telemetry_distributions_retain_every_observation() -> None:
     durations = eval_telemetry._Durations()
     samples = eval_telemetry._Samples()
     tokens = eval_telemetry._Tokens()
@@ -78,61 +74,45 @@ def test_telemetry_distribution_retention_is_bounded(
         == len(durations.intervals_ns)
         == len(durations.ttft_ms)
         == len(durations.ttfc_ms)
-        == 2
+        == 3
     )
-    assert len(samples.values) == len(tokens.exact_call_tokens) == 2
+    assert len(samples.values) == len(tokens.exact_call_tokens) == 3
     assert durations.latency_ms() == {
         "count": 3,
-        "retained_count": 2,
-        "complete": False,
+        "retained_count": 3,
+        "complete": True,
         "average": 5 / 1_000_000,
-        "p50": None,
-        "p95": None,
-        "p99": None,
+        "p50": 5 / 1_000_000,
+        "p95": 5 / 1_000_000,
+        "p99": 5 / 1_000_000,
     }
     duration_seconds = cast(
         dict[str, object], eval_telemetry._TaskTelemetry(run=durations).json(3)["duration_seconds"]
     )
-    assert duration_seconds["mindbridge"] is None
-    assert duration_seconds["total"] is None
+    assert duration_seconds["mindbridge"] == pytest.approx(15 / 1_000_000_000)
+    assert duration_seconds["total"] == pytest.approx(15 / 1_000_000_000)
     assert cast(dict[str, object], durations.ttft_json())["average"] == 2.0
     assert cast(dict[str, object], durations.ttfc_json())["average"] == 2.0
-    assert cast(dict[str, object], durations.ttft_json())["p99"] is None
-    assert cast(dict[str, object], durations.ttfc_json())["p99"] is None
+    assert cast(dict[str, object], durations.ttft_json())["p99"] == pytest.approx(2.98)
+    assert cast(dict[str, object], durations.ttfc_json())["p99"] == pytest.approx(2.98)
+    assert samples.json()["p99"] == pytest.approx(2.98)
     per_call = cast(dict[str, object], tokens.json(3)["per_call_total_tokens"])
-    assert per_call["complete"] is False
+    assert per_call["complete"] is True
     assert per_call["average"] == 2.0
-    assert per_call["p99"] is None
+    assert per_call["p99"] == pytest.approx(2.98)
 
-
-def test_retrieval_quality_spans_are_excluded_from_product_telemetry() -> None:
-    telemetry = EvaluationTelemetry()
-    try:
-        with (
-            telemetry.tracer.start_as_current_span(
-                BENCHMARK_TASK_SPAN,
-                attributes={BENCHMARK_TASK: "fixture", SPAN_KIND: "benchmark"},
-            ),
-            telemetry.tracer.start_as_current_span(
-                "mindbridge.benchmark.retrieval_quality",
-                attributes={
-                    BENCHMARK_PURPOSE: RETRIEVAL_QUALITY_PURPOSE,
-                    SPAN_KIND: "benchmark",
-                },
-            ),
-            telemetry.tracer.start_as_current_span(
-                "mindbridge.model.embedding",
-                attributes={SPAN_KIND: "model", MODEL_MODULE: "embedding"},
-            ),
-        ):
-            record_model_usage(input_tokens=2, output_tokens=0, total_tokens=2)
-        result = telemetry.result("fixture", question_count=1)
-    finally:
-        telemetry.close()
-
-    assert result["nodes"] == {}
-    assert cast(dict[str, object], result["token_usage"])["request_count"] == 0
-    assert cast(dict[str, object], result["diagnostic"])["nodes"] == {}
+    other_tokens = eval_telemetry._Tokens()
+    for value in (4, 5):
+        other_tokens.add(
+            {
+                MODEL_REQUEST_COUNT: 1,
+                TOKEN_EXPECTED_REQUEST_COUNT: 1,
+                TOKEN_REPORTED_REQUEST_COUNT: 1,
+                TOKEN_TOTAL: value,
+            }
+        )
+    tokens.merge(other_tokens)
+    assert tokens.exact_call_tokens == [1.0, 2.0, 3.0, 4.0, 5.0]
 
 
 def test_evaluation_telemetry_aggregates_nodes_ttft_and_modal_tokens() -> None:

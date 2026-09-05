@@ -63,6 +63,7 @@ from mindbridge._telemetry import (
     SPAN_KIND,
     TRACER_NAME,
     VISION_BATCHES_FAILED,
+    _record_retrieval_results,
     current_model_request_count,
     mark_model_requests,
     model_span,
@@ -1609,11 +1610,13 @@ class Memory:
                             assets,
                         )
                         hits = prepared_search().hits
+                        _record_retrieval_results(hits)
                         identities.result()
                 else:
                     if speech_assets:
                         self._recognize_speech(speech_assets, assets)
                     hits = prepared_search().hits
+                    _record_retrieval_results(hits)
             hits = _grounding_hits(hits, limit, budget_chars=self._evidence_budget)
             # Every question the answerer reads as text gets the reference time, not just the ones
             # whose phrasing a parser recognized. "How long ago did grandpa visit?" narrows no

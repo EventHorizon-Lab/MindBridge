@@ -1,4 +1,4 @@
-"""Bounded in-process aggregation for evaluation telemetry spans."""
+"""Exact in-process aggregation for evaluation telemetry spans."""
 
 from __future__ import annotations
 
@@ -85,7 +85,6 @@ DEFAULT_BENCHMARK_ARM = "mindbridge"
 SHARED_BENCHMARK_ARM = "shared"
 PRODUCT_PURPOSE = "product"
 DIAGNOSTIC_PURPOSE = "diagnostic"
-RETRIEVAL_QUALITY_PURPOSE = "retrieval_quality"
 JUDGE_PURPOSE = "judge"
 
 ANSWER_SPAN = "mindbridge.ask"
@@ -102,9 +101,6 @@ JUDGE_MODULE = "judge"
 _GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
 _MODEL_BATCH_SIZE = "mindbridge.model.batch_size"
 _INPUT_MODALITIES = "mindbridge.input.modalities"
-
-# ponytail: aggregates stay exact; only quantile samples and active-time intervals are capped.
-_MAX_RETAINED_DURATIONS = 200_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,12 +131,10 @@ class _Durations:
         self.count += 1
         duration_ns = _duration_ns(span)
         self.total_ns += duration_ns
-        if len(self.durations_ns) < _MAX_RETAINED_DURATIONS:
-            self.durations_ns.append(duration_ns)
+        self.durations_ns.append(duration_ns)
         if span.start_time is not None and span.end_time is not None:
             self.interval_count += 1
-            if len(self.intervals_ns) < _MAX_RETAINED_DURATIONS:
-                self.intervals_ns.append((span.start_time, max(span.start_time, span.end_time)))
+            self.intervals_ns.append((span.start_time, max(span.start_time, span.end_time)))
             self.first_start_ns = (
                 span.start_time
                 if self.first_start_ns is None
@@ -160,15 +154,13 @@ class _Durations:
         if ttft is not None:
             self.ttft_count += 1
             self.ttft_total_ms += ttft
-            if len(self.ttft_ms) < _MAX_RETAINED_DURATIONS:
-                self.ttft_ms.append(ttft)
+            self.ttft_ms.append(ttft)
         ttfc = _float_attribute(attributes, GEN_AI_TTFC)
         if ttfc is not None:
             self.ttfc_count += 1
             ttfc_ms = ttfc * 1_000
             self.ttfc_total_ms += ttfc_ms
-            if len(self.ttfc_ms) < _MAX_RETAINED_DURATIONS:
-                self.ttfc_ms.append(ttfc_ms)
+            self.ttfc_ms.append(ttfc_ms)
 
     def wall_seconds(self) -> float | None:
         """Return the elapsed time from the first span start to the last span end."""
@@ -177,7 +169,7 @@ class _Durations:
         return max(0, self.last_end_ns - self.first_start_ns) / 1_000_000_000
 
     def active_seconds(self) -> float | None:
-        """Return the union of retained span intervals, excluding gaps and overlap."""
+        """Return the union of span intervals, excluding gaps and overlap."""
         if not self.intervals_ns or len(self.intervals_ns) != self.interval_count:
             return None
         intervals = sorted(self.intervals_ns)
@@ -192,7 +184,7 @@ class _Durations:
         return (active_ns + end - start) / 1_000_000_000
 
     def latency_ms(self) -> dict[str, object]:
-        """Return exact aggregates, omitting quantiles if retention was capped."""
+        """Return the exact latency distribution."""
         return _distribution_json(
             tuple(value / 1_000_000 for value in self.durations_ns),
             total_count=self.count,
@@ -241,7 +233,7 @@ class _Durations:
 
 @dataclass(slots=True)
 class _Samples:
-    """Scalar observations with exact totals and bounded quantile retention."""
+    """Scalar observations retained for exact aggregates and quantiles."""
 
     count: int = 0
     total: float = 0.0
@@ -250,8 +242,7 @@ class _Samples:
     def add(self, value: float) -> None:
         self.count += 1
         self.total += value
-        if len(self.values) < _MAX_RETAINED_DURATIONS:
-            self.values.append(value)
+        self.values.append(value)
 
     def json(self) -> dict[str, object]:
         return _distribution_json(self.values, total_count=self.count, total=self.total)
@@ -348,8 +339,7 @@ class _Tokens:
         if requests == expected == reported == 1 and resolved_total is not None:
             self.exact_call_token_count += 1
             self.exact_call_token_total += resolved_total
-            if len(self.exact_call_tokens) < _MAX_RETAINED_DURATIONS:
-                self.exact_call_tokens.append(float(resolved_total))
+            self.exact_call_tokens.append(float(resolved_total))
         self.audio_seconds += _float_attribute(attributes, TOKEN_AUDIO_SECONDS) or 0.0
         requested = attributes.get("mindbridge.input.modalities")
         if isinstance(requested, tuple) and all(isinstance(value, str) for value in requested):
@@ -478,9 +468,7 @@ class _Tokens:
         self.audio_seconds += other.audio_seconds
         self.exact_call_token_count += other.exact_call_token_count
         self.exact_call_token_total += other.exact_call_token_total
-        retained = _MAX_RETAINED_DURATIONS - len(self.exact_call_tokens)
-        if retained > 0:
-            self.exact_call_tokens.extend(other.exact_call_tokens[:retained])
+        self.exact_call_tokens.extend(other.exact_call_tokens)
         for source, target in (
             (other.calls_by_input_modality, self.calls_by_input_modality),
             (other.input_by_modality, self.input_by_modality),
@@ -605,9 +593,6 @@ class _TaskTelemetry:
         attributes = span.attributes or {}
         status = _span_status(span)
         purpose = _string_attribute(attributes, BENCHMARK_PURPOSE) or PRODUCT_PURPOSE
-        if purpose == RETRIEVAL_QUALITY_PURPOSE:
-            # This harness-only scoring query is neither product work nor the timed warm replay.
-            return
         diagnostic = purpose == DIAGNOSTIC_PURPOSE
         if span.name == BENCHMARK_ANSWER_SPAN and not diagnostic:
             self.caller_answers.add(span)
@@ -1071,7 +1056,7 @@ class _SpanScope:
 
 
 class EvaluationTelemetry(SpanProcessor):
-    """Aggregate evaluation spans online without retaining per-request traces."""
+    """Aggregate evaluation spans online without retaining trace objects."""
 
     def __init__(self) -> None:
         self._lock = Lock()
@@ -1457,7 +1442,7 @@ class ResourceSampler:
         return {
             "measurement": {
                 "scope": "client_process_and_system_devices",
-                "phase": "product_execution_including_retrieval_quality_and_search_replay",
+                "phase": "product_execution_including_post_answer_search_replay",
                 "exclusive_attribution": False,
                 "wall_seconds": measured_wall_seconds,
                 "storage_scope": "selected_run_directories",

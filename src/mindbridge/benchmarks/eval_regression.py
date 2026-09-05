@@ -34,11 +34,17 @@ _METRICS: Mapping[str, _Metric] = {
         "lower",
         requires_complete_distribution=True,
     ),
-    "answer_e2e_latency_p95": _Metric(("answer", "latency_ms", "p95"), "ms", "lower"),
+    "answer_e2e_latency_p95": _Metric(
+        ("answer", "latency_ms", "p95"),
+        "ms",
+        "lower",
+        requires_complete_distribution=True,
+    ),
     "retrieval_e2e_latency_p95": _Metric(
         ("search_e2e", "latency_ms", "p95"),
         "ms",
         "lower",
+        requires_complete_distribution=True,
         complete_block=("search_e2e",),
     ),
     "tokens_per_call": _Metric(

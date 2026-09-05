@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from threading import Lock
@@ -209,6 +209,28 @@ _CURRENT_OPERATION_USAGE: ContextVar[_OperationUsage | None] = ContextVar(
 _CURRENT_FORMATION_REFUSALS: ContextVar[_FormationRefusals | None] = ContextVar(
     "mindbridge_formation_refusals", default=None
 )
+_RETRIEVAL_OBSERVER: ContextVar[Callable[[object], None] | None] = ContextVar(
+    "mindbridge_retrieval_observer", default=None
+)
+
+
+@contextmanager
+def _observe_retrieval_results(observer: Callable[[object], None]) -> Iterator[None]:
+    """Let an in-process benchmark observe the ranked list an answer already computed."""
+    token = _RETRIEVAL_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _RETRIEVAL_OBSERVER.reset(token)
+
+
+def _record_retrieval_results(results: object) -> None:
+    observer = _RETRIEVAL_OBSERVER.get()
+    if observer is None:
+        return
+    # Observability must not change a product answer; the harness marks the missing list.
+    with suppress(Exception):
+        observer(results)
 
 
 def token_modality_attribute(direction: str, modality: str) -> str:

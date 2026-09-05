@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from importlib import metadata
@@ -59,6 +59,7 @@ from mindbridge._telemetry import (
     MODEL_MODULE,
     OPERATION_TTFT,
     SPAN_KIND,
+    _observe_retrieval_results,
     mark_model_requests,
     model_span,
     record_unmetered_model_usage,
@@ -121,7 +122,6 @@ from mindbridge.benchmarks.eval_telemetry import (
     DIAGNOSTIC_PURPOSE,
     JUDGE_PURPOSE,
     PRODUCT_PURPOSE,
-    RETRIEVAL_QUALITY_PURPOSE,
     SHARED_BENCHMARK_ARM,
     EvaluationTelemetry,
     ResourceSampler,
@@ -192,8 +192,8 @@ _GOLD_EVIDENCE_KEYS = ("evidence_ids", "clue_ids")
 _UNRESOLVED_EVIDENCE_KEY = "unresolved_evidence_ids"
 _RECALL_CUTOFFS = (1, 5, 10, 20)
 _MANDATORY_CONTROLS = ("random_ranker", "blind", "recall_at_20")
-EVAL_SCHEMA_VERSION = 12
-EVAL_RUNNER_VERSION = "mindbridge_eval_official_v12"
+EVAL_SCHEMA_VERSION = 13
+EVAL_RUNNER_VERSION = "mindbridge_eval_official_v13"
 DEFAULT_ARM = "mindbridge"
 BASELINE_ARMS = ("blind", "full-context", "random", "compile")
 ARMS = (DEFAULT_ARM, *BASELINE_ARMS)
@@ -203,10 +203,8 @@ INGEST_MODES = (DEFAULT_INGEST_MODE, "capture")
 # A frozen dataclass instance is a safe default argument value; naming it once avoids repeating
 # the call (and the linter's objection to a call in a default) at every threading site below.
 DEFAULT_COMPILE_BUDGET = ContextBudget()
-# Retrieval quality always uses a fixed public top-100 search so it remains comparable when the
-# answer's recall limit or evidence budget changes.
+# The largest ranked window requested by an answer or the random retrieval control.
 RETRIEVAL_CANDIDATE_LIMIT = 100
-_BENCHMARK_RETRIEVAL_QUALITY_SPAN = "mindbridge.benchmark.retrieval_quality"
 _BENCHMARK_SEARCH_REPLAY_SETUP_SPAN = "mindbridge.benchmark.search_replay_setup"
 # Baseline prompts belong to the harness, not to the product: `Memory.ask` refuses to generate
 # without evidence by design, so a no-evidence arm cannot reuse its grounded prompt. Version
@@ -484,8 +482,6 @@ class _MemoryContext(Protocol):
 
 MemoryFactory = Callable[[Path], _MemoryContext]
 _SearchReplay = Callable[[], Awaitable[None]]
-_RetrievalQualityReplay = Callable[[], Awaitable[tuple[SampleResult, ...]]]
-_DeferredReplays = tuple[_SearchReplay, _RetrievalQualityReplay]
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,7 +495,7 @@ class _AnswerOutcome:
     abstention_reason: str | None = None
     cached: bool = False
     error: BaseException | None = None
-    # The dedicated public retrieval-quality search, in score order. Retrieval metrics score this;
+    # The answer's ranked list before grounding, in score order. Retrieval metrics score this;
     # `evidence` stays the answer's grounded hits.
     ranked_source_ids: tuple[str, ...] = ()
     ranked_source_ids_complete: bool = False
@@ -1349,7 +1345,7 @@ def _server_metric_results(
                     starts[name],
                     timeout_seconds=settings.timeout_seconds,
                 ),
-                "phase": "product_execution_including_retrieval_quality_and_search_replay",
+                "phase": "product_execution_including_post_answer_search_replay",
             }
     if "generation" not in result:
         result["generation"] = unavailable_server_resources(base_url=config.generation_base_url)
@@ -1588,7 +1584,7 @@ async def _run_arms(
         max_chars=arguments.compile_max_chars,
     )
     results: list[SampleResult] = []
-    deferred_replays: list[_DeferredReplays] = []
+    deferred_searches: list[_SearchReplay] = []
     for task in tasks:
         sample_count = sum(len(unit.questions) for unit in task.units) * len(arms)
         if not arguments.quiet:
@@ -1629,17 +1625,14 @@ async def _run_arms(
                     ingest_mode=arguments.ingest,
                     tracer=tracer,
                     on_progress=progress,
-                    on_replays_ready=deferred_replays.append,
+                    on_search_replay_ready=deferred_searches.append,
                 )
             )
     # This is deliberately a run-global second pass. Replaying one task while a later task is
     # still answering changes shared model-service load and contaminates both latency families.
-    for search_replay, _quality_replay in deferred_replays:
+    for search_replay in deferred_searches:
         await search_replay()
-    replacements: dict[str, SampleResult] = {}
-    for _search_replay, quality_replay in deferred_replays:
-        replacements.update((sample.sample_id, sample) for sample in await quality_replay())
-    return tuple(replacements.get(sample.sample_id, sample) for sample in results)
+    return tuple(results)
 
 
 async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated replay barrier
@@ -1660,22 +1653,13 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     ingest_mode: str = DEFAULT_INGEST_MODE,
     tracer: Tracer | None = None,
     on_progress: Callable[[int, int], None] | None = None,
-    on_replays_ready: Callable[[_DeferredReplays], None] | None = None,
+    on_search_replay_ready: Callable[[_SearchReplay], None] | None = None,
 ) -> tuple[SampleResult, ...]:
     """Run normalized units with bounded workers while preserving release order."""
     if min(batch_size, unit_concurrency, request_concurrency, recall_limit) <= 0:
         raise ValueError("batch size, concurrency, and recall limit must be positive")
     if recall_limit > 100:
         raise ValueError("recall limit must not exceed 100")
-    if any(arm.name == DEFAULT_ARM for arm in arms) and any(
-        question.cutoff_seconds is not None
-        and retrieval_gold_ids(task.spec.name, question.metadata)
-        for unit in task.units
-        for question in unit.questions
-    ):
-        raise ValueError(
-            "gold-labelled retrieval scoring with causal cutoffs needs an isolated store snapshot"
-        )
     slots: list[tuple[SampleResult, ...] | None] = [None] * len(task.units)
     unit_paths: list[Path | None] = [None] * len(task.units)
     stores_ready = [False] * len(task.units)
@@ -1750,26 +1734,10 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
             tracer=tracer,
         )
 
-    async def score_retrieval() -> tuple[SampleResult, ...]:
-        await _attach_retrieval_rankings(
-            task,
-            slots=slots,
-            unit_paths=unit_paths,
-            stores_ready=stores_ready,
-            memory_factory=memory_factory,
-            unit_concurrency=unit_concurrency,
-            request_semaphore=request_semaphore,
-            predict_only=predict_only,
-            response_cache=response_cache,
-            tracer=tracer,
-        )
-        return tuple(sample for group in slots if group is not None for sample in group)
-
-    if on_replays_ready is None:
+    if on_search_replay_ready is None:
         await replay_searches()
-        return await score_retrieval()
     else:
-        on_replays_ready((replay_searches, score_retrieval))
+        on_search_replay_ready(replay_searches)
     return tuple(sample for group in slots if group is not None for sample in group)
 
 
@@ -1883,179 +1851,6 @@ async def _measure_standalone_searches(  # noqa: C901 - setup failures need per-
                 return
 
     await asyncio.gather(*(measure_unit(index, unit) for index, unit in enumerate(task.units)))
-
-
-def _with_retrieval_ranking(
-    task: LoadedTask,
-    question: EvalQuestion,
-    sample: SampleResult,
-    *,
-    ranked: Sequence[SearchHit] | None,
-    error: BaseException | None = None,
-    predict_only: bool,
-) -> SampleResult:
-    source_ids = () if ranked is None else _source_ids(ranked)
-    metrics, score, exact_match = _score(
-        task.spec.name,
-        question,
-        sample.prediction,
-        sample.parsed_choice,
-        source_ids,
-        predict_only=predict_only,
-        retrieval_available=ranked is not None and error is None,
-        answer_failed=sample.error_code is not None,
-    )
-    return replace(
-        sample,
-        retrieval_candidates=len(source_ids),
-        ranked_source_ids=source_ids,
-        ranked_source_ids_complete=ranked is not None and error is None,
-        retrieval_diagnostic_error=None if error is None else _failure_detail(error),
-        metrics=metrics,
-        score=score,
-        exact_match=exact_match,
-    )
-
-
-def _cache_ranked_sample(
-    cache: ResponseCache | None,
-    task: LoadedTask,
-    sample: SampleResult,
-) -> None:
-    if (
-        cache is None
-        or sample.ingest_failure_count
-        or sample.error_code is not None
-        or sample.retrieval_diagnostic_error is not None
-        or not sample.prediction.strip()
-        or not sample.ranked_source_ids_complete
-    ):
-        return
-    cache.put(
-        _cache_task(task, PRODUCT_ARM),
-        sample.unit_id,
-        sample.question_id,
-        CachedAnswer(
-            sample.prediction,
-            sample.confidence,
-            sample.memory_ids,
-            sample.evidence,
-            sample.abstained,
-            sample.abstention_reason,
-            sample.ranked_source_ids,
-        ),
-    )
-
-
-async def _attach_retrieval_rankings(
-    task: LoadedTask,
-    *,
-    slots: list[tuple[SampleResult, ...] | None],
-    unit_paths: Sequence[Path | None],
-    stores_ready: Sequence[bool],
-    memory_factory: MemoryFactory,
-    unit_concurrency: int,
-    request_semaphore: asyncio.Semaphore,
-    predict_only: bool,
-    response_cache: ResponseCache | None,
-    tracer: Tracer | None,
-) -> None:
-    """Score retrieval only after every timed answer and warm-search replay has finished."""
-    store_semaphore = asyncio.Semaphore(unit_concurrency)
-
-    async def score_one(
-        memory: AsyncMemory,
-        question: EvalQuestion,
-        sample: SampleResult,
-    ) -> SampleResult:
-        try:
-            with (
-                nullcontext()
-                if tracer is None
-                else traced_span(
-                    tracer,
-                    _BENCHMARK_RETRIEVAL_QUALITY_SPAN,
-                    attributes={
-                        BENCHMARK_TASK: task.spec.name,
-                        BENCHMARK_SAMPLE: sample.sample_id,
-                        BENCHMARK_ARM: DEFAULT_ARM,
-                        BENCHMARK_PURPOSE: RETRIEVAL_QUALITY_PURPOSE,
-                        SPAN_KIND: "benchmark",
-                    },
-                )
-            ):
-                async with request_semaphore:
-                    ranked = await memory.search(
-                        _content(question.content),
-                        limit=RETRIEVAL_CANDIDATE_LIMIT,
-                        reference_at=question.reference_at,
-                    )
-        except Exception as error:
-            return _with_retrieval_ranking(
-                task,
-                question,
-                sample,
-                ranked=None,
-                error=error,
-                predict_only=predict_only,
-            )
-        updated = _with_retrieval_ranking(
-            task,
-            question,
-            sample,
-            ranked=ranked,
-            predict_only=predict_only,
-        )
-        _cache_ranked_sample(response_cache, task, updated)
-        return updated
-
-    async def score_unit(index: int, unit: EvalUnit) -> None:
-        path = unit_paths[index]
-        samples = slots[index]
-        if path is None or samples is None or not stores_ready[index]:
-            return
-        pending = {
-            sample.question_id: sample
-            for sample in samples
-            if sample.arm == DEFAULT_ARM
-            and not sample.cached
-            and not sample.ingest_failure_count
-            and not sample.ranked_source_ids_complete
-        }
-        questions = tuple(
-            (question, pending[question.question_id])
-            for question in unit.questions
-            if question.question_id in pending
-            and retrieval_gold_ids(task.spec.name, question.metadata)
-        )
-        if not questions:
-            return
-        async with store_semaphore:
-            scored: tuple[SampleResult, ...] = ()
-            try:
-                async with memory_factory(path) as memory:
-                    scored = tuple(
-                        await asyncio.gather(
-                            *(score_one(memory, question, sample) for question, sample in questions)
-                        )
-                    )
-            except Exception as error:
-                if not scored:
-                    scored = tuple(
-                        _with_retrieval_ranking(
-                            task,
-                            question,
-                            sample,
-                            ranked=None,
-                            error=error,
-                            predict_only=predict_only,
-                        )
-                        for question, sample in questions
-                    )
-            replacements = {sample.sample_id: sample for sample in scored}
-            slots[index] = tuple(replacements.get(sample.sample_id, sample) for sample in samples)
-
-    await asyncio.gather(*(score_unit(index, unit) for index, unit in enumerate(task.units)))
 
 
 async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one lifecycle
@@ -2239,7 +2034,6 @@ async def _answer_arms(
             compile_budget=compile_budget,
             tracer=tracer,
             on_complete=on_sample_completed,
-            defer_retrieval_quality=True,
         )
         for question, outcome in zip(questions, answered, strict=True):
             _cache_outcome(
@@ -2525,7 +2319,7 @@ def _candidate_count(unit: EvalUnit, question: EvalQuestion) -> int:
     return len({item.source_id for item in unit.memories if _memory_end(item) <= boundary})
 
 
-async def _answer_many(  # noqa: C901 - answer and retrieval diagnostics share one result path
+async def _answer_many(
     memory: AsyncMemory,
     questions: Sequence[EvalQuestion],
     *,
@@ -2540,7 +2334,6 @@ async def _answer_many(  # noqa: C901 - answer and retrieval diagnostics share o
     context: str = "",
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     tracer: Tracer | None = None,
-    defer_retrieval_quality: bool = False,
 ) -> tuple[_AnswerOutcome | BaseException, ...]:
     semaphore = request_semaphore or asyncio.Semaphore(request_concurrency)
 
@@ -2596,66 +2389,6 @@ async def _answer_many(  # noqa: C901 - answer and retrieval diagnostics share o
             if on_complete is not None:
                 on_complete()
 
-    async def attach_ranking(
-        question: EvalQuestion,
-        outcome: _AnswerOutcome | BaseException,
-    ) -> _AnswerOutcome | BaseException:
-        if not isinstance(outcome, _AnswerOutcome) or arm.name != DEFAULT_ARM:
-            return outcome
-        has_gold = bool(retrieval_gold_ids(task_name, question.metadata))
-        if has_gold and defer_retrieval_quality:
-            return outcome
-        quality_search = has_gold
-        if not quality_search and outcome.error is None:
-            return outcome
-        sample_id = sample_identity(question)
-        try:
-            with (
-                nullcontext()
-                if tracer is None
-                else traced_span(
-                    tracer,
-                    _BENCHMARK_RETRIEVAL_QUALITY_SPAN,
-                    attributes={
-                        BENCHMARK_TASK: task_name,
-                        BENCHMARK_SAMPLE: sample_id,
-                        BENCHMARK_ARM: arm.name,
-                        BENCHMARK_PURPOSE: RETRIEVAL_QUALITY_PURPOSE,
-                        SPAN_KIND: "benchmark",
-                    },
-                )
-            ):
-                async with semaphore:
-                    ranked = await memory.search(
-                        _content(question.content),
-                        limit=RETRIEVAL_CANDIDATE_LIMIT if quality_search else recall_limit,
-                        reference_at=question.reference_at,
-                    )
-        except Exception as error:
-            return replace(outcome, retrieval_diagnostic_error=error) if quality_search else outcome
-        return replace(
-            outcome,
-            confidence=(
-                max((hit.score for hit in ranked), default=0.0)
-                if outcome.error is not None and not quality_search
-                else outcome.confidence
-            ),
-            memory_ids=(
-                tuple(hit.id for hit in ranked)
-                if outcome.error is not None and not quality_search
-                else outcome.memory_ids
-            ),
-            evidence=(
-                tuple(_evidence(hit) for hit in ranked)
-                if outcome.error is not None and not quality_search
-                else outcome.evidence
-            ),
-            ranked_source_ids=_source_ids(ranked) if quality_search else outcome.ranked_source_ids,
-            ranked_source_ids_complete=(
-                True if quality_search else outcome.ranked_source_ids_complete
-            ),
-        )
-
     with _arm_run_span(tracer, task_name, arm.name):
         answered = tuple(
             await asyncio.gather(
@@ -2663,30 +2396,19 @@ async def _answer_many(  # noqa: C901 - answer and retrieval diagnostics share o
             )
         )
 
-    ranked = tuple(
-        await asyncio.gather(
-            *(
-                attach_ranking(question, outcome)
-                for question, outcome in zip(questions, answered, strict=True)
-            )
-        )
-    )
-
     diagnosed = tuple(
         replace(
             outcome,
             retrieval_diagnostic_error=RuntimeError(
-                "the public retrieval-quality search returned no ranked list"
+                "the ranked retrieval list from the product answer was not observed"
             ),
         )
         if isinstance(outcome, _AnswerOutcome)
         and arm.retrieves
-        and not defer_retrieval_quality
         and retrieval_gold_ids(task_name, question.metadata)
         and not outcome.ranked_source_ids_complete
-        and outcome.retrieval_diagnostic_error is None
         else outcome
-        for question, outcome in zip(questions, ranked, strict=True)
+        for question, outcome in zip(questions, answered, strict=True)
     )
     if not arm.generates and on_answer is not None:
         for question, outcome in zip(questions, diagnosed, strict=True):
@@ -2788,11 +2510,18 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
 ) -> _AnswerOutcome:
     latency_started = time.perf_counter()
     content = _content(question.content)
-    ranked_hits: tuple[SearchHit, ...] = ()
+    ranked: tuple[SearchHit, ...] = ()
+    ranked_complete = False
+
+    def observe_retrieval(value: object) -> None:
+        nonlocal ranked, ranked_complete
+        if isinstance(value, tuple) and all(isinstance(hit, SearchHit) for hit in value):
+            ranked = value
+            ranked_complete = True
 
     try:
         if arm.name == "random":
-            ranked_hits = await memory.search(
+            ranked = await memory.search(
                 content,
                 limit=(
                     RETRIEVAL_CANDIDATE_LIMIT
@@ -2801,7 +2530,7 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                 ),
                 reference_at=question.reference_at,
             )
-            order = list(ranked_hits)
+            order = list(ranked)
             random.Random(f"{arm.seed}:{sample_id}").shuffle(order)
             return _AnswerOutcome(
                 "",
@@ -2829,7 +2558,7 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                 0.0,
                 tuple(hit.id for hit in bundle.hits),
                 tuple(_evidence(hit) for hit in bundle.hits),
-                ranked_source_ids=_source_ids(ranked_hits),
+                ranked_source_ids=_source_ids(ranked),
                 compiled_chars=bundle.chars,
                 compiled_items=len(bundle.hits),
             )
@@ -2846,40 +2575,42 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                 (),
             )
         result: AnswerResult | None = None
-        ask_stream = getattr(memory, "ask_stream", None)
-        if ask_stream is None:
-            result = await memory.ask(
-                content,
-                limit=recall_limit,
-                reference_at=question.reference_at,
-            )
-        else:
-            first_token_seen = False
-            async for chunk in ask_stream(
-                content,
-                limit=recall_limit,
-                reference_at=question.reference_at,
-            ):
-                if chunk.text.strip() and not first_token_seen:
-                    first_token_seen = True
-                    if answer_span is not None:
-                        answer_span.set_attribute(
-                            OPERATION_TTFT,
-                            (time.perf_counter() - started) * 1_000,
-                        )
-                if chunk.result is not None:
-                    result = chunk.result
-            if result is None:
-                raise RuntimeError("answer stream ended without a terminal result")
+        with _observe_retrieval_results(observe_retrieval):
+            ask_stream = getattr(memory, "ask_stream", None)
+            if ask_stream is None:
+                result = await memory.ask(
+                    content,
+                    limit=recall_limit,
+                    reference_at=question.reference_at,
+                )
+            else:
+                first_token_seen = False
+                async for chunk in ask_stream(
+                    content,
+                    limit=recall_limit,
+                    reference_at=question.reference_at,
+                ):
+                    if chunk.text.strip() and not first_token_seen:
+                        first_token_seen = True
+                        if answer_span is not None:
+                            answer_span.set_attribute(
+                                OPERATION_TTFT,
+                                (time.perf_counter() - started) * 1_000,
+                            )
+                    if chunk.result is not None:
+                        result = chunk.result
+                if result is None:
+                    raise RuntimeError("answer stream ended without a terminal result")
     except Exception as error:
         return _AnswerOutcome(
             "",
             (time.perf_counter() - latency_started) * 1_000,
-            0.0,
-            (),
-            (),
+            max((hit.score for hit in ranked), default=0.0),
+            tuple(hit.id for hit in ranked),
+            tuple(_evidence(hit) for hit in ranked),
             error=error,
-            ranked_source_ids=_source_ids(ranked_hits),
+            ranked_source_ids=_source_ids(ranked),
+            ranked_source_ids_complete=ranked_complete,
         )
     assert result is not None
     # `_declined` stays on this path: the product cannot recognise a refusal a task worded
@@ -2898,7 +2629,8 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
             if result.abstention_reason is not None
             else (AbstentionReason.INSUFFICIENT_EVIDENCE.value if declined else None)
         ),
-        ranked_source_ids=_source_ids(ranked_hits),
+        ranked_source_ids=_source_ids(ranked),
+        ranked_source_ids_complete=ranked_complete,
     )
 
 
@@ -3585,6 +3317,10 @@ def _results(
         **_in_run_blind_rows(arguments, tasks, samples),
         **_blind_baseline_rows(arguments.blind_baseline, tasks),
     }
+    product_candidate_limit = _answer_retrieval_candidate_limit(
+        arguments.recall_limit,
+        memory_config,
+    )
     task_rows = []
     for task, arm in ((task, arm) for task in tasks for arm in arguments.arms):
         selected = tuple(
@@ -3597,9 +3333,10 @@ def _results(
             blind_rows.get(task.spec.name),
             arm=arm,
             retrieval_candidate_limit=(
-                RETRIEVAL_CANDIDATE_LIMIT
+                product_candidate_limit
                 if arm == DEFAULT_ARM
-                or (
+                else RETRIEVAL_CANDIDATE_LIMIT
+                if (
                     arm == "random"
                     and any(
                         retrieval_gold_ids(task.spec.name, sample.metadata) for sample in selected
@@ -3801,9 +3538,13 @@ def _arm_provenance(
     definitions: dict[str, object] = {
         DEFAULT_ARM: {
             "answers_from": "retrieved memories",
-            "retrieval": "dedicated public Memory.search after timed answer and search replay",
-            "retrieval_candidate_limit": RETRIEVAL_CANDIDATE_LIMIT,
-            "retrieval_candidate_limit_basis": ("fixed top-100 retrieval-quality search"),
+            "retrieval": "Memory.ask in-answer ranked list; no second scoring search",
+            "retrieval_candidate_limit": answer_candidate_limit,
+            "retrieval_candidate_limit_basis": (
+                "full rerank pool because evidence_budget_chars is configured"
+                if evidence_budget_chars is not None
+                else "min(100, recall_limit * 3)"
+            ),
             "answer_retrieval_candidate_limit": answer_candidate_limit,
             "answer_retrieval_candidate_limit_basis": (
                 "full rerank pool because evidence_budget_chars is configured"
@@ -3851,11 +3592,11 @@ def _arm_provenance(
     }
     return {
         "selected": list(arguments.arms),
-        "retrieval_candidate_limit": RETRIEVAL_CANDIDATE_LIMIT,
+        "retrieval_candidate_limit": answer_candidate_limit,
         "retrieval_candidate_limit_arm": DEFAULT_ARM,
-        "retrieval_candidate_source": (
-            "dedicated public Memory.search after timed answer and search replay"
-        ),
+        "retrieval_candidate_source": "Memory.ask in-answer ranked list",
+        "search_e2e_limit": arguments.recall_limit,
+        "search_e2e_source": "post-answer public Memory.search replay",
         "evidence_budget_chars": evidence_budget_chars,
         "ingest": arguments.ingest,
         "definitions": {name: definitions[name] for name in arguments.arms},
@@ -4148,9 +3889,9 @@ def _metadata_ids(metadata: Mapping[str, object], key: str) -> tuple[str, ...]:
 def _retrieved_sources(sample: SampleResult) -> tuple[str, ...]:
     """Return the retriever's ranked source IDs in rank order, deduplicated.
 
-    This is the dedicated public ``Memory.search`` result, not ``sample.evidence``. Evidence is
-    narrowed to the hits the generator cited, so scoring it would report the generator's citation
-    behaviour under the name of retrieval recall.
+    This is the ranked list observed inside ``Memory.ask``, not ``sample.evidence``. Evidence is
+    narrowed to the hits the generator saw, so scoring it would report grounding behaviour under
+    the name of retrieval recall.
     """
     return tuple(dict.fromkeys(source for source in sample.ranked_source_ids if source))
 

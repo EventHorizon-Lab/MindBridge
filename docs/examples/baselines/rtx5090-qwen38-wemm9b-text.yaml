@@ -1,23 +1,25 @@
 # Reference latency profile for the RTX 5090 benchmark client.
-# Run from the repository root with OPENAI_API_KEY=EMPTY. No credential is stored here.
+# EMPTY is an explicit non-secret sentinel, so an ambient OPENAI_API_KEY is never forwarded.
 
 embedding:
   provider: openai
   base_url: https://xyrobot-embed.xyrobot.com/v1
   model: tencent/WeMM-Embedding-9B
+  api_key: EMPTY
   dimension: 4096
   modalities: [text, image, video]
   request_format: messages
   timeout: 300.0
-  max_retries: 3
+  max_retries: 0
 
 generation:
   provider: openai
   base_url: http://xyrobot-vl.xyrobot.com/v1
   model: Qwen3.8-27B
+  api_key: EMPTY
   modalities: [text, image, video]
   timeout: 300.0
-  max_retries: 3
+  max_retries: 0
   video_limit: 8
   extra_body:
     chat_template_kwargs:
@@ -31,6 +33,7 @@ benchmark:
   judge:
     model: Qwen3.8-27B
     base_url: http://xyrobot-vl.xyrobot.com/v1
+    api_key: EMPTY
     timeout_seconds: 300.0
   download:
     benchmarks_root: .benchmarks

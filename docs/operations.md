@@ -217,6 +217,11 @@ spans, and the settle span carries the capture-to-settled interval its batch clo
 Model spans include request model, module, batch size, modalities, and
 `mindbridge.model.request_count`. Provider-reported usage is recorded without estimation:
 
+`mindbridge.model.request_count` counts logical adapter calls issued by MindBridge. Retries hidden
+inside a third-party SDK transport remain included in latency, but cannot be counted separately;
+token totals and completeness cover observable logical responses, not an earlier hidden attempt for
+which the provider returned no usage.
+
 | Attribute | Meaning |
 | --- | --- |
 | `mindbridge.token_usage.expected_request_count` | Requests expected to report token usage. |
