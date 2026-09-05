@@ -1248,7 +1248,11 @@ def test_capture_settle_and_pending_captures_round_trip(
         "last_error": None,
         "awaiting": "enrichment",
     }
-    assert datetime.fromisoformat(cast(str, pending[0]["enqueued_at"])).tzinfo is not None
+    # Every CLI timestamp is UTC with a trailing `Z`, which `fromisoformat` only parses from
+    # 3.11 on, so the offset is normalised before the timezone is asserted.
+    enqueued_at = cast(str, pending[0]["enqueued_at"])
+    assert enqueued_at.endswith("Z")
+    assert datetime.fromisoformat(enqueued_at[:-1] + "+00:00").tzinfo is not None
 
     status, settled, _ = _run(capsys, "--app", app, "-q", "settle")
     assert status == 0 and settled == {"settled": 1}
