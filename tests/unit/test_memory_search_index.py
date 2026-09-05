@@ -866,3 +866,71 @@ def test_the_candidate_trace_order_does_not_depend_on_the_process_hash_seed(
     assert len(runs[0]["candidates"]) > 100, "the corpus must exceed the route depth"
     assert runs[0]["hits"] == runs[1]["hits"], "the ranking must not depend on the hash seed"
     assert runs[0]["candidates"] == runs[1]["candidates"]
+
+
+def test_the_modality_floor_never_evicts_the_top_hit(tmp_path: Path) -> None:
+    """A floor promotes into spare slots; it does not rebuild the window out of last places."""
+    from mindbridge.memory import _grounding_hits
+    from mindbridge.types import SearchHit
+
+    created = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
+    media_types = {
+        Modality.IMAGE: "image/jpeg",
+        Modality.VIDEO: "video/mp4",
+        Modality.AUDIO: "audio/wav",
+    }
+
+    def _hit(name: str, modality: Modality, score: float) -> SearchHit:
+        assets: tuple[AssetRef, ...] = ()
+        if modality is not Modality.TEXT:
+            path = tmp_path / f"{name}-asset"
+            path.write_bytes(b"x")
+            assets = (
+                AssetRef(
+                    id=hashlib.sha256(name.encode()).hexdigest(),
+                    modality=modality,
+                    media_type=media_types[modality],
+                    size_bytes=1,
+                    sha256=hashlib.sha256(b"x").hexdigest(),
+                    name=path.name,
+                    path=path,
+                ),
+            )
+        return SearchHit(
+            id=name,
+            content=name,
+            score=score,
+            created_at=created,
+            assets=assets,
+            modality=modality,
+        )
+
+    ranking = tuple(
+        _hit(name, modality, score)
+        for name, modality, score in (
+            ("t1", Modality.TEXT, 0.9),
+            ("t2", Modality.TEXT, 0.8),
+            ("i1", Modality.IMAGE, 0.7),
+            ("v1", Modality.VIDEO, 0.6),
+            ("a1", Modality.AUDIO, 0.5),
+        )
+    )
+
+    grounded = {limit: [hit.id for hit in _grounding_hits(ranking, limit)] for limit in range(1, 6)}
+
+    assert grounded == {
+        1: ["t1"],
+        2: ["t1", "i1"],
+        3: ["t1", "i1", "v1"],
+        4: ["t1", "i1", "v1", "a1"],
+        5: ["t1", "t2", "i1", "v1", "a1"],
+    }
+    # The floor it promises: every modality the ranking holds is present once the window has a
+    # slot for each of them, and the ranking's own first hit is in every window.
+    for limit in range(4, 6):
+        assert {hit.modality for hit in _grounding_hits(ranking, limit)} == {
+            Modality.TEXT,
+            Modality.IMAGE,
+            Modality.VIDEO,
+            Modality.AUDIO,
+        }

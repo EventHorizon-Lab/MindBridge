@@ -759,7 +759,7 @@ def test_random_ranker_expectation_is_reported_next_to_measured_recall() -> None
     )
 
     retrieval = eval_module._retrieval_quality(
-        samples, seed=7, bootstrap_samples=32, recall_limit=20
+        samples, seed=7, bootstrap_samples=32, recall_limit=100
     )
     measured = cast(Mapping[str, Mapping[str, object]], retrieval["recall_at_k"])
     random_ranker = cast(Mapping[str, Mapping[str, object]], retrieval["random_ranker_recall_at_k"])
@@ -803,7 +803,7 @@ def test_retrieval_quality_says_so_when_the_adapter_carries_no_gold_evidence() -
     samples = (_sample("q1", sources=("s1",), gold=(), candidate_count=4),)
 
     retrieval = eval_module._retrieval_quality(
-        samples, seed=7, bootstrap_samples=32, recall_limit=20
+        samples, seed=7, bootstrap_samples=32, recall_limit=100
     )
 
     assert retrieval["gold_evidence_key"] is None
@@ -824,7 +824,7 @@ def test_gold_evidence_that_named_no_stored_memory_is_counted_not_absorbed() -> 
     )
 
     retrieval = eval_module._retrieval_quality(
-        samples, seed=7, bootstrap_samples=32, recall_limit=20
+        samples, seed=7, bootstrap_samples=32, recall_limit=100
     )
     controls = eval_module._controls("fixture", retrieval, None, is_blind_run=False)
 
@@ -840,7 +840,7 @@ def test_a_partly_joined_label_list_reports_both_the_measured_and_the_missed_ids
     )
 
     retrieval = eval_module._retrieval_quality(
-        samples, seed=7, bootstrap_samples=32, recall_limit=20
+        samples, seed=7, bootstrap_samples=32, recall_limit=100
     )
     measured = cast(Mapping[str, Mapping[str, object]], retrieval["recall_at_k"])
 
@@ -1210,7 +1210,7 @@ def test_retrieval_recall_scores_the_ranked_list_not_the_cited_evidence() -> Non
     )
 
     retrieval = eval_module._retrieval_quality(
-        (cited_not_ranked, unranked), seed=7, bootstrap_samples=32, recall_limit=20
+        (cited_not_ranked, unranked), seed=7, bootstrap_samples=32, recall_limit=100
     )
     measured = cast(Mapping[str, Mapping[str, object]], retrieval["recall_at_k"])
 

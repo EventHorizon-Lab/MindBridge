@@ -888,3 +888,82 @@ def test_add_stream_can_capture_instead_of_adding(tmp_path: Path) -> None:
         # `capture` is a mode, not a truthiness test, exactly as `AsyncCaptureStream` reads it.
         with pytest.raises(ValidationError):
             next(memory.add_stream(("a note",), capture=cast(Any, 1)))
+
+
+def test_a_finished_stream_never_leaves_another_thread_deferring(tmp_path: Path) -> None:
+    """Deferral is per thread: one stream's exit must not silence another thread's drains."""
+    with Memory(tmp_path, embedder=TinyEmbedder(), minimum_relevance=0) as memory:
+        first_open = threading.Event()
+        second_open = threading.Event()
+        first_done = threading.Event()
+        second_done = threading.Event()
+        pending: dict[str, int] = {}
+
+        def first_stream() -> None:
+            stream = memory.add_stream(("the kettle boiled",))
+            next(stream)
+            first_open.set()
+            assert second_open.wait(10)
+            for _record in stream:
+                pass
+            first_done.set()
+            assert second_done.wait(10)
+            # Nothing defers this thread any more, so its own write reaches the index.
+            memory.add("the toolbox is blue")
+            pending["first"] = len(memory._store.pending_index_operations(limit=5))
+
+        thread = threading.Thread(target=first_stream)
+        thread.start()
+        try:
+            assert first_open.wait(10)
+            stream = memory.add_stream(("the door was left open",))
+            next(stream)
+            second_open.set()
+            assert first_done.wait(10)
+            for _record in stream:
+                pass
+            second_done.set()
+        finally:
+            thread.join(30)
+
+        assert pending == {"first": 0}
+        assert memory._deferring is False
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_caption_is_cached_for_the_next_write_of_the_same_frame(
+    tmp_path: Path,
+) -> None:
+    """The live stream shares the write path's caption cache instead of paying twice for it."""
+    frame = Blob(b"frame", "image/png")
+    describer = RecordingVisionDescriber()
+    memory = AsyncMemory(
+        tmp_path,
+        embedder=RecordingEmbedder(frozenset({Modality.TEXT})),
+        vision_describer=describer,
+        minimum_relevance=0,
+    )
+    try:
+        commits = [
+            value
+            async for value in AsyncVisionStream(memory).consume(
+                _vision_packets(
+                    VisionFrame(frame),
+                    SceneBoundary(VisionBoundary.END),
+                )
+            )
+        ]
+        assert len(commits) == 1
+
+        added = await memory.add(frame)
+
+        assert len(describer.inputs) == 1
+        assert added.content.endswith("automatically described red toolbox")
+    finally:
+        await memory.close()
+
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        cached = connection.execute(
+            "SELECT space_id, description FROM visual_descriptions"
+        ).fetchall()
+    assert cached == [("test-vision:caption-v1", "automatically described red toolbox")]

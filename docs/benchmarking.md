@@ -43,6 +43,19 @@ license that forbids training, fine-tuning or distilling on the corpus. MindBrid
 not replace those terms; see the
 [scorer notices](../src/mindbridge/benchmarks/_official/NOTICE.md).
 
+If inputs are already present, validate their schema and digests without creating a run directory,
+loading a model, or contacting a provider:
+
+```bash
+uv run --frozen mindbridge-bench eval \
+  --tasks locomo-refined \
+  --check-integrity \
+  --no-download
+```
+
+The JSON response reports `unit_count`, `question_count`, `dataset_sha256`, and
+`evaluation_sha256` for each selected task.
+
 ## Run an evaluation
 
 Set credentials for the OpenAI-compatible generation endpoint, then select a task or group:
@@ -890,7 +903,7 @@ measured latency and resource cost. `results.jsonl` records each of those:
 | Official split and evaluator | `tasks[].evaluation_sha256`, `primary_metric`, `official_metric`, `scorer_protocol`, `official_judge_model`, `judge_model_official` |
 | Input route | `tasks[].input_modalities` and `performance.token_usage.calls_by_input_modality` |
 | Model and runtime revisions | `model.*`, `environment.mindbridge_version`, `zvec_version`, `runtime_versions`, `python_version`, `platform` |
-| Retrieval settings | `recall_limit`, `tasks[].retrieval.recall_limit`, and the full `model.memory_config` dump |
+| Retrieval settings | `recall_limit`, `tasks[].retrieval.ranked_candidate_limit`, and the full `model.memory_config` dump |
 | Hardware | `environment.hardware` and the `resources` block |
 | Latency and resource cost | `tasks[].performance`, `tasks[].answer_latency_ms`, and `resources` |
 | Replay inputs | `run_id`, `seed`, `seeds`, `bootstrap_samples`, `repeat_index`, `measurement_protocol`, `limit`, `offset`, `batch_size`, `blind`, `blind_baseline`, `arms.ingest`, `arms.definitions.compile` |

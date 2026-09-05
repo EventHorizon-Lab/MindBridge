@@ -2040,6 +2040,28 @@ class ContextBudget:
         ):
             raise ValidationError("budget freshness must be a positive timedelta")
 
+    def document(self) -> dict[str, object]:
+        """Return the JSON-ready bound document every surface reads and writes.
+
+        `freshness` is a timedelta; JSON carries the same bound as `freshness_seconds`, which is
+        the one rename between this projection and the dataclass.
+        """
+        return {
+            "max_chars": self.max_chars,
+            "max_items": self.max_items,
+            "max_media_items": self.max_media_items,
+            "memory_types": (
+                None
+                if self.memory_types is None
+                else sorted(value.value for value in self.memory_types)
+            ),
+            "min_confidence": self.min_confidence,
+            "freshness_seconds": (
+                None if self.freshness is None else self.freshness.total_seconds()
+            ),
+            "max_latency_ms": self.max_latency_ms,
+        }
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ContextConflict:
@@ -2256,6 +2278,21 @@ class ContextBundle:
         if self.omitted > 0:
             lines.extend(("", f"Omitted: {self.omitted} lower-ranked candidates"))
         return "\n".join(lines)
+
+    def document(self) -> dict[str, object]:
+        """Return the field-keyed projection REST, MCP, and the CLI each publish.
+
+        Values stay as they are declared -- the transports validate them through their own
+        models -- except `budget`, which flattens `freshness` to seconds, and `rendered`, which
+        is `render()` rather than a stored field. Driven by `fields(self)` so a new section
+        reaches all three surfaces instead of being spelled a fourth time in each of them.
+        """
+        values: dict[str, object] = {
+            declared.name: getattr(self, declared.name) for declared in fields(self)
+        }
+        values["budget"] = self.budget.document()
+        values["rendered"] = self.render()
+        return values
 
     def _sections(
         self,

@@ -3391,3 +3391,144 @@ def test_embedding_width_mismatch_names_both_widths() -> None:
 
     assert failure.value.reason == "response_invalid"
     assert "returned 3 values but the configured dimension is 2" in str(failure.value)
+
+
+def test_consolidation_drops_the_citation_a_correct_may_not_carry() -> None:
+    """A `correct` that also cites its evidence degrades to one valid operation.
+
+    The prompt asks `correct` to name what the evidence contradicts, so a model naming that
+    evidence too is being accurate; the value type still rejects the pair, and failing the whole
+    reply discarded every other operation in the batch over it.
+    """
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return _completion(
+            {
+                "operations": [
+                    {
+                        "intent": "correct",
+                        "targets": [1],
+                        "evidence": [0],
+                        "rationale": "the lamp is off",
+                    },
+                    {"intent": "forget", "targets": [0], "rationale": "no longer useful"},
+                ]
+            }
+        )
+
+    miscounted: dict[str, object] = {
+        "operations": [{"intent": "correct", "targets": [1], "evidence": [7]}]
+    }
+
+    def miscount(request: httpx.Request) -> httpx.Response:
+        return _completion(miscounted)
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        correct, forget = _model(_sdk_client(client)).consolidate(
+            _consolidation_evidence(),
+            trigger=MemoryTrigger.CONTRADICTION,
+        )
+    with (
+        httpx.Client(transport=httpx.MockTransport(miscount)) as client,
+        pytest.raises(ModelError) as failure,
+    ):
+        _model(_sdk_client(client)).consolidate(
+            _consolidation_evidence(),
+            trigger=MemoryTrigger.CONTRADICTION,
+        )
+
+    assert correct.intent is MemoryIntent.CORRECT
+    assert correct.target_ids == ("derived-1",)
+    assert correct.evidence_ids == ()
+    assert forget.intent is MemoryIntent.FORGET
+    assert forget.target_ids == ("raw-1",)
+    # Dropping the value does not stop resolving it: a cited index outside the evidence list is
+    # still a miscount that fails the whole response.
+    assert failure.value.reason == "response_invalid"
+
+
+def test_description_does_not_size_the_video_file_it_never_sends(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Only four decoded stills travel, so the clip's own bytes are not what the request carries.
+    # Sizing them refused a caption to every video memory over the inline item cap, and the write
+    # path swallows that refusal, so the memory was stored with no caption at all.
+    clip = _asset(tmp_path, "clip", Modality.VIDEO, "video/mp4", b"\0" * (16 * 1024 * 1024))
+    monkeypatch.setattr(
+        openai_backend,
+        "_video_frame_urls",
+        lambda *_args, **_kwargs: ("data:image/jpeg;base64,AAAA",) * 4,
+    )
+
+    with httpx.Client(transport=httpx.MockTransport(lambda _r: _caption_reply("one clip"))) as (
+        client
+    ):
+        model = _vision_model(
+            _sdk_client(client),
+            capabilities=frozenset({Modality.IMAGE, Modality.VIDEO}),
+        )
+        assert model.describe((ModelInput(assets=(clip,)),)) == ("one clip",)
+
+    # Every other path sends the file itself, so the cap still applies there.
+    with pytest.raises(ModelError) as failure:
+        openai_backend._require_inline_size((clip,))
+    assert failure.value.reason == "payload_too_large"
+
+
+def test_one_malformed_formation_reply_is_retried_once() -> None:
+    # The same HTTP 200 carrying invalid JSON that `describe` retries also reaches formation and
+    # consolidation, where it used to abort the whole batch on the first attempt.
+    valid = httpx.Response(
+        200,
+        json={
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "items": [
+                                    {
+                                        "observation_id": "observation_0",
+                                        "proposals": [
+                                            {
+                                                "kind": "state",
+                                                "content": "The lamp is on.",
+                                                "subject": "lamp",
+                                                "predicate": "power",
+                                                "value": "on",
+                                                "confidence": 0.9,
+                                                "valid_from": "2026-08-27T00:00:00Z",
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
+                        )
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        },
+    )
+    replies = [_malformed_reply(), valid]
+    sent: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return replies[len(sent) - 1]
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        (proposals,) = _model(_sdk_client(client)).form(
+            (
+                FormationInput(
+                    memory_id="source_text",
+                    content=ModelInput(text="The lamp is on."),
+                    context=ObservationContext(source_id="user"),
+                ),
+            )
+        )
+
+    assert [proposal.kind for proposal in proposals] == [MemoryKind.STATE]
+    assert len(sent) == 2
+    assert sent[0] == sent[1]

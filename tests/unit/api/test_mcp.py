@@ -1281,7 +1281,7 @@ async def test_the_compile_tool_reports_a_named_actor_too() -> None:
 
 def test_the_compile_tool_schema_rejects_non_finite_freshness() -> None:
     with pytest.raises(ValueError):
-        mcp_adapter.ContextBudgetInput.model_validate({"freshness_seconds": float("inf")})
+        content.ContextBudgetInput.model_validate({"freshness_seconds": float("inf")})
 
 
 async def test_the_compile_tool_rejects_an_unrepresentable_freshness() -> None:
@@ -1593,3 +1593,12 @@ def _error_text(result: CallToolResult) -> str:
 def _error_envelope(result: CallToolResult) -> dict[str, object]:
     # A bare `json.loads` is the contract: no prefix to strip on any failure shape.
     return cast(dict[str, object], json.loads(_error_text(result)))
+
+
+def test_the_budget_tool_description_states_the_live_defaults() -> None:
+    """The prose an agent sizes its window against is interpolated, so it cannot drift."""
+    budget = ContextBudget()
+    description = mcp_adapter._BUDGET_DESCRIPTION
+
+    assert f"which are {budget.max_chars:,} characters and {budget.max_items} items" in description
+    assert "which are 6,000" not in description

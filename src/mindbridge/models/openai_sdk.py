@@ -7,14 +7,14 @@ import hashlib
 import json
 import math
 import time
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from io import BytesIO
 from itertools import chain
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from opentelemetry import trace
 
@@ -42,6 +42,7 @@ from mindbridge.types import (
     AssetRef,
     FormationProposal,
     IdentityClaim,
+    MemoryIntent,
     MemoryOperation,
     MemoryRecord,
     MemoryTrigger,
@@ -159,7 +160,8 @@ evidence indices it derives from and a proposal with the same fields a formation
 may also name target indices, which must be among its own evidence indices, for detail the
 derived memory replaces in ordinary recall. correct names the target indices whose derived
 inference the evidence contradicts. forget names the target indices whose recall is no longer
-useful. identify names who a recognized person is: it carries a claim of
+useful. correct and forget name targets only and cite no evidence.
+identify names who a recognized person is: it carries a claim of
 {"identity_id":...,"name":...,"relationship":...} and the evidence indices supporting it, and
 names no target. relationship is optional. identity_id is the only identifier you ever write, and
 it must be copied exactly from the speaker_ids or face_identity_ids of an evidence item; at least
@@ -172,12 +174,17 @@ _CONSOLIDATION_FIELDS = frozenset(
     {"intent", "evidence", "targets", "proposal", "claim", "rationale"}
 )
 _CLAIM_FIELDS = frozenset({"identity_id", "name", "relationship"})
+# Intents the value type rejects when they carry evidence: their targets are what they act on, and
+# the kernel reads the grounds from the pass itself. A model that cites the evidence it corrected
+# from is naming something true, so the citation is dropped rather than failing the whole batch.
+_TARGET_ONLY_INTENTS = frozenset({MemoryIntent.CORRECT.value, MemoryIntent.FORGET.value})
 _MAX_CONSOLIDATION_OPERATIONS = 16
 _TRUNCATED_ANSWER_ERROR = (
     "generation stopped at the output token limit; raise generation_max_tokens or lower the "
     "answer limit"
 )
 _Operation = Literal["embedding", "generation", "transcription"]
+_JsonResult = TypeVar("_JsonResult")
 # The one 429 an identical retry can never clear: the account is out of quota, not too fast.
 _INSUFFICIENT_QUOTA = "insufficient_quota"
 # Bounds the base64 media the request carries, not the bytes on disk. Media reaches the provider
@@ -397,12 +404,12 @@ class OpenAIModels:
             temperature=generation_temperature,
             max_tokens=generation_max_tokens,
             extra_body=self._generation_extra_body,
-            # v2: the prompt now describes the attached media parts and the identify intent. The
-            # digest already made
-            # this a different recipe; the label says so out loud, because the recipe salts
+            # v2 described the attached media parts and the identify intent; v3 states that
+            # correct and forget cite no evidence. The digest already made each of those a
+            # different recipe; the label says so out loud, because the recipe salts
             # `operation_key` and the derived record's content address, so a store written
             # before the change no longer matches a duplicate proposal.
-            version="v2",
+            version="v3",
         )
 
     @property
@@ -598,26 +605,12 @@ class OpenAIModels:
         _require_consistent_assets(assets)
         _require_inline_size(assets)
         request = self._json_request(_FORMATION_SYSTEM_PROMPT, _formation_content(batch))
-        create_completion = cast(Any, self._client("generation").chat.completions.create)
-        mark_model_requests(1)
-        try:
-            response = create_completion(**request)
-        except ModelError:
-            raise
-        except Exception as error:
-            raise ModelError(
-                "formation request failed",
-                reason=_provider_reason(error),
-                stage="form",
-            ) from error
-        _record_openai_usage(
-            response,
+        return self._json_completion(
+            request,
+            subject="formation",
+            stage="form",
             input_modalities=modalities,
-            output_modalities=frozenset({Modality.TEXT}),
-        )
-        return _formation_results(
-            _json_completion_text(response, subject="formation", stage="form"),
-            batch,
+            parse=lambda content: _formation_results(content, batch),
         )
 
     def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
@@ -668,11 +661,36 @@ class OpenAIModels:
         request = self._json_request(_VISION_SYSTEM_PROMPT, content)
         request.setdefault("temperature", 0.0)
         request.setdefault("seed", _VISION_SEED)
+        return self._json_completion(
+            request,
+            subject="vision description",
+            stage="describe",
+            input_modalities=modalities,
+            parse=lambda content: _vision_captions(content, len(batch)),
+        )
+
+    def _json_completion(
+        self,
+        request: dict[str, object],
+        *,
+        subject: str,
+        stage: str,
+        input_modalities: frozenset[Modality],
+        parse: Callable[[str], _JsonResult],
+    ) -> _JsonResult:
+        """Send one JSON chat completion and parse it, retrying a malformed reply once.
+
+        An HTTP 200 carrying invalid JSON is outside what the SDK's `max_retries` covers and is
+        transient in practice; a truncation or any other failure is not retried, because an
+        identical second request cannot clear it. Both attempts are metered, even when the second
+        one also fails: the first request was billed whether or not its reply parsed, so the usage
+        is summed in `finally` rather than recorded per attempt, which would report only the last.
+        """
         create_completion = cast(Any, self._client("generation").chat.completions.create)
         usages: list[_ModelUsage | None] = []
         attempted = 0
 
-        def attempt() -> tuple[str, ...]:
+        def attempt() -> _JsonResult:
             nonlocal attempted
             attempted += 1
             mark_model_requests(attempted)
@@ -682,26 +700,20 @@ class OpenAIModels:
                 raise
             except Exception as error:
                 raise ModelError(
-                    "vision description request failed",
+                    f"{subject} request failed",
                     reason=_provider_reason(error),
-                    stage="describe",
+                    stage=stage,
                 ) from error
             usages.append(
                 _model_usage(
                     response,
-                    input_modalities=modalities,
+                    input_modalities=input_modalities,
                     output_modalities=frozenset({Modality.TEXT}),
                 )
             )
             _record_openai_provenance(response)
-            return _vision_captions(
-                _json_completion_text(response, subject="vision description", stage="describe"),
-                len(batch),
-            )
+            return parse(_json_completion_text(response, subject=subject, stage=stage))
 
-        # Both attempts are metered, even when the second one also fails: the first request was
-        # billed whether or not its reply parsed, so the usage is summed in `finally` rather than
-        # recorded per attempt, which would report only the last one.
         try:
             try:
                 return attempt()
@@ -772,26 +784,12 @@ class OpenAIModels:
             capabilities=self._generation_capabilities,
         )
         request = self._json_request(_CONSOLIDATION_SYSTEM_PROMPT, content)
-        create_completion = cast(Any, self._client("generation").chat.completions.create)
-        mark_model_requests(1)
-        try:
-            response = create_completion(**request)
-        except ModelError:
-            raise
-        except Exception as error:
-            raise ModelError(
-                "consolidation request failed",
-                reason=_provider_reason(error),
-                stage="consolidate",
-            ) from error
-        _record_openai_usage(
-            response,
+        return self._json_completion(
+            request,
+            subject="consolidation",
+            stage="consolidate",
             input_modalities=_generation_modalities(content),
-            output_modalities=frozenset({Modality.TEXT}),
-        )
-        return _consolidation_results(
-            _json_completion_text(response, subject="consolidation", stage="consolidate"),
-            batch,
+            parse=lambda text: _consolidation_results(text, batch),
         )
 
     def answer(
@@ -2087,10 +2085,13 @@ def _consolidation_operation(
     except ModelError as error:
         raise _invalid_consolidation_response() from error
     claimed = value.get("claim")
+    # Every cited index is resolved even where the intent discards it, so a miscount still fails
+    # the whole response the way an out-of-range target does.
+    cited = _cited_ids(value.get("evidence"), evidence)
     try:
         return MemoryOperation(
             intent=cast(Any, value["intent"]),
-            evidence_ids=_cited_ids(value.get("evidence"), evidence),
+            evidence_ids=() if value["intent"] in _TARGET_ONLY_INTENTS else cited,
             target_ids=_cited_ids(value.get("targets"), evidence),
             proposal=proposal,
             claim=None if claimed is None else _cited_claim(claimed, evidence),
@@ -2364,9 +2365,8 @@ def _json_text(value: object) -> str:
         raise ModelError("grounding evidence is not JSON-compatible") from None
 
 
-def _require_inline_size(
-    assets: Sequence[AssetRef],
-) -> None:
+def _require_inline_size(assets: Sequence[AssetRef]) -> None:
+    """Bound the base64 a request will carry, checking every asset is present and unchanged."""
     _require_verified_inline_size(_require_asset_integrity(assets))
 
 

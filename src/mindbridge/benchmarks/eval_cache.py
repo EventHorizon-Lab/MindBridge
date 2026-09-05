@@ -8,6 +8,7 @@ import math
 import os
 import sqlite3
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,8 +73,8 @@ class ResponseCache:
         self.namespace = namespace
         self._layered = layered
         self._closed = False
-        self._root = _open(self.root_path)
-        self._write = self._root if not layered else _open(self.write_path)
+        self._root = _open(self.root_path, _RESPONSES_DDL)
+        self._write = self._root if not layered else _open(self.write_path, _RESPONSES_DDL)
 
     def get(self, task: str, unit_id: str, question_id: str) -> CachedAnswer | None:
         key = self._key(task, unit_id, question_id)
@@ -143,15 +144,24 @@ class ResponseCache:
         return hashlib.sha256(encoded).hexdigest()
 
 
-def _open(path: Path) -> sqlite3.Connection:
+_RESPONSES_DDL = (
+    "CREATE TABLE IF NOT EXISTS responses ("
+    "cache_key TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL) WITHOUT ROWID"
+)
+_DESCRIPTIONS_DDL = (
+    "CREATE TABLE IF NOT EXISTS descriptions ("
+    "cache_key TEXT PRIMARY KEY NOT NULL, description TEXT NOT NULL) WITHOUT ROWID"
+)
+
+
+def _open(path: Path, ddl: str, *, check_same_thread: bool = True) -> sqlite3.Connection:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=60, isolation_level=None)
+    connection = sqlite3.connect(
+        path, timeout=60, isolation_level=None, check_same_thread=check_same_thread
+    )
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS responses ("
-        "cache_key TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL) WITHOUT ROWID"
-    )
+    connection.execute(ddl)
     if os.name == "posix":
         os.chmod(path, 0o600)
     return connection
@@ -250,16 +260,17 @@ class DescriptionCache:
     A caption becomes indexed text, and the measured generation endpoint returns a different
     completion for the same image on every call even at temperature 0 with a fixed seed. Two
     ingests of one corpus would therefore build different libraries, which makes a paired arm
-    incomparable with itself. Keying on the asset's own SHA-256 plus the describer's model makes
-    the second ingest reproduce the first exactly and spend nothing, and keeps two models'
-    captions from colliding in one file.
+    incomparable with itself. Keying on the asset's own SHA-256 plus the describer's vision space
+    makes the second ingest reproduce the first exactly and spend nothing. The space, not the
+    model, is the key the store itself uses: a cache keyed on the model alone would serve captions
+    written under an older prompt forever, so editing the prompt would measure a no-op.
     """
 
-    def __init__(self, path: Path, model: str) -> None:
-        if not model:
-            raise ValueError("description cache model must not be empty")
+    def __init__(self, path: Path, space: str) -> None:
+        if not space:
+            raise ValueError("description cache space must not be empty")
         self.path = path.expanduser().resolve()
-        self.model = model
+        self.space = space
         self.hits = 0
         self.misses = 0
         self._closed = False
@@ -267,7 +278,7 @@ class DescriptionCache:
         # the whole run from the thread that built the backend pool while units ingest on worker
         # threads. SQLite's per-thread binding is lifted and the calls are serialised here instead.
         self._lock = threading.Lock()
-        self._connection = _open_descriptions(self.path)
+        self._connection = _open(self.path, _DESCRIPTIONS_DDL, check_same_thread=False)
 
     def get(self, digest: str) -> str | None:
         with self._lock:
@@ -282,13 +293,32 @@ class DescriptionCache:
         return str(row[0])
 
     def put(self, digest: str, description: str) -> None:
-        if not description.strip():
-            raise ValueError("description must not be blank")
+        self.put_many(((digest, description),))
+
+    def put_many(self, items: Sequence[tuple[str, str]]) -> None:
+        """Write one batch of captions in one transaction.
+
+        `synchronous=FULL` costs an fsync per commit, and a described batch is written as a
+        batch, so committing each caption on its own made the cache slower than the endpoint.
+        """
+        rows = []
+        for digest, description in items:
+            if not description.strip():
+                raise ValueError("description must not be blank")
+            rows.append((self._key(digest), description))
+        if not rows:
+            return
         with self._lock:
-            self._connection.execute(
-                "INSERT OR REPLACE INTO descriptions(cache_key, description) VALUES (?, ?)",
-                (self._key(digest), description),
-            )
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._connection.executemany(
+                    "INSERT OR REPLACE INTO descriptions(cache_key, description) VALUES (?, ?)",
+                    rows,
+                )
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
 
     def close(self) -> None:
         with self._lock:
@@ -300,19 +330,5 @@ class DescriptionCache:
     def _key(self, digest: str) -> str:
         if not digest:
             raise ValueError("description cache digest must not be empty")
-        encoded = json.dumps((self.model, digest), ensure_ascii=False, separators=(",", ":"))
+        encoded = json.dumps((self.space, digest), ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(encoded.encode()).hexdigest()
-
-
-def _open_descriptions(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=60, isolation_level=None, check_same_thread=False)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=FULL")
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS descriptions ("
-        "cache_key TEXT PRIMARY KEY NOT NULL, description TEXT NOT NULL) WITHOUT ROWID"
-    )
-    if os.name == "posix":
-        os.chmod(path, 0o600)
-    return connection

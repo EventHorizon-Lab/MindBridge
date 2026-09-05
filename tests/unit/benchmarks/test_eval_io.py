@@ -8,6 +8,7 @@ import stat
 import zipfile
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Barrier, Event, Lock
@@ -19,7 +20,7 @@ import pytest
 
 import mindbridge.benchmarks.eval as eval_module
 import mindbridge.benchmarks.eval_adapters as eval_adapters
-from mindbridge import MindBridgeConfig, Modality
+from mindbridge import MemoryConfig, MemoryPlugins, MindBridgeConfig, Modality
 from mindbridge._telemetry import MODEL_MODULE, SPAN_KIND, mark_model_requests, model_span
 from mindbridge.benchmarks.atm_bench import ATM_BENCH_ADAPTER_VERSION
 from mindbridge.benchmarks.download import acquire_media
@@ -42,6 +43,7 @@ from mindbridge.benchmarks.eval_telemetry import (
     BENCHMARK_TASK_SPAN,
     EvaluationTelemetry,
 )
+from mindbridge.benchmarks.model_config import ModelConfig
 from mindbridge.benchmarks.prepare_media import (
     _OPENEQA_FRAME_RATE,
     _egolife_manifest,
@@ -1213,3 +1215,80 @@ def test_the_description_cache_is_opened_only_for_a_configured_vision_slot(
     assert eval_module._description_cache_path(no_response_cache, described) == (
         tmp_path / "cache" / "run-two" / "descriptions.db"
     )
+
+
+def test_a_prompt_change_at_one_model_does_not_replay_the_old_captions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The cache is keyed on the vision space the store uses, not on the model name alone.
+
+    Prompt, seed, temperature, and token cap are all in the space. Keyed on the model, editing
+    the prompt and rerunning would serve every caption from the old prompt while persisting it
+    into `visual_descriptions` under the new space, so the change would measure a no-op.
+    """
+    value = _description_input(tmp_path, "e" * 64)
+    cache_path = tmp_path / "cache" / "descriptions.db"
+
+    def pool(describer: _CountingDescriber) -> eval_module._BackendPool:
+        resolved = SimpleNamespace(
+            plugins=SimpleNamespace(
+                **{
+                    field.name: {
+                        "vision_describer": describer,
+                        "embedder": SimpleNamespace(),
+                    }.get(field.name)
+                    for field in fields(MemoryPlugins)
+                }
+            ),
+            settings=MemoryConfig(),
+            close=lambda: None,
+        )
+        monkeypatch.setattr(eval_module, "resolve_memory_config", lambda _config: resolved)
+        return eval_module._BackendPool(
+            ModelConfig(),
+            device=None,
+            batch_size=1,
+            needs_speech=False,
+            seed=0,
+            memory_config=MindBridgeConfig.model_validate({"embedding": {"provider": "openai"}}),
+            description_cache=cache_path,
+        )
+
+    def described_by(describer: _CountingDescriber) -> tuple[str, ...]:
+        built = pool(describer)
+        cache = built._description_cache
+        assert cache is not None and cache.space == describer.vision_space
+        try:
+            assert built._vision_describer is not None
+            return built._vision_describer.describe((value,))
+        finally:
+            cache.close()
+
+    first_backend = _CountingDescriber(prefix="old-prompt")
+    first_backend.vision_space = "caption-model:prompt-v1"
+    second_backend = _CountingDescriber(prefix="new-prompt")
+    second_backend.vision_space = "caption-model:prompt-v2"
+
+    original = described_by(first_backend)
+    described = described_by(second_backend)
+
+    assert first_backend.vision_model == second_backend.vision_model
+    assert original == ("old-prompt for eeee",)
+    assert described == ("new-prompt for eeee",)
+
+
+def test_a_described_batch_is_written_and_rejected_as_one_transaction(tmp_path: Path) -> None:
+    digests = [format(index, "064x") for index in range(8)]
+    cache = DescriptionCache(tmp_path / "descriptions.db", "caption-model:prompt-v1")
+    try:
+        cache.put_many([(digest, f"caption {digest[-1]}") for digest in digests])
+        assert [cache.get(digest) for digest in digests] == [
+            f"caption {digest[-1]}" for digest in digests
+        ]
+        with pytest.raises(ValueError, match="blank"):
+            cache.put_many([(format(8, "064x"), "later"), (format(9, "064x"), "  ")])
+        # A blank anywhere in the batch is caught before the transaction opens, so the batch is
+        # rejected whole rather than leaving its prefix behind.
+        assert cache.get(format(8, "064x")) is None
+    finally:
+        cache.close()

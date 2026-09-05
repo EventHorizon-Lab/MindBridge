@@ -51,7 +51,8 @@ have one place to stay current.
 ## Understand the direction
 
 - [Context OS direction](context-os.md) — the long-term product boundary, fast and slow context
-  planes, agentic memory management, and context compilation.
+  planes, agentic memory management, context compilation, and the evolution gates the current
+  release is working through.
 - [Product goals and design principles](design-principles.md) — the product target, the design
   goals, and the criteria a change must answer. States direction, not implemented status.
 - [Plugin architecture](plugin-architecture.md) — the kernel/plugin boundary and the admission rule

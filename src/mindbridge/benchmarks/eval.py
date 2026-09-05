@@ -697,14 +697,18 @@ class _CachedVisionDescriber:
         # One call for the whole miss set, so a partially cached batch still costs one request.
         fresh = iter(() if not pending else self._backend.describe(pending))
         described: list[str] = []
+        written: list[tuple[str, str]] = []
         for key, found in zip(keys, known, strict=True):
             if found is not None:
                 described.append(found)
                 continue
             value = next(fresh)
             if key is not None:
-                self._cache.put(key, value)
+                written.append((key, value))
             described.append(value)
+        # One commit for the batch: the cache is `synchronous=FULL`, so a per-caption write cost
+        # an fsync each.
+        self._cache.put_many(written)
         return tuple(described)
 
     def close(self) -> None:
@@ -873,7 +877,7 @@ class _BackendPool:
                 # cache file at all and behaves exactly as it does today.
                 if description_cache is not None:
                     self._description_cache = DescriptionCache(
-                        description_cache, plugins.vision_describer.vision_model
+                        description_cache, plugins.vision_describer.vision_space
                     )
                     borrowed = cast(
                         VisionDescriptionBackend,
@@ -2727,6 +2731,10 @@ def _sample(
         ranked_source_ids,
         predict_only=predict_only,
         arm=arm,
+        # A question whose run recorded no complete ranked list -- a replay from a cache
+        # written before the list was stored -- carries no retrieval score. Reporting the empty
+        # list as recall zero would invent one, and the task's `retrieval` block excludes exactly
+        # the same samples, so both surfaces report over one denominator.
         retrieval_available=(
             arm.retrieves and ranked_source_ids_complete and retrieval_diagnostic_error is None
         ),
@@ -2817,11 +2825,11 @@ def _score(
     metrics = _arm_metrics(metrics, arm, retrieval_available=retrieval_available)
     if answer_failed:
         # Keep the separately measured retrieval diagnostic and leave the failed answer unscored
-        # so it lands in `error_count`, not in the mean.
+        # so it lands in `error_count`, not in the mean. The `joint_*` metrics go with it: they
+        # are accuracy times recall, so scoring the empty prediction would put a confident zero
+        # back in under another name.
         diagnostic = {
-            name: value
-            for name, value in metrics.items()
-            if name.startswith(("retrieval_", "joint_"))
+            name: value for name, value in metrics.items() if name.startswith("retrieval_")
         }
         return diagnostic, None, None
     score = metrics.get(sample_primary_metric(task_name), metrics.get("token_f1"))
@@ -3937,6 +3945,7 @@ def _retrieval_quality(
             "recall_limit": recall_limit,
             "retrieval_candidate_limit": ranked_limit,
             "labelled_question_count": 0,
+            "unranked_labelled_question_count": 0,
             "recall_at_k": {},
             "random_ranker_recall_at_k": {},
             "unresolved_gold_evidence_ids": unresolved,

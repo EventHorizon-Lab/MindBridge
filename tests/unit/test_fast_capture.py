@@ -750,3 +750,15 @@ def test_a_capture_keeps_the_place_it_was_captured_in(tmp_path: Path) -> None:
         assert {
             hit.id for hit in memory.search("kettle", scope=RetrievalScope(place_id="kitchen"))
         } == {record.id}
+
+
+def test_settle_counts_only_the_rows_it_actually_settled(tmp_path: Path) -> None:
+    """A row another writer settled first is not this pass's work, so it is not counted."""
+    with Memory(tmp_path, embedder=CountingEmbedder(), minimum_relevance=0) as memory:
+        memory.capture("the spare key is in the blue toolbox")
+        # What losing the race looks like from inside: the row is gone by the time this pass
+        # claims it, so `_enrich_row` returns None and nothing was embedded or completed.
+        memory._store.settle_capture = lambda *args, **kwargs: False  # type: ignore[method-assign]
+
+        assert memory.settle() == 0
+        assert len(memory.pending_captures()) == 1

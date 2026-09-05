@@ -232,9 +232,10 @@ Three things bound what it costs and what it can do:
   file name, or store path -- and a reply that does not return exactly one non-empty caption per
   visual is rejected whole rather than mislabelling a memory with another's contents. The 20 MiB
   per-item and 64 MiB aggregate inline limits apply to these outbound image data URLs, including
-  decoded video stills, rather than to a video file that is never uploaded. One
-  malformed reply is retried once, because an endpoint can answer `200 OK` with invalid JSON and
-  an SDK retry policy never sees that; a second failure, or any other failure, leaves the memory
+  decoded video stills, rather than to a video file that is never uploaded. One malformed reply
+  is retried once -- as it is for formation and consolidation, which parse JSON from the same
+  endpoint -- because an endpoint can answer `200 OK` with invalid JSON and an SDK retry policy
+  never sees that; a second failure, or any other failure, leaves the memory
   stored **without** a caption rather than failing the write. Losing derived text must never lose
   an observation the caller handed over. Those batches are counted on the vision span as
   `mindbridge.vision.failed_batches`, so the loss is measurable rather than silent.

@@ -330,15 +330,17 @@ lifecycle guidance is in [deployment](deployment.md), with backup and repair pro
 
 MindBridge keeps a stable memory kernel and varies computation at typed capability boundaries:
 `EmbeddingBackend`, `GenerationBackend`, `StreamingGenerationBackend`, `TranscriptionBackend`,
-`SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, and `FormationBackend`. Routing reads
-declared modalities and stable model-space identities, while the kernel retains control of
-validation, record identity, durability, evidence, final hydration, and lifecycle.
+`SpeechBackend`, `VisionDescriptionBackend`, `FaceBackend`, `FormationBackend`, and
+`ConsolidationBackend`. Routing reads declared modalities and stable model-space identities, while
+the kernel retains control of validation, record identity, durability, evidence, final hydration,
+and lifecycle.
 
 Applications can compose those objects directly, group them in `MemoryPlugins`, or use
 `Memory.from_config` for the bundled provider catalog. Current bundled adapters cover Jina Omni and
-Sentence Transformers embedding, OpenAI-compatible embedding/generation/transcription/formation,
-FunASR speech, and OpenCV face analysis. Exact extras, provider fields, model revisions, and license
-constraints are maintained in [configuration](configuration.md).
+Sentence Transformers embedding, OpenAI-compatible
+embedding/generation/transcription/formation/vision/consolidation, FunASR speech, and OpenCV face
+analysis. Exact extras, provider fields, model revisions, and license constraints are maintained in
+[configuration](configuration.md).
 
 This boundary generalizes in three directions without changing the memory API:
 
@@ -364,8 +366,6 @@ capability.
   application must enforce its own network and download policy before creating a `Blob`.
 - Multimodal coverage is the intersection of input and configured backend capabilities. Unsupported
   routes fail; installing an extra does not by itself configure a model.
-- `VisionDescriptionBackend` is public and reachable by object injection, but no bundled vision
-  description implementation currently ships.
 - Formation is optional model inference, not guaranteed truth. Its records retain basis,
   confidence, source evidence, model, and recipe so callers can apply their own trust policy.
 - Search can return no evidence. Scores are request-local ranking values, not calibrated

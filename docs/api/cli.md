@@ -116,7 +116,7 @@ credential behavior live in [configuration](../configuration.md).
 | `record-outcome` | `OPERATION_ID OUTCOME`; `--note` | `{"recorded":bool}` | no |
 | `forget` | one or more `MEMORY_ID` values | `{"operation":{...}}` or `{"operation":null}` | no |
 | `rollback` | `OPERATION_ID` | `{"rolled_back":bool}` | no |
-| `operations` | `--limit` | `{"operations":[...]}` | no |
+| `operations` | `--limit` | `{"operations":[...]}`, each row carrying the `claim` an `identify` applied, the `identity` a `merge` moved, the `consent` a subject stated, and the `proposal` a `consolidate` wrote, or `null` | no |
 | `export` | exactly one of `--identity-id` or repeatable `--memory-id` | export bundle | no |
 | `apply-retention` | `--dry-run` | retention report | no |
 | `list` | `--limit`; `--cursor` | `{"items":[...],"next_cursor":...}` | yes |
