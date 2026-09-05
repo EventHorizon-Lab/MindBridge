@@ -10,6 +10,7 @@ from typing import Protocol, runtime_checkable
 
 from mindbridge.exceptions import ValidationError
 from mindbridge.types import (
+    AnswerPolicy,
     AnswerResult,
     AssetRef,
     FormationProposal,
@@ -329,7 +330,13 @@ class GenerationBackend(Protocol):
     @property
     def generation_capabilities(self) -> frozenset[Modality]: ...
 
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult: ...
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "abstain",
+    ) -> AnswerResult: ...
 
     def close(self) -> None: ...
 
@@ -342,6 +349,8 @@ class StreamingGenerationBackend(Protocol):
         self,
         question: ModelInput,
         hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "abstain",
     ) -> Iterator[str]: ...
 
 

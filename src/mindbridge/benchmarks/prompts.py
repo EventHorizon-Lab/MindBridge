@@ -7,6 +7,23 @@ observe/recall path may read them, and they must never influence the shared answ
 
 from dataclasses import dataclass
 
+from mindbridge.types import AnswerPolicy
+
+# The tasks whose official evaluation gives no credit for "unknown" and whose question sets hold
+# no genuinely unanswerable item, so an abstention there is a lost point rather than a correct
+# report. M3-Bench-Robot is scored by a judge against a reference answer with no abstention
+# class, and EgoLifeQA is 4-way multiple choice where the official protocol expects one of the
+# four letters. Every other task keeps `abstain`, because abstaining is part of what they
+# measure: LongMemEval and MEMLENS carry abstention abilities, ATM-Bench scores abstention as a
+# class, LoCoMo's category 5 is adversarial, and Mem-Gallery's `AR` mandates its own refusal
+# wording. This is protocol alignment on the request side; no scorer is changed by it.
+BEST_EFFORT_TASKS = frozenset({"m3-bench-robot", "egolifeqa"})
+
+
+def task_answer_policy(task_name: str) -> AnswerPolicy:
+    """Return the answer policy one benchmark task's official protocol calls for."""
+    return "best_effort" if task_name in BEST_EFFORT_TASKS else "abstain"
+
 
 @dataclass(frozen=True, slots=True)
 class PromptSpec:

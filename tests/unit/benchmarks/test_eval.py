@@ -30,6 +30,7 @@ from pydantic import ValidationError
 import mindbridge.benchmarks.eval as eval_module
 from mindbridge import (
     AbstentionReason,
+    AnswerPolicy,
     AnswerResult,
     AssetRef,
     AsyncMemory,
@@ -1224,6 +1225,7 @@ async def test_memlens_question_date_is_a_reference_clock_not_query_text(tmp_pat
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> AnswerResult:
             assert limit == 5
             observed.append(reference_at)
@@ -1601,8 +1603,9 @@ class _FakeMemory:
         *,
         limit: int,
         reference_at: datetime | None = None,
+        answer_policy: AnswerPolicy = "abstain",
     ) -> AnswerResult:
-        del reference_at
+        del reference_at, answer_policy
         self.events.append(f"ask:{question}:{limit}")
         return AnswerResult("A")
 
@@ -2450,8 +2453,9 @@ async def test_runner_scores_the_actual_ranking_at_a_causal_cutoff(
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> AnswerResult:
-            del question, limit, reference_at
+            del question, limit, reference_at, answer_policy
             _record_retrieval_results((ranked,))
             return AnswerResult("answer", (ranked,))
 
@@ -2573,9 +2577,10 @@ async def test_runner_applies_request_concurrency_across_units(tmp_path: Path) -
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> AnswerResult:
             nonlocal active, peak
-            del question, limit, reference_at
+            del question, limit, reference_at, answer_policy
             active += 1
             peak = max(peak, active)
             await asyncio.sleep(0.01)
@@ -2637,8 +2642,9 @@ async def test_standalone_search_reopens_warm_stores_after_every_answer(
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> AnswerResult:
-            del limit, reference_at
+            del limit, reference_at, answer_policy
             events.append(f"answer-start:{question}")
             await asyncio.sleep(0)
             events.append(f"answer-end:{question}")
@@ -2727,8 +2733,9 @@ async def test_run_arms_defers_replay_until_every_task_answer_finishes(
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> AnswerResult:
-            del limit, reference_at
+            del limit, reference_at, answer_policy
             events.append(f"answer:{question}")
             _record_retrieval_results(
                 (
@@ -2908,8 +2915,9 @@ async def test_answer_many_latency_excludes_request_semaphore_wait() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> AnswerResult:
-            del limit, reference_at
+            del limit, reference_at, answer_policy
             if question == "slow":
                 slow_started.set()
                 await release_slow.wait()
@@ -2949,8 +2957,9 @@ async def test_answer_many_reports_each_completed_answer_immediately() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> AnswerResult:
-            del limit, reference_at
+            del limit, reference_at, answer_policy
             if question == "slow":
                 await release_slow.wait()
             return AnswerResult("A")
@@ -2993,8 +3002,9 @@ async def test_answer_many_reports_failed_outcome_immediately() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> AnswerResult:
-            del limit, reference_at
+            del limit, reference_at, answer_policy
             if question == "failed":
                 raise RuntimeError("answer failed")
             await release_slow.wait()
@@ -3164,8 +3174,9 @@ async def test_runner_reports_cached_progress_before_pending_answer_finishes(
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> AnswerResult:
-            del limit, reference_at
+            del limit, reference_at, answer_policy
             await release_slow.wait()
             return AnswerResult("A")
 
@@ -3316,8 +3327,9 @@ async def test_answer_many_preserves_structured_abstention() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> AnswerResult:
-            del question, limit, reference_at
+            del question, limit, reference_at, answer_policy
             return AnswerResult(
                 "unknown",
                 abstained=True,
@@ -5148,3 +5160,21 @@ def test_run_arms_hands_every_task_to_the_completion_callback(tmp_path: Path) ->
     # Called once per task, in task order, before the next task starts.
     assert seen == [("atm-bench", 1), ("locomo-refined", 1)]
     assert [sample.prediction for sample in samples] == ["rewritten", "rewritten"]
+
+
+def test_only_the_two_tasks_whose_protocol_credits_no_abstention_ask_for_a_guess() -> None:
+    """Pinned as a set: widening it silently turns a reported refusal into an invented answer.
+
+    Every other task measures abstention in some form -- LongMemEval and MEMLENS carry abstention
+    abilities, ATM-Bench scores it as a class, LoCoMo's category 5 is adversarial -- so asking
+    those for a guess would be a scoring change, not a protocol alignment.
+    """
+    from mindbridge.benchmarks.prompts import BEST_EFFORT_TASKS, task_answer_policy
+    from mindbridge.benchmarks.task_catalog import TASKS
+
+    assert {"m3-bench-robot", "egolifeqa"} == BEST_EFFORT_TASKS
+    assert set(TASKS) >= BEST_EFFORT_TASKS
+    assert {
+        name for name in TASKS if task_answer_policy(name) == "best_effort"
+    } == BEST_EFFORT_TASKS
+    assert task_answer_policy("m3-bench-web") == "abstain"

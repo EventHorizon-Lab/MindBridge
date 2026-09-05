@@ -31,6 +31,7 @@ from mindbridge.exceptions import (
 )
 from mindbridge.types import (
     AffectCue,
+    AnswerPolicy,
     AnswerResult,
     AssetRef,
     Blob,
@@ -276,9 +277,12 @@ class FakeMemory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
+        answer_policy: AnswerPolicy = "abstain",
     ) -> AnswerResult:
         self._fail()
-        self.calls.append(("ask", question, limit, memory_type, reference_at, link_identities))
+        self.calls.append(
+            ("ask", question, limit, memory_type, reference_at, link_identities, answer_policy)
+        )
         return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
 
     def get(self, memory_id: str) -> MemoryRecord:
@@ -391,7 +395,14 @@ async def test_mcp_publishes_only_the_flat_local_tools() -> None:
             "scope",
             "explain",
         },
-        "ask_memory": {"question", "limit", "memory_type", "reference_at", "scope"},
+        "ask_memory": {
+            "question",
+            "limit",
+            "memory_type",
+            "reference_at",
+            "scope",
+            "answer_policy",
+        },
         "compile_context": {
             "goal",
             "budget",
@@ -530,7 +541,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
             OCCURRED_FROM,
             OCCURRED_UNTIL,
         ),
-        ("ask", "What color?", 5, MemoryType.PROCEDURAL, NOW, True),
+        ("ask", "What color?", 5, MemoryType.PROCEDURAL, NOW, True, "abstain"),
         ("get", "memory_1"),
         ("list", 7, "cursor_1"),
         ("delete", "memory_1"),
@@ -1454,7 +1465,7 @@ async def test_ask_memory_passes_embodied_operations_as_link_identities() -> Non
     async with Client(build_mcp_server(cast(Memory, memory), embodied_operations=True)) as client:
         await client.call_tool("ask_memory", {"question": "who is this?"})
 
-    link_identities_by_call = [call[-1] for call in memory.calls if call[0] == "ask"]
+    link_identities_by_call = [call[-2] for call in memory.calls if call[0] == "ask"]
     assert link_identities_by_call == [False, True]
 
 
@@ -1640,3 +1651,19 @@ def test_the_budget_tool_description_states_the_live_defaults() -> None:
 
     assert f"which are {budget.max_chars:,} characters and {budget.max_items} items" in description
     assert "which are 6,000" not in description
+
+
+async def test_ask_memory_forwards_the_answer_policy_and_rejects_an_unknown_one() -> None:
+    memory = FakeMemory()
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        await client.call_tool("ask_memory", {"question": "who is this?"})
+        await client.call_tool(
+            "ask_memory", {"question": "who is this?", "answer_policy": "best_effort"}
+        )
+        rejected = await client.call_tool(
+            "ask_memory", {"question": "who is this?", "answer_policy": "guess"}
+        )
+
+    assert rejected.is_error is True
+
+    assert [call[-1] for call in memory.calls if call[0] == "ask"] == ["abstain", "best_effort"]

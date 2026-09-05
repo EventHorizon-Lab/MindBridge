@@ -161,7 +161,7 @@ Request fields and defaults are:
 | `MemoryBatchCreate` | `contents` with 1–100 items; optional per-item arrays `occurred_at`, `occurred_end`, `metadata`, `context`; `memory_type="semantic"` for the complete batch |
 | `QueryRequest` | required `query`; `limit=10`; `explain=false`; optional `memory_type`, `reference_at`, `occurred_from`, `occurred_until`, `scope` |
 | `ReinforceRequest` | required `memory_ids` with 1–100 IDs |
-| `AnswerRequest` | required `question`; `limit=5`; optional `memory_type`, `reference_at`, `scope` |
+| `AnswerRequest` | required `question`; `limit=5`; `answer_policy="abstain"`; optional `memory_type`, `reference_at`, `scope` |
 | `ConsentRequest` | required `state` (`granted`, `withheld`, or `withdrawn`); optional `note` |
 | `RetentionRequest` | `dry_run=false` |
 | `ContextRequest` | required `goal`; optional `budget`, `reference_at`, `scope`; `allow_partial_sources=false` |
@@ -371,7 +371,15 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 `null`. `abstained` reports that the answerer emitted the reserved `[insufficient_evidence]`
 token, or that grounding found no usable evidence at all; a model that declines in its own words
 some other way is an ordinary answer. See
-[the SDK contract](python-sdk.md#public-values) for the exact rule. A response `context` is
+[the SDK contract](python-sdk.md#public-values) for the exact rule.
+
+`answer_policy` is `abstain` or `best_effort` and belongs to the caller. `abstain`, the default,
+returns a fixed refusal sentence when the evidence is thin. `best_effort` returns the most likely
+answer the evidence supports instead -- for a multiple-choice question, always one of the options
+-- and still sets `abstained` and `abstention_reason`, so a client whose protocol gives no credit
+for "unknown" keeps the confidence signal alongside a usable answer. On `POST
+/v1/answers/stream` the deltas are the provider's own and may carry the marker; the terminal
+`result` event holds the cleaned answer. A response `context` is
 the authoritative `MemoryContext`: typed kind and basis, confidence, valid and transaction time,
 visibility, lineage/source/evidence/supersession IDs, model recipe, optional
 subject/predicate/value, spatial pose, and affect cue fields. It is `null` on a raw record formed

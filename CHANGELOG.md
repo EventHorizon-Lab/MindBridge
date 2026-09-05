@@ -10,6 +10,23 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- `answer_policy` on `Memory.ask()`, `Memory.ask_stream()`, their `AsyncMemory` twins, REST
+  `AnswerRequest`, and the MCP `ask_memory` tool, with the new `AnswerPolicy` alias exported from
+  `mindbridge`. Abstaining is a policy the caller owns, not a fixed product behaviour: an
+  unanswerable question deserves a refusal, while a multiple-choice caller, or one whose protocol
+  gives no credit for "unknown", loses the whole answer to one. The default `"abstain"` is
+  unchanged in behaviour and sends a byte-identical prompt. `"best_effort"` instructs the answerer
+  to commit to the single most likely answer the evidence supports -- for a multiple-choice
+  question, always one of the offered options -- and to flag low confidence with the structured
+  marker on its own line before the answer, which MindBridge reads and removes. The result then
+  carries the same `abstained` and `abstention_reason` alongside a usable `answer`, so the
+  confidence signal survives. A `"best_effort"` question that retrieved nothing at all now reaches
+  the model as a guess instead of returning early, and is still reported as abstained with
+  `AbstentionReason.NO_EVIDENCE`. `GenerationBackend.answer` and
+  `StreamingGenerationBackend.stream_answer` take the same keyword-only argument, defaulted, so a
+  custom backend only needs it once a caller opts in. The benchmark harness sets `"best_effort"`
+  for exactly `m3-bench-robot` and `egolifeqa`, whose official evaluations credit no abstention
+  and whose question sets hold no unanswerable item; every other task keeps `"abstain"`.
 - Local storage advances to schema v18. Evidence is stored as clauses: a `CONSOLIDATE` operation's
   cited set is one conjunction, separate operations are alternatives, and withdrawing a source
   retires only the clauses it belonged to, so `(A AND B) OR C` keeps `C` when `A` goes. Derived

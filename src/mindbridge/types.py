@@ -127,6 +127,14 @@ class AbstentionReason(str, Enum):
     INSUFFICIENT_EVIDENCE = "insufficient_evidence"
 
 
+# Whether declining is the caller's preferred failure. Abstaining is right for a caller whose
+# questions can be genuinely unanswerable and wrong for one whose protocol gives no credit for
+# "unknown" -- a multiple-choice caller, or a benchmark scored only on a committed answer. The
+# product default stays `abstain`; `best_effort` still reports the insufficiency through
+# `AnswerResult.abstained`, it just also commits to the most likely answer.
+AnswerPolicy: TypeAlias = Literal["abstain", "best_effort"]
+
+
 class IndexQuantization(str, Enum):
     """Explicit compression applied only to the rebuildable vector index."""
 

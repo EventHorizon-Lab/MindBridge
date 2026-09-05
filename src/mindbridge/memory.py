@@ -39,7 +39,7 @@ from itertools import zip_longest
 from pathlib import Path
 from threading import Condition, RLock, local
 from time import perf_counter
-from typing import Literal, Protocol, TypeVar, cast
+from typing import Literal, Protocol, TypeVar, cast, get_args
 
 from opentelemetry import trace
 from opentelemetry.trace import Span, Tracer
@@ -150,6 +150,7 @@ from mindbridge.types import (
     AbstentionReason,
     AcousticBoundary,
     AnswerChunk,
+    AnswerPolicy,
     AnswerResult,
     ASRPartial,
     AssetRef,
@@ -1532,8 +1533,16 @@ class Memory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
+        answer_policy: AnswerPolicy = "abstain",
     ) -> AnswerResult:
         """Answer a native or mixed-modal question only from retrieved memories.
+
+        `answer_policy` decides what happens when the retrieved evidence is thin. The default,
+        `"abstain"`, refuses: `answer` is a fixed sentence and `abstained` is true. With
+        `"best_effort"` the answerer commits to the most likely answer the evidence supports --
+        for a multiple-choice question, always one of the options -- and still reports the same
+        `abstained` and `abstention_reason`, so a caller whose protocol gives no credit for
+        "unknown" gets a usable answer without losing the confidence signal.
 
         `link_identities` gates the one write `ask` can otherwise reach: when a retrieved image
         or video corroborates a voice-and-face pair, face recognition still runs to identify who
@@ -1551,6 +1560,7 @@ class Memory:
             reference_at=reference_at,
             scope=scope,
             link_identities=link_identities,
+            answer_policy=answer_policy,
         )
         while True:
             try:
@@ -1567,6 +1577,7 @@ class Memory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
+        answer_policy: AnswerPolicy = "abstain",
     ) -> Generator[AnswerChunk, None, AnswerResult]:
         """Answer as `ask()` does, but yield the answer while the model is still producing it.
 
@@ -1580,6 +1591,7 @@ class Memory:
         generator is closed or collected, and `close()` waits for open operations.
         """
         _limit(limit, maximum=100)
+        _answer_policy(answer_policy)
         self._require_answerer()
         return self._ask_chunks(
             question,
@@ -1588,6 +1600,7 @@ class Memory:
             reference_at=reference_at,
             scope=scope,
             link_identities=link_identities,
+            answer_policy=answer_policy,
         )
 
     def _require_answerer(self) -> None:
@@ -1607,6 +1620,7 @@ class Memory:
         reference_at: datetime | None,
         scope: RetrievalScope | None,
         link_identities: bool,
+        answer_policy: AnswerPolicy,
     ) -> Generator[AnswerChunk, None, AnswerResult]:
         answer = yield from self._ask_operation(
             question,
@@ -1615,6 +1629,7 @@ class Memory:
             reference_at=reference_at,
             scope=scope,
             link_identities=link_identities,
+            answer_policy=answer_policy,
         )
         # The operation and its span close before the result is handed over. A generator stays
         # suspended at whichever yield the caller stops on, so a terminal chunk yielded inside
@@ -1632,6 +1647,7 @@ class Memory:
         reference_at: datetime | None,
         scope: RetrievalScope | None,
         link_identities: bool,
+        answer_policy: AnswerPolicy,
     ) -> Generator[AnswerChunk, None, AnswerResult]:
         started = perf_counter()
         operation_ttft_recorded = False
@@ -1643,6 +1659,7 @@ class Memory:
             if queue_time_ms is not None:
                 span.set_attribute(ASYNC_QUEUE_TIME, queue_time_ms)
             _limit(limit, maximum=100)
+            _answer_policy(answer_policy)
             self._require_answerer()
             # `search()` opens a `mindbridge.search` operation span; `ask` reaches the same
             # retrieval plane directly. Keep its stage around every prerequisite through ranked
@@ -1721,7 +1738,9 @@ class Memory:
             # when the cleared frame drops its last reference. That defers closing the
             # provider's response and ends `mindbridge.model.generation` after its own parent,
             # which loses the call's model usage and emits a malformed trace.
-            with closing(self._answer_chunks(routed_question, routed_hits)) as deltas:
+            with closing(
+                self._answer_chunks(routed_question, routed_hits, answer_policy=answer_policy)
+            ) as deltas:
                 while True:
                     try:
                         delta = next(deltas)
@@ -7286,6 +7305,8 @@ class Memory:
         self,
         question: ModelInput,
         hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "abstain",
     ) -> Generator[str, None, AnswerResult]:
         """Yield answer deltas in provider order and return the validated grounded result.
 
@@ -7316,7 +7337,9 @@ class Memory:
                 if isinstance(self._answerer, StreamingGenerationBackend):
                     started = perf_counter()
                     parts: builtins.list[str] = []
-                    stream = iter(self._answerer.stream_answer(question, hits))
+                    stream = iter(
+                        self._answerer.stream_answer(question, hits, answer_policy=answer_policy)
+                    )
                     used_hits: object = None
                     try:
                         while True:
@@ -7364,6 +7387,17 @@ class Memory:
                         isinstance(hit, SearchHit) for hit in used_hits
                     ):
                         grounded = used_hits
+                        # A backend may report an answer that is not the concatenated deltas:
+                        # under `best_effort` the stream carries a low-confidence marker line
+                        # that belongs to `abstained`, not to the prose the caller shows.
+                        reported = getattr(used_hits, "answer", None)
+                        if reported is not None:
+                            if not isinstance(reported, str) or not reported.strip():
+                                raise ModelError(
+                                    "generation model returned an invalid answer",
+                                    reason="response_invalid",
+                                )
+                            answer = reported
                         abstention_reason = getattr(used_hits, "abstention_reason", None)
                         if abstention_reason is not None and not isinstance(
                             abstention_reason, AbstentionReason
@@ -7386,7 +7420,7 @@ class Memory:
                             abstention_reason=reason,
                         )
                 else:
-                    result = self._answerer.answer(question, hits)
+                    result = self._answerer.answer(question, hits, answer_policy=answer_policy)
                     buffered = True
             except MindBridgeError:
                 raise
@@ -8092,6 +8126,7 @@ class AsyncMemory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
+        answer_policy: AnswerPolicy = "abstain",
     ) -> AnswerResult:
         queued_at = perf_counter()
 
@@ -8105,6 +8140,7 @@ class AsyncMemory:
                     reference_at=reference_at,
                     scope=scope,
                     link_identities=link_identities,
+                    answer_policy=answer_policy,
                 )
             finally:
                 _ASYNC_QUEUE_TIME_MS.reset(token)
@@ -8120,6 +8156,7 @@ class AsyncMemory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
+        answer_policy: AnswerPolicy = "abstain",
     ) -> AsyncGenerator[AnswerChunk, None]:
         """Answer as `ask()` does, yielding chunks as the model produces them.
 
@@ -8139,6 +8176,7 @@ class AsyncMemory:
             reference_at=reference_at,
             scope=scope,
             link_identities=link_identities,
+            answer_policy=answer_policy,
         )
         return self._pump(stream)
 
@@ -11753,6 +11791,11 @@ def _identity_name(value: object) -> str:
 def _limit(value: object, *, maximum: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
         raise ValidationError(f"limit must be between 1 and {maximum}")
+
+
+def _answer_policy(value: object) -> None:
+    if value not in get_args(AnswerPolicy):
+        raise ValidationError("answer_policy must be 'abstain' or 'best_effort'")
 
 
 def _normalized_vector(values: Sequence[float], dimension: int) -> tuple[float, ...]:

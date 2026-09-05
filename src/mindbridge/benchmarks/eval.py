@@ -47,6 +47,7 @@ from mindbridge import (
     DEFAULT_FUNASR_MODEL_ID,
     DEFAULT_FUNASR_RECIPE,
     AbstentionReason,
+    AnswerPolicy,
     AnswerResult,
     AssetRef,
     AsyncMemory,
@@ -166,6 +167,7 @@ from mindbridge.benchmarks.official_scorers import (
     task_primary_metric,
 )
 from mindbridge.benchmarks.prepare_media import _has_audio, prepare_task_media
+from mindbridge.benchmarks.prompts import task_answer_policy
 from mindbridge.benchmarks.task_catalog import (
     TASKS,
     expand,
@@ -955,6 +957,8 @@ class _BorrowedBackend:
         self,
         question: ModelInput,
         hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "abstain",
     ) -> Iterator[str]:
         return cast(Iterator[str], cast(Any, self._backend).stream_answer(question, hits))
 
@@ -1043,7 +1047,13 @@ class _BorrowedGenerationBackend(_BorrowedBackend):
     def generation_capabilities(self) -> frozenset[Modality]:
         return cast(GenerationBackend, self._backend).generation_capabilities
 
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "abstain",
+    ) -> AnswerResult:
         return cast(GenerationBackend, self._backend).answer(question, hits)
 
 
@@ -3400,6 +3410,10 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                 (),
             )
         result: AnswerResult | None = None
+        # Protocol alignment, not a scorer change: two tasks' official evaluations give no credit
+        # for "unknown", so the request asks for a committed answer there. `task_answer_policy`
+        # owns the mapping and its rationale.
+        answer_policy = task_answer_policy(task_name)
         with _observe_retrieval_results(observe_retrieval):
             ask_stream = getattr(memory, "ask_stream", None)
             if ask_stream is None:
@@ -3407,6 +3421,7 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                     content,
                     limit=recall_limit,
                     reference_at=question.reference_at,
+                    answer_policy=answer_policy,
                 )
             else:
                 first_token_seen = False
@@ -3414,6 +3429,7 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                     content,
                     limit=recall_limit,
                     reference_at=question.reference_at,
+                    answer_policy=answer_policy,
                 ):
                     if chunk.text.strip() and not first_token_seen:
                         first_token_seen = True

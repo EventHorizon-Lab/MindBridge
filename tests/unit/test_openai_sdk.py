@@ -4388,3 +4388,133 @@ def test_one_malformed_formation_reply_is_retried_once() -> None:
     assert [proposal.kind for proposal in proposals] == [MemoryKind.STATE]
     assert len(sent) == 2
     assert sent[0] == sent[1]
+
+
+def _answer_policy_transport(
+    requests: list[dict[str, object]],
+    reply: str,
+) -> httpx.MockTransport:
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(cast(dict[str, object], json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"index": 0, "message": {"content": reply}, "finish_reason": "stop"}]
+            },
+        )
+
+    return httpx.MockTransport(respond)
+
+
+def test_the_default_answer_policy_sends_the_same_request_as_asking_for_abstention() -> None:
+    """`answer_policy` is opt-in: the default path must be byte-identical to what it was."""
+    requests: list[dict[str, object]] = []
+    hit = SearchHit(id="memory_1", content="the toolbox is blue", score=0.9, created_at=NOW)
+    with httpx.Client(transport=_answer_policy_transport(requests, "Blue.")) as client:
+        model = _model(_sdk_client(client))
+        model.answer("What colour?", (hit,))
+        model.answer("What colour?", (hit,), answer_policy="abstain")
+
+    assert requests[0] == requests[1]
+    assert requests[0]["messages"] == [
+        {"role": "system", "content": openai_backend._GROUNDED_SYSTEM_PROMPT},
+        cast(list[dict[str, object]], requests[0]["messages"])[1],
+    ]
+    assert (
+        f"If the hits do not contain enough evidence, reply with exactly "
+        f"{openai_backend._ABSTENTION_MARKER} and nothing else, whatever language the question "
+        "uses."
+    ) in openai_backend._GROUNDED_SYSTEM_PROMPT
+
+
+def test_best_effort_asks_for_a_committed_answer_and_reports_the_marker_separately() -> None:
+    requests: list[dict[str, object]] = []
+    hit = SearchHit(
+        id="memory_1", content="a blue crate stood by the door", score=0.4, created_at=NOW
+    )
+    reply = f"{openai_backend._ABSTENTION_MARKER}\nThe toolbox is probably blue."
+    with httpx.Client(transport=_answer_policy_transport(requests, reply)) as client:
+        result = _model(_sdk_client(client)).answer(
+            "What colour is the toolbox?", (hit,), answer_policy="best_effort"
+        )
+
+    system = cast(list[dict[str, str]], requests[0]["messages"])[0]["content"]
+    assert system == openai_backend._BEST_EFFORT_SYSTEM_PROMPT
+    assert "do not decline" in system and "multiple-choice" in system
+    # The marker is a confidence flag here, not the answer: it is reported, then cut out.
+    assert result.answer == "The toolbox is probably blue."
+    assert result.abstained is True
+    assert result.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
+    assert result.hits == (hit,)
+
+
+def test_best_effort_still_guesses_when_nothing_was_retrieved() -> None:
+    """The early no-evidence return is what `best_effort` exists to skip."""
+    requests: list[dict[str, object]] = []
+    with httpx.Client(transport=_answer_policy_transport(requests, "Probably blue.")) as client:
+        result = _model(_sdk_client(client)).answer(
+            "What colour is the toolbox?", (), answer_policy="best_effort"
+        )
+
+    assert len(requests) == 1
+    assert result.answer == "Probably blue."
+    assert result.abstained is True
+    assert result.abstention_reason is AbstentionReason.NO_EVIDENCE
+
+
+def test_best_effort_falls_back_to_the_refusal_sentence_when_the_model_only_marks() -> None:
+    requests: list[dict[str, object]] = []
+    hit = SearchHit(id="memory_1", content="unrelated", score=0.2, created_at=NOW)
+    with httpx.Client(
+        transport=_answer_policy_transport(requests, openai_backend._ABSTENTION_MARKER)
+    ) as client:
+        result = _model(_sdk_client(client)).answer(
+            "What colour?", (hit,), answer_policy="best_effort"
+        )
+
+    assert result.answer == UNKNOWN_ANSWER
+    assert result.abstained is True
+
+
+def test_streaming_best_effort_yields_the_marker_but_completes_with_the_clean_answer() -> None:
+    """The deltas are the provider's; the completion is what a buffering caller reports."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        del request
+        deltas = (f"{openai_backend._ABSTENTION_MARKER}\n", "Probably blue.")
+        chunks = [
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "answer-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": delta},
+                        "finish_reason": "stop" if delta is deltas[-1] else None,
+                    }
+                ],
+            }
+            for delta in deltas
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    hit = SearchHit(id="memory_1", content="a blue crate", score=0.4, created_at=NOW)
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        stream = _model(_sdk_client(client)).stream_answer(
+            ModelInput(text="What colour?"), (hit,), answer_policy="best_effort"
+        )
+        deltas = []
+        while True:
+            try:
+                deltas.append(next(stream))
+            except StopIteration as completed:
+                grounded = completed.value
+                break
+
+    assert "".join(deltas) == f"{openai_backend._ABSTENTION_MARKER}\nProbably blue."
+    assert grounded.answer == "Probably blue."
+    assert grounded.abstention_reason is AbstentionReason.INSUFFICIENT_EVIDENCE
+    assert tuple(grounded) == (hit,)

@@ -77,6 +77,7 @@ from mindbridge.models.base import (
 from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.types import (
     AbstentionReason,
+    AnswerPolicy,
     AnswerResult,
     AssetRef,
     Blob,
@@ -168,7 +169,13 @@ class _FakeModels:
             (1.0, 0.0) if "red" in value.text.casefold() else (0.0, 1.0) for value in batch
         )
 
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "abstain",
+    ) -> AnswerResult:
         grounded = tuple(hits)
         self.answer_calls.append((question, grounded))
         answer = f"Grounded in: {grounded[0].content}" if grounded else "I do not know."
@@ -780,6 +787,8 @@ def test_memory_traces_end_to_end_stages_and_streaming_ttft(tmp_path: Path) -> N
             self,
             question: ModelInput,
             hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> Iterator[str]:
             del question, hits
             record_model_usage(input_tokens=5, output_tokens=3, total_tokens=8)
@@ -971,6 +980,8 @@ def test_empty_stream_is_invalid_model_output(tmp_path: Path, chunks: tuple[str,
             self,
             question: ModelInput,
             hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> Iterator[str]:
             del question, hits
             yield from chunks
@@ -1001,6 +1012,8 @@ def test_stream_ttft_requires_an_actual_model_request(tmp_path: Path) -> None:
             self,
             question: ModelInput,
             hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> Iterator[str]:
             del question, hits
             mark_model_requests(0, token_usage_expected=0)
@@ -1034,6 +1047,8 @@ def test_streaming_answer_reports_only_the_hits_the_stream_used(tmp_path: Path) 
             self,
             question: ModelInput,
             hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> Generator[str, None, tuple[SearchHit, ...]]:
             del question
             yield "grounded"
@@ -1054,6 +1069,8 @@ def test_streaming_answer_preserves_structured_abstention(tmp_path: Path) -> Non
             self,
             question: ModelInput,
             hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> Generator[str, None, AnswerResult]:
             del question
             yield "unknown"
@@ -4759,7 +4776,13 @@ def test_omni_add_batches_declared_transcripts_and_ask_reuses_them(
 
 def test_no_hit_ask_routes_media_and_cannot_accept_fabricated_hits(tmp_path: Path) -> None:
     class FabricatingModels(_FakeModels):
-        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "abstain",
+        ) -> AnswerResult:
             super().answer(question, hits)
             fabricated = SearchHit(
                 id="fabricated",
@@ -4796,6 +4819,8 @@ class _CountingStreamer(_FakeModels):
         self,
         question: ModelInput,
         hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "abstain",
     ) -> Generator[str, None, tuple[SearchHit, ...]]:
         del question
         for part in ("the red ", "toolbox is ", "on the bench"):
@@ -4929,6 +4954,8 @@ def test_abandoning_ask_stream_closes_the_generation_stream_inside_the_operation
             self,
             question: ModelInput,
             hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "abstain",
         ) -> Generator[str, None, tuple[SearchHit, ...]]:
             try:
                 yield from super().stream_answer(question, hits)
@@ -4993,7 +5020,13 @@ def test_ask_stream_records_time_to_first_token_on_the_generation_span(tmp_path:
 
 def test_ask_returns_only_retrieved_hits_the_answerer_used(tmp_path: Path) -> None:
     class SelectingModels(_FakeModels):
-        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "abstain",
+        ) -> AnswerResult:
             super().answer(question, hits)
             fabricated = SearchHit(
                 id="fabricated",
@@ -5024,7 +5057,13 @@ def test_answering_reinforces_only_the_evidence_the_model_cited(tmp_path: Path) 
     """
 
     class CitingModels(_FakeModels):
-        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "abstain",
+        ) -> AnswerResult:
             super().answer(question, hits)
             return AnswerResult(answer="grounded", hits=(hits[0],))
 
@@ -5070,7 +5109,13 @@ def test_reinforce_on_answer_false_keeps_answering_free_of_side_effects(tmp_path
     """
 
     class CitingModels(_FakeModels):
-        def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult:
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "abstain",
+        ) -> AnswerResult:
             super().answer(question, hits)
             return AnswerResult(answer="grounded", hits=(hits[0],))
 
@@ -6923,3 +6968,27 @@ def test_erasing_a_person_leaves_an_irreversible_log_row_holding_no_content(
         assert memory.operations()[0].rolled_back_at is None
         assert memory.identity(survivor) is None
         assert '"speaker_name":null' in memory.get(record.id).content
+
+
+def test_ask_hands_the_caller_chosen_answer_policy_to_the_answerer(tmp_path: Path) -> None:
+    policies: list[str] = []
+
+    class _PolicyAnswerer(_FakeModels):
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: AnswerPolicy = "abstain",
+        ) -> AnswerResult:
+            policies.append(answer_policy)
+            return super().answer(question, hits, answer_policy=answer_policy)
+
+    with _memory(tmp_path, _PolicyAnswerer()) as memory:
+        memory.add("the toolbox is red")
+        memory.ask("what colour is the toolbox?")
+        memory.ask("what colour is the toolbox?", answer_policy="best_effort")
+        with pytest.raises(ValidationError, match="answer_policy"):
+            memory.ask("what colour is the toolbox?", answer_policy="guess")  # type: ignore[arg-type]
+
+    assert policies == ["abstain", "best_effort"]
