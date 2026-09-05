@@ -47,6 +47,7 @@ all = [
     "starlette>=0.46,<2",
     "torch>=2.6,<3",
     "torchaudio>=2.11,<3",
+    "tqdm>=4.66,<5",
     "uvicorn>=0.35,<1",
 ]
 benchmarks = [
@@ -59,6 +60,9 @@ benchmarks = [
     # eval.py reads its harness configuration file as YAML, which also parses the JSON files the
     # flag used to take.
     "pyyaml>=6,<7",
+    # eval.py draws the per-task progress bar with it, and formats the non-interactive progress
+    # line with `tqdm.format_meter` so both modes report the same counts and ETA.
+    "tqdm>=4.66,<5",
 ]
 observability = [
     "opentelemetry-sdk>=1.34,<2",
@@ -120,8 +124,9 @@ dev = [
     # tests/test_package.py reads this file; tomllib is 3.11+. mypy also requires the
     # backport on 3.10, which is why the tests passed before anything declared it.
     "tomli>=2,<3; python_version < '3.11'",
-    # eval.py imports yaml; PyYAML ships no inline types, so the strict gate needs the stubs.
+    # eval.py imports yaml and tqdm; neither ships inline types, so the strict gate needs stubs.
     "types-PyYAML>=6,<7",
+    "types-tqdm>=4.66,<5",
 ]
 
 [tool.hatch.build.targets.wheel]

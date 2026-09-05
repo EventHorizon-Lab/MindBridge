@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import logging
 import re
 import subprocess
 import sys
+import time
 from argparse import ArgumentTypeError
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import fields, replace
 from datetime import datetime, timezone
 from inspect import getattr_static, signature
@@ -1600,22 +1603,80 @@ async def test_ingest_announces_the_first_failure_once_with_its_message(
     assert "returned 2048 values but the configured dimension is 1536" in captured
 
 
-def test_progress_reporter_writes_milestones_to_stderr(
+def test_progress_throttles_a_non_interactive_run_by_elapsed_time(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under capture stderr is not a terminal, which is the log-line path."""
+    now = 0.0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+
+    with eval_module._progress("running fixture", "sample", total=20) as report:
+        report(1, 20)  # the first completion always reports
+        now = 1.0
+        report(2, 20)  # too soon
+        now = eval_module._PROGRESS_LOG_SECONDS + 1.0
+        report(3, 20)
+        now += 1.0
+        report(4, 20)  # too soon again
+        report(20, 20)  # the last completion always reports
+
+    lines = capsys.readouterr().err.splitlines()
+    assert [line.split(" (")[0] for line in lines] == [
+        "mindbridge-bench eval: running fixture: 1/20",
+        "mindbridge-bench eval: running fixture: 3/20",
+        "mindbridge-bench eval: running fixture: 20/20",
+    ]
+    # tqdm formats the meter, so the log line carries the same elapsed/ETA a bar would show.
+    assert re.search(r"\( 15%\) \[01:01<\d\d:\d\d, +\d+", lines[1]) is not None
+
+
+def test_progress_reports_nothing_when_disabled_or_empty(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    report = eval_module._progress_reporter("running fixture", "samples")
+    with eval_module._progress("running fixture", "sample", total=20, enabled=False) as report:
+        report(1, 20)
+    with eval_module._progress("running fixture", "sample", total=0) as report:
+        report(1, 0)
 
-    report(1, 20)
-    report(2, 20)
-    report(3, 20)
-    report(20, 20)
+    assert capsys.readouterr().err == ""
 
-    assert capsys.readouterr().err.splitlines() == [
-        "mindbridge-bench eval: running fixture: 1/20 samples (5%)",
-        "mindbridge-bench eval: running fixture: 2/20 samples (10%)",
-        "mindbridge-bench eval: running fixture: 20/20 samples (100%)",
-    ]
-    eval_module._progress_reporter("running fixture", "samples", enabled=False)(1, 1)
+
+def test_progress_drives_a_bar_on_a_terminal(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal gets a bar fed with deltas, not the throttled log lines."""
+    updates: list[int] = []
+    closed: list[bool] = []
+
+    class Bar:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            self.n = 0
+
+        def __enter__(self) -> Bar:
+            return self
+
+        def __exit__(self, *_error: object) -> None:
+            closed.append(True)
+
+        def update(self, delta: int) -> None:
+            self.n += delta
+            updates.append(delta)
+
+    class Terminal:
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(sys, "stderr", Terminal())
+    monkeypatch.setattr(eval_module, "tqdm", Bar)
+
+    with eval_module._progress("running fixture", "sample", total=3) as report:
+        report(1, 3)
+        report(3, 3)
+
+    # The callbacks carry an absolute count; tqdm wants the delta since the last draw.
+    assert updates == [1, 2]
+    assert closed == [True]
     assert capsys.readouterr().err == ""
 
 
@@ -2442,37 +2503,37 @@ async def test_runner_reports_cached_progress_before_pending_answer_finishes(
             ),
         ),
     )
-    report = eval_module._progress_reporter("running fixture", "samples")
+    with eval_module._progress("running fixture", "sample", total=2) as report:
 
-    def on_progress(completed: int, total: int) -> None:
-        report(completed, total)
-        if completed == 1:
-            first_reported.set()
+        def on_progress(completed: int, total: int) -> None:
+            report(completed, total)
+            if completed == 1:
+                first_reported.set()
 
-    pending = asyncio.create_task(
-        run_loaded_task(
-            task,
-            run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
-            memory_factory=cast(MemoryFactory, lambda _path: Context()),
-            batch_size=1,
-            unit_concurrency=1,
-            request_concurrency=2,
-            recall_limit=1,
-            response_cache=cast(ResponseCache, Cache()),
-            on_progress=on_progress,
+        pending = asyncio.create_task(
+            run_loaded_task(
+                task,
+                run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+                memory_factory=cast(MemoryFactory, lambda _path: Context()),
+                batch_size=1,
+                unit_concurrency=1,
+                request_concurrency=2,
+                recall_limit=1,
+                response_cache=cast(ResponseCache, Cache()),
+                on_progress=on_progress,
+            )
         )
-    )
-    try:
-        await asyncio.wait_for(first_reported.wait(), timeout=1)
-        assert not pending.done()
-        captured = capsys.readouterr()
-        assert captured.out == ""
-        assert "running fixture: 1/2 samples (50%)" in captured.err
-    finally:
-        release_slow.set()
+        try:
+            await asyncio.wait_for(first_reported.wait(), timeout=1)
+            assert not pending.done()
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert "running fixture: 1/2 ( 50%)" in captured.err
+        finally:
+            release_slow.set()
 
-    await asyncio.wait_for(pending, timeout=1)
-    assert "running fixture: 2/2 samples (100%)" in capsys.readouterr().err
+        await asyncio.wait_for(pending, timeout=1)
+        assert "running fixture: 2/2 (100%)" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio
@@ -3784,3 +3845,102 @@ def test_eval_run_section_reports_bad_values_as_usage_errors(body: str, tmp_path
 
     with pytest.raises(SystemExit):
         eval_module._arguments(parser, parsed, overrides=overrides)
+
+
+@pytest.fixture
+def restored_logging() -> Iterator[None]:
+    """`_configure_logging` claims the root handler, so give it back to pytest afterwards."""
+    root = logging.getLogger()
+    saved = (root.level, list(root.handlers), list(root.filters))
+    try:
+        yield
+    finally:
+        root.setLevel(saved[0])
+        root.handlers[:] = saved[1]
+        root.filters[:] = saved[2]
+
+
+def _emit_from_every_source() -> None:
+    # httpx logs one of these per successful call; modelscope and jieba set their own logger
+    # level when imported, so they escape a root threshold entirely.
+    logging.getLogger("httpx").info('HTTP Request: POST /v1/chat "HTTP/1.1 200 OK"')
+    logging.getLogger("modelscope").setLevel(logging.INFO)
+    logging.getLogger("modelscope").info("loading model configuration")
+    logging.getLogger("jieba").setLevel(logging.DEBUG)
+    logging.getLogger("jieba").debug("building prefix dict")
+    logging.getLogger("httpx").warning("connection reset, retrying")
+    logging.getLogger("mindbridge.benchmarks.eval").info("ingest finished")
+
+
+def test_configure_logging_keeps_dependency_info_out_of_the_run(
+    capsys: pytest.CaptureFixture[str], restored_logging: None
+) -> None:
+    """Only MindBridge is verbose at INFO; a dependency has to reach WARNING to be heard."""
+    eval_module._configure_logging("INFO")
+    # What `import funasr` does at module scope. It must not lift anything back up.
+    logging.basicConfig(level=logging.INFO)
+    _emit_from_every_source()
+
+    assert [line.split(": ", 1)[0] for line in capsys.readouterr().err.splitlines()] == [
+        "WARNING httpx",
+        "INFO mindbridge.benchmarks.eval",
+    ]
+
+
+def test_configure_logging_opens_the_whole_process_for_debug(
+    capsys: pytest.CaptureFixture[str], restored_logging: None
+) -> None:
+    """`--verbosity DEBUG` is the one setting that asks for everyone else's detail too."""
+    eval_module._configure_logging("DEBUG")
+    _emit_from_every_source()
+
+    assert [line.split(": ", 1)[0] for line in capsys.readouterr().err.splitlines()] == [
+        "INFO httpx",
+        "INFO modelscope",
+        "DEBUG jieba",
+        "WARNING httpx",
+        "INFO mindbridge.benchmarks.eval",
+    ]
+
+
+def test_configure_logging_still_filters_while_a_bar_is_live(
+    monkeypatch: pytest.MonkeyPatch, restored_logging: None
+) -> None:
+    """The filter has to survive the progress bar, which is up for the whole of every task.
+
+    Routing console logging through `tqdm.contrib.logging.logging_redirect_tqdm` instead would
+    hand the records to a handler of tqdm's own; carrying the filters across is a detail tqdm
+    only started honouring in 4.69.1, so below that the dependency INFO came straight back for
+    the duration of the bar.
+    """
+
+    class Terminal(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    terminal = Terminal()
+    monkeypatch.setattr(sys, "stderr", terminal)
+    eval_module._configure_logging("INFO")
+
+    with eval_module._progress("running fixture", "sample", total=4) as report:
+        _emit_from_every_source()
+        report(1, 4)
+
+    drawn = terminal.getvalue()
+    assert "HTTP Request" not in drawn
+    assert "loading model configuration" not in drawn
+    assert "WARNING httpx: connection reset, retrying" in drawn
+    assert "INFO mindbridge.benchmarks.eval: ingest finished" in drawn
+
+
+def test_configure_logging_silences_mindbridge_too_at_error(
+    capsys: pytest.CaptureFixture[str], restored_logging: None
+) -> None:
+    """A raised floor applies to the harness as well, not just to its dependencies."""
+    eval_module._configure_logging("ERROR")
+    _emit_from_every_source()
+    logging.getLogger("mindbridge.benchmarks.eval").error("run failed")
+
+    assert [line.split(": ", 1)[0] for line in capsys.readouterr().err.splitlines()] == [
+        "ERROR mindbridge.benchmarks.eval",
+    ]

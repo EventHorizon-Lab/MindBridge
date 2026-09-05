@@ -239,8 +239,19 @@ repository rather than the process directory; `--data-root` defaults to
 `<benchmarks-root>/data`. Run `mindbridge-bench eval --help` for the full concurrency, cache,
 generation, and comparison options.
 
-Unless `--quiet` is set, `eval` reports sample and judge progress to stderr after the first
-completion and at roughly ten-percent intervals.
+Unless `--quiet` is set, `eval` reports sample and judge progress to stderr. On a terminal that
+is a live progress bar with an ETA. When stderr is a file or a pipe, where a redrawn bar is
+unreadable, the same counts and ETA are written as one line at most once a minute, plus the first
+and the last completion, so a stalled run says so immediately and the log always ends on the
+final count.
+
+`--verbosity` sets the log level for the run and claims the root handler before an imported
+dependency can raise it: `funasr`, `modelscope`, `numba` and others each turn their own logging
+up when imported. It applies to MindBridge's own loggers; a dependency has to reach `WARNING` to
+be heard, so a successful HTTP request logs nothing and a benchmark run does not carry anyone
+else's INFO. `--verbosity DEBUG` is the exception and opens the whole process, per-request
+transport lines included. The results table is printed regardless; `--quiet` (or
+`--verbosity ERROR`) is what suppresses it.
 
 `--limit` accepts `-1`, a fraction between zero and one, or an absolute adapter-unit count. Use an
 integer for a count; a non-integral value above one is truncated to an integer by the current

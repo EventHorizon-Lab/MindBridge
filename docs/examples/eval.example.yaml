@@ -259,6 +259,8 @@ benchmark:
     download: true
     # Accept a corpus whose digest is not pinned. Off by default for a reason.
     allow_unverified_data: false
+    # MindBridge's own log level. Dependencies are held at WARNING unless this is
+    # DEBUG, which opens the whole process. The results table prints either way.
     verbosity: INFO
     quiet: false
 

@@ -7,6 +7,7 @@ import asyncio
 import gc
 import hashlib
 import json
+import logging
 import math
 import os
 import platform
@@ -29,6 +30,7 @@ import yaml
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode, Tracer
 from pydantic import SecretStr
+from tqdm import tqdm
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
@@ -1005,6 +1007,70 @@ class _BackendPool:
                     resource.close()
 
 
+# The log namespace this harness is allowed to be verbose about: everything under the
+# installed package, derived so a rename cannot leave a stale literal behind.
+_ROOT_PACKAGE = __name__.split(".", 1)[0]
+
+
+class _TqdmHandler(logging.Handler):
+    """Emit every record through `tqdm.write`, so a live progress bar survives a log line.
+
+    The alternative, wrapping the run in `tqdm.contrib.logging.logging_redirect_tqdm`, swaps this
+    handler out for one of tqdm's own for the duration of the bar, and carrying the filters across
+    is a detail tqdm only started honouring in 4.69.1. Owning the handler keeps `_VerbosityFilter`
+    attached to the thing that actually emits, at every version, bar or no bar. `sys.stderr` is
+    read per record rather than captured, so redirecting it after configuration still works.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            tqdm.write(self.format(record), file=sys.stderr)
+        except Exception:  # logging must never raise into the run it is reporting on
+            self.handleError(record)
+
+
+class _VerbosityFilter(logging.Filter):
+    """Admit MindBridge's records at the requested level and everyone else's at ``third_party``.
+
+    A root level alone does not hold: `modelscope`, `numba`, `jieba` and `torch.__trace` each set
+    their own logger level when imported, and a logger with an explicit level never consults the
+    root's, so their INFO and DEBUG records reach the root handler whatever it was configured
+    with. Deciding per record on the handler is the one place no dependency can reach around, and
+    it needs no list of names to keep up to date.
+    """
+
+    def __init__(self, level: int, third_party: int) -> None:
+        super().__init__()
+        self._level = level
+        self._third_party = third_party
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        own = record.name.split(".", 1)[0] == _ROOT_PACKAGE
+        return record.levelno >= (self._level if own else self._third_party)
+
+
+def _configure_logging(verbosity: str) -> None:
+    """Claim the root handler before an imported dependency installs a noisier one.
+
+    `import funasr` runs `logging.basicConfig(level=INFO)` at module scope, which switches every
+    library in the process to INFO: each successful model call then prints its own
+    `HTTP Request: ... 200 OK` line and buries the warnings worth reading. Configuring first makes
+    that call a no-op. `--verbosity` then applies to MindBridge only; a dependency has to reach
+    WARNING to be heard, because a benchmark run is not the place to read anyone else's INFO.
+    `DEBUG` is the exception that opens the whole process, transport chatter included.
+    """
+    level: int = logging.getLevelName(verbosity)
+    third_party = level if verbosity == "DEBUG" else max(level, logging.WARNING)
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s %(name)s: %(message)s",
+        handlers=[_TqdmHandler()],
+        force=True,
+    )
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(_VerbosityFilter(level, third_party))
+
+
 def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
     argv: Sequence[str] | None = None, *, prog: str | None = None
 ) -> int:
@@ -1020,6 +1086,7 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         memory_config, overrides = _load_memory_config(config_path)
     except ValueError as error:
         parser.error(str(error))
+    _configure_logging(_picked(parsed.verbosity, overrides.run.verbosity, "INFO"))
     download = DownloadSettings.resolve(
         overrides.download,
         benchmarks_root=parsed.benchmarks_root,
@@ -1593,18 +1660,23 @@ async def _run_arms(
         sample_count = sum(len(unit.questions) for unit in task.units) * len(arms)
         if not arguments.quiet:
             _announce(f"running {task.spec.name} ({len(task.units)} units, {sample_count} samples)")
-        progress = _progress_reporter(
-            f"running {task.spec.name}", "samples", enabled=not arguments.quiet
-        )
-        with traced_span(
-            tracer,
-            BENCHMARK_TASK_SPAN,
-            attributes={
-                BENCHMARK_TASK: task.spec.name,
-                BENCHMARK_ARM: SHARED_BENCHMARK_ARM,
-                BENCHMARK_PURPOSE: "orchestration",
-                SPAN_KIND: "benchmark",
-            },
+        with (
+            _progress(
+                f"running {task.spec.name}",
+                "sample",
+                total=sample_count,
+                enabled=not arguments.quiet,
+            ) as progress,
+            traced_span(
+                tracer,
+                BENCHMARK_TASK_SPAN,
+                attributes={
+                    BENCHMARK_TASK: task.spec.name,
+                    BENCHMARK_ARM: SHARED_BENCHMARK_ARM,
+                    BENCHMARK_PURPOSE: "orchestration",
+                    SPAN_KIND: "benchmark",
+                },
+            ),
         ):
             run = BenchmarkRun(
                 arguments.data_root,
@@ -2909,9 +2981,6 @@ async def _apply_judges(
         )
     )
     semaphore = asyncio.Semaphore(config.concurrency)
-    progress = _progress_reporter(
-        f"judging with {config.model}", "answers", enabled=not arguments.quiet
-    )
     completed = 0
 
     async def judge(sample: SampleResult) -> SampleResult:
@@ -2933,7 +3002,13 @@ async def _apply_judges(
         return result
 
     try:
-        judged = await asyncio.gather(*(judge(sample) for sample in samples))
+        with _progress(
+            f"judging with {config.model}",
+            "answer",
+            total=len(planned),
+            enabled=not arguments.quiet,
+        ) as progress:
+            judged = await asyncio.gather(*(judge(sample) for sample in samples))
     finally:
         await client.close()
         if cache is not None:
@@ -4645,7 +4720,10 @@ def _jsonl_bytes(values: Iterable[object]) -> bytes:
 
 
 def _announce(message: str) -> None:
-    print(f"mindbridge-bench eval: {message}", file=sys.stderr)
+    # `tqdm.write` is how a bar and a message share one stream: it erases the bar, writes the
+    # line, and redraws. With no bar live it is a `print` with a flush, so every caller is
+    # bar-safe without knowing whether one is running.
+    tqdm.write(f"mindbridge-bench eval: {message}", file=sys.stderr)
 
 
 def _ignore_progress(_completed: int, _total: int) -> None:
@@ -4662,23 +4740,57 @@ def _ignore_store_ready() -> None:
     pass
 
 
-def _progress_reporter(
-    stage: str, noun: str, *, enabled: bool = True
-) -> Callable[[int, int], None]:
-    """Report the first completion and each new ten-percent milestone."""
-    if not enabled:
-        return _ignore_progress
-    last_decile = 0
+# How long a non-interactive run may stay silent between progress lines.
+_PROGRESS_LOG_SECONDS = 60.0
+# tqdm's own meter with the bar glyphs removed. A redrawn bar in a log file is one unreadable
+# line of carriage returns, but the counts and the ETA are the ones a terminal would have shown,
+# so both modes report identical numbers.
+_PROGRESS_LOG_FORMAT = (
+    "{desc}: {n_fmt}/{total_fmt} ({percentage:3.0f}%) [{elapsed}<{remaining}, {rate_fmt}]"
+)
 
-    def report(completed: int, total: int) -> None:
-        nonlocal last_decile
-        decile = completed * 10 // total
-        if completed != 1 and completed != total and decile <= last_decile:
+
+@contextmanager
+def _progress(
+    stage: str, noun: str, *, total: int, enabled: bool = True
+) -> Iterator[Callable[[int, int], None]]:
+    """Report progress as a live bar on a terminal and as throttled lines anywhere else."""
+    if not enabled or total <= 0:
+        yield _ignore_progress
+        return
+    if sys.stderr.isatty():
+        with tqdm(total=total, desc=stage, unit=noun, file=sys.stderr, leave=False) as bar:
+
+            def advance(completed: int, _total: int) -> None:
+                bar.update(completed - bar.n)
+
+            yield advance
+        return
+    started = time.monotonic()
+    last = 0.0
+
+    def report(completed: int, _total: int) -> None:
+        # Throttle on elapsed time, not on a fraction of the work: a tenth of a forty-minute task
+        # and a tenth of a twenty-second one are not the same amount of silence. The first and
+        # the last completion always report, so a run that stalls at the start says so at once
+        # and the log always ends on the final count.
+        nonlocal last
+        now = time.monotonic()
+        if completed not in {1, total} and now - last < _PROGRESS_LOG_SECONDS:
             return
-        last_decile = decile
-        _announce(f"{stage}: {completed}/{total} {noun} ({completed / total:.0%})")
+        last = now
+        _announce(
+            tqdm.format_meter(
+                completed,
+                total,
+                now - started,
+                prefix=stage,
+                unit=noun,
+                bar_format=_PROGRESS_LOG_FORMAT,
+            )
+        )
 
-    return report
+    yield report
 
 
 _first_ingest_failure_announced = False
