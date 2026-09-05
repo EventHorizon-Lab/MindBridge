@@ -5168,13 +5168,14 @@ def test_only_the_two_tasks_whose_protocol_credits_no_abstention_ask_for_a_guess
     Every other task measures abstention in some form -- LongMemEval and MEMLENS carry abstention
     abilities, ATM-Bench scores it as a class, LoCoMo's category 5 is adversarial -- so asking
     those for a guess would be a scoring change, not a protocol alignment.
+
+    Membership only. That the mapping actually reaches the answerer is asserted end to end by
+    `test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path`; comparing
+    `task_answer_policy` with its own frozenset here would pass with the harness wired to
+    nothing.
     """
-    from mindbridge.benchmarks.prompts import BEST_EFFORT_TASKS, task_answer_policy
+    from mindbridge.benchmarks.prompts import BEST_EFFORT_TASKS
     from mindbridge.benchmarks.task_catalog import TASKS
 
     assert {"m3-bench-robot", "egolifeqa"} == BEST_EFFORT_TASKS
     assert set(TASKS) >= BEST_EFFORT_TASKS
-    assert {
-        name for name in TASKS if task_answer_policy(name) == "best_effort"
-    } == BEST_EFFORT_TASKS
-    assert task_answer_policy("m3-bench-web") == "abstain"

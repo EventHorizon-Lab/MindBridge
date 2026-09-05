@@ -1225,6 +1225,11 @@ like a former it proposes and never writes storage. An `IDENTIFY` proposal carri
 `IdentityClaim` rather than a `FormationProposal`: the backend names the identity and cites the
 evidence, and the kernel builds the typed assertion.
 
+`answer_policy` is keyword-only and defaulted on both generation protocols, and MindBridge sends
+it only when a caller asked for something other than `"abstain"`. A backend written against the
+earlier two-argument signature therefore keeps answering; accept the argument to support
+`"best_effort"`, which otherwise fails the call with `ModelError`.
+
 The bundled OpenAI former receives compact observation aliases, enriched content and assets, plus
 the observation basis, confidence, explicit validity bounds, and spatial frame/anchor. It does not
 receive a separate occurrence timestamp, identity registry, or actor roster. Speaker or face IDs

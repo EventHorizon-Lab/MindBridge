@@ -6992,3 +6992,36 @@ def test_ask_hands_the_caller_chosen_answer_policy_to_the_answerer(tmp_path: Pat
             memory.ask("what colour is the toolbox?", answer_policy="guess")  # type: ignore[arg-type]
 
     assert policies == ["abstain", "best_effort"]
+
+
+def test_a_backend_written_before_answer_policy_still_answers_at_the_default(
+    tmp_path: Path,
+) -> None:
+    """`GenerationBackend` is a `runtime_checkable` Protocol, so `isinstance` proves the method
+    exists but not that it takes this keyword. The default must send nothing new, or every
+    third-party backend written against the shipped two-argument signature breaks on its first
+    `ask()`. Opting in still needs a backend that accepts the keyword, which is pinned here as
+    the accepted cost.
+    """
+
+    class _LegacyAnswerer(_FakeModels):
+        def answer(  # type: ignore[override]
+            self, question: ModelInput, hits: Sequence[SearchHit]
+        ) -> AnswerResult:
+            del question
+            return AnswerResult(answer="Legacy.", hits=tuple(hits))
+
+    class _LegacyStreamingAnswerer(_LegacyAnswerer):
+        def stream_answer(
+            self, question: ModelInput, hits: Sequence[SearchHit]
+        ) -> Generator[str, None, tuple[SearchHit, ...]]:
+            del question
+            yield "Legacy."
+            return tuple(hits)
+
+    for models in (_LegacyAnswerer(), _LegacyStreamingAnswerer()):
+        with _memory(tmp_path / type(models).__name__, models) as memory:
+            memory.add("the toolbox is red")
+            assert memory.ask("what colour is the toolbox?").answer == "Legacy."
+            with pytest.raises(ModelError):
+                memory.ask("what colour is the toolbox?", answer_policy="best_effort")

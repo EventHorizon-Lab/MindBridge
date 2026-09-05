@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import math
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Generator, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +61,7 @@ from mindbridge.benchmarks.model_config import DEFAULT_TIMEOUT_SECONDS, ModelCon
 from mindbridge.benchmarks.official_scorers import metric_is_official, retrieval_gold_ids
 from mindbridge.benchmarks.task_catalog import TaskSpec
 from mindbridge.configuration import OpenAIEmbeddingConfig
+from mindbridge.models.base import GenerationBackend
 
 _ATOMIC_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.AUDIO, Modality.VIDEO})
 
@@ -1364,3 +1365,85 @@ def test_a_replayed_answer_still_carries_the_ranked_list_it_was_scored_from(
     assert retrieval["unranked_labelled_question_count"] == 0
     # The bound recall was measured under, not the `--recall-limit` that bounds `ask`.
     assert retrieval["retrieval_candidate_limit"] == RETRIEVAL_CANDIDATE_LIMIT
+
+
+@pytest.mark.parametrize(
+    ("task_name", "expected"),
+    [
+        ("m3-bench-robot", "best_effort"),
+        ("egolifeqa", "best_effort"),
+        ("atm-bench", "abstain"),
+    ],
+)
+def test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path(
+    tmp_path: Path, task_name: str, expected: str
+) -> None:
+    """The whole chain: `_arm_answer` -> `AsyncMemory.ask_stream` -> `_BorrowedGenerationBackend`.
+
+    The harness lends one answerer to every per-unit memory, so the borrowed wrapper is the last
+    hop before the provider. It once declared the keyword and dropped it, which made the whole
+    arm a silent no-op that no fake-`ask` test could see.
+    """
+    recorded: list[str] = []
+
+    class Answerer:
+        generation_capabilities = _ATOMIC_MODALITIES
+        generation_model = "fake-generator"
+
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: str = "abstain",
+        ) -> AnswerResult:
+            del question
+            recorded.append(answer_policy)
+            return AnswerResult("Ada.", tuple(hits))
+
+        def stream_answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: str = "abstain",
+        ) -> Generator[str, None, tuple[SearchHit, ...]]:
+            del question
+            recorded.append(answer_policy)
+            yield "Ada."
+            return tuple(hits)
+
+        def close(self) -> None:
+            return None
+
+    borrowed = eval_module._BorrowedGenerationBackend(Answerer())
+    _, _, question = _task()
+
+    async def run() -> eval_module._AnswerOutcome | BaseException:
+        async with AsyncMemory(
+            tmp_path,
+            embedder=_TinyEmbedder(),
+            answerer=cast(GenerationBackend, borrowed),
+            minimum_relevance=0,
+        ) as memory:
+            await memory.add("Ada signed the contract")
+            answered = await _answer_many(
+                memory,
+                (question,),
+                request_concurrency=1,
+                recall_limit=5,
+                arm=PRODUCT_ARM,
+                task_name=task_name,
+                unit_id="unit",
+            )
+            return answered[0]
+
+    outcome = asyncio.run(run())
+    assert not isinstance(outcome, BaseException)
+    assert outcome.prediction == "Ada."
+    assert recorded == [expected]
+
+    # The buffered half of the same wrapper, which a non-streaming provider takes.
+    recorded.clear()
+    borrowed.answer(ModelInput("who signed it?"), (), answer_policy="best_effort")
+    assert recorded == ["best_effort"]

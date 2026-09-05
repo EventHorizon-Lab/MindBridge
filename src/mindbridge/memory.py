@@ -7333,13 +7333,17 @@ class Memory:
         ):
             mark_model_requests(1)
             buffered = False
+            # The protocols are `runtime_checkable`, so `isinstance` proves the method exists but
+            # not that it takes this keyword. A backend written against the two-argument signature
+            # keeps working as long as the default asks for nothing new.
+            policy: dict[str, AnswerPolicy] = (
+                {} if answer_policy == "abstain" else {"answer_policy": answer_policy}
+            )
             try:
                 if isinstance(self._answerer, StreamingGenerationBackend):
                     started = perf_counter()
                     parts: builtins.list[str] = []
-                    stream = iter(
-                        self._answerer.stream_answer(question, hits, answer_policy=answer_policy)
-                    )
+                    stream = iter(self._answerer.stream_answer(question, hits, **policy))
                     used_hits: object = None
                     try:
                         while True:
@@ -7389,8 +7393,14 @@ class Memory:
                         grounded = used_hits
                         # A backend may report an answer that is not the concatenated deltas:
                         # under `best_effort` the stream carries a low-confidence marker line
-                        # that belongs to `abstained`, not to the prose the caller shows.
-                        reported = getattr(used_hits, "answer", None)
+                        # that belongs to `abstained`, not to the prose the caller shows. The
+                        # default path never consults `.answer`, so a hit sequence that happens
+                        # to carry that attribute cannot replace a caller's deltas there.
+                        reported = (
+                            None
+                            if answer_policy == "abstain"
+                            else getattr(used_hits, "answer", None)
+                        )
                         if reported is not None:
                             if not isinstance(reported, str) or not reported.strip():
                                 raise ModelError(
@@ -7420,7 +7430,7 @@ class Memory:
                             abstention_reason=reason,
                         )
                 else:
-                    result = self._answerer.answer(question, hits, answer_policy=answer_policy)
+                    result = self._answerer.answer(question, hits, **policy)
                     buffered = True
             except MindBridgeError:
                 raise

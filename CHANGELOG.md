@@ -435,6 +435,19 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- **Breaking:** `GenerationBackend.answer` and `StreamingGenerationBackend.stream_answer` declare
+  a keyword-only `answer_policy` argument. Both protocols are `runtime_checkable`, and
+  `isinstance` checks the method name rather than its signature, so a custom backend written
+  against the two-argument signature keeps answering: MindBridge sends the keyword only when a
+  caller asks for something other than the default `"abstain"`, and passing `"best_effort"` to a
+  backend that does not accept it raises `ModelError` with `reason="model_failed"`. Accept the
+  argument to support the policy.
+- The benchmark runner records the `answer_policy` each task's product arm requested, next to the
+  `arm` and `task` fields of every `results.jsonl` task row and every `samples.jsonl` sample row,
+  so a run that asked for a committed answer is distinguishable from every earlier run of the same
+  task. The baseline arms do not call `ask`, so their rows carry `null`. Purely additive: the
+  evaluation schema version is unchanged, and older result documents still load.
+
 - `AsyncMemory(memory)` now wraps an already-open `Memory` instead of repeating its constructor;
   open one with `AsyncMemory.from_plugins()`, `AsyncMemory.from_config()`, or
   `AsyncMemory(Memory(...))`.

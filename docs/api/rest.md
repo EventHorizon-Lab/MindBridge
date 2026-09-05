@@ -377,7 +377,9 @@ some other way is an ordinary answer. See
 returns a fixed refusal sentence when the evidence is thin. `best_effort` returns the most likely
 answer the evidence supports instead -- for a multiple-choice question, always one of the options
 -- and still sets `abstained` and `abstention_reason`, so a client whose protocol gives no credit
-for "unknown" keeps the confidence signal alongside a usable answer. On `POST
+for "unknown" keeps the confidence signal alongside a usable answer. It also costs one more
+generation call than the default on a question that grounds nothing, where `abstain` refuses
+without calling the model. On `POST
 /v1/answers/stream` the deltas are the provider's own and may carry the marker; the terminal
 `result` event holds the cleaned answer. A response `context` is
 the authoritative `MemoryContext`: typed kind and basis, confidence, valid and transaction time,

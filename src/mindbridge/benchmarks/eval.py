@@ -511,6 +511,8 @@ class SampleResult:
             "ranked_source_ids_complete": self.ranked_source_ids_complete,
             "dropped_hits": self.dropped_hits,
             "task": self.task,
+            # The policy this sample's request carried; only the product arm reaches `ask`.
+            "answer_policy": (task_answer_policy(self.task) if self.arm == DEFAULT_ARM else None),
             "benchmark": self.benchmark,
             "dataset_sha256": self.dataset_sha256,
             "evaluation_sha256": self.evaluation_sha256,
@@ -960,7 +962,10 @@ class _BorrowedBackend:
         *,
         answer_policy: AnswerPolicy = "abstain",
     ) -> Iterator[str]:
-        return cast(Iterator[str], cast(Any, self._backend).stream_answer(question, hits))
+        return cast(
+            Iterator[str],
+            cast(Any, self._backend).stream_answer(question, hits, answer_policy=answer_policy),
+        )
 
     def close(self) -> None:
         return None
@@ -1054,7 +1059,9 @@ class _BorrowedGenerationBackend(_BorrowedBackend):
         *,
         answer_policy: AnswerPolicy = "abstain",
     ) -> AnswerResult:
-        return cast(GenerationBackend, self._backend).answer(question, hits)
+        return cast(GenerationBackend, self._backend).answer(
+            question, hits, answer_policy=answer_policy
+        )
 
 
 class _BorrowedFaceBackend(_BorrowedBackend):
@@ -4219,6 +4226,12 @@ def _task_rows(
             {
                 "arm": arm,
                 "task": task.spec.name,
+                # The request policy, so a run that asked for a committed answer is not
+                # byte-indistinguishable from every earlier run of the same task. Only the
+                # product arm reaches `ask`, so the baseline arms carry no policy.
+                "answer_policy": (
+                    task_answer_policy(task.spec.name) if arm == DEFAULT_ARM else None
+                ),
                 "benchmark": task.spec.benchmark,
                 "variant": task.spec.variant,
                 "adapter_version": task.spec.adapter_version,

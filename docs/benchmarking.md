@@ -1041,7 +1041,10 @@ Three result fields carry a caveat that decides whether they can be quoted:
   abilities, ATM-Bench scores abstention as a class, LoCoMo's category 5 is adversarial, and
   Mem-Gallery's `AR` mandates its own refusal wording. Under `best_effort` the answer is still
   reported with `abstained` set when the evidence was thin, so `abstentions` still counts it; only
-  the prediction changes from a refusal to the answerer's best guess.
+  the prediction changes from a refusal to the answerer's best guess. Each `results.jsonl` task
+  row and each `samples.jsonl` sample row records the `answer_policy` its product arm requested
+  (`null` for the baseline arms, which do not call `ask`), so a `best_effort` run is not
+  silently comparable with an earlier `abstain` run of the same task.
 - **A task whose query prompt mandates a format or a refusal wording puts that wording into
   retrieval, not only into generation.** `EvalQuestion.content` is what the runner passes to
   `Memory.ask`, and `ask` takes one content input for both legs, so the instruction is matched

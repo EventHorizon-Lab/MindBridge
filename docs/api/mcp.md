@@ -185,7 +185,8 @@ injected memory; without one it returns `model_error/backend_not_configured`. Wi
 is `abstain` or `best_effort`: the default refuses when the evidence is thin, while `best_effort`
 commits to the most likely answer -- for a multiple-choice question, always one of the options --
 and still reports `abstained`, so an agent that must produce an answer keeps the confidence
-signal without losing the answer.
+signal without losing the answer. Under `best_effort` a question that grounds nothing spends a
+generation call too, where the default returns without one.
 
 `compile_context` is the preferred way to get task-ready context: it returns a structured,
 budgeted bundle with provenance instead of one sentence, calls no generation model, and stores no
