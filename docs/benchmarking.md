@@ -242,6 +242,11 @@ generation, and comparison options.
 Unless `--quiet` is set, `eval` reports sample and judge progress to stderr after the first
 completion and at roughly ten-percent intervals.
 
+`--verbosity` sets the library log level for the run and claims the root handler before an
+imported dependency can raise it. HTTP transport loggers stay at `WARNING` below `DEBUG`, so a
+successful request logs nothing and only warnings and errors reach stderr. The results table is
+printed regardless; `--quiet` (or `--verbosity ERROR`) is what suppresses it.
+
 `--limit` accepts `-1`, a fraction between zero and one, or an absolute adapter-unit count. Use an
 integer for a count; a non-integral value above one is truncated to an integer by the current
 loader selection. Its unit is adapter-specific: OpenEQA limits episodes and retains every question

@@ -259,6 +259,8 @@ benchmark:
     download: true
     # Accept a corpus whose digest is not pinned. Off by default for a reason.
     allow_unverified_data: false
+    # Library log level. Below DEBUG, per-request HTTP lines stay off; warnings and
+    # errors always print, as does the results table.
     verbosity: INFO
     quiet: false
 

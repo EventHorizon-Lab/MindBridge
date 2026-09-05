@@ -7,6 +7,7 @@ import asyncio
 import gc
 import hashlib
 import json
+import logging
 import math
 import os
 import platform
@@ -1005,6 +1006,20 @@ class _BackendPool:
                     resource.close()
 
 
+def _configure_logging(verbosity: str) -> None:
+    """Claim the root handler before an imported dependency installs a noisier one.
+
+    `import funasr` runs `logging.basicConfig(level=INFO)` at module scope, which switches every
+    library in the process to INFO: each successful model call then prints its own
+    `HTTP Request: ... 200 OK` line and buries the warnings worth reading. Configuring first makes
+    that call a no-op, and the per-request transport chatter stays off below DEBUG.
+    """
+    logging.basicConfig(level=verbosity, format="%(levelname)s %(name)s: %(message)s", force=True)
+    if verbosity != "DEBUG":
+        for transport in ("httpx", "httpcore", "openai", "urllib3"):
+            logging.getLogger(transport).setLevel(logging.WARNING)
+
+
 def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
     argv: Sequence[str] | None = None, *, prog: str | None = None
 ) -> int:
@@ -1020,6 +1035,7 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         memory_config, overrides = _load_memory_config(config_path)
     except ValueError as error:
         parser.error(str(error))
+    _configure_logging(_picked(parsed.verbosity, overrides.run.verbosity, "INFO"))
     download = DownloadSettings.resolve(
         overrides.download,
         benchmarks_root=parsed.benchmarks_root,

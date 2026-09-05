@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -3784,3 +3785,34 @@ def test_eval_run_section_reports_bad_values_as_usage_errors(body: str, tmp_path
 
     with pytest.raises(SystemExit):
         eval_module._arguments(parser, parsed, overrides=overrides)
+
+
+def test_configure_logging_silences_per_request_transport_lines() -> None:
+    """A later `basicConfig(INFO)` from a dependency must not resurrect httpx's 200 lines."""
+    root = logging.getLogger()
+    saved = (root.level, list(root.handlers))
+    try:
+        eval_module._configure_logging("INFO")
+        # What `import funasr` does at module scope; it must not take effect any more.
+        logging.basicConfig(level=logging.INFO)
+
+        assert logging.getLogger("httpx").getEffectiveLevel() == logging.WARNING
+        assert logging.getLogger("mindbridge").getEffectiveLevel() == logging.INFO
+    finally:
+        logging.getLogger("httpx").setLevel(logging.NOTSET)
+        root.setLevel(saved[0])
+        root.handlers[:] = saved[1]
+
+
+def test_configure_logging_keeps_transport_detail_for_debug_runs() -> None:
+    """`--verbosity DEBUG` is the one setting that asks for the per-request lines."""
+    root = logging.getLogger()
+    saved = (root.level, list(root.handlers))
+    try:
+        eval_module._configure_logging("DEBUG")
+
+        assert logging.getLogger("httpx").getEffectiveLevel() == logging.DEBUG
+    finally:
+        logging.getLogger("httpx").setLevel(logging.NOTSET)
+        root.setLevel(saved[0])
+        root.handlers[:] = saved[1]
