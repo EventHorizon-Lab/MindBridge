@@ -186,6 +186,8 @@ class RunOverrides(_HarnessModel):
     regression_threshold: Annotated[float, Field(strict=True, ge=0)] | None = None
     predict_only: bool | None = None
     log_samples: bool | None = None
+    # Reporting cadence, not a sweep knob: it only decides when each task's table is printed.
+    stream_results: bool | None = None
     allow_unverified_data: bool | None = None
     download: bool | None = None
     overwrite: bool | None = None

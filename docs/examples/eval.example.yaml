@@ -255,6 +255,10 @@ benchmark:
 
     # Skip scoring and only record predictions.
     predict_only: false
+    # Judge and print each task as it finishes instead of waiting for the last one. Later tasks
+    # then answer under the judging load of earlier ones, so their latency and token figures stop
+    # being comparable; leave it off whenever those numbers will be quoted.
+    stream_results: false
     # Fetch missing pinned annotations and selected media.
     download: true
     # Accept a corpus whose digest is not pinned. Off by default for a reason.

@@ -10,6 +10,17 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- `mindbridge-bench eval` now persists and can report each task as it finishes, instead of holding
+  a whole multi-task run until the last one is done. Every run appends `samples.partial.jsonl` as
+  each task stops answering and removes it once the real artifacts land, so an interruption during
+  the sixth task no longer discards the first five tasks' answers. The copy holds predictions and
+  is written before anything that can fail, and it is guarded like the artifacts it stands in for:
+  a rerun into the same output directory refuses without `--overwrite` rather than deleting the
+  record of a crashed run. `--stream-results` (`benchmark.run.stream_results`, off by default)
+  additionally judges and prints each task's table at that point, using the same arithmetic as the
+  final document, so the scores and controls in `results.jsonl` are unchanged either way. Only the
+  `performance` blocks change, which is why the flag is opt-in: judging one task overlaps the next
+  task's answering, so later tasks' latency and token figures describe a contended service.
 - `ask_stream()` on `Memory` and `AsyncMemory`, and the `AnswerChunk` value it yields. `ask()`
   already consumed a provider's token stream, timed the first token into the
   `mindbridge.model.time_to_first_token` span attribute, and then returned only the joined text,
