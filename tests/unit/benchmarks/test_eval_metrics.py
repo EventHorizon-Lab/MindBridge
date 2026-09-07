@@ -279,6 +279,49 @@ def test_answer_latency_names_the_quantity_it_measures() -> None:
     assert cast(float, latency["p99"]) == pytest.approx(39.7)
 
 
+def test_metrics_mark_an_unavailable_dataset_unit_as_incomplete() -> None:
+    sample = _sample("q1", sources=(), gold=(), candidate_count=0)
+    task = cast(
+        Any,
+        SimpleNamespace(
+            spec=SimpleNamespace(name="fixture"),
+            units=(SimpleNamespace(unit_id="unit"),),
+            unavailable_units={"private-video": "ERROR: Private video"},
+        ),
+    )
+
+    metrics = eval_module._metrics(task, (sample,), _arguments())
+    coverage = cast(Mapping[str, object], metrics["dataset_coverage"])
+
+    assert metrics["score_valid"] is False
+    assert coverage == {
+        "complete": False,
+        "evaluated_unit_count": 1,
+        "unavailable_unit_count": 1,
+        "unavailable_units": {"private-video": "ERROR: Private video"},
+        "score_comparable_to_full_dataset": False,
+    }
+
+
+def test_metrics_do_not_compare_a_selected_slice_to_the_full_dataset() -> None:
+    sample = _sample("q1", sources=(), gold=(), candidate_count=0)
+    task = cast(
+        Any,
+        SimpleNamespace(
+            spec=SimpleNamespace(name="fixture"),
+            units=(SimpleNamespace(unit_id="unit"),),
+            unavailable_units={},
+        ),
+    )
+
+    metrics = eval_module._metrics(task, (sample,), _arguments(limit=1, offset=0))
+    coverage = cast(Mapping[str, object], metrics["dataset_coverage"])
+
+    assert metrics["score_valid"] is True
+    assert coverage["complete"] is True
+    assert coverage["score_comparable_to_full_dataset"] is False
+
+
 # --- family 3: ASR real-time factor and inference latency -----------------------------------
 
 

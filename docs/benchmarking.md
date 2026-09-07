@@ -556,6 +556,17 @@ require hundreds of gigabytes. Long videos are prepared as deterministic bounded
 `.benchmarks/.prepared/`; preparation needs `ffmpeg` and `ffprobe`, and M3-Bench web media also
 needs `yt-dlp`.
 
+M3-Bench-web's official release publishes YouTube URLs rather than a durable web-video archive.
+When `yt-dlp` identifies a video as permanently unavailable (for example, private, removed, or
+copyright-blocked), acquisition continues and records the unit and exact reason under
+`unavailable_units` in the generated media manifest. Results then report incomplete
+`dataset_coverage` and set `score_valid` and `score_comparable_to_full_dataset` to `false`; the
+remaining samples are useful for development but are not a full-dataset benchmark score. Network,
+authentication, throttling, and unknown download failures still stop the run instead of being
+misreported as upstream data loss. Supplying an operator-managed copy with `--media-root` retains
+the unit and produces complete coverage. An intentional `--limit` or `--offset` slice can have
+complete selected coverage, but still reports `score_comparable_to_full_dataset: false`.
+
 Use `--no-download` for an offline run. Override operator-managed inputs explicitly:
 
 ```bash
