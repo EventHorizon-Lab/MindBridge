@@ -830,6 +830,87 @@ def _caption_response(*captions: str) -> httpx.Response:
     )
 
 
+def test_declarative_generation_slot_carries_every_control_through_the_real_factory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A control is only wired if it survives the recipe factory, which no adapter test sees.
+
+    `_owned_openai_models` names every adapter control as an explicit keyword, so a control added
+    to `_build_generation` and forgotten there raises `TypeError` on the first `from_config`.
+    Every other configuration test monkeypatches that factory away, which is how the documented
+    `min_video_seconds` shipped unreachable. Only the SDK client is faked here, so the real
+    factory runs and the built adapter has to answer.
+    """
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/embeddings"):
+            count = len(json.loads(request.content)["input"])
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"index": position, "embedding": [1.0, 0.0, 0.0, 0.0]}
+                        for position in range(count)
+                    ]
+                },
+            )
+        if not json.loads(request.content).get("stream"):
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"index": 0, "message": {"content": "391"}, "finish_reason": "stop"}
+                    ]
+                },
+            )
+        # `ask` answers over the streaming path, so the same wiring has to hold for deltas.
+        chunk = {
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "answer-model",
+            "choices": [{"index": 0, "delta": {"content": "391"}, "finish_reason": "stop"}],
+        }
+        return httpx.Response(
+            200,
+            content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http_client:
+        monkeypatch.setattr(
+            recipes_module,
+            "_openai_client",
+            lambda **_values: openai.OpenAI(
+                api_key="test-key",
+                base_url="https://models.example.test/v1",
+                http_client=http_client,
+                max_retries=0,
+            ),
+        )
+        with Memory.from_config(
+            {
+                "data_dir": tmp_path,
+                "embedding": {"provider": "openai", "model": "tiny-test", "dimension": 4},
+                "generation": {
+                    "provider": "openai",
+                    "model": "answer-model",
+                    # Every optional control at once: a keyword the factory forgets fails here.
+                    "temperature": 0.0,
+                    "seed": 7,
+                    "max_tokens": 64,
+                    "video_limit": 4,
+                    "min_video_seconds": 2.0,
+                    "extra_body": {"top_k": 20},
+                },
+            }
+        ) as memory:
+            memory.add("Ada counted 391 birds.")
+            answered = memory.ask("How many birds?")
+
+    assert answered.answer == "391"
+
+
 def _openai_slot_stub(
     monkeypatch: pytest.MonkeyPatch,
     http_client: httpx.Client,

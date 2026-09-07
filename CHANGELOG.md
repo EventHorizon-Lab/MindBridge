@@ -602,6 +602,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- `generation.min_video_seconds` in a configuration file no longer raises `TypeError` on the first
+  `Memory.from_config`. The setting reached the recipe factory, which names every adapter control
+  as an explicit keyword and had never been given this one, so the documented field was
+  unreachable through declarative composition while it worked when `OpenAIModels` was constructed
+  by hand. Every configuration test had replaced that factory with a stub, so a new one now drives
+  every generation control through the real factory and asserts the built adapter answers.
 - Two `add_stream` calls running at once no longer leave one of their threads permanently deferring
   its index flushes. The deferral that batches a stream's index commits was one shared slot each
   stream saved and restored, so the stream that finished second handed back the id of the thread
