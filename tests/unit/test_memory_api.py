@@ -331,6 +331,8 @@ class _FakeIndex:
         memory_type: str | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
         ef: int | None = None,
         exact: bool = False,
     ) -> tuple[IndexHit, ...]:
@@ -345,8 +347,19 @@ class _FakeIndex:
             for document_id, document in self.documents.items()
             if (space_id is None or document.embedding.space_id == space_id)
             and (task is None or document.embedding.task == task)
+            and self._matches_projection(document, place_id, identity_id)
             and self._matches_time_and_type(document, memory_type, occurred_from, occurred_until)
         )[:limit]
+
+    @staticmethod
+    def _matches_projection(
+        document: IndexDocument,
+        place_id: str | None,
+        identity_id: str | None,
+    ) -> bool:
+        return (place_id is None or document.place_id == place_id) and (
+            identity_id is None or identity_id in document.identity_ids
+        )
 
     def lexical_search(
         self,
@@ -358,6 +371,8 @@ class _FakeIndex:
         memory_type: str | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
     ) -> tuple[IndexHit, ...]:
         self.lexical_search_calls += 1
         self.lexical_queries.append(text)
@@ -372,6 +387,8 @@ class _FakeIndex:
             if space_id is not None and embedding.space_id != space_id:
                 continue
             if task is not None and embedding.task != task:
+                continue
+            if not self._matches_projection(document, place_id, identity_id):
                 continue
             if not self._matches_time_and_type(
                 document, memory_type, occurred_from, occurred_until
@@ -3539,10 +3556,13 @@ def test_composite_query_retains_atomic_media_recall(
             memory_type: str | None = None,
             occurred_from: datetime | None = None,
             occurred_until: datetime | None = None,
+            place_id: str | None = None,
+            identity_id: str | None = None,
             ef: int | None = None,
             exact: bool = False,
         ) -> tuple[IndexHit, ...]:
             del space_id, task, memory_type, occurred_from, occurred_until, ef, exact
+            del place_id, identity_id
             current.dense_search_calls += 1
             return (
                 (IndexHit(id=record.id, relevance=0.9, confidence=0.9),)
@@ -3581,6 +3601,8 @@ def test_search_does_not_serialize_callers(
         memory_type: str | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
         ef: int | None = None,
         exact: bool = False,
     ) -> tuple[IndexHit, ...]:
@@ -3594,6 +3616,8 @@ def test_search_does_not_serialize_callers(
             memory_type=memory_type,
             occurred_from=occurred_from,
             occurred_until=occurred_until,
+            place_id=place_id,
+            identity_id=identity_id,
             ef=ef,
             exact=exact,
         )
@@ -4140,7 +4164,7 @@ def test_a_full_text_tokenizer_change_rebuilds_without_reembedding(
         recipe = store.get_metadata("index.recipe")
         assert recipe is not None
         assert ":fts-bigram-fused:" in recipe
-        assert recipe.endswith("context-keys-v11:quantization-none")
+        assert recipe.endswith("context-keys-v12:quantization-none")
 
 
 def test_index_quantization_requires_the_public_enum(tmp_path: Path) -> None:
@@ -6559,6 +6583,20 @@ def test_a_name_registered_before_naming_became_a_claim_survives_the_upgrade(
         assert identity_id not in {
             entry.identity_id for entry in bundle.actors if isinstance(entry, ProvisionalActor)
         }
+
+        # A migration cannot embed, and `reindex()` only replays the vectors SQLite already
+        # holds, so the capture queue is what makes the backfilled sentence searchable: it
+        # settles like a captured record instead of staying out of `search` forever.
+        assertion_id = next(
+            item.id
+            for item in memory.list(limit=50).items
+            if item.context is not None and item.context.identity_id == identity_id
+        )
+        assert [pending.memory_id for pending in memory.pending_captures()] == [assertion_id]
+        memory.reindex()
+        assert all(hit.id != assertion_id for hit in memory.search("recognized person", limit=10))
+        assert memory.settle() == 1
+        assert assertion_id in {hit.id for hit in memory.search("recognized person", limit=10)}
 
         # The backfilled assertion is the one the kernel derives, so re-registering the same
         # name changes nothing rather than stacking a second assertion on the person.

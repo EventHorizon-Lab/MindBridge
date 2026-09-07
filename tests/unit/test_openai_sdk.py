@@ -1360,6 +1360,114 @@ def test_consolidation_sizes_the_request_by_emitted_part(
     assert failure.value.reason == "payload_too_large"
 
 
+def test_consolidation_prompt_spells_the_operation_keys_it_will_be_parsed_against() -> None:
+    """Prose describing a key is not the key: a measured endpoint wrote "target" for "targets".
+
+    The consolidation prompt used to say only that an operation "names one target index", so the
+    field table and the request disagreed about spelling and every proposal in the batch was
+    discarded -- twice, with the pass then reporting nothing applied. The formation prompt never
+    had this failure because it prints its own envelope and every field name literally, which is
+    the property asserted here for consolidation.
+    """
+    prompt = openai_backend._CONSOLIDATION_SYSTEM_PROMPT
+    for field in openai_backend._CONSOLIDATION_FIELDS:
+        assert f"  {field}" in prompt, field
+    assert '{"operations":[{"intent":"correct","targets":[0]' in prompt
+    # A consolidation proposal is parsed by the formation proposal decoder, so the optional
+    # fields it accepts have to be spelled here too: unmentioned, they were simply never sent,
+    # and a derived record silently inherited validity instead of stating its own.
+    for optional in ("valid_from", "valid_until", "spatial"):
+        assert optional in prompt, optional
+
+
+def test_consolidation_names_the_unknown_key_and_quotes_the_reply() -> None:
+    """The rejection is total, so its message is the only account of why nothing was applied.
+
+    No alias is accepted: a key the field table does not carry is a proposal written against
+    some other contract. The error has to say which key and show the text, or the operator sees
+    only `applied=0` from a pass that in fact refused two well-reasoned corrections.
+    """
+    reply: dict[str, object] = {
+        "operations": [{"intent": "correct", "target": [0], "rationale": "contradicted"}]
+    }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return _completion(reply)
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client))
+        with pytest.raises(ModelError) as failure:
+            model.consolidate(_consolidation_evidence(), trigger=MemoryTrigger.MANUAL)
+
+    assert failure.value.reason == "response_invalid"
+    assert "unknown key(s) target" in str(failure.value)
+    assert '"target": [0]' in str(failure.value)
+
+
+def test_consolidation_says_the_proposal_is_what_was_malformed() -> None:
+    """A proposal the formation parser cannot read is reported as a proposal, not as absence.
+
+    The parser reports a bad shape by returning None, so a misspelled proposal key used to
+    arrive at the operation as no proposal at all and failed on the missing one instead --
+    naming neither the proposal nor the key, on the one message the pass ever produces.
+    """
+    reply: dict[str, object] = {
+        "operations": [
+            {
+                "intent": "consolidate",
+                "evidence": [0],
+                "rationale": "two mornings say the same thing",
+                "proposal": {
+                    "kind": "state",
+                    "content": "the kettle is on the worktop",
+                    "confidence": 0.8,
+                    "memory_type": "semantic",
+                },
+            }
+        ]
+    }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return _completion(reply)
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client))
+        with pytest.raises(ModelError) as failure:
+            model.consolidate(_consolidation_evidence(), trigger=MemoryTrigger.MANUAL)
+
+    assert failure.value.reason == "response_invalid"
+    assert "proposal is not a valid formation proposal" in str(failure.value)
+    assert '"memory_type": "semantic"' in str(failure.value)
+
+
+def test_consolidation_operations_parse_when_the_reply_uses_the_documented_keys() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        # The documented server contract is `json_object`; a `json_schema` response format would
+        # fail every endpoint that implements only the former, so the prompt carries the shape.
+        assert json.loads(request.content)["response_format"] == {"type": "json_object"}
+        return _completion(
+            {
+                "operations": [
+                    {"intent": "correct", "targets": [1], "rationale": "Evidence 0 contradicts."},
+                    {"intent": "reinforce", "targets": [1], "evidence": [0], "rationale": "seen"},
+                ]
+            }
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        applied = _model(_sdk_client(client)).consolidate(
+            _consolidation_evidence(),
+            trigger=MemoryTrigger.MANUAL,
+        )
+
+    assert [operation.intent for operation in applied] == [
+        MemoryIntent.CORRECT,
+        MemoryIntent.REINFORCE,
+    ]
+    assert applied[0].target_ids == ("derived-1",)
+    assert applied[1].evidence_ids == ("raw-1",)
+
+
 def test_consolidation_recipe_identifies_every_generation_control() -> None:
     baseline = OpenAIModels().consolidation_recipe
     variants = {
@@ -3250,7 +3358,9 @@ _FORMATION_REQUIREMENTS = {
     "state": ("subject", "predicate", "value"),
     "relation": ("subject", "predicate", "value"),
     "trait": ("subject", "predicate", "value"),
-    "response_policy": ("subject", "predicate", "value"),
+    # `response_policy` is deliberately absent: the kernel refuses a model-proposed one
+    # (`_formation_refusal`), so asking the former for a kind that can only be thrown away
+    # spends tokens on refusals. The host authorizes one through `apply()` instead.
 }
 
 
@@ -3287,6 +3397,29 @@ def test_formation_prompt_states_every_field_the_validator_demands(
     assert row is not None, f"the prompt's kind table has no row for {kind}"
     stated = {token.strip(" ,.") for token in row.split("--", 1)[1].split()}
     assert set(extra) <= stated, f"{kind} row omits {sorted(set(extra) - stated)}"
+
+
+def test_consolidation_asks_only_for_kinds_its_own_field_rule_states() -> None:
+    """The consolidation prompt has one sentence for proposal fields, so it may only list kinds
+    that sentence covers -- subject, predicate and value.
+
+    It used to offer `affect` while stating no rule for it, and a compliant model that read the
+    sentence sent subject alone: `FormationProposal` requires a value for an affect, so the
+    proposal parsed to nothing and the whole batch was rejected. An affect additionally needs a
+    cue modality that the cited source itself carried, plus valence and arousal, which is what
+    formation states at ingest against one observation's own modalities. Consolidation derives
+    across sources and has no single cue channel to name, so it is not asked for one.
+    """
+    spellable = {
+        kind
+        for kind, extra in _FORMATION_REQUIREMENTS.items()
+        if set(extra) <= {"subject", "predicate", "value"}
+    }
+    prompt = openai_backend._CONSOLIDATION_SYSTEM_PROMPT
+    listed = prompt.split("whose kind is", 1)[1].split(", plus", 1)[0]
+    named = set(listed.replace("or ", "").replace(",", " ").split())
+
+    assert named == spellable
 
 
 def test_a_malformed_proposal_does_not_discard_its_valid_siblings() -> None:

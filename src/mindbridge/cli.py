@@ -140,11 +140,6 @@ OPERATIONS: tuple[str, ...] = (
 )
 DOCTOR = "doctor"
 COMMANDS: tuple[str, ...] = (*(name.replace("_", "-") for name in OPERATIONS), DOCTOR)
-# Operations a running owner serves over `/v1`. Other operations have no route today; that is a
-# documented transport gap, reported honestly, not a CLI design choice.
-REMOTE_COMMANDS = frozenset(
-    {"add", "add-many", "search", "ask", "compile", "get", "list", "delete"}
-)
 _QUERY_METAVAR: Mapping[str, str] = {
     "add": "TEXT",
     "capture": "TEXT",
@@ -157,8 +152,18 @@ _QUERY_METAVAR: Mapping[str, str] = {
 _DEFAULT_REMOTE_TIMEOUT_SECONDS = 30.0
 # One list, because a slot added to `recipes` used to need remembering in four separate literals
 # here; the flag, the explain document, `doctor`, and the composition guard all derive from it.
-_SLOTS: tuple[str, ...] = ("embedder", "answerer", "former", "consolidator", "transcriber")
+_SLOTS: tuple[str, ...] = (
+    "embedder",
+    "answerer",
+    "former",
+    "consolidator",
+    "transcriber",
+    "vision",
+)
 _OPTIONAL_SLOTS: tuple[str, ...] = _SLOTS[1:]
+# The one slot whose `Memory` keyword is not its name. `MindBridgeConfig` and the flag call the
+# slot `vision`; the object it holds is a describer, which is what `Memory` names its parameter.
+_MEMORY_KEYWORDS: Mapping[str, str] = {"vision": "vision_describer"}
 _TUNING: tuple[str, ...] = (
     "index_speech",
     "minimum_relevance",
@@ -323,6 +328,8 @@ def _open_memory(arguments: argparse.Namespace) -> Memory:
             backends["consolidator"] = recipes.consolidator(arguments.consolidator)
         if arguments.transcriber is not None:
             backends["transcriber"] = recipes.transcriber(arguments.transcriber)
+        if arguments.vision is not None:
+            backends["vision"] = recipes.vision(arguments.vision)
     try:
         # `Memory` closes the backends it accepted, but it opens the store before it accepts them,
         # so a busy data directory would otherwise leak whatever this process just constructed.
@@ -333,6 +340,7 @@ def _open_memory(arguments: argparse.Namespace) -> Memory:
             former=backends.get("former"),  # type: ignore[arg-type]
             consolidator=backends.get("consolidator"),  # type: ignore[arg-type]
             transcriber=backends.get("transcriber"),  # type: ignore[arg-type]
+            vision_describer=backends.get("vision"),  # type: ignore[arg-type]
             index_speech=arguments.index_speech,
             minimum_relevance=arguments.minimum_relevance,
             ambiguity_margin=arguments.ambiguity_margin,
@@ -467,6 +475,7 @@ def _doctor_capabilities(loaded: Mapping[str, object]) -> _Document | None:
             embedder=cast(Any, embedder),
             answerer=cast(Any, loaded.get("answerer")),
             transcriber=cast(Any, loaded.get("transcriber")),
+            vision_describer=cast(Any, loaded.get("vision")),
             former=cast(Any, loaded.get("former")),
             consolidator=cast(Any, loaded.get("consolidator")),
         )
@@ -1078,7 +1087,7 @@ def _run_remote(arguments: argparse.Namespace) -> _Document:
     command = arguments.command
     if command == DOCTOR:
         return _remote_doctor(arguments)
-    if command not in REMOTE_COMMANDS:
+    if command not in _REMOTE:
         raise _CompositionError(
             f"{command} has no /v1 route, so it cannot run against --url; the Python SDK and a "
             "local --app or --embedder composition support it",
@@ -1086,7 +1095,34 @@ def _run_remote(arguments: argparse.Namespace) -> _Document:
             subject=command,
         )
     method, path, body = _REMOTE[command](arguments)
-    return _request(arguments.url, method, path, body, _remote_timeout(arguments))
+    try:
+        document = _request(arguments.url, method, path, body, _remote_timeout(arguments))
+    except _RemoteFailure as failure:
+        raise _remote_switch_off(command, arguments.url, failure) from failure
+    return _REMOTE_RESULT[command](document) if command in _REMOTE_RESULT else document
+
+
+def _remote_switch_off(command: str, url: str, failure: _RemoteFailure) -> Exception:
+    """Report a gated route the owner never registered as the configuration condition it is.
+
+    `create_app` leaves the identity and embodied routes unregistered when the host did not opt
+    in, so the owner answers "route does not exist" rather than anything about the subject the
+    command named. That code is in no exit table, so forwarding it verbatim exits 1 with a
+    message about routing; the switch the host left off is the actual subject.
+
+    A base URL pointing somewhere that is not a MindBridge owner answers the same 404, and no
+    probe distinguishes the two -- a `/healthz` request would answer for whatever is listening
+    there. The message names both possibilities rather than asserting the likelier one.
+    """
+    switch = _REMOTE_SWITCH.get(command)
+    if switch is None or failure.envelope.get("code") != "not_found":
+        return failure
+    return _CompositionError(
+        f"the owner at {url} does not serve {command}: it was started without {switch}, or the "
+        "URL does not point at a MindBridge server",
+        reason="unsupported_in_remote_mode",
+        subject=command,
+    )
 
 
 def _remote_add(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
@@ -1124,8 +1160,84 @@ def _remote_add_many(arguments: argparse.Namespace) -> tuple[str, str, _Document
     return "POST", "/v1/memories/batch", body
 
 
+def _remote_capture(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    # The route takes the same body `POST /v1/memories` does, so the encoding is the same too.
+    _method, _path, body = _remote_add(arguments)
+    return "POST", "/v1/capture", body
+
+
+def _remote_settle(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    body: _Document = {"limit": arguments.limit, "max_attempts": arguments.max_attempts}
+    _put(body, "memory_ids", list(arguments.memory_ids) or None)
+    return "POST", "/v1/settle", body
+
+
+def _remote_pending_captures(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    query = [("limit", arguments.limit), *(("memory_ids", value) for value in arguments.memory_ids)]
+    return "GET", f"/v1/pending_captures?{urlencode(query)}", None
+
+
 def _remote_search(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
     return "POST", "/v1/memories/search", _remote_query("query", arguments)
+
+
+def _remote_search_with_trace(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    # One route serves both searches; `explain` is what selects the traced SDK operation.
+    return "POST", "/v1/memories/search", {**_remote_query("query", arguments), "explain": True}
+
+
+def _remote_reinforce(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    return "POST", "/v1/memories/reinforce", {"memory_ids": list(arguments.memory_ids)}
+
+
+def _remote_speech(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    return "POST", "/v1/speech", {"memory_id": arguments.memory_id}
+
+
+def _remote_faces(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    return "POST", "/v1/faces", {"memory_id": arguments.memory_id}
+
+
+def _remote_register_identity(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    body: _Document = {"identity_id": arguments.identity_id, "name": arguments.name}
+    _put(body, "relationship", arguments.relationship)
+    return "POST", "/v1/identities", body
+
+
+def _remote_identity(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    return "GET", f"/v1/identities/{quote(arguments.identity_id, safe='')}", None
+
+
+def _remote_unlink_identity(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    return "POST", f"/v1/identities/{quote(arguments.alias_id, safe='')}/unlink", None
+
+
+def _remote_forget_identity(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    return "DELETE", f"/v1/identities/{quote(arguments.identity_id, safe='')}", None
+
+
+def _remote_record_consent(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    body: _Document = {"state": arguments.state}
+    _put(body, "note", arguments.note)
+    identity_id = quote(arguments.identity_id, safe="")
+    return "POST", f"/v1/identities/{identity_id}/consent", body
+
+
+def _remote_consent(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    return "GET", f"/v1/identities/{quote(arguments.identity_id, safe='')}/consent", None
+
+
+def _remote_export(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    query = (
+        [("identity_id", arguments.identity_id)]
+        if arguments.identity_id is not None
+        else [("memory_ids", value) for value in arguments.memory_ids]
+    )
+    return "GET", f"/v1/export?{urlencode(query)}", None
+
+
+def _remote_apply_retention(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
+    return "POST", "/v1/retention", {"dry_run": arguments.dry_run}
 
 
 def _remote_ask(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
@@ -1179,16 +1291,66 @@ def _remote_list(arguments: argparse.Namespace) -> tuple[str, str, _Document | N
     return "GET", f"/v1/memories?{urlencode(query)}", None
 
 
+# Every command a running owner serves over `/v1`, and the only place that set is written down:
+# `_run_remote` refuses anything absent here. A command missing from it has no route at all, not
+# a route the CLI forgot -- `consolidate`, `deliberate`, `apply`, `rollback`, `operations`, and
+# the rest of the control plane are SDK-only by design, and so are `add-stream`,
+# `register-speaker`, `reindex`, and `optimize`.
 _REMOTE: Mapping[str, Callable[[argparse.Namespace], tuple[str, str, _Document | None]]] = {
     "add": _remote_add,
     "add-many": _remote_add_many,
+    "capture": _remote_capture,
+    "settle": _remote_settle,
+    "pending-captures": _remote_pending_captures,
     "search": _remote_search,
+    "search-with-trace": _remote_search_with_trace,
     "ask": _remote_ask,
     "compile": _remote_compile,
     "get": _remote_get,
+    "speech": _remote_speech,
+    "faces": _remote_faces,
+    "register-identity": _remote_register_identity,
+    "identity": _remote_identity,
+    "record-consent": _remote_record_consent,
+    "consent": _remote_consent,
+    "forget-identity": _remote_forget_identity,
+    "unlink-identity": _remote_unlink_identity,
+    "reinforce": _remote_reinforce,
+    "export": _remote_export,
+    "apply-retention": _remote_apply_retention,
     "list": _remote_list,
     "delete": _remote_delete,
 }
+# Which `create_app` switch registers each gated route, so a 404 from an owner that never opted
+# in names the switch instead of reaching the caller as an unexplained exit 1.
+_REMOTE_SWITCH: Mapping[str, str] = {
+    "speech": "embodied_operations",
+    "faces": "embodied_operations",
+    "register-identity": "identity_operations",
+    "identity": "identity_operations",
+    "record-consent": "identity_operations",
+    "consent": "identity_operations",
+    "forget-identity": "identity_operations",
+    "unlink-identity": "identity_operations",
+    "export": "identity_operations",
+    "apply-retention": "identity_operations",
+}
+# The four responses REST shapes differently from the command's own document. A script must read
+# one shape per command whichever transport ran it, so the transport translates back rather than
+# printing a second vocabulary under `--url`.
+_REMOTE_RESULT: Mapping[str, Callable[[_Document], _Document]] = {
+    "pending-captures": lambda document: {"pending": document["items"]},
+    "forget-identity": lambda document: cast(_Document, document["erasure"]),
+    "register-identity": lambda _document: {},
+    "identity": lambda document: {"identity": _remote_profile(document["identity"])},
+}
+
+
+def _remote_profile(profile: object) -> _Document | None:
+    """Project the owner's identity profile onto the three fields `identity` prints locally."""
+    if not isinstance(profile, dict):
+        return None
+    return {name: profile.get(name) for name in ("identity_id", "name", "relationship")}
 
 
 def _remote_doctor(arguments: argparse.Namespace) -> _Document:
@@ -1497,12 +1659,14 @@ def _retrieval_scope(value: object) -> RetrievalScope | None:
         return None
     if not isinstance(value, dict):
         raise ValidationError("scope must be a JSON object")
-    _fields(value, {"valid_at", "known_at", "near", "radius_m"})
+    _fields(value, {"valid_at", "known_at", "near", "radius_m", "place_id", "identity_id"})
     return RetrievalScope(
         valid_at=_optional_time(value.get("valid_at"), "scope.valid_at"),
         known_at=_optional_time(value.get("known_at"), "scope.known_at"),
         near=_spatial_context(value.get("near")),
         radius_m=cast(float | None, value.get("radius_m")),
+        place_id=cast(str | None, value.get("place_id")),
+        identity_id=cast(str | None, value.get("identity_id")),
     )
 
 
@@ -1560,6 +1724,8 @@ def _retrieval_scope_document(scope: RetrievalScope | None) -> _Document | None:
         "known_at": _encode_optional_time(scope.known_at),
         "near": _spatial_document(scope.near),
         "radius_m": scope.radius_m,
+        "place_id": scope.place_id,
+        "identity_id": scope.identity_id,
     }
 
 
@@ -1680,6 +1846,7 @@ def _context_document(context: MemoryContext | None) -> _Document | None:
         "supersedes_id": context.supersedes_id,
         "model_id": context.model_id,
         "recipe": context.recipe,
+        "identity_id": context.identity_id,
         "spatial": _spatial_document(context.spatial),
         "cue_modality": None if context.cue_modality is None else context.cue_modality.value,
         "valence": context.valence,
@@ -1802,7 +1969,8 @@ def _default(operation: str, parameter: str) -> object:
 
 
 _MEMORY_DEFAULTS: Mapping[str, object] = {
-    name: _default("__init__", name) for name in ("data_dir", *_OPTIONAL_SLOTS, *_TUNING)
+    name: _default("__init__", _MEMORY_KEYWORDS.get(name, name))
+    for name in ("data_dir", *_OPTIONAL_SLOTS, *_TUNING)
 }
 
 
@@ -1837,6 +2005,9 @@ def _parser() -> argparse.ArgumentParser:
         "--consolidator", metavar="NAME", help="consolidation recipe, with --embedder"
     )
     parser.add_argument("--transcriber", metavar="NAME", help="speech recipe, with --embedder")
+    parser.add_argument(
+        "--vision", metavar="NAME", help="visual description recipe, with --embedder"
+    )
     # Derived from the SDK default, never hardcoded: `_reject_embedder_only_options` compares this
     # against `_MEMORY_DEFAULTS`, so a literal here silently rejects every --app/--url invocation
     # the moment the SDK default moves. `BooleanOptionalAction` also supplies --no-index-speech.

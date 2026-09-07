@@ -679,8 +679,8 @@ def test_benchmark_speech_backend_satisfies_the_runtime_protocol() -> None:
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_module.EVAL_SCHEMA_VERSION == 13
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v13"
+    assert eval_module.EVAL_SCHEMA_VERSION == 14
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v14"
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(
@@ -690,6 +690,7 @@ def test_response_cache_namespace_changes_with_runner_recipe(
             recall_limit=8,
             blind=False,
             ingest="add",
+            deliberate=False,
             compile_max_items=24,
             compile_max_chars=16000,
         ),
@@ -979,6 +980,7 @@ def test_eval_config_reuses_the_declarative_memory_schema(tmp_path: Path) -> Non
             model="mindbridge",
             blind=False,
             ingest="add",
+            deliberate=False,
             compile_max_items=24,
             compile_max_chars=16000,
         ),
@@ -2520,6 +2522,7 @@ async def test_run_arms_defers_replay_until_every_task_answer_finishes(
             benchmarks_root=tmp_path / "corpus",
             media_manifest=None,
             media_overrides={},
+            deliberate=False,
         ),
     )
     telemetry = EvaluationTelemetry()

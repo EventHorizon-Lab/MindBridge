@@ -307,13 +307,19 @@ class ObservationContext:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RetrievalScope:
-    """Optional world-time, knowledge-time, and spatial retrieval scope.
+    """Optional world-time, knowledge-time, spatial, and identity retrieval scope.
 
     Two spatial axes, because a household asks in both. `near`/`radius_m` is metric and answers
     "within two metres of here". `place_id` is symbolic and answers "in the kitchen" — the query a
     person actually asks, and the one a robot can label when it cannot localise metrically. They
     are independent: a symbolic equality is the one spatial predicate SQLite indexes cheaply,
     while the metric radius is a filter over retrieved candidates.
+
+    `identity_id` answers "about this person". A memory is in scope when its semantic subject is
+    that identity (`memory_semantics.identity_id`, the binding a naming or claim assertion
+    carries) **or** the identity was observed in it: a diarised speech segment or a face
+    observation on one of the memory's media assets. A merged alias resolves to the surviving
+    identity, so scoping by either ID of a merged pair returns the same memories.
     """
 
     valid_at: datetime | None = None
@@ -322,6 +328,8 @@ class RetrievalScope:
     radius_m: float | None = None
     # `None` means "do not scope by place", never "memories that have no place".
     place_id: str | None = None
+    # `None` means "do not scope by identity", never "memories about nobody".
+    identity_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.valid_at, "scope valid_at")
@@ -332,6 +340,14 @@ class RetrievalScope:
             # rejected on the write path cannot be silently accepted on the read path.
             if not isinstance(place, str) or not place.strip() or place != place.strip():
                 raise ValidationError("scope place_id must be non-empty and trimmed")
+        if self.identity_id is not None:
+            identity = self.identity_id
+            if (
+                not isinstance(identity, str)
+                or not identity.strip()
+                or identity != identity.strip()
+            ):
+                raise ValidationError("scope identity_id must be non-empty and trimmed")
         if (self.near is None) != (self.radius_m is None):
             raise ValidationError("scope near and radius_m must be supplied together")
         if self.near is not None and not isinstance(self.near, SpatialContext):
@@ -1788,12 +1804,19 @@ class MemoryCapabilities:
         }
         return frozenset(name for name, ready in available.items() if ready)
 
-    def document(self) -> dict[str, object]:
+    def document(self, *, served: frozenset[str] | None = None) -> dict[str, object]:
         """Return the JSON-ready capability document every surface publishes.
 
         REST serves it from `/healthz`, the MCP server embeds it in its instructions, and
         `mindbridge doctor` prints it, so the three cannot describe the same composition
-        differently. Modality sets and operation names are sorted so the document is stable.
+        differently -- beyond the one narrowing below. Modality sets and operation names are
+        sorted so the document is stable.
+
+        `served` names the operations the publishing surface can actually route to, and
+        `operations` is intersected with it. The backends are declared the same way everywhere,
+        but the control plane is SDK-only by design, so a network surface that published the
+        whole derivation would tell an agent it has a `consolidate` it cannot find. The SDK and
+        `mindbridge doctor` pass nothing and publish the derivation itself.
         """
         values: dict[str, object] = {
             declared.name: (
@@ -1803,7 +1826,8 @@ class MemoryCapabilities:
             )
             for declared in fields(self)
         }
-        values["operations"] = sorted(self.operations)
+        operations = self.operations
+        values["operations"] = sorted(operations if served is None else operations & served)
         return values
 
 

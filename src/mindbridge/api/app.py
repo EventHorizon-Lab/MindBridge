@@ -36,6 +36,7 @@ from mindbridge.api.content import (
     content_input,
     context_budget,
 )
+from mindbridge.api.deliberation import deliberation_lifespan
 from mindbridge.api.errors import (
     REASON_STATUS,
     error_response,
@@ -43,6 +44,7 @@ from mindbridge.api.errors import (
     exception_response,
     register_error_handlers,
 )
+from mindbridge.control import dump_operation
 from mindbridge.types import (
     AbstentionReason,
     AnswerChunk,
@@ -325,6 +327,10 @@ class MemoryOperationResponse(_ResponseModel):
     claim: IdentityClaimResponse | None
     consent: ConsentClaimResponse | None
     identity: IdentityChangeResponse | None
+    # The canonical logged payload, exactly as `mindbridge operations` prints it: a
+    # consolidation's subject is what it proposed, so a row without this reported an intent and
+    # no statement, and the replay path had to read the proposal from the SDK instead.
+    proposal: dict[str, object] | None
     rationale: str | None
     model_id: str | None
     recipe: str | None
@@ -361,6 +367,9 @@ class RetentionResponse(_ResponseModel):
 
 def _operation_response(record: MemoryOperationRecord) -> MemoryOperationResponse:
     operation = record.operation
+    # Read back from the canonical logged payload rather than re-derived from the value type, so
+    # the row REST serves and the row the CLI prints are one document -- and `apply` accepts it.
+    logged = cast(dict[str, object], json.loads(dump_operation(operation)))
     return MemoryOperationResponse(
         operation_id=record.operation_id,
         intent=operation.intent,
@@ -382,6 +391,7 @@ def _operation_response(record: MemoryOperationRecord) -> MemoryOperationRespons
             if operation.identity is None
             else IdentityChangeResponse.model_validate(operation.identity)
         ),
+        proposal=cast("dict[str, object] | None", logged["proposal"]),
         rationale=operation.rationale,
         model_id=record.model_id,
         recipe=record.recipe,
@@ -496,7 +506,8 @@ class CapabilitiesResponse(_ResponseModel):
     speaker_recognition: bool
     streaming_generation: bool
     # Derived from the backends above, not declared: which optional operations this composition
-    # can serve. `MemoryCapabilities.document()` is the one place that derivation happens.
+    # can serve *and this app routes to*. `MemoryCapabilities.document()` is the one place that
+    # derivation happens; `_ROUTED_OPERATIONS` is what `/healthz` may promise of it.
     operations: tuple[str, ...]
 
 
@@ -766,12 +777,22 @@ class _RequestTelemetry:
                 span.set_attribute("mindbridge.transport.response_started", response_started)
 
 
+# Which of `MemoryCapabilities.operations` a `/v1` route can actually reach. Consolidation --
+# like cognitive forgetting and operation rollback, which are not derived capabilities at all --
+# has no route by design (`docs/context-os.md`), so `/healthz` must not advertise it; `speech`
+# and `faces` reach `analyzeSpeech` and `analyzeFaces` only when the host opts in. An operation
+# added to the derivation stays unadvertised here until it is given a route.
+_ROUTED_OPERATIONS = frozenset({"ask", "transcribe", "describe_vision", "formation"})
+_EMBODIED_ROUTED_OPERATIONS = frozenset({"speech", "faces"})
+
+
 def create_app(
     *,
     memory: _Memory,
     identity_operations: bool = False,
     embodied_operations: bool = False,
     tracer: Tracer | None = None,
+    deliberate_every: float | None = None,
 ) -> FastAPI:
     """Create an unauthenticated API over one caller-owned memory instance.
 
@@ -780,8 +801,25 @@ def create_app(
     or analyzing a person is host authority that no route grants unless the host opts in. When a
     switch is off the routes it gates are never registered, so a caller gets 404 rather than 403 --
     it cannot discover through the error what an enabled deployment would offer.
+
+    ``deliberate_every`` is a number of seconds after which this process runs ``deliberate()``
+    on the memory it serves, off by default. The control plane stays SDK-only -- no route and no
+    tool exposes it -- but the signals the routes write, above all the ``QUERY_FAILURE`` rows a
+    failed ``search``, ``ask``, or ``compile`` records, can only be consumed by the process that
+    owns the directory. Without this a REST-only or MCP-only deployment collects them and drops
+    them. It is refused when no consolidation backend is configured, because the loop would then
+    raise on every round.
     """
-    app = FastAPI(title="MindBridge", version="0.2.0")
+    served = _ROUTED_OPERATIONS | (
+        _EMBODIED_ROUTED_OPERATIONS if embodied_operations else frozenset()
+    )
+    app = FastAPI(
+        title="MindBridge",
+        version="0.2.0",
+        lifespan=(
+            None if deliberate_every is None else deliberation_lifespan(memory, deliberate_every)
+        ),
+    )
     register_error_handlers(app)
     app.add_middleware(_RequestBodyLimit)
     app.add_middleware(
@@ -798,7 +836,9 @@ def create_app(
     def health() -> HealthResponse:
         # Read from the injected instance on every call, so a composition swapped behind this
         # process is reported rather than a snapshot taken at construction.
-        return HealthResponse(capabilities=_capabilities_response(memory.capabilities))
+        return HealthResponse(
+            capabilities=_capabilities_response(memory.capabilities, served=served)
+        )
 
     app.include_router(
         _v1_router(
@@ -1434,9 +1474,11 @@ def _search(service: _Memory, request: QueryRequest) -> SearchResponse:
     return SearchResponse.model_validate({"hits": traced.hits, "trace": traced.trace})
 
 
-def _capabilities_response(capabilities: MemoryCapabilities) -> CapabilitiesResponse:
-    """Serialize the one capability document MCP and the CLI publish too."""
-    return CapabilitiesResponse.model_validate(capabilities.document())
+def _capabilities_response(
+    capabilities: MemoryCapabilities, *, served: frozenset[str]
+) -> CapabilitiesResponse:
+    """Serialize the one capability document MCP and the CLI publish too, minus what has no route."""
+    return CapabilitiesResponse.model_validate(capabilities.document(served=served))
 
 
 def _headers(scope: Scope) -> list[tuple[bytes, bytes]]:

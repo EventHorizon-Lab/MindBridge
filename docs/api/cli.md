@@ -42,6 +42,7 @@ Use `mindbridge COMMAND --help` for the command-specific flags summarized below.
 | `--former NAME` | formation recipe for `--embedder`; omit it to disable formation |
 | `--consolidator NAME` | consolidation recipe for `--embedder`; omit it to disable `consolidate` |
 | `--transcriber NAME` | speech recipe for `--embedder` |
+| `--vision NAME` | visual description recipe for `--embedder`; omit it to disable captioning |
 | `--index-speech`, `--no-index-speech` | enable or disable transcript indexing; default enabled |
 | `--minimum-relevance FLOAT` | relevance floor; default `0.10` |
 | `--ambiguity-margin FLOAT` | top-two gate when `limit=1`; default `0.01` |
@@ -54,8 +55,11 @@ Use `mindbridge COMMAND --help` for the command-specific flags summarized below.
 only to `--url`. Inapplicable options fail instead of being ignored. `--app` follows the
 `MODULE:ATTR` convention and adds the working directory to `sys.path`.
 
-The listed flags are the complete direct-composition surface. Use `--app` for index quantization,
-face analysis, speaker/face thresholds, a custom backend, or any other `Memory` setting.
+The listed flags are the complete direct-composition surface. Use `--app MODULE:ATTR` for index
+quantization, face analysis, speaker/face thresholds, a custom backend, or any other `Memory`
+setting. In particular the `faces` command needs a face analyzer, which is built from local model
+files rather than a named recipe, so it has no flag: compose it in an application and select that
+application with `--app`.
 
 Composition, model identity, credentials, and settings are documented in
 [configuration](../configuration.md).
@@ -75,14 +79,21 @@ server's owner.
 | --- | --- | --- |
 | `jina-omni` | `--embedder` | pinned Jina Omni model, revision, and 1024 dimensions |
 | `funasr` | `--transcriber` | pinned FunASR model and component revisions |
-| `openai` | `--embedder`, `--answerer`, `--former`, `--consolidator`, `--transcriber` | `text-embedding-3-small`, `gpt-5-mini`, `gpt-5-mini`, `gpt-5-mini`, `whisper-1` |
+| `openai` | `--embedder`, `--answerer`, `--former`, `--consolidator`, `--transcriber`, `--vision` | `text-embedding-3-small`, `gpt-5-mini`, `gpt-5-mini`, `gpt-5-mini`, `whisper-1`, `gpt-5-mini` |
 
 Only `openai` accepts a model suffix, for example `--former openai:gpt-5-mini`. Selecting a former
 opts into one formation model call after each source observation commits; omitting `--former`
 keeps formation off. `--consolidator` is what the `consolidate` command needs, and it costs
-nothing until that command runs: unlike a former it is not on the write path. Recipe names form a
-closed table; use `--app` for other backends. Provider trust, license, model identity, and
-credential behavior live in [configuration](../configuration.md).
+nothing until that command runs: unlike a former it is not on the write path. `--vision` selects
+the describer that captions visual memories so the lexical half of retrieval can reach an image
+with no words of its own; it declares the `image` modality, costs one chat completion per write
+batch that carries an image, and omitting it keeps the write path as cheap as it is without one.
+Recipe names form a closed table; use `--app` for other backends. Provider trust, license, model
+identity, and credential behavior live in [configuration](../configuration.md).
+
+```bash
+mindbridge --embedder openai --former openai --vision openai add @panel.png
+```
 
 ### Commands
 
@@ -91,24 +102,24 @@ credential behavior live in [configuration](../configuration.md).
 | `add` | content; `--occurred-at`; `--occurred-end`; `--metadata`; `--memory-type`; `--context` | memory object | yes |
 | `add-many` | optional JSONL source; `--memory-type` | `{"memories":[...]}` | yes |
 | `add-stream` | optional JSONL source; `--memory-type`; `--capture` | `{"memories":[...]}` | no |
-| `capture` | same operands and options as `add` | memory object | no |
-| `settle` | optional `MEMORY_ID...`; `--limit`; `--max-attempts` | `{"settled":int}` | no |
-| `pending-captures` | optional `MEMORY_ID...`; `--limit` | `{"pending":[...]}` | no |
+| `capture` | same operands and options as `add` | memory object | yes |
+| `settle` | optional `MEMORY_ID...`; `--limit`; `--max-attempts` | `{"settled":int}` | yes |
+| `pending-captures` | optional `MEMORY_ID...`; `--limit` | `{"pending":[...]}` | yes |
 | `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
-| `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | no |
+| `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | yes |
 | `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--link-identities`/`--no-link-identities` | answer object | yes (`--link-identities` is local-only) |
 | `compile` | content; `--max-chars`; `--max-items`; `--max-media-items`; repeatable `--memory-type`; `--min-confidence`; `--freshness-seconds`; `--max-latency-ms`; `--reference-at`; `--scope` | context bundle plus `rendered` | yes |
 | `get` | `MEMORY_ID` | memory object | yes |
-| `speech` | `MEMORY_ID` | `{"segments":[...]}` | no |
-| `faces` | `MEMORY_ID` | `{"observations":[...]}` | no |
+| `speech` | `MEMORY_ID` | `{"segments":[...]}` | yes when the owner enables `embodied_operations` |
+| `faces` | `MEMORY_ID` | `{"observations":[...]}` | yes when the owner enables `embodied_operations` |
 | `register-speaker` | `SPEAKER_ID NAME`; `--relationship` | `{}` | no |
-| `register-identity` | `IDENTITY_ID NAME`; `--relationship` | `{}` | no |
-| `identity` | `IDENTITY_ID` | `{"identity":{...}}` or `{"identity":null}` | no |
-| `record-consent` | `IDENTITY_ID STATE`; `--note` | `{"operation":{...}}` or `{"operation":null}` | no |
-| `consent` | `IDENTITY_ID` | `{"consent":"granted"}` or `{"consent":null}` | no |
-| `forget-identity` | `IDENTITY_ID` | erasure counts | no |
-| `unlink-identity` | `ALIAS_ID` | `{"restored_identity_id":...}` | no |
-| `reinforce` | one or more `MEMORY_ID` values | `{"reinforced":int}` | no |
+| `register-identity` | `IDENTITY_ID NAME`; `--relationship` | `{}` | yes when the owner enables `identity_operations` |
+| `identity` | `IDENTITY_ID` | `{"identity":{...}}` or `{"identity":null}` | yes when the owner enables `identity_operations` |
+| `record-consent` | `IDENTITY_ID STATE`; `--note` | `{"operation":{...}}` or `{"operation":null}` | yes when the owner enables `identity_operations` |
+| `consent` | `IDENTITY_ID` | `{"consent":"granted"}` or `{"consent":null}` | yes when the owner enables `identity_operations` |
+| `forget-identity` | `IDENTITY_ID` | erasure counts | yes when the owner enables `identity_operations` |
+| `unlink-identity` | `ALIAS_ID` | `{"restored_identity_id":...}` | yes when the owner enables `identity_operations` |
+| `reinforce` | one or more `MEMORY_ID` values | `{"reinforced":int}` | yes |
 | `consolidation-candidates` | `--limit`; `--idle` | `{"candidates":[{"trigger":...,"memory_ids":[...],"evidence_count":int}]}` | no |
 | `consolidate` | optional goal content; `--evidence-id`; `--limit`; `--trigger` | `{"operations":[...],"rejected":[...],"weighed":int}` | no |
 | `deliberate` | `--limit`; `--max-rounds`; `--idle` | `{"rounds":int,"weighed":int,"skipped":int,"applied":int,"rejected":int,"model_calls":int}` | no |
@@ -117,8 +128,8 @@ credential behavior live in [configuration](../configuration.md).
 | `forget` | one or more `MEMORY_ID` values | `{"operation":{...}}` or `{"operation":null}` | no |
 | `rollback` | `OPERATION_ID` | `{"rolled_back":bool}` | no |
 | `operations` | `--limit` | `{"operations":[...]}`, each row carrying the `claim` an `identify` applied, the `identity` a `merge` moved, the `consent` a subject stated, and the `proposal` a `consolidate` wrote, or `null` | no |
-| `export` | exactly one of `--identity-id` or repeatable `--memory-id` | export bundle | no |
-| `apply-retention` | `--dry-run` | retention report | no |
+| `export` | exactly one of `--identity-id` or repeatable `--memory-id` | export bundle | yes when the owner enables `identity_operations` |
+| `apply-retention` | `--dry-run` | retention report | yes when the owner enables `identity_operations` |
 | `list` | `--limit`; `--cursor` | `{"items":[...],"next_cursor":...}` | yes |
 | `delete` | `MEMORY_ID` | `{"deleted":bool}` | yes |
 | `reindex` | none | `{"memories":int}` | no |
@@ -170,7 +181,10 @@ means nobody has recorded one. What the two restrained states change is listed u
 `export` prints `exported_at`, `identity_id`, `identities`, `records`, and `operations` -- every
 version of every record the subject appears in or is named by, and every log row that moved any of
 it. Media is named by asset identity and digest; no bytes are printed, so a document stays safe to
-pipe. `apply-retention` prints `dry_run`, `media_memory_ids`, `forgotten_memory_ids`, `asset_ids`,
+pipe. Under `--url` the operation rows in an `export` bundle, and the row `record-consent` prints,
+come from the [REST operation object](rest.md#response-objects), which carries the same fields --
+`proposal` included -- so a row is the same document on either transport.
+`apply-retention` prints `dry_run`, `media_memory_ids`, `forgotten_memory_ids`, `asset_ids`,
 `capture_memory_ids`, and `deleted`; it deletes through the same path as `delete`, so
 [what `delete` removes](python-sdk.md#what-delete-removes) applies unchanged. Start with
 `--dry-run`.
@@ -226,8 +240,8 @@ optional `occurred_at`, `occurred_end`, `metadata`, and `context`; unknown field
 `--memory-type` applies to every line.
 
 The CLI context decoder accepts `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`,
-and `spatial`; its scope decoder accepts `valid_at`, `known_at`, `near`, and `radius_m`. It does not
-currently accept `place_id`; use the Python, REST, or MCP surface for symbolic place input.
+and `spatial`; its scope decoder accepts `valid_at`, `known_at`, `near`, `radius_m`, `place_id`,
+and `identity_id`, which is the whole of [`RetrievalScope`](python-sdk.md#public-values).
 
 ```bash
 mindbridge --embedder jina-omni add "The mug is on the table" \
@@ -278,7 +292,12 @@ settled or unknown, and `get` tells the two apart.
 durable but unsearchable until `settle` runs.
 
 Unless `--quiet` is set, commands write the resolved composition as one JSON document on stderr
-before executing. `--url` forwards successful owner response objects unchanged. Runtime
+before executing. `--url` forwards successful owner response objects unchanged, except for the
+four whose REST shape is not the command's own document: `pending-captures` prints `pending` where
+the route returns `items`, `forget-identity` prints the erasure counts the route nests under
+`erasure`, `register-identity` prints `{}` rather than the route's `registered`, and `identity`
+prints the three fields the local command prints, dropping the route's `confirmed` and
+`evidence_ids`. One command prints one shape on both transports. Runtime
 failures write one [shared error envelope](rest.md#error-envelope) to stderr and nothing to stdout;
 remote envelopes, including `trace_id`, are forwarded unchanged. Local CLI and MCP errors retain
 `subject`, including local paths; unauthenticated REST redacts storage subjects.
@@ -293,7 +312,8 @@ still syntactically required.
 - `--embedder` constructs each configured recipe, exercises its published loader probe, and
   reports the data-directory state without writing memory data. The probed backends also fill
   `capabilities`, which is `MemoryCapabilities.document()` -- the same document `GET /healthz`
-  serves and the MCP server greets an agent with, including the derived `operations` set. It is
+  serves and the MCP server greets an agent with, narrowed on each network surface to the
+  operations it serves, while `doctor` prints the whole derived `operations` set. It is
   declared by the backends, so producing it opens no store and creates no data directory. Every
   probed backend stays loaded until the capability summary is built and is then closed, so a
   doctor run holds the weights of all configured slots at once.
@@ -332,13 +352,19 @@ exit 130 use their conventional plain stderr diagnostics.
 
 ### Operations without a remote route
 
-With `--url`, only `add`, `add-many`, `search`, `ask`, `compile`, `get`, `list`, `delete`, and
-`doctor` are available. Other commands exit 10 with `unsupported_in_remote_mode`, whether or not
-their operation has a REST route: `reinforce`, `capture`, `settle`, and `pending-captures` always
-have one, and `speech`, `faces`, `register-identity`, `identity`, `unlink-identity`,
-`forget-identity`, `record-consent`, `consent`, `export`, and `apply-retention` have one when the
-owner enables the matching switch, but the CLI does not
-currently wire any of those routes into remote mode. The complete route boundary is listed in
+Every command whose operation has a `/v1` route runs under `--url`; the `--url` column above is
+the complete list. Eleven commands exit 10 with `unsupported_in_remote_mode` because the
+operation has no route at all, not because the CLI declines to send one:
+
+- The control plane is SDK-only by [documented design](../context-os.md): `consolidation-candidates`,
+  `consolidate`, `deliberate`, `apply`, `record-outcome`, `forget`, `rollback`, and `operations`.
+- `add-stream`, `reindex`, and `optimize` are local ingestion and index maintenance on the owner's
+  own directory, and `register-speaker` has no route of its own.
+
+A gated command sent to an owner that did not enable the matching switch also exits 10, naming
+that switch: `create_app` never registers those routes, so the owner answers that the route does
+not exist rather than saying anything about the person or record the command named. The complete
+route boundary is listed in
 [REST operations without a route](rest.md#operations-without-a-route).
 
 ### Input limits

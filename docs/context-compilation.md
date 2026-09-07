@@ -387,7 +387,8 @@ those backends can serve (`ask`, `speech`, `transcribe`, `faces`, `describe_visi
 `MemoryCapabilities.document()` renders that value as one JSON-ready document, and it is the only
 renderer: `GET /healthz` serves it, the MCP server embeds it in its instructions, and
 `mindbridge doctor` prints it under `capabilities`. The three surfaces cannot describe one
-composition differently.
+composition differently -- it is the same document, narrowed on each network surface to the
+operations it serves, while the SDK and `doctor` publish the full derivation.
 
 ```python
 if memory.capabilities.generation:

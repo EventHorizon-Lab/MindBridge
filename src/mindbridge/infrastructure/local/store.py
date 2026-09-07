@@ -43,6 +43,46 @@ _SCHEMA_VERSION = 16
 # comment that introduced it instructed: a v12 store is the one that step still has to migrate.
 _PRE_VISUAL_DESCRIPTION_VERSION = 12
 _SQLITE_PARAMETER_BATCH = 900
+# Which identities one memory is "in": the records whose semantic subject is that identity, plus
+# the records whose media carries a diarised speech segment or a face observation of them. This
+# direction answers the search index projection, one document at a time. A merge re-points every
+# one of these rows onto the surviving identity, so only canonical IDs ever appear here.
+_IDENTITY_MEMORY_SQL = """
+    SELECT memory_id AS memory_id, ms.identity_id AS identity_id
+    FROM memory_semantics AS ms
+    WHERE ms.identity_id IS NOT NULL AND ({predicate})
+    UNION
+    SELECT memory_id, ss.speaker_id
+    FROM memory_assets AS ma
+    JOIN speech_segments AS ss ON ss.asset_id = ma.asset_id
+    WHERE ss.speaker_id IS NOT NULL AND ({predicate})
+    UNION
+    SELECT memory_id, fo.identity_id
+    FROM memory_assets AS ma
+    JOIN face_observations AS fo ON fo.asset_id = ma.asset_id
+    WHERE {predicate}
+"""
+# The same membership asked the other way round -- which memories one identity is in -- resolved
+# once from three bound copies of the canonical ID. Correlating the projection statement against
+# the row being filtered instead made SQLite re-run its three-branch UNION for every candidate
+# `memory_records` row, and for every embedding in the store on a merge. The two directions are
+# one membership rule; `test_identity_membership_sql_agrees_in_both_directions` pins that.
+_IDENTITY_MEMORIES_SQL = """
+    SELECT ms.memory_id AS memory_id
+    FROM memory_semantics AS ms
+    WHERE ms.identity_id = ?
+    UNION
+    SELECT ma.memory_id
+    FROM memory_assets AS ma
+    JOIN speech_segments AS ss ON ss.asset_id = ma.asset_id
+    WHERE ss.speaker_id = ?
+    UNION
+    SELECT ma.memory_id
+    FROM memory_assets AS ma
+    JOIN face_observations AS fo ON fo.asset_id = ma.asset_id
+    WHERE fo.identity_id = ?
+"""
+_IDENTITY_SCOPE_CLAUSE = f"AND memory_records.memory_id IN ({_IDENTITY_MEMORIES_SQL})"
 # The predicate that makes one identity-bound STATE assertion a consent statement. Shared with
 # `mindbridge.memory`, which writes those assertions, so the writer and the projection can never
 # disagree about which records they are.
@@ -1197,11 +1237,18 @@ class IndexDocument:
     memory_type: str = "semantic"
     occurred_at: datetime | None = None
     occurred_end: datetime | None = None
+    place_id: str | None = None
+    # Every identity this memory is about: its semantic subject, plus everyone observed in its
+    # media. Projected so the search index can filter on it; SQLite stays authoritative.
+    identity_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.memory_type not in _MEMORY_TYPES:
             raise ValueError("memory_type must be semantic, episodic, or procedural")
         _require_interval(self.occurred_at, self.occurred_end)
+        _require_optional_identifier(self.place_id, "place_id")
+        for identity_id in self.identity_ids:
+            _require_identifier(identity_id, "identity_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2279,6 +2326,7 @@ class LocalStore:
         near: SpatialContext | None = None,
         radius_m: float | None = None,
         place_id: str | None = None,
+        identity_id: str | None = None,
         active_only: bool = False,
     ) -> tuple[StoredMemory, ...]:
         """Hydrate existing memories with one query and preserve input ranking.
@@ -2286,16 +2334,23 @@ class LocalStore:
         `place_id` scopes the slate to one symbolic place. It is a hard filter, unlike `near`/
         `radius_m` which the caller applies to metric pose, and it is applied in SQL so a scoped
         hydration reads only the rows it returns.
+
+        `identity_id` scopes it to one person, accepting a merged alias, and is a hard filter for
+        the same reason: it is the authoritative answer the search index only approximates.
         """
         if not memory_ids:
             return ()
         for memory_id in memory_ids:
             _require_identifier(memory_id, "memory_id")
         _require_optional_identifier(place_id, "place_id")
+        _require_optional_identifier(identity_id, "identity_id")
         place_clause = "" if place_id is None else "AND place_id = ?"
         place_parameters: tuple[object, ...] = () if place_id is None else (place_id,)
         rows: list[sqlite3.Row] = []
         with self._read_transaction() as connection:
+            identity_clause, identity_parameters = _identity_scope(connection, identity_id)
+            if identity_clause is None:
+                return ()
             for offset in range(0, len(memory_ids), _SQLITE_PARAMETER_BATCH):
                 batch = memory_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
                 placeholders = ", ".join("?" for _memory_id in batch)
@@ -2308,8 +2363,9 @@ class LocalStore:
                         FROM memory_records
                         WHERE memory_id IN ({placeholders})
                         {place_clause}
+                        {identity_clause}
                         """,
-                        (*batch, *place_parameters),
+                        (*batch, *place_parameters, *identity_parameters),
                     ).fetchall()
                 )
             assets_by_memory = self._read_memory_assets(connection, tuple(memory_ids))
@@ -2349,6 +2405,7 @@ class LocalStore:
         near: SpatialContext | None = None,
         radius_m: float | None = None,
         place_id: str | None = None,
+        identity_id: str | None = None,
         active_only: bool = False,
     ) -> int:
         """Count what `read_memories` would return for the same arguments.
@@ -2362,10 +2419,14 @@ class LocalStore:
         for memory_id in memory_ids:
             _require_identifier(memory_id, "memory_id")
         _require_optional_identifier(place_id, "place_id")
+        _require_optional_identifier(identity_id, "identity_id")
         place_clause = "" if place_id is None else "AND place_id = ?"
         place_parameters: tuple[object, ...] = () if place_id is None else (place_id,)
         by_id: dict[str, sqlite3.Row] = {}
         with self._read_transaction() as connection:
+            identity_clause, identity_parameters = _identity_scope(connection, identity_id)
+            if identity_clause is None:
+                return 0
             for offset in range(0, len(memory_ids), _SQLITE_PARAMETER_BATCH):
                 batch = memory_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
                 placeholders = ", ".join("?" for _memory_id in batch)
@@ -2375,8 +2436,9 @@ class LocalStore:
                     FROM memory_records
                     WHERE memory_id IN ({placeholders})
                     {place_clause}
+                    {identity_clause}
                     """,
-                    (*batch, *place_parameters),
+                    (*batch, *place_parameters, *identity_parameters),
                 ).fetchall():
                     by_id[_row_text(row, "memory_id")] = row
             scoped, semantic_ids = _select_memory_contexts(
@@ -3051,6 +3113,7 @@ class LocalStore:
                 "UPDATE media_assets SET transcript = ? WHERE asset_id = ?",
                 (transcript, asset_id),
             )
+            _queue_asset_identity_projection(connection, asset_id)
             return self._read_speech(connection, asset_id), SpeechRollback(
                 asset_id,
                 identity_changes,
@@ -3260,6 +3323,7 @@ class LocalStore:
                     for position, face in enumerate(analysis.faces)
                 ),
             )
+            _queue_asset_identity_projection(connection, asset_id)
             return self._read_faces(connection, asset_id)
 
     def resolve_identity_id(self, identity_id: str) -> str | None:
@@ -3631,6 +3695,7 @@ class LocalStore:
         near: SpatialContext | None = None,
         radius_m: float | None = None,
         place_id: str | None = None,
+        identity_id: str | None = None,
     ) -> dict[str, tuple[str, ...]]:
         """Return, per memory, the active event records formed from the same observations.
 
@@ -3652,6 +3717,7 @@ class LocalStore:
         # the join finds nothing.
         _require_scope_axes(valid_at=valid_at, known_at=known_at, near=near, radius_m=radius_m)
         _require_optional_identifier(place_id, "place_id")
+        _require_optional_identifier(identity_id, "identity_id")
         if not ids:
             return {}
         # Both evidence sides are read as of the same transaction time the versions are, so a
@@ -3700,6 +3766,7 @@ class LocalStore:
                 near=near,
                 radius_m=radius_m,
                 place_id=place_id,
+                identity_id=identity_id,
                 active_only=True,
             )
         }
@@ -3933,6 +4000,10 @@ class LocalStore:
             ).fetchone(),
             "created_at",
         )
+        # Before the re-pointing below, while the rows the index projection reads still say
+        # `source`: every memory it names is about `target` afterwards, and only the outbox can
+        # tell the index that.
+        _queue_identity_projection(connection, source)
         connection.execute(
             "UPDATE speech_segments SET speaker_id = ? WHERE speaker_id = ?",
             (target, source),
@@ -4112,6 +4183,9 @@ class LocalStore:
         }
         if modalities != {"face", "voice"}:
             return None
+        # Same reason as the merge: the rows below move from `target` to `alias_id`, so the
+        # index projection of every memory naming `target` has to be rebuilt.
+        _queue_identity_projection(connection, target)
         connection.execute(
             """
             INSERT INTO identities (identity_id, name, relationship, created_at, updated_at)
@@ -4238,6 +4312,8 @@ class LocalStore:
             if members is None:
                 return None
             resolved_id = members[0]
+            # Before the erasure strips the rows the index projection reads.
+            _queue_identity_projection(connection, resolved_id)
             exemplars = {
                 _identity_modality(row["modality"]): int(row["count"])
                 for row in connection.execute(
@@ -4587,7 +4663,7 @@ class LocalStore:
                         SELECT e.embedding_id, e.memory_id, e.object_part, e.model_id, e.space_id,
                                e.task, e.dimension, e.normalized, e.vector, e.created_at,
                                m.content, m.metadata_json, m.memory_type,
-                               m.occurred_at, m.occurred_end
+                               m.occurred_at, m.occurred_end, m.place_id
                         FROM embeddings AS e
                         JOIN memory_records AS m ON m.memory_id = e.memory_id
                         WHERE e.embedding_id IN ({placeholders})
@@ -4595,9 +4671,13 @@ class LocalStore:
                         tuple(batch),
                     ).fetchall()
                 )
+            identity_ids = _identity_projections(
+                connection,
+                tuple({_row_text(row, "memory_id") for row in rows}),
+            )
         by_id: dict[str, IndexDocument] = {}
         for row in rows:
-            document = _index_document_from_row(row)
+            document = _index_document_from_row(row, identity_ids)
             by_id[document.embedding.embedding_id] = document
         return tuple(by_id[embedding_id] for embedding_id in embedding_ids if embedding_id in by_id)
 
@@ -4653,7 +4733,7 @@ class LocalStore:
                         SELECT e.embedding_id, e.memory_id, e.object_part, e.model_id, e.space_id,
                                e.task, e.dimension, e.normalized, e.vector, e.created_at,
                                m.content, m.metadata_json, m.memory_type,
-                               m.occurred_at, m.occurred_end
+                               m.occurred_at, m.occurred_end, m.place_id
                         FROM embeddings AS e
                         JOIN memory_records AS m ON m.memory_id = e.memory_id
                         WHERE e.memory_id IN ({placeholders})
@@ -4662,9 +4742,10 @@ class LocalStore:
                         tuple(batch),
                     ).fetchall()
                 )
+            identity_ids = _identity_projections(connection, memory_ids)
         by_memory: dict[str, list[IndexDocument]] = {}
         for row in rows:
-            document = _index_document_from_row(row)
+            document = _index_document_from_row(row, identity_ids)
             by_memory.setdefault(document.embedding.memory_id, []).append(document)
         return tuple(
             document for memory_id in memory_ids for document in by_memory.get(memory_id, ())
@@ -4947,7 +5028,8 @@ class LocalStore:
     ) -> bool:
         existing = connection.execute(
             """
-            SELECT content, modality, memory_type, metadata_json, occurred_at, occurred_end
+            SELECT content, modality, memory_type, metadata_json, occurred_at, occurred_end,
+                   place_id
             FROM memory_records
             WHERE memory_id = ?
             """,
@@ -4975,6 +5057,9 @@ class LocalStore:
             or existing["occurred_at"] != _optional_datetime_text(memory.occurred_at)
             or existing["occurred_end"] != _optional_datetime_text(memory.occurred_end)
             or existing_asset_ids != supplied_asset_ids
+            # The index carries `place_id` as a filter field, so relabelling a room is a change
+            # to the indexed document even though none of its text moved.
+            or existing["place_id"] != memory.place_id
         )
         connection.execute(
             """
@@ -5996,9 +6081,12 @@ def _v16_backfill_naming_assertions(connection: sqlite3.Connection) -> None:
     kernel would have written, under the ID the kernel derives, so re-registering the same name
     stays the no-op it is documented to be rather than minting a second assertion.
 
-    The record carries no vectors: embedding needs a model a migration must not call, so the
-    sentence stays out of `search` until the next `reindex`. The projection, which is what a
-    registered name is for, is correct as soon as the store opens.
+    The record carries no vectors: embedding needs a model a migration must not call. Each one is
+    therefore enqueued in `capture_queue`, which is the store's standing "this record still owes
+    model work" queue, so the next `settle()` embeds and indexes it exactly as it settles a
+    captured record -- `reindex()` cannot, because it replays the embeddings SQLite already holds
+    and a record with none is invisible to it. The projection, which is what a registered name is
+    for, is correct as soon as the store opens, and `pending_captures()` names what is still owed.
     """
     rows = connection.execute(
         """
@@ -6060,6 +6148,10 @@ def _v16_backfill_naming_assertions(connection: sqlite3.Connection) -> None:
                 memory_id, version, confidence, recorded_at, visible
             ) VALUES (?, 1, 1.0, ?, 1)
             """,
+            (memory_id, recorded_at),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO capture_queue (memory_id, enqueued_at) VALUES (?, ?)",
             (memory_id, recorded_at),
         )
 
@@ -7796,14 +7888,20 @@ def _refresh_inherited_columns(connection: sqlite3.Connection, memory_id: str) -
         return
     places = {_optional_row_text(row, "place_id") for row in rows}
     tags = {_canonical_object_json(_row_text(row, "metadata_json")) for row in rows}
+    place_id = places.pop() if len(places) == 1 else None
+    current = connection.execute(
+        "SELECT place_id FROM memory_records WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()
     connection.execute(
         "UPDATE memory_records SET place_id = ?, metadata_json = ? WHERE memory_id = ?",
-        (
-            places.pop() if len(places) == 1 else None,
-            tags.pop() if len(tags) == 1 else "{}",
-            memory_id,
-        ),
+        (place_id, tags.pop() if len(tags) == 1 else "{}", memory_id),
     )
+    # The search index carries `place_id` as a filter field, so a record that regains or loses
+    # its inherited place has to be reprojected -- this UPDATE bypasses `_write_memory`, which
+    # is where every other place change is noticed.
+    if current is not None and _optional_row_text(current, "place_id") != place_id:
+        LocalStore._queue_memory_embeddings(connection, memory_id, exclude=set())
 
 
 def _refresh_evidence_projection(
@@ -8325,7 +8423,10 @@ def _embedding_from_row(row: sqlite3.Row) -> StoredEmbedding:
     )
 
 
-def _index_document_from_row(row: sqlite3.Row) -> IndexDocument:
+def _index_document_from_row(
+    row: sqlite3.Row,
+    identity_ids: Mapping[str, tuple[str, ...]],
+) -> IndexDocument:
     return IndexDocument(
         embedding=_embedding_from_row(row),
         content=_row_text(row, "content"),
@@ -8333,6 +8434,82 @@ def _index_document_from_row(row: sqlite3.Row) -> IndexDocument:
         memory_type=_row_text(row, "memory_type"),
         occurred_at=_optional_datetime_from_row(row, "occurred_at"),
         occurred_end=_optional_datetime_from_row(row, "occurred_end"),
+        place_id=_optional_row_text(row, "place_id"),
+        identity_ids=identity_ids.get(_row_text(row, "memory_id"), ()),
+    )
+
+
+def _identity_scope(
+    connection: sqlite3.Connection,
+    identity_id: str | None,
+) -> tuple[str | None, tuple[object, ...]]:
+    """Return the SQL clause and parameters that scope `memory_records` to one identity.
+
+    A `None` clause means the requested identity does not exist, so nothing is in scope.
+    """
+    if identity_id is None:
+        return "", ()
+    resolved_id = _resolve_identity_id(connection, identity_id)
+    if resolved_id is None:
+        return None, ()
+    return _IDENTITY_SCOPE_CLAUSE, (resolved_id, resolved_id, resolved_id)
+
+
+def _identity_projections(
+    connection: sqlite3.Connection,
+    memory_ids: Sequence[str],
+) -> dict[str, tuple[str, ...]]:
+    """Project every identity each memory is about, for the search index to filter on."""
+    projections: dict[str, list[str]] = {}
+    for offset in range(0, len(memory_ids), _SQLITE_PARAMETER_BATCH):
+        batch = memory_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+        placeholders = ", ".join("?" for _memory_id in batch)
+        statement = _IDENTITY_MEMORY_SQL.format(predicate=f"memory_id IN ({placeholders})")
+        for row in connection.execute(statement, (*batch, *batch, *batch)).fetchall():
+            projections.setdefault(_row_text(row, "memory_id"), []).append(
+                _row_text(row, "identity_id")
+            )
+    return {memory_id: tuple(sorted(values)) for memory_id, values in projections.items()}
+
+
+def _queue_asset_identity_projection(connection: sqlite3.Connection, asset_id: str) -> None:
+    """Re-enqueue the memories that already reference an asset whose people just became known.
+
+    Speech and face analysis usually run while the memory is being written, but a caller can also
+    ask for either after the fact, and then the indexed identity projection of an already-indexed
+    memory is out of date the moment the observations land.
+    """
+    connection.execute(
+        """
+        INSERT INTO search_index_queue (embedding_id, action, enqueued_at)
+        SELECT e.embedding_id, 'upsert', ?
+        FROM embeddings AS e
+        WHERE EXISTS (
+            SELECT 1 FROM memory_assets AS ma
+            WHERE ma.memory_id = e.memory_id AND ma.asset_id = ?
+        )
+        ORDER BY e.embedding_id
+        """,
+        (_datetime_text(datetime.now(timezone.utc)), asset_id),
+    )
+
+
+def _queue_identity_projection(connection: sqlite3.Connection, identity_id: str) -> None:
+    """Re-enqueue every memory whose indexed identity projection this identity appears in.
+
+    Merging, splitting and erasing an identity all re-point the rows the projection reads, and
+    none of them touches the embeddings, so nothing else would tell the index its filter field
+    is now wrong. Called before the re-pointing, while the rows still name this identity.
+    """
+    connection.execute(
+        f"""
+        INSERT INTO search_index_queue (embedding_id, action, enqueued_at)
+        SELECT e.embedding_id, 'upsert', ?
+        FROM embeddings AS e
+        WHERE e.memory_id IN ({_IDENTITY_MEMORIES_SQL})
+        ORDER BY e.embedding_id
+        """,
+        (_datetime_text(datetime.now(timezone.utc)), identity_id, identity_id, identity_id),
     )
 
 

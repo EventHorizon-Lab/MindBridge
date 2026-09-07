@@ -738,7 +738,10 @@ intent, not two unrelated operations, and not `delete()`; the operation log dist
 three by intent, by `forgotten_ids`, and by not appearing at all. One pass may not contradict
 itself either: an operation that would retire evidence an earlier accepted operation in the same
 pass built on, or that builds on evidence an earlier one retired, is rejected as
-`"inconsistent_batch"`.
+`"inconsistent_batch"`. A record may not be its own evidence: a `CONSOLIDATE` re-proposing a claim
+that already stands while citing that claim mints the cited record's own ID, and a `REINFORCE`
+naming its target among its evidence is the same malformation. Both are rejected as
+`"target_is_evidence"`.
 
 `forget` is the host entry point for the FORGET intent and needs no backend. The host names the
 IDs and is the authority, so no window bounds it. It is cognitive forgetting only: recall skips
@@ -833,6 +836,12 @@ is matched by equality and nothing normalises it beyond rejecting empty or untri
 producer that writes both `kitchen` and `the kitchen` partitions its own store — which is why the
 value is readable rather than write-only. A place scope excludes memories with no place; it does
 not treat them as being everywhere.
+
+`RetrievalScope(identity_id=...)` scopes retrieval to one person: the memories whose semantic
+subject is that identity, plus the memories whose media shows their face or carries their speech.
+A merged alias is accepted and resolves to the identity it became, so an ID held from before a
+merge still reaches the person. An identity the store does not know scopes to nothing rather than
+to everything.
 
 `capabilities` publishes what the composition declared — the modality set each backend accepts,
 the embedding model, space and dimension, the optional model identities, and whether speaker
@@ -987,7 +996,7 @@ The principal immutable values are:
 | `SpatialContext` | `frame_id`, `anchor`, `x`, `y`, `z`, `orientation_xyzw`, `position_uncertainty_m` |
 | `ObservationContext` | `basis`, `source_id`, `confidence`, `valid_from`, `valid_until`, `spatial`, `place_id` |
 | `MemoryContext` | `kind`, `basis`, `confidence`, `valid_from`, `valid_until`, `recorded_at`, `visible`, `retired_at`, `lineage_id`, `source_id`, `subject`, `predicate`, `value`, `evidence_ids`, `supersedes_id`, `model_id`, `recipe`, `identity_id`, `spatial`, `cue_modality`, `valence`, `arousal` |
-| `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m`, `place_id` |
+| `RetrievalScope` | `valid_at`, `known_at`, `near`, `radius_m`, `place_id`, `identity_id` |
 | `ContextBudget` | `max_chars`, `max_items`, `max_media_items`, `memory_types`, `min_confidence`, `freshness`, `max_latency_ms` |
 | `ContextConflict` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknown` | `kind` (a `ContextUnknownKind`), `detail` |

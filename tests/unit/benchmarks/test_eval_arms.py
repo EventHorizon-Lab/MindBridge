@@ -875,6 +875,7 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
             arms=(DEFAULT_ARM, "blind", "random"),
             full_context_chars=24_000,
             ingest="add",
+            deliberate=False,
             compile_max_items=24,
             compile_max_chars=16_000,
             seed=7,

@@ -29,6 +29,7 @@ from mindbridge.api.content import (
     content_input,
     context_budget,
 )
+from mindbridge.api.deliberation import deliberation_lifespan
 from mindbridge.api.messages import error_message
 from mindbridge.exceptions import MindBridgeError, ValidationError
 from mindbridge.types import (
@@ -156,7 +157,10 @@ _SCOPE_DESCRIPTION = (
     " `near` is a pose in a named coordinate frame (`frame_id`, `anchor` of observer or subject,"
     " metres for `x`/`y`/`z`, `orientation_xyzw` as a unit quaternion) and `radius_m` is metres."
     " Spatial filtering only matches memories stored with a spatial context in the same frame and"
-    " anchor, so it excludes every plain text memory."
+    " anchor, so it excludes every plain text memory. `place_id` scopes to one symbolic place."
+    " `identity_id` scopes to one person: memories whose semantic subject is that identity, plus"
+    " memories whose media shows their face or carries their speech. A merged alias is accepted"
+    " and resolves to the surviving identity."
 )
 _GOAL_DESCRIPTION = (
     "The task the context is for, phrased the way the memories would be worded: a non-blank"
@@ -384,6 +388,7 @@ def build_mcp_server(
     embodied_operations: bool = True,
     write_operations: bool = True,
     tracer: Tracer | None = None,
+    deliberate_every: float | None = None,
 ) -> MCPServer[None]:
     """Expose the typed agent tool surface without taking ownership of ``memory``.
 
@@ -408,6 +413,13 @@ def build_mcp_server(
     With all three False the surface is exactly the five read tools -- ``search_memories``,
     ``ask_memory``, ``compile_context``, ``get_memory`` and ``list_memories`` -- which is
     recall and compile alone.
+
+    ``deliberate_every`` is the same opt-in slow loop ``create_app`` takes, off by default: a
+    number of seconds after which this process runs ``deliberate()`` on the memory it serves, in
+    the server lifespan. No tool reaches the control plane, and one physical ``data_dir`` has one
+    live owner, so without it an MCP-only deployment records ``QUERY_FAILURE`` signals that
+    nothing ever reads. It is refused when no consolidation backend is configured, or when the
+    interval is not a positive number of seconds.
     """
     transport_telemetry = _request_telemetry(tracer or otel_trace.get_tracer("mindbridge.api.mcp"))
     server: MCPServer[None] = MCPServer(
@@ -425,6 +437,9 @@ def build_mcp_server(
             write_operations=write_operations,
         ),
         version="0.2.0",
+        lifespan=(
+            None if deliberate_every is None else deliberation_lifespan(memory, deliberate_every)
+        ),
         middleware=[
             transport_telemetry,
             cast(ServerMiddleware[Any], _strict_tool_arguments),
@@ -1176,6 +1191,18 @@ def _bundle_entry(entry: object) -> object:
     return entry
 
 
+# Which of `MemoryCapabilities.operations` one of the fifteen tools can actually reach, mirroring
+# `app._ROUTED_OPERATIONS`. Consolidation, cognitive forgetting and rollback stay with the owning
+# process (`docs/context-os.md`), so the greeting's prose and its JSON must agree that there is no
+# `consolidate` here; `speech` and `faces` reach a tool only when the host opts in, and so do
+# `formation` and `describe_vision`, which run on the write path alone -- a read-only server has
+# no tool that forms, and none that captions a frame. `transcribe` stays unconditional: a read
+# tool transcribes the audio a caller asks its question with.
+_TOOLED_OPERATIONS = frozenset({"ask", "transcribe"})
+_EMBODIED_TOOLED_OPERATIONS = frozenset({"speech", "faces"})
+_WRITTEN_TOOLED_OPERATIONS = frozenset({"formation", "describe_vision"})
+
+
 def _instructions(
     capabilities: MemoryCapabilities,
     *,
@@ -1185,11 +1212,18 @@ def _instructions(
 ) -> str:
     """Render the declared capability view an agent reads when it connects.
 
-    The document is `MemoryCapabilities.document()` verbatim -- the same object `/healthz` serves
-    and `mindbridge doctor` prints -- rather than a prose subset that used to omit every model
-    identity and every non-embedding modality set. MCP fixes `instructions` at construction, so
-    this is a snapshot of the composition the server was built with; `/healthz` is the live one.
+    The document is `MemoryCapabilities.document()` -- the same object `/healthz` serves and
+    `mindbridge doctor` prints -- rather than a prose subset that used to omit every model
+    identity and every non-embedding modality set, narrowed to the operations this server's tools
+    serve so `operations` cannot name one an agent will not find. MCP fixes `instructions` at
+    construction, so this is a snapshot of the composition the server was built with; `/healthz`
+    is the live one.
     """
+    served = (
+        _TOOLED_OPERATIONS
+        | (_EMBODIED_TOOLED_OPERATIONS if embodied_operations else frozenset())
+        | (_WRITTEN_TOOLED_OPERATIONS if write_operations else frozenset())
+    )
     return "\n".join(
         (
             "MindBridge is local multimodal memory for one physical data directory.",
@@ -1225,8 +1259,10 @@ def _instructions(
                 " reinforce only what actually helped you answer."
             ),
             "Declared capabilities of this composition, the same JSON document GET /healthz"
-            " serves. `operations` names the optional operations these backends can serve:",
-            json.dumps(capabilities.document(), indent=2, sort_keys=True),
+            " serves. `operations` names the optional operations these backends can serve and"
+            " this server's tools exercise, whether a tool calls one directly or add_memory and"
+            " ask_memory reach it while ingesting or answering:",
+            json.dumps(capabilities.document(served=served), indent=2, sort_keys=True),
         )
     )
 

@@ -22,7 +22,8 @@ def test_global_help_lists_only_supported_runners_without_importing_them(
     assert cli.main([]) == 0
 
     printed = capsys.readouterr().out
-    assert set(cli.RUNNERS) == {"eval", "local-index", "locomo-refined"}
+    assert set(cli.RUNNERS) == {"control-plane", "eval", "local-index", "locomo-refined"}
+    assert "control-plane" in printed
     assert "eval" in printed
     assert "local-index" in printed
     assert "locomo-refined" in printed

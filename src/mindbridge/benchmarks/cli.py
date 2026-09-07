@@ -12,6 +12,10 @@ INTERRUPT_EXIT_CODE = 130
 PROGRAM = "mindbridge-bench"
 
 RUNNERS: dict[str, tuple[str, str]] = {
+    "control-plane": (
+        "mindbridge.benchmarks.control_plane",
+        "Measure the slow loop's consolidation quality",
+    ),
     "eval": (
         "mindbridge.benchmarks.eval",
         "Run pinned benchmark tasks with confidence intervals",

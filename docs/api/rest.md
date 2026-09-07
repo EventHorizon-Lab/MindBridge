@@ -58,6 +58,7 @@ create_app(
     identity_operations: bool = False,
     embodied_operations: bool = False,
     tracer: Tracer | None = None,
+    deliberate_every: float | None = None,
 ) -> fastapi.FastAPI
 ```
 
@@ -197,9 +198,11 @@ client's measurement.
 An input `context` is an optional typed observation. Its `place_id` is a trimmed symbolic place
 label independent of its metric `spatial` pose. `scope` is an optional retrieval filter:
 `valid_at` and `known_at` are timezone-aware world-time and transaction-time instants; `place_id`
-matches the stored label exactly; and `near` with a non-negative `radius_m` restricts results to
-the same coordinate frame and observer/subject anchor. SQLite authoritatively reapplies every
-scope filter after candidate retrieval.
+matches the stored label exactly; `identity_id` scopes to one person -- the memories that identity
+is the subject of, plus the memories whose media shows their face or carries their speech, with a
+merged alias resolving to the surviving identity; and `near` with a non-negative `radius_m`
+restricts results to the same coordinate frame and observer/subject anchor. SQLite authoritatively
+reapplies every scope filter after candidate retrieval.
 
 Create-request context:
 
@@ -346,7 +349,7 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 | `UnlinkResponse` | `restored_identity_id` |
 | `ForgetResponse` | `erasure`: `identity_id`, `alias_ids`, `face_exemplars`, `voice_exemplars`, `face_observations`, `speech_segments` |
 | `ConsentResponse` | `consent`: `granted`, `withheld`, `withdrawn`, or `null` when nobody has recorded a statement |
-| `MemoryOperationResponse` | `operation_id`, `intent`, `trigger`, `evidence_ids`, `target_ids`, `claim`, `consent`, `identity`, `rationale`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `superseded`, `applied_at`, `rolled_back_at`, `outcome`, `outcome_note` |
+| `MemoryOperationResponse` | `operation_id`, `intent`, `trigger`, `evidence_ids`, `target_ids`, `claim`, `consent`, `identity`, `proposal`, `rationale`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `superseded`, `applied_at`, `rolled_back_at`, `outcome`, `outcome_note` |
 | `RecordConsentResponse` | `operation`, or `null` when the same statement already stands |
 | `ExportResponse` | `exported_at`, `identity_id`, `identities`, `records`, `operations` |
 | `RetentionResponse` | `dry_run`, `media_memory_ids`, `forgotten_memory_ids`, `asset_ids`, `capture_memory_ids`, `deleted` |
@@ -408,14 +411,16 @@ list means the backend is absent, not that it supports nothing. A `null` model I
 same space. `speaker_recognition` is not derivable from `transcription`: a transcription backend
 and a speech backend occupy one slot and declare the same modalities, but only the second resolves
 speakers, so this is the field that says whether `speech` will work. `operations` is derived from
-those backends rather than declared, and names which optional operations this composition can
-serve, so a caller does not have to know that `ask` needs generation or `consolidate` a
-consolidation backend. Values are captured when `Memory` is constructed, so the route performs no
-I/O and no model call.
+those backends rather than declared, so a caller does not have to know that `ask` needs generation,
+and it is then narrowed to what this app can actually route to: `speech` and `faces` appear only
+when the host built it with `embodied_operations=True` (the example above), and `consolidate` never
+appears, because the control plane has no `/v1` route. Values are captured when `Memory` is
+constructed, so the route performs no I/O and no model call.
 
-This is `MemoryCapabilities.document()` verbatim. The MCP server embeds the same document in its
-instructions and `mindbridge doctor` prints it under `capabilities`, so no surface can describe
-one composition differently.
+This is `MemoryCapabilities.document()` with `operations` filtered that way. The MCP server embeds
+the same document, filtered to the operations its tools reach, and `mindbridge doctor` prints the
+whole derivation under `capabilities`, so no surface can describe one composition differently or
+promise an operation it cannot serve.
 
 ## Errors and limits
 

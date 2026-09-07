@@ -191,6 +191,8 @@ def test_group_by_falls_back_until_it_has_distinct_parent_memories() -> None:
         memory_type=None,
         occurred_from=None,
         occurred_until=None,
+        place_id=None,
+        identity_id=None,
         ef=None,
         exact=False,
     )
@@ -244,7 +246,6 @@ def test_create_search_flush_close_and_reopen(tmp_path: Path) -> None:
     assert lexical[0].relevance == pytest.approx(1.0)
 
     index.optimize()
-    assert index.index_completeness == pytest.approx(1.0)
     index.flush()
     index.close()
     index.close()

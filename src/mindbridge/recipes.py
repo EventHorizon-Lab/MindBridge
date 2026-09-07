@@ -25,6 +25,7 @@ from mindbridge.models.base import (
     GenerationBackend,
     SpeechBackend,
     TranscriptionBackend,
+    VisionDescriptionBackend,
 )
 from mindbridge.models.funasr import (
     DEFAULT_FUNASR_MODEL_ID,
@@ -49,7 +50,7 @@ from mindbridge.types import Modality
 if TYPE_CHECKING:
     from openai import OpenAI
 
-Slot = Literal["embedder", "answerer", "former", "consolidator", "transcriber"]
+Slot = Literal["embedder", "answerer", "former", "consolidator", "transcriber", "vision"]
 
 JINA_OMNI = "jina-omni"
 FUNASR = "funasr"
@@ -60,7 +61,7 @@ OPENAI = "openai"
 _SLOTS: Mapping[str, frozenset[str]] = {
     FUNASR: frozenset({"transcriber"}),
     JINA_OMNI: frozenset({"embedder"}),
-    OPENAI: frozenset({"embedder", "answerer", "former", "consolidator", "transcriber"}),
+    OPENAI: frozenset({"embedder", "answerer", "former", "consolidator", "transcriber", "vision"}),
 }
 _PARAMETERIZED = frozenset({OPENAI})
 _PROBES: Mapping[str, str] = {JINA_OMNI: "weights", FUNASR: "import", OPENAI: "client"}
@@ -72,6 +73,8 @@ _OPENAI_MODELS: Mapping[str, str] = {
     # So does the memory-management loop; both reason with the same completion controls.
     "consolidator": DEFAULT_GENERATION_MODEL,
     "transcriber": DEFAULT_TRANSCRIPTION_MODEL,
+    # Captioning is a chat completion over image parts, so it pins the generation constant too.
+    "vision": DEFAULT_GENERATION_MODEL,
 }
 # MindBridge never reads a credential. The official SDK performs its own documented lookup, so the
 # source of the key is reportable while the value never enters this process's output.
@@ -159,6 +162,11 @@ def former(name: str, *, load: bool = False) -> FormationBackend:
 def consolidator(name: str, *, load: bool = False) -> ConsolidationBackend:
     """Return the consolidation backend one recipe names; the caller owns and closes it."""
     return cast(ConsolidationBackend, _build(name, slot="consolidator", load=load))
+
+
+def vision(name: str, *, load: bool = False) -> VisionDescriptionBackend:
+    """Return the visual-description backend one recipe names; the caller owns and closes it."""
+    return cast(VisionDescriptionBackend, _build(name, slot="vision", load=load))
 
 
 def transcriber(name: str, *, load: bool = False) -> SpeechBackend | TranscriptionBackend:
@@ -309,6 +317,15 @@ def _build(name: str, *, slot: Slot, load: bool) -> object:
         # One adapter serves all three: `formation_model` and `consolidation_model` are the
         # generation model it was given.
         return _OwnedClientModels(client, generation_model=selected)
+    if slot == "vision":
+        # `vision_capabilities` are the generation ones, and `Memory` rejects a describer that
+        # declares anything but image or video. Image alone is the declarative default too:
+        # video is captioned from four decoded stills, so it costs four image parts per memory.
+        return _OwnedClientModels(
+            client,
+            generation_model=selected,
+            generation_capabilities=frozenset({Modality.IMAGE}),
+        )
     return _OwnedClientModels(client, transcription_model=selected)
 
 

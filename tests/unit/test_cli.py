@@ -56,6 +56,7 @@ from mindbridge.types import (
     MemoryTrigger,
     MemoryType,
     Modality,
+    ObservationContext,
     Page,
     PendingCapture,
     SearchHit,
@@ -114,6 +115,20 @@ class _Embedder:
         return tuple(
             (1.0, 0.0) if "red" in value.text.casefold() else (0.0, 1.0) for value in inputs
         )
+
+    def close(self) -> None:
+        return None
+
+
+class _Describer:
+    """A visual slot doctor can probe without an endpoint."""
+
+    vision_capabilities = frozenset({Modality.IMAGE})
+    vision_model = "cli-test-vision"
+    vision_space = "cli-test-vision:caption-v1"
+
+    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+        return tuple("a described image" for _value in inputs)
 
     def close(self) -> None:
         return None
@@ -495,6 +510,46 @@ def test_typed_context_and_scope_round_trip(app: str, capsys: pytest.CaptureFixt
     assert len(cast(dict[str, list[object]], found)["hits"]) == 1
 
 
+def test_scope_carries_the_place_and_identity_axes(
+    app: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Both symbolic axes were unreachable from the CLI: its decoder rejected the two keys."""
+    with Memory(tmp_path / "store", embedder=_Embedder()) as memory:
+        placed = memory.add(
+            "a red wrench in the shed",
+            context=ObservationContext(place_id="shed"),
+        )
+        memory.add("a red wrench nowhere in particular")
+
+    status, found, _ = _run(
+        capsys,
+        "--app",
+        app,
+        "-q",
+        "search",
+        "red wrench",
+        "--scope",
+        json.dumps({"place_id": "shed"}),
+    )
+    assert status == 0
+    assert [hit["id"] for hit in cast(dict[str, list[dict[str, object]]], found)["hits"]] == [
+        placed.id
+    ]
+
+    status, nobody, _ = _run(
+        capsys,
+        "--app",
+        app,
+        "-q",
+        "search",
+        "red wrench",
+        "--scope",
+        json.dumps({"identity_id": "nobody"}),
+    )
+    assert status == 0
+    assert nobody == {"hits": []}
+
+
 def test_quiet_suppresses_only_the_banner(app: str, capsys: pytest.CaptureFixture[str]) -> None:
     _status, quiet_stdout, quiet_stderr = _run(capsys, "--app", app, "-q", "add", "a red wrench")
     assert quiet_stderr == []
@@ -653,6 +708,7 @@ def test_recipes_pin_identity_to_the_constants_in_the_source() -> None:
         "former": "gpt-5-mini",
         "consolidator": "gpt-5-mini",
         "transcriber": "gpt-5-mini",
+        "vision": "gpt-5-mini",
     }
     assert "OPENAI_API_KEY" in cast(str, recipes.describe("openai")["credential"])
 
@@ -702,6 +758,40 @@ def test_the_consolidator_flag_reaches_the_memory_it_composes(
     assert captured["consolidator"] is sentinel
 
 
+def test_the_vision_flag_reaches_the_memory_it_composes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--vision` is the only flag whose `Memory` keyword differs from the slot's own name."""
+    from mindbridge import cli
+
+    sentinel = object()
+    captured: dict[str, object] = {}
+    arguments = cli._parser().parse_args(
+        ["--data-dir", str(tmp_path), "--embedder", "openai", "--vision", "openai", "list"]
+    )
+    monkeypatch.setattr(recipes, "embedder", lambda name, **kw: object())
+    monkeypatch.setattr(recipes, "vision", lambda name, **kw: sentinel)
+    monkeypatch.setattr(cli, "Memory", lambda *args, **kwargs: captured.update(kwargs))
+
+    cli._open_memory(arguments)
+
+    assert captured["vision_describer"] is sentinel
+
+
+def test_the_vision_recipe_declares_a_visual_capability_memory_accepts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A describer inheriting the text-only generation default is rejected by `Memory`."""
+    monkeypatch.setattr(recipes, "_openai_client", _SdkClient)
+    describer = recipes.vision("openai")
+    try:
+        assert describer.vision_capabilities == frozenset({Modality.IMAGE})
+        declared = declared_capabilities(embedder=_Embedder(), vision_describer=describer)
+        assert declared.vision == frozenset({Modality.IMAGE})
+    finally:
+        describer.close()
+
+
 def test_every_recipe_slot_has_a_command_line_flag() -> None:
     """The four literals this used to need are now one list; keep the flag set derived from it."""
     from mindbridge import cli
@@ -731,7 +821,7 @@ class _SdkClient:
         self.close_calls += 1
 
 
-@pytest.mark.parametrize("slot", ("embedder", "answerer", "former", "transcriber"))
+@pytest.mark.parametrize("slot", ("embedder", "answerer", "former", "transcriber", "vision"))
 def test_a_recipe_closes_the_sdk_client_it_constructed(
     slot: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -817,6 +907,27 @@ def test_doctor_publishes_the_capability_document_without_opening_a_store(
     # Declared by the backend, so the summary neither opens nor creates the data directory.
     assert report["data_dir_state"] == "absent"
     assert not store.exists()
+
+    # Every probed slot reaches the summary: a composed backend doctor loaded but omitted here
+    # would be reported as a capability the deployment does not have.
+    monkeypatch.setattr(recipes, "vision", lambda name, *, load=False: _Describer())
+    _status, seeing, _ = _run(
+        capsys,
+        "--embedder",
+        "jina-omni",
+        "--vision",
+        "openai",
+        "--data-dir",
+        str(store),
+        "-q",
+        "doctor",
+    )
+    capabilities = cast(dict[str, object], cast(dict[str, object], seeing)["capabilities"])
+    assert (
+        capabilities
+        == declared_capabilities(embedder=_Embedder(), vision_describer=_Describer()).document()
+    )
+    assert capabilities["operations"] == ["describe_vision"]
 
 
 def test_doctor_declares_no_capabilities_for_an_application_it_must_not_call(
@@ -927,6 +1038,8 @@ def test_remote_mode_posts_to_v1_and_echoes_the_body(
                     "known_at": None,
                     "near": None,
                     "radius_m": None,
+                    "place_id": None,
+                    "identity_id": None,
                 },
             },
         )
@@ -1035,17 +1148,8 @@ def test_remote_mode_passes_the_cursor_through_unparsed(
     ("command", "operands"),
     (
         ("add-stream", ("[]",)),
-        ("speech", ("memory-1",)),
-        ("faces", ("memory-1",)),
         ("register-speaker", ("speaker-1", "Ana")),
-        ("register-identity", ("identity-1", "Ana")),
-        ("record-consent", ("identity-1", "withdrawn")),
-        ("consent", ("identity-1",)),
-        ("export", ("--identity-id", "identity-1")),
-        ("apply-retention", ()),
-        ("reinforce", ("memory-1",)),
-        ("settle", ()),
-        ("pending-captures", ()),
+        ("consolidation-candidates", ()),
         ("consolidate", ("why",)),
         ("deliberate", ()),
         ("apply", ("--operation", '{"intent": "forget", "target_ids": ["memory-1"]}')),

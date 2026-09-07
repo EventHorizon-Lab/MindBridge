@@ -306,8 +306,11 @@ def test_forgetting_replaces_the_indexed_memories_in_the_same_commit(tmp_path: P
         assert stored is not None and "Alice" not in stored.content
         document = store.read_index_document("alice-first:0")
         assert document is not None and "Alice" not in document.content
-        # The projection is only told after SQLite committed, through the durable outbox.
+        # The projection is only told after SQLite committed, through the durable outbox. Three
+        # entries: the erasure re-enqueues the memory whose indexed identity projection named
+        # the forgotten person, then the caller's replacement deletes and re-adds the vector.
         assert [operation.embedding_id for operation in store.pending_index_operations()] == [
+            "alice-first:0",
             "alice-first:0",
             "alice-first:0",
         ]

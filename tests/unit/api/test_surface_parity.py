@@ -44,11 +44,19 @@ from mindbridge.types import (
     ContextConflict,
     ContextUnknown,
     ContextUnknownKind,
+    EvidenceBasis,
     FaceObservation,
+    FormationProposal,
     IdentityErasure,
     IdentityProfile,
     MemoryCapabilities,
+    MemoryContext,
+    MemoryIntent,
+    MemoryKind,
+    MemoryOperation,
+    MemoryOperationRecord,
     MemoryRecord,
+    MemoryTrigger,
     Modality,
     NamedActor,
     Page,
@@ -473,6 +481,59 @@ def test_result_records_expose_the_same_fields_on_both_transports(
     assert set(mcp_model.model_fields) == expected
 
 
+def test_an_operation_row_is_one_document_on_both_transports() -> None:
+    """The log row is an audit surface, so REST and `mindbridge operations` print the same keys.
+
+    REST carried no `proposal`, so a consolidation row read over `--url` named an intent and no
+    statement -- and `apply`, which takes a row exactly as it is printed, refused to replay it.
+    """
+    record = MemoryOperationRecord(
+        operation_id=1,
+        operation=MemoryOperation(
+            intent=MemoryIntent.CONSOLIDATE,
+            evidence_ids=("memory_1",),
+            proposal=FormationProposal(
+                kind=MemoryKind.ENTITY,
+                content="Ana is a person",
+                subject="Ana",
+                confidence=0.9,
+            ),
+            rationale="two observations name her",
+        ),
+        trigger=MemoryTrigger.MANUAL,
+        applied_at=datetime(2026, 9, 5, tzinfo=timezone.utc),
+    )
+
+    document = cli._operation_document(record)
+
+    assert set(rest.MemoryOperationResponse.model_fields) == set(document)
+    assert document["proposal"] is not None
+    assert rest._operation_response(record).proposal == document["proposal"]
+
+
+def test_a_memory_context_is_one_document_on_every_surface() -> None:
+    """REST and MCP serialize the dataclass, so the CLI has to print every field it declares.
+
+    `identity_id` is the claim's semantic subject. Dropping it locally made `get`, `search`,
+    `compile`, and `export` say a claim was about nobody unless the caller went through `--url`.
+    """
+    context = MemoryContext(
+        kind=MemoryKind.ENTITY,
+        basis=EvidenceBasis.USER_STATEMENT,
+        confidence=0.9,
+        valid_from=None,
+        valid_until=None,
+        recorded_at=datetime(2026, 9, 5, tzinfo=timezone.utc),
+        identity_id="identity_1",
+    )
+
+    document = cli._context_document(context)
+
+    assert document is not None
+    assert set(document) == {field.name for field in dataclass_fields(MemoryContext)}
+    assert document["identity_id"] == "identity_1"
+
+
 def test_serialized_assets_drop_the_local_path_on_both_transports() -> None:
     expected = {field.name for field in dataclass_fields(AssetRef)} - {"path"}
 
@@ -527,8 +588,15 @@ class _TinyEmbedder:
 
 
 def test_every_surface_publishes_one_capability_document() -> None:
-    """REST, MCP, and the CLI must render `MemoryCapabilities.document()`, not three views."""
-    served = rest._capabilities_response(CAPABILITIES).model_dump(mode="json")
+    """REST, MCP, and the CLI must render `MemoryCapabilities.document()`, not three views.
+
+    The two network surfaces narrow `operations` to what they route to, which
+    `test_capability_document.py` covers; this composition declares only `ask`, which every
+    surface serves, so the three documents here are the same object.
+    """
+    served = rest._capabilities_response(CAPABILITIES, served=rest._ROUTED_OPERATIONS).model_dump(
+        mode="json"
+    )
     instructions = mcp_adapter.build_mcp_server(_UnusedMemory()).instructions  # type: ignore[arg-type]
     assert instructions is not None
     greeted = json.loads(instructions[instructions.index("{") :])
@@ -633,6 +701,21 @@ def test_the_documented_count_of_operations_without_a_tool_is_the_real_one() -> 
     )
 
     assert f"{_COUNT_WORDS[without_a_tool]} Python operations have no MCP tool." in page
+
+
+def test_the_documented_count_of_sdk_operations_is_the_real_one() -> None:
+    """Two pages state the SDK operation count in prose, and the two had already drifted apart.
+
+    The enumeration is the one `test_every_sdk_operation_is_exposed_or_documented_as_a_gap` pins
+    against `Memory` itself: every public attribute that is not construction, lifecycle, or the
+    capability declaration.
+    """
+    count = len(SHARED_OPERATIONS) + len(UNEXPOSED_OPERATIONS)
+    docs = Path(mindbridge.__file__).parents[2] / "docs"
+
+    for name in ("architecture.md", "product-capabilities.md"):
+        page = (docs / name).read_text(encoding="utf-8")
+        assert f"{count} product operations" in page, name
 
 
 def test_the_documented_root_import_count_and_inventory_are_the_real_ones() -> None:

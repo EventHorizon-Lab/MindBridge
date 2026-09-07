@@ -202,8 +202,8 @@ _GOLD_EVIDENCE_KEYS = ("evidence_ids", "clue_ids")
 _UNRESOLVED_EVIDENCE_KEY = "unresolved_evidence_ids"
 _RECALL_CUTOFFS = (1, 5, 10, 20)
 _MANDATORY_CONTROLS = ("random_ranker", "blind", "recall_at_20")
-EVAL_SCHEMA_VERSION = 13
-EVAL_RUNNER_VERSION = "mindbridge_eval_official_v13"
+EVAL_SCHEMA_VERSION = 14
+EVAL_RUNNER_VERSION = "mindbridge_eval_official_v14"
 DEFAULT_ARM = "mindbridge"
 BASELINE_ARMS = ("blind", "full-context", "random", "compile")
 ARMS = (DEFAULT_ARM, *BASELINE_ARMS)
@@ -312,6 +312,7 @@ class _Arguments:
     arms: tuple[str, ...]
     full_context_chars: int
     ingest: str
+    deliberate: bool
     compile_max_items: int
     compile_max_chars: int
     model_args: str
@@ -1127,6 +1128,10 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
     except ValueError as error:
         parser.error(str(error))
     _configure_logging(_picked(parsed.verbosity, overrides.run.verbosity, "INFO"))
+    if parsed.deliberate and (memory_config is None or memory_config.consolidation is None):
+        # Refused rather than silently ignored: without a consolidation backend every round
+        # would raise, and a run that quietly skipped the loop would report a score for it.
+        parser.error("--deliberate requires a --config declaring a `consolidation` section")
     download = DownloadSettings.resolve(
         overrides.download,
         benchmarks_root=parsed.benchmarks_root,
@@ -1483,8 +1488,9 @@ def _execute(
     Mapping[str, object],
     int,
 ]:
-    global _first_ingest_failure_announced
+    global _first_ingest_failure_announced, _deliberation_applied
     _first_ingest_failure_announced = False
+    _deliberation_applied = 0
     needs_speech = any(
         isinstance(atom, Path)
         and _MODALITY_BY_SUFFIX.get(atom.suffix.casefold()) in {Modality.AUDIO, Modality.VIDEO}
@@ -1839,6 +1845,7 @@ async def _run_arms(
                 compile_budget=compile_budget,
                 ingest_mode=arguments.ingest,
                 ingest_digest=_ingest_digest(task, arguments, memory_config),
+                deliberate=arguments.deliberate,
                 tracer=tracer,
                 on_progress=progress,
                 on_search_replay_ready=deferred_searches.append,
@@ -1870,6 +1877,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     ingest_mode: str = DEFAULT_INGEST_MODE,
     ingest_digest: str | None = None,
+    deliberate: bool = False,
     tracer: Tracer | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     on_search_replay_ready: Callable[[_SearchReplay], None] | None = None,
@@ -1931,6 +1939,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
                 compile_budget=compile_budget,
                 ingest_mode=ingest_mode,
                 checkpoint=checkpoint,
+                deliberate=deliberate,
                 tracer=tracer,
                 on_sample_completed=sample_completed,
                 on_store_ready=store_ready,
@@ -2217,6 +2226,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     ingest_mode: str = DEFAULT_INGEST_MODE,
     checkpoint: _IngestCheckpoint | None = None,
+    deliberate: bool = False,
     tracer: Tracer | None = None,
     on_sample_completed: Callable[[], None] | None = None,
     on_store_ready: Callable[[], None] | None = None,
@@ -2299,6 +2309,8 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                         on_chunk=_checkpoint_writer(checkpoint, ingested, ingest_failure_details),
                     )
                     ingested = end
+                    if deliberate:
+                        await _deliberate_after_ingest(memory)
                 pending = end
                 context = (
                     _full_context(memories[:pending], full_context_chars) if stuffs_context else ""
@@ -2599,6 +2611,18 @@ async def _capture_chunk(
             if not settled:
                 break
     return failures
+
+
+async def _deliberate_after_ingest(memory: AsyncMemory) -> None:
+    """Run the slow loop over what was just ingested, before the cutoff's questions are asked.
+
+    Between ingest and questions rather than after the whole unit: that is where a real
+    deployment's loop would have run, and a consolidation applied after the questions could not
+    change an answer it was meant to improve.
+    """
+    global _deliberation_applied
+    report = await memory.deliberate()
+    _deliberation_applied += report.applied
 
 
 async def _ingest(
@@ -3845,6 +3869,12 @@ def _results(
         "unit_concurrency": arguments.unit_concurrency,
         "request_concurrency": arguments.request_concurrency,
         "recall_limit": arguments.recall_limit,
+        # P5/P6: without this the configured consolidator was constructed, registered for close,
+        # and never called, and nothing in the report said so.
+        "deliberation": {
+            "enabled": arguments.deliberate,
+            "operations_applied": _deliberation_applied,
+        },
         "arms": _arm_provenance(arguments, memory_config),
         "measurement_protocol": _measurement_protocol(
             arguments,
@@ -5132,6 +5162,10 @@ def _progress(
 
 
 _first_ingest_failure_announced = False
+# Run-global like `_first_ingest_failure_announced` above and for the same reason: the whole
+# evaluation runs inside one `asyncio.run`, so this is single-threaded, and threading a counter
+# back through four call layers would change five signatures to report one integer.
+_deliberation_applied = 0
 
 
 def _announce_first_ingest_failure(error: BaseException, source_id: str) -> None:
@@ -5328,6 +5362,15 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         type=_positive_int,
         default=None,
         help="ContextBudget.max_chars for the compile arm",
+    )
+    parser.add_argument(
+        "--deliberate",
+        action="store_true",
+        help=(
+            "run Memory.deliberate() after each cutoff's ingest and before its questions, so "
+            "the slow loop's effect on QA scores is measurable; requires a config declaring "
+            "`consolidation`"
+        ),
     )
     parser.add_argument(
         "--ingest",
@@ -5633,6 +5676,7 @@ def _arguments(
         arms=arms,
         full_context_chars=full_context_chars,
         ingest=ingest,
+        deliberate=parsed.deliberate,
         compile_max_items=compile_max_items,
         compile_max_chars=compile_max_chars,
         model_args=parsed.model_args,
@@ -6241,6 +6285,7 @@ def _cache_namespace(
         "blind": arguments.blind,
         "batch_sizes": dict(sorted(batch_sizes.items())),
         "ingest": arguments.ingest,
+        "deliberate": arguments.deliberate,
         "compile_max_items": arguments.compile_max_items,
         "compile_max_chars": arguments.compile_max_chars,
     }
