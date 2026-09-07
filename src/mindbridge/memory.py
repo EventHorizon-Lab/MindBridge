@@ -8,6 +8,7 @@ import builtins
 import hashlib
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -219,17 +220,28 @@ _IDENTITY_LINK_RECIPE = "mindbridge-identity-link-v1"
 # nothing, and can stop after any pass.
 _RETENTION_PAGE_SIZE = 1_000
 _INDEX_RECIPE_PREFIX = (
-    "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:context-keys-v10"
+    "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:context-keys-v11"
 )
 # Recipes whose stored embeddings are still correct, so the index is rebuilt from SQLite without
 # paying to embed the content again. A full-text tokenizer change belongs here and not below: it
 # rewrites the derived documents and leaves every vector untouched. Version 9 named its CJK field
 # `fts-dual-language` because it ran a Chinese segmenter, which returned nothing for Japanese or
-# Korean; version 10 tokenizes that field into script-agnostic character bigrams instead.
+# Korean; version 10 tokenizes that field into script-agnostic character bigrams instead. Version
+# 11 adds the `place_id` and `identity_ids` filter fields, which are projections of rows SQLite
+# already holds.
 _REINDEXABLE_INDEX_RECIPES = frozenset(
-    "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
-    f"context-keys-v9:quantization-{mode.value}"
-    for mode in IndexQuantization
+    {
+        *(
+            "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
+            f"context-keys-v9:quantization-{mode.value}"
+            for mode in IndexQuantization
+        ),
+        *(
+            "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:"
+            f"context-keys-v10:quantization-{mode.value}"
+            for mode in IndexQuantization
+        ),
+    }
 )
 # Recipes that also invalidate the stored embeddings, so reopening pays for a full re-embed.
 _LEGACY_INDEX_RECIPES = frozenset(
@@ -254,6 +266,11 @@ _OUTBOX_BATCH_SIZE = 256
 # than configurable: a caller cannot choose better values without knowing what a Zvec flush costs,
 # and the visible behaviour they trade against - when a committed item enters the index - is
 # already forced by `search`, which drains before it reads.
+# The kernel's only sink that survives a deployment without the OpenTelemetry SDK installed,
+# where every `operation_span` is a no-op. It carries the reasons the kernel already computes at
+# the points where it degrades or refuses rather than raises, because a capability that fails
+# quietly is one nobody notices has stopped working.
+_LOGGER = logging.getLogger(__name__)
 _STREAM_GROUP_ITEMS = 32
 _STREAM_GROUP_SECONDS = 0.25
 _REINDEX_PAGE_SIZE = 256
@@ -494,6 +511,8 @@ class _Index(Protocol):
         memory_type: str | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
         ef: int | None = None,
         exact: bool = False,
     ) -> tuple[IndexHit, ...]: ...
@@ -508,6 +527,8 @@ class _Index(Protocol):
         memory_type: str | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
     ) -> tuple[IndexHit, ...]: ...
 
     def flush(self) -> None: ...
@@ -744,10 +765,16 @@ class Memory:
             index_missing = not index_path.exists()
             index_rebuild, embedding_rebuild = self._ensure_store_metadata(index_path)
             if embedding_rebuild:
+                _LOGGER.warning("re-embedding stored memories for space %s", self._space_id)
                 self._reembed_memories()
                 self._store.set_metadata(_STORE_METADATA_KEYS["space"], self._space_id)
                 self._store.set_metadata(_STORE_METADATA_KEYS["index"], self._index_recipe)
             if index_missing or index_rebuild:
+                _LOGGER.info(
+                    "rebuilding the search index (missing=%s, recipe changed=%s)",
+                    index_missing,
+                    index_rebuild,
+                )
                 with _translate_storage_errors("checkpoint a missing search index"):
                     self._store.queue_all_embeddings()
         except BaseException:
@@ -1229,6 +1256,13 @@ class Memory:
             if waits:
                 span.set_attribute(CAPTURE_TIME_TO_SEARCHABLE, max(waits))
             if failures:
+                # Only the first is raised, and a row that reaches `max_attempts` is then skipped
+                # by the queue read rather than retried, so without this the rest are silent.
+                _LOGGER.warning(
+                    "settle left %d captured record(s) unfinished; first: %s",
+                    len(failures),
+                    failures[0],
+                )
                 raise failures[0]
             return len(settled)
 
@@ -1780,6 +1814,7 @@ class Memory:
                 near=None if scope is None else scope.near,
                 radius_m=None if scope is None else scope.radius_m,
                 place_id=None if scope is None else scope.place_id,
+                identity_id=None if scope is None else scope.identity_id,
             )
 
     def _consented_actors(
@@ -2870,6 +2905,10 @@ class Memory:
                     targets = _retiring_targets(operation)
                     named = set(operation.evidence_ids) | set(operation.target_ids)
                     if targets & consumed or named & retired:
+                        _LOGGER.warning(
+                            "consolidation refused a %s proposal: inconsistent_batch",
+                            operation.intent.value,
+                        )
                         rejected.append((operation, "inconsistent_batch"))
                         continue
                     try:
@@ -2885,6 +2924,11 @@ class Memory:
                             )
                         )
                     except _RejectedOperation as rejection:
+                        _LOGGER.warning(
+                            "consolidation refused a %s proposal: %s",
+                            operation.intent.value,
+                            rejection.reason,
+                        )
                         rejected.append((operation, rejection.reason))
                     else:
                         consumed.update(set(operation.evidence_ids) - targets)
@@ -2991,6 +3035,9 @@ class Memory:
                         # does not apply. Every other rejection does.
                         window=None,
                         assets=assets,
+                        # The host's own path, so a `RESPONSE_POLICY` proposal is authorized
+                        # here and nowhere else.
+                        host_authored=True,
                     )
             except _RejectedOperation as rejection:
                 raise ValidationError(
@@ -3336,6 +3383,9 @@ class Memory:
         shown: Mapping[str, MemoryRecord] | None,
         window: frozenset[str] | None,
         assets: _OperationAssets,
+        # True only on `apply()`: the host authored this operation itself. A model-proposed
+        # kind the kernel refuses on provenance -- a `RESPONSE_POLICY` -- turns on this flag.
+        host_authored: bool = False,
     ) -> MemoryOperationRecord:
         if operation.intent is MemoryIntent.MERGE:
             # A cross-modal merge is committed by the kernel from corroboration evidence it
@@ -3382,7 +3432,13 @@ class Memory:
         try:
             if operation.intent is MemoryIntent.CONSOLIDATE:
                 return _operation_record(
-                    self._apply_consolidation(operation, pending, shown=shown, assets=assets)
+                    self._apply_consolidation(
+                        operation,
+                        pending,
+                        shown=shown,
+                        assets=assets,
+                        host_authored=host_authored,
+                    )
                 )
             if operation.intent is MemoryIntent.IDENTIFY:
                 return _operation_record(
@@ -3500,6 +3556,7 @@ class Memory:
         *,
         shown: Mapping[str, MemoryRecord] | None,
         assets: _OperationAssets,
+        host_authored: bool,
     ) -> StoredOperation:
         """Validate one consolidation proposal and commit it through the formation path."""
         if shown is None or not set(operation.evidence_ids) <= set(shown):
@@ -3512,7 +3569,7 @@ class Memory:
         proposal = operation.proposal
         assert proposal is not None
         sources = tuple(shown[memory_id] for memory_id in operation.evidence_ids)
-        primary = _consolidation_primary(proposal, sources)
+        primary = _consolidation_primary(proposal, sources, host_authored=host_authored)
         if primary is None:
             raise _RejectedOperation("invalid_proposal")
         # One operation, one transaction time: the derived record, its evidence links, and any
@@ -3547,6 +3604,14 @@ class Memory:
             context=context,
             place_id=place_id,
         )
+        # A derived ID that ignores its episode source -- a RELATION, or a model-inferred TRAIT
+        # -- is a function of the proposal alone, so re-proposing a claim that already stands
+        # while citing that claim mints the cited record's own ID. Linking a record to itself is
+        # malformed evidence whatever set it came from, exactly as it is for a REINFORCE, and it
+        # is refused here rather than left to fail the storage constraint and take the whole
+        # pass down.
+        if prepared.memory_id in operation.evidence_ids:
+            raise _RejectedOperation("target_is_evidence")
         logged = self._commit_formation(
             tuple((prepared, source.id, proposal.confidence) for source in sources),
             (),
@@ -4558,7 +4623,13 @@ class Memory:
                 # which is the policy the model adapter already applies to a malformed one, and
                 # which consolidation already applies to this same rule. Damage to the batch
                 # envelope still raises above: that is not one opinion.
-                if _formation_refusal(proposal, inputs_by_id[source.id]) is not None:
+                refusal = _formation_refusal(proposal, inputs_by_id[source.id])
+                if refusal is not None:
+                    _LOGGER.warning(
+                        "formation proposal refused for memory %s: %s",
+                        source.id,
+                        refusal,
+                    )
                     refused += 1
                     continue
                 prepared = _prepare_memory(
@@ -4799,7 +4870,12 @@ class Memory:
             descriptions = self._vision_descriptions(
                 tuple(self._resolved_model_input(_asset_content(asset)) for asset in pending)
             )
-        except ModelError:
+        except ModelError as error:
+            _LOGGER.warning(
+                "vision description failed for %d asset(s); storing them without a caption: %s",
+                len(pending),
+                error,
+            )
             # A description is derived convenience, and the caller handed us an observation to
             # store: losing the caption must never lose the memory. One malformed reply from the
             # describer used to fail the whole `add`, which an ingesting caller then reports as
@@ -5084,6 +5160,13 @@ class Memory:
         candidate_limit = _ROUTE_CANDIDATES
         candidate_ceiling = max(candidate_limit, limit * (_MAX_RETRIEVAL_KEYS + 1))
         seen_index_ids: set[str] = set()
+        # Both are static per document, so the index answers them itself instead of the loop
+        # below widening its window until enough survivors of a post-filter turn up. That
+        # widening is bounded, and for a one-person or one-room predicate the bound is reached
+        # long before the matches are: the pushdown is what makes those scopes recall what the
+        # store holds. SQLite still applies the same predicates below and decides.
+        scope_place_id = None if scope is None else scope.place_id
+        scope_identity_id = self._pushed_identity(scope)
         with self._write_lock:
             # A read asks for the current truth, so it closes an `add_stream` group that is still
             # open on this thread instead of skipping the drain with it: the consumer that searches
@@ -5099,6 +5182,8 @@ class Memory:
                         memory_types=memory_types,
                         occurred_from=occurred_from,
                         occurred_until=occurred_until,
+                        place_id=scope_place_id,
+                        identity_id=scope_identity_id,
                     )
                 else:
                     # Zvec range-filtered FTS is unstable after dense queries; the global
@@ -5118,6 +5203,8 @@ class Memory:
                             memory_types=memory_types,
                             occurred_from=preferred_range[0],
                             occurred_until=preferred_range[1],
+                            place_id=scope_place_id,
+                            identity_id=scope_identity_id,
                         )
                     )
                     fallback = self._index_candidates(
@@ -5127,6 +5214,8 @@ class Memory:
                         memory_types=memory_types,
                         occurred_from=occurred_from,
                         occurred_until=occurred_until,
+                        place_id=scope_place_id,
+                        identity_id=scope_identity_id,
                     )
                     candidates = _IndexCandidates(
                         dense=_merge_index_hits(preferred.dense, fallback.dense),
@@ -5157,6 +5246,8 @@ class Memory:
                     memory_types=memory_types,
                     route_limit=candidate_limit,
                     result_limit=limit,
+                    place_id=scope_place_id,
+                    identity_id=scope_identity_id,
                 )
             index_ids = tuple(
                 dict.fromkeys(hit.id for hit in (*candidates.dense, *candidates.lexical))
@@ -5194,6 +5285,7 @@ class Memory:
                     # reader would have to explain, and because narrowing a count can only
                     # widen the search. The hydration site below is mutation-covered.
                     place_id=None if scope is None else scope.place_id,
+                    identity_id=None if scope is None else scope.identity_id,
                     active_only=True,
                 )
             if (
@@ -5253,6 +5345,7 @@ class Memory:
                     near=None if scope is None else scope.near,
                     radius_m=None if scope is None else scope.radius_m,
                     place_id=None if scope is None else scope.place_id,
+                    identity_id=None if scope is None else scope.identity_id,
                     active_only=True,
                 )
             with self._trace("mindbridge.retrieval.rank", kind="stage"):
@@ -5412,6 +5505,18 @@ class Memory:
             ambiguous=ambiguous,
         )
 
+    def _pushed_identity(self, scope: RetrievalScope | None) -> str | None:
+        """Resolve a scoped identity to the ID the index projection stores, or `None`.
+
+        A merge re-points every projected row onto the survivor, so a request naming a merged
+        alias has to be resolved before it can be pushed down. An unknown identity is pushed
+        unresolved: it matches nothing in the index, which is what SQLite decides too.
+        """
+        if scope is None or scope.identity_id is None:
+            return None
+        with _translate_storage_errors("resolve a scoped identity"):
+            return self._store.resolve_identity_id(scope.identity_id) or scope.identity_id
+
     def _deepen_temporal_lexical_candidates(
         self,
         candidates: _IndexCandidates,
@@ -5422,6 +5527,8 @@ class Memory:
         memory_types: frozenset[MemoryType] | None,
         route_limit: int,
         result_limit: int,
+        place_id: str | None = None,
+        identity_id: str | None = None,
     ) -> tuple[_IndexCandidates, tuple[IndexCandidate, ...]]:
         if temporal_range is None or not lexical_query or len(candidates.lexical) < route_limit:
             return candidates, documents
@@ -5483,6 +5590,8 @@ class Memory:
                 lexical_query=lexical_query,
                 limit=search_limit,
                 memory_types=memory_types,
+                place_id=place_id,
+                identity_id=identity_id,
             ).lexical
             qualified = tuple(
                 hit
@@ -5515,6 +5624,8 @@ class Memory:
         memory_types: frozenset[MemoryType] | None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
     ) -> _IndexCandidates:
         # The index filter takes one type, so a set becomes one route per type rather than a
         # post-filter over a shared window. Each type then gets the full `limit` of depth, which
@@ -5534,6 +5645,8 @@ class Memory:
                 memory_type=value,
                 occurred_from=occurred_from,
                 occurred_until=occurred_until,
+                place_id=place_id,
+                identity_id=identity_id,
             )
             for value in type_values
             for vector in vectors
@@ -5549,6 +5662,8 @@ class Memory:
                     memory_type=value,
                     occurred_from=occurred_from,
                     occurred_until=occurred_until,
+                    place_id=place_id,
+                    identity_id=identity_id,
                 )
                 for value in type_values
             )
@@ -8652,12 +8767,21 @@ def _formation_memory_type(kind: MemoryKind) -> MemoryType:
 def _formation_refusal(
     proposal: FormationProposal,
     source: FormationInput,
+    *,
+    host_authored: bool = False,
 ) -> str | None:
     """Say why the kernel refuses to ground this proposal in this source, or `None` to keep it.
 
     A refusal costs the proposal and nothing else, on both paths that ask: formation drops it,
     and consolidation moves on to the next cited source.
     """
+    if proposal.kind is MemoryKind.RESPONSE_POLICY and not host_authored:
+        # How the system should behave toward somebody is a grant, not an inference: one
+        # observed cue must not become standing guidance. Keyed on where the proposal came
+        # from, never on the basis it claims -- a formation or consolidation backend builds
+        # its own `FormationProposal` and could name any basis -- so the only path that
+        # authorizes one is the host's own `apply()`.
+        return "response_policy formation requires explicit host authorization"
     if proposal.kind is MemoryKind.AFFECT and (
         proposal.cue_modality is None or proposal.cue_modality not in source.content.modalities
     ):
@@ -8784,6 +8908,8 @@ def _is_derived(memories: Mapping[str, StoredMemory], memory_id: str) -> bool:
 def _consolidation_primary(
     proposal: FormationProposal,
     sources: Sequence[MemoryRecord],
+    *,
+    host_authored: bool = False,
 ) -> MemoryRecord | None:
     """Return the newest cited source the proposal is grounded in, or `None`.
 
@@ -8807,6 +8933,7 @@ def _consolidation_primary(
                 content=ModelInput(text=source.content, assets=source.assets),
                 context=_observation_from_record(source),
             ),
+            host_authored=host_authored,
         )
         if refusal is None:
             return source
@@ -8970,7 +9097,18 @@ def _formation_context(
         valid_from = recorded_at
     return MemoryContext(
         kind=proposal.kind,
-        basis=proposal.basis,
+        # How the system should behave toward somebody is a grant: the kernel refuses every
+        # model-proposed `RESPONSE_POLICY`, so one that reaches persistence was authorized by
+        # the host calling `apply()` itself, and the stored record names that authorization
+        # rather than the default the proposal carried. Stamped here, on the persisted context
+        # alone, and never on the proposal: the log keeps the proposal it was handed and
+        # `_formation_memory_id` keys on that basis, so replaying a logged row mints the same
+        # ID and is recognised as the duplicate it is.
+        basis=(
+            EvidenceBasis.RESPONSE_FEEDBACK
+            if proposal.kind is MemoryKind.RESPONSE_POLICY
+            else proposal.basis
+        ),
         confidence=proposal.confidence,
         valid_from=valid_from,
         valid_until=valid_until,
@@ -9185,6 +9323,15 @@ def _fallback_unsupported(
         raise ModelError(
             f"configured {operation} model does not support: {names}",
             reason="unsupported_modality",
+        )
+    if unsupported:
+        # Not fatal, but the whole capability of this modality now rides on a transcript or a
+        # description that may never arrive. Silent fallback is how media encoding has died
+        # unnoticed here before.
+        _LOGGER.warning(
+            "configured %s model does not support %s; falling back to derived text",
+            operation,
+            ", ".join(sorted(modality.value for modality in unsupported)),
         )
     return unsupported
 
@@ -9798,6 +9945,8 @@ def _scope_description(scope: RetrievalScope | None) -> str | None:
     bounds = []
     if scope.place_id is not None:
         bounds.append(f"place {scope.place_id}")
+    if scope.identity_id is not None:
+        bounds.append(f"identity {scope.identity_id}")
     if scope.near is not None:
         radius = "" if scope.radius_m is None else f" within {scope.radius_m} m"
         bounds.append(f"frame {scope.near.frame_id}{radius}")

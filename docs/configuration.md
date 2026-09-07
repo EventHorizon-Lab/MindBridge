@@ -275,9 +275,33 @@ primitives stay available for a host that wants to schedule the two halves itsel
 
 Consolidation stays off when the slot is omitted, and `consolidate()` then raises
 `ModelError(reason="backend_not_configured")` while every other operation is unchanged. Declaring
-it flips `consolidate` on in the capability document that `/healthz`, the MCP server
-instructions, and `mindbridge doctor` publish. Unlike formation it is not on the write path: it
-runs only when a host calls `consolidate()`.
+it flips `consolidate` on in the capability document `mindbridge doctor` prints. `/healthz` and the
+MCP server instructions never list it, whatever is declared: neither surface has a route or a tool
+for consolidation, because the control plane stays with the process that owns the memory, and each
+surface publishes only the operations it can serve. Unlike formation it is not on the write path:
+it runs only when a host calls `consolidate()`.
+
+### Running the loop inside a server process
+
+A REST or MCP deployment cannot call `deliberate()` over the wire — no route and no tool reaches
+the control plane — and one physical `data_dir` has one live owner, so nothing else can call it
+either. The signals the served routes and tools record, above all the `QUERY_FAILURE` rows a
+failed `search`, `ask`, or `compile` writes, would then be collected and never read. Pass
+`deliberate_every` to `create_app` or `build_mcp_server` to have the serving process run the loop
+itself:
+
+```python
+app = create_app(memory=memory, deliberate_every=900.0)
+server = build_mcp_server(memory, deliberate_every=900.0)
+```
+
+It is a number of seconds, off by default, and it means the same thing on both surfaces. The round
+runs in a worker thread inside the server lifespan, so it never blocks a request or a tool call,
+and each round logs one line at `INFO` on the `mindbridge.api.deliberation` logger:
+`deliberation: rounds=… weighed=… applied=… rejected=…`. A failed round logs a warning and the
+next one still runs. Passing it without a configured `consolidation` backend, or with a
+non-positive interval, raises `ValidationError` at construction rather than failing on the first
+round.
 
 `modalities` becomes the media the backend attaches to its request. Evidence assets in a declared
 modality travel natively, so an image or audio memory with no derived description is readable by

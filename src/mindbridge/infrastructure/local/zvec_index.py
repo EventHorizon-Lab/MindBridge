@@ -29,7 +29,12 @@ _OCCURRED_AT_FIELD = "occurred_at"
 _OCCURRED_END_FIELD = "occurred_end"
 _SPACE_FIELD = "space_id"
 _TASK_FIELD = "task"
+_PLACE_FIELD = "place_id"
+_IDENTITY_FIELD = "identity_ids"
 _VECTOR_FIELD = "embedding"
+# Zvec has no null scalars, so "this memory has no place" is the empty string. It is not a legal
+# `place_id` (the store rejects blank and untrimmed values), so it can never collide with one.
+_MISSING_PLACE = ""
 _SCALAR_FIELDS = frozenset(
     {
         _CONTENT_FIELD,
@@ -40,6 +45,8 @@ _SCALAR_FIELDS = frozenset(
         _OCCURRED_END_FIELD,
         _SPACE_FIELD,
         _TASK_FIELD,
+        _PLACE_FIELD,
+        _IDENTITY_FIELD,
     }
 )
 _MISSING_OCCURRED_AT = -(2**63)
@@ -234,13 +241,6 @@ class ZvecIndex:
         collection = cast(Any, self._require_collection())
         return int(collection.stats.doc_count)
 
-    @property
-    def index_completeness(self) -> float:
-        """Return the indexed fraction of the dense-vector field."""
-        collection = cast(Any, self._require_collection())
-        values = collection.stats.index_completeness
-        return float(values[_VECTOR_FIELD])
-
     def upsert(self, documents: Sequence[IndexDocument]) -> None:
         """Idempotently apply a batch, checking every per-document status."""
         if not documents:
@@ -251,9 +251,10 @@ class ZvecIndex:
         for document in documents:
             embedding = document.embedding
             self._validate_vector(embedding.values)
-            _filter_literal(embedding.space_id, _SPACE_FIELD)
-            _filter_literal(embedding.task, _TASK_FIELD)
-            _filter_literal(document.memory_type, _MEMORY_TYPE_FIELD)
+            # No filter-grammar check here. These are stored field values, not filter syntax:
+            # `IndexDocument` already validated every one of them, and the outbox row this
+            # batch drains is committed, so a refusal on the write path is unrecoverable --
+            # the row never acks and every later drain re-raises the same rejection.
             ids.append(embedding.embedding_id)
             docs.append(
                 self._zvec.Doc(
@@ -277,6 +278,8 @@ class ZvecIndex:
                         ),
                         _SPACE_FIELD: embedding.space_id,
                         _TASK_FIELD: embedding.task,
+                        _PLACE_FIELD: document.place_id or _MISSING_PLACE,
+                        _IDENTITY_FIELD: list(document.identity_ids),
                     },
                     vectors={_VECTOR_FIELD: list(embedding.values)},
                 )
@@ -307,6 +310,8 @@ class ZvecIndex:
         memory_type: str | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
         ef: int | None = None,
         exact: bool = False,
     ) -> tuple[IndexHit, ...]:
@@ -320,6 +325,8 @@ class ZvecIndex:
                 memory_type=memory_type,
                 occurred_from=occurred_from,
                 occurred_until=occurred_until,
+                place_id=place_id,
+                identity_id=identity_id,
                 ef=ef,
                 exact=exact,
             )
@@ -343,6 +350,8 @@ class ZvecIndex:
         memory_type: str | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
     ) -> tuple[IndexHit, ...]:
         """Return BM25 matches with scores normalized against the best candidate."""
         if not text.strip():
@@ -357,6 +366,8 @@ class ZvecIndex:
                 memory_type=memory_type,
                 occurred_from=occurred_from,
                 occurred_until=occurred_until,
+                place_id=place_id,
+                identity_id=identity_id,
             )
         scores = tuple(max(0.0, _required_score(doc)) for doc in docs)
         maximum = max(scores, default=0.0)
@@ -588,6 +599,8 @@ class ZvecIndex:
         memory_type: str | None,
         occurred_from: datetime | None,
         occurred_until: datetime | None,
+        place_id: str | None,
+        identity_id: str | None,
         ef: int | None,
         exact: bool,
     ) -> list[object]:
@@ -607,6 +620,8 @@ class ZvecIndex:
             memory_type=memory_type,
             occurred_from=occurred_from,
             occurred_until=occurred_until,
+            place_id=place_id,
+            identity_id=identity_id,
         )
         groups = collection.group_by_query(
             query=query,
@@ -656,6 +671,8 @@ class ZvecIndex:
         memory_type: str | None,
         occurred_from: datetime | None,
         occurred_until: datetime | None,
+        place_id: str | None,
+        identity_id: str | None,
     ) -> list[object]:
         return cast(
             list[object],
@@ -675,6 +692,8 @@ class ZvecIndex:
                     memory_type=memory_type,
                     occurred_from=occurred_from,
                     occurred_until=occurred_until,
+                    place_id=place_id,
+                    identity_id=identity_id,
                 ),
                 include_vector=False,
                 output_fields=[],
@@ -733,6 +752,21 @@ class ZvecIndex:
                     nullable=False,
                     index_param=self._zvec.InvertIndexParam(),
                 ),
+                self._zvec.FieldSchema(
+                    name=_PLACE_FIELD,
+                    data_type=self._zvec.DataType.STRING,
+                    nullable=False,
+                    index_param=self._zvec.InvertIndexParam(),
+                ),
+                # One memory can be about several people, so this is the one array field.
+                # Zvec filters arrays only through `contain_any`/`contain_all`, which is
+                # exactly the predicate an identity scope needs.
+                self._zvec.FieldSchema(
+                    name=_IDENTITY_FIELD,
+                    data_type=self._zvec.DataType.ARRAY_STRING,
+                    nullable=False,
+                    index_param=self._zvec.InvertIndexParam(),
+                ),
             ],
             vectors=[
                 self._zvec.VectorSchema(
@@ -764,7 +798,21 @@ class ZvecIndex:
                 or content.index_param.extra_params != extra_params
             ):
                 _schema_mismatch(f"{name} FTS field differs")
-        for name in (_MEMORY_ID_FIELD, _MEMORY_TYPE_FIELD, _SPACE_FIELD, _TASK_FIELD):
+        identity = fields[_IDENTITY_FIELD]
+        if (
+            identity.data_type != self._zvec.DataType.ARRAY_STRING
+            or identity.nullable
+            or identity.index_param is None
+            or identity.index_param.type != self._zvec.IndexType.INVERT
+        ):
+            _schema_mismatch(f"{_IDENTITY_FIELD} scalar field differs")
+        for name in (
+            _MEMORY_ID_FIELD,
+            _MEMORY_TYPE_FIELD,
+            _SPACE_FIELD,
+            _TASK_FIELD,
+            _PLACE_FIELD,
+        ):
             field = fields[name]
             if (
                 field.data_type != self._zvec.DataType.STRING
@@ -966,6 +1014,8 @@ def _filter_expression(
     memory_type: str | None = None,
     occurred_from: datetime | None = None,
     occurred_until: datetime | None = None,
+    place_id: str | None = None,
+    identity_id: str | None = None,
 ) -> str | None:
     clauses = []
     if space_id is not None:
@@ -974,6 +1024,7 @@ def _filter_expression(
         clauses.append(f"{_TASK_FIELD} = {_filter_literal(task, _TASK_FIELD)}")
     if memory_type is not None:
         clauses.append(f"{_MEMORY_TYPE_FIELD} = {_filter_literal(memory_type, _MEMORY_TYPE_FIELD)}")
+    clauses.extend(_scope_clauses(place_id, identity_id))
     if occurred_from is not None or occurred_until is not None:
         clauses.append(f"{_OCCURRED_AT_FIELD} > {_MISSING_OCCURRED_AT}")
     if occurred_from is not None:
@@ -985,12 +1036,57 @@ def _filter_expression(
     return " AND ".join(clauses) or None
 
 
+def _scope_clauses(place_id: str | None, identity_id: str | None) -> list[str]:
+    """The caller-supplied predicates, each omitted when the grammar cannot spell its value."""
+    clauses = []
+    place_literal = None if place_id is None else _scope_literal(place_id, _PLACE_FIELD)
+    if place_literal is not None:
+        clauses.append(f"{_PLACE_FIELD} = {place_literal}")
+    # `contain_any` with one value: Zvec's array grammar has no scalar equality, and one member is
+    # what an identity scope asks. The index field is a projection, so a stale entry costs recall
+    # only -- SQLite hydration reapplies the same predicate and decides.
+    identity_literal = None if identity_id is None else _scope_literal(identity_id, _IDENTITY_FIELD)
+    if identity_literal is not None:
+        clauses.append(f"{_IDENTITY_FIELD} contain_any ({identity_literal})")
+    return clauses
+
+
 def _filter_literal(value: str, name: str) -> str:
+    """Quote one value for Zvec's filter grammar, escaping rather than refusing an apostrophe.
+
+    `place_id` is free text -- non-empty and trimmed is its whole contract -- so a room called
+    "Ana's room" has to be expressible. Measured against a real 0.7 collection: the lexer treats
+    a backslash as an escape only before an apostrophe, so `\\'` matches an apostrophe while every
+    other backslash stands for itself (doubling one makes it match two). The two shapes the
+    grammar therefore cannot spell are a backslash immediately before an apostrophe and one
+    before the closing quote, and those are refused here -- at query time, where a refusal costs
+    one search, never on the write path, where it would strand an already-committed outbox row.
+
+    Internal fields (space, task, memory type) come from enumerated values, so a refusal is a
+    bug. User scope values go through `_scope_literal`, which drops the predicate instead.
+    """
     if not value or value != value.strip():
         raise ValueError(f"{name} must be non-empty and trimmed")
-    if "'" in value or "\\" in value or any(ord(character) < 32 for character in value):
+    if value.endswith("\\") or "\\'" in value or any(ord(character) < 32 for character in value):
         raise ValueError(f"{name} contains characters unsupported by Zvec filters")
-    return f"'{value}'"
+    return "'{}'".format(value.replace("'", "\\'"))
+
+
+def _scope_literal(value: str, name: str) -> str | None:
+    """Quote a caller's scope value, or drop its predicate when the grammar cannot spell it.
+
+    A place or identity id the write path accepted -- `attic\\`, a name holding a tab -- has to
+    be searchable: raising here turned a legal stored value into `IndexUnavailableError`, and a
+    503 from REST. The pushdown is an optimisation, so omitting the clause is safe.
+
+    # ponytail: an unrepresentable value narrows recall to whatever the post-filter window
+    # holds, since SQLite hydration is what enforces the scope either way. Escaping the value
+    # properly needs a grammar change in Zvec.
+    """
+    try:
+        return _filter_literal(value, name)
+    except ValueError:
+        return None
 
 
 def _timestamp(value: datetime | None) -> int:

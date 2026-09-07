@@ -1,6 +1,6 @@
 # Benchmarking
 
-MindBridge provides one evaluation runner and two focused utilities. Use the evaluation runner for
+MindBridge provides one evaluation runner and three focused utilities. Use the evaluation runner for
 quality claims; use the utilities only for their narrower artifact or storage purpose.
 
 | Command | Use it for | Do not infer |
@@ -8,6 +8,7 @@ quality claims; use the utilities only for their narrower artifact or storage pu
 | `mindbridge-bench eval` | Pinned datasets, official or explicitly identified scorers, confidence intervals, and run comparisons | That a score is leaderboard-comparable without checking its dataset, judge, and validity fields |
 | `mindbridge-bench locomo-refined` | Raw LoCoMo-Refined predictions for another evaluator | An integrated benchmark score |
 | `mindbridge-bench local-index` | SQLite-to-Zvec ingestion, recall, latency, throughput, and disk use | Embedding or answer quality |
+| `mindbridge-bench control-plane` | Slow-loop quality on a seeded synthetic scenario: consolidation precision, contradiction recovery, false retirement, and rollback success | Retrieval or answer quality; the scenario is sized so one deliberation window covers it |
 
 Never point a benchmark at an application's live `data_dir`. One physical directory has one live
 MindBridge owner, and each independent benchmark unit needs its own new directory.
@@ -418,6 +419,63 @@ from `mindbridge.benchmarks.task_catalog`; `--list-tasks` remains authoritative.
 Zvec. It needs no dataset, generation model, or judge and reports exact-search recall, ingestion,
 optimization and query latency, throughput, and disk use. It is the sole direct-adapter exception;
 its result supports local-index claims only, not end-to-end memory, embedding, or answer quality.
+
+### Control-plane behaviour benchmark
+
+`uv run --frozen mindbridge-bench control-plane --config CONFIG --data-dir DIR` measures the slow
+loop rather than recall. It ingests a seeded synthetic long run through `Memory.add_many` --
+persons with a standing gold fact, one fact observed twice, and a preference stated then flipped
+with a later `occurred_at` -- and then asserts each side of every flip as a host-authored
+`RELATION` claim over its own observation, through `Memory.apply` with a `CONSOLIDATE` operation.
+That step is what makes the flip resolvable at all: `CORRECT` and consolidation forgetting only
+reach a *derived* record, so a correction of the raw observation is refused `not_derived` however
+right it is, and a scenario without a former has no other way to hold a claim. `RELATION` is the
+kind whose two sides both stand until the loop retires one -- a `STATE` is superseded by lineage
+reconciliation as soon as the second claim lands, and a model-inferred `TRAIT` stays invisible
+until a second evidence group supports it -- so the pair is what the `CONTRADICTION` trigger of
+`consolidation_candidates()` reports: two disagreeing visible claims in one lineage.
+
+Before that step existed the metric was structurally unreachable: every flip was two raw
+observations, so `CORRECT` was refused `not_derived` on all of them and `contradiction_recovery`
+could only ever read `0.0`. The benchmark configures no former, so any `CONTRADICTION` candidate an
+earlier run reported came from claims the loop's own accepted `CONSOLIDATE` operations minted
+mid-run, never from the injected observation pairs.
+
+Two failing recalls per person follow, asking about a window after everything the scenario
+recorded. Those are the whole of the `QUERY_FAILURE` signal, and they come last on purpose: a
+candidate is dropped while nothing about it has changed since an operation last weighed it, and
+the claims above are applied operations over the very records that query is nearest to.
+
+It then runs `deliberate()` with the configured consolidator and scores the operation log against
+the ground truth it injected:
+
+| Metric | Definition | Undefined when |
+| --- | --- | --- |
+| `consolidation_precision` | Applied `CONSOLIDATE` operations whose cited evidence is exactly one injected duplicate group, over every applied `CONSOLIDATE` | The loop applied no consolidation |
+| `contradiction_recovery` | Injected preference flips where the newer claim is in force and the older is out of recall -- forgotten, or its version retired by the `CORRECT` that resolves it -- over every injected flip | Never; the denominator is the scenario |
+| `false_retirement` | Retired records that were gold-standing, over every record the run retired | The run retired nothing |
+| `rollback_success` | Applied operations `rollback()` reversed, newest first; `state_restored` separately reports whether every ingested record came back into recall | The loop applied nothing |
+| `deliberation.model_calls` | Backend round trips. `ConsolidationBackend` reports no token or currency cost, so this is the loop's whole cost proxy | Never |
+
+Each applied operation is judged with `record_outcome()` before anything is rolled back, so the
+operation log itself carries the verdict and `outcomes.confirmed` / `outcomes.refuted` are
+derivable from the log alone. A `CORRECT` that retires the claim actually in force is judged
+`REFUTED`, so the log does not call the wrong half of a flip a success. The scenario's own
+`apply()` rows are not judged: they are the ground truth, not something the loop proposed. An
+undefined rate is reported as `null`, never as `1.0`.
+
+`--config` is a MindBridge configuration file declaring `embedding` and `consolidation`; a
+`benchmark:` section, so an `eval` config can be reused verbatim, is ignored. The benchmark pins
+`minimum_relevance=0` and `reinforce_on_answer=False` itself, for the same reproducibility reason
+`eval` does.
+
+### Running the slow loop during an evaluation
+
+`mindbridge-bench eval --deliberate` runs `deliberate()` after each causal cutoff's ingest and
+before that cutoff's questions, so "does the loop change QA scores" is measurable on the existing
+tasks. It is off by default and refused when the configuration declares no `consolidation`
+section. The run report carries `deliberation.enabled` and `deliberation.operations_applied`, and
+the flag is part of the response-cache namespace, so a cached run is never reused across it.
 
 ### Result boundaries
 

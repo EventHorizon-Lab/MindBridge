@@ -9,8 +9,9 @@ SQLite indexes cheaply.
 These tests pin the four things that make it worth having rather than the metric version: the
 value round-trips and stays optional, a scoped hydration filters in SQL and is planned onto
 `memory_records_place_idx` rather than degrading into the post-hoc Python filter the metric radius
-scope is forced to be, relabelling a room costs no reindex, and an existing store gains the column
-without losing a memory.
+scope is forced to be, relabelling a room reprojects the memory into the search index (which now
+carries `place_id` as a pushed-down filter field), and an existing store gains the column without
+losing a memory.
 """
 
 from __future__ import annotations
@@ -195,8 +196,8 @@ def test_the_query_a_scoped_hydration_actually_runs_uses_the_place_index(
     assert "SCAN" not in plan
 
 
-def test_changing_only_a_place_label_does_not_requeue_the_search_index(tmp_path: Path) -> None:
-    """Zvec carries no place, so relabelling a room must not cost a reindex of that memory."""
+def test_changing_a_place_label_requeues_the_search_index(tmp_path: Path) -> None:
+    """Zvec carries `place_id` as a filter field, so relabelling a room reprojects the memory."""
     with LocalStore(tmp_path) as store:
         store.write_memory(_memory("relabelled", "the kettle is on", place_id="kitchen"))
         store.write_embedding(_embedding("relabelled"))
@@ -206,13 +207,14 @@ def test_changing_only_a_place_label_does_not_requeue_the_search_index(tmp_path:
         store.write_memory(_memory("relabelled", "the kettle is on", place_id="utility room"))
         reread = store.read_memory("relabelled")
         assert reread is not None and reread.place_id == "utility room"
-        assert store.pending_index_operations() == ()
-
-        # Content still is indexed text, so changing that must still requeue.
-        store.write_memory(_memory("relabelled", "the kettle is off", place_id="utility room"))
         assert [operation.embedding_id for operation in store.pending_index_operations()] == [
             "relabelled#0"
         ]
+        store.acknowledge_index_operations(store.pending_index_operations())
+
+        # Rewriting the same label is not a change, so it still costs nothing.
+        store.write_memory(_memory("relabelled", "the kettle is on", place_id="utility room"))
+        assert store.pending_index_operations() == ()
 
 
 @pytest.mark.skipif(sqlite3.sqlite_version_info < (3, 35), reason="DROP COLUMN needs SQLite 3.35")

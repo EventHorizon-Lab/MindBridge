@@ -1397,6 +1397,56 @@ def test_the_affect_hop_takes_no_item_slot_and_charges_only_what_it_prints() -> 
     assert [hit.id for hit in hopped.episodes] == []
 
 
+def test_an_affect_entry_is_priced_as_the_cue_it_renders_as() -> None:
+    """A bundle carrying affect stays inside the `max_chars` it reports.
+
+    The cue's basis, cue modality, valence, arousal, evidence IDs, and co-occurring events are
+    characters the line prints. They were added after `_select` had priced the plain hit, so a
+    store holding a handful of affect entries compiled a bundle whose own header announced
+    `Budget: 4647/4000 chars`.
+    """
+    hits = (
+        *(
+            _affect_hit(
+                f"cue-{index}",
+                score=0.9 - index / 100,
+                content=f"ana sounded pleased about the demo {index}",
+                evidence_ids=(f"obs-{index}-a", f"obs-{index}-b"),
+            )
+            for index in range(6)
+        ),
+        *(_hit(f"fact-{index}", score=0.8 - index / 100, content="x" * 60) for index in range(6)),
+        *(
+            _hit(f"ep-{index}", score=0.7 - index / 100, memory_type=MemoryType.EPISODIC)
+            for index in range(6)
+        ),
+    )
+
+    for ceiling in (1200, 2000, 4000):
+        bundle = compile_context(
+            "what is going on",
+            hits,
+            budget=ContextBudget(max_chars=ceiling),
+            reference_at=REFERENCE,
+            co_derived_events=lambda cues: {cue: (f"{cue}-event",) for cue in cues},
+        )
+        # `omitted` puts an unknown and a trailer below the evidence; measure the evidence.
+        evidence = bundle.render().split("\n\n## Unknowns")[0].split("\n\nOmitted:")[0]
+        assert bundle.affect, ceiling
+        assert len(evidence) <= bundle.chars <= ceiling, ceiling
+
+    # With nothing omitted there are no diagnostics at all, so the whole text is bounded.
+    whole = compile_context(
+        "what is going on",
+        hits,
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        co_derived_events=lambda cues: {cue: (f"{cue}-event",) for cue in cues},
+    )
+    assert (whole.omitted, whole.unknowns) == (0, ())
+    assert len(whole.render()) <= whole.chars <= whole.budget.max_chars
+
+
 def _hop_spy() -> tuple[list[Sequence[str]], Callable[[Sequence[str]], dict[str, tuple[str, ...]]]]:
     """A hop resolver that records which affect IDs it was asked to resolve."""
     asked: list[Sequence[str]] = []

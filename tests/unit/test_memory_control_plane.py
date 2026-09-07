@@ -1184,6 +1184,58 @@ def test_consolidation_cannot_retire_a_record_it_did_not_cite(tmp_path: Path) ->
         assert memory.operations() == ()
 
 
+def test_consolidation_refuses_a_proposal_that_cites_the_claim_it_would_mint(
+    tmp_path: Path,
+) -> None:
+    """A RELATION ID is a function of the proposal, not of the evidence set, so re-proposing a
+    standing claim while citing it mints that claim's own ID."""
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "self-citation", consolidator) as memory:
+        first, second, third = _observations(
+            memory,
+            "Ana asked for a late slot",
+            "Ana moved the standup later",
+            "Ana arrived on time",
+        )
+        relation = FormationProposal(
+            kind=MemoryKind.RELATION,
+            content="Ana prefers late meetings",
+            subject="Ana",
+            predicate="prefers",
+            value="late meetings",
+            confidence=0.6,
+        )
+        claim = memory.apply(
+            MemoryOperation(
+                intent=MemoryIntent.CONSOLIDATE,
+                evidence_ids=(first.id, second.id),
+                proposal=relation,
+            )
+        ).created_ids[0]
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, claim, second.id),
+                    proposal=relation,
+                ),
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, third.id),
+                    proposal=_trait("Ana", "punctual"),
+                ),
+            )
+        )
+        report = memory.consolidate(evidence_ids=(first.id, second.id, third.id, claim))
+
+        assert [reason for _operation, reason in report.rejected] == ["target_is_evidence"]
+        # The refusal costs that one proposal and not the pass, so the rest of the batch applied.
+        assert len(report.operations) == 1
+        standing = memory.get(claim)
+        assert standing.context is not None
+        assert set(standing.context.evidence_ids) == {first.id, second.id}
+
+
 def test_one_pass_may_not_contradict_itself(tmp_path: Path) -> None:
     """op1 consolidating from A and op2 forgetting A is the reachable form of a stale proposal."""
     consolidator = ScriptedConsolidator()

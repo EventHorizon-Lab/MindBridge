@@ -244,21 +244,36 @@ def compile_context(
             f"budget max_chars must be at least {overhead} to fit this goal's context header",
             subject="budget",
         )
+    # An affect entry becomes an `AffectCue`: the same hit, plus the events its evidence also
+    # formed. The conversion happens before the pricing, not after it, because a cue renders its
+    # basis, cue modality, valence, arousal, and evidence IDs on the line: pricing the plain hit
+    # and rendering the cue is what let a bundle overrun the `max_chars` it reported.
+    candidates = [_affect_cue(hit, ()) if _section(hit) == "affect" else hit for hit in candidates]
     sections = _select(candidates, budget, overhead)
     # The deadline is checked here, between section assembly and the optional enrichment that
     # follows it. Nothing already computed is discarded and no stage is cut in half, so a bundle
     # under a deadline is a prefix of the one without it, never a different one.
     skipped = _past_deadline(budget, started_at)
-    # An affect entry becomes an `AffectCue`: the same hit, plus the events its evidence also
-    # formed. Substituted before anything reads the sections, so `hits`, `chars`, and the
-    # conflict pass all see one instance per included memory. The hop is resolved only for the
-    # entries that were bought, so the read it costs is bounded by the budget rather than by
-    # how deep retrieval ranked.
+    # The hop is resolved only for the entries that were bought, so the read it costs is bounded
+    # by the budget rather than by how deep retrieval ranked.
     hops: Mapping[str, Sequence[str]] = MappingProxyType({})
     if co_derived_events is not None and not skipped and sections["affect"]:
         hops = co_derived_events(tuple(hit.id for hit in sections["affect"]))
-    affect = tuple(_affect_cue(hit, hops.get(hit.id, ())) for hit in sections["affect"])
-    sections["affect"] = affect
+    if hops:
+        # A resolved hop lengthens a line `_select` has already priced, so selection runs again
+        # over the cues it will render. An affect entry the second pass buys instead carries no
+        # hop, the same as one resolved to nothing: the hop is enrichment, and the read it costs
+        # stays bounded by what the first pass bought.
+        candidates = [
+            _affect_cue(hit, hops[hit.id]) if isinstance(hit, AffectCue) and hit.id in hops else hit
+            for hit in candidates
+        ]
+        sections = _select(candidates, budget, overhead)
+    # Every candidate in this section was converted above; the branch keeps the declared type
+    # total rather than asserting it.
+    affect = tuple(
+        hit if isinstance(hit, AffectCue) else _affect_cue(hit, ()) for hit in sections["affect"]
+    )
     # Rank order, not section order: `_lineage_conflict` pairs each value with the highest-ranked
     # memory asserting it, so a lineage whose claims land in different sections must still be read
     # by score. `ContextBundle.hits` sorts the same way.

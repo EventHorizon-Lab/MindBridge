@@ -85,14 +85,27 @@ build_mcp_server(
     embodied_operations: bool = True,
     write_operations: bool = True,
     tracer: Tracer | None = None,
+    deliberate_every: float | None = None,
 ) -> MCPServer[None]
 ```
+
+`deliberate_every` is the opt-in slow loop described in
+[configuration](../configuration.md#running-the-loop-inside-a-server-process). `run("stdio")`
+blocks for the life of the process and no tool reaches the control plane, so without it the
+`QUERY_FAILURE` signals these tools record are collected and never weighed.
 
 `build_mcp_server` reads `memory.capabilities` once and publishes it as the server `instructions`,
 so a connecting agent learns the configured modalities, embedding identity, and backends without
 spending a tool call. There is no capabilities tool. The text also states that `compile_context` is
 the preferred way to obtain context, and that cognitive forgetting, consolidation, and operation
-rollback have no tool here. MCP fixes `instructions` at construction, so a server built before a
+rollback have no tool here. The document's `operations` list agrees with that prose: it is narrowed
+to the operations this server's tools exercise -- some directly, some while `add_memory` ingests or
+`ask_memory` answers -- so `consolidate` is never listed however the
+composition is configured, `speech` and `faces` are listed only with `embodied_operations=True`,
+and `formation` and `describe_vision` -- which run on the write path alone -- only with
+`write_operations=True`. `transcribe` stays listed either way, because a read tool transcribes
+the audio a question arrives as.
+MCP fixes `instructions` at construction, so a server built before a
 composition change keeps advertising the composition it was built with;
 [`GET /healthz`](rest.md#endpoints) is the live reading.
 
@@ -153,9 +166,11 @@ Pagination cursors are opaque and must be passed back unchanged.
 `context` carries typed observation basis, source ID, confidence, validity, optional spatial pose,
 and optional symbolic `place_id`. `scope.valid_at` selects world validity and `scope.known_at`
 selects the transaction version known then; `scope.place_id` matches the stored label exactly;
-`scope.near` and `scope.radius_m` must appear together, and their frame ID and observer/subject
-anchor must match the stored spatial context. SQLite reapplies every filter after candidate
-retrieval.
+`scope.identity_id` scopes to one person -- the memories that identity is the subject of, plus the
+memories whose media shows their face or carries their speech, with a merged alias resolving to
+the surviving identity; `scope.near` and `scope.radius_m` must appear together, and their frame ID
+and observer/subject anchor must match the stored spatial context. SQLite reapplies every filter
+after candidate retrieval.
 
 `add_memory` is content-addressed. `delete_memory` reports whether a record existed. Search,
 answer, compile, and the two analysis tools are not marked read-only because their SDK path

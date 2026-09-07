@@ -131,9 +131,10 @@ contract](api/python-sdk.md#content-contract).
 
 The raw source commits before formation begins. When a `FormationBackend` is present and declares
 support for the source modalities, it may propose `entity`, `event`, `state`, `relation`, `affect`,
-`trait`, or `response_policy` records. MindBridge validates the proposal's source binding,
-modality, confidence, validity interval, spatial frame, and kind-specific fields. The source record
-is never replaced.
+or `trait` records. A `response_policy` is refused whatever proposes it: standing guidance about
+how to behave toward somebody is a grant only the host makes, through `apply()`, on the basis
+`response_feedback`. MindBridge validates the proposal's source binding, modality, confidence,
+validity interval, spatial frame, and kind-specific fields. The source record is never replaced.
 
 Accepted derived records carry their source memory in `evidence_ids`, the model and recipe identity,
 and a stable semantic lineage. Derived records, evidence rows, state versions, formation completion

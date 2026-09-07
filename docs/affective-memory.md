@@ -66,7 +66,7 @@ owns it.
 | Capability | State | Owner |
 | --- | --- | --- |
 | `MemoryKind` carries `AFFECT`, `EVENT`, `TRAIT`, and `RESPONSE_POLICY` | Implemented | [Python SDK](api/python-sdk.md) |
-| `EvidenceBasis` carries `observation`, `user_statement`, `model_inference`, and `response_feedback` | Implemented | [Python SDK](api/python-sdk.md) |
+| `EvidenceBasis` carries `observation`, `user_statement`, `model_inference`, and `response_feedback`, the basis every host-authored `RESPONSE_POLICY` is stored with | Implemented | [Python SDK](api/python-sdk.md) |
 | `FormationProposal` carries `valence` in [-1, 1], `arousal` in [0, 1], one `cue_modality`, a validity interval, `confidence`, and `subject` | Implemented | [Python SDK](api/python-sdk.md) |
 | `AFFECT` is an episodic record, so it ranks and decays as an episode | Implemented | [Memory types, time, and decay](memory-types-time-and-decay.md) |
 | SQLite stores affect fields authoritatively; Zvec stays a rebuildable projection | Implemented | [Architecture](architecture.md) |
@@ -161,7 +161,11 @@ in its results. A store that preferentially returns memories matching the curren
 mood-congruent feedback loop, which is a product defect and not a feature.
 
 **`RESPONSE_POLICY` comes only from explicit feedback.** Inferred affect is not consent to change
-how the system behaves toward somebody.
+how the system behaves toward somebody. The kernel refuses a `RESPONSE_POLICY` proposed by a
+formation or consolidation backend, whatever basis the proposal claims; only an operation the host
+applies itself through `apply()` writes one, and the stored record carries `response_feedback`. The
+authorization is stamped on that record and not on the proposal, which the operation log keeps
+exactly as it was handed over so a logged row replays to the same derived record.
 
 **Arousal-weighted consolidation priority stays capped.** High arousal may raise the priority of
 deliberation, bounded, so that a single intense episode cannot dominate the slow loop. If such a

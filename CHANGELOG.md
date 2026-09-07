@@ -343,6 +343,45 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - `mindbridge.identity.*` span attributes reporting per-asset recognizer yield, including
   observation counts of zero, so a recognizer that runs and detects nothing is distinguishable from
   one that was never configured.
+- `RetrievalScope.identity_id`, the "about this person" axis, on `search()`, `ask()`, and
+  `compile()` and on every transport that carries a scope. A memory is in scope when its semantic
+  subject is that identity or the identity was observed in it — a diarised speech segment or a
+  face observation on one of its assets — and a merged alias resolves to the surviving identity,
+  so either ID of a merged pair answers the same. The edges and their SQLite indexes already
+  existed; nothing could ask for them. `place_id` and `identity_id` are also pushed down into the
+  search index rather than post-filtered: both are static per document, and a bounded candidate
+  window over a library returned an answer that was silently short for a predicate matching two
+  records. Index recipe `context-keys-v11` therefore carries the two filter fields, and a
+  collection built by an earlier recipe is detected as stale and replayed from SQLite without
+  re-embedding stored content. A scope value the index's filter grammar cannot spell — a trailing
+  backslash, a control character — drops only its pushdown clause, since SQLite hydration is what
+  enforces the scope either way. The CLI's `--scope` decoder accepts both keys, so it now spells
+  the whole of `RetrievalScope`.
+- `create_app(deliberate_every=)` and `build_mcp_server(deliberate_every=)`, which run
+  `deliberate()` on an interval for as long as the surface is serving. `consolidation_candidates()`
+  is the only reader of the `QUERY_FAILURE` rows a failed recall writes, and one physical
+  `data_dir` has one live owner, so a REST-only or MCP-only deployment collected that signal and
+  dropped it. Both surfaces share one loop; it is refused without a consolidation backend or for a
+  non-positive interval. Shutdown asks the loop to stop rather than cancelling it, so a round
+  already inside its worker thread — which is not cancellable, and which applies its operations
+  either way — finishes and reports what it applied.
+- `mindbridge --vision NAME`, the visual-description recipe slot, so a captioning backend can be
+  composed from the command line the way the embedder, answerer, former, consolidator, and
+  transcriber already could. `--url` mode now covers every command that has a `/v1` route, and a
+  command with no route says so as a composition error instead of failing as a bad request.
+- `mindbridge-bench control-plane`, a behaviour benchmark for the slow loop — `deliberate()`,
+  `record_outcome()`, `rollback()` — over a deterministic synthetic long run whose ground truth
+  the scenario builder holds, which is what makes consolidation precision, duplicate coverage, and
+  contradiction recovery computable at all. `mindbridge-bench eval --deliberate` runs the same loop
+  after each cutoff's ingest and before its questions, where a real deployment's loop would have
+  run, and the result artifact reports whether it was enabled and how many operations it applied
+  (benchmark result schema v14).
+- Kernel warnings at the points where a reason string already existed and was discarded:
+  re-embedding a store for a new space, an unfinished `settle()`, a refused consolidation or
+  formation proposal and why, a vision description that failed so its assets are stored without a
+  caption, and a configured model that cannot accept a modality so derived text is used instead.
+  Observability rode entirely on OpenTelemetry spans, which are no-ops when the SDK is absent, and
+  the kernel held no logger at all: silent degradation is how a capability dies unnoticed.
 
 ### Changed
 
@@ -599,6 +638,30 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   arrived only because Sentence Transformers pulls it in; `cairosvg` is how the pinned Jina revision
   converts `image/svg+xml`, a documented input. `cairosvg` is LGPL-3.0, installed separately and
   never linked.
+- A `RESPONSE_POLICY` proposed by a formation or consolidation backend is refused, whatever basis
+  the proposal claims: how the system should behave toward somebody is a grant, not an inference,
+  and one observed cue must not become standing guidance. Only an operation the host applies
+  itself through `apply()` writes one, and the stored record carries basis `response_feedback`.
+  The authorization is stamped on that record rather than on the proposal, which the operation log
+  keeps exactly as it was handed over, so a logged row still replays to the same derived record.
+- Each network surface narrows the `operations` list in its capability document to what it can
+  actually serve, so an agent no longer reads a capability it has no way to invoke. `consolidate`
+  is never listed, `speech` and `faces` only with `embodied_operations=True`, and `formation` and
+  `describe_vision` — which run on the write path alone — only with `write_operations=True`.
+  `transcribe` stays listed either way, because a read tool transcribes the audio a question
+  arrives as. `mindbridge doctor` still prints the whole derivation, because the CLI does have the
+  commands.
+- The consolidation prompt spells the literal operation keys it will be parsed against, and the
+  optional `valid_from`, `valid_until`, and `spatial` fields a proposal may carry. It described
+  them in prose only, and a measured endpoint answered a correction with `target` for `targets`,
+  which the field table rejects as an unknown key — discarding the whole batch, twice, with the
+  pass then reporting nothing applied. A rejected reply is now failed loudly, naming which key was
+  wrong and quoting the text, rather than leaving an operator with `applied=0` and no account of
+  it. The consolidation recipe is `v4`, and the recipe salts each operation key and derived
+  record's content address.
+- REST operation rows carry `proposal`, the canonical logged payload the CLI already printed. A
+  consolidation row read over `--url` reported an intent and no statement, and `apply`, which
+  takes a row exactly as it is printed, could not replay it.
 
 ### Fixed
 
@@ -832,6 +895,18 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - `add_many` names the failing item in `subject`.
 - The REST adapter's `_Memory` protocol declared three defaults the SDK does not have. Mypy does not
   compare defaults across a structural protocol, so nothing caught it.
+- A compiled bundle no longer overruns the `max_chars` it reports. An affect entry renders as an
+  `AffectCue` — its basis, cue modality, valence, arousal, and evidence IDs are on the line — but
+  the budget priced the plain hit it was selected as, and a resolved co-derived-event hop
+  lengthened a line that had already been paid for. Selection now prices the cues it will render,
+  and runs again over any entry a hop lengthened.
+- A control-plane operation citing the record it would create is refused as `"target_is_evidence"`
+  rather than failing a storage constraint and taking the whole pass down with it. Re-proposing a
+  claim that already stands while citing that claim mints the cited record's own ID; a `REINFORCE`
+  naming its target among its evidence is the same malformation.
+- An identity-scoped read resolves the identity's memory set once instead of re-running the
+  three-branch membership UNION for every candidate record — and, on a merge, for every embedding
+  in the store.
 
 ### Documentation
 

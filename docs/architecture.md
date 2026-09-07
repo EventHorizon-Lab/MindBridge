@@ -202,6 +202,17 @@ projection ranking: `valid_at` and `known_at` select the assertion valid in the 
 the system at those instants, while `near` and `radius_m` compare distance only within a matching
 spatial frame and anchor, with no implicit frame transform.
 
+`RetrievalScope.identity_id` is the fourth axis: the memories one person is in. A memory is in
+scope when its semantic subject is that identity or the identity was observed in it -- a face
+observation or a diarised speech segment on one of its media assets -- and a merged alias resolves
+to the surviving identity. `identity_id` and `place_id` are the two axes that are static per
+document, so the search index carries both as filter fields and answers them itself; a
+high-selectivity predicate over one person or one room would otherwise depend on a bounded
+candidate window happening to contain its few matches. The index fields are a projection, so
+merging, splitting, or erasing an identity re-enqueues the affected memories through the same
+durable outbox, and a stale field can only cost recall: SQLite reapplies both predicates during
+hydration and decides.
+
 `search_with_trace()` exposes bounded ranking signals and terminal rejection reasons without
 copying memory content or metadata into the trace. `ask()` uses the same retrieval path, applies
 the evidence budget, routes the question and hits through the generation backend's declared
@@ -265,8 +276,8 @@ gate in the [benchmark protocol](benchmarking.md#mandatory-controls).
 
 ## Public and trust boundaries
 
-Supported SDK values are imported from `mindbridge`. The `Memory` SDK exposes 35 product
-operations. REST exposes thirteen `/v1` routes: add, batch add, list, search, reinforce, get,
+Supported SDK values are imported from `mindbridge`. The `Memory` SDK exposes 36 product operations.
+REST exposes thirteen `/v1` routes: add, batch add, list, search, reinforce, get,
 delete, answer, streamed answer, compile context, capture, settle, and pending captures. Ten more -- speech, face,
 register identity, get identity, unlink identity, forget identity, record consent, read consent,
 export a subject, and apply retention -- exist only when the host
@@ -276,7 +287,7 @@ operations plus speech, face, and identity operations, or fewer when the host wi
 with `identity_operations=False`, `embodied_operations=False`, or `write_operations=False`,
 because naming a person, binding a face to a voice, and changing durable state are host
 authority and the host decides whether each is on the wire at all. All three withheld leaves the
-five read tools. The local CLI exposes the 35 operations
+five read tools. The local CLI exposes the same 36 product operations
 plus `doctor`; `--url` is limited to a fixed subset of operations regardless of what REST exposes,
 listed in [the CLI reference](api/cli.md#operations-without-a-remote-route).
 

@@ -288,7 +288,12 @@ agent view of the same process and carries its own `identity_operations` switch 
 name and the same default-on-for-a-trusted-agent-host reasoning; a host that wants REST and MCP to
 grant the same agent the same authority sets both switches the same way. Neither transport ever
 reaches the control plane -- `consolidation_candidates`, `consolidate`, `forget`, `rollback`, and
-`operations` stay SDK-only regardless of any switch.
+`operations` stay SDK-only regardless of any switch. What runs the loop for a deployment that only
+speaks REST or MCP is the serving process itself: the `deliberate_every` both `create_app` and
+`build_mcp_server` take runs `deliberate()` on an interval inside the server lifespan, which is
+the only place that can, because one physical `data_dir` has one live owner and the
+`QUERY_FAILURE` rows those routes and tools write are readable nowhere else. See
+[the configuration reference](configuration.md#running-the-loop-inside-a-server-process).
 
 The compiler is that view's centre. `POST /v1/context` and the `compile_context` MCP tool return a
 budgeted bundle with provenance, and `GET /healthz` and the MCP server instructions advertise the
@@ -341,7 +346,7 @@ context utility under the target device's latency, resource, and privacy constra
 | Real-time behavior | Capture acknowledgement and search p50, p95, and p99; time to searchable; speculative first-hit latency; CPU, memory, energy, and disk. |
 | Context utility | Downstream task success against no-memory, full-context, and retrieval-only baselines; useful evidence per token and per millisecond. |
 | Embodied quality | Multimodal, temporal, and spatial recall; identity false merge and fragmentation; affect attribution and trait false positives. |
-| Slow-loop quality | Consolidation precision, contradiction recovery, false retirement, rollback success, model cost, and formation lag. |
+| Slow-loop quality | Consolidation precision, contradiction recovery, false retirement, rollback success, model cost, and formation lag. `mindbridge-bench control-plane` measures the first five; formation lag is still unmeasured. |
 | Trust | Crash recovery, replay determinism, provenance coverage, permission enforcement, and deletion completeness. |
 | Developer and agent experience | Time to first memory, integration code, tool-call success, context size, and correction effort. |
 
@@ -384,6 +389,9 @@ defaults or justify superiority claims.
    run candidates through consolidation to a fixed point, all six triggers are produced from
    committed state rather than named in an enum -- `QUERY_FAILURE` from recorded empty recalls,
    `PRESSURE` from a declared record budget, `IDLE` from an operator-declared window -- and every
+   trigger except `PRESSURE` fires under the default policy: `PRESSURE` derives nothing at all
+   until `memory_budget_records` is set, because without a declared budget no amount of growth is
+   evidence that consolidating or forgetting anything is useful. Every
    pass records that it weighed its evidence set whatever it yielded, so a candidate the model
    could not resolve stops coming back until its own signal moves instead of being paid for every
    round. `consolidate()` holds no lock across the backend round trip, so slow reasoning does not
@@ -407,8 +415,9 @@ defaults or justify superiority claims.
    useful evidence per token. Running it across the benchmark suite and publishing the result is
    still what closes the gate.
 5. Extend REST or MCP only after the Python contract and authority model are stable. Done: the
-   compiler; one capability document rendered identically by `/healthz`, the MCP server
-   instructions, and `mindbridge doctor`; and the three switches
+   compiler; one capability document rendered by `/healthz`, the MCP server instructions, and
+   `mindbridge doctor` -- the same document, narrowed on each network surface to the operations
+   it serves; and the three switches
    `build_mcp_server(identity_operations=, embodied_operations=, write_operations=)`, which
    withhold naming and erasing a person, the two analysis tools -- and with them the
    cross-modal identity merge `analyze_faces` commits -- and adding, deleting and reinforcing.

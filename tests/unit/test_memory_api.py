@@ -331,6 +331,8 @@ class _FakeIndex:
         memory_type: str | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
         ef: int | None = None,
         exact: bool = False,
     ) -> tuple[IndexHit, ...]:
@@ -345,8 +347,19 @@ class _FakeIndex:
             for document_id, document in self.documents.items()
             if (space_id is None or document.embedding.space_id == space_id)
             and (task is None or document.embedding.task == task)
+            and self._matches_projection(document, place_id, identity_id)
             and self._matches_time_and_type(document, memory_type, occurred_from, occurred_until)
         )[:limit]
+
+    @staticmethod
+    def _matches_projection(
+        document: IndexDocument,
+        place_id: str | None,
+        identity_id: str | None,
+    ) -> bool:
+        return (place_id is None or document.place_id == place_id) and (
+            identity_id is None or identity_id in document.identity_ids
+        )
 
     def lexical_search(
         self,
@@ -358,6 +371,8 @@ class _FakeIndex:
         memory_type: str | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
     ) -> tuple[IndexHit, ...]:
         self.lexical_search_calls += 1
         self.lexical_queries.append(text)
@@ -372,6 +387,8 @@ class _FakeIndex:
             if space_id is not None and embedding.space_id != space_id:
                 continue
             if task is not None and embedding.task != task:
+                continue
+            if not self._matches_projection(document, place_id, identity_id):
                 continue
             if not self._matches_time_and_type(
                 document, memory_type, occurred_from, occurred_until
@@ -3539,10 +3556,13 @@ def test_composite_query_retains_atomic_media_recall(
             memory_type: str | None = None,
             occurred_from: datetime | None = None,
             occurred_until: datetime | None = None,
+            place_id: str | None = None,
+            identity_id: str | None = None,
             ef: int | None = None,
             exact: bool = False,
         ) -> tuple[IndexHit, ...]:
             del space_id, task, memory_type, occurred_from, occurred_until, ef, exact
+            del place_id, identity_id
             current.dense_search_calls += 1
             return (
                 (IndexHit(id=record.id, relevance=0.9, confidence=0.9),)
@@ -3581,6 +3601,8 @@ def test_search_does_not_serialize_callers(
         memory_type: str | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
         ef: int | None = None,
         exact: bool = False,
     ) -> tuple[IndexHit, ...]:
@@ -3594,6 +3616,8 @@ def test_search_does_not_serialize_callers(
             memory_type=memory_type,
             occurred_from=occurred_from,
             occurred_until=occurred_until,
+            place_id=place_id,
+            identity_id=identity_id,
             ef=ef,
             exact=exact,
         )
@@ -4127,7 +4151,7 @@ def test_a_full_text_tokenizer_change_rebuilds_without_reembedding(tmp_path: Pat
         recipe = store.get_metadata("index.recipe")
         assert recipe is not None
         assert ":fts-stemmed-plus-bigram:" in recipe
-        assert recipe.endswith("context-keys-v10:quantization-none")
+        assert recipe.endswith("context-keys-v11:quantization-none")
 
 
 def test_index_quantization_requires_the_public_enum(tmp_path: Path) -> None:
