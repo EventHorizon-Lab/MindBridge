@@ -189,7 +189,8 @@ annotated [example configuration](examples/eval.example.yaml) for every field an
 keys retain the unset-flag defaults.
 
 `--blind` and `--blind-baseline` remain command-line-only because they label or attach a whole
-no-memory control run rather than an arm sweep. `--blind` cannot be combined with an arm selection
+no-memory control run rather than an arm sweep. `--resume` is command-line-only for the same
+reason: it describes one invocation's recovery, not the sweep a file declares. `--blind` cannot be combined with an arm selection
 in the file. `--config`, the literal `--model mindbridge`, and the `--list-tasks` and
 `--check-integrity` action modes also remain command-line-only. The three `*-args` strings are
 shorthand: `--model-args` writes generation endpoint settings, `--gen-kwargs` writes
@@ -968,6 +969,43 @@ is rejected if either artifact's TTFT distribution is incomplete.
 
 Use `--use-cache .benchmarks/response-cache` to persist deterministic generation responses across
 isolated reruns. The cache is an optimization, not a substitute for the result artifacts.
+
+## Resume an interrupted run
+
+A long run that is killed - by an out-of-memory reaper, a lost session, or a Ctrl-C - keeps both
+halves of its work when it is started with a fixed `--run-id` and a response cache:
+
+```bash
+mindbridge-bench eval \
+  --tasks locomo-refined \
+  --run-id locomo-sweep-01 \
+  --use-cache .benchmarks/response-cache \
+  --resume
+```
+
+`--use-cache` returns the answers and judge scores already produced; `--resume` returns the stores
+already ingested. Rerun the identical command after an interruption. The two recover different
+work and are independent, but a resumed run without the cache still re-answers every question.
+
+`--resume` requires the `--run-id` of the run it continues, because a generated identifier names a
+directory no earlier run wrote to. Checkpoints are written on every run, so the interrupted run
+does not need to have been started with `--resume`.
+
+Each unit's store is reused only when the checkpoint beside it still describes the run being
+started. The checkpoint names the task and dataset revision, the embedding, transcription, and
+memory configuration, the device, and the ingest mode; anything else rebuilds that unit from
+zero. A store that was ingested past the earliest cutoff still holding unanswered questions is
+also rebuilt, because reusing it would answer those questions with memories they must not have
+seen yet. So is a unit whose store directory was emptied or deleted while its checkpoint stayed
+behind. Rebuilding empties that unit directory and zeroes its checkpoint together.
+
+The checkpoint is written after each committed batch, never before, so an interruption inside a
+batch costs at most one duplicated batch rather than silently dropped evidence. Write failures
+recorded before the interruption are carried into the resumed run's `unwritten` column.
+
+A resumed run is not a performance baseline: it skips ingest another invocation paid for and
+inherits that run's warm description cache. The result document records `resume`, and comparing
+either side of a `--compare` pair that carries it is refused.
 
 ## Produce raw LoCoMo-Refined predictions
 

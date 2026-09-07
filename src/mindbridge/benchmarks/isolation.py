@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import shutil
 from pathlib import Path
 
 _MAX_COMPONENT_BYTES = 240
@@ -49,9 +50,33 @@ class BenchmarkRun:
             / _safe_component(run_id, "run")
         )
 
+    def checkpoint_path(self, unit_id: str) -> Path:
+        """Return the note recording how much of one unit is already in its store.
+
+        The note lives beside the unit directories instead of inside one: a store directory has a
+        single owner, and a file that owner did not write is an orphan to it.
+        """
+        return self.path / "checkpoints" / f"{_safe_component(unit_id, 'unit')}.json"
+
+    def unit_path(self, unit_id: str) -> Path:
+        """Return one unit directory without creating or claiming it."""
+        return self.path / _safe_component(unit_id, "unit")
+
+    def reset_unit(self, unit_id: str) -> Path:
+        """Empty and recreate one unit directory whose contents cannot be trusted.
+
+        A wipe that fails has to raise: ingesting into a directory that still holds the previous
+        attempt's prefix duplicates every memory it kept.
+        """
+        path = self.unit_path(unit_id)
+        if path.exists():
+            shutil.rmtree(path)
+        path.mkdir(mode=0o700)
+        return path
+
     def unit_dir(self, unit_id: str) -> Path:
         """Atomically create and return one isolated unit data directory."""
-        path = self.path / _safe_component(unit_id, "unit")
+        path = self.unit_path(unit_id)
         try:
             path.mkdir(mode=0o700)
         except FileExistsError:

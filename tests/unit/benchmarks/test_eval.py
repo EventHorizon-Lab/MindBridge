@@ -1783,6 +1783,218 @@ async def test_runner_ingests_only_memory_available_at_each_cutoff(tmp_path: Pat
     assert [sample.score for sample in samples] == [1.0, 1.0]
 
 
+class _HaltingMemory(_FakeMemory):
+    """Stop writing partway through a corpus the way a killed run does."""
+
+    def __init__(self, events: list[str], *, chunks: int) -> None:
+        super().__init__(events)
+        self.remaining = chunks
+
+    async def add_many(
+        self,
+        contents: Sequence[object],
+        **kwargs: object,
+    ) -> tuple[object, ...]:
+        if self.remaining <= 0:
+            raise IndexUnavailableError("index exhausted file descriptors")
+        self.remaining -= 1
+        return await super().add_many(contents, **kwargs)
+
+
+class _HaltingContext:
+    def __init__(self, events: list[str], *, chunks: int) -> None:
+        self.memory = _HaltingMemory(events, chunks=chunks)
+
+    async def __aenter__(self) -> AsyncMemory:
+        return cast(AsyncMemory, self.memory)
+
+    async def __aexit__(self, *_error: object) -> None:
+        return None
+
+
+def _store_factory(events: list[str], *, chunks: int | None = None) -> MemoryFactory:
+    """Leave a file in the unit directory the way opening a real store does."""
+
+    def factory(path: Path) -> _FakeContext | _HaltingContext:
+        (path / "store.sqlite3").touch()
+        return _FakeContext(events) if chunks is None else _HaltingContext(events, chunks=chunks)
+
+    return cast(MemoryFactory, factory)
+
+
+def _resumable_task(
+    tmp_path: Path, memories: Sequence[MemoryItem], cutoff: float | None
+) -> LoadedTask:
+    spec = TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40)
+    return LoadedTask(
+        spec,
+        tmp_path / "fixture.json",
+        "1" * 64,
+        (
+            EvalUnit(
+                "unit",
+                tuple(memories),
+                (
+                    EvalQuestion(
+                        "q1",
+                        ("first",),
+                        expected_choice="A",
+                        score_kind="choice",
+                        cutoff_seconds=cutoff,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_ingests_only_what_the_killed_run_had_not_written(tmp_path: Path) -> None:
+    task = _resumable_task(
+        tmp_path,
+        [MemoryItem(str(number), (str(number),)) for number in range(4)],
+        None,
+    )
+    interrupted: list[str] = []
+
+    await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+        memory_factory=_store_factory(interrupted, chunks=2),
+        batch_size=1,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=5,
+        ingest_digest="recipe",
+    )
+
+    assert interrupted == ["add:[source_id: 0]\n0", "add:[source_id: 1]\n1"]
+
+    resumed: list[str] = []
+    samples = await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run", resume=True),
+        memory_factory=_store_factory(resumed),
+        batch_size=1,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=5,
+        ingest_digest="recipe",
+    )
+
+    assert resumed == ["add:[source_id: 2]\n2", "add:[source_id: 3]\n3", "ask:first:5"]
+    assert [sample.score for sample in samples] == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_resume_rebuilds_a_store_that_ran_past_a_pending_cutoff(tmp_path: Path) -> None:
+    task = _resumable_task(
+        tmp_path,
+        [
+            MemoryItem("early", ("early",), end_seconds=5),
+            MemoryItem("later", ("later",), end_seconds=15),
+        ],
+        10,
+    )
+    run = BenchmarkRun(tmp_path / "stores", "fixture", "run", resume=True)
+    stale = run.unit_dir("unit") / "leaked.sqlite3"
+    stale.write_text("both memories", encoding="utf-8")
+    eval_module._IngestCheckpoint(run, "unit", "recipe").record(2, ())
+
+    events: list[str] = []
+    await run_loaded_task(
+        task,
+        run=run,
+        memory_factory=_store_factory(events),
+        batch_size=8,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=5,
+        ingest_digest="recipe",
+    )
+
+    # The question at ten seconds may not see the memory that ends at fifteen, so a store already
+    # holding both is rebuilt instead of reused.
+    assert events == ["add:[source_id: early]\nearly", "ask:first:5"]
+    assert not stale.exists()
+
+
+@pytest.mark.asyncio
+async def test_resume_distrusts_a_checkpoint_whose_store_is_gone(tmp_path: Path) -> None:
+    task = _resumable_task(
+        tmp_path,
+        [MemoryItem(str(number), (str(number),)) for number in range(2)],
+        None,
+    )
+    run = BenchmarkRun(tmp_path / "stores", "fixture", "run", resume=True)
+    run.unit_dir("unit")
+    eval_module._IngestCheckpoint(run, "unit", "recipe").record(2, ())
+
+    events: list[str] = []
+    await run_loaded_task(
+        task,
+        run=run,
+        memory_factory=_store_factory(events),
+        batch_size=8,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=5,
+        ingest_digest="recipe",
+    )
+
+    assert events == ["add:[source_id: 0]\n0", "add:[source_id: 1]\n1", "ask:first:5"]
+
+
+@pytest.mark.asyncio
+async def test_resume_rebuilds_a_store_built_by_another_recipe(tmp_path: Path) -> None:
+    task = _resumable_task(tmp_path, [MemoryItem("early", ("early",))], None)
+    run = BenchmarkRun(tmp_path / "stores", "fixture", "run", resume=True)
+    eval_module._IngestCheckpoint(run, "unit", "recipe").record(1, ())
+
+    events: list[str] = []
+    await run_loaded_task(
+        task,
+        run=run,
+        memory_factory=_store_factory(events),
+        batch_size=8,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=5,
+        ingest_digest="another-embedder",
+    )
+
+    assert events == ["add:[source_id: early]\nearly", "ask:first:5"]
+
+
+def test_ingest_checkpoint_carries_prior_write_failures_into_the_resumed_run(
+    tmp_path: Path,
+) -> None:
+    run = BenchmarkRun(tmp_path / "stores", "fixture", "run", resume=True)
+    (run.unit_dir("unit") / "store.db").write_text("two memories", encoding="utf-8")
+    checkpoint = eval_module._IngestCheckpoint(run, "unit", "recipe")
+    detail = eval_module.FailureDetail("early", "storage_failed", "disk_full", "write", "OSError")
+
+    checkpoint.record(2, (detail,))
+
+    assert checkpoint.start((), ()) == (2, [detail])
+    # A note whose store is gone describes nothing, and one rebuilt store leaves no stale count.
+    assert eval_module._IngestCheckpoint(run, "unit", "recipe-2").start((), ()) == (0, [])
+    assert checkpoint.start((), ()) == (0, [])
+
+
+def test_resume_needs_the_run_id_of_the_run_it_continues() -> None:
+    parser = eval_module._build_parser("eval")
+
+    with pytest.raises(SystemExit):
+        eval_module._arguments(parser, parser.parse_args(["--tasks", "clbench", "--resume"]))
+
+    arguments = eval_module._arguments(
+        parser, parser.parse_args(["--tasks", "clbench", "--resume", "--run-id", "keep"])
+    )
+
+    assert arguments.resume and arguments.run_id == "keep"
+
+
 @pytest.mark.asyncio
 async def test_runner_scores_the_actual_ranking_at_a_causal_cutoff(
     tmp_path: Path,
@@ -2159,6 +2371,11 @@ async def test_run_arms_defers_replay_until_every_task_answer_finishes(
             arms=(eval_module.DEFAULT_ARM,),
             full_context_chars=24_000,
             ingest="add",
+            resume=False,
+            device=None,
+            benchmarks_root=tmp_path / "corpus",
+            media_manifest=None,
+            media_overrides={},
         ),
     )
     telemetry = EvaluationTelemetry()

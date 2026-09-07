@@ -319,6 +319,7 @@ class _Arguments:
     allow_unverified_data: bool
     download: bool
     overwrite: bool
+    resume: bool
     quiet: bool
 
 
@@ -1567,6 +1568,7 @@ async def _run_all(
             memory_factory=memory_factory,
             response_cache=response_cache,
             tracer=tracer,
+            memory_config=memory_config,
         )
     finally:
         if generator is not None:
@@ -1582,6 +1584,7 @@ async def _run_arms(
     memory_factory: MemoryFactory,
     response_cache: ResponseCache | None,
     tracer: Tracer,
+    memory_config: MindBridgeConfig | None = None,
 ) -> tuple[SampleResult, ...]:
     compile_budget = ContextBudget(
         max_items=arguments.compile_max_items,
@@ -1610,6 +1613,7 @@ async def _run_arms(
                 arguments.data_root,
                 task.spec.name,
                 arguments.run_id,
+                resume=arguments.resume,
             )
             results.extend(
                 await run_loaded_task(
@@ -1627,6 +1631,7 @@ async def _run_arms(
                     full_context_chars=arguments.full_context_chars,
                     compile_budget=compile_budget,
                     ingest_mode=arguments.ingest,
+                    ingest_digest=_ingest_digest(task, arguments, memory_config),
                     tracer=tracer,
                     on_progress=progress,
                     on_search_replay_ready=deferred_searches.append,
@@ -1655,6 +1660,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     full_context_chars: int = DEFAULT_FULL_CONTEXT_CHARS,
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     ingest_mode: str = DEFAULT_INGEST_MODE,
+    ingest_digest: str | None = None,
     tracer: Tracer | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     on_search_replay_ready: Callable[[_SearchReplay], None] | None = None,
@@ -1683,6 +1689,11 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
                 return
             data_dir = run.unit_dir(unit.unit_id)
             unit_paths[index] = data_dir
+            checkpoint = (
+                None
+                if ingest_digest is None
+                else _IngestCheckpoint(run, unit.unit_id, ingest_digest)
+            )
             reported = 0
 
             def sample_completed() -> None:
@@ -1710,6 +1721,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
                 full_context_chars=full_context_chars,
                 compile_budget=compile_budget,
                 ingest_mode=ingest_mode,
+                checkpoint=checkpoint,
                 tracer=tracer,
                 on_sample_completed=sample_completed,
                 on_store_ready=store_ready,
@@ -1857,6 +1869,112 @@ async def _measure_standalone_searches(  # noqa: C901 - setup failures need per-
     await asyncio.gather(*(measure_unit(index, unit) for index, unit in enumerate(task.units)))
 
 
+@dataclass(frozen=True, slots=True)
+class _IngestCheckpoint:
+    """Record how much of one unit's causal prefix is durably in its store.
+
+    A store is authoritative for what it holds but says nothing about which benchmark items were
+    meant to land there, so a run that is killed mid-corpus leaves nothing that says where to
+    start again. The note is written after each committed chunk and never before: one that trails
+    the store costs a duplicated chunk, one that leads it silently drops evidence.
+    """
+
+    run: BenchmarkRun
+    unit_id: str
+    digest: str
+
+    def start(
+        self,
+        memories: Sequence[MemoryItem],
+        cutoffs: Sequence[float | None],
+    ) -> tuple[int, list[FailureDetail]]:
+        """Return the prefix a resumed run may keep, rebuilding the store when it may not."""
+        ingested, failures = self._read()
+        # A store ingested past the first pending cutoff would answer that cutoff's questions with
+        # memories they must not have seen yet. That leak is silent and scores well, so the store
+        # is rebuilt rather than reused.
+        if ingested and cutoffs and ingested > _prefix_end(memories, cutoffs[0]):
+            ingested, failures = 0, []
+        # A note is evidence only about a store that is still there. One left over from a deleted
+        # or already-rebuilt directory would skip a prefix that nothing ever wrote.
+        directory = self.run.unit_path(self.unit_id)
+        if ingested and not (directory.is_dir() and any(directory.iterdir())):
+            ingested, failures = 0, []
+        if self.run.resume and not ingested:
+            self.run.reset_unit(self.unit_id)
+            # The rebuilt store and its note move together. A run killed between the two would
+            # otherwise leave the old count describing a directory that no longer holds anything.
+            self.record(0, ())
+        return ingested, failures
+
+    def record(self, ingested: int, failures: Sequence[FailureDetail]) -> None:
+        path = self.run.checkpoint_path(self.unit_id)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        payload = json.dumps(
+            {
+                "digest": self.digest,
+                "ingested": ingested,
+                "failures": [detail.json() for detail in failures],
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        temporary = path.with_name(f"{path.name}.tmp")
+        temporary.write_text(payload, encoding="utf-8")
+        temporary.replace(path)
+
+    def _read(self) -> tuple[int, list[FailureDetail]]:
+        if not self.run.resume:
+            return 0, []
+        try:
+            document = self.run.checkpoint_path(self.unit_id).read_text(encoding="utf-8")
+            payload = json.loads(document)
+        except (OSError, ValueError):
+            return 0, []
+        if not isinstance(payload, Mapping) or payload.get("digest") != self.digest:
+            return 0, []
+        ingested = payload.get("ingested")
+        failures = payload.get("failures")
+        if (
+            not isinstance(ingested, int)
+            or isinstance(ingested, bool)
+            or ingested < 0
+            or not isinstance(failures, list)
+        ):
+            return 0, []
+        try:
+            details = [_restored_failure(detail) for detail in failures]
+        except (KeyError, TypeError):
+            return 0, []
+        return ingested, details
+
+
+def _restored_failure(payload: Mapping[str, object]) -> FailureDetail:
+    return FailureDetail(
+        source_id=_optional_text(payload["source_id"]),
+        code=str(payload["code"]),
+        reason=_optional_text(payload["reason"]),
+        stage=_optional_text(payload["stage"]),
+        cause_type=_optional_text(payload["cause_type"]),
+    )
+
+
+def _optional_text(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
+def _checkpoint_writer(
+    checkpoint: _IngestCheckpoint | None,
+    ingested: int,
+    failures: Sequence[FailureDetail],
+) -> Callable[[int], None] | None:
+    """Note each committed chunk so a killed run resumes from it instead of from zero."""
+    if checkpoint is None:
+        return None
+    return lambda done: checkpoint.record(ingested + done, failures)
+
+
 async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one lifecycle
     task: LoadedTask,
     unit: EvalUnit,
@@ -1874,6 +1992,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
     full_context_chars: int = DEFAULT_FULL_CONTEXT_CHARS,
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
     ingest_mode: str = DEFAULT_INGEST_MODE,
+    checkpoint: _IngestCheckpoint | None = None,
     tracer: Tracer | None = None,
     on_sample_completed: Callable[[], None] | None = None,
     on_store_ready: Callable[[], None] | None = None,
@@ -1926,26 +2045,32 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
         if len(reading_arms) == 1
         else SHARED_BENCHMARK_ARM
     )
-    pending = 0
-    ingest_failures = 0
     ingest_failure_details: list[FailureDetail] = []
+    ingested = 0
+    # An arm that reads no memory never writes one either, so it neither trusts nor rebuilds a
+    # store another run left behind.
+    if checkpoint is not None and reads_memory:
+        ingested, ingest_failure_details = checkpoint.start(memories, cutoffs)
+    # `pending` is the causal cursor every arm reads from; `ingested` is how much of it a previous
+    # run already wrote. They differ only while a resumed store runs ahead of the current cutoff.
+    pending = 0
+    ingest_failures = len(ingest_failure_details)
     try:
         async with memory_factory(data_dir) as memory:
             for cutoff in cutoffs:
-                boundary = math.inf if cutoff is None else cutoff
-                end = pending
-                while end < len(memories) and _memory_end(memories[end]) <= boundary:
-                    end += 1
-                if reads_memory:
+                end = _prefix_end(memories, cutoff, pending)
+                if reads_memory and end > ingested:
                     ingest_failures += await _ingest(
                         memory,
-                        memories[pending:end],
+                        memories[ingested:end],
                         batch_size=batch_size,
                         on_failure=ingest_failure_details.append,
                         tracer=tracer,
                         mode=ingest_mode,
                         arm=memory_arm,
+                        on_chunk=_checkpoint_writer(checkpoint, ingested, ingest_failure_details),
                     )
+                    ingested = end
                 pending = end
                 context = (
                     _full_context(memories[:pending], full_context_chars) if stuffs_context else ""
@@ -2254,6 +2379,7 @@ async def _ingest(
     *,
     batch_size: int,
     on_failure: Callable[[FailureDetail], None] | None = None,
+    on_chunk: Callable[[int], None] | None = None,
     tracer: Tracer | None = None,
     mode: str = DEFAULT_INGEST_MODE,
     arm: str = DEFAULT_ARM,
@@ -2309,12 +2435,25 @@ async def _ingest(
         )
 
     chunk_ingest = capture_chunk if mode == "capture" else add_chunk
-    return sum(
-        [
-            await chunk_ingest(items[offset : offset + batch_size])
-            for offset in range(0, len(items), batch_size)
-        ]
-    )
+    return await _ingest_chunks(chunk_ingest, items, batch_size=batch_size, on_chunk=on_chunk)
+
+
+async def _ingest_chunks(
+    ingest_chunk: Callable[[Sequence[MemoryItem]], Awaitable[int]],
+    items: Sequence[MemoryItem],
+    *,
+    batch_size: int,
+    on_chunk: Callable[[int], None] | None,
+) -> int:
+    """Ingest one chunk at a time, noting each boundary a killed run could restart from."""
+    failures = 0
+    for offset in range(0, len(items), batch_size):
+        # Every item of a chunk is written or counted as failed by the time it returns, so a
+        # chunk boundary is the only place a resumable note is exactly true.
+        failures += await ingest_chunk(items[offset : offset + batch_size])
+        if on_chunk is not None:
+            on_chunk(min(offset + batch_size, len(items)))
+    return failures
 
 
 def _candidate_count(unit: EvalUnit, question: EvalQuestion) -> int:
@@ -3421,6 +3560,7 @@ def _results(
         "num_fewshot": arguments.num_fewshot,
         "log_samples": arguments.log_samples,
         "response_cache": None if arguments.use_cache is None else str(arguments.use_cache),
+        "resume": arguments.resume,
         "cached_response_count": sum(sample.cached for sample in samples),
         "cached_judge_count": sum(sample.judge_cached for sample in samples),
         "abstentions": _abstentions(samples),
@@ -3497,7 +3637,11 @@ def _measurement_protocol(
     )
     return {
         "state": state,
-        "store": "one newly-created physical data directory per benchmark unit",
+        "store": (
+            "one reused-or-created physical data directory per benchmark unit"
+            if arguments.resume
+            else "one newly-created physical data directory per benchmark unit"
+        ),
         "repeat_index": getattr(arguments, "repeat_index", 0),
         "repeat_execution": "independent_eval_invocation",
         "measured_response_count": len(samples) - cached,
@@ -5015,6 +5159,14 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         help="download missing pinned annotations and selected media",
     )
     parser.add_argument("--overwrite", action="store_true", default=None)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "reuse the stores and ingest checkpoints of an interrupted run with the same "
+            "--run-id instead of ingesting every unit again"
+        ),
+    )
     parser.add_argument("--quiet", action="store_true", default=None)
     parser.add_argument(
         "--verbosity",
@@ -5131,6 +5283,11 @@ def _arguments(
     run_id = (
         parsed.run_id or declared_run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     )
+    # A generated run identifier names a directory no earlier run wrote to, so resuming one would
+    # quietly ingest everything again. `--resume` stays command-line-only for the reason `--blind`
+    # does: it describes one invocation's recovery, not the sweep a configuration file declares.
+    if parsed.resume and not (parsed.run_id or declared_run_id):
+        parser.error("--resume needs the --run-id of the run it continues")
     output = parsed.output_path or run.output_path or settings.benchmarks_root / "results" / run_id
     if performance_budgets and compare is None:
         parser.error("--performance-budget requires --compare")
@@ -5184,6 +5341,7 @@ def _arguments(
         allow_unverified_data=allow_unverified,
         download=download_inputs,
         overwrite=overwrite,
+        resume=bool(parsed.resume),
         quiet=quiet or verbosity in {"ERROR", "CRITICAL"},
     )
 
@@ -5659,6 +5817,15 @@ def _memory_end(item: MemoryItem) -> float:
     return math.inf if item.end_seconds is None else item.end_seconds
 
 
+def _prefix_end(memories: Sequence[MemoryItem], cutoff: float | None, start: int = 0) -> int:
+    """Return how many ordered memories a question at ``cutoff`` is allowed to have seen."""
+    boundary = math.inf if cutoff is None else cutoff
+    end = start
+    while end < len(memories) and _memory_end(memories[end]) <= boundary:
+        end += 1
+    return end
+
+
 def _error_code(error: BaseException) -> str:
     return error.code if isinstance(error, MindBridgeError) else type(error).__name__
 
@@ -5684,6 +5851,39 @@ def _failure_detail(error: BaseException, *, source_id: str | None = None) -> Fa
 def _task_seed(seed: int, task: str) -> int:
     digest = hashlib.sha256(f"{seed}:{task}".encode()).digest()
     return int.from_bytes(digest[:8], "big")
+
+
+def _ingest_digest(
+    task: LoadedTask,
+    arguments: _Arguments,
+    memory_config: MindBridgeConfig | None,
+) -> str:
+    """Identify everything that decides what one unit's store ends up holding.
+
+    A resumed run trusts an existing store only when this matches, because a store written by
+    another embedder, ingest mode, or dataset revision is not the store this run would write.
+    The generator is deliberately absent: it answers questions and never writes.
+    """
+    payload: dict[str, object] = {
+        "runner": EVAL_RUNNER_VERSION,
+        "implementation": _implementation_identity(),
+        "task": _cache_task(task),
+        "embedding_model": DEFAULT_JINA_MODEL_ID,
+        "embedding_revision": DEFAULT_JINA_REVISION,
+        "transcription_model": DEFAULT_FUNASR_MODEL_ID,
+        "device": arguments.device or "auto",
+        "ingest": arguments.ingest,
+        # Every unoverridden dataset and media path is resolved under this root, and two roots
+        # can hold differently prepared copies of the same pinned corpus.
+        "benchmarks_root": str(arguments.benchmarks_root),
+        "media_manifest": (
+            None if arguments.media_manifest is None else str(arguments.media_manifest)
+        ),
+        "media_root": str(arguments.media_overrides.get(task.spec.name, "")),
+    }
+    if memory_config is not None:
+        payload["memory_config"] = _memory_config_payload(memory_config)
+    return hashlib.sha256(_json_bytes(payload)).hexdigest()
 
 
 def _cache_namespace(
