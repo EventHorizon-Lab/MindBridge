@@ -678,6 +678,15 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- `mindbridge-bench eval --resume` is no longer refused by the crash copy of the run it continues.
+  The guard that keeps a rerun from deleting a leftover `samples.partial.jsonl` covered `--resume`
+  too, so the one command written to recover an interrupted run exited on the file that run had
+  left behind. `--resume` now passes that file and only that file; `results.jsonl` and
+  `samples.jsonl` still need `--overwrite`, because a run that wrote them finished.
+- A `--resume` run no longer reuses a store built with the other setting of `--deliberate`. The
+  checkpoint recipe named the embedder, the ingest mode and the corpus but not consolidation,
+  which applies operations to the store between chunks: a resumed run could inherit memories that
+  had been consolidated when it asked for none, or the reverse.
 - `generation.min_video_seconds` in a configuration file no longer raises `TypeError` on the first
   `Memory.from_config`. The setting reached the recipe factory, which names every adapter control
   as an explicit keyword and had never been given this one, so the documented field was

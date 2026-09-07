@@ -1086,14 +1086,16 @@ work and are independent, but a resumed run without the cache still re-answers e
 
 `--resume` requires the `--run-id` of the run it continues, because a generated identifier names a
 directory no earlier run wrote to. Checkpoints are written on every run, so the interrupted run
-does not need to have been started with `--resume`.
+does not need to have been started with `--resume`. The crash copy that interrupted run left
+behind is the one artifact `--resume` may find in the output directory without `--overwrite`;
+`results.jsonl` and `samples.jsonl` still refuse, because a run that wrote them finished.
 
 Each unit's store is reused only when the checkpoint beside it still describes the run being
 started. The checkpoint names the task and dataset revision, the embedding, transcription, and
-memory configuration, the device, and the ingest mode; anything else rebuilds that unit from
-zero. A store that was ingested past the earliest cutoff still holding unanswered questions is
-also rebuilt, because reusing it would answer those questions with memories they must not have
-seen yet. So is a unit whose store directory was emptied or deleted while its checkpoint stayed
+memory configuration, the device, the ingest mode, and whether the run consolidates with
+`--deliberate`; anything else rebuilds that unit from zero. A store that was ingested past the
+earliest cutoff still holding unanswered questions is also rebuilt, because reusing it would
+answer those questions with memories they must not have seen yet. So is a unit whose store directory was emptied or deleted while its checkpoint stayed
 behind. Rebuilding empties that unit directory and zeroes its checkpoint together, and it first
 opens the store it is about to destroy, so a unit another run still owns fails with the usual
 in-use error instead of being deleted underneath it.

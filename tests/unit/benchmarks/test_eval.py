@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 from argparse import ArgumentTypeError
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import fields, replace
 from datetime import datetime, timezone
 from inspect import getattr_static, signature
@@ -2100,6 +2100,7 @@ def test_ingest_digest_ignores_the_answer_model(tmp_path: Path) -> None:
         SimpleNamespace(
             device=None,
             ingest="add",
+            deliberate=False,
             benchmarks_root=tmp_path,
             media_manifest=None,
             media_overrides={},
@@ -2125,6 +2126,13 @@ def test_ingest_digest_ignores_the_answer_model(tmp_path: Path) -> None:
         task,
         arguments,
         config.model_copy(update={"embedding": embedding.model_copy(update={"model": "embed-2"})}),
+    )
+    # `--deliberate` applies consolidation to the store itself, so a run that asks for it must
+    # not resume into one built without it -- or the other way round.
+    assert digest != eval_module._ingest_digest(
+        task,
+        cast(eval_module._Arguments, SimpleNamespace(**vars(arguments) | {"deliberate": True})),
+        config,
     )
 
 
@@ -4150,19 +4158,6 @@ def test_eval_run_section_reports_bad_values_as_usage_errors(body: str, tmp_path
         eval_module._arguments(parser, parsed, overrides=overrides)
 
 
-@pytest.fixture
-def restored_logging() -> Iterator[None]:
-    """`_configure_logging` claims the root handler, so give it back to pytest afterwards."""
-    root = logging.getLogger()
-    saved = (root.level, list(root.handlers), list(root.filters))
-    try:
-        yield
-    finally:
-        root.setLevel(saved[0])
-        root.handlers[:] = saved[1]
-        root.filters[:] = saved[2]
-
-
 def _emit_from_every_source() -> None:
     # httpx logs one of these per successful call; modelscope and jieba set their own logger
     # level when imported, so they escape a root threshold entirely.
@@ -4176,7 +4171,7 @@ def _emit_from_every_source() -> None:
 
 
 def test_configure_logging_keeps_dependency_info_out_of_the_run(
-    capsys: pytest.CaptureFixture[str], restored_logging: None
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Only MindBridge is verbose at INFO; a dependency has to reach WARNING to be heard."""
     eval_module._configure_logging("INFO")
@@ -4191,7 +4186,7 @@ def test_configure_logging_keeps_dependency_info_out_of_the_run(
 
 
 def test_configure_logging_opens_the_whole_process_for_debug(
-    capsys: pytest.CaptureFixture[str], restored_logging: None
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """`--verbosity DEBUG` is the one setting that asks for everyone else's detail too."""
     eval_module._configure_logging("DEBUG")
@@ -4207,7 +4202,7 @@ def test_configure_logging_opens_the_whole_process_for_debug(
 
 
 def test_configure_logging_still_filters_while_a_bar_is_live(
-    monkeypatch: pytest.MonkeyPatch, restored_logging: None
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The filter has to survive the progress bar, which is up for the whole of every task.
 
@@ -4237,7 +4232,7 @@ def test_configure_logging_still_filters_while_a_bar_is_live(
 
 
 def test_configure_logging_silences_mindbridge_too_at_error(
-    capsys: pytest.CaptureFixture[str], restored_logging: None
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A raised floor applies to the harness as well, not just to its dependencies."""
     eval_module._configure_logging("ERROR")
@@ -4250,7 +4245,7 @@ def test_configure_logging_silences_mindbridge_too_at_error(
 
 
 def test_configure_logging_turns_down_a_dependency_that_owns_its_handler(
-    monkeypatch: pytest.MonkeyPatch, restored_logging: None
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`modelscope` logs through a handler of its own with `propagate = False`, past every filter.
 
@@ -4269,17 +4264,24 @@ def test_configure_logging_turns_down_a_dependency_that_owns_its_handler(
     eval_module._configure_logging("INFO")
     assert os.environ["MODELSCOPE_LOG_LEVEL"] == "40"
 
+
 def _streaming_arguments(output_path: Path, **overrides: object) -> eval_module._Arguments:
     values: dict[str, object] = {
         "arms": ("mindbridge",),
+        "benchmarks_root": output_path.parent / "corpus",
         "blind": False,
         "blind_baseline": None,
         "bootstrap_samples": 32,
+        "deliberate": False,
+        "device": None,
+        "media_manifest": None,
+        "media_overrides": {},
         "output_path": output_path,
         "predict_only": True,
         "quiet": False,
         "log_samples": False,
         "recall_limit": 20,
+        "resume": False,
         "run_id": "run",
         "seed": 7,
         "stream_results": False,
@@ -4458,6 +4460,17 @@ def test_a_rerun_does_not_silently_discard_a_leftover_crash_copy(tmp_path: Path)
 
     # `--overwrite` remains the one way through, as it is for every other artifact.
     eval_module._require_output(tmp_path, overwrite=True)
+
+
+def test_resume_is_not_blocked_by_the_crash_copy_of_the_run_it_continues(tmp_path: Path) -> None:
+    """`--resume` names an interrupted run, so that run's crash copy cannot be what refuses it."""
+    (tmp_path / eval_module._PARTIAL_SAMPLES_FILE).write_bytes(b"{}\n")
+    eval_module._require_output(tmp_path, overwrite=False, resume=True)
+
+    # A finished run is not one to resume, so its real artifacts still need `--overwrite`.
+    (tmp_path / eval_module._RESULTS_FILE).write_bytes(b"{}\n")
+    with pytest.raises(FileExistsError, match=eval_module._RESULTS_FILE):
+        eval_module._require_output(tmp_path, overwrite=False, resume=True)
 
 
 def test_final_judging_skips_answers_already_judged_while_streaming(

@@ -1177,7 +1177,7 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         judge_config = _judge_config(base_config, arguments, overrides=overrides)
     except ValueError as error:
         parser.error(str(error))
-    _require_output(arguments.output_path, overwrite=arguments.overwrite)
+    _require_output(arguments.output_path, overwrite=arguments.overwrite, resume=arguments.resume)
     manifest, manifest_directory = load_media_manifest(arguments.media_manifest)
     if arguments.download:
         for name in arguments.tasks:
@@ -6146,11 +6146,16 @@ def _assignments(values: Sequence[str], selected: Sequence[str]) -> dict[str, Pa
     return result
 
 
-def _require_output(path: Path, *, overwrite: bool) -> None:
+def _require_output(path: Path, *, overwrite: bool, resume: bool = False) -> None:
     # The crash copy is guarded like the artifacts it stands in for. A run that died leaves one
     # behind and no `results.jsonl`, so without this a same-`--run-id` retry would pass the guard
     # and delete the only record of the tasks that did finish, before answering anything.
-    for name in (_RESULTS_FILE, _SAMPLES_FILE, _PARTIAL_SAMPLES_FILE, _EGOMEM_SUBMISSION_FILE):
+    # `--resume` is the exception, and only for the crash copy: it names the interrupted run it
+    # continues, so the leftover is that run's own and refusing it would block the one command
+    # written to recover from it. The finished artifacts still need `--overwrite`, because a run
+    # that wrote them is not one to resume.
+    guarded = (_RESULTS_FILE, _SAMPLES_FILE, _EGOMEM_SUBMISSION_FILE)
+    for name in guarded if resume else (*guarded, _PARTIAL_SAMPLES_FILE):
         target = path / name
         if target.exists() and not overwrite:
             raise FileExistsError(f"evaluation artifact already exists: {target}")
@@ -6239,6 +6244,9 @@ def _ingest_digest(
         "transcription_model": DEFAULT_FUNASR_MODEL_ID,
         "device": arguments.device or "auto",
         "ingest": arguments.ingest,
+        # `--deliberate` applies consolidation operations to the store between chunks, so a store
+        # built with it holds different memories than one built without it.
+        "deliberate": arguments.deliberate,
         # Every unoverridden dataset and media path is resolved under this root, and two roots
         # can hold differently prepared copies of the same pinned corpus.
         "benchmarks_root": str(arguments.benchmarks_root),
