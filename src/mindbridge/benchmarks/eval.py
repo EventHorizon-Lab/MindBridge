@@ -1883,10 +1883,13 @@ class _IngestCheckpoint:
     unit_id: str
     digest: str
 
-    def start(
+    async def start(
         self,
         memories: Sequence[MemoryItem],
         cutoffs: Sequence[float | None],
+        *,
+        memory_factory: MemoryFactory,
+        data_dir: Path,
     ) -> tuple[int, list[FailureDetail]]:
         """Return the prefix a resumed run may keep, rebuilding the store when it may not."""
         ingested, failures = self._read()
@@ -1897,11 +1900,18 @@ class _IngestCheckpoint:
             ingested, failures = 0, []
         # A note is evidence only about a store that is still there. One left over from a deleted
         # or already-rebuilt directory would skip a prefix that nothing ever wrote.
-        directory = self.run.unit_path(self.unit_id)
-        if ingested and not (directory.is_dir() and any(directory.iterdir())):
+        occupied = _holds_anything(data_dir)
+        if ingested and not occupied:
             ingested, failures = 0, []
         if self.run.resume and not ingested:
-            self.run.reset_unit(self.unit_id)
+            if occupied:
+                # A store keeps its ownership lock inside its own directory, so deleting one
+                # another run still owns would replace that run's `DataDirectoryInUseError` with
+                # two live writers. Opening the store first is how this run learns through the
+                # public path that the directory it is about to destroy is nobody else's.
+                async with memory_factory(data_dir):
+                    pass
+                self.run.reset_unit(self.unit_id)
             # The rebuilt store and its note move together. A run killed between the two would
             # otherwise leave the old count describing a directory that no longer holds anything.
             self.record(0, ())
@@ -1962,6 +1972,11 @@ def _restored_failure(payload: Mapping[str, object]) -> FailureDetail:
 
 def _optional_text(value: object) -> str | None:
     return None if value is None else str(value)
+
+
+def _holds_anything(directory: Path) -> bool:
+    """Say whether a unit directory still holds the store a checkpoint claims to describe."""
+    return directory.is_dir() and any(directory.iterdir())
 
 
 def _checkpoint_writer(
@@ -2047,15 +2062,19 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
     )
     ingest_failure_details: list[FailureDetail] = []
     ingested = 0
-    # An arm that reads no memory never writes one either, so it neither trusts nor rebuilds a
-    # store another run left behind.
-    if checkpoint is not None and reads_memory:
-        ingested, ingest_failure_details = checkpoint.start(memories, cutoffs)
+    ingest_failures = 0
     # `pending` is the causal cursor every arm reads from; `ingested` is how much of it a previous
     # run already wrote. They differ only while a resumed store runs ahead of the current cutoff.
     pending = 0
-    ingest_failures = len(ingest_failure_details)
     try:
+        # An arm that reads no memory never writes one either, so it neither trusts nor rebuilds
+        # a store another run left behind. Resolving the checkpoint inside this block reports a
+        # directory owned by another run as the store failure it is.
+        if checkpoint is not None and reads_memory:
+            ingested, ingest_failure_details = await checkpoint.start(
+                memories, cutoffs, memory_factory=memory_factory, data_dir=data_dir
+            )
+            ingest_failures = len(ingest_failure_details)
         async with memory_factory(data_dir) as memory:
             for cutoff in cutoffs:
                 end = _prefix_end(memories, cutoff, pending)
@@ -3843,10 +3862,14 @@ def _configured_device_label(explicit: str | None, config: MindBridgeConfig) -> 
     return ",".join(dict.fromkeys(devices)) or "remote"
 
 
-def _memory_config_payload(config: MindBridgeConfig) -> dict[str, object]:
+def _memory_config_payload(
+    config: MindBridgeConfig,
+    *,
+    exclude: frozenset[str] = frozenset(),
+) -> dict[str, object]:
     return cast(
         dict[str, object],
-        config.model_dump(mode="json", exclude={"data_dir"}),
+        config.model_dump(mode="json", exclude={"data_dir", *exclude}),
     )
 
 
@@ -5882,8 +5905,17 @@ def _ingest_digest(
         "media_root": str(arguments.media_overrides.get(task.spec.name, "")),
     }
     if memory_config is not None:
-        payload["memory_config"] = _memory_config_payload(memory_config)
+        payload["memory_config"] = _memory_config_payload(
+            memory_config, exclude=_ANSWER_ONLY_SECTIONS
+        )
     return hashlib.sha256(_json_bytes(payload)).hexdigest()
+
+
+# `generation` builds the answerer and nothing else on this path: it answers questions and never
+# writes one. Naming it here would rebuild every store in the run when only the answer model
+# changed. A configured consolidator may reuse that answerer, but consolidation runs only when a
+# caller asks for it and no evaluation does.
+_ANSWER_ONLY_SECTIONS = frozenset({"generation"})
 
 
 def _cache_namespace(

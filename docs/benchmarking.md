@@ -997,7 +997,9 @@ memory configuration, the device, and the ingest mode; anything else rebuilds th
 zero. A store that was ingested past the earliest cutoff still holding unanswered questions is
 also rebuilt, because reusing it would answer those questions with memories they must not have
 seen yet. So is a unit whose store directory was emptied or deleted while its checkpoint stayed
-behind. Rebuilding empties that unit directory and zeroes its checkpoint together.
+behind. Rebuilding empties that unit directory and zeroes its checkpoint together, and it first
+opens the store it is about to destroy, so a unit another run still owns fails with the usual
+in-use error instead of being deleted underneath it.
 
 The checkpoint is written after each committed batch, never before, so an interruption inside a
 batch costs at most one duplicated batch rather than silently dropped evidence. Write failures

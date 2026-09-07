@@ -38,6 +38,7 @@ from mindbridge import (
     Modality,
     ModelError,
     SearchHit,
+    StorageError,
 )
 from mindbridge._telemetry import _record_retrieval_results
 from mindbridge.benchmarks.eval import (
@@ -91,7 +92,7 @@ from mindbridge.benchmarks.model_config import (
 from mindbridge.benchmarks.official_scorers import scorer_protocol, task_family
 from mindbridge.benchmarks.task_catalog import TASKS, TaskSpec, expand
 from mindbridge.benchmarks.video_mme_v2 import score_group_answers
-from mindbridge.configuration import OpenAIEmbeddingConfig
+from mindbridge.configuration import OpenAIEmbeddingConfig, OpenAIGenerationConfig
 from mindbridge.models.base import EmbedTask, ModelInput, SpeechAnalysis, SpeechBackend
 
 
@@ -1966,20 +1967,101 @@ async def test_resume_rebuilds_a_store_built_by_another_recipe(tmp_path: Path) -
     assert events == ["add:[source_id: early]\nearly", "ask:first:5"]
 
 
-def test_ingest_checkpoint_carries_prior_write_failures_into_the_resumed_run(
+@pytest.mark.asyncio
+async def test_ingest_checkpoint_carries_prior_write_failures_into_the_resumed_run(
     tmp_path: Path,
 ) -> None:
     run = BenchmarkRun(tmp_path / "stores", "fixture", "run", resume=True)
-    (run.unit_dir("unit") / "store.db").write_text("two memories", encoding="utf-8")
+    data_dir = run.unit_dir("unit")
+    (data_dir / "store.db").write_text("two memories", encoding="utf-8")
     checkpoint = eval_module._IngestCheckpoint(run, "unit", "recipe")
     detail = eval_module.FailureDetail("early", "storage_failed", "disk_full", "write", "OSError")
+    factory = _store_factory([])
 
     checkpoint.record(2, (detail,))
 
-    assert checkpoint.start((), ()) == (2, [detail])
+    assert await checkpoint.start((), (), memory_factory=factory, data_dir=data_dir) == (
+        2,
+        [detail],
+    )
     # A note whose store is gone describes nothing, and one rebuilt store leaves no stale count.
-    assert eval_module._IngestCheckpoint(run, "unit", "recipe-2").start((), ()) == (0, [])
-    assert checkpoint.start((), ()) == (0, [])
+    stale = eval_module._IngestCheckpoint(run, "unit", "recipe-2")
+    assert await stale.start((), (), memory_factory=factory, data_dir=data_dir) == (0, [])
+    assert await checkpoint.start((), (), memory_factory=factory, data_dir=data_dir) == (0, [])
+
+
+@pytest.mark.asyncio
+async def test_resume_leaves_a_store_another_run_owns_alone(tmp_path: Path) -> None:
+    task = _resumable_task(tmp_path, [MemoryItem("early", ("early",))], None)
+    run = BenchmarkRun(tmp_path / "stores", "fixture", "run", resume=True)
+    owned = run.unit_dir("unit") / "store.sqlite3"
+    owned.write_text("another run is writing here", encoding="utf-8")
+    # A checkpoint from a different recipe is what sends this unit down the rebuild path.
+    eval_module._IngestCheckpoint(run, "unit", "other-recipe").record(1, ())
+
+    def occupied(path: Path) -> _FakeContext:
+        # What `Memory` raises when another live instance owns the directory.
+        raise StorageError(
+            "the data directory is already in use by another live MindBridge instance",
+            reason="data_dir_in_use",
+            stage="open",
+            subject=str(path),
+        )
+
+    samples = await run_loaded_task(
+        task,
+        run=run,
+        memory_factory=cast(MemoryFactory, occupied),
+        batch_size=8,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=5,
+        ingest_digest="recipe",
+    )
+
+    assert owned.read_text(encoding="utf-8") == "another run is writing here"
+    assert [sample.error_code for sample in samples] == ["storage_error"]
+
+
+def test_ingest_digest_ignores_the_answer_model(tmp_path: Path) -> None:
+    spec = TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40)
+    task = LoadedTask(
+        spec,
+        tmp_path / "fixture.json",
+        "1" * 64,
+        (EvalUnit("unit", (), (EvalQuestion("q1", ("first",), references=("A",)),)),),
+    )
+    arguments = cast(
+        eval_module._Arguments,
+        SimpleNamespace(
+            device=None,
+            ingest="add",
+            benchmarks_root=tmp_path,
+            media_manifest=None,
+            media_overrides={},
+        ),
+    )
+    embedding = OpenAIEmbeddingConfig(provider="openai", model="embed-1")
+    config = MindBridgeConfig(
+        embedding=embedding,
+        generation=OpenAIGenerationConfig(provider="openai", model="answer-1"),
+    )
+
+    digest = eval_module._ingest_digest(task, arguments, config)
+
+    # Only the answer model moved, and no store's contents depend on it.
+    assert digest == eval_module._ingest_digest(
+        task,
+        arguments,
+        config.model_copy(
+            update={"generation": OpenAIGenerationConfig(provider="openai", model="answer-2")}
+        ),
+    )
+    assert digest != eval_module._ingest_digest(
+        task,
+        arguments,
+        config.model_copy(update={"embedding": embedding.model_copy(update={"model": "embed-2"})}),
+    )
 
 
 def test_resume_needs_the_run_id_of_the_run_it_continues() -> None:
