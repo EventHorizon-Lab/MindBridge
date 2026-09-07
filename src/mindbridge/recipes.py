@@ -197,6 +197,7 @@ class _OwnedClientModels(OpenAIModels):
         generation_temperature: float | None = None,
         generation_max_tokens: int | None = None,
         generation_video_limit: int | None = 8,
+        generation_min_video_seconds: float | None = None,
         generation_extra_body: Mapping[str, object] | None = None,
     ) -> None:
         super().__init__(
@@ -214,6 +215,7 @@ class _OwnedClientModels(OpenAIModels):
             generation_temperature=generation_temperature,
             generation_max_tokens=generation_max_tokens,
             generation_video_limit=generation_video_limit,
+            generation_min_video_seconds=generation_min_video_seconds,
             generation_extra_body=generation_extra_body,
         )
         self._owned_client = client
@@ -247,6 +249,7 @@ def _owned_openai_models(
     generation_temperature: float | None = None,
     generation_max_tokens: int | None = None,
     generation_video_limit: int | None = 8,
+    generation_min_video_seconds: float | None = None,
     generation_extra_body: Mapping[str, object] | None = None,
 ) -> OpenAIModels:
     """Build the SDK adapter and own the client created for declarative composition."""
@@ -277,6 +280,7 @@ def _owned_openai_models(
             generation_temperature=generation_temperature,
             generation_max_tokens=generation_max_tokens,
             generation_video_limit=generation_video_limit,
+            generation_min_video_seconds=generation_min_video_seconds,
             generation_extra_body=generation_extra_body,
         )
     except BaseException:
