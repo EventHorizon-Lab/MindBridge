@@ -151,6 +151,7 @@ class LoadedTask:
     dataset_sha256: str
     units: tuple[EvalUnit, ...]
     input_sha256: Mapping[str, str] = field(default_factory=dict)
+    unavailable_units: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         unit_ids = tuple(unit.unit_id for unit in self.units)
@@ -192,6 +193,7 @@ class MediaResolver:
         self.task_name = task_name
         self.root = root
         self._manifest = _task_manifest(manifest, task_name)
+        self.unavailable_units = _task_unavailable_units(manifest, task_name)
         self._manifest_directory = manifest_directory
         self._index: dict[str, list[Path]] | None = None
 
@@ -420,7 +422,21 @@ def load_task(
         ).encode()
         inputs["media_manifest"] = hashlib.sha256(encoded).hexdigest()
     inputs["memory"] = _memory_digest(units)
-    return LoadedTask(spec, dataset, digest, units, inputs)
+    unavailable_units = _selected_unavailable_units(
+        spec,
+        dataset,
+        resolver.unavailable_units,
+        limit,
+        offset,
+    )
+    return LoadedTask(
+        spec,
+        dataset,
+        digest,
+        units,
+        inputs,
+        unavailable_units,
+    )
 
 
 def dataset_digest(path: Path) -> str:
@@ -562,6 +578,8 @@ def _m3(
 
     units = []
     for video in _selected(load_m3_bench(dataset), limit, offset):
+        if video.video_id in media.unavailable_units:
+            continue
         memories = media.parts(
             video.video_id,
             (video.video_id,),
@@ -1519,6 +1537,48 @@ def _task_manifest(manifest: Mapping[str, object] | None, task_name: str) -> Map
     if not isinstance(units, dict):
         raise ValueError(f"media manifest task {task_name} units must be an object")
     return units
+
+
+def _task_unavailable_units(
+    manifest: Mapping[str, object] | None, task_name: str
+) -> Mapping[str, str]:
+    if manifest is None:
+        return {}
+    tasks = manifest.get("tasks")
+    if not isinstance(tasks, dict):
+        raise ValueError("media manifest tasks must be an object")
+    task = tasks.get(task_name, {})
+    if not isinstance(task, dict):
+        raise ValueError(f"media manifest task {task_name} must be an object")
+    unavailable = task.get("unavailable_units", {})
+    if not isinstance(unavailable, dict) or any(
+        not isinstance(unit_id, str)
+        or not unit_id.strip()
+        or not isinstance(reason, str)
+        or not reason.strip()
+        for unit_id, reason in unavailable.items()
+    ):
+        raise ValueError(
+            f"media manifest task {task_name} unavailable_units must map IDs to reasons"
+        )
+    return unavailable
+
+
+def _selected_unavailable_units(
+    spec: TaskSpec,
+    dataset: Path,
+    unavailable_units: Mapping[str, str],
+    limit: Limit,
+    offset: int,
+) -> Mapping[str, str]:
+    if not unavailable_units or spec.name not in {"m3-bench-robot", "m3-bench-web"}:
+        return unavailable_units
+    from mindbridge.benchmarks.m3_bench import load_m3_bench
+
+    selected_ids = {video.video_id for video in _selected(load_m3_bench(dataset), limit, offset)}
+    return {
+        unit_id: reason for unit_id, reason in unavailable_units.items() if unit_id in selected_ids
+    }
 
 
 def _memory_part(part: _ManifestPart) -> MemoryItem:

@@ -3780,6 +3780,14 @@ def _metrics(
         max(sample.ingest_failure_count for sample in samples if sample.unit_id == unit_id)
         for unit_id in {sample.unit_id for sample in samples}
     )
+    unavailable_units = dict(getattr(task, "unavailable_units", {}))
+    evaluated_units = getattr(task, "units", ())
+    evaluated_unit_count = (
+        len(evaluated_units) if evaluated_units else len({sample.unit_id for sample in samples})
+    )
+    full_dataset_selected = getattr(arguments, "offset", 0) == 0 and getattr(
+        arguments, "limit", None
+    ) in (None, -1)
     result: dict[str, object] = {
         "arm": arm,
         "primary_metric": primary_name,
@@ -3796,8 +3804,18 @@ def _metrics(
         ),
         "score": primary,
         "score_valid": (
-            error_count == 0 and ingest_failure_count == 0 and retrieval_diagnostic_error_count == 0
+            error_count == 0
+            and ingest_failure_count == 0
+            and retrieval_diagnostic_error_count == 0
+            and not unavailable_units
         ),
+        "dataset_coverage": {
+            "complete": not unavailable_units,
+            "evaluated_unit_count": evaluated_unit_count,
+            "unavailable_unit_count": len(unavailable_units),
+            "unavailable_units": unavailable_units,
+            "score_comparable_to_full_dataset": (full_dataset_selected and not unavailable_units),
+        },
         "metrics": metric_rows,
         "exact_match": metric_rows.get("exact_match"),
         "question_count": len(samples),

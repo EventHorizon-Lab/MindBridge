@@ -96,8 +96,11 @@ def prepare_task_media(
     patterns = _selected_patterns(spec, dataset_path, limit, offset)
     if not patterns:
         raise ValueError(f"{spec.name} produced no selected media")
+    unavailable_units: Mapping[str, str] = {}
     if managed:
-        _acquire_selected(spec, dataset_path, root, patterns, download, announce)
+        unavailable_units = _acquire_selected(
+            spec, dataset_path, root, patterns, download, announce
+        )
     elif not effective_root.is_dir():
         raise FileNotFoundError(f"{spec.name} media root does not exist: {effective_root}")
 
@@ -110,6 +113,7 @@ def prepare_task_media(
         limit,
         offset,
         announce,
+        unavailable_units,
     )
 
 
@@ -122,9 +126,21 @@ def _prepared_manifest(
     limit: Limit,
     offset: int,
     announce: Callable[[str], None] | None,
+    unavailable_units: Mapping[str, str],
 ) -> Mapping[str, object] | None:
     if spec.name in {"m3-bench-robot", "m3-bench-web"}:
-        return {"units": _m3_manifest(dataset, media_root, cache, limit, offset, announce)}
+        return {
+            "units": _m3_manifest(
+                dataset,
+                media_root,
+                cache,
+                limit,
+                offset,
+                announce,
+                frozenset(unavailable_units),
+            ),
+            **({"unavailable_units": dict(unavailable_units)} if unavailable_units else {}),
+        }
     if spec.name in {"video-mme", "video-mme-v2", "egotempo"}:
         return {
             "units": _video_manifest(spec.name, dataset, media_root, cache, limit, offset, announce)
@@ -159,12 +175,12 @@ def _acquire_selected(
     patterns: Sequence[str],
     download: bool,
     announce: Callable[[str], None] | None,
-) -> None:
+) -> Mapping[str, str]:
     source = spec.media_source
     if source is None:
-        return
+        return {}
     if source.acquirer == "youtube":
-        _acquire_youtube(spec, dataset, root, patterns, download, announce)
+        return _acquire_youtube(spec, dataset, root, patterns, download, announce)
     elif source.acquirer == "ego4d":
         _acquire_ego4d(spec, dataset, root, patterns, download, announce)
     elif source.acquirer in {"open-eqa-hm3d-frames", "scannet"}:
@@ -178,6 +194,7 @@ def _acquire_selected(
             allow_missing=spec.name == "supermemory-vqa",
             announce=announce,
         )
+    return {}
 
 
 def _manifest_has_task(manifest: Mapping[str, object] | None, task_name: str) -> bool:
@@ -278,6 +295,7 @@ def _m3_manifest(
     limit: Limit,
     offset: int,
     announce: Callable[[str], None] | None,
+    unavailable_units: frozenset[str] = frozenset(),
 ) -> dict[str, list[dict[str, object]]]:
     from mindbridge.benchmarks.m3_bench import M3BenchVideo, load_m3_bench
 
@@ -301,7 +319,11 @@ def _m3_manifest(
             ],
         )
 
-    videos = tuple(_selected(load_m3_bench(dataset), limit, offset))
+    videos = tuple(
+        video
+        for video in _selected(load_m3_bench(dataset), limit, offset)
+        if video.video_id not in unavailable_units
+    )
     return dict(_prepare_many(prepare, videos))
 
 
@@ -760,7 +782,7 @@ def _acquire_youtube(
     patterns: Sequence[str],
     download: bool,
     announce: Callable[[str], None] | None,
-) -> None:
+) -> Mapping[str, str]:
     from mindbridge.benchmarks.m3_bench import load_m3_bench
 
     videos = {video.video_id: video for video in load_m3_bench(dataset)}
@@ -783,52 +805,109 @@ def _acquire_youtube(
         video_id for video_id in selected if not (destination / f"{video_id}.mp4").is_file()
     )
     if not missing:
-        return
+        return {}
     if not download:
         raise FileNotFoundError(f"{spec.name} media is missing and --no-download was given")
     command = _yt_dlp_command()
     destination.mkdir(mode=0o700, parents=True, exist_ok=True)
     sleep = _youtube_sleep()
+    unavailable: dict[str, str] = {}
     for index, video_id in enumerate(missing, start=1):
         video = videos.get(video_id)
-        if video is None or video.video_url is None:
-            raise FileNotFoundError(f"M3-Bench web annotation has no URL for {video_id}")
-        if urlparse(video.video_url).scheme not in {"http", "https"}:
-            raise ValueError(f"M3-Bench web URL is not HTTP(S): {video.video_url!r}")
-        target = destination / f"{_component(video_id)}.mp4"
         if announce is not None:
             announce(f"downloading M3-Bench web video {index}/{len(missing)}: {video_id}")
-        completed = subprocess.run(
-            (
-                *command,
-                "--output",
-                str(target),
-                "--format-sort",
-                "res:360,ext:mp4:m4a",
-                "--merge-output-format",
-                "mp4",
-                "--remux-video",
-                "mp4",
-                "--no-playlist",
-                "--sleep-interval",
-                f"{sleep:g}",
-                "--max-sleep-interval",
-                f"{sleep * 2:g}",
-                "--sleep-requests",
-                f"{max(1.0, sleep / 4):g}",
-                "--no-progress",
-                "--",
-                video.video_url,
-            ),
-            check=False,
+        reason = _acquire_youtube_video(
+            video_id,
+            None if video is None else video.video_url,
+            destination / f"{_component(video_id)}.mp4",
+            command,
+            sleep,
         )
-        if (
-            completed.returncode
-            or not target.is_file()
-            or not target.stat().st_size
-            or not _has_audio(target)
-        ):
-            raise RuntimeError(f"yt-dlp could not acquire M3-Bench web video {video_id}")
+        if reason is not None:
+            unavailable[video_id] = reason
+            if announce is not None:
+                announce(f"skipping unavailable M3-Bench web video {video_id}: {reason}")
+    return unavailable
+
+
+def _acquire_youtube_video(
+    video_id: str,
+    video_url: str | None,
+    target: Path,
+    command: Sequence[str],
+    sleep: float,
+) -> str | None:
+    if video_url is None:
+        raise FileNotFoundError(f"M3-Bench web annotation has no URL for {video_id}")
+    if urlparse(video_url).scheme not in {"http", "https"}:
+        raise ValueError(f"M3-Bench web URL is not HTTP(S): {video_url!r}")
+    returncode, output = _download_youtube_video(command, video_url, target, sleep)
+    if not returncode and _valid_youtube_video(target):
+        return None
+    if returncode and _permanently_unavailable_youtube(output):
+        target.unlink(missing_ok=True)
+        return _yt_dlp_error(output)
+    detail = f": {_yt_dlp_error(output)}" if output else ""
+    raise RuntimeError(f"yt-dlp could not acquire M3-Bench web video {video_id}{detail}")
+
+
+def _download_youtube_video(
+    command: Sequence[str], url: str, target: Path, sleep: float
+) -> tuple[int, str]:
+    completed = subprocess.run(
+        (
+            *command,
+            "--output",
+            str(target),
+            "--format-sort",
+            "res:360,ext:mp4:m4a",
+            "--merge-output-format",
+            "mp4",
+            "--remux-video",
+            "mp4",
+            "--no-playlist",
+            "--sleep-interval",
+            f"{sleep:g}",
+            "--max-sleep-interval",
+            f"{sleep * 2:g}",
+            "--sleep-requests",
+            f"{max(1.0, sleep / 4):g}",
+            "--no-progress",
+            "--",
+            url,
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
+    return completed.returncode, output
+
+
+def _valid_youtube_video(target: Path) -> bool:
+    return target.is_file() and bool(target.stat().st_size) and _has_audio(target)
+
+
+_PERMANENT_YOUTUBE_ERRORS = (
+    "private video",
+    "video unavailable",
+    "has been removed",
+    "removed by the uploader",
+    "account associated with this video has been terminated",
+    "blocked it in your country on copyright grounds",
+    "not available in your country",
+)
+
+
+def _permanently_unavailable_youtube(output: str) -> bool:
+    normalized = output.casefold()
+    return any(message in normalized for message in _PERMANENT_YOUTUBE_ERRORS)
+
+
+def _yt_dlp_error(output: str) -> str:
+    lines = tuple(line.strip() for line in output.splitlines() if line.strip())
+    errors = tuple(line for line in lines if line.casefold().startswith("error:"))
+    return (errors or lines or ("unknown yt-dlp error",))[-1]
 
 
 def _acquire_openeqa(spec: TaskSpec, root: Path, patterns: Sequence[str]) -> None:
