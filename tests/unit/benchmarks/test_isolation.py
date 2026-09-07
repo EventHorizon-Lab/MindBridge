@@ -73,6 +73,23 @@ def test_layout_is_stable_safe_and_collision_free(tmp_path: Path) -> None:
     assert resumed.unit_dir(unit_ids[0]) == paths[0]
 
 
+def test_checkpoint_notes_live_outside_the_store_they_describe(tmp_path: Path) -> None:
+    run = BenchmarkRun(tmp_path, "benchmark", "run-01")
+    data_dir = run.unit_dir("../unit:01")
+    note = run.checkpoint_path("../unit:01")
+
+    assert note.parent == run.path / "checkpoints"
+    assert note != run.checkpoint_path("unit:01")
+
+    (data_dir / "store.db").write_text("stale", encoding="utf-8")
+    note.parent.mkdir(mode=0o700, exist_ok=True)
+    note.write_text("{}", encoding="utf-8")
+
+    assert run.reset_unit("../unit:01") == data_dir
+    assert data_dir.is_dir() and not any(data_dir.iterdir())
+    assert note.exists()
+
+
 @pytest.mark.parametrize("value", ["", " ", " leading", "trailing "])
 def test_layout_rejects_ambiguous_identifiers(tmp_path: Path, value: str) -> None:
     with pytest.raises(ValueError, match="non-empty and trimmed"):

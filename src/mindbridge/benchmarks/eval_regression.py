@@ -182,6 +182,10 @@ def _require_comparable(candidate: Mapping[str, object], baseline: Mapping[str, 
             _not_comparable(".".join(path), current, previous)
     if bool(candidate.get("response_cache")) or bool(baseline.get("response_cache")):
         raise ValueError("performance results using a response cache are not comparable")
+    # A resumed run skips the ingest a previous invocation already paid for and inherits its warm
+    # description cache, so its write-path timings describe neither run.
+    if bool(candidate.get("resume")) or bool(baseline.get("resume")):
+        raise ValueError("performance results from a resumed run are not comparable")
 
     current_protocol = _at(candidate, ("measurement_protocol", "state"), "legacy_unspecified")
     previous_protocol = _at(baseline, ("measurement_protocol", "state"), "legacy_unspecified")

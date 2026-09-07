@@ -900,6 +900,7 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
             num_fewshot=0,
             log_samples=False,
             use_cache=None,
+            resume=False,
             allow_unverified_data=False,
             run_id="run",
             model=DEFAULT_ARM,
