@@ -1001,8 +1001,10 @@ failure also makes `--fail-on-regression` exit nonzero.
 
 Performance budgets use the same `--compare` artifact but apply only after stricter comparability
 checks: schema and runner, task/input digests, models and full memory composition, concurrency,
-warmup protocol, runtime versions, acceleration runtime, and hardware must match; neither result
-may use a response cache or contain a product or retrieval-diagnostic error.
+warmup protocol, runtime versions, acceleration runtime, and hardware must match; the candidate
+must carry a product row for every task the baseline measured, so a narrowed `--tasks` selection
+is rejected instead of leaving the dropped task's budget unevaluated; and neither result may use a
+response cache or contain a product or retrieval-diagnostic error.
 
 ```bash
 mindbridge-bench eval \

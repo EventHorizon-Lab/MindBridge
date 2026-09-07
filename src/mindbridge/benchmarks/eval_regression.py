@@ -136,8 +136,16 @@ def performance_comparisons(
         raise ValueError(f"unknown performance budget(s): {', '.join(unknown)}")
     _require_comparable(candidate, baseline)
     previous = _product_tasks(baseline)
+    current_tasks = _product_tasks(candidate)
+    # Rows are produced per candidate task, so a baseline task the candidate dropped would leave
+    # the budget unevaluated and the gate green. A narrowed task selection is a different run.
+    omitted = sorted(set(previous) - set(current_tasks))
+    if omitted:
+        raise ValueError(
+            f"candidate omits performance baseline product row(s): {', '.join(omitted)}"
+        )
     rows: list[dict[str, object]] = []
-    for current in _product_tasks(candidate).values():
+    for current in current_tasks.values():
         task_name = str(current["task"])
         prior = previous.get(task_name)
         if prior is None:

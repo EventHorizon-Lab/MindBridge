@@ -6571,6 +6571,20 @@ def test_a_name_registered_before_naming_became_a_claim_survives_the_upgrade(
             entry.identity_id for entry in bundle.actors if isinstance(entry, ProvisionalActor)
         }
 
+        # A migration cannot embed, and `reindex()` only replays the vectors SQLite already
+        # holds, so the capture queue is what makes the backfilled sentence searchable: it
+        # settles like a captured record instead of staying out of `search` forever.
+        assertion_id = next(
+            item.id
+            for item in memory.list(limit=50).items
+            if item.context is not None and item.context.identity_id == identity_id
+        )
+        assert [pending.memory_id for pending in memory.pending_captures()] == [assertion_id]
+        memory.reindex()
+        assert all(hit.id != assertion_id for hit in memory.search("recognized person", limit=10))
+        assert memory.settle() == 1
+        assert assertion_id in {hit.id for hit in memory.search("recognized person", limit=10)}
+
         # The backfilled assertion is the one the kernel derives, so re-registering the same
         # name changes nothing rather than stacking a second assertion on the person.
         memory.register_identity(identity_id, "Li")

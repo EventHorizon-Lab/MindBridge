@@ -462,7 +462,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `memory_operations.outcome` and `outcome_note` columns, and admits the `merge` intent; version
   15 admits the `consent` intent so a data subject's own statement can be logged; version 16
   backfills a visible naming assertion for identities registered before names became versioned
-  claims.
+  claims. A migration must not call a model, so each backfilled assertion is enqueued in the
+  capture queue: the projection is correct as soon as the store opens, `pending_captures()`
+  names what is still owed, and the next `settle()` embeds and indexes the sentence.
 
 - **Breaking:** `minimum_relevance` now gates evidence relevance — the cosine the dense route
   reports, or the demoted full-text contribution when only the lexical route matched, times the

@@ -6081,9 +6081,12 @@ def _v16_backfill_naming_assertions(connection: sqlite3.Connection) -> None:
     kernel would have written, under the ID the kernel derives, so re-registering the same name
     stays the no-op it is documented to be rather than minting a second assertion.
 
-    The record carries no vectors: embedding needs a model a migration must not call, so the
-    sentence stays out of `search` until the next `reindex`. The projection, which is what a
-    registered name is for, is correct as soon as the store opens.
+    The record carries no vectors: embedding needs a model a migration must not call. Each one is
+    therefore enqueued in `capture_queue`, which is the store's standing "this record still owes
+    model work" queue, so the next `settle()` embeds and indexes it exactly as it settles a
+    captured record -- `reindex()` cannot, because it replays the embeddings SQLite already holds
+    and a record with none is invisible to it. The projection, which is what a registered name is
+    for, is correct as soon as the store opens, and `pending_captures()` names what is still owed.
     """
     rows = connection.execute(
         """
@@ -6145,6 +6148,10 @@ def _v16_backfill_naming_assertions(connection: sqlite3.Connection) -> None:
                 memory_id, version, confidence, recorded_at, visible
             ) VALUES (?, 1, 1.0, ?, 1)
             """,
+            (memory_id, recorded_at),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO capture_queue (memory_id, enqueued_at) VALUES (?, ?)",
             (memory_id, recorded_at),
         )
 

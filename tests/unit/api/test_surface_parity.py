@@ -44,11 +44,13 @@ from mindbridge.types import (
     ContextConflict,
     ContextUnknown,
     ContextUnknownKind,
+    EvidenceBasis,
     FaceObservation,
     FormationProposal,
     IdentityErasure,
     IdentityProfile,
     MemoryCapabilities,
+    MemoryContext,
     MemoryIntent,
     MemoryKind,
     MemoryOperation,
@@ -507,6 +509,29 @@ def test_an_operation_row_is_one_document_on_both_transports() -> None:
     assert set(rest.MemoryOperationResponse.model_fields) == set(document)
     assert document["proposal"] is not None
     assert rest._operation_response(record).proposal == document["proposal"]
+
+
+def test_a_memory_context_is_one_document_on_every_surface() -> None:
+    """REST and MCP serialize the dataclass, so the CLI has to print every field it declares.
+
+    `identity_id` is the claim's semantic subject. Dropping it locally made `get`, `search`,
+    `compile`, and `export` say a claim was about nobody unless the caller went through `--url`.
+    """
+    context = MemoryContext(
+        kind=MemoryKind.ENTITY,
+        basis=EvidenceBasis.USER_STATEMENT,
+        confidence=0.9,
+        valid_from=None,
+        valid_until=None,
+        recorded_at=datetime(2026, 9, 5, tzinfo=timezone.utc),
+        identity_id="identity_1",
+    )
+
+    document = cli._context_document(context)
+
+    assert document is not None
+    assert set(document) == {field.name for field in dataclass_fields(MemoryContext)}
+    assert document["identity_id"] == "identity_1"
 
 
 def test_serialized_assets_drop_the_local_path_on_both_transports() -> None:

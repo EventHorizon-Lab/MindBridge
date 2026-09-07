@@ -1846,6 +1846,7 @@ def _context_document(context: MemoryContext | None) -> _Document | None:
         "supersedes_id": context.supersedes_id,
         "model_id": context.model_id,
         "recipe": context.recipe,
+        "identity_id": context.identity_id,
         "spatial": _spatial_document(context.spatial),
         "cue_modality": None if context.cue_modality is None else context.cue_modality.value,
         "valence": context.valence,

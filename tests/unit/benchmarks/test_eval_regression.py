@@ -151,6 +151,18 @@ def test_performance_comparison_rejects_different_ingest_modes() -> None:
         performance_comparisons(candidate, baseline, {"answer_e2e_latency_p95": 0.1})
 
 
+def test_performance_comparison_rejects_a_candidate_that_dropped_a_baseline_task() -> None:
+    """A budget cannot pass by omission: the dropped task is named instead of ignored."""
+    baseline = _result()
+    second = deepcopy(baseline["tasks"][0])
+    second["task"] = "second"
+    baseline["tasks"].append(second)
+    candidate = _result()
+
+    with pytest.raises(ValueError, match="candidate omits performance baseline product row"):
+        performance_comparisons(candidate, baseline, {"answer_e2e_latency_p95": 0.1})
+
+
 def test_performance_comparison_rejects_incomplete_token_usage() -> None:
     candidate = _result()
     baseline = _result()
