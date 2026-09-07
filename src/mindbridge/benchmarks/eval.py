@@ -1035,8 +1035,11 @@ class _VerbosityFilter(logging.Filter):
     A root level alone does not hold: `modelscope`, `numba`, `jieba` and `torch.__trace` each set
     their own logger level when imported, and a logger with an explicit level never consults the
     root's, so their INFO and DEBUG records reach the root handler whatever it was configured
-    with. Deciding per record on the handler is the one place no dependency can reach around, and
-    it needs no list of names to keep up to date.
+    with. Deciding per record on the handler needs no list of names to keep up to date, and no
+    dependency that reaches the root handler can get around it.
+
+    A dependency that installs its own handler and sets `propagate = False` never reaches this
+    filter at all; `_dependency_log_levels` is where those are turned down by name.
     """
 
     def __init__(self, level: int, third_party: int) -> None:
@@ -1047,6 +1050,22 @@ class _VerbosityFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         own = record.name.split(".", 1)[0] == _ROOT_PACKAGE
         return record.levelno >= (self._level if own else self._third_party)
+
+
+def _dependency_log_levels(third_party: int) -> None:
+    """Turn down the dependencies that log through a handler of their own, not the root's.
+
+    `modelscope.utils.logger` attaches its own stderr handler to the `modelscope` logger and sets
+    `propagate = False`, so `_VerbosityFilter` never sees those records: every FunASR run --
+    `import funasr` imports modelscope -- printed its INFO whatever `--verbosity` said, through a
+    plain `StreamHandler` that also smears the live progress bar. It reads its level from the
+    environment once, at import, so this has to be set before anything imports it, and an
+    explicit setting from the caller wins.
+
+    ponytail: one name, because one installed dependency does this today. The next one gets a
+    line here; there is no generic hook short of patching `logging.Logger.addHandler`.
+    """
+    os.environ.setdefault("MODELSCOPE_LOG_LEVEL", str(third_party))
 
 
 def _configure_logging(verbosity: str) -> None:
@@ -1069,6 +1088,7 @@ def _configure_logging(verbosity: str) -> None:
     )
     for handler in logging.getLogger().handlers:
         handler.addFilter(_VerbosityFilter(level, third_party))
+    _dependency_log_levels(third_party)
 
 
 def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point

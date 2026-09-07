@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -3944,3 +3945,24 @@ def test_configure_logging_silences_mindbridge_too_at_error(
     assert [line.split(": ", 1)[0] for line in capsys.readouterr().err.splitlines()] == [
         "ERROR mindbridge.benchmarks.eval",
     ]
+
+
+def test_configure_logging_turns_down_a_dependency_that_owns_its_handler(
+    monkeypatch: pytest.MonkeyPatch, restored_logging: None
+) -> None:
+    """`modelscope` logs through a handler of its own with `propagate = False`, past every filter.
+
+    `import funasr` imports it, and it reads its level from the environment once, at import, so
+    the threshold has to be there before that happens. A caller who set one explicitly keeps it.
+    """
+    monkeypatch.delenv("MODELSCOPE_LOG_LEVEL", raising=False)
+    eval_module._configure_logging("INFO")
+    assert os.environ["MODELSCOPE_LOG_LEVEL"] == str(logging.WARNING)
+
+    monkeypatch.delenv("MODELSCOPE_LOG_LEVEL")
+    eval_module._configure_logging("DEBUG")
+    assert os.environ["MODELSCOPE_LOG_LEVEL"] == str(logging.DEBUG)
+
+    monkeypatch.setenv("MODELSCOPE_LOG_LEVEL", "40")
+    eval_module._configure_logging("INFO")
+    assert os.environ["MODELSCOPE_LOG_LEVEL"] == "40"
