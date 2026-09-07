@@ -31,6 +31,7 @@ from mindbridge.memory import (
     _LEXICAL_FULL_COVERAGE,
     _LEXICAL_FULL_COVERAGE_RELEVANCE,
     _MAX_TEXT_CHARACTERS,
+    _lexical_query_terms,
     _lexical_relevance,
     _speech_retrieval_text,
 )
@@ -698,6 +699,38 @@ def test_a_chinese_question_can_reach_full_lexical_coverage(tmp_path: Path) -> N
         assert coverage[answer.id] == pytest.approx(1.0)
         assert coverage[shuffled.id] < _LEXICAL_FULL_COVERAGE
         assert [hit.content for hit in traced.hits] == [_ANSWER, _DECOY, _SHUFFLED]
+
+
+def test_query_terms_mirror_what_the_index_can_actually_match() -> None:
+    """Rerank terms have to be the terms the full-text index produces, or coverage cannot fuse.
+
+    Three separate ways they used not to be. Thai reached `\\w+`, whose word class excludes the
+    combining marks Thai writes its vowels and tones with, so a query shredded at every mark into
+    fragments whose boundaries no index term shares. The unsegmented-script list that would have
+    routed it to bigrams did not include Thai, or Lao, Khmer or Myanmar. And every run emitted its
+    single characters beside its bigrams, which the index cannot produce at `ngram_min` 2 and
+    which made the term count -- the denominator `_LEXICAL_FULL_COVERAGE` is measured against --
+    a property of the language rather than of the question.
+    """
+    thai = _lexical_query_terms("ร้านเบเกอรี่")
+    assert thai
+    assert all(len(term) == 2 for term in thai)
+    # The index breaks its ngrams at the mark, so a bigram may not span one: measured against
+    # Zvec, "ยว" matches a document containing "เบเกอรี่ยว" and the pair spanning the mark before
+    # it does not.
+    assert "รย" not in thai
+
+    for text in ("ອາຫານລາວ", "អាហារខ្មែរ", "ထမင်းဟင်း"):
+        assert _lexical_query_terms(text), text
+
+    # No single-character terms, in any script, and a Chinese question no longer carries several
+    # times the terms of the English one it translates.
+    chinese = _lexical_query_terms("爱丽丝面包店")
+    assert all(len(term) == 2 for term in chinese)
+    assert len(chinese) <= 2 * len(_lexical_query_terms("Alice bakery Tuesday"))
+    # A lone character yields nothing rather than a term the index can never answer, which drops
+    # the lexical route instead of running it to guaranteed emptiness.
+    assert _lexical_query_terms("猫") == frozenset()
 
 
 def test_temporal_factor_boosts_overlap_and_never_penalises() -> None:

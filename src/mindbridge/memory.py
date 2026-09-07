@@ -219,16 +219,21 @@ _IDENTITY_LINK_RECIPE = "mindbridge-identity-link-v1"
 # nothing, and can stop after any pass.
 _RETENTION_PAGE_SIZE = 1_000
 _INDEX_RECIPE_PREFIX = (
-    "zvec-0.7:hnsw-cosine-m50-efc500:fts-stemmed-plus-bigram:grouped-range:context-keys-v10"
+    "zvec-0.7:hnsw-cosine-m50-efc500:fts-bigram-fused:grouped-range:context-keys-v11"
 )
 # Recipes whose stored embeddings are still correct, so the index is rebuilt from SQLite without
 # paying to embed the content again. A full-text tokenizer change belongs here and not below: it
 # rewrites the derived documents and leaves every vector untouched. Version 9 named its CJK field
 # `fts-dual-language` because it ran a Chinese segmenter, which returned nothing for Japanese or
-# Korean; version 10 tokenizes that field into script-agnostic character bigrams instead.
+# Korean; version 10 tokenized that field into script-agnostic character bigrams but admitted
+# only documents containing a listed script and answered a query from one field or the other by
+# detecting the query's script; version 11 decides what enters the bigram field by what the
+# stemmed field already answers rather than by script, and fuses both routes on any query with
+# something for each, which is what makes a mixed-script query able to reach a Latin-only memory.
 _REINDEXABLE_INDEX_RECIPES = frozenset(
-    "zvec-0.7:hnsw-cosine-m50-efc500:fts-dual-language:grouped-range:"
-    f"context-keys-v9:quantization-{mode.value}"
+    f"zvec-0.7:hnsw-cosine-m50-efc500:{full_text}:grouped-range:"
+    f"context-keys-v{version}:quantization-{mode.value}"
+    for full_text, version in (("fts-dual-language", 9), ("fts-stemmed-plus-bigram", 10))
     for mode in IndexQuantization
 )
 # Recipes that also invalidate the stored embeddings, so reopening pays for a full re-embed.
@@ -342,19 +347,27 @@ _NO_TRANSCRIPTION_SPACE = "none:asr-v1"
 _NO_FACE_SPACE = "none:face-v1"
 _ISO_DATE = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 _LEXICAL_TERM = re.compile(r"\w+")
-# Runs `\w+` cannot split into words, because they are written without spaces and no segmenter
-# is available here: Han ideographs (Chinese, and Japanese kanji) and Japanese kana. What follows
-# is character and adjacent-character bigram splitting, which is script-agnostic, so no Japanese
-# text is handed to a Chinese segmenter by being listed here.
+# Runs `\w+` cannot split into words, because they are written without spaces and no segmenter is
+# available here. What follows is adjacent-character bigram splitting, which is script-agnostic,
+# so no Japanese text is handed to a Chinese segmenter by being listed here.
 #
-# This is deliberately narrower than the identically named predicate in the Zvec index, which
-# also lists Hangul. The two answer different questions. The index one asks which documents need
-# the character-bigram full-text field instead of the English stemmer, and Korean needs it
-# because its particles agglutinate onto the eojeol. This one asks which runs `\w+` fails to
-# split at all, and Korean is space-delimited, so `\w+` already yields eojeol tokens here and
-# per-syllable Hangul terms would only dilute them.
+# This is deliberately narrower than `_ngram_text` in the Zvec index, which strips only Latin
+# words and bigrams whatever is left. The two answer different questions. The index asks what a
+# query could possibly match; this one asks which runs `\w+` fails to split at all, and
+# bigramming a script it already splits would only dilute the word terms the coverage ratio is
+# tuned on. Korean is excluded for that reason: it is space-delimited, so `\w+` yields eojeol.
+#
+# ponytail: an enumerated list of unspaced scripts, and a script missing from it silently gets
+# one useless whole-run term -- which is how Thai went unretrievable. Inverting it to enumerate
+# the space-delimited scripts is worse, not better: that list is far longer, and omitting an
+# entry there breaks a script that works today. Add a range when a corpus needs it.
 _UNSEGMENTED_RUN = re.compile(
     "["
+    "\u0e00-\u0e7f"  # Thai
+    "\u0e80-\u0eff"  # Lao
+    "\u0f00-\u0fff"  # Tibetan
+    "\u1000-\u109f"  # Myanmar
+    "\u1780-\u17ff"  # Khmer
     "\u3040-\u30ff"  # Hiragana and Katakana
     "\u31f0-\u31ff"  # Katakana Phonetic Extensions
     "\u3400-\u4dbf"  # CJK Unified Ideographs Extension A
@@ -364,6 +377,12 @@ _UNSEGMENTED_RUN = re.compile(
     "\U00020000-\U0003ffff"  # CJK Unified Ideographs Extension B and later
     "]+"
 )
+# What the index's ngram tokenizer treats as a token boundary: it is configured with
+# `token_chars` of letter and digit, so everything else separates rather than disappears.
+# Thai and Lao write their vowels and tones as combining marks, which are neither, so a bigram
+# must not be formed across one -- measured against the index, "ยว" matches and the pair that
+# spans the mark before it does not.
+_TOKEN_BREAK = re.compile(r"[\W_]")
 # The Chinese counterpart of `_LEXICAL_NOISE_TERMS`: particles, copulas, prepositions,
 # conjunctions, pronouns, and interrogatives. Stripping them matters more than it does in
 # English, because every one of them otherwise carries IDF weight into the coverage ratio that
@@ -10477,22 +10496,32 @@ def _lexical_relevance(
 
 
 def _lexical_terms(value: str) -> frozenset[str]:
-    """Split text into words, plus characters and adjacent-character bigrams for unspaced runs.
+    """Split text into words, plus adjacent-character bigrams for runs `\\w+` cannot split.
 
-    `\\w+` matches an entire CJK run as one token. That token is by construction the rarest term
-    in any corpus, so it took the largest IDF weight into the coverage ratio and could never
+    `\\w+` matches an entire unspaced run as one token. That token is by construction the rarest
+    term in any corpus, so it took the largest IDF weight into the coverage ratio and could never
     match anything, which put `_LEXICAL_FULL_COVERAGE` — the one term that actually fuses the
     dense and full-text routes — permanently out of reach for every multi-character Chinese
     query. Runs are therefore removed before word splitting rather than left alongside their
-    parts, and re-emitted as characters and bigrams: the dependency-free stand-in for a
-    segmenter, and the reason a query needs an adjacent pair to match rather than one character
-    that happens to appear somewhere.
+    parts, and re-emitted as bigrams: the dependency-free stand-in for a segmenter, and the
+    reason a query needs an adjacent pair to match rather than one character that happens to
+    appear somewhere.
+
+    Bigrams only, and not the single characters as well. Emitting both made the term count a
+    property of the language rather than of the question -- eleven terms for `爱丽丝面包店`
+    against three for the `Alice bakery Tuesday` it translates -- which moved
+    `_LEXICAL_FULL_COVERAGE` out of reach for Chinese at a length it stayed reachable for
+    English. A lone single-character run therefore yields no term at all, and `search` drops the
+    lexical route for such a query. The stemmed full-text field would in fact match it, because
+    the `standard` tokenizer splits Han per character, but a single character is too weak a term
+    to rank on: it would return `lexical_match` with a coverage of zero, contributing candidates
+    and no ranking signal, and the dense route still answers the query.
     """
     normalized = unicodedata.normalize("NFKC", value).casefold()
     terms = set(_LEXICAL_TERM.findall(_UNSEGMENTED_RUN.sub(" ", normalized)))
     for run in _UNSEGMENTED_RUN.findall(normalized):
-        terms.update(run)
-        terms.update(run[index : index + 2] for index in range(len(run) - 1))
+        for piece in _TOKEN_BREAK.split(run):
+            terms.update(piece[index : index + 2] for index in range(len(piece) - 1))
     if _NEGATED_CONTRACTION.search(normalized) is not None:
         terms.add("not")
     return frozenset(terms)

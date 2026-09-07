@@ -150,11 +150,11 @@ def test_lexical_search_preserves_relative_bm25_score_and_all_filters() -> None:
     assert tuple(hit.relevance for hit in hits) == (1.0, 0.5)
     assert all(hit.confidence == 0.0 for hit in hits)
     assert all(hit.lexical_match for hit in hits)
+    # A Latin query has nothing the bigram field could answer that the stemmer does not, so it
+    # runs one route and skips fusion; the mixed-script query below is what needs both.
     assert collection.options == {
-        "queries": {
-            "field_name": "content",
-            "fts": {"match_string": "project review"},
-        },
+        "queries": [{"field_name": "content", "fts": {"match_string": "project review"}}],
+        "reranker": None,
         "topk": 2,
         "filter": (
             "space_id = 'workspace' AND task = 'document' AND "
@@ -255,6 +255,43 @@ def test_create_search_flush_close_and_reopen(tmp_path: Path) -> None:
         assert reopened.search((1.0, 0.0), limit=1, exact=True)[0].id == "embedding_one"
 
 
+def test_a_query_only_fuses_the_routes_that_can_answer_it() -> None:
+    collection = _LexicalCollection([_QueryDocument("first", 0.8)])
+    index = object.__new__(ZvecIndex)
+    index._zvec = _QueryZvec
+    index._collection = collection
+    index._gate = _CollectionGate()
+
+    index.lexical_search("Alice 星期二 bakery", limit=1)
+
+    assert collection.options["queries"] == [
+        {"field_name": "content", "fts": {"match_string": "Alice 星期二 bakery"}},
+        {"field_name": "content_ngram", "fts": {"match_string": "星期二"}},
+    ]
+    assert collection.options["reranker"] == {"rank_constant": 60}
+
+
+def test_punctuation_left_over_from_latin_words_does_not_open_a_second_route() -> None:
+    """Stripping Latin words must leave nothing, not the punctuation between them.
+
+    `"?"` is truthy, so a query ending in one would otherwise fuse a second FTS route that
+    tokenizes to zero terms -- the ngram field takes only letters and digits -- and can never
+    match. Most questions end in punctuation, so this is the common path, not an edge case.
+    """
+    collection = _LexicalCollection([_QueryDocument("first", 0.8)])
+    index = object.__new__(ZvecIndex)
+    index._zvec = _QueryZvec
+    index._collection = collection
+    index._gate = _CollectionGate()
+
+    index.lexical_search("What did Alice buy?", limit=1)
+
+    assert collection.options["queries"] == [
+        {"field_name": "content", "fts": {"match_string": "What did Alice buy?"}}
+    ]
+    assert collection.options["reranker"] is None
+
+
 def test_dense_index_accepts_media_only_document_without_text(tmp_path: Path) -> None:
     _require_zvec()
     with ZvecIndex(tmp_path / "index", dimension=2) as index:
@@ -315,7 +352,7 @@ def test_quantized_vector_indexes_query_and_reopen(
         assert {hit.id for hit in hits} == expected_ids
 
 
-def test_full_text_search_stems_folds_accents_and_routes_chinese(tmp_path: Path) -> None:
+def test_full_text_search_stems_and_folds_accents(tmp_path: Path) -> None:
     _require_zvec()
     with ZvecIndex(tmp_path / "index", dimension=2) as index:
         index.upsert(
@@ -329,9 +366,16 @@ def test_full_text_search_stems_folds_accents_and_routes_chinese(tmp_path: Path)
         assert index.lexical_search("项目复盘", limit=2)[0].id == "chinese"
 
 
-def test_full_text_search_routes_japanese_and_korean_off_the_chinese_segmenter(
+def test_full_text_search_answers_every_script_including_unspaced_ones(
     tmp_path: Path,
 ) -> None:
+    """Every document enters the bigram field, so no script depends on being listed anywhere.
+
+    jieba misses 東京 inside a Japanese sentence and the English stemmer cannot split a Korean
+    eojeol from its particle, which is what the bigram field was added for. Thai is the case that
+    showed listing scripts could not work: it reached neither field, so a query quoting a Thai
+    document verbatim returned nothing at all.
+    """
     _require_zvec()
     with ZvecIndex(tmp_path / "index", dimension=2) as index:
         index.upsert(
@@ -339,16 +383,44 @@ def test_full_text_search_routes_japanese_and_korean_off_the_chinese_segmenter(
                 _document("japanese", "昨日は東京で友達とラーメンを食べました", (1.0, 0.0)),
                 _document("korean", "어제 친구와 함께 서울에서 라면을 먹었습니다", (0.0, 1.0)),
                 _document("chinese", "今天在上海进行项目复盘", (1.0, 1.0)),
+                _document("thai", "อลิซไปร้านเบเกอรี่เมื่อวันอังคาร", (0.5, 0.5)),
             ]
         )
 
-        # jieba misses 東京 inside a Japanese sentence and the English stemmer cannot split a
-        # Korean eojeol from its particle; the character-bigram field answers both.
-        assert [hit.id for hit in index.lexical_search("東京", limit=3)] == ["japanese"]
-        assert [hit.id for hit in index.lexical_search("ラーメン", limit=3)] == ["japanese"]
-        assert [hit.id for hit in index.lexical_search("서울", limit=3)] == ["korean"]
-        assert [hit.id for hit in index.lexical_search("라면", limit=3)] == ["korean"]
-        assert [hit.id for hit in index.lexical_search("项目复盘", limit=3)] == ["chinese"]
+        assert [hit.id for hit in index.lexical_search("東京", limit=4)] == ["japanese"]
+        assert [hit.id for hit in index.lexical_search("ラーメン", limit=4)] == ["japanese"]
+        assert [hit.id for hit in index.lexical_search("서울", limit=4)] == ["korean"]
+        assert [hit.id for hit in index.lexical_search("라면", limit=4)] == ["korean"]
+        assert [hit.id for hit in index.lexical_search("项目复盘", limit=4)] == ["chinese"]
+        assert [hit.id for hit in index.lexical_search("ร้านเบเกอรี่", limit=4)] == ["thai"]
+
+
+def test_full_text_search_reaches_a_latin_document_from_a_mixed_script_query(
+    tmp_path: Path,
+) -> None:
+    """One CJK character in a query must not cost it the stemmed route.
+
+    Routing a query to a single field by script did exactly that: `content_ngram` held nothing
+    for a Latin-only document, so the memory this query quotes two words of was unreachable.
+    """
+    _require_zvec()
+    with ZvecIndex(tmp_path / "index", dimension=2) as index:
+        index.upsert(
+            [
+                _document(
+                    "english",
+                    "Alice went to the bakery on Tuesday and bought sourdough bread",
+                    (1.0, 0.0),
+                ),
+                _document("chinese", "爱丽丝星期二去面包店买了酸面包", (0.0, 1.0)),
+            ]
+        )
+
+        assert {hit.id for hit in index.lexical_search("Alice 星期二 bakery", limit=2)} == {
+            "english",
+            "chinese",
+        }
+        assert "english" in {hit.id for hit in index.lexical_search("sourdough 面包", limit=2)}
 
 
 def test_schema_optimizes_time_ranges_and_automatic_maintenance(tmp_path: Path) -> None:
@@ -704,6 +776,7 @@ class _LexicalCollection:
 class _QueryZvec:
     Query = dict
     Fts = dict
+    RrfReRanker = dict
 
 
 class _DenseZvec:
