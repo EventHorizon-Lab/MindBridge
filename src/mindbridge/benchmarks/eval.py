@@ -1534,10 +1534,11 @@ def _execute(
     streamed: set[str] = set()
 
     @contextmanager
-    def exclude_judge_measurement() -> Iterator[None]:
-        # Immediate judging is part of reporting cadence, not product execution. Keep it between
-        # tasks for prompt feedback, but split both client and server accounting around it so a
-        # shared generation/judge endpoint does not acquire judge tokens or time.
+    def exclude_task_tail_measurement() -> Iterator[None]:
+        # Immediate judging and interim reporting are not product execution. Keep them between
+        # tasks for prompt feedback, but split both client and server accounting around the whole
+        # tail so a shared endpoint does not acquire judge traffic and client measurements do not
+        # acquire bootstrap aggregation or console-I/O time.
         with sampler.exclude():
             before = {
                 name: capture_metrics(
@@ -1568,7 +1569,7 @@ def _execute(
             telemetry=telemetry,
             memory_config=memory_config,
             streamed=streamed,
-            exclude_judge_measurement=exclude_judge_measurement,
+            exclude_task_tail_measurement=exclude_task_tail_measurement,
         )
         response_cache = (
             None
@@ -1685,7 +1686,7 @@ def _task_completion(
     telemetry: EvaluationTelemetry,
     memory_config: MindBridgeConfig | None,
     streamed: set[str],
-    exclude_judge_measurement: Callable[[], AbstractContextManager[None]] | None = None,
+    exclude_task_tail_measurement: Callable[[], AbstractContextManager[None]] | None = None,
 ) -> _TaskCompletion:
     """Build the per-task tail: persist, then normally score and print immediately.
 
@@ -1713,10 +1714,15 @@ def _task_completion(
             partial.flush()
             os.fsync(partial.fileno())
         if arguments.stream_results:
-            task_samples = _with_grounding_loss(task_samples, telemetry)
-            if not arguments.predict_only:
-                measurement_exclusion = exclude_judge_measurement or nullcontext
-                with measurement_exclusion():
+            measurement_exclusion = (
+                exclude_task_tail_measurement
+                if exclude_task_tail_measurement is not None
+                and (not arguments.predict_only or not arguments.quiet)
+                else nullcontext
+            )
+            with measurement_exclusion():
+                task_samples = _with_grounding_loss(task_samples, telemetry)
+                if not arguments.predict_only:
                     task_samples = await _apply_judges(
                         (task,),
                         task_samples,
@@ -1724,24 +1730,26 @@ def _task_completion(
                         config=judge_config,
                         tracer=telemetry.tracer,
                     )
-            streamed.update(sample.sample_id for sample in task_samples)
-            if not arguments.quiet:
-                _announce(f"interim results for {task.spec.name} (later tasks still running)")
-                print(
-                    _table(
-                        {
-                            "tasks": _task_rows(
-                                arguments,
-                                (task,),
-                                task_samples,
-                                batch_sizes,
-                                _task_performance(telemetry, (task,), task_samples, arguments.arms),
-                                None,
-                                memory_config=memory_config,
-                            )
-                        }
+                streamed.update(sample.sample_id for sample in task_samples)
+                if not arguments.quiet:
+                    _announce(f"interim results for {task.spec.name} (later tasks still running)")
+                    print(
+                        _table(
+                            {
+                                "tasks": _task_rows(
+                                    arguments,
+                                    (task,),
+                                    task_samples,
+                                    batch_sizes,
+                                    _task_performance(
+                                        telemetry, (task,), task_samples, arguments.arms
+                                    ),
+                                    None,
+                                    memory_config=memory_config,
+                                )
+                            }
+                        )
                     )
-                )
         return task_samples
 
     return completed
@@ -5110,6 +5118,7 @@ def _write_artifacts(
 
 
 _SECRET_CONFIG_KEYS = frozenset({"api_key", "authorization", "password", "secret", "token"})
+_OPAQUE_CONFIG_KEYS = frozenset({"extra_body"})
 
 
 def _config_artifact(
@@ -5181,11 +5190,20 @@ def _config_artifact(
 def _secret_free_yaml_value(value: object) -> object:
     """Convert a resolved config tree to safe YAML primitives and omit credential fields."""
     if isinstance(value, Mapping):
-        return {
-            str(key): _secret_free_yaml_value(item)
-            for key, item in value.items()
-            if str(key).casefold() not in _SECRET_CONFIG_KEYS
-        }
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            name = str(key)
+            normalized = name.casefold()
+            if normalized in _SECRET_CONFIG_KEYS:
+                continue
+            # Provider-specific request bodies are intentionally unconstrained and can carry
+            # credentials under arbitrary names. Their values cannot be proven safe by a key
+            # blacklist, so retain only whether the effective request configured one.
+            if normalized in _OPAQUE_CONFIG_KEYS and item:
+                result[name] = {"configured": True, "values": "omitted"}
+                continue
+            result[name] = _secret_free_yaml_value(item)
+        return result
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, (set, frozenset)):

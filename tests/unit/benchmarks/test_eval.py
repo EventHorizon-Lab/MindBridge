@@ -3408,6 +3408,10 @@ generation:
   provider: openai
   model: configured-model
   api_key: configured-generation-secret
+  extra_body:
+    auth_token: provider-body-secret
+    nested:
+      X-API-Key: nested-provider-secret
 benchmark:
   judge:
     model: configured-judge
@@ -3462,6 +3466,10 @@ benchmark:
         "credentials": "omitted",
     }
     assert document["product"]["generation"]["model"] == "cli-model"
+    assert document["product"]["generation"]["extra_body"] == {
+        "configured": True,
+        "values": "omitted",
+    }
     assert document["benchmark"]["judge"]["model"] == "cli-judge"
     assert document["benchmark"]["run"]["limit"] == 1
 
@@ -4483,12 +4491,20 @@ def test_stream_results_judges_one_task_before_printing_it(
     streamed: set[str] = set()
     measurement_events: list[str] = []
 
-    class ExcludeJudge:
+    class ExcludeTail:
         def __enter__(self) -> None:
             measurement_events.append("enter")
 
         def __exit__(self, *_args: object) -> None:
             measurement_events.append("exit")
+
+    original_table = eval_module._table
+
+    def table(results: dict[str, object]) -> str:
+        assert measurement_events == ["enter"]
+        return original_table(results)
+
+    monkeypatch.setattr(eval_module, "_table", table)
 
     async def judge(answered: SampleResult, plan: object, **_kwargs: object) -> SampleResult:
         assert plan is not None
@@ -4505,7 +4521,7 @@ def test_stream_results_judges_one_task_before_printing_it(
             telemetry=telemetry,
             memory_config=None,
             streamed=streamed,
-            exclude_judge_measurement=ExcludeJudge,
+            exclude_task_tail_measurement=ExcludeTail,
         )
         scored = asyncio.run(_completion(completed, task, (sample,)))
     finally:

@@ -443,7 +443,7 @@ def local_scores(  # noqa: C901 - direct task dispatch mirrors official scorer f
         scores.update(_gallery_retrieval(metadata, evidence_source_ids))
         return scores
     if family == "es-memeval":
-        return {"f1": _es_memeval_f1(prediction, references[0])}
+        return {"f1": _es_memeval_f1(_es_memeval_prediction(prediction), references[0])}
     return {}
 
 
@@ -636,7 +636,7 @@ def judge_plan(  # noqa: C901 - direct task dispatch keeps official protocols au
         prompt = _ES_MEMEVAL_JUDGE_PROMPT.format(
             question=question,
             gold=reference,
-            prediction=prediction,
+            prediction=_es_memeval_prediction(prediction),
         )
         return JudgePlan(
             protocol,
@@ -1010,6 +1010,11 @@ def _locomo_f1(prediction: str, reference: str) -> float:
         return 0.0
     precision, recall = overlap / len(predicted), overlap / len(expected)
     return 2 * precision * recall / (precision + recall)
+
+
+def _es_memeval_prediction(value: str) -> str:
+    """Apply the released QA runner's post-generation cleanup."""
+    return value.replace("*", "").replace("#", "").strip("Answer:").strip()
 
 
 def _es_memeval_f1(prediction: str, reference: str) -> float:

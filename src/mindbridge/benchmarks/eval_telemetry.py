@@ -1534,7 +1534,9 @@ class ResourceSampler:
                 "exclusive_attribution": False,
                 "wall_seconds": measured_wall_seconds,
                 "excluded_window_count": len(self._excluded_intervals),
-                "excluded_windows": "per-task judge and its metrics snapshots",
+                "excluded_windows": (
+                    "per-task judging, interim aggregation, reporting, and metrics snapshots"
+                ),
                 "judge_traffic_excluded": True,
                 "storage_scope": "selected_run_directories",
                 "storage_root_count": len(self._storage_roots),
