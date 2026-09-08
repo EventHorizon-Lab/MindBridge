@@ -28,7 +28,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   under either cadence.
 - Completed `eval` output directories now retain `config.yaml` as a resolved comparison manifest.
   It records the effective product, judge, download, server-observation, and run settings after
-  file, environment, and command-line precedence, while omitting every API credential.
+  file, environment, and command-line precedence, while omitting every API credential and the
+  values of unconstrained provider-specific `extra_body` mappings.
 - `ask_stream()` on `Memory` and `AsyncMemory`, and the `AnswerChunk` value it yields. `ask()`
   already consumed a provider's token stream, timed the first token into the
   `mindbridge.model.time_to_first_token` span attribute, and then returned only the joined text,

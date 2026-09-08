@@ -932,8 +932,9 @@ Each completed `eval` output directory contains:
 
 - `config.yaml`: a resolved comparison manifest containing the effective product, judge, download,
   server-observation, and run settings after file, environment, and command-line precedence. API
-  credentials are omitted. This generated manifest describes the completed run; it is not intended
-  to be passed back to `--config` as an input document.
+  credentials and unconstrained provider-specific `extra_body` values are omitted. This generated
+  manifest describes the completed run; it is not intended to be passed back to `--config` as an
+  input document.
 - `samples.jsonl`: one prediction and its native metrics, evidence intervals, retrieval diagnostics,
   `ranked_source_ids_complete`, and structured failure fields per sample, per arm.
 - `results.jsonl`: one aggregate record with dataset and implementation pins, arm definitions,
