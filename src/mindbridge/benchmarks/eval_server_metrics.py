@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.request import Request, urlopen
@@ -89,8 +89,14 @@ def metrics_window(
     before: MetricsSnapshot,
     *,
     timeout_seconds: float = 5.0,
+    excluded: Sequence[tuple[MetricsSnapshot, MetricsSnapshot]] = (),
 ) -> dict[str, object]:
-    """Take the closing snapshot and report process-global deltas for the window."""
+    """Take the closing snapshot and report process-global deltas for the window.
+
+    ``excluded`` names completed sub-windows, such as an in-between judge pass, whose counter
+    deltas must not be attributed to product execution. Gauges remain the outer window's endpoint
+    readings because they are instantaneous rather than cumulative.
+    """
     after = capture_metrics(url, timeout_seconds=timeout_seconds)
     result: dict[str, object] = {
         "scope": "server_process_global",
@@ -99,19 +105,31 @@ def metrics_window(
         "metrics_url": url,
         "started_at": before.captured_at,
         "ended_at": after.captured_at,
+        "excluded_window_count": len(excluded),
     }
-    if not before.available or not after.available:
+    unavailable_exclusion = next(
+        ((start, end) for start, end in excluded if not start.available or not end.available),
+        None,
+    )
+    if not before.available or not after.available or unavailable_exclusion is not None:
+        exclusion_start, exclusion_end = (
+            (None, None) if unavailable_exclusion is None else unavailable_exclusion
+        )
         result.update(
             status="unavailable",
             start_error_type=before.error_type,
             end_error_type=after.error_type,
+            exclusion_start_error_type=(
+                None if exclusion_start is None else exclusion_start.error_type
+            ),
+            exclusion_end_error_type=None if exclusion_end is None else exclusion_end.error_type,
         )
         return result
 
     resets: list[str] = []
     counters: dict[str, object] = {}
     for name in COUNTERS:
-        delta = _counter_delta(before, after, name)
+        delta = _counter_delta_excluding(before, after, name, excluded)
         if delta is None and name in before.values and name in after.values:
             resets.append(name)
         if name in before.values or name in after.values:
@@ -123,8 +141,8 @@ def metrics_window(
 
     histograms: dict[str, object] = {}
     for name in HISTOGRAMS:
-        count_delta = _counter_delta(before, after, f"{name}_count")
-        sum_delta = _counter_delta(before, after, f"{name}_sum")
+        count_delta = _counter_delta_excluding(before, after, f"{name}_count", excluded)
+        sum_delta = _counter_delta_excluding(before, after, f"{name}_sum", excluded)
         if (
             count_delta is None
             and f"{name}_count" in before.values
@@ -159,7 +177,12 @@ def metrics_window(
     }
     result.update(
         status="partial" if resets else "ok",
-        request_count_delta=_counter_delta(before, after, "vllm:request_success_total"),
+        request_count_delta=_counter_delta_excluding(
+            before,
+            after,
+            "vllm:request_success_total",
+            excluded,
+        ),
         counters=counters,
         histograms=histograms,
         gauges=gauges,
@@ -193,6 +216,27 @@ def _counter_delta(before: MetricsSnapshot, after: MetricsSnapshot, name: str) -
     if start is None or end is None or end < start:
         return None
     return end - start
+
+
+def _counter_delta_excluding(
+    before: MetricsSnapshot,
+    after: MetricsSnapshot,
+    name: str,
+    excluded: Sequence[tuple[MetricsSnapshot, MetricsSnapshot]],
+) -> float | None:
+    total = _counter_delta(before, after, name)
+    if total is None:
+        return None
+    removed = 0.0
+    for start, end in excluded:
+        delta = _counter_delta(start, end, name)
+        if delta is None:
+            # A series that exists in the outer snapshots but disappears or resets inside an
+            # exclusion cannot be separated safely. Refuse the delta instead of retaining judge
+            # traffic under a deceptively precise number.
+            return None
+        removed += delta
+    return max(0.0, total - removed)
 
 
 def _series_average(snapshot: MetricsSnapshot, name: str) -> float | None:

@@ -26,7 +26,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from importlib import metadata
@@ -237,6 +237,7 @@ _FULL_CONTEXT_SYSTEM_PROMPT = (
 DEFAULT_BOOTSTRAP_SAMPLES = 2_000
 _RESULTS_FILE = "results.jsonl"
 _SAMPLES_FILE = "samples.jsonl"
+_CONFIG_FILE = "config.yaml"
 # Written task by task while the run is still going, and removed once the real artifacts land. A
 # multi-task run used to hold every sample in memory until the last task finished, so an upstream
 # outage during task five threw away four tasks of answers. This file is never an evaluation
@@ -280,6 +281,7 @@ _BREAKDOWN_FIELDS: Mapping[str, tuple[str, ...]] = {
     "atm-bench": ("qtype",),
     "mem-gallery": ("point",),
     "longmemeval": ("question_type",),
+    "es-memeval": ("capability",),
     "clbench": ("context_category", "sub_category"),
     "beam": ("category", "difficulty"),
     "personamem-v3": ("task_family", "task_type"),
@@ -1256,7 +1258,20 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
     )
     if performance_rows:
         results["performance_comparisons"] = performance_rows
-    _write_artifacts(arguments, samples, results, submission_bytes)
+    _write_artifacts(
+        arguments,
+        samples,
+        results,
+        submission_bytes,
+        config_bytes=_config_artifact(
+            arguments,
+            config,
+            judge_config,
+            memory_config,
+            download,
+            overrides.server_metrics,
+        ),
+    )
     _announce_submission(arguments, submission_status)
     for reason in _uninterpretable_tasks(results):
         _announce(f"UNINTERPRETABLE: {reason}")
@@ -1442,6 +1457,7 @@ def _server_metric_results(
     config: ModelConfig,
     memory_config: MindBridgeConfig | None,
     cache_only: bool,
+    excluded: Mapping[str, Sequence[tuple[MetricsSnapshot, MetricsSnapshot]]] | None = None,
 ) -> dict[str, object]:
     endpoints = _server_metrics_endpoints(settings)
     result: dict[str, object] = {}
@@ -1460,8 +1476,10 @@ def _server_metric_results(
                     url,
                     starts[name],
                     timeout_seconds=settings.timeout_seconds,
+                    excluded=() if excluded is None else excluded.get(name, ()),
                 ),
                 "phase": "product_execution_including_post_answer_search_replay",
+                "judge_traffic_excluded": True,
             }
     if "generation" not in result:
         result["generation"] = unavailable_server_resources(base_url=config.generation_base_url)
@@ -1508,8 +1526,40 @@ def _execute(
         )
     )
     metrics_settings = ServerMetricsOverrides() if server_metrics is None else server_metrics
+    metric_endpoints = _server_metrics_endpoints(metrics_settings)
+    metric_exclusions: dict[str, list[tuple[MetricsSnapshot, MetricsSnapshot]]] = {
+        name: [] for name in metric_endpoints
+    }
     embedding_warmup_count = 0
     streamed: set[str] = set()
+
+    @contextmanager
+    def exclude_judge_measurement() -> Iterator[None]:
+        # Immediate judging is part of reporting cadence, not product execution. Keep it between
+        # tasks for prompt feedback, but split both client and server accounting around it so a
+        # shared generation/judge endpoint does not acquire judge tokens or time.
+        with sampler.exclude():
+            before = {
+                name: capture_metrics(
+                    url,
+                    timeout_seconds=metrics_settings.timeout_seconds,
+                )
+                for name, url in metric_endpoints.items()
+            }
+            try:
+                yield
+            finally:
+                for name, url in metric_endpoints.items():
+                    metric_exclusions[name].append(
+                        (
+                            before[name],
+                            capture_metrics(
+                                url,
+                                timeout_seconds=metrics_settings.timeout_seconds,
+                            ),
+                        )
+                    )
+
     try:
         task_completed = _task_completion(
             arguments,
@@ -1518,6 +1568,7 @@ def _execute(
             telemetry=telemetry,
             memory_config=memory_config,
             streamed=streamed,
+            exclude_judge_measurement=exclude_judge_measurement,
         )
         response_cache = (
             None
@@ -1592,6 +1643,7 @@ def _execute(
                     config=config,
                     memory_config=memory_config,
                     cache_only=all_cached,
+                    excluded=metric_exclusions,
                 )
             finally:
                 if pool is not None:
@@ -1633,13 +1685,14 @@ def _task_completion(
     telemetry: EvaluationTelemetry,
     memory_config: MindBridgeConfig | None,
     streamed: set[str],
+    exclude_judge_measurement: Callable[[], AbstractContextManager[None]] | None = None,
 ) -> _TaskCompletion:
-    """Build the per-task tail: always persist, and under `--stream-results` also score and print.
+    """Build the per-task tail: persist, then normally score and print immediately.
 
     Answering every task before anything is written or scored made a multi-task run silent until
     the last task finished, and made an outage during the last task discard every earlier task's
-    answers. The crash copy costs nothing and is always written; judging early is opt-in because
-    its traffic overlaps later tasks' answers and moves their latency and token measurements.
+    answers. The crash copy costs nothing and is always written. Immediate judging is the default;
+    `--no-stream-results` retains the former run-global scoring pass when explicitly requested.
     """
     partial_path = arguments.output_path / _PARTIAL_SAMPLES_FILE
     partial_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1662,13 +1715,15 @@ def _task_completion(
         if arguments.stream_results:
             task_samples = _with_grounding_loss(task_samples, telemetry)
             if not arguments.predict_only:
-                task_samples = await _apply_judges(
-                    (task,),
-                    task_samples,
-                    arguments=arguments,
-                    config=judge_config,
-                    tracer=telemetry.tracer,
-                )
+                measurement_exclusion = exclude_judge_measurement or nullcontext
+                with measurement_exclusion():
+                    task_samples = await _apply_judges(
+                        (task,),
+                        task_samples,
+                        arguments=arguments,
+                        config=judge_config,
+                        tracer=telemetry.tracer,
+                    )
             streamed.update(sample.sample_id for sample in task_samples)
             if not arguments.quiet:
                 _announce(f"interim results for {task.spec.name} (later tasks still running)")
@@ -3950,6 +4005,11 @@ def _measurement_protocol(
         "answer_e2e_includes_request_admission": True,
         "post_answer_search_replay_in_client_resource_window": True,
         "judge_in_client_resource_window": False,
+        "judge_measurement_exclusion": (
+            "interleaved sub-windows removed from client and model-server counters"
+            if getattr(arguments, "stream_results", False) and not arguments.predict_only
+            else "judging runs after the product measurement window"
+        ),
     }
 
 
@@ -4191,7 +4251,13 @@ def _metrics(
         uses_judge = any(
             sample.judge_model is not None and metric_name in sample.metrics for sample in samples
         )
-        clamp = (0.0, 5.0) if metric_name == "judge_score_0_5" else (0.0, 1.0)
+        clamp = (
+            (0.0, 5.0)
+            if metric_name == "judge_score_0_5"
+            else (0.0, 2.0)
+            if metric_name == "judge_score_0_2"
+            else (0.0, 1.0)
+        )
         metric_rows[metric_name] = {
             "official_metric": official(metric_name, uses_judge=uses_judge),
             **summarize(
@@ -5019,6 +5085,8 @@ def _write_artifacts(
     samples: Sequence[SampleResult],
     results: Mapping[str, object],
     submission: bytes | None,
+    *,
+    config_bytes: bytes | None = None,
 ) -> None:
     samples_bytes = _jsonl_bytes(sample.json() for sample in samples)
     document = dict(results)
@@ -5032,11 +5100,102 @@ def _write_artifacts(
         (arguments.output_path / _SAMPLES_FILE, samples_bytes),
         (arguments.output_path / _RESULTS_FILE, results_bytes),
     ]
+    if config_bytes is not None:
+        files.append((arguments.output_path / _CONFIG_FILE, config_bytes))
     if submission is not None:
         files.append((submission_path, submission))
     _atomic_replace(files)
     # The real samples file now holds everything the crash copy did.
     (arguments.output_path / _PARTIAL_SAMPLES_FILE).unlink(missing_ok=True)
+
+
+_SECRET_CONFIG_KEYS = frozenset({"api_key", "authorization", "password", "secret", "token"})
+
+
+def _config_artifact(
+    arguments: _Arguments,
+    config: ModelConfig,
+    judge_config: _JudgeConfig,
+    memory_config: MindBridgeConfig | None,
+    download: DownloadSettings,
+    server_metrics: ServerMetricsOverrides,
+) -> bytes:
+    """Serialize the resolved run configuration without serializing credentials.
+
+    This is a comparison manifest, not a byte-for-byte copy of the input file: flags and
+    environment values may override that file, and every OpenAI-compatible block can contain an
+    API key. Keeping the resolved, secret-free values is both safer and the only snapshot that
+    describes the run that produced the neighboring results.
+    """
+    product = (
+        {
+            "embedding": {"provider": "jina-omni"},
+            "generation": {
+                "provider": "openai",
+                "base_url": config.generation_base_url,
+                "model": config.generation_model,
+                "timeout": config.timeout_seconds,
+                "modalities": sorted(modality.value for modality in config.generation_capabilities),
+                "min_video_seconds": config.generation_min_video_seconds,
+            },
+        }
+        if memory_config is None
+        else _memory_config_payload(memory_config)
+    )
+    run = {
+        item.name: getattr(arguments, item.name)
+        for item in fields(_Arguments)
+        # These raw strings either duplicate resolved blocks below or, for judge arguments, may
+        # themselves contain an API key. The source config path is provenance, not run behavior.
+        if item.name not in {"judge_model_args", "memory_config"}
+    }
+    document = {
+        "artifact": {
+            "kind": "mindbridge-bench-effective-config",
+            "schema_version": 1,
+            "credentials": "omitted",
+        },
+        "product": product,
+        "benchmark": {
+            "judge": {
+                "model": judge_config.model,
+                "base_url": judge_config.base_url,
+                "timeout_seconds": judge_config.timeout_seconds,
+                "concurrency": judge_config.concurrency,
+            },
+            "download": {
+                "benchmarks_root": download.benchmarks_root,
+                "data_root": download.data_root,
+                "hf_home": download.hf_home,
+                "hf_endpoint": download.hf_endpoint,
+                "youtube_sleep_seconds": download.youtube_sleep_seconds,
+            },
+            "server_metrics": server_metrics.model_dump(mode="json"),
+            "run": run,
+        },
+    }
+    safe = _secret_free_yaml_value(document)
+    return yaml.safe_dump(safe, allow_unicode=True, sort_keys=True).encode("utf-8")
+
+
+def _secret_free_yaml_value(value: object) -> object:
+    """Convert a resolved config tree to safe YAML primitives and omit credential fields."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _secret_free_yaml_value(item)
+            for key, item in value.items()
+            if str(key).casefold() not in _SECRET_CONFIG_KEYS
+        }
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (set, frozenset)):
+        return [_secret_free_yaml_value(item) for item in sorted(value, key=str)]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_secret_free_yaml_value(item) for item in value]
+    if isinstance(value, SecretStr):
+        # Defensive fallback for a future credential field whose name is not yet `api_key`.
+        return "<redacted>"
+    return value
 
 
 def _atomic_replace(files: Sequence[tuple[Path, bytes]]) -> None:
@@ -5521,12 +5680,11 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--stream-results",
         "--stream_results",
-        action="store_true",
-        default=None,
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
         help=(
-            "judge and print each task's table as soon as that task finishes answering, instead "
-            "of only after the last task; the judging traffic then overlaps later tasks' answers, "
-            "so their latency and token measurements are no longer comparable with a normal run"
+            "judge and print each task's table as soon as that task finishes answering (default); "
+            "use --no-stream-results to defer all judging until every task has answered"
         ),
     )
     parser.add_argument("--allow-unverified-data", action="store_true", default=None)
@@ -5622,7 +5780,7 @@ def _arguments(
     regression_threshold = _picked(parsed.regression_threshold, run.regression_threshold, 0.0)
     predict_only = _picked(parsed.predict_only, run.predict_only, False)
     log_samples = _picked(parsed.log_samples, run.log_samples, False)
-    stream_results = _picked(parsed.stream_results, run.stream_results, False)
+    stream_results = _picked(getattr(parsed, "stream_results", None), run.stream_results, True)
     allow_unverified = _picked(parsed.allow_unverified_data, run.allow_unverified_data, False)
     download_inputs = _picked(parsed.download, run.download, True)
     overwrite = _picked(parsed.overwrite, run.overwrite, False)
@@ -6173,7 +6331,7 @@ def _require_output(path: Path, *, overwrite: bool, resume: bool = False) -> Non
     # written to recover from it. The finished artifacts still need `--overwrite`, because a run
     # that wrote them is not one to resume.
     guarded = (_RESULTS_FILE, _SAMPLES_FILE, _EGOMEM_SUBMISSION_FILE)
-    for name in guarded if resume else (*guarded, _PARTIAL_SAMPLES_FILE):
+    for name in guarded if resume else (*guarded, _PARTIAL_SAMPLES_FILE, _CONFIG_FILE):
         target = path / name
         if target.exists() and not overwrite:
             raise FileExistsError(f"evaluation artifact already exists: {target}")

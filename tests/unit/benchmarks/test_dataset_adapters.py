@@ -1026,3 +1026,112 @@ def test_longmemeval_reports_no_gold_evidence_when_the_release_marks_no_turn(
 
     assert question.metadata["evidence_ids"] == ()
     assert question.metadata["answer_session_ids"] == ("s1",)
+
+
+def test_es_memeval_qa_keeps_session_memory_and_visible_evidence_only(tmp_path: Path) -> None:
+    dataset = _write(
+        tmp_path / "es-memeval" / "data" / "evo_emo.json",
+        [
+            {
+                "id": "p1",
+                "basic_info": {"name": "Sarah"},
+                "dialog_history": [
+                    {
+                        "id": "conv1",
+                        "timestamp": "2025-01-02",
+                        "dialogue": [
+                            {"idx": 1, "role": "seeker", "content": "I started painting."},
+                            {"idx": 2, "role": "supporter", "content": "That sounds calming."},
+                        ],
+                    },
+                    {
+                        "id": "conv2",
+                        "timestamp": "2025-02-03",
+                        "dialogue": [
+                            {"idx": 1, "role": "seeker", "content": "I still paint."},
+                        ],
+                    },
+                ],
+                "questions": [
+                    {
+                        "id": "timeline",
+                        "questions": [
+                            {
+                                "idx": 1,
+                                "capability": "information extraction",
+                                "question": "What hobby did Sarah start?",
+                                "answer": "Painting",
+                                # Event annotations and malformed IDs are not
+                                # visible inputs. Both turn IDs map to the one
+                                # session document used by the upstream RAG QA.
+                                "evidence": ["event1", "conv1:1", "conv1:2", "bad:9"],
+                            },
+                            {
+                                "idx": 2,
+                                "capability": "abstention",
+                                "question": "What brand of paint did she buy?",
+                                "answer": "Unknown",
+                                "evidence": [],
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+
+    unit = load_task(
+        TASKS["es-memeval-qa"], root=tmp_path, dataset_path=dataset, verify_digest=False
+    ).units[0]
+
+    assert unit.unit_id == "p1"
+    assert [memory.source_id for memory in unit.memories] == ["conv1", "conv2"]
+    assert unit.memories[0].content == (
+        "[2025-01-02]\nSarah: I started painting.\nsupporter: That sounds calming.",
+    )
+    assert unit.questions[0].metadata["evidence_ids"] == ("conv1",)
+    assert unit.questions[0].metadata["annotation_evidence_ids"] == (
+        "event1",
+        "conv1:1",
+        "conv1:2",
+        "bad:9",
+    )
+    assert unit.questions[0].reference_at == unit.memories[-1].occurred_at
+    assert unit.questions[1].refusal == "unknown"
+    assert unit.questions[1].metadata["abstention"] is True
+
+
+def test_es_memeval_rejects_unknown_dialogue_roles(tmp_path: Path) -> None:
+    dataset = _write(
+        tmp_path / "evo_emo.json",
+        [
+            {
+                "id": "p1",
+                "basic_info": {"name": "Sarah"},
+                "dialog_history": [
+                    {
+                        "id": "conv1",
+                        "timestamp": "2025-01-02",
+                        "dialogue": [{"idx": 1, "role": "observer", "content": "Text"}],
+                    }
+                ],
+                "questions": [
+                    {
+                        "id": "timeline",
+                        "questions": [
+                            {
+                                "idx": 1,
+                                "capability": "abstention",
+                                "question": "Question?",
+                                "answer": "Unknown",
+                                "evidence": [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="invalid ES-MemEval dialogue role"):
+        load_task(TASKS["es-memeval-qa"], root=tmp_path, dataset_path=dataset, verify_digest=False)

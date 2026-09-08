@@ -98,6 +98,47 @@ def test_metrics_window_marks_counter_resets_partial(monkeypatch: pytest.MonkeyP
     assert result["counter_resets"] == ["vllm:request_success_total"]
 
 
+def test_metrics_window_subtracts_interleaved_judge_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def snapshot(label: str, requests: float, tokens: float) -> MetricsSnapshot:
+        return MetricsSnapshot(
+            label,
+            {
+                "vllm:request_success_total": requests,
+                "vllm:prompt_tokens_total": tokens,
+                "vllm:e2e_request_latency_seconds_sum": requests * 2,
+                "vllm:e2e_request_latency_seconds_count": requests,
+            },
+            {},
+        )
+
+    before = snapshot("start", 10, 100)
+    judge_start = snapshot("judge-start", 12, 120)
+    judge_end = snapshot("judge-end", 15, 180)
+    after = snapshot("end", 19, 260)
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.eval_server_metrics.capture_metrics",
+        lambda *_args, **_kwargs: after,
+    )
+
+    result = cast(
+        dict[str, Any],
+        metrics_window(
+            "https://models.example/metrics",
+            before,
+            excluded=((judge_start, judge_end),),
+        ),
+    )
+
+    assert result["excluded_window_count"] == 1
+    assert result["request_count_delta"] == 6.0
+    assert result["counters"]["vllm:prompt_tokens_total"]["delta"] == 100.0
+    histogram = result["histograms"]["vllm:e2e_request_latency_seconds"]
+    assert histogram["count_delta"] == 6.0
+    assert histogram["sum_delta"] == 12.0
+
+
 def test_metrics_window_preserves_snapshot_failure_without_aborting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

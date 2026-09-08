@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import yaml
 from opentelemetry import trace
 from opentelemetry.trace import Tracer
 from pydantic import ValidationError
@@ -186,6 +187,7 @@ def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
         "EgoLifeQA",
         "EgoMemReason",
         "EgoTempo",
+        "ES-MemEval",
         "LoCoMo-Refined",
         "LongMemEval",
         "M3-Bench",
@@ -207,6 +209,7 @@ def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
     assert expand(("video-*",)) == ("video-mme", "video-mme-v2")
     assert expand(("open-eqa",)) == ("openeqa-hm3d", "openeqa-scannet")
     assert expand(("openeqa-scannet-v0",)) == ("openeqa-scannet",)
+    assert expand(("evoemo",)) == ("es-memeval-qa",)
     assert all(
         task.media_source.revision is None or len(task.media_source.revision) == 40
         for task in TASKS.values()
@@ -599,14 +602,23 @@ def test_egomem_submission_is_upload_ready_only_when_complete(tmp_path: Path) ->
         eval_module._Arguments,
         SimpleNamespace(output_path=tmp_path, overwrite=True),
     )
-    eval_module._write_artifacts(arguments, samples[:1], {}, content)
+    config_bytes = b"generation:\n  provider: openai\n"
+    eval_module._write_artifacts(
+        arguments,
+        samples[:1],
+        {},
+        content,
+        config_bytes=config_bytes,
+    )
     submission_path = tmp_path / "egomemreason_submission.json"
     assert submission_path.read_bytes() == content
     assert {path.name for path in tmp_path.iterdir()} == {
         "egomemreason_submission.json",
+        "config.yaml",
         "results.jsonl",
         "samples.jsonl",
     }
+    assert (tmp_path / "config.yaml").read_bytes() == config_bytes
     for path in (tmp_path / "results.jsonl", tmp_path / "samples.jsonl"):
         assert all(isinstance(json.loads(line), dict) for line in path.read_bytes().splitlines())
     eval_module._write_artifacts(arguments, samples[:1], {}, None)
@@ -3085,6 +3097,7 @@ _EXPECTED_BREAKDOWN_FIELDS: dict[str, tuple[str, ...]] = {
     "atm-bench": ("qtype",),
     "mem-gallery": ("point",),
     "longmemeval": ("question_type",),
+    "es-memeval": ("capability",),
     "clbench": ("context_category", "sub_category"),
     "beam": ("category", "difficulty"),
     "personamem-v3": ("task_family", "task_type"),
@@ -3385,6 +3398,85 @@ def test_eval_config_reports_the_yaml_error_position(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="invalid YAML at line"):
         eval_module._load_memory_config(path)
+
+
+def test_eval_config_artifact_records_effective_values_without_credentials(tmp_path: Path) -> None:
+    path = tmp_path / "eval.yaml"
+    path.write_text(
+        """
+generation:
+  provider: openai
+  model: configured-model
+  api_key: configured-generation-secret
+benchmark:
+  judge:
+    model: configured-judge
+    api_key: configured-judge-secret
+""",
+        encoding="utf-8",
+    )
+    memory_config, overrides = eval_module._load_memory_config(path)
+    parser = eval_module._build_parser("eval")
+    parsed = parser.parse_args(
+        [
+            "--tasks",
+            "clbench",
+            "--limit",
+            "1",
+            "--model_args",
+            "model=cli-model",
+            "--judge-model-args",
+            "model=cli-judge,api_key=cli-judge-secret",
+        ]
+    )
+    download = DownloadSettings.resolve(
+        overrides.download,
+        benchmarks_root=tmp_path / "corpus",
+        data_root=tmp_path / "data",
+    )
+    arguments = eval_module._arguments(parser, parsed, download, overrides)
+    model = eval_module._model_config(
+        arguments.model,
+        arguments.model_args,
+        memory_config=memory_config,
+        overrides=overrides,
+    )
+    judge = eval_module._judge_config(model, arguments, overrides=overrides)
+    effective_memory = eval_module._evaluation_memory_config(memory_config, model, arguments)
+
+    artifact = eval_module._config_artifact(
+        arguments,
+        model,
+        judge,
+        effective_memory,
+        download,
+        overrides.server_metrics,
+    )
+    document = cast(dict[str, Any], yaml.safe_load(artifact))
+
+    assert b"secret" not in artifact
+    assert b"api_key" not in artifact
+    assert document["artifact"] == {
+        "kind": "mindbridge-bench-effective-config",
+        "schema_version": 1,
+        "credentials": "omitted",
+    }
+    assert document["product"]["generation"]["model"] == "cli-model"
+    assert document["benchmark"]["judge"]["model"] == "cli-judge"
+    assert document["benchmark"]["run"]["limit"] == 1
+
+
+def test_eval_streams_task_results_by_default_and_can_be_disabled() -> None:
+    parser = eval_module._build_parser("eval")
+
+    default = eval_module._arguments(parser, parser.parse_args(["--tasks", "clbench"]))
+    deferred = eval_module._arguments(
+        parser,
+        parser.parse_args(["--tasks", "clbench", "--no-stream-results"]),
+    )
+
+    assert default.stream_results is True
+    assert deferred.stream_results is False
 
 
 @pytest.mark.parametrize("spelling", ("all", "ALL", " all ", "-1"))
@@ -4379,7 +4471,7 @@ def test_each_task_lands_in_the_crash_copy_before_the_run_ends(
     # It can hold prompts and judge responses under --log-samples, so it is as private as the
     # artifacts it stands in for.
     assert partial.stat().st_mode & 0o777 == 0o600
-    # Persisting is not reporting: without --stream-results nothing is scored or printed early.
+    # Explicitly disabling streaming persists without scoring or printing early.
     assert "atm-bench" not in capsys.readouterr().out
 
 
@@ -4389,9 +4481,18 @@ def test_stream_results_judges_one_task_before_printing_it(
     task, sample = _streaming_task("atm-bench")
     arguments = _streaming_arguments(tmp_path / "output", stream_results=True, predict_only=False)
     streamed: set[str] = set()
+    measurement_events: list[str] = []
+
+    class ExcludeJudge:
+        def __enter__(self) -> None:
+            measurement_events.append("enter")
+
+        def __exit__(self, *_args: object) -> None:
+            measurement_events.append("exit")
 
     async def judge(answered: SampleResult, plan: object, **_kwargs: object) -> SampleResult:
         assert plan is not None
+        assert measurement_events == ["enter"]
         return replace(answered, score=0.5, metrics={"accuracy": 0.5})
 
     monkeypatch.setattr(eval_module, "_judge_sample", judge)
@@ -4404,6 +4505,7 @@ def test_stream_results_judges_one_task_before_printing_it(
             telemetry=telemetry,
             memory_config=None,
             streamed=streamed,
+            exclude_judge_measurement=ExcludeJudge,
         )
         scored = asyncio.run(_completion(completed, task, (sample,)))
     finally:
@@ -4417,6 +4519,7 @@ def test_stream_results_judges_one_task_before_printing_it(
     assert "0.5000" in printed and "1.0000" not in printed
     # The final judging pass must not spend a second call on an answer this already scored.
     assert streamed == {"atm-bench/unit/atm-bench-q"}
+    assert measurement_events == ["enter", "exit"]
 
 
 def test_the_crash_copy_survives_a_judging_failure(

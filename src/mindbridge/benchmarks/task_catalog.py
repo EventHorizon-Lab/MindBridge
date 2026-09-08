@@ -8,6 +8,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 
 from mindbridge.benchmarks.atm_bench import ATM_BENCH_ADAPTER_VERSION
+from mindbridge.benchmarks.es_memeval import ES_MEMEVAL_ADAPTER_VERSION
 from mindbridge.benchmarks.openeqa import OPENEQA_ADAPTER_VERSION, OPENEQA_SPLITS
 
 DEFAULT_BENCHMARKS_ROOT = Path(".benchmarks")
@@ -78,6 +79,7 @@ _SUPERMEMORY = (
 _ATM = ("Jingbiao/ATM-Bench", "78e826dc07e97466b2f54443831ef9a83ab8b27c")
 _GALLERY = ("Ethan-Bei/Mem-Gallery", "af912daba984e896e253016b7c7e334ef92c2a6f")
 _LONGMEMEVAL = ("xiaowu0162/longmemeval", "2ec2a557f339b6c0369619b1ed5793734cc87533")
+_ES_MEMEVAL = ("slptongji/ES-MemEval", "692624208acc077b8867698c1d6fcd998dee641a")
 _CLBENCH = ("tencent/CL-bench", "b28a5832a09b0d96c0cf4c22e90d7c60ede25b80")
 _BEAM = ("mohammadtavakoli78/BEAM", "3e12035532eb85768f1a7cd779832b650c4b2ef9")
 _PERSONAMEM_V3 = (
@@ -354,6 +356,15 @@ TASKS: dict[str, TaskSpec] = {
             variant="s",
         ),
         _task(
+            "es-memeval-qa",
+            "ES-MemEval",
+            "es-memeval/data/evo_emo.json",
+            ES_MEMEVAL_ADAPTER_VERSION,
+            _ES_MEMEVAL,
+            digest="f30698e87fddaeff51270a666c654da604f487a3456ec60d2b6ae08a6fecd420",
+            variant="qa",
+        ),
+        _task(
             "clbench",
             "CL-Bench",
             "clbench/CL-bench.jsonl",
@@ -444,6 +455,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "atm-bench": tuple(name for name in TASKS if name.startswith("atm-bench-")),
     "beam": tuple(name for name in TASKS if name.startswith("beam-")),
     "openeqa": tuple(name for name in TASKS if name.startswith("openeqa-")),
+    "es-memeval": ("es-memeval-qa",),
     "all": tuple(TASKS),
 }
 
@@ -464,6 +476,8 @@ ALIASES = {
     "atm-hard-sgm": "atm-bench-hard-sgm",
     "longmemeval": "longmemeval-s",
     "longmemeval-small": "longmemeval-s",
+    "evoemo": "es-memeval",
+    "evo-emo": "es-memeval",
     "cl-bench": "clbench",
     "personamem": "personamem-v3",
     "open-eqa": "openeqa",
