@@ -60,6 +60,7 @@ from mindbridge.benchmarks.eval import (
     _ref_at_n,
     _run_identifier,
     _seed_values,
+    _video_mme_v2_accuracy,
     _video_mme_v2_rating,
     main,
     run_loaded_task,
@@ -101,11 +102,11 @@ from mindbridge.configuration import OpenAIEmbeddingConfig, OpenAIGenerationConf
 from mindbridge.models.base import EmbedTask, ModelInput, SpeechAnalysis, SpeechBackend
 
 
-def _egomem_sample(example_id: int, answer: str | None = None) -> SampleResult:
+def _sample_fixture(example_id: int, answer: str | None = None) -> SampleResult:
     selected = answer or "ABCD"[(example_id - 1) % 4]
     return SampleResult(
-        task="egomemreason",
-        benchmark="EgoMemReason",
+        task="fixture",
+        benchmark="Fixture",
         dataset_sha256="1" * 64,
         evaluation_sha256="2" * 64,
         unit_id="A1_JAKE",
@@ -120,19 +121,19 @@ def _egomem_sample(example_id: int, answer: str | None = None) -> SampleResult:
         ingest_failure_count=0,
         error_code=None,
         metadata={"example_id": example_id, "choices": ("a", "b", "c", "d")},
-        scorer_protocol=scorer_protocol("egomemreason"),
+        scorer_protocol=scorer_protocol("fixture"),
     )
 
 
 def test_samples_report_structured_abstentions() -> None:
     abstained = replace(
-        _egomem_sample(1),
+        _sample_fixture(1),
         abstained=True,
         abstention_reason="insufficient_evidence",
     )
 
     assert abstained.json()["abstention_reason"] == "insufficient_evidence"
-    assert eval_module._abstentions((abstained, _egomem_sample(2))) == {
+    assert eval_module._abstentions((abstained, _sample_fixture(2))) == {
         "count": 1,
         "rate": 0.5,
         "reasons": {"insufficient_evidence": 1},
@@ -184,8 +185,6 @@ def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
         "ATM-Bench",
         "BEAM",
         "CL-Bench",
-        "EgoLifeQA",
-        "EgoMemReason",
         "EgoTempo",
         "ES-MemEval",
         "LoCoMo-Refined",
@@ -197,8 +196,8 @@ def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
         "OpenEQA",
         "PersonaMem-v3",
         "SuperMemory-VQA",
-        "Video-MME",
         "Video-MME-v2",
+        "WorldMemArena",
     }
     assert expand(("M3", "atm-main", "supermemory-subject-1")) == (
         "m3-bench-robot",
@@ -206,7 +205,11 @@ def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
         "supermemory-vqa",
         "atm-bench-main",
     )
-    assert expand(("video-*",)) == ("video-mme", "video-mme-v2")
+    assert expand(("video-*",)) == ("video-mme-v2",)
+    with pytest.raises(ValueError, match="unknown task"):
+        expand(("video-mme",))
+    with pytest.raises(ValueError, match="unknown task"):
+        expand(("memeye",))
     assert expand(("open-eqa",)) == ("openeqa-hm3d", "openeqa-scannet")
     assert expand(("openeqa-scannet-v0",)) == ("openeqa-scannet",)
     assert expand(("evoemo",)) == ("es-memeval-qa",)
@@ -439,8 +442,18 @@ def test_video_mme_v2_rating_uses_the_official_zero_to_one_hundred_scale() -> No
     )
 
     rating = _video_mme_v2_rating(samples, seed=3, bootstrap_samples=20)
+    accuracy = _video_mme_v2_accuracy(
+        samples,
+        seed=3,
+        bootstrap_samples=20,
+        official_metric=True,
+    )
 
     assert rating["mean"] == 25.0
+    assert cast(dict[str, object], accuracy["overall"])["mean"] == 50.0
+    assert accuracy["question_count"] == 4
+    assert accuracy["answered_count"] == 4
+    assert accuracy["correct_count"] == 2
     assert score_group_answers(
         "logic", "[1, [2, 3], 4]", (True, False, True, False)
     ) == pytest.approx(100 / 3)
@@ -568,52 +581,16 @@ def test_comparison_rejects_different_scorers_and_judges(tmp_path: Path) -> None
             eval_module._comparisons(arguments, (task,), (current,))
 
 
-def test_egomem_submission_is_upload_ready_only_when_complete(tmp_path: Path) -> None:
-    samples = tuple(_egomem_sample(example_id) for example_id in range(1, 501))
-
-    content, status = eval_module._egomem_submission(samples, requested=True, allow_partial=False)
-
-    assert content is not None
-    assert status is not None
-    assert status["status"] == "ready"
-    assert status["file"] == "egomemreason_submission.json"
-    payload = json.loads(content)
-    assert len(payload) == 500
-    assert payload[0] == {"example_id": 1, "predicted_answer": "A"}
-    assert payload[-1] == {"example_id": 500, "predicted_answer": "D"}
-    assert [row["example_id"] for row in payload] == list(range(1, 501))
-    assert all(set(row) == {"example_id", "predicted_answer"} for row in payload)
-
-    partial_content, partial_status = eval_module._egomem_submission(
-        samples[:10], requested=True, allow_partial=True
-    )
-    assert partial_content is None
-    assert partial_status is not None and partial_status["status"] == "partial"
-
-    invalid_content, invalid_status = eval_module._egomem_submission(
-        (replace(samples[0], parsed_choice=None), *samples[1:]),
-        requested=True,
-        allow_partial=False,
-    )
-    assert invalid_content is None
-    assert invalid_status is not None and invalid_status["status"] == "invalid"
-
+def test_write_artifacts_persists_the_effective_config_beside_the_results(tmp_path: Path) -> None:
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(output_path=tmp_path, overwrite=True),
     )
     config_bytes = b"generation:\n  provider: openai\n"
-    eval_module._write_artifacts(
-        arguments,
-        samples[:1],
-        {},
-        content,
-        config_bytes=config_bytes,
-    )
-    submission_path = tmp_path / "egomemreason_submission.json"
-    assert submission_path.read_bytes() == content
+
+    eval_module._write_artifacts(arguments, (_sample_fixture(1),), {}, config_bytes=config_bytes)
+
     assert {path.name for path in tmp_path.iterdir()} == {
-        "egomemreason_submission.json",
         "config.yaml",
         "results.jsonl",
         "samples.jsonl",
@@ -621,8 +598,6 @@ def test_egomem_submission_is_upload_ready_only_when_complete(tmp_path: Path) ->
     assert (tmp_path / "config.yaml").read_bytes() == config_bytes
     for path in (tmp_path / "results.jsonl", tmp_path / "samples.jsonl"):
         assert all(isinstance(json.loads(line), dict) for line in path.read_bytes().splitlines())
-    eval_module._write_artifacts(arguments, samples[:1], {}, None)
-    assert not submission_path.exists()
 
 
 def test_mm_lifelong_ref_at_300_uses_official_quantized_iou() -> None:
@@ -691,8 +666,8 @@ def test_benchmark_speech_backend_satisfies_the_runtime_protocol() -> None:
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_module.EVAL_SCHEMA_VERSION == 14
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v14"
+    assert eval_module.EVAL_SCHEMA_VERSION == 15
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v15"
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(
@@ -1657,6 +1632,26 @@ def test_progress_reports_nothing_when_disabled_or_empty(
     assert capsys.readouterr().err == ""
 
 
+def test_deferred_progress_starts_when_media_total_is_discovered(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 0.0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+
+    with eval_module._deferred_progress("preparing fixture media", "source") as report:
+        report(0, 2)
+        now = 1.0
+        report(1, 2)
+        now = 2.0
+        report(2, 2)
+
+    assert [line.split(" (")[0] for line in capsys.readouterr().err.splitlines()] == [
+        "mindbridge-bench eval: preparing fixture media: 0/2",
+        "mindbridge-bench eval: preparing fixture media: 1/2",
+        "mindbridge-bench eval: preparing fixture media: 2/2",
+    ]
+
+
 def test_progress_drives_a_bar_on_a_terminal(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1698,7 +1693,7 @@ def test_progress_drives_a_bar_on_a_terminal(
 
 @pytest.mark.asyncio
 async def test_judge_skips_samples_with_ingest_failures(monkeypatch: pytest.MonkeyPatch) -> None:
-    sample = replace(_egomem_sample(1), ingest_failure_count=1)
+    sample = replace(_sample_fixture(1), ingest_failure_count=1)
     calls = 0
 
     def unexpected_plan(*_args: object, **_kwargs: object) -> None:
@@ -2590,7 +2585,7 @@ async def test_standalone_search_reports_planned_error_when_store_reopen_fails(
         ),
     )
     sample = replace(
-        _egomem_sample(1),
+        _sample_fixture(1),
         task="fixture",
         unit_id="unit",
         question_id="q1",
@@ -3064,7 +3059,7 @@ def test_metric_breakdowns_cover_every_catalog_task(tmp_path: Path) -> None:
         (EvalUnit("unit", (), (EvalQuestion("q1", ("q",), ("r",)),)),),
     )
     sample = replace(
-        _egomem_sample(1),
+        _sample_fixture(1),
         task="openeqa-hm3d",
         score=1.0,
         metadata={"category": "object recognition"},
@@ -3084,12 +3079,8 @@ def test_metric_breakdowns_cover_every_catalog_task(tmp_path: Path) -> None:
 _EXPECTED_BREAKDOWN_FIELDS: dict[str, tuple[str, ...]] = {
     "locomo-refined": ("category",),
     "m3-bench": ("question_types",),
-    "video-mme": ("duration", "domain", "task_type"),
     "video-mme-v2": ("group_type", "level", "second_head", "third_head"),
-    "egolifeqa": ("day", "question_type"),
-    # No breakdown: the public release ships no answer key, so every sample
-    # scores `None` and there is nothing to group.
-    "egomemreason": (),
+    "worldmemarena": ("question_type", "question_type_abbrev", "difficulty"),
     "egotempo": ("question_type",),
     "memlens": ("question_type", "question_subtype"),
     "mm-lifelong": ("question_type",),
@@ -3117,7 +3108,7 @@ def _breakdown_task(family: str, tmp_path: Path) -> LoadedTask:
 
 
 def _breakdown_sample(task: str, metadata: dict[str, object]) -> SampleResult:
-    return replace(_egomem_sample(1), task=task, score=1.0, metadata=metadata)
+    return replace(_sample_fixture(1), task=task, score=1.0, metadata=metadata)
 
 
 @pytest.mark.parametrize("family", sorted(_EXPECTED_BREAKDOWN_FIELDS))
@@ -4642,7 +4633,6 @@ def test_the_crash_copy_is_removed_once_the_real_artifacts_land(tmp_path: Path) 
         _streaming_arguments(output, overwrite=True),
         (sample,),
         {"run_id": "run", "tasks": []},
-        None,
     )
 
     assert not partial.exists()

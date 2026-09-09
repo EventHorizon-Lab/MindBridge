@@ -31,9 +31,9 @@ List the current task groups, pinned revisions, and local-data readiness:
 mindbridge-bench eval --list-tasks
 ```
 
-The catalog currently covers LoCoMo-Refined, ES-MemEval, M3-Bench, Video-MME and Video-MME-v2,
-EgoLifeQA, EgoMemReason, EgoTempo, MemLens, MM-Lifelong, SuperMemory-VQA, ATM-Bench,
-Mem-Gallery, LongMemEval, CL-Bench, BEAM, PersonaMem-v3, and OpenEQA. Use the listing command
+The catalog currently covers LoCoMo-Refined, ES-MemEval, M3-Bench, Video-MME-v2, WorldMemArena,
+EgoTempo, MemLens, MM-Lifelong, SuperMemory-VQA, ATM-Bench, Mem-Gallery, LongMemEval, CL-Bench,
+BEAM, PersonaMem-v3, and OpenEQA. Use the listing command
 instead of copying task names from this page; it is generated from the catalog used by the
 runner.
 
@@ -381,7 +381,7 @@ there, not what an arm can see once ingest finishes.
 
 ## Supported benchmark categories and primary metrics
 
-The executable catalog currently contains 18 benchmark families expanded to 32 concrete tasks.
+The executable catalog currently contains 16 benchmark families expanded to 30 concrete tasks.
 They fall into three dataset categories and one local systems microbenchmark. Classification follows
 the primary workload; several suites deliberately overlap categories.
 
@@ -427,15 +427,13 @@ from `mindbridge.benchmarks.task_catalog`; `--list-tasks` remains authoritative.
 
 | Benchmark and selector | What it measures and when to use it | Primary result and scoring requirement | Data requirement |
 | --- | --- | --- | --- |
-| EgoLifeQA (`egolifeqa`) | Multi-day causal video/audio memory, names, last occurrences, and temporal questions; use for wearable lifelogs | `accuracy`; deterministic choice scorer | Pinned Hugging Face annotations and EgoLife media; automatic |
-| EgoMemReason (`egomemreason`) | Multi-day egocentric reasoning with 4--10 choices; use to generate an official-server submission because public labels are withheld | `submission`; no local judge | Pinned Hugging Face annotations and EgoLife media; automatic |
+| WorldMemArena (`worldmemarena`) | Causal multimodal agent and lifelong sessions with checkpoint QA, updates, temporal reasoning, visual recall/search, and cross-modal reasoning | `correct_ratio`; the official configurable Correct/Hallucination/Omission judge, plus `answer_f1` and `answer_bleu1` | Pinned Hugging Face JSON and images; automatic |
 | EgoTempo (`egotempo`) | Open-ended temporal QA over Ego4D clips; use for temporal grounding rather than multi-session retrieval | `accuracy`; judge `gemini-1.5-flash` | Pinned GitHub annotations; media needs Ego4D authorization and AWS credentials |
 | MM-Lifelong (`mm-lifelong`: day/week/month) | Day-to-month video memory, multi-interval clues, temporal localization, and open-ended answers; use for duration scaling | `answer_accuracy`; judge `gpt-5` | Pinned Hugging Face annotations and split media; automatic |
 | SuperMemory-VQA (`supermemory-vqa`) | Causal multi-video memory, skill breakdowns, answerability, and unanswerable cases; use for lifelong video QA | `qa_accuracy`; deterministic choice scorer | Pinned Hugging Face annotations, transcripts, and video; automatic |
 | M3-Bench (`m3-bench`: robot/web) | Causal long-video memory and open-ended QA; use for robot and web-video histories | `accuracy`; judge `gpt-4o-2024-11-20` | Pinned GitHub annotations; robot media from Hugging Face, web media through `yt-dlp` |
-| Video-MME (`video-mme`) | Short, medium, and long cross-domain video understanding; use as a video-generation baseline, not as evidence of long-term memory alone | `accuracy`; deterministic choice scorer | Pinned Hugging Face Parquet and ZIP media; automatic |
-| Video-MME-v2 (`video-mme-v2`) | Four-question relevance/logic groups with level and reasoning-head breakdowns; use when grouped consistency matters | `rating` (0--100); deterministic grouped scorer | Pinned Hugging Face Parquet and media volumes; automatic |
-| OpenEQA (`openeqa`: HM3D/ScanNet) | Open-ended EM-EQA over fixed scene histories: spatial, recognition, localization, and world knowledge; use for spatial episodic memory | `llm_match`; judge `gpt-4-1106-preview` | Pinned GitHub questions; operator supplies extracted HM3D or licensed ScanNet frames |
+| Video-MME-v2 (`video-mme-v2`) | Four-question relevance/logic groups with level and reasoning-head breakdowns; use when grouped consistency matters | `rating` and auxiliary `accuracy` (both 0--100); deterministic grouped scorer | Pinned Hugging Face Parquet and media volumes; automatic |
+| OpenEQA (`openeqa`: HM3D/ScanNet) | Open-ended EM-EQA over fixed scene histories: spatial, recognition, localization, and world knowledge; use for spatial episodic memory | `llm_match` (0--100); judge `gpt-4-1106-preview` | Pinned GitHub questions; operator supplies extracted HM3D or licensed ScanNet frames |
 
 ### Local storage and retrieval microbenchmark
 
@@ -527,17 +525,17 @@ Coverage is deliberately asymmetric:
   shifts and sycophancy behavior. LoCoMo-Refined explicitly removed LoCoMo's adversarial category
   5, so it must not be cited as adversarial coverage.
 - **Retrieval versus generation:** every dataset row measures generated answers. Exact
-  MindBridge source-ID recall is available only for LoCoMo-Refined, LongMemEval, ATM-Bench, and
-  Mem-Gallery. PersonaMem-v3's official candidate-ranking metrics rank answer slates and are not
+  MindBridge source-ID recall is available for LoCoMo-Refined, LongMemEval, ATM-Bench, and
+  Mem-Gallery. WorldMemArena image evidence can be joined exactly, but its `mp_*`
+  labels name scorer-authored memory points rather than raw turns and remain unresolved.
+  PersonaMem-v3's official candidate-ranking metrics rank answer slates and are not
   source-ID recall for the MindBridge retriever.
 - **Open-ended versus open-domain:** open-ended scoring appears in many rows, while explicit
-  cross-domain or world-knowledge breakdowns come from Video-MME and OpenEQA. Do not infer
+  cross-domain or world-knowledge breakdowns come from OpenEQA. Do not infer
   open-domain coverage from free-form answer format alone.
 
-EgoMemReason's public release has no answer key. A complete valid run writes the upload-ready JSON
-array `egomemreason_submission.json`; partial runs remain development artifacts.
-Video-MME-v2's grouped `rating` is on a 0--100 scale. Other 0--5 diagnostics are named explicitly
-in `results.jsonl`.
+Video-MME-v2's grouped `rating` and question-level `accuracy` are both on a 0--100 scale. Other
+0--5 diagnostics are named explicitly in `results.jsonl`.
 
 Protocol boundaries that affect interpretation are explicit rather than approximated:
 
@@ -546,15 +544,20 @@ Protocol boundaries that affect interpretation are explicit rather than approxim
   runtime media preparation; LoCoMo-Refined and MemLens ingest the releases' published captions.
 - CL-Bench has no separate question field. The adapter splits the final user turn at its last
   blank-line paragraph break and marks oversized residual questions with `question_unsliced`.
-- BEAM reports its per-rubric `llm_judge_score`. The `event_ordering` composite is absent because
-  its semantic-alignment call has a different shape that the runner does not issue.
+- BEAM reports its per-rubric `llm_judge_score`; `event_ordering` additionally runs the official
+  pairwise event-equivalence calls and reports `precision`, `recall`, `f1`, `tau_norm`, and
+  `final_score`. As in upstream `report_results.py`, its category result uses `tau_norm`.
 - PersonaMem-v3 reads the released fields and causally masks future events. Task families requiring
   structured actions, response-threaded clusters, or paired-row deltas carry no official headline;
   `profile.json` is scorer-side ground truth and is never ingested as memory.
 - SuperMemory-VQA reports `qa_accuracy`; `qa_mrr` is unavailable because the answer backend does
   not expose answer-option scores.
-- OpenEQA reports normalized `llm_match` plus `llm_match_score_1_5`. Its fixed-history adapter is
+- OpenEQA reports 0--100 `llm_match` plus `llm_match_score_1_5`. Its fixed-history adapter is
   not the active-navigation A-EQA protocol.
+- WorldMemArena support covers its official checkpoint-QA answer protocol. Its separate memory
+  snapshot recall/correctness, update-handling, interference, and LLM evidence-coverage calls are
+  reported unavailable because MindBridge does not export the per-session snapshot those scorers
+  require. Gold memory-point summaries are never ingested as system memories.
 
 Review the upstream repository and license printed by `--list-tasks` before download. Dataset terms
 remain independent of MindBridge's license; the copied scorer licenses and protocol notes are in
@@ -583,9 +586,9 @@ Use `--no-download` for an offline run. Override operator-managed inputs explici
 
 ```bash
 mindbridge-bench eval \
-  --tasks video-mme \
-  --task-data video-mme=/datasets/video-mme/test.parquet \
-  --media-root video-mme=/datasets/video-mme/videos \
+  --tasks video-mme-v2 \
+  --task-data video-mme-v2=/datasets/video-mme-v2/test.parquet \
+  --media-root video-mme-v2=/datasets/video-mme-v2/videos \
   --allow-unverified-data
 ```
 
@@ -640,11 +643,11 @@ Four choices decide whether a number here is comparable with the leaderboard:
   `benchmarks/prepare_media.py` is the knob for deliberately thinning a scene's history.
 - **`--limit` counts episodes, not questions.** One episode is one physically isolated store fed
   by hundreds of frames, and every question over it answers against the same ingested scene.
-- **The headline is `llm_match`, reported 0-1.** It is the official LLM-Match protocol: the
+- **The headline is `llm_match`, reported 0--100.** It is the official LLM-Match protocol: the
   `mmbench` prompt, or `mmbench-extra` for the 263 questions that publish `extra_answers`, judged
   by `gpt-4-1106-preview` for a mark of 1-5. The raw mark is kept beside it as
-  `llm_match_score_1_5`. Upstream prints the same quantity multiplied by 100. Two upstream
-  behaviours are reproduced rather than corrected: a prediction is cut after its last period when
+  `llm_match_score_1_5`. Two upstream behaviours are reproduced rather than corrected: a
+  prediction is cut after its last period when
   that period is not already its final character, and a mark outside 1-5 is clipped instead of
   rejected.
 
@@ -660,8 +663,8 @@ runtime media, so they need neither `ffmpeg` nor a preparation pass:
 | `longmemeval-s` | one question | its own 50-session haystack | `accuracy`, the yes/no answer-check judge |
 | `es-memeval-qa` | one seeker | every dated seeker/supporter session and all of that seeker's QA items | non-official adapted `llm_judge`, the GPT-4o 0--2 rubric normalized to 0--1 |
 | `clbench` | one task | the reference document behind its question | `solving_rate`, the binary rubric judge |
-| `beam-100k` … `beam-10m` | one conversation | the whole transcript | `llm_judge_score`, mean over rubric items |
-| `personamem-v3` | one persona | five engagement logs plus a calendar stream | `personamem_score`, 0-1 |
+| `beam-100k` … `beam-10m` | one conversation | the whole transcript | Category metrics: `tau_norm` for event ordering, `llm_judge_score` otherwise |
+| `personamem-v3` | one persona | five engagement logs plus a calendar stream | `accuracy_pct_micro`, 0--100 when scorer coverage is complete |
 
 Four of them need a note before a number is quoted:
 
@@ -679,10 +682,10 @@ Four of them need a note before a number is quoted:
   last blank-line paragraph break. 1,322 of the 1,899 records split cleanly (median question 434
   characters); 130 end up with a question of 2,000 characters or more and carry
   `question_unsliced` in their metadata. Filter on that field before reporting.
-- **BEAM's `event_ordering` category loses part of its official metric.** Upstream combines the
-  per-rubric judge score with `tau_norm x f1`, whose alignment step is a second, differently
-  shaped model call the runner does not issue. The per-rubric `llm_judge_score` is reported and
-  the composite is left absent rather than approximated.
+- **BEAM's `event_ordering` category has a distinct official path.** The runner issues the
+  pairwise equivalence calls used for semantic alignment, then computes the same F1, normalized
+  Kendall tau, and `final_score = tau_norm x f1`. The upstream report selects `tau_norm` for this
+  category and `llm_judge_score` for the other nine.
 - **PersonaMem-v3 is scored on the families the pinned release supports.** Its evaluation
   repository has drifted from the released data -- the repository's slate scorer reads a `slate`
   and `origin_by_idx` the release does not publish -- so the reproduced protocols read only
@@ -691,11 +694,13 @@ Four of them need a note before a number is quoted:
   `task_registry.PRIMARY_METRIC` names. The proactive decision judge, the two repetition-fatigue
   cluster tasks, `new_suggestions_chatbot`, `local_recommendation_geo_shift`,
   `active_mistake_prevention` and `short_vs_long_term_lifecycle` are answered and reported but
-  carry no official headline -- the last one ranks a slate like the other three, but upstream
-  scores it with a delta across two paired rows that a single row cannot carry. The cluster rows
-  are dropped at load because their runner threads each response into the next prompt. The rubric judge's evidence block is also narrower than upstream's `build_source_a`,
-  which queries the persona backend for the same-day avoid slice and the privacy flags, so
-  hard-rule checks that depend on those under-fire relative to a full-harness run.
+  carry no official headline -- therefore the aggregate `accuracy_pct_micro` is explicitly
+  unavailable instead of being calculated over a biased subset. The last one ranks a slate like
+  the other three, but upstream scores it with a delta across two paired rows that a single row
+  cannot carry. The cluster rows are dropped at load because their runner threads each response
+  into the next prompt. Judge evidence is reconstructed from the release's frozen source-A slices,
+  including same-day avoids, privacy flags, update contradictions, style references, and friend
+  records.
 
 PersonaMem-v3 masks history causally: each query is answered against only the events that happened
 strictly before its timestamp, which the runner applies through the same cutoff machinery the
@@ -877,6 +882,7 @@ which is the honest state and not a defect to paper over.
 | `es-memeval` | QA `evidence` turn IDs; event IDs are scorer-only annotations | Exact at the published session retrieval granularity: a session is gold when it contains at least one labelled visible turn |
 | `atm-bench` | `evidence_ids` naming emails and media records | Exact |
 | `mem-gallery` | `clue_ids`, the clue round IDs | Exact |
+| `worldmemarena` | Gold `image_id` and scorer-authored `memory_id` points | Exact for image IDs; `mp_*` memory points are unresolved rather than leaked into memory |
 | `mm-lifelong` | `total_intervals`, and `clue_intervals[].video_id` on the week and month splits | Interval-level only, and already reported as the official `ref_at_300`. The clue video IDs cannot be joined: prepared clips are keyed by file stem, not by release video ID |
 | `supermemory-vqa` | `question_evidence.time_spans[].video_id`, kept as `source_video_ids` | Source-video level only. The join exists — `prepare_media` writes `<video_id>-video-#####` — but scoring it needs a group recall ("any clip of each gold video"), a different operator from the exact set recall above. Not implemented |
 | `m3-bench` | `timestamp` and `before_clip` | Not derivable: both say when the question is asked, not where the answer is |
@@ -884,15 +890,13 @@ which is the honest state and not a defect to paper over.
 | `clbench` | `context_id`, which names the whole unit | Not derivable: a label equal to the unit cannot separate rankers |
 | `beam` | Rubrics and reference answers; `turns[].id` is a turn's own index and no question refers to one | Not derivable |
 | `personamem-v3` | Slate-internal `_origin` and `_held_out_persona_item` | Unresolved. Those fields are deliberately excluded from the rendered slate because they are the answer; whether `_origin` names a `source_object_id` that matches an `event_id` needs a check against the corpus |
-| `egolifeqa`, `egomemreason` | Query time only | Not derivable |
 | `egotempo` | One clip per unit | Degenerate: a one-candidate pool cannot separate rankers |
 | `openeqa` | `episode_history`, which is the unit | Not derivable |
-| `video-mme`, `video-mme-v2` | Nothing beyond the answer | Not derivable |
+| `video-mme-v2` | Nothing beyond the answer | Not derivable |
 
-So retrieval quality is measurable on **5 of the 18 families** in the catalog. `recall_at_20` — the
-premise behind treating index content rather than ranking as the lever — is checkable on those five
-and on no others, and three of them were only wired in after that premise was already load-bearing.
-Treat it as a five-sample generalisation.
+So exact retrieval quality is measurable on five families in the catalog, plus the image-labelled
+subset of WorldMemArena. Its `recall_at_20` remains a diagnostic for those compatible source-ID
+labels, not a universal benchmark metric.
 
 The two exact labels wired here are joined differently, because the risk differs. LongMemEval marks
 the answering turn as the memories are built, so its label is exact by construction; a turn over
@@ -940,8 +944,6 @@ Each completed `eval` output directory contains:
 - `results.jsonl`: one aggregate record with dataset and implementation pins, arm definitions,
   aggregate metrics, confidence intervals, performance, token usage, abstentions, mandatory
   controls, the noise floor, resource usage, and a digest of `samples.jsonl`.
-- `egomemreason_submission.json`: the official JSON-array submission, only for a complete, valid
-  EgoMemReason run from the `mindbridge` arm.
 
 A run in progress also holds `samples.partial.jsonl`, appended as each task finishes answering and
 removed when the real artifacts land. It is a crash copy, not an artifact: it carries no results
@@ -972,9 +974,8 @@ Three result fields carry a caveat that decides whether they can be quoted:
 - **`abstentions` undercounts.** It counts two things: the opaque marker the answer backend emits
   when it declines, and -- for a task whose own prompt mandates a refusal wording -- an answer
   equal to that wording. A model that refuses in its own free wording, on a task that mandates
-  none, is still not counted. Measured under the older exact-sentence detector, an EgoLifeQA slice
-  reported 2 of 51 while 14 of 51 answers read as refusals; treat the field as a lower bound and
-  read the predictions before drawing a conclusion about refusal rates.
+  none, is still not counted. Treat the field as a lower bound and read the predictions before
+  drawing a conclusion about refusal rates.
 - **A task whose query prompt mandates a format or a refusal wording puts that wording into
   retrieval, not only into generation.** `EvalQuestion.content` is what the runner passes to
   `Memory.ask`, and `ask` takes one content input for both legs, so the instruction is matched

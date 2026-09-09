@@ -202,8 +202,8 @@ _GOLD_EVIDENCE_KEYS = ("evidence_ids", "clue_ids")
 _UNRESOLVED_EVIDENCE_KEY = "unresolved_evidence_ids"
 _RECALL_CUTOFFS = (1, 5, 10, 20)
 _MANDATORY_CONTROLS = ("random_ranker", "blind", "recall_at_20")
-EVAL_SCHEMA_VERSION = 14
-EVAL_RUNNER_VERSION = "mindbridge_eval_official_v14"
+EVAL_SCHEMA_VERSION = 15
+EVAL_RUNNER_VERSION = "mindbridge_eval_official_v15"
 DEFAULT_ARM = "mindbridge"
 BASELINE_ARMS = ("blind", "full-context", "random", "compile")
 ARMS = (DEFAULT_ARM, *BASELINE_ARMS)
@@ -243,9 +243,7 @@ _CONFIG_FILE = "config.yaml"
 # outage during task five threw away four tasks of answers. This file is never an evaluation
 # artifact -- it carries no results document and no digest -- it is the crash copy.
 _PARTIAL_SAMPLES_FILE = "samples.partial.jsonl"
-_EGOMEM_SUBMISSION_FILE = "egomemreason_submission.json"
 _MEDIA_MANIFEST_FILE = "media-manifest.jsonl"
-_EGOMEM_SUBMISSION_COUNT = 500
 _MODALITY_BY_SUFFIX = {
     ".aac": Modality.AUDIO,
     ".flac": Modality.AUDIO,
@@ -266,14 +264,11 @@ _MODALITY_BY_SUFFIX = {
 # siblings. A family absent here reports no breakdown at all, which is
 # invisible in a results document, so `tests/unit/benchmarks/test_eval.py`
 # pins this table against the metadata the adapters actually emit.
-# `egomemreason` is deliberately absent: its public release has no answer key,
-# so every sample scores `None` and there is nothing to group.
 _BREAKDOWN_FIELDS: Mapping[str, tuple[str, ...]] = {
     "locomo-refined": ("category",),
     "m3-bench": ("question_types",),
-    "video-mme": ("duration", "domain", "task_type"),
     "video-mme-v2": ("group_type", "level", "second_head", "third_head"),
-    "egolifeqa": ("day", "question_type"),
+    "worldmemarena": ("question_type", "question_type_abbrev", "difficulty"),
     "egotempo": ("question_type",),
     "memlens": ("question_type", "question_subtype"),
     "mm-lifelong": ("question_type",),
@@ -1190,19 +1185,23 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
             )
     generated_manifest: dict[str, object] = {}
     for name in arguments.tasks:
-        prepared = prepare_task_media(
-            TASKS[name],
-            root=arguments.benchmarks_root,
-            dataset_path=arguments.dataset_overrides.get(
-                name, TASKS[name].dataset_path(arguments.benchmarks_root)
-            ),
-            media_root=arguments.media_overrides.get(name),
-            manifest=manifest,
-            limit=arguments.limit,
-            offset=arguments.offset,
-            download=arguments.download,
-            announce=None if arguments.quiet else _announce,
-        )
+        with _deferred_progress(
+            f"preparing {name} media", "source", enabled=not arguments.quiet
+        ) as progress:
+            prepared = prepare_task_media(
+                TASKS[name],
+                root=arguments.benchmarks_root,
+                dataset_path=arguments.dataset_overrides.get(
+                    name, TASKS[name].dataset_path(arguments.benchmarks_root)
+                ),
+                media_root=arguments.media_overrides.get(name),
+                manifest=manifest,
+                limit=arguments.limit,
+                offset=arguments.offset,
+                download=arguments.download,
+                announce=None if arguments.quiet else _announce,
+                on_progress=None if arguments.quiet else progress,
+            )
         if prepared is not None:
             generated_manifest[name] = prepared
     if generated_manifest:
@@ -1225,11 +1224,6 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         memory_config=memory_config,
         server_metrics=overrides.server_metrics,
     )
-    submission_bytes, submission_status = _egomem_submission(
-        samples,
-        requested="egomemreason" in arguments.tasks,
-        allow_partial=arguments.offset > 0 or arguments.limit not in (None, -1),
-    )
     results = _results(
         arguments,
         config,
@@ -1238,7 +1232,6 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         samples,
         duration,
         batch_sizes,
-        submission_status,
         performance,
         memory_config=memory_config,
         resources=resources,
@@ -1262,7 +1255,6 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
         arguments,
         samples,
         results,
-        submission_bytes,
         config_bytes=_config_artifact(
             arguments,
             config,
@@ -1272,7 +1264,6 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
             overrides.server_metrics,
         ),
     )
-    _announce_submission(arguments, submission_status)
     for reason in _uninterpretable_tasks(results):
         _announce(f"UNINTERPRETABLE: {reason}")
     if not arguments.quiet:
@@ -1284,8 +1275,7 @@ def main(  # noqa: C901 - offline gates and evaluation share one CLI entry point
     performance_regressed = arguments.fail_on_regression and any(
         row["regressed"] is True for row in performance_rows
     )
-    submission_invalid = submission_status is not None and submission_status["status"] == "invalid"
-    return int(has_errors or regressed or performance_regressed or submission_invalid)
+    return int(has_errors or regressed or performance_regressed)
 
 
 def _execution_has_errors(samples: Sequence[SampleResult], results: Mapping[str, object]) -> bool:
@@ -1320,15 +1310,6 @@ def _load_tasks(
         )
         for name in arguments.tasks
     )
-
-
-def _announce_submission(arguments: _Arguments, status: Mapping[str, object] | None) -> None:
-    if status is None or arguments.quiet:
-        return
-    if status["status"] == "ready":
-        _announce(f"wrote {arguments.output_path / _EGOMEM_SUBMISSION_FILE}")
-        return
-    _announce(f"EgoMemReason submission {status['status']}: {status['reason']}")
 
 
 @contextmanager
@@ -1744,7 +1725,6 @@ def _task_completion(
                                     _task_performance(
                                         telemetry, (task,), task_samples, arguments.arms
                                     ),
-                                    None,
                                     memory_config=memory_config,
                                 )
                             }
@@ -3742,10 +3722,6 @@ def _ref_at_n(
 
 
 def _parsed_choice(task_name: str, prediction: str, choices: Sequence[str]) -> str | None:
-    if task_name == "video-mme":
-        from mindbridge.benchmarks.video_mme import parse_video_mme_option
-
-        return parse_video_mme_option(prediction)
     if task_name == "video-mme-v2":
         from mindbridge.benchmarks.video_mme_v2 import parse_video_mme_v2_option
 
@@ -3770,7 +3746,6 @@ def _task_rows(
     samples: Sequence[SampleResult],
     batch_sizes: Mapping[str, int],
     performance: Mapping[str, Mapping[str, Mapping[str, object]]],
-    submission_status: Mapping[str, object] | None,
     *,
     memory_config: MindBridgeConfig | None,
 ) -> list[dict[str, object]]:
@@ -3814,14 +3789,6 @@ def _task_rows(
                 else arguments.recall_limit
             ),
         )
-        if (
-            task.spec.name == "egomemreason"
-            and submission_status is not None
-            and arm == DEFAULT_ARM
-        ):
-            metrics["submission"] = dict(submission_status)
-            if submission_status["status"] == "invalid":
-                metrics["score_valid"] = False
         task_rows.append(
             {
                 "arm": arm,
@@ -3864,7 +3831,6 @@ def _results(
     samples: Sequence[SampleResult],
     duration_seconds: float,
     batch_sizes: Mapping[str, int],
-    submission_status: Mapping[str, object] | None,
     performance: Mapping[str, Mapping[str, Mapping[str, object]]],
     *,
     memory_config: MindBridgeConfig | None = None,
@@ -3877,7 +3843,6 @@ def _results(
         samples,
         batch_sizes,
         performance,
-        submission_status,
         memory_config=memory_config,
     )
     media_roots = {}
@@ -3899,7 +3864,6 @@ def _results(
                 for sample in samples
             )
             or _incomplete_search_replay(task_rows)
-            or (submission_status is not None and submission_status["status"] == "invalid")
             else "completed"
         ),
         "duration_seconds": duration_seconds,
@@ -4264,6 +4228,10 @@ def _metrics(
             if metric_name == "judge_score_0_5"
             else (0.0, 2.0)
             if metric_name == "judge_score_0_2"
+            else (1.0, 5.0)
+            if metric_name == "llm_match_score_1_5"
+            else (0.0, 100.0)
+            if metric_name == "llm_match"
             else (0.0, 1.0)
         )
         metric_rows[metric_name] = {
@@ -4366,28 +4334,85 @@ def _metrics(
         ),
         "breakdowns": _metric_breakdowns(task, samples, arguments),
     }
-    if task.spec.name == "video-mme" and scored:
-        result["video_mme"] = _video_mme_metrics(
-            samples,
-            seed=seed,
-            bootstrap_samples=arguments.bootstrap_samples,
-            strict=primary,
-        )
     if task.spec.name == "video-mme-v2" and scored:
         rating = _video_mme_v2_rating(
             samples,
             seed=seed,
             bootstrap_samples=arguments.bootstrap_samples,
         )
+        accuracy = _video_mme_v2_accuracy(
+            samples,
+            seed=seed,
+            bootstrap_samples=arguments.bootstrap_samples,
+            official_metric=official("accuracy"),
+        )
         result.update(
             {
                 "primary_metric": "rating",
                 "official_metric": official("rating"),
                 "score": rating,
-                "question_accuracy": metric_rows.get("question_accuracy", primary),
+                "accuracy": accuracy,
             }
         )
         metric_rows["rating"] = {"official_metric": official("rating"), **rating}
+        metric_rows["accuracy"] = {
+            "official_metric": official("accuracy"),
+            **cast(Mapping[str, object], accuracy["overall"]),
+        }
+    if task.spec.name == "personamem-v3":
+        from mindbridge.benchmarks._official.personamem_v3_scoring import (
+            COMPLETE_HEADLINE_COVERAGE,
+        )
+
+        scored_rows = tuple(sample for sample in samples if sample.score is not None)
+        score_coverage_complete = COMPLETE_HEADLINE_COVERAGE and len(scored_rows) == len(samples)
+        supported_subset_accuracy = summarize(
+            tuple(
+                ScoredValue(sample.sample_id, sample.unit_id, 100.0 * cast(float, sample.score))
+                for sample in scored_rows
+            ),
+            seed=seed,
+            bootstrap_samples=arguments.bootstrap_samples,
+            clamp=(0.0, 100.0),
+        )
+        accuracy = (
+            supported_subset_accuracy
+            if score_coverage_complete
+            else summarize(
+                (),
+                seed=seed,
+                bootstrap_samples=arguments.bootstrap_samples,
+                clamp=(0.0, 100.0),
+            )
+        )
+        accuracy_official = score_coverage_complete and official(
+            "accuracy_pct_micro", uses_judge=bool(judge_models)
+        )
+        metric_rows["accuracy_pct_micro"] = {
+            "official_metric": accuracy_official,
+            **accuracy,
+        }
+        result.update(
+            {
+                "primary_metric": "accuracy_pct_micro",
+                "official_metric": accuracy_official,
+                "score": accuracy,
+                "score_valid": bool(result["score_valid"]) and score_coverage_complete,
+                "score_coverage": {
+                    "complete": score_coverage_complete,
+                    "scored_question_count": len(scored_rows),
+                    "unscored_question_count": len(samples) - len(scored_rows),
+                    "supported_subset_accuracy_pct_micro": supported_subset_accuracy,
+                },
+            }
+        )
+        if not score_coverage_complete:
+            result["unavailable_metrics"] = {
+                "accuracy_pct_micro": (
+                    "the official PersonaMem-v3 micro score requires every selected task family; "
+                    "structured-action, threaded-cluster, and paired-row protocols are unavailable"
+                )
+            }
     if task.spec.name == "supermemory-vqa" and scored:
         result["answerability"] = {
             "official_metric": official("answerability"),
@@ -4396,9 +4421,20 @@ def _metrics(
         result["unavailable_metrics"] = {
             "qa_mrr": "answer-option scores are not exposed by the MindBridge answer backend"
         }
-    if task.spec.name == "egomemreason":
+    if task.spec.name == "worldmemarena":
         result["unavailable_metrics"] = {
-            "accuracy": "the public release has no answer key; official server scoring is required"
+            "memory_snapshot": (
+                "the unified runner has no per-session memory-snapshot export required by the "
+                "official recall/correctness, update-handling, and interference protocols"
+            ),
+            "retrieval_coverage": (
+                "the official semantic evidence-coverage judge is not part of checkpoint QA; "
+                "the generic exact-ID retrieval block remains a MindBridge diagnostic"
+            ),
+            "retrieval_ranking": (
+                "the official fuzzy memory/session/content matching protocol cannot be reproduced "
+                "from MindBridge source IDs"
+            ),
         }
     reference_scores = tuple(
         ScoredValue(sample.sample_id, sample.unit_id, sample.ref_at_300)
@@ -4744,59 +4780,6 @@ def _metric_breakdowns(
     return result
 
 
-def _video_mme_metrics(
-    samples: Sequence[SampleResult],
-    *,
-    seed: int,
-    bootstrap_samples: int,
-    strict: Mapping[str, object],
-) -> dict[str, object]:
-    overall = _video_mme_cell(
-        samples,
-        seed=seed,
-        bootstrap_samples=bootstrap_samples,
-        strict=strict,
-    )
-    return {
-        **overall,
-        "by_duration": {
-            duration: _video_mme_cell(
-                tuple(sample for sample in samples if sample.metadata.get("duration") == duration),
-                seed=_task_seed(seed, duration),
-                bootstrap_samples=bootstrap_samples,
-            )
-            for duration in ("short", "medium", "long")
-            if any(sample.metadata.get("duration") == duration for sample in samples)
-        },
-    }
-
-
-def _video_mme_cell(
-    samples: Sequence[SampleResult],
-    *,
-    seed: int,
-    bootstrap_samples: int,
-    strict: Mapping[str, object] | None = None,
-) -> dict[str, object]:
-    scores = tuple(
-        ScoredValue(sample.sample_id, sample.unit_id, sample.score)
-        for sample in samples
-        if sample.score is not None
-    )
-    answered = tuple(
-        ScoredValue(sample.sample_id, sample.unit_id, sample.score)
-        for sample in samples
-        if sample.score is not None and sample.parsed_choice is not None
-    )
-    return {
-        "accuracy": strict or summarize(scores, seed=seed, bootstrap_samples=bootstrap_samples),
-        "answered_accuracy": summarize(answered, seed=seed, bootstrap_samples=bootstrap_samples),
-        "question_count": len(samples),
-        "answered_count": len(answered),
-        "unanswered_count": len(samples) - len(answered),
-    }
-
-
 def _video_mme_v2_rating(
     samples: Sequence[SampleResult], *, seed: int, bootstrap_samples: int
 ) -> dict[str, object]:
@@ -4815,6 +4798,62 @@ def _video_mme_v2_rating(
         bootstrap_samples=bootstrap_samples,
         clamp=(0.0, 100.0),
     )
+
+
+def _video_mme_v2_accuracy(
+    samples: Sequence[SampleResult],
+    *,
+    seed: int,
+    bootstrap_samples: int,
+    official_metric: bool,
+) -> dict[str, object]:
+    """Reproduce the released `_acc.json` scale, denominator, and taxonomy cells."""
+
+    def summary(selected: Sequence[SampleResult], suffix: str) -> dict[str, object]:
+        return summarize(
+            tuple(
+                ScoredValue(sample.sample_id, sample.unit_id, 100.0 * float(sample.score or 0.0))
+                for sample in selected
+            ),
+            seed=_task_seed(seed, suffix),
+            bootstrap_samples=bootstrap_samples,
+            clamp=(0.0, 100.0),
+        )
+
+    answered = tuple(sample for sample in samples if sample.parsed_choice is not None)
+    taxonomy_fields = ("group_type", "level", "second_head", "third_head")
+    cells: dict[str, object] = {}
+    for taxonomy_field in taxonomy_fields:
+        labels = sorted({str(sample.metadata.get(taxonomy_field, "")) for sample in samples})
+        cells[f"by_{taxonomy_field}"] = {
+            (f"level_{label}" if taxonomy_field == "level" else label): summary(
+                tuple(
+                    sample
+                    for sample in samples
+                    if str(sample.metadata.get(taxonomy_field, "")) == label
+                ),
+                f"accuracy:{taxonomy_field}:{label}",
+            )
+            for label in labels
+            if label
+        }
+    return {
+        "official_metric": official_metric,
+        "overall": summary(samples, "accuracy"),
+        "answered_accuracy": (
+            summary(answered, "answered_accuracy")
+            if answered
+            else {
+                **summary((), "answered_accuracy"),
+                "mean": 0.0,
+            }
+        ),
+        "question_count": len(samples),
+        "answered_count": len(answered),
+        "correct_count": sum(sample.score == 1.0 for sample in samples),
+        "error_count": sum(sample.error_code is not None for sample in samples),
+        **cells,
+    }
 
 
 def _video_mme_v2_group_values(
@@ -5007,92 +5046,10 @@ def _baseline_samples(path: Path) -> tuple[dict[str, object], ...]:
     return tuple(rows)
 
 
-def _egomem_submission(
-    samples: Sequence[SampleResult], *, requested: bool, allow_partial: bool
-) -> tuple[bytes | None, dict[str, object] | None]:
-    if not requested:
-        return None, None
-    selected = tuple(
-        sample for sample in samples if sample.task == "egomemreason" and sample.arm == DEFAULT_ARM
-    )
-    predictions: list[tuple[int, str]] = []
-    invalid_count = 0
-    for sample in selected:
-        example_id = sample.metadata.get("example_id")
-        choices = sample.metadata.get("choices")
-        choice_count = (
-            len(choices)
-            if isinstance(choices, Sequence) and not isinstance(choices, str | bytes)
-            else 0
-        )
-        answer = sample.parsed_choice
-        if (
-            isinstance(example_id, bool)
-            or not isinstance(example_id, int)
-            or sample.error_code is not None
-            or sample.ingest_failure_count
-            or not 4 <= choice_count <= 10
-            or not isinstance(answer, str)
-            or answer not in "ABCDEFGHIJ"[:choice_count]
-        ):
-            invalid_count += 1
-            continue
-        predictions.append((example_id, answer))
-
-    example_ids = tuple(example_id for example_id, _answer in predictions)
-    duplicate_count = len(example_ids) - len(set(example_ids))
-    status: dict[str, object] = {
-        "file": None,
-        "sample_count": len(selected),
-        "required_sample_count": _EGOMEM_SUBMISSION_COUNT,
-    }
-    if invalid_count or duplicate_count:
-        status.update(
-            {
-                "status": "invalid",
-                "reason": (
-                    f"{invalid_count} invalid prediction(s), "
-                    f"{duplicate_count} duplicate example_id(s)"
-                ),
-            }
-        )
-        return None, status
-
-    expected_ids = set(range(1, _EGOMEM_SUBMISSION_COUNT + 1))
-    actual_ids = set(example_ids)
-    if actual_ids != expected_ids:
-        partial = allow_partial and actual_ids < expected_ids
-        status.update(
-            {
-                "status": "partial" if partial else "invalid",
-                "reason": (
-                    f"found {len(actual_ids)} of {_EGOMEM_SUBMISSION_COUNT} required example IDs"
-                ),
-            }
-        )
-        return None, status
-
-    content = _json_bytes(
-        [
-            {"example_id": example_id, "predicted_answer": answer}
-            for example_id, answer in sorted(predictions)
-        ]
-    )
-    status.update(
-        {
-            "status": "ready",
-            "file": _EGOMEM_SUBMISSION_FILE,
-            "sha256": hashlib.sha256(content).hexdigest(),
-        }
-    )
-    return content, status
-
-
 def _write_artifacts(
     arguments: _Arguments,
     samples: Sequence[SampleResult],
     results: Mapping[str, object],
-    submission: bytes | None,
     *,
     config_bytes: bytes | None = None,
 ) -> None:
@@ -5101,17 +5058,12 @@ def _write_artifacts(
     document["samples_sha256"] = hashlib.sha256(samples_bytes).hexdigest()
     results_bytes = _jsonl_bytes((document,))
     arguments.output_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    submission_path = arguments.output_path / _EGOMEM_SUBMISSION_FILE
-    if submission is None and arguments.overwrite:
-        submission_path.unlink(missing_ok=True)
     files = [
         (arguments.output_path / _SAMPLES_FILE, samples_bytes),
         (arguments.output_path / _RESULTS_FILE, results_bytes),
     ]
     if config_bytes is not None:
         files.append((arguments.output_path / _CONFIG_FILE, config_bytes))
-    if submission is not None:
-        files.append((submission_path, submission))
     _atomic_replace(files)
     # The real samples file now holds everything the crash copy did.
     (arguments.output_path / _PARTIAL_SAMPLES_FILE).unlink(missing_ok=True)
@@ -5342,11 +5294,11 @@ def _progress(
     def report(completed: int, _total: int) -> None:
         # Throttle on elapsed time, not on a fraction of the work: a tenth of a forty-minute task
         # and a tenth of a twenty-second one are not the same amount of silence. The first and
-        # the last completion always report, so a run that stalls at the start says so at once
-        # and the log always ends on the final count.
+        # the last completion always report. Preparation may also report zero before starting, so
+        # a run that stalls on its first source says so at once and the log ends on the final count.
         nonlocal last
         now = time.monotonic()
-        if completed not in {1, total} and now - last < _PROGRESS_LOG_SECONDS:
+        if completed not in {0, 1, total} and now - last < _PROGRESS_LOG_SECONDS:
             return
         last = now
         _announce(
@@ -5361,6 +5313,27 @@ def _progress(
         )
 
     yield report
+
+
+@contextmanager
+def _deferred_progress(
+    stage: str, noun: str, *, enabled: bool = True
+) -> Iterator[Callable[[int, int], None]]:
+    """Start a progress reporter once a producer discovers its total work count."""
+    with ExitStack() as stack:
+        expected_total: int | None = None
+        report: Callable[[int, int], None] = _ignore_progress
+
+        def advance(completed: int, total: int) -> None:
+            nonlocal expected_total, report
+            if expected_total is None:
+                expected_total = total
+                report = stack.enter_context(_progress(stage, noun, total=total, enabled=enabled))
+            elif total != expected_total:
+                raise ValueError(f"{stage} progress total changed from {expected_total} to {total}")
+            report(completed, total)
+
+        yield advance
 
 
 _first_ingest_failure_announced = False
@@ -6355,7 +6328,7 @@ def _require_output(path: Path, *, overwrite: bool, resume: bool = False) -> Non
     # continues, so the leftover is that run's own and refusing it would block the one command
     # written to recover from it. The finished artifacts still need `--overwrite`, because a run
     # that wrote them is not one to resume.
-    guarded = (_RESULTS_FILE, _SAMPLES_FILE, _EGOMEM_SUBMISSION_FILE)
+    guarded = (_RESULTS_FILE, _SAMPLES_FILE)
     for name in guarded if resume else (*guarded, _PARTIAL_SAMPLES_FILE, _CONFIG_FILE):
         target = path / name
         if target.exists() and not overwrite:

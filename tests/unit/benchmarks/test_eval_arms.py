@@ -924,7 +924,6 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
         samples,
         1.0,
         {task.spec.name: 1},
-        None,
         {
             task.spec.name: {
                 DEFAULT_ARM: {

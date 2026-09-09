@@ -21,6 +21,7 @@ rights holders before downloading, using, or redistributing EvoEmo.
 - BEAM, copyright 2025 Mohammad Tavakoli.
 - PersonaMem-v3 evaluation code, copyright 2026 The PersonaMem-v3 Authors.
 - OpenEQA, copyright Meta Platforms, Inc. and affiliates.
+- WorldMemArena, copyright 2026 WorldMemArena Authors.
 
 Those components are provided under the MIT License:
 

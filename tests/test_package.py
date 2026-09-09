@@ -321,6 +321,7 @@ def test_dependency_surface_is_exact() -> None:
             "soundfile",
             "torch",
             "torchaudio",
+            "torchvision",
         },
         "server": {"fastapi", "starlette", "uvicorn"},
         "mcp": {"mcp"},

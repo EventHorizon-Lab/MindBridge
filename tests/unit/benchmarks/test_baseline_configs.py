@@ -45,7 +45,7 @@ def test_5090_baseline_has_exact_models_endpoints_and_no_secret(name: str) -> No
     assert not any(path.is_absolute() for path in paths if path is not None)
 
 
-def test_media_baseline_selects_runtime_image_video_and_asr_routes() -> None:
+def test_media_baseline_selects_runtime_image_and_video_routes() -> None:
     config, overrides = _load_memory_config(_BASELINES / "rtx5090-qwen38-wemm9b-media.yaml")
 
     assert config is not None
@@ -54,7 +54,7 @@ def test_media_baseline_selects_runtime_image_video_and_asr_routes() -> None:
     selected = overrides.run.tasks
     assert selected is not None
     tasks = expand(tuple(selected.split(",")))
-    assert set(tasks) == {"atm-bench-main", "egolifeqa"}
+    assert set(tasks) == {"atm-bench-main", "video-mme-v2"}
     patterns: set[str] = set()
     for task in tasks:
         source = TASKS[task].media_source
@@ -62,4 +62,4 @@ def test_media_baseline_selects_runtime_image_video_and_asr_routes() -> None:
             patterns.update(source.patterns)
     assert "data/raw_memory/image/*" in patterns
     assert "data/raw_memory/video/*" in patterns
-    assert "A?_*/DAY*/*.mp4" in patterns
+    assert "videos/*.zip" in patterns

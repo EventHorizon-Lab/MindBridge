@@ -13,7 +13,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypeAlias, TypeVar, cast
 
-from mindbridge.benchmarks.egomem_reason import EgoMemReasonQuestion
 from mindbridge.benchmarks.egotempo import EgoTempoQuestion
 from mindbridge.benchmarks.mem_gallery import (
     MemGalleryQuestion,
@@ -601,46 +600,6 @@ def _m3(
     return tuple(units)
 
 
-def _video_mme(
-    spec: TaskSpec,
-    dataset: Path,
-    media: MediaResolver,
-    _root: Path,
-    limit: Limit,
-    offset: int,
-) -> tuple[EvalUnit, ...]:
-    from mindbridge.benchmarks.prompts import VIDEO_MME_QUERY_PROMPT
-    from mindbridge.benchmarks.video_mme import load_video_mme
-
-    return tuple(
-        EvalUnit(
-            video.video_id,
-            media.parts(video.video_id, (video.video_id, video.source_video_id)),
-            tuple(
-                EvalQuestion(
-                    question.question_id,
-                    (
-                        VIDEO_MME_QUERY_PROMPT.text.format(
-                            question=question.question,
-                            options="\n".join(question.options),
-                        ),
-                    ),
-                    expected_choice=question.answer,
-                    score_kind="choice",
-                    metadata={
-                        "duration": video.duration,
-                        "domain": video.domain,
-                        "task_type": question.task_type,
-                        "choices": question.options,
-                    },
-                )
-                for question in video.questions
-            ),
-        )
-        for video in _selected(load_video_mme(dataset), limit, offset)
-    )
-
-
 def _video_mme_v2(
     spec: TaskSpec,
     dataset: Path,
@@ -684,78 +643,80 @@ def _video_mme_v2(
     )
 
 
-def _egolife(
-    spec: TaskSpec,
+def _worldmemarena(
+    _spec: TaskSpec,
     dataset: Path,
-    media: MediaResolver,
+    _media: MediaResolver,
     _root: Path,
     limit: Limit,
     offset: int,
 ) -> tuple[EvalUnit, ...]:
-    from mindbridge.benchmarks.egolife_qa import load_egolife_qa
+    from mindbridge.benchmarks.worldmemarena import load_worldmemarena
 
-    questions = load_egolife_qa(dataset)
-    identity = dataset.stem.removeprefix("EgoLifeQA_")
-    memories = media.parts(identity, (identity,), allow_all=True)
-    normalized = tuple(
-        EvalQuestion(
-            question.question_id,
-            _choice_parts(question.question, question.choices),
-            expected_choice=question.correct_option,
-            score_kind="choice",
-            cutoff_seconds=question.query_offset_ms / 1_000,
-            metadata={
-                "day": question.query_day,
-                "question_type": question.question_type,
-                "needs_audio": question.needs_audio,
-                "choices": question.choices,
-            },
-        )
-        for question in _selected(questions, limit, offset)
-    )
-    _require_timestamped_media(spec.name, identity, memories, normalized)
-    return (EvalUnit(identity, memories, normalized),)
-
-
-def _egomem(
-    spec: TaskSpec,
-    dataset: Path,
-    media: MediaResolver,
-    _root: Path,
-    limit: Limit,
-    offset: int,
-) -> tuple[EvalUnit, ...]:
-    from mindbridge.benchmarks.egomem_reason import load_egomem_reason
-    from mindbridge.benchmarks.prompts import EGOMEM_REASON_QUERY_PROMPT
-
-    grouped: dict[str, list[EgoMemReasonQuestion]] = {}
-    for question in _selected(load_egomem_reason(dataset), limit, offset):
-        grouped.setdefault(question.identity, []).append(question)
     units = []
-    for identity, raw_questions in sorted(grouped.items()):
-        memories = media.parts(identity, (identity,), allow_all=True)
+    for sample in _selected(load_worldmemarena(dataset), limit, offset):
+        session_positions = {
+            session.session_id: position for position, session in enumerate(sample.sessions)
+        }
+        memories = []
+        for session_position, session in enumerate(sample.sessions):
+            for turn_position, turn in enumerate(session.turns):
+                start = float(session_position * 100_000 + turn_position * 10)
+                memories.append(
+                    MemoryItem(
+                        f"{sample.sample_id}:{session.session_id}:T{turn_position:04d}",
+                        (f"{turn.role}: {turn.content}",),
+                        start_seconds=start,
+                        end_seconds=start + 1.0,
+                    )
+                )
+                memories.extend(
+                    MemoryItem(
+                        attachment.image_id,
+                        (
+                            f"{turn.role} shared an image: {attachment.caption}",
+                            (sample.source_path.parent / attachment.file_path).resolve(),
+                        ),
+                        start_seconds=start + image_position + 1.0,
+                        end_seconds=start + image_position + 2.0,
+                    )
+                    for image_position, attachment in enumerate(turn.attachments)
+                )
         questions = tuple(
             EvalQuestion(
                 question.question_id,
-                (
-                    question.question,
-                    EGOMEM_REASON_QUERY_PROMPT.text.format(
-                        query_time=question.query_time,
-                        question_with_options=_choice_parts(question.question, question.choices)[1],
-                    ),
+                _free_text_parts(question.question),
+                (question.answer,),
+                cutoff_seconds=(
+                    (max(session_positions[item] for item in checkpoint.covered_sessions) + 1)
+                    * 100_000.0
                 ),
-                score_kind="submission",
-                cutoff_seconds=question.query_offset_ms / 1_000,
                 metadata={
-                    "query_type": question.query_type,
-                    "example_id": question.example_id,
-                    "choices": question.choices,
+                    "question_type": question.question_type,
+                    "question_type_abbrev": question.question_type_abbrev,
+                    "difficulty": question.difficulty,
+                    "checkpoint_id": checkpoint.checkpoint_id,
+                    # MindBridge source IDs can reproduce the release's image IDs exactly.
+                    # Gold `mp_*` IDs name scorer-authored summaries, not raw dialogue turns;
+                    # presenting those summaries as memories would leak labels into the system.
+                    "evidence_ids": tuple(
+                        identifier
+                        for identifier in question.evidence_ids
+                        if not identifier.startswith("mp_")
+                    ),
+                    "unresolved_evidence_ids": tuple(
+                        identifier
+                        for identifier in question.evidence_ids
+                        if identifier.startswith("mp_")
+                    ),
+                    "gold_evidence_contents": question.evidence_contents,
                 },
+                source_question=question.question,
             )
-            for question in raw_questions
+            for checkpoint in sample.checkpoints
+            for question in checkpoint.questions
         )
-        _require_timestamped_media(spec.name, identity, memories, questions)
-        units.append(EvalUnit(identity, memories, questions))
+        units.append(EvalUnit(sample.sample_id, tuple(memories), questions))
     return tuple(units)
 
 
@@ -1568,10 +1529,8 @@ _LOADERS = {
     "locomo-refined": _locomo,
     "m3-bench-robot": _m3,
     "m3-bench-web": _m3,
-    "video-mme": _video_mme,
     "video-mme-v2": _video_mme_v2,
-    "egolifeqa": _egolife,
-    "egomemreason": _egomem,
+    "worldmemarena": _worldmemarena,
     "egotempo": _egotempo,
     "openeqa-hm3d": _openeqa,
     "openeqa-scannet": _openeqa,

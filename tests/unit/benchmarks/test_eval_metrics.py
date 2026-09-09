@@ -322,6 +322,68 @@ def test_metrics_do_not_compare_a_selected_slice_to_the_full_dataset() -> None:
     assert coverage["score_comparable_to_full_dataset"] is False
 
 
+def test_openeqa_aggregate_keeps_the_official_zero_to_one_hundred_scale() -> None:
+    sample = replace(
+        _sample("q1", sources=(), gold=(), candidate_count=0, score=75.0),
+        task="openeqa-hm3d",
+        benchmark="OpenEQA",
+        metrics={"llm_match": 75.0, "llm_match_score_1_5": 4.0},
+        judge_model="gpt-4-1106-preview",
+    )
+    task = cast(
+        Any,
+        SimpleNamespace(
+            spec=SimpleNamespace(name="openeqa-hm3d"),
+            units=(SimpleNamespace(unit_id="unit"),),
+            unavailable_units={},
+        ),
+    )
+
+    result = eval_module._metrics(task, (sample,), _arguments())
+
+    assert cast(Mapping[str, object], result["score"])["mean"] == 75.0
+    metric = cast(Mapping[str, object], cast(Mapping[str, object], result["metrics"])["llm_match"])
+    assert metric["mean"] == 75.0
+    assert metric["official_metric"] is True
+
+
+def test_personamem_does_not_publish_a_biased_partial_micro_score() -> None:
+    supported = replace(
+        _sample("q1", sources=(), gold=(), candidate_count=0, score=0.9),
+        task="personamem-v3",
+        benchmark="PersonaMem-v3",
+        metrics={"personamem_score": 0.9},
+        judge_model="gpt-5.5",
+    )
+    unsupported = replace(
+        supported,
+        question_id="q2",
+        score=None,
+        metrics={},
+        judge_model=None,
+    )
+    task = cast(
+        Any,
+        SimpleNamespace(
+            spec=SimpleNamespace(name="personamem-v3"),
+            units=(SimpleNamespace(unit_id="unit"),),
+            unavailable_units={},
+        ),
+    )
+
+    result = eval_module._metrics(task, (supported, unsupported), _arguments())
+    score = cast(Mapping[str, object], result["score"])
+    coverage = cast(Mapping[str, object], result["score_coverage"])
+
+    assert result["primary_metric"] == "accuracy_pct_micro"
+    assert result["official_metric"] is False
+    assert result["score_valid"] is False
+    assert score["mean"] is None
+    assert coverage["complete"] is False
+    subset = cast(Mapping[str, object], coverage["supported_subset_accuracy_pct_micro"])
+    assert subset["mean"] == 90.0
+
+
 # --- family 3: ASR real-time factor and inference latency -----------------------------------
 
 
@@ -1226,9 +1288,8 @@ def test_metric_breakdown_families_all_exist_in_the_single_family_table() -> Non
     for family in (
         "locomo-refined",
         "m3-bench",
-        "video-mme",
         "video-mme-v2",
-        "egolifeqa",
+        "worldmemarena",
         "egotempo",
         "memlens",
         "mm-lifelong",

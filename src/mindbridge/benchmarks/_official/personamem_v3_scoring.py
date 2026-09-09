@@ -40,6 +40,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from math import log2
 
+# `eval` must not publish the official micro headline while the task protocols
+# listed in the scope note above remain unavailable. Keeping this next to the
+# scorer inventory prevents row coverage from being mistaken for benchmark
+# protocol coverage (two cluster families are dropped before rows are built).
+COMPLETE_HEADLINE_COVERAGE = False
+
 JUDGE_PREFACE = (
     "You are an expert judge evaluating a personalized assistant's output.\n"
     "Reason step-by-step before producing your final score. Base every score on the evidence\n"
@@ -630,7 +636,7 @@ def score_unified_rubric(task_type: str, payload: Mapping[str, object]) -> dict[
     # `chatbot_personalized_response` publishes the un-penalised, hard-rule-gated
     # primary as its headline; the telegraph deduction stays a diagnostic.
     if main is not None:
-        scores["pr_preference_alignment_score_gated"] = 0.0 if violated else round(main, 2)
+        scores["pr_preference_alignment_score"] = 0.0 if violated else round(main, 2)
     return scores
 
 
