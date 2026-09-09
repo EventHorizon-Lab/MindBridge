@@ -11,7 +11,6 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, m
 
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, NonEmptyString
 
-MEMLENS_ADAPTER_VERSION = "memlens_official_v1"
 _DATE_PATTERN = re.compile(r"^(\d{4}/\d{2}/\d{2}) \([A-Za-z]{3}\) (\d{2}:\d{2})$")
 
 

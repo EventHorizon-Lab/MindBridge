@@ -101,9 +101,11 @@ app = create_app(memory=memory)
 ```
 
 Register framework shutdown handling for both `memory.close()` and `client.close()`, then run one
-worker:
+worker under the deployment's own ASGI server. MindBridge does not depend on one, so install the
+chosen server alongside it:
 
 ```bash
+uv add uvicorn
 uvicorn my_application:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 

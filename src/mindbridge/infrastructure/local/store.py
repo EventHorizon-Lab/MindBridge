@@ -2283,27 +2283,6 @@ class LocalStore:
             ).fetchone()
         return row is not None
 
-    def mark_formation_completed(
-        self,
-        source_memory_id: str,
-        recipe: str,
-        *,
-        completed_at: datetime,
-    ) -> None:
-        """Durably mark an idempotent automatic formation run as complete."""
-        _require_identifier(source_memory_id, "source_memory_id")
-        _require_identifier(recipe, "recipe")
-        _require_aware(completed_at, "completed_at")
-        with self._transaction() as connection:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO formation_runs (
-                    source_memory_id, recipe, completed_at
-                ) VALUES (?, ?, ?)
-                """,
-                (source_memory_id, recipe, _datetime_text(completed_at)),
-            )
-
     def add_memory_evidence(
         self,
         memory_id: str,
@@ -5149,16 +5128,6 @@ class LocalStore:
         return {
             embedding_id: tuple(grouped.get(embedding_id, ())) for embedding_id in embedding_ids
         }
-
-    def delete_embedding(self, embedding_id: str) -> bool:
-        """Delete one vector and durably enqueue removal from the search index."""
-        _require_identifier(embedding_id, "embedding_id")
-        with self._transaction() as connection:
-            cursor = connection.execute(
-                "DELETE FROM embeddings WHERE embedding_id = ?",
-                (embedding_id,),
-            )
-        return cursor.rowcount > 0
 
     def read_index_document(self, embedding_id: str) -> IndexDocument | None:
         """Hydrate the current index payload from authoritative SQLite state."""

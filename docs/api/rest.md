@@ -31,11 +31,11 @@ The generated FastAPI schema is the machine-readable contract. A running applica
 
 ## Start the adapter
 
-Install the server extra together with the extras required by the chosen backends, construct one
-`Memory`, and inject it:
+Install the server extra together with the extras required by the chosen backends and an ASGI
+server of the deployment's choosing, construct one `Memory`, and inject it:
 
 ```bash
-uv add "mindbridge[local,server]"
+uv add "mindbridge[local,server]" uvicorn
 ```
 
 ```python

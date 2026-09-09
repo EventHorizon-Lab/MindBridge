@@ -44,7 +44,7 @@ from mindbridge.models.openai_sdk import (
 )
 from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
-from mindbridge.plugins import MemoryConfig, MemoryPlugins, MemorySettings
+from mindbridge.plugins import MemoryConfig, MemoryPlugins
 from mindbridge.types import Modality, RetentionPolicy
 
 _Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -271,10 +271,10 @@ class MindBridgeConfig(_ConfigModel):
     consolidation: OpenAIConsolidationConfig | None = None
     speech: SpeechProviderConfig | None = None
     face: OpenCVFaceConfig | None = None
-    settings: MemorySettings = Field(default_factory=MemorySettings)
+    settings: MemoryConfig = Field(default_factory=MemoryConfig)
     # Its own section rather than a `settings` field: every other setting shapes what recall
     # returns and can be changed back, and this one deletes. It reaches `Memory` as
-    # `MemorySettings.retention`, which is the same value under the name `from_plugins` reads;
+    # `MemoryConfig.retention`, which is the same value under the name `from_plugins` reads;
     # declaring it twice is refused rather than silently resolved.
     retention: RetentionPolicy | None = None
 

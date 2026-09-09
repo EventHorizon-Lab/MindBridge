@@ -180,7 +180,3 @@ class MemoryConfig:
     # what recall returns and can be changed back, and this one deletes. Empty by default: no
     # age is declared, so nothing ages out.
     retention: RetentionPolicy = _NO_RETENTION
-
-
-# Clearer name for new code; keep the original public value intact for compatibility.
-MemorySettings = MemoryConfig

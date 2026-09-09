@@ -15,21 +15,15 @@ is how a leaderboard number gets misquoted by a factor of a hundred.
 
 from __future__ import annotations
 
-import asyncio
 import re
-from collections import defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Sequence
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
-from mindbridge import AsyncMemory, MindBridgeError
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, NonEmptyString
-from mindbridge.benchmarks.prompts import VIDEO_MME_V2_QUERY_PROMPT
-
-VIDEO_MME_V2_ADAPTER_VERSION = "video_mme_v2_official_v1"
 
 VideoMMEV2GroupType = Literal["relevance", "logic"]
 VideoMMEV2Level = Literal["1", "2", "3"]
@@ -131,104 +125,6 @@ class VideoMMEV2Group(ContractModel):
         return self
 
 
-class VideoMMEV2QuestionResult(ContractModel):
-    """One official evaluator row plus the MindBridge diagnostics behind it."""
-
-    question_id: Identifier
-    position: int = Field(ge=1, le=GROUP_SIZE)
-    question: NonEmptyString
-    options: tuple[NonEmptyString, ...] = Field(min_length=2, max_length=len(_OPTION_LABELS))
-    answer: VideoMMEV2Option
-    level: VideoMMEV2Level
-    second_head: NonEmptyString
-    third_head: NonEmptyString
-    response: str
-    mindbridge_model_answer: str
-    mindbridge_confidence: float = Field(ge=0.0, le=1.0)
-    mindbridge_memory_ids: tuple[Identifier, ...]
-    mindbridge_evidence_ids: tuple[Identifier, ...]
-    mindbridge_trace_id: Identifier
-    mindbridge_error_code: NonEmptyString | None = None
-    # One ingest covers the whole video before any of its four questions is asked, so every
-    # question in a group carries the same count. A non-zero count marks a group answered over
-    # incomplete memory: one missing segment can break a dependency chain and cost the whole
-    # group its score, not one question its point.
-    mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
-
-
-class VideoMMEV2GroupResult(ContractModel):
-    """Official result object for one scored group."""
-
-    video_id: Identifier
-    group_type: VideoMMEV2GroupType
-    group_structure: NonEmptyString
-    questions: tuple[VideoMMEV2QuestionResult, ...] = Field(
-        min_length=GROUP_SIZE, max_length=GROUP_SIZE
-    )
-
-
-class VideoMMEV2Rating(ContractModel):
-    """The leaderboard number: grouped non-linear score, and the cells it breaks into.
-
-    Reproduces the released `_rating.json`. Every cell is a mean over whole groups on a 0-100
-    scale, so `group_count` is the denominator rather than a question count.
-
-    The taxonomy cells are keyed on the *fourth* question of each group, because that is what
-    the released scorer reads (`group[-1]`). `level`, `second_head`, and `third_head` all vary
-    within a group in the official release, so this is a real choice the scorer makes and not
-    a detail that happens to be constant.
-    """
-
-    group_count: int = Field(gt=0)
-    overall: _Score = Field(ge=0.0, le=100.0)
-    by_group_type: dict[str, _Score]
-    by_level: dict[str, _Score]
-    by_second_head: dict[str, _Score]
-    by_third_head: dict[str, _Score]
-
-
-class VideoMMEV2Accuracy(ContractModel):
-    """Plain per-question accuracy and its cells, reproducing the released `_acc.json`.
-
-    `overall` counts every question, scoring an unparseable or missing response wrong, which is
-    what the released `get_final_acc` writes to disk. `answered_accuracy` is the answered-only
-    number the same script prints as "Simple accuracy (valid only)".
-
-    Matching the artifact's exact `accuracy` naming and scale keeps quoted values checkable.
-    """
-
-    question_count: int = Field(gt=0)
-    answered_count: int = Field(ge=0)
-    correct_count: int = Field(ge=0)
-    error_count: int = Field(ge=0)
-    overall: _Score = Field(ge=0.0, le=100.0)
-    answered_accuracy: _Score = Field(ge=0.0, le=100.0)
-    by_group_type: dict[str, _Score]
-    by_level: dict[str, _Score]
-    by_second_head: dict[str, _Score]
-    by_third_head: dict[str, _Score]
-
-    @model_validator(mode="after")
-    def require_consistent_counts(self) -> VideoMMEV2Accuracy:
-        if self.correct_count > self.answered_count or self.answered_count > self.question_count:
-            raise ValueError("Video-MME-v2 accuracy counts are inconsistent")
-        if self.error_count > self.question_count - self.answered_count:
-            raise ValueError("Video-MME-v2 failed questions must not carry a parsed answer")
-        return self
-
-
-class VideoMMEV2Metrics(ContractModel):
-    """Both released scoring views over one run.
-
-    The benchmark exists because these two disagree: a model scattering correct answers across
-    groups earns the same accuracy and a much lower rating than one answering whole groups. A
-    run reports both or it reports nothing interpretable.
-    """
-
-    rating: VideoMMEV2Rating
-    accuracy: VideoMMEV2Accuracy
-
-
 class _RawQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -289,79 +185,6 @@ def load_video_mme_v2(annotation_path: Path) -> tuple[VideoMMEV2Group, ...]:
     return groups
 
 
-async def run_video_mme_v2_group(
-    memory: AsyncMemory,
-    annotation: VideoMMEV2Group,
-    video_path: Path,
-    *,
-    recall_limit: int = 20,
-    request_concurrency: int = 4,
-) -> VideoMMEV2GroupResult:
-    """Ingest one source video and answer the four official questions scored over it."""
-    if not 1 <= recall_limit <= 100 or request_concurrency <= 0:
-        raise ValueError(
-            "recall_limit must be between 1 and 100; request_concurrency must be positive"
-        )
-    try:
-        await memory.add(
-            video_path,
-            metadata={"benchmark": "video-mme-v2", "video_id": annotation.video_id},
-        )
-        ingest_failures = 0
-    except Exception:
-        ingest_failures = 1
-
-    semaphore = asyncio.Semaphore(request_concurrency)
-    answered = await asyncio.gather(
-        *(
-            _answer_question(
-                memory,
-                question,
-                recall_limit,
-                semaphore,
-                ingest_failures,
-            )
-            for question in annotation.questions
-        ),
-        return_exceptions=True,
-    )
-    # A raising recall costs its own question, not the group. `VideoMMEV2GroupResult`
-    # requires all four rows, so an escaping exception took the whole group's rating with
-    # it and then ended the run, because the CLI awaits each group in turn. It matters
-    # more here than in any per-question benchmark: the rating is defined over whole
-    # groups only, so a group short of a row cannot be scored at all.
-    answers = []
-    for question, outcome in zip(annotation.questions, answered, strict=True):
-        if not isinstance(outcome, BaseException):
-            answers.append(outcome)
-        elif isinstance(outcome, Exception):
-            answers.append(_failed_result(question, _error_code(outcome), ingest_failures))
-        else:
-            raise outcome
-    return VideoMMEV2GroupResult(
-        video_id=annotation.video_id,
-        group_type=annotation.group_type,
-        group_structure=annotation.group_structure,
-        questions=tuple(answers),
-    )
-
-
-def evaluate_video_mme_v2(results: tuple[VideoMMEV2GroupResult, ...]) -> VideoMMEV2Metrics:
-    """Compute the official grouped rating and per-question accuracy over whole groups."""
-    if not results:
-        raise ValueError("Video-MME-v2 results must not be empty")
-    return VideoMMEV2Metrics(
-        rating=_rating(results),
-        accuracy=_accuracy(results),
-    )
-
-
-def score_group(result: VideoMMEV2GroupResult) -> _Score:
-    """Score one group on the released 0-100 non-linear scale."""
-    correct = tuple(_is_correct(question) for question in result.questions)
-    return score_group_answers(result.group_type, result.group_structure, correct)
-
-
 def score_group_answers(group_type: str, group_structure: str, correct: Sequence[bool]) -> _Score:
     """Score four parsed answers without rebuilding the full result contract."""
     answers = tuple(correct)
@@ -413,73 +236,8 @@ def _chain_progress(correct: tuple[bool, ...], structure: VideoMMEV2LogicStructu
     return progress
 
 
-def _rating(results: tuple[VideoMMEV2GroupResult, ...]) -> VideoMMEV2Rating:
-    scores = tuple(score_group(result) for result in results)
-    # Keyed on the last question of each group, which is what the released scorer reads.
-    tails = tuple(result.questions[-1] for result in results)
-    return VideoMMEV2Rating(
-        group_count=len(results),
-        overall=_mean(scores),
-        by_group_type=_cells(
-            scores, (result.group_type for result in results), key=lambda value: value
-        ),
-        by_level=_cells(scores, (tail.level for tail in tails), key=_level_key),
-        by_second_head=_cells(scores, (tail.second_head for tail in tails)),
-        by_third_head=_cells(scores, (tail.third_head for tail in tails)),
-    )
-
-
-def _accuracy(results: tuple[VideoMMEV2GroupResult, ...]) -> VideoMMEV2Accuracy:
-    questions = tuple(question for result in results for question in result.questions)
-    group_types = tuple(
-        result.group_type for result in results for _ in range(len(result.questions))
-    )
-    scores = tuple(100.0 * _is_correct(question) for question in questions)
-    answered = tuple(question for question in questions if question.response in _OPTION_LABELS)
-    correct_count = sum(_is_correct(question) for question in answered)
-    return VideoMMEV2Accuracy(
-        question_count=len(questions),
-        answered_count=len(answered),
-        correct_count=correct_count,
-        error_count=sum(question.mindbridge_error_code is not None for question in questions),
-        overall=_mean(scores),
-        answered_accuracy=100.0 * correct_count / len(answered) if answered else 0.0,
-        by_group_type=_cells(scores, group_types, key=lambda value: value),
-        by_level=_cells(scores, (question.level for question in questions), key=_level_key),
-        by_second_head=_cells(scores, (question.second_head for question in questions)),
-        by_third_head=_cells(scores, (question.third_head for question in questions)),
-    )
-
-
-def _cells(
-    scores: tuple[_Score, ...],
-    labels: Iterable[str],
-    *,
-    key: Callable[[str], str] = lambda value: value,
-) -> dict[str, _Score]:
-    """Average `scores` into one cell per label, sorted so a manifest diff stays readable."""
-    grouped: dict[str, list[_Score]] = defaultdict(list)
-    for score, label in zip(scores, labels, strict=True):
-        grouped[key(label)].append(score)
-    return {label: _mean(tuple(values)) for label, values in sorted(grouped.items())}
-
-
-def _level_key(level: str) -> str:
-    """Name a level cell the way the released `_rating.json` does."""
-    return f"level_{level}"
-
-
 def _mean(scores: tuple[_Score, ...]) -> _Score:
     return sum(scores) / len(scores) if scores else 0.0
-
-
-def _is_correct(question: VideoMMEV2QuestionResult) -> bool:
-    """Score one row, counting an unparseable or missing response wrong.
-
-    The released scorer marks those rows `-1` and then folds `-1` into zero in both the rating
-    and the accuracy it writes out, so an abstention is a wrong answer to every number here.
-    """
-    return question.response == question.answer
 
 
 def _group(rows: list[_RawQuestion]) -> VideoMMEV2Group:
@@ -507,98 +265,4 @@ def _group(rows: list[_RawQuestion]) -> VideoMMEV2Group:
             )
             for position, row in enumerate(rows, start=1)
         ),
-    )
-
-
-async def _answer_question(
-    memory: AsyncMemory,
-    question: VideoMMEV2Question,
-    recall_limit: int,
-    semaphore: asyncio.Semaphore,
-    ingest_failures: int,
-) -> VideoMMEV2QuestionResult:
-    query = VIDEO_MME_V2_QUERY_PROMPT.text.format(
-        question=question.question,
-        options="\n".join(question.options),
-    )
-    try:
-        async with semaphore:
-            result = await memory.ask(query, limit=recall_limit)
-    except MindBridgeError as error:
-        return _question_result(
-            question,
-            model_answer="",
-            confidence=0.0,
-            memory_ids=(),
-            evidence_ids=(),
-            trace_id=f"eval_error_{question.question_id}",
-            error_code=error.code,
-            ingest_failures=ingest_failures,
-        )
-    return _question_result(
-        question,
-        model_answer=result.answer,
-        confidence=max((item.score for item in result.hits), default=0.0),
-        memory_ids=tuple(item.id for item in result.hits),
-        evidence_ids=(),
-        trace_id=f"eval_{question.question_id}",
-        ingest_failures=ingest_failures,
-    )
-
-
-def _failed_result(
-    question: VideoMMEV2Question,
-    error_code: str,
-    ingest_failures: int,
-) -> VideoMMEV2QuestionResult:
-    """One row for a question whose recall raised, so its group still scores four of them.
-
-    `response` is empty, which the released scorer counts wrong, and `mindbridge_error_code`
-    is what keeps a transport failure from reading as a model that answered badly.
-    """
-    return _question_result(
-        question,
-        model_answer="",
-        confidence=0.0,
-        memory_ids=(),
-        evidence_ids=(),
-        trace_id=f"eval_error_{question.question_id}",
-        error_code=error_code,
-        ingest_failures=ingest_failures,
-    )
-
-
-def _error_code(error: Exception) -> str:
-    return error.code if isinstance(error, MindBridgeError) else type(error).__name__
-
-
-def _question_result(
-    question: VideoMMEV2Question,
-    *,
-    model_answer: str,
-    confidence: float,
-    memory_ids: tuple[str, ...],
-    evidence_ids: tuple[str, ...],
-    trace_id: str,
-    ingest_failures: int,
-    error_code: str | None = None,
-) -> VideoMMEV2QuestionResult:
-    option = parse_video_mme_v2_option(model_answer)
-    return VideoMMEV2QuestionResult(
-        question_id=question.question_id,
-        position=question.position,
-        question=question.question,
-        options=question.options,
-        answer=question.answer,
-        level=question.level,
-        second_head=question.second_head,
-        third_head=question.third_head,
-        response=option or "",
-        mindbridge_model_answer=model_answer,
-        mindbridge_confidence=confidence,
-        mindbridge_memory_ids=memory_ids,
-        mindbridge_evidence_ids=evidence_ids,
-        mindbridge_trace_id=trace_id,
-        mindbridge_error_code=error_code,
-        mindbridge_ingest_failure_count=ingest_failures,
     )

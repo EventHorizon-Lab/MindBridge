@@ -37,7 +37,6 @@ from mindbridge import (
     MemoryOperation,
     MemoryPlugins,
     MemoryRecord,
-    MemorySettings,
     MemoryTrigger,
     MindBridgeConfig,
     Modality,
@@ -92,8 +91,6 @@ def test_declarative_config_is_typed_strict_and_keeps_local_policy_separate(
         index_quantization=IndexQuantization.FP16,
         retrieval_mode=RetrievalMode.LEXICAL,
     )
-    assert MemorySettings is MemoryConfig
-
     with pytest.raises(PydanticValidationError, match="extra_forbidden"):
         MindBridgeConfig.model_validate(
             {

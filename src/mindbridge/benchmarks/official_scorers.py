@@ -287,8 +287,6 @@ _RANKED_INDEXES = re.compile(r"ranked[ _]index(?:es|ices)?\s*[:=]?\s*\[([^\]]*)\
 _RANKED_JSON = re.compile(r'"ranked_indices"\s*:\s*\[([^\]]*)\]')
 
 _LOCOMO_TOKEN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
-_ATM_MEDIA_ID = re.compile(r"\b(\d{8}_\d{6})\b")
-_ATM_EMAIL_ID = re.compile(r"\b(email\d+)\b", re.IGNORECASE)
 
 
 def task_family(task: str) -> str | None:

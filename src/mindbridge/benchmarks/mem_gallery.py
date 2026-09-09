@@ -17,8 +17,6 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, NonEmptyString
 
-MEM_GALLERY_ADAPTER_VERSION = "mem_gallery_official_v2"
-
 MemGalleryPoint = Literal["FR", "MR", "TR", "VR", "TTL", "VS", "CD", "KR", "AR"]
 _POINTS: frozenset[str] = frozenset(("FR", "MR", "TR", "VR", "TTL", "VS", "CD", "KR", "AR"))
 _QA_KEY = "human-annotated QAs"
@@ -152,17 +150,6 @@ def load_mem_gallery(dialog_directory: Path) -> tuple[MemGalleryTopic, ...]:
     if not paths:
         raise ValueError(f"no Mem-Gallery topic files under {dialog_directory}")
     return tuple(load_mem_gallery_topic(path) for path in paths)
-
-
-def mem_gallery_dialog_digest(dialog_directory: Path) -> str:
-    """Digest the concatenated per-file digests of `data/dialog`, in sorted order.
-
-    Shared by the CLI run manifest and the dataset-smoke summary so a run's manifest and a
-    smoke row cannot silently disagree about which release digest names -- each used to
-    compute this independently.
-    """
-    joined = "".join(sha256_file(path) for path in sorted(dialog_directory.glob("*.json")))
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
 def sha256_file(path: Path) -> str:

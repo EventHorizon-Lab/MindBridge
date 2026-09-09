@@ -1,4 +1,4 @@
-"""Tests for the closed-store paired replay helper."""
+"""Tests for the paired-replay research driver."""
 
 from __future__ import annotations
 
@@ -13,21 +13,13 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType
-from typing import Any
 
 import httpx
 import pytest
 
 from mindbridge.benchmarks.eval import _BaselineGenerator, _load_memory_config
 from mindbridge.benchmarks.model_config import ModelConfig
-from mindbridge.benchmarks.paired_replay import (
-    GeneratorPayload,
-    ReplayRequest,
-    clone_closed_store,
-    replay_compile,
-    same_generator_input,
-)
-from mindbridge.types import ContextBudget, RetrievalScope, SearchHit
+from mindbridge.types import SearchHit
 
 
 def _driver() -> ModuleType:
@@ -38,85 +30,6 @@ def _driver() -> ModuleType:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
-
-
-def test_clone_closed_store_copies_into_distinct_directory(tmp_path: Path) -> None:
-    source = tmp_path / "formed-store"
-    source.mkdir()
-    (source / "state.sqlite3").write_text("closed-store", encoding="utf-8")
-
-    destination = clone_closed_store(source, tmp_path / "candidate-store")
-
-    assert destination != source
-    assert (destination / "state.sqlite3").read_text(encoding="utf-8") == "closed-store"
-    (destination / "candidate-only").write_text("isolated", encoding="utf-8")
-    assert not (source / "candidate-only").exists()
-
-
-def test_clone_closed_store_refuses_shared_or_existing_destination(tmp_path: Path) -> None:
-    source = tmp_path / "formed-store"
-    source.mkdir()
-
-    with pytest.raises(ValueError, match="must differ"):
-        clone_closed_store(source, source)
-    with pytest.raises(ValueError, match="must not be nested"):
-        clone_closed_store(source, source / "candidate-store")
-    destination = tmp_path / "candidate-store"
-    destination.mkdir()
-    with pytest.raises(FileExistsError, match="already exists"):
-        clone_closed_store(source, destination)
-
-
-def test_same_generator_input_requires_exact_text_and_media_order() -> None:
-    baseline = GeneratorPayload(b'{"messages":["context"],"seed":42}')
-
-    assert same_generator_input(baseline, baseline)
-    assert not same_generator_input(
-        baseline, GeneratorPayload(b'{"messages":["context changed"],"seed":42}')
-    )
-    assert not same_generator_input(
-        baseline, GeneratorPayload(b'{"messages":["context"],"seed":43}')
-    )
-
-
-async def test_replay_compile_forwards_the_frozen_public_request() -> None:
-    captured: dict[str, Any] = {}
-
-    class Asset:
-        id = "asset-1"
-        sha256 = "a" * 64
-        media_type = "image/png"
-
-    class Hit:
-        id = "memory-1"
-        assets = (Asset(),)
-
-    class Bundle:
-        hits = (Hit(),)
-
-        def render(self) -> str:
-            return "exact rendered context"
-
-    class Memory:
-        async def compile(self, question: object, **kwargs: object) -> Bundle:
-            captured.update(question=question, **kwargs)
-            return Bundle()
-
-    reference_at = datetime(2025, 7, 22, 16, 48, tzinfo=timezone.utc)
-    budget = ContextBudget(max_items=24, max_chars=16000)
-    scope = RetrievalScope(valid_at=reference_at, known_at=reference_at)
-    request = ReplayRequest("frozen question", reference_at, budget, scope)
-
-    result = await replay_compile(Memory(), request)  # type: ignore[arg-type]
-
-    assert captured == {
-        "question": "frozen question",
-        "budget": budget,
-        "reference_at": reference_at,
-        "scope": scope,
-    }
-    assert result.rendered == "exact rendered context"
-    assert result.media == (("memory-1", "asset-1", "a" * 64, "image/png"),)
 
 
 def test_driver_refuses_to_clone_a_store_with_a_live_owner(tmp_path: Path) -> None:

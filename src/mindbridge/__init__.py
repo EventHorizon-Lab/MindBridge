@@ -49,7 +49,7 @@ from mindbridge.models.jina import JinaOmniEmbedder
 from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
-from mindbridge.plugins import MemoryConfig, MemoryPlugins, MemorySettings
+from mindbridge.plugins import MemoryConfig, MemoryPlugins
 from mindbridge.types import (
     AbstentionReason,
     AcousticBoundary,
@@ -206,7 +206,6 @@ __all__ = [
     "MemoryOutcome",
     "MemoryPlugins",
     "MemoryRecord",
-    "MemorySettings",
     "MemoryTrigger",
     "MemoryType",
     "MindBridgeConfig",

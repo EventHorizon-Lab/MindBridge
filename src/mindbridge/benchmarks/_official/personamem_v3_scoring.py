@@ -415,9 +415,6 @@ DIM_DEF_ALIAS = {"relationship_aware": "relationship_awareness"}
 PRIMARY_WEIGHT = 0.8
 SECONDARY_WEIGHT = 0.2
 
-RUBRIC_TASK_TYPES = frozenset(APPLICABILITY)
-
-
 # The 13 task types whose headline IS the unified rubric, from EVAL.md's "Full
 # metric set per judged task type" table. `APPLICABILITY` is wider than this on
 # purpose: it also lists tasks whose `pr_*` output upstream keeps as a

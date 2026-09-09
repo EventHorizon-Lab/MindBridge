@@ -34,8 +34,6 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, NonEmptyString
 
-CLBENCH_ADAPTER_VERSION = "clbench_official_v1"
-
 _PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n")
 
 # Separates "a short final turn with no blank-line break, where the whole turn

@@ -49,7 +49,6 @@ all = [
     "torchaudio>=2.11,<3",
     "torchvision>=0.26,<0.27",
     "tqdm>=4.66,<5",
-    "uvicorn>=0.35,<1",
 ]
 benchmarks = [
     # download.py imports httpx at module scope; huggingface-hub happens to require it today.
@@ -100,7 +99,6 @@ local = [
 server = [
     "fastapi>=0.116,<1",
     "starlette>=0.46,<2",
-    "uvicorn>=0.35,<1",
 ]
 mcp = [
     "mcp>=2,<3",

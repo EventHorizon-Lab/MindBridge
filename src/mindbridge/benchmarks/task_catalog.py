@@ -13,8 +13,6 @@ from mindbridge.benchmarks.longmemeval import LONGMEMEVAL_ADAPTER_VERSION
 from mindbridge.benchmarks.openeqa import OPENEQA_ADAPTER_VERSION, OPENEQA_SPLITS
 from mindbridge.benchmarks.worldmemarena import WORLDMEMARENA_ADAPTER_VERSION
 
-DEFAULT_BENCHMARKS_ROOT = Path(".benchmarks")
-
 
 @dataclass(frozen=True, slots=True)
 class MediaSource:

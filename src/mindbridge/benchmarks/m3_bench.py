@@ -8,8 +8,6 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, NonEmptyString
 
-M3_BENCH_ADAPTER_VERSION = "m3_bench_official_v1"
-
 
 class M3BenchQuestion(ContractModel):
     """One open-ended question and the official reference answer."""
