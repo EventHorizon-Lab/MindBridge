@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile, gettempdir
+from threading import Event, Thread
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast, overload
 
 import yaml
@@ -2213,6 +2214,7 @@ async def _run_arms(
                 deliberate=arguments.deliberate,
                 tracer=tracer,
                 on_progress=progress,
+                on_activity=progress.set_activity,
                 on_search_replay_ready=deferred_searches.append,
             )
         if on_task_complete is not None:
@@ -2245,6 +2247,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     deliberate: bool = False,
     tracer: Tracer | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    on_activity: Callable[[str], None] | None = None,
     on_search_replay_ready: Callable[[_SearchReplay], None] | None = None,
 ) -> tuple[SampleResult, ...]:
     """Run normalized units with bounded workers while preserving release order."""
@@ -2260,6 +2263,8 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     completed = 0
     total = sum(len(unit.questions) for unit in task.units) * len(arms)
     notify_progress = on_progress or _ignore_progress
+    notify_activity = on_activity or _ignore_activity
+    unit_activities: list[str | None] = [None] * len(task.units)
     for index, unit in enumerate(task.units):
         queue.put_nowait((index, unit))
 
@@ -2278,6 +2283,12 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
             )
             reported = 0
 
+            def activity(
+                phase: str, unit_index: int = index, unit_total: int = len(task.units)
+            ) -> None:
+                unit_activities[unit_index] = phase
+                notify_activity(_activity_summary(unit_activities, unit_total))
+
             def sample_completed() -> None:
                 nonlocal completed, reported
                 completed += 1
@@ -2287,6 +2298,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
             def store_ready(unit_index: int = index) -> None:
                 stores_ready[unit_index] = True
 
+            activity("preparing")
             samples = await _run_unit(
                 task,
                 unit,
@@ -2307,11 +2319,14 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
                 deliberate=deliberate,
                 tracer=tracer,
                 on_sample_completed=sample_completed,
+                on_activity=activity,
                 on_store_ready=store_ready,
             )
             slots[index] = samples
             for _ in range(len(samples) - reported):
                 sample_completed()
+            unit_activities[index] = None
+            notify_activity(_activity_summary(unit_activities, len(task.units)))
             queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(min(unit_concurrency, len(task.units)))]
@@ -2594,10 +2609,12 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
     deliberate: bool = False,
     tracer: Tracer | None = None,
     on_sample_completed: Callable[[], None] | None = None,
+    on_activity: Callable[[str], None] | None = None,
     on_store_ready: Callable[[], None] | None = None,
 ) -> tuple[SampleResult, ...]:
     ordered = tuple((arm, question) for arm in arms for question in unit.questions)
     notify_store_ready = on_store_ready or _ignore_store_ready
+    notify_activity = on_activity or _ignore_activity
     results: dict[tuple[str, str], SampleResult] = {}
     for arm in arms:
         results.update(
@@ -2663,6 +2680,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
             for cutoff in cutoffs:
                 end = _prefix_end(memories, cutoff, pending)
                 if reads_memory and end > ingested:
+                    notify_activity("ingesting")
                     ingest_failures += await _ingest(
                         memory,
                         memories[ingested:end],
@@ -2675,11 +2693,13 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                     )
                     ingested = end
                     if deliberate:
+                        notify_activity("deliberating")
                         await _deliberate_after_ingest(memory)
                 pending = end
                 context = (
                     _full_context(memories[:pending], full_context_chars) if stuffs_context else ""
                 )
+                notify_activity("answering")
                 cutoff_results = await _answer_arms(
                     memory,
                     task,
@@ -5681,8 +5701,46 @@ def _ignore_store_ready() -> None:
     pass
 
 
+def _ignore_activity(_activity: str) -> None:
+    pass
+
+
+def _activity_summary(activities: Sequence[str | None], total: int) -> str:
+    active = tuple((index, phase) for index, phase in enumerate(activities) if phase is not None)
+    if not active:
+        return "finishing"
+    if len(active) == 1:
+        index, phase = active[0]
+        return f"{phase} unit {index + 1}/{total}"
+    counts: dict[str, int] = {}
+    for _index, phase in active:
+        counts[phase] = counts.get(phase, 0) + 1
+    phases = ", ".join(f"{phase} {count}" for phase, count in counts.items())
+    return f"{len(active)} active units: {phases}"
+
+
+class _ProgressReporter(Protocol):
+    def __call__(self, completed: int, total: int) -> None: ...
+
+    def set_activity(self, activity: str) -> None: ...
+
+
+@dataclass(slots=True)
+class _CallbackProgressReporter:
+    callback: Callable[[int, int], None]
+
+    def __call__(self, completed: int, total: int) -> None:
+        self.callback(completed, total)
+
+    def set_activity(self, activity: str) -> None:
+        del activity
+
+
 # How long a non-interactive run may stay silent between progress lines.
 _PROGRESS_LOG_SECONDS = 60.0
+# A sample can spend minutes rebuilding and ingesting before its answer exists. Redraw the live
+# meter while its count is unchanged so elapsed time and the current phase still prove liveness.
+_PROGRESS_REFRESH_SECONDS = 1.0
 # tqdm's own meter with the bar glyphs removed. A redrawn bar in a log file is one unreadable
 # line of carriage returns, but the counts and the ETA are the ones a terminal would have shown,
 # so both modes report identical numbers.
@@ -5694,18 +5752,35 @@ _PROGRESS_LOG_FORMAT = (
 @contextmanager
 def _progress(
     stage: str, noun: str, *, total: int, enabled: bool = True
-) -> Iterator[Callable[[int, int], None]]:
+) -> Iterator[_ProgressReporter]:
     """Report progress as a live bar on a terminal and as throttled lines anywhere else."""
     if not enabled or total <= 0:
-        yield _ignore_progress
+        yield _CallbackProgressReporter(_ignore_progress)
         return
     if sys.stderr.isatty():
         with tqdm(total=total, desc=stage, unit=noun, file=sys.stderr, leave=False) as bar:
+            stopped = Event()
 
-            def advance(completed: int, _total: int) -> None:
-                bar.update(completed - bar.n)
+            def refresh() -> None:
+                while not stopped.wait(_PROGRESS_REFRESH_SECONDS):
+                    bar.refresh()
 
-            yield advance
+            @dataclass(slots=True)
+            class LiveProgressReporter:
+                def __call__(self, completed: int, total: int) -> None:
+                    del total
+                    bar.update(completed - bar.n)
+
+                def set_activity(self, activity: str) -> None:
+                    bar.set_postfix_str(activity, refresh=True)
+
+            refresher = Thread(target=refresh, name="mindbridge-bench-progress", daemon=True)
+            refresher.start()
+            try:
+                yield LiveProgressReporter()
+            finally:
+                stopped.set()
+                refresher.join()
         return
     started = time.monotonic()
     last = 0.0
@@ -5731,7 +5806,7 @@ def _progress(
             )
         )
 
-    yield report
+    yield _CallbackProgressReporter(report)
 
 
 @contextmanager

@@ -705,6 +705,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- The live `mindbridge-bench eval` progress bar no longer appears frozen while a unit rebuilds,
+  ingests, deliberates, or waits for its first answer. It preserves the truthful completed-sample
+  count while refreshing elapsed time once a second and summarizing every active unit by phase.
 - `mindbridge-bench eval --resume` is no longer refused by the crash copy of the run it continues.
   The guard that keeps a rerun from deleting a leftover `samples.partial.jsonl` covered `--resume`
   too, so the one command written to recover an interrupted run exited on the file that run had

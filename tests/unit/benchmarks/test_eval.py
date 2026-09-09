@@ -12,11 +12,12 @@ import subprocess
 import sys
 import time
 from argparse import ArgumentTypeError
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import fields, replace
 from datetime import datetime, timezone
 from inspect import getattr_static, signature
 from pathlib import Path
+from threading import Event as ThreadEvent
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -1882,6 +1883,8 @@ def test_progress_drives_a_bar_on_a_terminal(
     """A terminal gets a bar fed with deltas, not the throttled log lines."""
     updates: list[int] = []
     closed: list[bool] = []
+    activities: list[str] = []
+    refreshed = ThreadEvent()
 
     class Bar:
         def __init__(self, **kwargs: object) -> None:
@@ -1898,19 +1901,30 @@ def test_progress_drives_a_bar_on_a_terminal(
             self.n += delta
             updates.append(delta)
 
+        def set_postfix_str(self, activity: str, *, refresh: bool) -> None:
+            activities.append(activity)
+            assert refresh
+
+        def refresh(self) -> None:
+            refreshed.set()
+
     class Terminal:
         def isatty(self) -> bool:
             return True
 
     monkeypatch.setattr(sys, "stderr", Terminal())
     monkeypatch.setattr(eval_module, "tqdm", Bar)
+    monkeypatch.setattr(eval_module, "_PROGRESS_REFRESH_SECONDS", 0.001)
 
     with eval_module._progress("running fixture", "sample", total=3) as report:
+        report.set_activity("ingesting unit 1/1")
         report(1, 3)
+        assert refreshed.wait(timeout=1)
         report(3, 3)
 
     # The callbacks carry an absolute count; tqdm wants the delta since the last draw.
     assert updates == [1, 2]
+    assert activities == ["ingesting unit 1/1"]
     assert closed == [True]
     assert capsys.readouterr().err == ""
 
@@ -3135,6 +3149,7 @@ async def test_runner_reports_cached_progress_before_pending_answer_finishes(
 ) -> None:
     first_reported = asyncio.Event()
     release_slow = asyncio.Event()
+    activities: list[str] = []
 
     class Memory(_FakeMemory):
         async def ask(
@@ -3205,6 +3220,7 @@ async def test_runner_reports_cached_progress_before_pending_answer_finishes(
                 recall_limit=1,
                 response_cache=cast(ResponseCache, Cache()),
                 on_progress=on_progress,
+                on_activity=activities.append,
             )
         )
         try:
@@ -3218,6 +3234,71 @@ async def test_runner_reports_cached_progress_before_pending_answer_finishes(
 
         await asyncio.wait_for(pending, timeout=1)
         assert "running fixture: 2/2 (100%)" in capsys.readouterr().err
+    assert activities == ["preparing unit 1/1", "answering unit 1/1", "finishing"]
+
+
+@pytest.mark.asyncio
+async def test_runner_removes_completed_unit_from_concurrent_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release_slow = asyncio.Event()
+    stale_cleared = asyncio.Event()
+    activities: list[str] = []
+    saw_concurrent = False
+
+    def observe_activity(activity: str) -> None:
+        nonlocal saw_concurrent
+        activities.append(activity)
+        if activity.startswith("2 active units:"):
+            saw_concurrent = True
+        if saw_concurrent and activity == "answering unit 1/2":
+            stale_cleared.set()
+
+    async def fake_run_unit(
+        _task: LoadedTask, unit: EvalUnit, _data_dir: Path, **kwargs: object
+    ) -> tuple[SampleResult, ...]:
+        on_activity = cast(Callable[[str], None], kwargs["on_activity"])
+        on_activity("answering")
+        if unit.unit_id == "slow":
+            await release_slow.wait()
+        return (_sample_fixture(1),)
+
+    monkeypatch.setattr(eval_module, "_run_unit", fake_run_unit)
+    task = LoadedTask(
+        TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        tmp_path / "fixture.json",
+        "1" * 64,
+        tuple(
+            EvalUnit(
+                unit_id,
+                (),
+                (EvalQuestion("question", ("question",), references=("A",)),),
+            )
+            for unit_id in ("slow", "fast")
+        ),
+    )
+
+    pending = asyncio.create_task(
+        run_loaded_task(
+            task,
+            run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+            memory_factory=cast(MemoryFactory, lambda _path: None),
+            batch_size=1,
+            unit_concurrency=2,
+            request_concurrency=2,
+            recall_limit=1,
+            on_activity=observe_activity,
+        )
+    )
+    try:
+        await asyncio.wait_for(stale_cleared.wait(), timeout=1)
+        assert not pending.done()
+        assert activities[-1] == "answering unit 1/2"
+    finally:
+        release_slow.set()
+
+    await asyncio.wait_for(pending, timeout=1)
+    assert activities[-1] == "finishing"
 
 
 @pytest.mark.asyncio

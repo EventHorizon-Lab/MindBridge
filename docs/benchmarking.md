@@ -268,7 +268,10 @@ repository rather than the process directory; `--data-root` defaults to
 generation, and comparison options.
 
 Unless `--quiet` is set, `eval` reports sample and judge progress to stderr. On a terminal that
-is a live progress bar with an ETA. When stderr is a file or a pipe, where a redrawn bar is
+is a live progress bar with an ETA. While a sample is still rebuilding, ingesting, deliberating,
+or answering, the bar keeps its honest completed-sample count but refreshes its elapsed time and
+labels the active phase. Concurrent units are summarized by phase rather than letting a completed
+unit leave a stale label behind. When stderr is a file or a pipe, where a redrawn bar is
 unreadable, the same counts and ETA are written as one line at most once a minute, plus the first
 and the last completion, so a stalled run says so immediately and the log always ends on the
 final count.
