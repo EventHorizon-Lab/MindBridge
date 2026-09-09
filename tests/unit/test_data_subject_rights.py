@@ -39,8 +39,10 @@ from mindbridge import (
     MemoryType,
     Modality,
     NamedActor,
+    ProvisionalActor,
     RetentionPolicy,
     RetentionReport,
+    RetrievalScope,
     SpeakerEmbedding,
     SpeechAnalysis,
     SpeechTurn,
@@ -360,6 +362,38 @@ def test_a_withheld_person_leaves_a_compiled_bundle_with_an_unknown(tmp_path: Pa
         assert episode.id in {hit.id for hit in bundle.hits}
 
 
+def test_compile_names_an_observed_person_only_as_of_the_requested_knowledge_time(
+    tmp_path: Path,
+) -> None:
+    with _memory(tmp_path) as memory:
+        clip = memory.add(Blob(b"a-1 arrives", "video/mp4", "a-1.mp4"))
+        identity_id = memory.faces(clip.id)[0].identity_id
+        before_naming = datetime.now(timezone.utc)
+        memory.register_identity(identity_id, "Ann", relationship="neighbour")
+
+        historical = memory.compile(
+            "who arrives",
+            scope=RetrievalScope(known_at=before_naming),
+        )
+        current = memory.compile("who arrives")
+
+        assert [actor for actor in historical.actors if isinstance(actor, NamedActor)] == []
+        assert [
+            actor.identity_id for actor in historical.actors if isinstance(actor, ProvisionalActor)
+        ] == [identity_id]
+        assert [actor.name for actor in current.actors if isinstance(actor, NamedActor)] == ["Ann"]
+
+        assert memory.record_consent(identity_id, ConsentState.WITHDRAWN) is not None
+        restrained = memory.compile(
+            "who arrives",
+            scope=RetrievalScope(known_at=before_naming),
+        )
+        assert restrained.actors == ()
+        assert ContextUnknownKind.CONSENT_WITHHELD in {
+            unknown.kind for unknown in restrained.unknowns
+        }
+
+
 def test_a_withheld_person_is_not_named_by_a_clip_alone(tmp_path: Path) -> None:
     """Consent is read from every identity edge that can name somebody, not only ENTITY hits.
 
@@ -512,6 +546,7 @@ def test_a_dry_run_deletes_nothing_and_a_real_run_deletes_only_what_aged_out(
         planned = memory.apply_retention(dry_run=True)
         assert planned.dry_run is True
         assert planned.media_memory_ids == (clip.id,)
+        assert planned.cascade_memory_ids == ()
         assert planned.asset_ids == (asset.id,)
         # Forgotten far more recently than the policy allows, so it is not a candidate.
         assert planned.forgotten_memory_ids == ()
@@ -522,6 +557,7 @@ def test_a_dry_run_deletes_nothing_and_a_real_run_deletes_only_what_aged_out(
         applied = memory.apply_retention()
         assert applied.dry_run is False
         assert applied.media_memory_ids == (clip.id,)
+        assert applied.cascade_memory_ids == ()
         assert applied.asset_ids == (asset.id,)
         assert applied.forgotten_memory_ids == ()
 
@@ -553,6 +589,62 @@ def test_retention_finalizes_cognitive_forgetting_and_abandons_failed_captures(
             memory.get(note.id)
         assert memory.get(kept.id).id == kept.id
         assert [row.memory_id for row in memory.pending_captures()] == [queued.id]
+
+
+def test_retention_dry_run_and_result_include_the_grounded_support_cascade(
+    tmp_path: Path,
+) -> None:
+    proposal = FormationProposal(
+        kind=MemoryKind.STATE,
+        content="The gate sticks in rain",
+        subject="gate",
+        predicate="condition",
+        value="sticks in rain",
+    )
+    policy = RetentionPolicy(forgotten_days=_AGED)
+    with _memory(tmp_path, retention=policy, former=ScriptedFormer(proposal)) as memory:
+        source = memory.add("The gate sticks in the rain", occurred_at=OCCURRED)
+        derived = next(record for record in memory.list(limit=100).items if record.id != source.id)
+        assert memory.forget((source.id,)) is not None
+
+        planned = memory.apply_retention(dry_run=True)
+        assert planned.forgotten_memory_ids == (source.id,)
+        assert planned.cascade_memory_ids == (derived.id,)
+        assert planned.deleted == 2
+        assert memory.get(derived.id).id == derived.id
+
+        applied = memory.apply_retention()
+        assert applied == planned.__class__(
+            dry_run=False,
+            forgotten_memory_ids=(source.id,),
+            cascade_memory_ids=(derived.id,),
+        )
+        for memory_id in (source.id, derived.id):
+            with pytest.raises(MemoryNotFoundError):
+                memory.get(memory_id)
+
+
+def test_retention_handles_more_than_one_sql_parameter_batch(tmp_path: Path) -> None:
+    policy = RetentionPolicy(forgotten_days=_AGED)
+    with _memory(tmp_path, retention=policy) as memory:
+        records = tuple(memory.capture(f"retention record {index}") for index in range(901))
+        record_ids = tuple(record.id for record in records)
+        assert memory.forget(record_ids) is not None
+
+        planned = memory.apply_retention(dry_run=True)
+        assert planned.dry_run is True
+        assert set(planned.forgotten_memory_ids) == set(record_ids)
+        assert planned.deleted == len(record_ids)
+        assert memory.get(record_ids[0]).id == record_ids[0]
+        assert memory.get(record_ids[-1]).id == record_ids[-1]
+
+        applied = memory.apply_retention()
+        assert applied.dry_run is False
+        assert set(applied.forgotten_memory_ids) == set(record_ids)
+        assert applied.deleted == len(record_ids)
+        for memory_id in (record_ids[0], record_ids[-1]):
+            with pytest.raises(MemoryNotFoundError):
+                memory.get(memory_id)
 
 
 def test_an_undeclared_policy_deletes_nothing(tmp_path: Path) -> None:
@@ -616,6 +708,7 @@ def test_the_cli_translates_consent_export_and_retention(tmp_path: Path) -> None
             "dry_run": True,
             "media_memory_ids": [],
             "forgotten_memory_ids": [note.id],
+            "cascade_memory_ids": [],
             "asset_ids": [],
             "capture_memory_ids": [],
             "deleted": 1,

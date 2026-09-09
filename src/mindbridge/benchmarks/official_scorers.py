@@ -58,7 +58,7 @@ from mindbridge.benchmarks._official.openeqa_llm_match import (
 )
 from mindbridge.benchmarks.personamem_v3 import RANKING_TASK_TYPES
 
-SCORER_VERSION = "official_scorers_v2"
+SCORER_VERSION = "official_scorers_v3"
 
 
 class _Stemmer(Protocol):
@@ -115,7 +115,7 @@ _PROTOCOLS = {
     "longmemeval": "longmemeval_anscheck_2ec2a557f339",
     "clbench": "clbench_binary_rubric_b28a5832a09b",
     "beam": "beam_unified_rubric_3e12035532eb",
-    "personamem-v3": "personamem_v3_rubric_7b00a090b35b",
+    "personamem-v3": "personamem_v3_rubric_7b00a090b35b_ranking_ad80a3b1b322",
     "openeqa": "openeqa_llm_match_cfa3fce4595c",
 }
 
@@ -180,7 +180,7 @@ _OFFICIAL_METRICS: dict[str, frozenset[str]] = {
             "hit@1",
             "hit@3",
             "mrr",
-            "ndcg_graded@5",
+            "ndcg_at_5",
             "sycophancy_caved",
             "sycophancy_resistance_0_10",
             "used_outdated_stance",
@@ -226,15 +226,11 @@ _PERSONAMEM_HEADLINES: dict[str, tuple[str, float]] = {
     "hidden_persona_implicit_qa": ("deep_motivation_alignment", 3.0),
 }
 _PERSONAMEM_RUBRIC_HEADLINE = ("pr_combined_personalization_score", 10.0)
-# `task_registry.PRIMARY_METRIC` -- the column upstream's aggregator reads --
-# gives all three single-target ranking tasks a graded nDCG@5, chosen over a
-# binary top-1 because the gold is "subtle by design" and nDCG rewards
-# surfacing it high with a smooth position discount. `compute_ranking_metrics`
-# does label its own `recall@1` "Headline accuracy", but that is one of the
-# many metrics it emits, not the one the aggregator reads. Every one of these
-# rows has exactly one target, so the graded gain map reduces to the binary
-# one and `ndcg_graded@5` is that metric.
-_PERSONAMEM_RANKING_HEADLINE = ("ndcg_graded@5", 1.0)
+# PersonaMem-v3 commit ad80a3b1b322 gives all three single-target ranking
+# tasks a shared graded NDCG@5 headline: target +2, filler +1 and hard negative
+# -2. Hidden-persona slates alone use filler 0 when they contain no hard
+# negatives. The target-only score remains a separately named diagnostic.
+_PERSONAMEM_RANKING_HEADLINE = ("ndcg_at_5", 1.0)
 
 # Ranks a slate like the other three, but its upstream headline is
 # `lifecycle_score` -- the delta between a paired pre-row's and post-row's
@@ -855,13 +851,9 @@ def _personamem_local(prediction: str, metadata: Mapping[str, object]) -> dict[s
     negatives = {
         index for index in _index_values(metadata, "negative_indexes") if 0 <= index < count
     }
-    # `slate_ranking.ORIGIN_GAIN`: the held-out target is gain 3.0 and every
-    # other origin -- hard negatives, carve-outs and fillers alike -- is 0.0.
-    # `task_registry` describes a +2/-2/+1 scheme for one ranking task, but it
-    # belongs to a `_graded_ndcg_at_k` the release's fields cannot reconstruct,
-    # and negative gains make nDCG itself negative. Hard negatives keep their
-    # own reported diagnostics below instead.
-    gains = [3.0 if index in positives else 0.0 for index in ranked]
+    task_type = str(metadata.get("task_type", ""))
+    filler_gain = 0.0 if task_type == "hidden_persona_recommendation" and not negatives else 1.0
+    target_only = pm3.ndcg_at_k([3.0 if index in positives else 0.0 for index in ranked], 5)
     scores = {
         "recall@1": pm3.recall_at_k(ranked, positives, 1),
         "recall@3": pm3.recall_at_k(ranked, positives, 3),
@@ -869,11 +861,47 @@ def _personamem_local(prediction: str, metadata: Mapping[str, object]) -> dict[s
         "hit@1": pm3.hit_at_k(ranked, positives, 1),
         "hit@3": pm3.hit_at_k(ranked, positives, 3),
         "mrr": pm3.mrr(ranked, positives),
-        "ndcg_graded@5": pm3.ndcg_at_k(gains, 5),
+        "target_only_ndcg@5": target_only,
+        # Deprecated compatibility alias for artifacts created before
+        # official_scorers_v3. It is intentionally absent from
+        # `_OFFICIAL_METRICS` because this target-only formula is not the
+        # current upstream graded metric.
+        "ndcg_graded@5": target_only,
         "negative_in_top1": float(bool(ranked) and ranked[0] in negatives),
         "negative_in_top3": float(any(index in negatives for index in ranked[:3])),
     }
-    return _personamem_headline(str(metadata.get("task_type", "")), scores)
+    if task_type not in _PERSONAMEM_PAIRED_RANKING:
+        scores["ndcg_at_5"] = _personamem_official_ndcg(
+            ranked,
+            positives,
+            negatives,
+            filler_gain=filler_gain,
+            k=5,
+        )
+    return _personamem_headline(task_type, scores)
+
+
+def _personamem_official_ndcg(
+    ranked: Sequence[int],
+    positives: set[int],
+    negatives: set[int],
+    *,
+    filler_gain: float,
+    k: int,
+) -> float:
+    """Reproduce PersonaMem-v3 ad80a3b1's current graded NDCG."""
+
+    def relevance(index: int) -> float:
+        if index in positives:
+            return 2.0
+        return -2.0 if index in negatives else filler_gain
+
+    gains = [relevance(index) for index in ranked]
+    ideal = sorted(gains, reverse=True)[:k]
+    denominator = pm3.dcg(ideal)
+    if denominator <= 0:
+        return 0.0
+    return min(1.0, max(0.0, pm3.dcg(gains[:k]) / denominator))
 
 
 def _parse_ranking(prediction: str, count: int) -> tuple[int, ...]:

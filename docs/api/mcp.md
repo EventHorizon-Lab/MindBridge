@@ -140,7 +140,7 @@ rejected. The MCP-specific media bounds are listed below.
 | `add_memory` | required `content`; `occurred_at=None`; `occurred_end=None`; `metadata=None`; `memory_type="semantic"`; `context=None` | `MemoryResult` | write, idempotent |
 | `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None`; `explain=false` | `{"hits":[SearchHitResult,...],"trace":null}` | write, not idempotent |
 | `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None` | `AnswerResponse` | write, not idempotent |
-| `compile_context` | required `goal`; `budget=None`; `reference_at=None`; `scope=None` | `ContextBundleResult` | write, not idempotent |
+| `compile_context` | required `goal`; `budget=None`; `reference_at=None`; `scope=None`; `allow_partial_sources=false` | `ContextBundleResult` | write, not idempotent |
 | `get_memory` | required `memory_id` | `MemoryResult` | read-only |
 | `list_memories` | `limit=100`; `cursor=None` | `PageResult` | read-only |
 | `delete_memory` | required `memory_id` | `{"deleted":bool}` | destructive, idempotent |
@@ -196,6 +196,10 @@ accepts 1 through 65,536, `max_items` 1 through 100, `max_media_items` any non-n
 `null`, and `max_latency_ms` is a deadline the
 compiler checks between stages rather than a timeout that aborts. The
 [compiler reference](../context-compilation.md) owns section, selection, and conflict semantics.
+`allow_partial_sources=true` explicitly enables verified raw-text excerpts when the full parent
+does not fit. The default false keeps full-record-only selection and skips selector reads; the
+additive `excerpts` result remains empty. Tool calls reject non-boolean values rather than coercing
+them into the opt-in.
 
 The embodied and identity tools follow the SDK operation they dispatch to:
 
@@ -266,7 +270,9 @@ Successful calls populate MCP `structuredContent`:
 | `ContextBudgetResult` | `max_chars`, `max_items`, `max_media_items` or `null`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
 | `ContextConflictResult` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknownResult` | `kind`, `detail` |
-| `ContextBundleResult` | `goal`, `reference_at`, `budget`, the `SearchHitResult` arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `traits`, the `AffectCueResult` array `affect`, the mixed `actors` array of `SearchHitResult` and `ProvisionalActorResult`, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
+| `ContextBundleResult` | `goal`, `reference_at`, `budget`, the `SearchHitResult` arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `traits`, the `AffectCueResult` array `affect`, the mixed `actors` array of `SearchHitResult` and `ProvisionalActorResult`, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, separately typed `excerpts`, `rendered` |
+| `ContextExcerptResult` | `source_memory_id`, structured `matched_index_id`, partial `content`, digest-bound `selector`, score, source timestamps, `memory_type`, `context`, `place_id`; the rendered line warns that omitted text may qualify it |
+| `TextSpanSelectorResult` | parent and embedding-input digests, recipe version, and ordered exact `TextSpanPieceResult` values with role, half-open code-point offsets, source text, and piece digest |
 | `ProvisionalActorResult` | `identity_id`, `memory_ids` |
 | `AffectCueResult` | every `SearchHitResult` field plus `event_ids`: the events formed from the same observations the cue cites in its own `context.evidence_ids`, which is co-occurrence inside one capture and not an attributed cause |
 | `SpeakerSegment` | `asset_id`, `start_ms`, `end_ms`, `text`, `speaker_id`, `speaker_name`, `identity_score` |

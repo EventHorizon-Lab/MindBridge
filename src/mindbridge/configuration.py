@@ -144,6 +144,7 @@ class _OpenAICompletionConfig(_OpenAIConfig):
     seed: _Seed | None = None
     max_tokens: _PositiveInt | None = None
     extra_body: Mapping[str, object] | None = None
+    stream: bool = False
 
 
 class OpenAIGenerationConfig(_OpenAICompletionConfig):
@@ -436,6 +437,7 @@ def _completion_values(config: _OpenAICompletionConfig) -> dict[str, object]:
         "generation_seed": config.seed,
         "generation_max_tokens": config.max_tokens,
         "generation_extra_body": config.extra_body,
+        "generation_stream": True if config.stream else None,
     }
     values.update((key, value) for key, value in optional.items() if value is not None)
     return values

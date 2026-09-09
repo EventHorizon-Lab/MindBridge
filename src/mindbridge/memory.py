@@ -37,7 +37,7 @@ from itertools import zip_longest
 from pathlib import Path
 from threading import Condition, RLock, local
 from time import perf_counter
-from typing import Protocol, TypeVar, cast
+from typing import Literal, Protocol, TypeVar, cast
 
 from opentelemetry import trace
 from opentelemetry.trace import Span, Tracer
@@ -73,7 +73,13 @@ from mindbridge._telemetry import (
     traced_span,
 )
 from mindbridge.configuration import MindBridgeConfig, resolve_memory_config
-from mindbridge.context import NamedActorLink, compile_context, evidence_cost
+from mindbridge.context import (
+    EvidenceClosure,
+    NamedActorLink,
+    _rejection,
+    compile_context,
+    evidence_cost,
+)
 from mindbridge.control import dump_operation, load_operation, operation_key
 from mindbridge.exceptions import (
     IdentityNotFoundError,
@@ -91,6 +97,7 @@ from mindbridge.infrastructure.local.assets import (
     AssetStoreError,
     AssetTooLargeError,
 )
+from mindbridge.infrastructure.local.scoring import max_cosine_scores
 from mindbridge.infrastructure.local.store import (
     CONSENT_PREDICATE,
     IdentityLink,
@@ -103,6 +110,8 @@ from mindbridge.infrastructure.local.store import (
     StoredEmbedding,
     StoredMemory,
     StoredOperation,
+    StoredTextSelector,
+    StoredTextSpanPiece,
     UnsupportedSchemaError,
     # The one normalization subjects are compared under. Importing the store's own is what keeps
     # the writer and the comparer from disagreeing about when two subjects are the same.
@@ -150,6 +159,7 @@ from mindbridge.types import (
     ContentInput,
     ContextBudget,
     ContextBundle,
+    ContextExcerpt,
     ContextUnknown,
     ContextUnknownKind,
     DeliberationReport,
@@ -181,6 +191,7 @@ from mindbridge.types import (
     RetentionPolicy,
     RetentionReport,
     RetrievalCandidateTrace,
+    RetrievalMode,
     RetrievalRejection,
     RetrievalScope,
     RetrievalTrace,
@@ -191,6 +202,8 @@ from mindbridge.types import (
     StreamEvent,
     StreamInput,
     StreamPhase,
+    TextSpanPiece,
+    TextSpanSelector,
     TracedSearchResult,
     VADPacket,
     VisionBoundary,
@@ -611,6 +624,19 @@ class _PreparedMemory:
     legacy_memory_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _TextKeySpan:
+    role: Literal["context", "body"]
+    start_codepoint: int
+    end_codepoint: int
+
+
+@dataclass(frozen=True, slots=True)
+class _TextKeyDescriptor:
+    key: str
+    spans: tuple[_TextKeySpan, ...]
+
+
 @dataclass(slots=True)
 class _OperationAssets:
     leased: builtins.list[StoredAsset]
@@ -636,6 +662,7 @@ class _IndexCandidates:
 class _SearchOutcome:
     hits: tuple[SearchHit, ...]
     trace: RetrievalTrace | None = None
+    matched_dense_index_ids: tuple[tuple[str, str], ...] = ()
 
 
 class Memory:
@@ -654,6 +681,7 @@ class Memory:
         consolidator: ConsolidationBackend | None = None,
         index_speech: bool = _DEFAULT_CONFIG.index_speech,
         index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
+        retrieval_mode: RetrievalMode = _DEFAULT_CONFIG.retrieval_mode,
         minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
         ambiguity_margin: float = _DEFAULT_CONFIG.ambiguity_margin,
         evidence_budget_chars: int | None = _DEFAULT_CONFIG.evidence_budget_chars,
@@ -693,6 +721,7 @@ class Memory:
         self._pending_asset_cleanup: dict[str, StoredAsset] = {}
         self._index_quantization = _index_quantization(index_quantization)
         self._index_recipe = _index_recipe(self._index_quantization)
+        self._retrieval_mode = _retrieval_mode(retrieval_mode)
         self._speaker_similarity = _unit_interval(speaker_similarity, "speaker_similarity")
         self._speaker_margin = _unit_interval(speaker_margin, "speaker_margin")
         self._face_similarity = _unit_interval(face_similarity, "face_similarity")
@@ -841,6 +870,7 @@ class Memory:
             consolidator=plugins.consolidator,
             index_speech=config.index_speech,
             index_quantization=config.index_quantization,
+            retrieval_mode=config.retrieval_mode,
             minimum_relevance=config.minimum_relevance,
             ambiguity_margin=config.ambiguity_margin,
             evidence_budget_chars=config.evidence_budget_chars,
@@ -1730,6 +1760,7 @@ class Memory:
         budget: ContextBudget | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        allow_partial_sources: bool = False,
     ) -> ContextBundle:
         """Compile one bounded, structured context bundle for a goal."""
         with self._trace("mindbridge.compile", kind="operation"), self._operation() as assets:
@@ -1739,6 +1770,8 @@ class Memory:
             budget = ContextBudget() if budget is None else budget
             if not isinstance(budget, ContextBudget):
                 raise ValidationError("budget must be a ContextBudget")
+            if not isinstance(allow_partial_sources, bool):
+                raise ValidationError("allow_partial_sources must be a boolean")
             scope = _retrieval_scope(scope)
             with self._trace("mindbridge.content.prepare", kind="stage"):
                 prepared = self._prepare_content(goal, assets)
@@ -1778,10 +1811,57 @@ class Memory:
             # The same transcript cache `search()` writes for a spoken query. It is a cache of
             # the query's own audio, not a memory: `compile()` stores nothing it retrieved.
             self._persist_transcripts(assets)
-            hits, named, withheld = self._consented_actors(
+            closures, unavailable = self._evidence_closures(
                 outcome.hits,
-                self._named_actors(outcome.hits),
+                budget=budget,
+                reference_at=reference,
+                scope=scope,
+                started_at=started_at,
             )
+            closure_hits = tuple(
+                {
+                    hit.id: hit
+                    for hit in (
+                        *outcome.hits,
+                        *(hit for closure in closures for hit in closure.members),
+                    )
+                }.values()
+            )
+            provisional = self._provisional_identities(closure_hits, scope=scope)
+            permitted, named, withheld, restrained = self._consented_actors(
+                closure_hits,
+                self._named_actors(closure_hits, scope=scope),
+                observed_identity_ids=frozenset(
+                    identity_id
+                    for identity_ids in provisional.values()
+                    for identity_id in identity_ids
+                ),
+            )
+            permitted_ids = {hit.id for hit in permitted}
+            before_consent = len(closures)
+            closures = tuple(
+                closure
+                for closure in closures
+                if all(member.id in permitted_ids for member in closure.members)
+            )
+            withheld_closures = len(closures) < before_consent
+            hits = tuple(hit for hit in outcome.hits if hit.id in permitted_ids)
+            excerpts = (
+                self._context_excerpts(
+                    hits,
+                    dict(outcome.matched_dense_index_ids),
+                )
+                if allow_partial_sources
+                else {}
+            )
+            if withheld_closures:
+                unavailable = (
+                    *unavailable,
+                    ContextUnknown(
+                        kind=ContextUnknownKind.EVIDENCE_UNAVAILABLE,
+                        detail="one or more ranked assertions required evidence withheld by consent",
+                    ),
+                )
             bundle = compile_context(
                 prepared.text,
                 hits,
@@ -1791,16 +1871,189 @@ class Memory:
                 unknowns=(
                     *self._request_unknowns(prepared, scope, hits),
                     *withheld,
+                    *unavailable,
                 ),
                 candidate_limit=candidate_limit,
-                provisional=self._provisional_identities(hits),
+                provisional={
+                    memory_id: tuple(
+                        identity_id for identity_id in identity_ids if identity_id not in restrained
+                    )
+                    for memory_id, identity_ids in self._provisional_identities(
+                        permitted, scope=scope
+                    ).items()
+                    if any(identity_id not in restrained for identity_id in identity_ids)
+                },
                 named=named,
                 co_derived_events=partial(self._co_derived_events, scope=scope),
+                closures=closures,
+                excerpts=excerpts,
             )
             # QUERY_FAILURE hook: a bundle with no evidence in it is the compiler reporting that
             # the goal found nothing, which is the same signal as an empty search.
-            self._note_query_failure(prepared.text, failed=not bundle.hits)
+            self._note_query_failure(
+                prepared.text,
+                failed=not bundle.hits and not bundle.excerpts,
+            )
             return bundle
+
+    def _context_excerpts(
+        self,
+        hits: Sequence[SearchHit],
+        matched_dense_index_ids: Mapping[str, str],
+    ) -> dict[str, ContextExcerpt]:
+        """Verify compiler-only excerpts for scoped, consented raw candidates."""
+        eligible = tuple(
+            hit
+            for hit in hits
+            if hit.id in matched_dense_index_ids
+            and hit.modality is Modality.TEXT
+            and not hit.assets
+            and (hit.context is None or hit.context.kind is MemoryKind.OBSERVATION)
+        )
+        if not eligible:
+            return {}
+        embedding_ids = tuple(matched_dense_index_ids[hit.id] for hit in eligible)
+        with _translate_storage_errors("read text selectors"):
+            selectors = self._store.read_text_selectors(embedding_ids)
+        excerpts: dict[str, ContextExcerpt] = {}
+        for hit in eligible:
+            embedding_id = matched_dense_index_ids[hit.id]
+            for stored in selectors.get(embedding_id, ()):
+                excerpt = _verified_context_excerpt(hit, embedding_id, stored)
+                if excerpt is not None:
+                    excerpts[hit.id] = excerpt
+                    break
+        return excerpts
+
+    def _evidence_closures(  # noqa: C901 - bounded graph traversal keeps scope checks in one place
+        self,
+        anchors: Sequence[SearchHit],
+        *,
+        budget: ContextBudget,
+        reference_at: datetime,
+        scope: RetrievalScope | None,
+        started_at: float | None = None,
+    ) -> tuple[tuple[EvidenceClosure, ...], tuple[ContextUnknown, ...]]:
+        """Hydrate finite, scoped transitive provenance for ranked compilation anchors."""
+        started_at = perf_counter() if started_at is None else started_at
+        by_id = {anchor.id: anchor for anchor in anchors}
+        frontier = tuple(
+            source_id
+            for anchor in anchors
+            if anchor.context is not None
+            for source_id in anchor.context.evidence_ids
+        )
+        expanded: set[str] = set()
+        bounded: set[str] = set()
+        deadline = False
+        max_nodes = max(1, len(anchors) * budget.max_items)
+        while frontier:
+            if (
+                budget.max_latency_ms is not None
+                and (perf_counter() - started_at) * 1_000 > budget.max_latency_ms
+            ):
+                deadline = True
+                break
+            current = tuple(dict.fromkeys(frontier))
+            wanted = tuple(source_id for source_id in current if source_id not in by_id)
+            selected: tuple[str, ...] = ()
+            if wanted:
+                remaining = max_nodes - len(by_id)
+                if remaining <= 0:
+                    bounded.update(wanted)
+                    break
+                selected, rejected = wanted[:remaining], wanted[remaining:]
+                bounded.update(rejected)
+                with _translate_storage_errors("hydrate compilation evidence"):
+                    hydrated = self._store.read_memories(
+                        selected,
+                        valid_at=None if scope is None else scope.valid_at,
+                        known_at=None if scope is None else scope.known_at,
+                        near=None if scope is None else scope.near,
+                        radius_m=None if scope is None else scope.radius_m,
+                        place_id=None if scope is None else scope.place_id,
+                        identity_id=None if scope is None else scope.identity_id,
+                        active_only=True,
+                    )
+                for memory in hydrated:
+                    by_id[memory.memory_id] = self._search_hit(memory, 0.0)
+            frontier = tuple(
+                child
+                for source_id in current
+                if source_id not in expanded
+                and (source := by_id.get(source_id)) is not None
+                and source.context is not None
+                for child in source.context.evidence_ids
+            )
+            expanded.update(current)
+        closures: list[EvidenceClosure] = []
+        failed: dict[str, str] = {}
+        max_depth = min(budget.max_items, 256)
+
+        def traverse(  # noqa: C901 - tri-colour validation retains all hard eligibility checks
+            anchor: SearchHit,
+        ) -> tuple[tuple[str, ...], str | None]:
+            states: dict[str, int] = {}
+            ordered: list[str] = []
+
+            def visit(memory_id: str, depth: int) -> str | None:
+                if depth > max_depth:
+                    return "bounded"
+                if memory_id in bounded:
+                    return "bounded"
+                hit = by_id.get(memory_id)
+                if hit is None:
+                    return (
+                        "unavailable before the compilation deadline"
+                        if deadline
+                        else "unavailable under the requested scope"
+                    )
+                if _rejection(hit, budget, reference_at) is not None:
+                    return "excluded by the requested context bounds"
+                state = states.get(memory_id, 0)
+                if state == 1:
+                    return "cyclic"
+                if state == 2:
+                    return None
+                states[memory_id] = 1
+                context = hit.context
+                if context is not None:
+                    for source_id in context.evidence_ids:
+                        if (reason := visit(source_id, depth + 1)) is not None:
+                            return reason
+                states[memory_id] = 2
+                ordered.append(memory_id)
+                return None
+
+            reason = visit(anchor.id, 0)
+            return tuple(ordered), reason
+
+        for anchor in anchors:
+            ordered, reason = traverse(anchor)
+            if reason is not None:
+                failed[anchor.id] = reason
+                continue
+            # `visit` is postorder; the anchor remains query-ranked and leads its own closure.
+            closures.append(
+                EvidenceClosure(
+                    anchor,
+                    (
+                        anchor,
+                        *(by_id[memory_id] for memory_id in ordered if memory_id != anchor.id),
+                    ),
+                )
+            )
+        reasons: dict[str, int] = {}
+        for reason in failed.values():
+            reasons[reason] = reasons.get(reason, 0) + 1
+        unknowns = tuple(
+            ContextUnknown(
+                kind=ContextUnknownKind.EVIDENCE_UNAVAILABLE,
+                detail=f"{count} ranked assertions required evidence {reason}",
+            )
+            for reason, count in sorted(reasons.items())
+        )
+        return tuple(closures), unknowns
 
     def _co_derived_events(
         self,
@@ -1833,10 +2086,13 @@ class Memory:
         self,
         hits: Sequence[SearchHit],
         named: Mapping[str, tuple[NamedActorLink, ...]],
+        *,
+        observed_identity_ids: frozenset[str] = frozenset(),
     ) -> tuple[
         tuple[SearchHit, ...],
         dict[str, tuple[NamedActorLink, ...]],
         tuple[ContextUnknown, ...],
+        frozenset[str],
     ]:
         """Drop the named actors whose subject withheld or withdrew consent, and say so.
 
@@ -1861,12 +2117,13 @@ class Memory:
         # carried: a bundle that reached a person's clip but not their naming assertion used to
         # find nothing bound here, consult no consent at all, and then name them from the clip.
         bound.update(link[0] for links in named.values() for link in links)
+        bound.update(observed_identity_ids)
         if not bound:
-            return tuple(hits), dict(named), ()
+            return tuple(hits), dict(named), (), frozenset()
         with _translate_storage_errors("read identity consent"):
             restrained = self._store.restrained_identities() & bound
         if not restrained:
-            return tuple(hits), dict(named), ()
+            return tuple(hits), dict(named), (), frozenset()
         kept = tuple(
             hit
             for hit in hits
@@ -1892,9 +2149,15 @@ class Memory:
                     ),
                 ),
             ),
+            restrained,
         )
 
-    def _provisional_identities(self, hits: Sequence[SearchHit]) -> dict[str, tuple[str, ...]]:
+    def _provisional_identities(
+        self,
+        hits: Sequence[SearchHit],
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> dict[str, tuple[str, ...]]:
         """Resolve which people the candidate evidence observed but nobody has named.
 
         Deterministic kernel policy, like every other identity decision: a person is
@@ -1903,9 +2166,18 @@ class Memory:
         if not hits:
             return {}
         with _translate_storage_errors("read provisional identities"):
-            return self._store.provisional_identities(tuple(hit.id for hit in hits))
+            return self._store.provisional_identities(
+                tuple(hit.id for hit in hits),
+                valid_at=None if scope is None else scope.valid_at,
+                known_at=None if scope is None else scope.known_at,
+            )
 
-    def _named_actors(self, hits: Sequence[SearchHit]) -> dict[str, tuple[NamedActorLink, ...]]:
+    def _named_actors(
+        self,
+        hits: Sequence[SearchHit],
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> dict[str, tuple[NamedActorLink, ...]]:
         """Resolve which people the candidate evidence's identity edge already names.
 
         Deterministic kernel policy, the positive counterpart of `_provisional_identities`: a
@@ -1915,7 +2187,11 @@ class Memory:
         if not hits:
             return {}
         with _translate_storage_errors("read named actors"):
-            return self._store.named_actors(tuple(hit.id for hit in hits))
+            return self._store.named_actors(
+                tuple(hit.id for hit in hits),
+                valid_at=None if scope is None else scope.valid_at,
+                known_at=None if scope is None else scope.known_at,
+            )
 
     def _request_unknowns(
         self,
@@ -3193,7 +3469,11 @@ class Memory:
                     ),
                     # `linked` is the evidence this operation actually inserted, so a link that
                     # predated it survives the reversal. Records deleted above take their own.
-                    retire_evidence=row.linked,
+                    retire_evidence=(
+                        () if row.clause_changes or row.linked_clauses else row.linked
+                    ),
+                    retire_clauses=row.linked_clauses,
+                    reverse_clause_changes=row.clause_changes,
                     # A CORRECT retired the versions it named. A CONSOLIDATE may also have
                     # superseded records in the derived record's lineage that no backend ever
                     # saw; the log row names those exactly, so both halves reverse here.
@@ -3636,6 +3916,12 @@ class Memory:
             # -- still stands, so a source corrected in between makes the proposal stale.
             require_active=operation.evidence_ids,
             require_unretired=operation.evidence_ids,
+            # One consolidation operation presents one derived assertion over the complete cited
+            # set. Treating those citations as singleton alternatives lets a summary that used A
+            # and B survive with all of its prose after A is withdrawn. A later operation may add
+            # a different complete set as another clause; REINFORCE remains the explicit way to
+            # add independent singleton support.
+            joint_evidence_clauses=True,
         )
         if logged is None:
             raise _RejectedOperation("duplicate")
@@ -3927,6 +4213,7 @@ class Memory:
         with (
             self._trace("mindbridge.apply_retention", kind="operation"),
             self._operation(),
+            self._write_lock,
         ):
             media_ids: tuple[str, ...] = ()
             aged_assets: tuple[str, ...] = ()
@@ -3958,23 +4245,33 @@ class Memory:
                         for capture in self._store.pending_captures(limit=_RETENTION_PAGE_SIZE)
                         if capture.attempts > 0 and capture.enqueued_at < cutoff
                     )
+            direct_ids = (*media_ids, *forgotten_ids)
+            with _translate_storage_errors("predict retention cascade"):
+                deleted_ids = self._store.deletion_cascade(direct_ids)
+                direct_set = set(direct_ids)
+                cascade_ids = tuple(
+                    memory_id for memory_id in deleted_ids if memory_id not in direct_set
+                )
+                orphaned_assets = self._store.assets_orphaned_by_deletion(deleted_ids)
+            reported_assets = tuple(dict.fromkeys((*aged_assets, *orphaned_assets)))
             if dry_run:
                 return RetentionReport(
                     dry_run=True,
                     media_memory_ids=media_ids,
                     forgotten_memory_ids=forgotten_ids,
-                    asset_ids=aged_assets,
+                    cascade_memory_ids=cascade_ids,
+                    asset_ids=reported_assets,
                     capture_memory_ids=capture_ids,
                 )
-            for memory_id in (*media_ids, *forgotten_ids):
+            for memory_id in direct_ids:
                 self.delete(memory_id)
             removed: list[str] = []
-            with self._write_lock, _translate_storage_errors("delete retained media"):
+            with _translate_storage_errors("delete retained media"):
                 # Whatever the deletions above orphaned is already gone; what is left here is
                 # media no memory referenced in the first place, which nothing else collects
                 # until the next open.
                 self._cleanup_pending_assets()
-                for asset_id in aged_assets:
+                for asset_id in reported_assets:
                     if self._store.read_asset(asset_id) is None or (
                         self._store.delete_asset_if_unreferenced(asset_id)
                     ):
@@ -3985,6 +4282,7 @@ class Memory:
                 dry_run=False,
                 media_memory_ids=media_ids,
                 forgotten_memory_ids=forgotten_ids,
+                cascade_memory_ids=cascade_ids,
                 asset_ids=tuple(removed),
                 capture_memory_ids=capture_ids,
             )
@@ -4280,6 +4578,13 @@ class Memory:
                 elif self._derives_transcripts(batched):
                     self._cache_audio_transcripts(batched, operation)
                 missing = [self._prepare_for_embedding(memory, operation) for memory in missing]
+                selector_maps = {
+                    memory.memory_id: _text_selector_map(
+                        memory,
+                        raw_observation=not isinstance(memory.context, MemoryContext),
+                    )
+                    for memory in missing
+                }
                 embedding_parts = tuple(
                     (memory, object_part, model_input)
                     for memory in missing
@@ -4317,8 +4622,9 @@ class Memory:
                         created_at=now,
                         object_part=object_part,
                         normalized=True,
+                        text_selectors=selector_maps[memory.memory_id].get(model_input, ()),
                     )
-                    for (memory, object_part, _model_input), vector in zip(
+                    for (memory, object_part, model_input), vector in zip(
                         embedding_parts, vectors, strict=True
                     )
                 )
@@ -4496,6 +4802,10 @@ class Memory:
                     )
                 )
             )
+            selector_map = _text_selector_map(
+                memory,
+                raw_observation=(row.context is None or row.context.kind is MemoryKind.OBSERVATION),
+            )
             now = datetime.now(timezone.utc)
             enriched = replace(row, content=memory.content.text, updated_at=now)
             with (
@@ -4519,8 +4829,9 @@ class Memory:
                             created_at=now,
                             object_part=object_part,
                             normalized=True,
+                            text_selectors=selector_map.get(model_input, ()),
                         )
-                        for (_memory, object_part, _model_input), vector in zip(
+                        for (_memory, object_part, model_input), vector in zip(
                             parts, vectors, strict=True
                         )
                     ),
@@ -4627,6 +4938,15 @@ class Memory:
             # share keeps only what they all say, which `_commit_formation` settles.
             place_id, metadata = _agreed_inheritance((source,))
             for proposal in proposals:
+                evidence_ids = (
+                    (source.id,) if proposal.evidence_ids is None else proposal.evidence_ids
+                )
+                if source.id not in evidence_ids or not set(evidence_ids) <= set(inputs_by_id):
+                    raise ModelError(
+                        "formation proposal cited an observation outside its batch",
+                        reason="response_invalid",
+                        stage="form",
+                    )
                 # One derived opinion the model grounded wrongly -- an affect cue naming a
                 # modality the source never carried, a pose in another frame -- must not cost the
                 # caller the observation it came from. `add` commits the source before formation
@@ -4659,6 +4979,7 @@ class Memory:
                     recorded_at=now,
                     identity_id=self._bound_identity(proposal),
                 )
+                context = replace(context, evidence_ids=evidence_ids)
                 pairs.append(
                     (
                         replace(
@@ -4678,7 +4999,12 @@ class Memory:
                 )
         grounded, conflicting = _grounded_formation_pairs(pairs)
         record_formation_refusals(refused + conflicting)
-        self._commit_formation(grounded, formed_sources, completed_at=now)
+        self._commit_formation(
+            grounded,
+            formed_sources,
+            completed_at=now,
+            joint_evidence_clauses=True,
+        )
 
     def _commit_formation(
         self,
@@ -4692,6 +5018,7 @@ class Memory:
         require_active: Sequence[str] = (),
         require_unretired: Sequence[str] = (),
         projection_identity_id: str | None = None,
+        joint_evidence_clauses: bool = False,
         projection_factory: Callable[
             [], tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]
         ]
@@ -4794,10 +5121,32 @@ class Memory:
                 applied = self._store.apply_formation(
                     stored,
                     embeddings,
+                    evidence_clauses=(
+                        ()
+                        if not joint_evidence_clauses
+                        else tuple(
+                            dict.fromkeys(
+                                (
+                                    prepared.memory_id,
+                                    prepared.context.evidence_ids,
+                                    confidence,
+                                )
+                                for prepared, _source_id, confidence in ordered_pairs
+                                if isinstance(prepared.context, MemoryContext)
+                                and prepared.context.evidence_ids
+                            )
+                        )
+                    ),
                     evidence=tuple(
-                        (prepared.memory_id, source_id, confidence)
-                        for prepared, source_id, confidence in ordered_pairs
-                        if source_id is not None
+                        dict.fromkeys(
+                            (prepared.memory_id, evidence_id, confidence)
+                            for prepared, _source_id, confidence in ordered_pairs
+                            for evidence_id in (
+                                ()
+                                if not isinstance(prepared.context, MemoryContext)
+                                else prepared.context.evidence_ids
+                            )
+                        )
                     ),
                     source_memory_ids=tuple(source.id for source in sources),
                     narrowed=narrowed,
@@ -5145,29 +5494,38 @@ class Memory:
         trace_candidates: builtins.list[RetrievalCandidateTrace] | None = (
             [] if capture_trace else None
         )
-        prepared = self._embedding_content(prepared, operation)
-        aggregate = self._route_embedding(prepared)
-        text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
-        focused_text = text_parts[0] if len(text_parts) > 1 else prepared.text
-        focused = replace(
-            prepared,
-            text=focused_text,
-            canonical_parts=(("text", focused_text),) if focused_text else (),
-        )
-        model_inputs = tuple(
-            dict.fromkeys(
-                (
-                    aggregate,
-                    *self._embedding_inputs(
-                        focused,
-                        maximum_keys=_MAX_QUERY_RETRIEVAL_KEYS,
-                    ),
+        vectors: tuple[tuple[float, ...], ...] = ()
+        if self._retrieval_mode is RetrievalMode.LEXICAL:
+            text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
+            focused_text = text_parts[0] if len(text_parts) > 1 else prepared.text
+        else:
+            # A lexical-only instance must not call a remote embedding service for its query.
+            # Hybrid and dense preserve the existing multimodal preparation and query-key route.
+            prepared = self._embedding_content(prepared, operation)
+            text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
+            focused_text = text_parts[0] if len(text_parts) > 1 else prepared.text
+            aggregate = self._route_embedding(prepared)
+            focused = replace(
+                prepared,
+                text=focused_text,
+                canonical_parts=(("text", focused_text),) if focused_text else (),
+            )
+            model_inputs = tuple(
+                dict.fromkeys(
+                    (
+                        aggregate,
+                        *self._embedding_inputs(
+                            focused,
+                            maximum_keys=_MAX_QUERY_RETRIEVAL_KEYS,
+                        ),
+                    )
                 )
             )
-        )
-        vectors = tuple(dict.fromkeys(self._embed(model_inputs, task=EmbedTask.QUERY)))
+            vectors = tuple(dict.fromkeys(self._embed(model_inputs, task=EmbedTask.QUERY)))
         lexical_query = focused_text
         if not _lexical_query_terms(lexical_query):
+            lexical_query = ""
+        if self._retrieval_mode is RetrievalMode.DENSE:
             lexical_query = ""
         candidate_limit = _ROUTE_CANDIDATES
         candidate_ceiling = max(candidate_limit, limit * (_MAX_RETRIEVAL_KEYS + 1))
@@ -5196,6 +5554,7 @@ class Memory:
                         occurred_until=occurred_until,
                         place_id=scope_place_id,
                         identity_id=scope_identity_id,
+                        retrieval_mode=self._retrieval_mode,
                     )
                 else:
                     # Zvec range-filtered FTS is unstable after dense queries; the global
@@ -5217,6 +5576,7 @@ class Memory:
                             occurred_until=preferred_range[1],
                             place_id=scope_place_id,
                             identity_id=scope_identity_id,
+                            retrieval_mode=self._retrieval_mode,
                         )
                     )
                     fallback = self._index_candidates(
@@ -5228,6 +5588,7 @@ class Memory:
                         occurred_until=occurred_until,
                         place_id=scope_place_id,
                         identity_id=scope_identity_id,
+                        retrieval_mode=self._retrieval_mode,
                     )
                     candidates = _IndexCandidates(
                         dense=_merge_index_hits(preferred.dense, fallback.dense),
@@ -5260,6 +5621,7 @@ class Memory:
                     result_limit=limit,
                     place_id=scope_place_id,
                     identity_id=scope_identity_id,
+                    retrieval_mode=self._retrieval_mode,
                 )
             index_ids = tuple(
                 dict.fromkeys(hit.id for hit in (*candidates.dense, *candidates.lexical))
@@ -5321,17 +5683,19 @@ class Memory:
             hydrated_documents,
             documents,
             index_ids_by_memory,
+            retrieval_mode=self._retrieval_mode,
         )
         (
             dense_relevance,
             dense_confidence,
             lexical_relevance_by_rank,
             lexical_matches,
+            matched_dense_index_ids,
         ) = _parent_index_signals(candidates, documents)
-        # `lexical_relevance_by_rank` rather than `lexical_matches`, which holds exactly the same
-        # memory ids and is a `set`. Both mappings are filled in one pass over `documents`, so
-        # this is the same ids in insertion order instead of an order that follows the
-        # interpreter's string hash seed. The visible effect is narrow -- `read_memories` does not
+        # `lexical_relevance_by_rank` rather than `lexical_matches`, which holds the same memory
+        # ids in a set. Both mappings are filled in one pass over `documents`, so this preserves
+        # native lexical-route insertion order instead of following the interpreter's string hash
+        # seed. The visible effect is narrow -- `read_memories` does not
         # order by its argument, so the ranking and the ranked part of the trace never depended on
         # this, and the ranking sorts on `(-final_score, memory_id)` regardless -- but
         # `_extend_missing_memory_traces` walks these ids directly, so a stale-index candidate's
@@ -5370,6 +5734,7 @@ class Memory:
                     dense_confidence,
                     lexical_relevance_by_rank,
                     lexical_matches,
+                    retrieval_mode=self._retrieval_mode,
                 )
                 if memory_types is not None:
                     kept = frozenset(memory_type.value for memory_type in memory_types)
@@ -5382,9 +5747,36 @@ class Memory:
                         dense_confidence,
                         lexical_relevance_by_rank,
                         lexical_matches,
+                        retrieval_mode=self._retrieval_mode,
                     )
                     memories = tuple(memory for memory in memories if memory.memory_type in kept)
-                lexical_relevance = _lexical_relevance(lexical_query, memories)
+                lexical_only_ids = tuple(
+                    memory.memory_id
+                    for memory in memories
+                    if memory.memory_id in lexical_matches
+                    and memory.memory_id not in dense_relevance
+                )
+                if lexical_only_ids and vectors:
+                    with (
+                        self._trace("mindbridge.retrieval.score_completion", kind="stage"),
+                        _translate_storage_errors("complete hybrid candidate scores"),
+                        closing(
+                            self._store.iter_memory_embedding_vectors(
+                                lexical_only_ids,
+                                space_id=self._space_id,
+                                task=_DOCUMENT_TASK,
+                            )
+                        ) as document_vectors,
+                    ):
+                        completed = max_cosine_scores(vectors, document_vectors)
+                    for memory_id, (relevance, confidence) in completed.items():
+                        dense_relevance[memory_id] = relevance
+                        dense_confidence[memory_id] = confidence
+                lexical_coverage = (
+                    _lexical_relevance(lexical_query, memories)
+                    if self._retrieval_mode is RetrievalMode.HYBRID
+                    else {}
+                )
                 ranked = []
                 ranked_traces: dict[str, RetrievalCandidateTrace] | None = (
                     {} if trace_candidates is not None else None
@@ -5393,7 +5785,7 @@ class Memory:
                     memory_id = memory.memory_id
                     lexical_match = memory_id in lexical_matches
                     lexical_strength = (
-                        lexical_relevance.get(memory_id, 0.0) if lexical_match else 0.0
+                        lexical_coverage.get(memory_id, 0.0) if lexical_match else 0.0
                     )
                     lexical_score = (
                         _LEXICAL_FULL_COVERAGE_RELEVANCE
@@ -5401,11 +5793,19 @@ class Memory:
                         if lexical_strength >= _LEXICAL_FULL_COVERAGE
                         else 0.0
                     )
-                    base = max(dense_relevance.get(memory_id, 0.0), lexical_score)
-                    relevance = _bounded_scale(
-                        base,
-                        1.0 + _MAX_LEXICAL_RERANK_BONUS * lexical_strength,
-                    )
+                    if self._retrieval_mode is RetrievalMode.LEXICAL:
+                        # This diagnostic mode exposes Zvec's own normalized full-text route:
+                        # stemmed and n-gram FTS, RRF-fused when both apply. Hybrid-only term
+                        # coverage and dense fusion must not alter its admission or order.
+                        relevance = lexical_relevance_by_rank.get(memory_id, 0.0)
+                        base = relevance
+                        lexical_score = relevance
+                    else:
+                        base = max(dense_relevance.get(memory_id, 0.0), lexical_score)
+                        relevance = _bounded_scale(
+                            base,
+                            1.0 + _MAX_LEXICAL_RERANK_BONUS * lexical_strength,
+                        )
                     lexical_rerank_bonus = relevance - base
                     (
                         final_score,
@@ -5515,6 +5915,11 @@ class Memory:
             candidate_limit=candidate_limit,
             exhaustive=candidates.exhausted,
             ambiguous=ambiguous,
+            matched_dense_index_ids={
+                hit.id: matched_dense_index_ids[hit.id]
+                for hit in hits
+                if hit.id in matched_dense_index_ids
+            },
         )
 
     def _pushed_identity(self, scope: RetrievalScope | None) -> str | None:
@@ -5541,24 +5946,23 @@ class Memory:
         result_limit: int,
         place_id: str | None = None,
         identity_id: str | None = None,
+        retrieval_mode: RetrievalMode,
     ) -> tuple[_IndexCandidates, tuple[IndexCandidate, ...]]:
         if temporal_range is None or not lexical_query or len(candidates.lexical) < route_limit:
             return candidates, documents
         lexical_by_id = {hit.id: hit for hit in candidates.lexical}
         # A heuristic proxy for "worth deepening for", NOT a bound on the gate. It cannot be one:
-        # the gate scores a full-text candidate from `lexical_relevance_by_rank`, a reciprocal
-        # rank over the final candidate set, while `hit.relevance` here is the index's own
-        # similarity -- and the rank a deepened candidate ends up with depends on the deepening
-        # this decision is choosing whether to do. Tightening the proxy toward the gate's real
-        # ceiling was tried and made it too permissive: the loop then stopped at a nearer weak
-        # candidate and never reached a stronger in-range one outside the first window, which
-        # `test_temporal_search_reads_lexical_evidence_from_authoritative_time_range` catches.
-        # Treat this threshold as tuned, and re-run that test before changing it.
+        # Hybrid applies a full-coverage demotion before gating lexical evidence; lexical mode
+        # uses the native normalized FTS relevance directly. The threshold remains only a
+        # deepening heuristic, not a final admission criterion.
+        lexical_gate_scale = (
+            1.0 if retrieval_mode is RetrievalMode.LEXICAL else _LEXICAL_FULL_COVERAGE_RELEVANCE
+        )
         qualified_parents = {
             document.memory_id
             for document in documents
             if (hit := lexical_by_id.get(document.embedding_id)) is not None
-            and _LEXICAL_FULL_COVERAGE_RELEVANCE * hit.relevance >= self._minimum_relevance
+            and lexical_gate_scale * hit.relevance >= self._minimum_relevance
             and _overlaps_temporal_range(
                 document.occurred_at,
                 document.occurred_end,
@@ -5592,8 +5996,7 @@ class Memory:
         qualified = tuple(
             hit
             for hit in lexical
-            if hit.id in in_range
-            and _LEXICAL_FULL_COVERAGE_RELEVANCE * hit.relevance >= self._minimum_relevance
+            if hit.id in in_range and lexical_gate_scale * hit.relevance >= self._minimum_relevance
         )
         while len(qualified) < required and len(lexical) >= search_limit and search_limit < total:
             search_limit = min(search_limit * 2, total)
@@ -5604,12 +6007,13 @@ class Memory:
                 memory_types=memory_types,
                 place_id=place_id,
                 identity_id=identity_id,
+                retrieval_mode=retrieval_mode,
             ).lexical
             qualified = tuple(
                 hit
                 for hit in lexical
                 if hit.id in in_range
-                and _LEXICAL_FULL_COVERAGE_RELEVANCE * hit.relevance >= self._minimum_relevance
+                and lexical_gate_scale * hit.relevance >= self._minimum_relevance
             )
         updated = _IndexCandidates(
             dense=candidates.dense,
@@ -5638,6 +6042,7 @@ class Memory:
         occurred_until: datetime | None = None,
         place_id: str | None = None,
         identity_id: str | None = None,
+        retrieval_mode: RetrievalMode = RetrievalMode.HYBRID,
     ) -> _IndexCandidates:
         # The index filter takes one type, so a set becomes one route per type rather than a
         # post-filter over a shared window. Each type then gets the full `limit` of depth, which
@@ -5662,6 +6067,7 @@ class Memory:
             )
             for value in type_values
             for vector in vectors
+            if retrieval_mode is not RetrievalMode.LEXICAL
         )
         lexical_calls = (
             tuple(
@@ -5679,13 +6085,15 @@ class Memory:
                 )
                 for value in type_values
             )
-            if lexical_query
+            if lexical_query and retrieval_mode is not RetrievalMode.DENSE
             else ()
         )
         calls = (*dense_calls, *lexical_calls)
         routes: tuple[tuple[IndexHit, ...], ...]
         with self._trace("mindbridge.index.search", kind="stage") as span:
             span.set_attribute("mindbridge.index.route_count", len(calls))
+            if not calls:
+                return _IndexCandidates(dense=(), lexical=(), exhausted=True)
             if len(calls) == 1:
                 routes = (calls[0](),)
             else:
@@ -5698,9 +6106,8 @@ class Memory:
         lexical_routes = routes[len(dense_calls) :]
         return _IndexCandidates(
             dense=_merge_index_hits(*dense_routes),
-            # One route keeps the index's own order, which `lexical_relevance_by_rank` reads as a
-            # reciprocal rank. Several have to be re-ordered by relevance or that rank would
-            # record the interleaving of the routes instead of the ranking of the candidates.
+            # One route keeps the index's own order. Several routes are re-ordered by native
+            # relevance so the result does not reflect their route interleaving.
             lexical=_merge_lexical_routes(lexical_routes),
             exhausted=all(len(route) < limit for route in routes),
         )
@@ -7330,6 +7737,7 @@ class AsyncMemory:
         consolidator: ConsolidationBackend | None = None,
         index_speech: bool = _DEFAULT_CONFIG.index_speech,
         index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
+        retrieval_mode: RetrievalMode = _DEFAULT_CONFIG.retrieval_mode,
         minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
         ambiguity_margin: float = _DEFAULT_CONFIG.ambiguity_margin,
         evidence_budget_chars: int | None = _DEFAULT_CONFIG.evidence_budget_chars,
@@ -7357,6 +7765,7 @@ class AsyncMemory:
             consolidator=consolidator,
             index_speech=index_speech,
             index_quantization=index_quantization,
+            retrieval_mode=retrieval_mode,
             minimum_relevance=minimum_relevance,
             ambiguity_margin=ambiguity_margin,
             evidence_budget_chars=evidence_budget_chars,
@@ -7401,6 +7810,7 @@ class AsyncMemory:
             consolidator=plugins.consolidator,
             index_speech=config.index_speech,
             index_quantization=config.index_quantization,
+            retrieval_mode=config.retrieval_mode,
             minimum_relevance=config.minimum_relevance,
             ambiguity_margin=config.ambiguity_margin,
             evidence_budget_chars=config.evidence_budget_chars,
@@ -7738,6 +8148,7 @@ class AsyncMemory:
         budget: ContextBudget | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        allow_partial_sources: bool = False,
     ) -> ContextBundle:
         return await asyncio.to_thread(
             self._memory.compile,
@@ -7745,6 +8156,7 @@ class AsyncMemory:
             budget=budget,
             reference_at=reference_at,
             scope=scope,
+            allow_partial_sources=allow_partial_sources,
         )
 
     @property
@@ -9295,6 +9707,185 @@ def _contextual_text_keys(text: str) -> tuple[str, ...]:
     return tuple(keys)
 
 
+_TEXT_SELECTOR_RECIPE = "mindbridge-contextual-text-key-v1"
+
+
+def _stripped_span(text: str, start: int, end: int) -> tuple[int, int] | None:
+    """Return the exact source interval retained by `text[start:end].strip()`."""
+    source = text[start:end]
+    stripped_left = source.lstrip()
+    if not stripped_left:
+        return None
+    left = len(source) - len(stripped_left)
+    stripped = stripped_left.rstrip()
+    return start + left, start + left + len(stripped)
+
+
+def _contextual_text_key_descriptors(text: str) -> tuple[_TextKeyDescriptor, ...]:
+    """Mirror `_contextual_text_keys` while retaining exact source ranges.
+
+    `_contextual_text_keys` remains the byte-for-byte authority for embedding inputs. Tests compare
+    these descriptors with it, and callers join a descriptor to an embedding only by exact
+    `ModelInput` equality.
+    """
+    if len(text) <= _TEXT_KEY_CHARACTERS:
+        return (
+            _TextKeyDescriptor(
+                key=text,
+                spans=(_TextKeySpan("body", 0, len(text)),),
+            ),
+        )
+    first_line_end = len(text.splitlines()[0])
+    context_interval = _stripped_span(text, 0, min(first_line_end, _TEXT_KEY_CONTEXT))
+    context = "" if context_interval is None else text[context_interval[0] : context_interval[1]]
+    step = _TEXT_KEY_CHARACTERS - _TEXT_KEY_OVERLAP
+    descriptors = []
+    for start in range(0, len(text), step):
+        interval = _stripped_span(text, start, min(len(text), start + _TEXT_KEY_CHARACTERS))
+        if interval is None:
+            continue
+        chunk = text[interval[0] : interval[1]]
+        spans: tuple[_TextKeySpan, ...] = (_TextKeySpan("body", *interval),)
+        key = chunk
+        if context and not chunk.startswith(context):
+            if context_interval is None:  # pragma: no cover - `context` proves this unreachable
+                raise AssertionError("context interval is missing")
+            key = f"{context}\n\n{chunk}"
+            spans = (_TextKeySpan("context", *context_interval), *spans)
+        descriptors.append(_TextKeyDescriptor(key=key, spans=spans))
+        if start + _TEXT_KEY_CHARACTERS >= len(text):
+            break
+    return tuple(descriptors)
+
+
+def _text_selector_map(
+    memory: _PreparedMemory,
+    *,
+    raw_observation: bool,
+) -> dict[ModelInput, tuple[StoredTextSelector, ...]]:
+    """Return selectors only when a new raw key is an exact projection of stored text."""
+    content = memory.content
+    if (
+        not raw_observation
+        or content.modality is not Modality.TEXT
+        or content.assets
+        or content.audio_transcript
+        or content.visual_description
+        or content.canonical_parts != (("text", content.text),)
+        or not content.text
+    ):
+        return {}
+    parent_digest = hashlib.sha256(content.text.encode("utf-8")).hexdigest()
+    aggregate = memory.content
+    aggregate_input = ModelInput(text=aggregate.text, assets=())
+    grouped: dict[ModelInput, list[StoredTextSelector]] = {}
+    for descriptor in _contextual_text_key_descriptors(content.text):
+        model_input = ModelInput(text=descriptor.key)
+        # `_embedding_inputs` removes atomic keys equal to its aggregate. Preserve that exact
+        # behavior and never attach a selector to the unsliced aggregate route.
+        if model_input == aggregate_input:
+            continue
+        selector = StoredTextSelector(
+            parent_content_sha256=parent_digest,
+            embedding_input_sha256=hashlib.sha256(descriptor.key.encode("utf-8")).hexdigest(),
+            recipe_version=_TEXT_SELECTOR_RECIPE,
+            pieces=tuple(
+                StoredTextSpanPiece(
+                    role=span.role,
+                    start_codepoint=span.start_codepoint,
+                    end_codepoint=span.end_codepoint,
+                    piece_sha256=hashlib.sha256(
+                        content.text[span.start_codepoint : span.end_codepoint].encode("utf-8")
+                    ).hexdigest(),
+                )
+                for span in descriptor.spans
+            ),
+        )
+        selectors = grouped.setdefault(model_input, [])
+        if selector not in selectors:
+            selectors.append(selector)
+    return {model_input: tuple(selectors) for model_input, selectors in grouped.items()}
+
+
+def _verified_context_excerpt(
+    hit: SearchHit,
+    embedding_id: str,
+    stored: StoredTextSelector,
+) -> ContextExcerpt | None:
+    """Return a public excerpt only when every durable selector claim still verifies."""
+    if stored.recipe_version != _TEXT_SELECTOR_RECIPE:
+        return None
+    parent_digest = hashlib.sha256(hit.content.encode("utf-8")).hexdigest()
+    if parent_digest != stored.parent_content_sha256:
+        return None
+    pieces = []
+    for stored_piece in stored.pieces:
+        if stored_piece.end_codepoint > len(hit.content):
+            return None
+        source_text = hit.content[stored_piece.start_codepoint : stored_piece.end_codepoint]
+        if hashlib.sha256(source_text.encode("utf-8")).hexdigest() != stored_piece.piece_sha256:
+            return None
+        pieces.append(
+            TextSpanPiece(
+                role=stored_piece.role,
+                start_codepoint=stored_piece.start_codepoint,
+                end_codepoint=stored_piece.end_codepoint,
+                source_text=source_text,
+                sha256=stored_piece.piece_sha256,
+            )
+        )
+    context_pieces = tuple(piece.source_text for piece in pieces if piece.role == "context")
+    body_pieces = tuple(piece.source_text for piece in pieces if piece.role == "body")
+    if len(body_pieces) != 1 or len(context_pieces) > 1:
+        return None
+    embedding_input = (
+        body_pieces[0] if not context_pieces else f"{context_pieces[0]}\n\n{body_pieces[0]}"
+    )
+    if hashlib.sha256(embedding_input.encode("utf-8")).hexdigest() != stored.embedding_input_sha256:
+        return None
+    selector = TextSpanSelector(
+        parent_content_sha256=stored.parent_content_sha256,
+        embedding_input_sha256=stored.embedding_input_sha256,
+        recipe_version=stored.recipe_version,
+        pieces=tuple(pieces),
+    )
+    return ContextExcerpt(
+        source_memory_id=hit.id,
+        matched_index_id=embedding_id,
+        content=_excerpt_content(hit.content, pieces),
+        selector=selector,
+        score=hit.score,
+        created_at=hit.created_at,
+        occurred_at=hit.occurred_at,
+        occurred_end=hit.occurred_end,
+        memory_type=hit.memory_type,
+        context=hit.context,
+        place_id=hit.place_id,
+    )
+
+
+def _excerpt_content(parent: str, pieces: Sequence[TextSpanPiece]) -> str:
+    """Render ordered exact pieces with an explicit marker for every omitted range."""
+    intervals = sorted((piece.start_codepoint, piece.end_codepoint) for piece in pieces)
+    merged: list[tuple[int, int]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    omission = "[… omitted source text …]"
+    rendered = []
+    cursor = 0
+    for start, end in merged:
+        if start > cursor:
+            rendered.append(omission)
+        rendered.append(parent[start:end])
+        cursor = end
+    if cursor < len(parent):
+        rendered.append(omission)
+    return " ".join(rendered)
+
+
 def _asset_content(asset: StoredAsset) -> _PreparedContent:
     return _PreparedContent(
         text="",
@@ -10023,6 +10614,12 @@ def _retrieval_scope(value: RetrievalScope | None) -> RetrievalScope | None:
     return value
 
 
+def _retrieval_mode(value: RetrievalMode) -> RetrievalMode:
+    if not isinstance(value, RetrievalMode):
+        raise ValidationError("retrieval_mode must be a RetrievalMode")
+    return value
+
+
 def _memory_type(value: object) -> MemoryType:
     if not isinstance(value, MemoryType):
         raise ValidationError("memory_type must be a MemoryType value")
@@ -10204,7 +10801,10 @@ def _budgeted_hits(
             continue
         cost = evidence_cost(hit)
         if used + cost > budget_chars:
-            break
+            # The selected prefix remains mandatory, but this supplemental scan is a packing
+            # pass. An oversized lower-ranked hit must not prevent a later, smaller record from
+            # using the remaining character budget.
+            continue
         used += cost
         extra.append(hit)
     return tuple(extra)
@@ -10242,6 +10842,7 @@ def _search_outcome(
     candidate_limit: int,
     exhaustive: bool,
     ambiguous: bool = False,
+    matched_dense_index_ids: Mapping[str, str] | None = None,
 ) -> _SearchOutcome:
     trace = (
         None
@@ -10253,7 +10854,11 @@ def _search_outcome(
             ambiguous=ambiguous,
         )
     )
-    return _SearchOutcome(hits=tuple(hits), trace=trace)
+    return _SearchOutcome(
+        hits=tuple(hits),
+        trace=trace,
+        matched_dense_index_ids=tuple((matched_dense_index_ids or {}).items()),
+    )
 
 
 def _parent_index_ids(documents: Sequence[IndexCandidate]) -> dict[str, tuple[str, ...]]:
@@ -10271,26 +10876,32 @@ def _early_candidate_trace(
     lexical_index_relevance: Mapping[str, float],
     lexical_matches: set[str],
     rejected_by: RetrievalRejection,
+    *,
+    retrieval_mode: RetrievalMode,
 ) -> RetrievalCandidateTrace:
     lexical_match = memory_id in lexical_matches
+    lexical_gate_scale = (
+        1.0 if retrieval_mode is RetrievalMode.LEXICAL else _LEXICAL_FULL_COVERAGE_RELEVANCE
+    )
     return RetrievalCandidateTrace(
         memory_id=memory_id,
         index_ids=index_ids,
         dense_relevance=dense_relevance.get(memory_id, 0.0),
         dense_confidence=dense_confidence.get(memory_id, 0.0),
-        # `lexical_relevance` is the ranking score contribution, which needs the term coverage
-        # computed from content this candidate never had hydrated. Reporting the index-side
-        # strength in its place would make the two figures incomparable across dispositions --
-        # a rejected candidate would appear to carry more lexical evidence than a ranked one --
-        # so the unknown component stays `None` and `lexical_match` carries what is known.
+        # Hybrid needs term coverage from hydrated content, so its lexical ranking contribution
+        # stays unknown here. Lexical mode ranks directly by native FTS relevance, which the
+        # index already supplied.
+        lexical_relevance=(
+            lexical_index_relevance.get(memory_id, 0.0)
+            if retrieval_mode is RetrievalMode.LEXICAL and lexical_match
+            else None
+        ),
         lexical_match=lexical_match,
-        # An upper bound on what the gate would have scored, not a value the gate produced: this
-        # candidate was rejected before ranking, so the full-coverage test that decides whether
-        # the lexical half counts at all, the temporal factor, and the observation's own
-        # confidence were never applied. All three can only lower it.
+        # An upper bound on what the gate would have scored: time and observation confidence were
+        # not evaluated for this rejected candidate.
         gate_relevance=max(
             dense_relevance.get(memory_id, 0.0),
-            _LEXICAL_FULL_COVERAGE_RELEVANCE * lexical_index_relevance.get(memory_id, 0.0),
+            lexical_gate_scale * lexical_index_relevance.get(memory_id, 0.0),
         ),
         rejected_by=rejected_by,
     )
@@ -10303,6 +10914,8 @@ def _extend_hydration_traces(
     hydrated_documents: Sequence[IndexCandidate],
     accepted_documents: Sequence[IndexCandidate],
     index_ids_by_memory: Mapping[str, tuple[str, ...]],
+    *,
+    retrieval_mode: RetrievalMode,
 ) -> None:
     if target is None:
         return
@@ -10311,9 +10924,13 @@ def _extend_hydration_traces(
         dense_confidence,
         lexical_index_relevance,
         lexical_matches,
+        _matched_dense_index_ids,
     ) = _parent_index_signals(candidates, hydrated_documents)
     dense_by_id = {hit.id: hit for hit in candidates.dense}
     lexical_by_id = {hit.id: hit for hit in candidates.lexical}
+    lexical_gate_scale = (
+        1.0 if retrieval_mode is RetrievalMode.LEXICAL else _LEXICAL_FULL_COVERAGE_RELEVANCE
+    )
     hydrated_ids = {document.embedding_id for document in hydrated_documents}
     for index_id in index_ids:
         if index_id in hydrated_ids:
@@ -10329,15 +10946,13 @@ def _extend_hydration_traces(
                 dense_confidence=dense_hit_confidence,
                 lexical_relevance=(
                     None
-                    if lexical_hit is None
-                    else _LEXICAL_FULL_COVERAGE_RELEVANCE * lexical_hit.relevance
+                    if lexical_hit is None or retrieval_mode is not RetrievalMode.LEXICAL
+                    else lexical_hit.relevance
                 ),
                 lexical_match=lexical_hit is not None,
                 gate_relevance=max(
                     0.0 if dense_hit is None else dense_hit.relevance,
-                    0.0
-                    if lexical_hit is None
-                    else _LEXICAL_FULL_COVERAGE_RELEVANCE * lexical_hit.relevance,
+                    0.0 if lexical_hit is None else lexical_gate_scale * lexical_hit.relevance,
                 ),
                 rejected_by=RetrievalRejection.STALE_INDEX,
             )
@@ -10355,6 +10970,7 @@ def _extend_hydration_traces(
                 lexical_index_relevance,
                 lexical_matches,
                 RetrievalRejection.OCCURRENCE_RANGE,
+                retrieval_mode=retrieval_mode,
             )
         )
 
@@ -10368,6 +10984,8 @@ def _extend_missing_memory_traces(
     dense_confidence: Mapping[str, float],
     lexical_index_relevance: Mapping[str, float],
     lexical_matches: set[str],
+    *,
+    retrieval_mode: RetrievalMode,
 ) -> None:
     if target is None:
         return
@@ -10383,6 +11001,7 @@ def _extend_missing_memory_traces(
                     lexical_index_relevance,
                     lexical_matches,
                     RetrievalRejection.MISSING_MEMORY,
+                    retrieval_mode=retrieval_mode,
                 )
             )
 
@@ -10396,6 +11015,8 @@ def _extend_memory_type_traces(
     dense_confidence: Mapping[str, float],
     lexical_index_relevance: Mapping[str, float],
     lexical_matches: set[str],
+    *,
+    retrieval_mode: RetrievalMode,
 ) -> None:
     if target is None:
         return
@@ -10410,6 +11031,7 @@ def _extend_memory_type_traces(
                     lexical_index_relevance,
                     lexical_matches,
                     RetrievalRejection.MEMORY_TYPE,
+                    retrieval_mode=retrieval_mode,
                 )
             )
 
@@ -10499,13 +11121,14 @@ def _extend_ranked_traces(
 def _parent_index_signals(
     candidates: _IndexCandidates,
     documents: Sequence[IndexCandidate],
-) -> tuple[dict[str, float], dict[str, float], dict[str, float], set[str]]:
+) -> tuple[dict[str, float], dict[str, float], dict[str, float], set[str], dict[str, str]]:
     dense_by_id = {hit.id: hit for hit in candidates.dense}
     lexical_by_id = {hit.id: hit for hit in candidates.lexical}
     dense_relevance: dict[str, float] = {}
     dense_confidence: dict[str, float] = {}
     lexical_relevance: dict[str, float] = {}
     lexical_matches: set[str] = set()
+    winning_dense: dict[str, tuple[float, str]] = {}
     for document in documents:
         memory_id = document.memory_id
         embedding_id = document.embedding_id
@@ -10517,13 +11140,27 @@ def _parent_index_signals(
             dense_confidence[memory_id] = max(
                 dense_confidence.get(memory_id, 0.0), cast(float, dense_hit.confidence)
             )
+            current = winning_dense.get(memory_id)
+            candidate = (dense_hit.relevance, embedding_id)
+            if (
+                current is None
+                or candidate[0] > current[0]
+                or (candidate[0] == current[0] and candidate[1] < current[1])
+            ):
+                winning_dense[memory_id] = candidate
         lexical_hit = lexical_by_id.get(embedding_id)
         if lexical_hit is not None:
             lexical_matches.add(memory_id)
             lexical_relevance[memory_id] = max(
                 lexical_relevance.get(memory_id, 0.0), lexical_hit.relevance
             )
-    return dense_relevance, dense_confidence, lexical_relevance, lexical_matches
+    return (
+        dense_relevance,
+        dense_confidence,
+        lexical_relevance,
+        lexical_matches,
+        {memory_id: value[1] for memory_id, value in winning_dense.items()},
+    )
 
 
 def _retrieval_is_ambiguous(

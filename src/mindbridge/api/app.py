@@ -156,6 +156,7 @@ class ContextRequest(StrictModel):
     budget: ContextBudgetRequest | None = None
     reference_at: AwareDatetime | None = None
     scope: RetrievalScope | None = None
+    allow_partial_sources: Annotated[bool, Field(strict=True)] = False
 
 
 class SettleRequest(StrictModel):
@@ -360,6 +361,7 @@ class RetentionResponse(_ResponseModel):
     dry_run: bool
     media_memory_ids: tuple[str, ...]
     forgotten_memory_ids: tuple[str, ...]
+    cascade_memory_ids: tuple[str, ...]
     asset_ids: tuple[str, ...]
     capture_memory_ids: tuple[str, ...]
     deleted: int
@@ -451,6 +453,35 @@ class ContextUnknownResponse(_ResponseModel):
     detail: str
 
 
+class TextSpanPieceResponse(_ResponseModel):
+    role: Literal["context", "body"]
+    start_codepoint: int
+    end_codepoint: int
+    source_text: str
+    sha256: str
+
+
+class TextSpanSelectorResponse(_ResponseModel):
+    parent_content_sha256: str
+    embedding_input_sha256: str
+    recipe_version: str
+    pieces: tuple[TextSpanPieceResponse, ...]
+
+
+class ContextExcerptResponse(_ResponseModel):
+    source_memory_id: str
+    matched_index_id: str
+    content: str
+    selector: TextSpanSelectorResponse
+    score: Annotated[float, Field(ge=0.0, le=1.0)]
+    created_at: AwareDatetime
+    occurred_at: AwareDatetime | None
+    occurred_end: AwareDatetime | None
+    memory_type: MemoryType
+    context: MemoryContext | None
+    place_id: str | None
+
+
 class ContextBundleResponse(_ResponseModel):
     goal: str
     reference_at: AwareDatetime
@@ -476,6 +507,7 @@ class ContextBundleResponse(_ResponseModel):
     chars: int
     elapsed_ms: int
     deadline_exceeded: bool
+    excerpts: tuple[ContextExcerptResponse, ...] = ()
     # The deterministic text of `ContextBundle.render()`, so a caller need not re-derive it.
     rendered: str
 
@@ -595,6 +627,7 @@ class _Memory(Protocol):
         budget: ContextBudget | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        allow_partial_sources: bool = False,
     ) -> ContextBundle: ...
 
     def reinforce(self, memory_ids: Sequence[str]) -> int: ...
@@ -1439,6 +1472,7 @@ def _add_context_route(
                 budget=context_budget(request.budget),
                 reference_at=request.reference_at,
                 scope=request.scope,
+                allow_partial_sources=request.allow_partial_sources,
             )
         )
 

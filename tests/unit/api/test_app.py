@@ -148,6 +148,10 @@ UNKNOWN = ContextUnknown(
     kind=ContextUnknownKind.BUDGET_EXCLUDED,
     detail="3 candidates did not fit 24 items and 16000 chars",
 )
+EVIDENCE_UNAVAILABLE = ContextUnknown(
+    kind=ContextUnknownKind.EVIDENCE_UNAVAILABLE,
+    detail="a required supporting memory was unavailable",
+)
 SEGMENT = SpeakerSegment(
     asset_id="b" * 64,
     start_ms=0,
@@ -335,9 +339,10 @@ class FakeMemory:
         budget: ContextBudget | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        allow_partial_sources: bool = False,
     ) -> ContextBundle:
         self._fail()
-        self.calls.append(("compile", goal, budget, reference_at, scope))
+        self.calls.append(("compile", goal, budget, reference_at, scope, allow_partial_sources))
         return _bundle(budget or ContextBudget(), reference_at or NOW)
 
     def reinforce(self, memory_ids: Sequence[str]) -> int:
@@ -1366,6 +1371,7 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
                     "max_latency_ms": 250,
                 },
                 "reference_at": NOW.isoformat(),
+                "allow_partial_sources": True,
             },
         )
 
@@ -1384,6 +1390,7 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
             ),
             NOW,
             None,
+            True,
         )
     ]
     bundle = response.json()
@@ -1420,7 +1427,11 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
         {
             "kind": "budget_excluded",
             "detail": "3 candidates did not fit 24 items and 16000 chars",
-        }
+        },
+        {
+            "kind": "evidence_unavailable",
+            "detail": "a required supporting memory was unavailable",
+        },
     ]
     assert bundle["occurred_from"] == "2026-08-27T00:00:00Z"
     assert bundle["occurred_until"] == "2026-08-28T00:00:00Z"
@@ -1445,6 +1456,20 @@ def test_the_context_route_returns_the_whole_bundle_without_local_asset_paths() 
     assert "/private/mindbridge/assets" not in response.text
 
 
+@pytest.mark.parametrize("value", (1, "true"))
+def test_the_context_route_requires_a_real_boolean_for_partial_sources(value: object) -> None:
+    memory = FakeMemory()
+    with TestClient(create_app(memory=memory)) as client:
+        response = client.post(
+            "/v1/context",
+            json={"goal": "What should I bring?", "allow_partial_sources": value},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "validation_error"
+    assert memory.calls == []
+
+
 def test_the_context_route_reports_a_named_actor_too() -> None:
     """Mirrors the provisional-actor case above for a person a naming assertion already names.
 
@@ -1461,8 +1486,15 @@ def test_the_context_route_reports_a_named_actor_too() -> None:
         budget: ContextBudget | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        allow_partial_sources: bool = False,
     ) -> ContextBundle:
-        bundle = original_compile(goal, budget=budget, reference_at=reference_at, scope=scope)
+        bundle = original_compile(
+            goal,
+            budget=budget,
+            reference_at=reference_at,
+            scope=scope,
+            allow_partial_sources=allow_partial_sources,
+        )
         return replace(bundle, actors=(NAMED,))
 
     memory.compile = compile_with_named_actor  # type: ignore[method-assign]
@@ -1487,7 +1519,7 @@ def test_the_context_route_defaults_to_the_sdk_budget() -> None:
         response = client.post("/v1/context", json={"goal": "What should I bring?"})
 
     assert response.status_code == 200
-    assert memory.calls == [("compile", "What should I bring?", None, None, None)]
+    assert memory.calls == [("compile", "What should I bring?", None, None, None, False)]
     assert response.json()["budget"] == {
         "max_chars": 16_000,
         "max_items": 24,
@@ -1849,6 +1881,7 @@ def test_the_data_subject_rights_dispatch_to_the_sdk_when_identities_are_enabled
         "dry_run": True,
         "media_memory_ids": [],
         "forgotten_memory_ids": ["mem_1"],
+        "cascade_memory_ids": [],
         "asset_ids": [],
         "capture_memory_ids": [],
         "deleted": 1,
@@ -1926,7 +1959,7 @@ def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
         affect=(_affect_cue(),),
         traits=(),
         conflicts=(CONFLICT,),
-        unknowns=(UNKNOWN,),
+        unknowns=(UNKNOWN, EVIDENCE_UNAVAILABLE),
         occurred_from=OCCURRED_FROM,
         occurred_until=OCCURRED_UNTIL,
         frames=("home/map",),

@@ -178,7 +178,7 @@ Every span sets `mindbridge.span.kind` to `operation`, `stage`, `model`, or `tra
 | Level | Useful span names |
 | --- | --- |
 | Operation | `mindbridge.add`, `.add_many`, `.search`, `.ask`, `.delete`, `.reindex`, `.optimize` |
-| Stage | `mindbridge.content.prepare`, `.retrieve`, `.storage.*`, `.index.*`, `.retrieval.rank`, `.identity.*` |
+| Stage | `mindbridge.content.prepare`, `.retrieve`, `.storage.*`, `.index.*`, `.retrieval.score_completion`, `.retrieval.rank`, `.identity.*` |
 | Model | `mindbridge.model.embedding`, `.transcription`, `.face`, `.generation`, `.formation`, `.vision` |
 | Transport | `mindbridge.http.request`, `mindbridge.mcp.request` |
 
@@ -192,6 +192,10 @@ leg: question content preparation, reference-time and temporal parsing, scope no
 required query speech work, query embedding, index lookup, and ranking. Its existing
 `mindbridge.content.prepare`, model, `mindbridge.index.search`, and `mindbridge.retrieval.rank`
 children remain available for attribution.
+
+Hybrid searches emit `mindbridge.retrieval.score_completion` only when a parent admitted by the
+lexical route was absent from the bounded ANN result. The stage covers reading that parent's
+persisted document vectors from SQLite and exact local cosine scoring; it makes no model request.
 
 `mindbridge.index.sync` retains one parent span and separates its durable stages without changing
 the SQLite-before-Zvec-before-ack order:
@@ -300,3 +304,33 @@ index settings:
 
 Never bypass compatibility checks by editing `PRAGMA user_version`, `store_metadata`, or the
 outbox.
+
+Schema 17 migrates each schema-16 flat evidence interval into a singleton clause version. Current
+clauses remain the authoritative `OR` of complete `AND` member sets; the flat
+`memory_evidence` rows are their compatibility union. The migration is atomic, retains active and
+retired intervals, and refuses a partial clause-table shape instead of filling it in around
+unknown data. Zvec remains derived: rebuilding a missing index reads the SQLite embeddings and
+current clause projection without calling the embedding model again.
+
+Clause versions are append-only transaction history. An inverse written by operation rollback
+points to the exact predecessor version it restores. This lets operations reverse newest first
+while an unrelated later update, including an equal-valued one, still blocks an older rollback.
+Physical `delete()` remains unlogged and irreversible; clause history does not recreate erased
+records.
+
+The schema-16 to schema-17 migration is automatic, transactional, and idempotent. Opening a store
+with schema 17 is an upgrade: an older SDK that only recognizes schema 16 cannot open it, and there
+is no automatic downgrade. Make and test a backup before upgrading; never use a copied benchmark
+archive as the live migration target.
+
+Schema 18 adds `embedding_text_selectors` and `embedding_text_span_pieces`. A selector belongs to
+one newly written pure-text raw embedding part and stores a parent-content digest, reconstructed
+embedding-input digest, recipe, and ordered code-point ranges with piece digests. It does not
+duplicate parent text. The schema-17 migration creates both tables transactionally and leaves them
+empty: old embedding rows have no durable locator, so startup never guesses offsets and never calls
+the embedding model. Reopening schema 18 is idempotent. A partial or incompatible selector-table
+shape is refused after checking primary keys, foreign keys, check constraints, and the piece index;
+the failed migration rolls back without advancing the version or retaining new DDL. Deleting an
+embedding cascades its selectors. Zvec rebuild still reads existing SQLite vectors and does not
+create selectors or re-embed content. An SDK that only supports schema 17 cannot open an upgraded
+store, and there is no automatic downgrade or physical-delete recovery.

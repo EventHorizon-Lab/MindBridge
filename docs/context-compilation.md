@@ -43,12 +43,79 @@ each `budget_excluded` tally -- is therefore a statement about that window, not 
 window came back full and the bundle still lost evidence, `unknowns` carries a
 `candidates_exhausted` entry saying so, so the difference is visible rather than inferred.
 
+## Evidence-closed selection
+
+For a derived hit, `compile()` follows its actual `context.evidence_ids` recursively and admits
+the assertion only with the complete finite dependency closure. Every member is hydrated under the
+same scope, type, confidence, freshness, active, and knowledge-time bounds. A missing, filtered,
+cyclic, or bounded dependency refuses the anchor and emits `evidence_unavailable`; this strict
+first version can therefore omit a claim whose historical or differently typed source a request
+excluded. All evidence IDs are conjunctive in this version: the schema has no minimal sufficient
+OR-of-AND support groups. Dependencies receive score `0.0`, which means supporting evidence rather
+than an independently query-ranked result. Their rendered lines retain basis and bounded evidence
+IDs; an evidence pointer is provenance, not semantic entailment.
+
+Consent remains enforced for named actor assertions and resolved actor links. Current formation
+does not create a derived claim whose required raw observation is removed by consent: withholding
+recognition leaves the underlying observation readable. If a future contract makes such a source
+ineligible, it must use the same closed-selection refusal path.
+
+Actor names use the same `known_at` and `valid_at` view as compiled evidence: a name asserted
+later is not projected into a historical bundle. Consent is present policy, so a current withdrawal
+continues to suppress actor rendering even for a historical request.
+
+An admitted closure spends the common item, character, and media budgets atomically, counting each
+memory once. The existing conservative per-hit media pricing remains, so an asset repeated by
+distinct included memories can still be charged more than once. Candidate-window conflict
+representatives are co-required with their own closures; that is bounded counterevidence coverage,
+not a global completeness guarantee. Co-derived events remain co-occurrence metadata and never
+become support or cause.
+
+## Exact raw excerpts
+
+When `compile(..., allow_partial_sources=True)` receives a newly written, pure-text raw observation
+that is too large to fit as a full hit, it may select one exact span projection associated with the
+dense embedding part that matched the query. The option defaults to `False`; in that mode the
+compiler performs no selector read and retains the prior full-record-only selection, rendering,
+omission, and query-failure behavior.
+It appears in `ContextBundle.excerpts` as a `ContextExcerpt`; `ContextBundle.hits` continues to
+contain complete records only. The renderer labels it `partial source; omitted text may qualify
+it`, prints the parent memory ID and half-open Unicode code-point offsets, and inserts labelled
+ellipsis wherever source text was omitted. Combining characters can therefore be split even
+though every returned code-point slice is exact.
+
+Each selector carries the parent-content digest, embedding-input digest, recipe version, and an
+ordered tuple of `TextSpanPiece` values. A piece carries its `context` or `body` role, offsets,
+exact source text, and digest. SQLite stores the offsets and digests rather than another copy of
+the source text. Hydration slices the authoritative parent and verifies the parent, pieces, and
+reconstructed embedding input. A failed check disables that excerpt and leaves the parent record,
+vector, and ordinary search result usable. These digests and `matched_index_id` remain structured
+provenance; they are not repeated in the text sent to a model.
+
+Excerpts inherit the parent record's visibility, requested scope, temporal view, identity and
+consent checks. Only a dense-matched text part of a raw observation is eligible. Aggregate keys,
+lexical-only matches, media and derived records, and schema-17 rows migrated without selectors are
+not. The compiler tries the full parent first. A parent can appear either as one full hit or one
+excerpt, never both. A later derived evidence closure can replace an excerpt only when its complete
+full-record closure fits atomically; otherwise the excerpt stays and the derived assertion is
+withheld. An excerpt is not an evidence-clause member, a citation reinforcement, or proof that its
+omitted text agrees. A selected statement can be qualified or withdrawn later in the omitted
+parent, so applications must retain the partial-source warning.
+
+The opt-in Python `bundle.compact()` presentation aliases only structurally rendered IDs after
+selection. Its memory symbols report full, partial, or reference-only coverage; partial citation
+resolution retains the exact selector, while reference-only and identity symbols cannot resolve as
+memory citations. Plain `resolve()` only decodes an alias and grants no evidence or retrieval
+authority. Compaction neither changes the bundle nor reclaims grounding budget. The text and its
+request-local symbol table are reversible together, but literal alias text and runtime IDs inside
+the untouched goal prevent a general semantic-equivalence claim for compact text alone.
+
 ## Budget
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `max_chars` | `16000` | Rendered-evidence character ceiling: the header, each section heading, each memory's whole rendered line, and a per-modality text equivalent for each media asset. One image part is charged 2000, one audio part 4000, and one video part 12000, so a ceiling below 12000 omits every video record it ranks |
-| `max_items` | `24` | Maximum included memories |
+| `max_chars` | `16000` | Grounding character ceiling: the header, each section heading, each full memory or excerpt line, including excerpt labels, source ID and offsets, and a per-modality text equivalent for each media asset. One image part is charged 2000, one audio part 4000, and one video part 12000, so a ceiling below 12000 omits every video record it ranks |
+| `max_items` | `24` | Maximum included complete memories plus excerpts |
 | `max_media_items` | `None` | Maximum grounded media parts; `0` compiles a text-only bundle and `None` lets `max_chars` alone decide |
 | `memory_types` | `None` | Keep only these `MemoryType` values, pushed into the index as one route per type; `None` keeps every type |
 | `min_confidence` | `0.0` | Minimum typed confidence; a record with no typed context counts as `1.0` |
@@ -71,6 +138,7 @@ character ceiling can only approximate them. The prices are fixed:
 | Charged | Characters |
 | --- | --- |
 | One memory's rendered line | `len(render_hit_line(hit)) + 1` -- the `- [id]` frame, the squeezed record text, and the confidence and validity suffix |
+| One exact excerpt line | `len(render_excerpt_line(excerpt)) + 1` -- partial-source warning, parent ID, offsets, selected text, source time, confidence and validity |
 | The header | its four rendered lines, about 150 characters plus the goal |
 | One section heading | its blank line, `##` marker plus space, and the name |
 | One `image` asset | 2000 |
@@ -98,11 +166,11 @@ demand better inferences, not a way to exclude observations; filter those by `me
 
 ### What `max_chars` does and does not bound
 
-`max_chars` bounds the *rendered* evidence, the quantity `ContextBundle.chars` reports and the
+`max_chars` bounds the *rendered grounding*, the quantity `ContextBundle.chars` reports and the
 quantity the selection charges: the header, every section heading, every memory line with its
-frame, and every `NamedActor` or `ProvisionalActor` line. A bundle that reports no compilation
-diagnostics therefore satisfies `len(bundle.render()) <= bundle.chars <= max_chars`, and a caller
-shipping `render()` no longer has to size against it themselves.
+frame, every excerpt line and its `Partial sources` heading, and every `NamedActor` or
+`ProvisionalActor` line. A bundle that reports no compilation diagnostics therefore satisfies
+`len(bundle.render()) <= bundle.chars <= max_chars`.
 
 `chars` is an upper bound rather than an exact length -- media parts are charged their text
 equivalent, which is far above the zero characters they render as, and the budget line is priced
@@ -131,10 +199,12 @@ section assembly and before the optional enrichment that follows it, and if the 
 already passed it skips that enrichment instead of truncating it halfway. A bundle compiled under
 a deadline is therefore a prefix of the bundle without one, never a different bundle.
 
-Today the one optional stage is conflict detection. When it is skipped, `conflicts` is empty and
-`unknowns` carries a `stage_skipped` entry naming it, so an empty `conflicts` under a deadline is
-never mistaken for agreement. Every bundle reports `elapsed_ms`, measured from before retrieval,
-and `deadline_exceeded`, which is true when `elapsed_ms` passed the declared deadline.
+Today the one optional stage is conflict reporting. The dependency and candidate-conflict closure
+needed for atomic admission is mandatory and still applies before this stage; a deadline never
+admits an incomplete assertion. When reporting is skipped, `conflicts` is empty and `unknowns`
+carries a `stage_skipped` entry naming it, so an empty `conflicts` under a deadline is never
+mistaken for agreement. Every bundle reports `elapsed_ms`, measured from before retrieval, and
+`deadline_exceeded`, which is true when `elapsed_ms` passed the declared deadline.
 
 ## Sections
 
@@ -196,9 +266,11 @@ still owes a downstream-utility measurement against the no-memory, full-context,
 retrieval-only baselines; that measurement decides whether the halving point is right or whether
 the floor round should go entirely.
 
-`ContextBundle` also reports `occurred_from` and `occurred_until` over the included hits, `frames`
+`ContextBundle` also reports `occurred_from` and `occurred_until` over the included hits and
+excerpts, `frames`
 (the distinct metric spatial frame IDs, sorted), `places` (the distinct symbolic `place_id`s,
-sorted), and `hits` (every included hit in rank order).
+sorted), `hits` (every complete included hit in rank order), and `excerpts` (the separately typed
+partial raw sources in selection order).
 
 ## Unknowns
 
@@ -209,6 +281,7 @@ a thin bundle explains itself instead of looking like an empty store.
 | `kind` | When it appears |
 | --- | --- |
 | `budget_excluded` | Counted candidates a bound removed, or that did not fit the budget, or actor lines that did not fit `max_chars` |
+| `evidence_unavailable` | A derived assertion's required support was missing, ineligible under the request's visibility, type, confidence, freshness, scope, or consent bounds, cyclic, or exceeded the bounded dependency traversal; the assertion is withheld with its incomplete provenance |
 | `section_empty` | A bundle section a `memory_types` request left empty, naming the section and either that the filter excluded every type it carries, or that the request admitted the type and no record of it reached the bundle at all -- a kind-keyed section (`actors`, `scene`, `affect`, `traits`) empty while another section already carries a record of its type is silent, since flagging it would be noise in most bundles |
 | `scope_empty` | A `scope` was supplied and retrieval matched nothing; the entry names the bounds |
 | `modality_unsupported` | The goal carries media this composition's embedder cannot search |
@@ -300,21 +373,24 @@ score. Read an event's text with `get()`.
 
 ## Conflicts
 
-Candidates that share a `lineage_id`, carry kind `state`, `relation`, or `trait`, and disagree on
-`value` produce one `ContextConflict` each. Its `values` and `memory_ids` are aligned: each
-distinct value is paired with the highest-ranked candidate asserting it. The compiler reports the
-disagreement and leaves resolution to the caller or to a later correction.
+Conflicts apply to lineages whose write contract gives them one standing value: every `state`
+assertion and a `trait` assertion whose basis is `user_statement`. Candidate-known representatives
+in one such lineage that disagree on `value`, together with each representative's declared evidence,
+are admitted as one atomic group or all withheld when the group does not fit. An accumulating
+`relation` can validly hold several values, such as two children, and model-inferred traits can
+accumulate evidence; differing values in either kind are not automatically contradictions.
 
-Detection reads every candidate the filters kept, not only the ones the budget bought, so running
-out of slots cannot make a disagreement disappear. A `memory_id` in a conflict may therefore name
-a memory that is not in `hits`; `render()` marks it `not included`, because that memory has no
-line of its own anywhere in the text. At least one included memory must take part, so a lineage
-the bundle says nothing about is not reported as its disagreement.
+Detection is bounded by the eligible ranked candidate window. It does not claim to find a
+counterpart elsewhere in the corpus. Within that window, a conflict cannot be made to disappear by
+admitting only one representative: every representative and its recursively required support must
+satisfy the request's scope and filters and fit the shared item, character, and media budgets. If a
+counterpart's support is unavailable or the complete group does not fit, no affirmative member of
+that group is included.
 
 A candidate a *filter* removed -- `memory_types`, `min_confidence`, or `freshness` -- is not
 compared, and neither is a superseded version bitemporal filtering already excluded. `conflicts`
-is a statement about what this request admitted, not a belief-revision history; read
-`memory_versions` through the control plane for that.
+describes eligible functional claims known to this bounded retrieval, not a corpus-wide
+belief-revision history; read `memory_versions` through the control plane for that.
 
 ## Rendered text
 
@@ -395,8 +471,9 @@ if memory.capabilities.generation:
     print(memory.ask("Where is the spare key?").answer)
 ```
 
-`AsyncMemory` mirrors `compile()`. The command line exposes it as `mindbridge compile`, locally and
-against `--url`; see [the CLI reference](api/cli.md). Agents reach it as `POST /v1/context` on
+`AsyncMemory` mirrors `compile()`. The command line exposes the partial-source opt-in as
+`mindbridge compile --allow-partial-sources`, locally and against `--url`; see the
+[CLI reference](api/cli.md). Agents reach the same explicit opt-in as `POST /v1/context` on
 [REST](api/rest.md#endpoints) and as the `compile_context` tool on [MCP](api/mcp.md#tools), which
 also publishes the capability view as its server instructions. REST publishes the same view from
 `GET /healthz`.

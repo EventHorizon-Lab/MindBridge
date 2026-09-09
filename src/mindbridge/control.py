@@ -155,6 +155,7 @@ def proposal_payload(proposal: FormationProposal) -> dict[str, object]:
         "valence": proposal.valence,
         "arousal": proposal.arousal,
         "spatial": None if spatial is None else _spatial_payload(spatial),
+        "evidence_ids": (None if proposal.evidence_ids is None else list(proposal.evidence_ids)),
     }
 
 
@@ -189,6 +190,9 @@ def _proposal(value: object) -> FormationProposal:
         cue_modality=cast(Any, value.get("cue_modality")),
         valence=cast(Any, value.get("valence")),
         arousal=cast(Any, value.get("arousal")),
+        evidence_ids=(
+            None if value.get("evidence_ids") is None else cast(Any, tuple(value["evidence_ids"]))
+        ),
     )
 
 

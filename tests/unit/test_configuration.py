@@ -42,6 +42,7 @@ from mindbridge import (
     MindBridgeConfig,
     Modality,
     ObservationContext,
+    RetrievalMode,
     SearchHit,
 )
 from mindbridge._telemetry import MODEL_MODULE, TOKEN_TOTAL, VISION_BATCHES_FAILED
@@ -74,7 +75,11 @@ def test_declarative_config_is_typed_strict_and_keeps_local_policy_separate(
                 "detector_model": tmp_path / "yunet.onnx",
                 "recognizer_model": tmp_path / "sface.onnx",
             },
-            "settings": {"index_speech": True, "index_quantization": "fp16"},
+            "settings": {
+                "index_speech": True,
+                "index_quantization": "fp16",
+                "retrieval_mode": "lexical",
+            },
         }
     )
 
@@ -85,6 +90,7 @@ def test_declarative_config_is_typed_strict_and_keeps_local_policy_separate(
     assert config.settings == MemoryConfig(
         index_speech=True,
         index_quantization=IndexQuantization.FP16,
+        retrieval_mode=RetrievalMode.LEXICAL,
     )
     assert MemorySettings is MemoryConfig
 
@@ -167,6 +173,7 @@ def test_local_policy_defaults_stay_pinned_to_their_recorded_provenance() -> Non
     assert defaults == MemoryConfig(
         index_speech=True,
         index_quantization=IndexQuantization.NONE,
+        retrieval_mode=RetrievalMode.HYBRID,
         minimum_relevance=0.10,
         ambiguity_margin=0.01,
         evidence_budget_chars=None,
@@ -281,6 +288,7 @@ _LOCAL_FORMATION_REPLY = json.dumps(
                 "proposals": [
                     {
                         "kind": "trait",
+                        "evidence_observation_ids": ["observation_0"],
                         "content": "Ada drinks tea in the morning.",
                         "subject": "Ada",
                         "predicate": "prefers",
@@ -291,6 +299,7 @@ _LOCAL_FORMATION_REPLY = json.dumps(
                     },
                     {
                         "kind": "affect",
+                        "evidence_observation_ids": ["observation_0"],
                         "content": "Ada sounded relieved.",
                         "subject": "Ada",
                         "value": "relief",
@@ -488,6 +497,23 @@ def test_builtin_openai_generation_config_maps_friendly_names_to_the_sdk_adapter
         "generation_temperature": 0.1,
         "generation_max_tokens": 512,
     }
+
+
+def test_builtin_openai_generation_stream_is_explicitly_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    marker = cast(GenerationBackend, object())
+
+    def build(**values: object) -> GenerationBackend:
+        captured.update(values)
+        return marker
+
+    monkeypatch.setattr(recipes_module, "_owned_openai_models", build)
+    spec = configuration.OpenAIGenerationConfig(provider="openai", stream=True)
+
+    assert configuration._build_generation(spec) is marker
+    assert captured["generation_stream"] is True
 
 
 def test_builtin_openai_embedding_config_maps_friendly_names_to_the_sdk_adapter(

@@ -72,6 +72,21 @@ uv run --frozen mindbridge-bench eval \
 The resulting `results.jsonl` reports `unit_count`, `question_count`, `dataset_sha256`, and
 `evaluation_sha256` for each selected task.
 
+Some datasets omit the clock used to interpret relative phrases such as "this morning". For a
+reproducible run, supply a timezone-aware fallback without changing questions that already carry a
+dataset or corpus date:
+
+```bash
+uv run --frozen mindbridge-bench eval \
+  --tasks m3-bench-robot \
+  --fallback-reference-at 2026-09-08T00:00:00Z \
+  --output-path .benchmarks/results/m3-fixed-clock
+```
+
+The fallback is passed only as the question's `reference_at`; it does not write event times or
+knowledge-visibility timestamps. Results record the normalized clock and the number of questions
+that used it. Invalid or timezone-naive values fail before provider clients are created.
+
 ## Run a bounded evaluation
 
 Configure an OpenAI-compatible generation endpoint, then start with one task and one memory unit:
@@ -402,8 +417,13 @@ from `mindbridge.benchmarks.task_catalog`; `--list-tasks` remains authoritative.
 | MemLens (`memlens`: 32K/64K/128K/256K) | Information extraction, multi-session and temporal reasoning, knowledge updates, and refusal over dated conversations; use for scaling context length | `accuracy`; judge `qwen3-235b-judge` | Pinned Hugging Face JSON and 195-question subset; automatic; published captions need no runtime media |
 | LongMemEval (`longmemeval-s`) | User, assistant, and preference recall plus multi-session reasoning, updates, abstention, and exact turn-level retrieval; use for established long-term dialogue behaviors | `accuracy`; judge `gpt-4o-2024-08-06` | Pinned Hugging Face JSON; automatic |
 | BEAM (`beam`: 100K/500K/1M/10M) | Very-long dialogue with contradiction resolution, ordering, extraction, updates, summarization, and temporal reasoning; use for length scaling | `llm_judge_score`; judge `gpt-4.1-mini` | Pinned GitHub tier directories; automatic |
-| PersonaMem-v3 (`personamem-v3`) | Causally masked cross-app personalization, preference shifts, sycophancy, privacy, hallucination, and candidate ranking; use for personal-agent behavior | `personamem_score`; judged families use `gpt-5.5`, ranking rows are deterministic | Pinned Hugging Face backend JSON; automatic; scorer-only `profile.json` is excluded |
+| PersonaMem-v3 (`personamem-v3`) | Causally masked cross-app personalization, preference shifts, sycophancy, privacy, hallucination, and candidate ranking; use for personal-agent behavior | `personamem_score`; judged families use `gpt-5.5`, ranking rows use the deterministic `ndcg_at_5` formula frozen at upstream commit `ad80a3b1b322` | Pinned Hugging Face backend JSON; automatic; scorer-only `profile.json` is excluded |
 | CL-Bench (`clbench`) | Learning a long reference document and following open-ended instructions; use for task-local context learning, not gold-source retrieval | `solving_rate`; judge `gpt-5.1` | Pinned Hugging Face JSONL; automatic |
+
+LongMemEval assigns every stored turn or split block an opaque, per-question source-order ID such
+as `M000000`. Release session labels, including answer and abstention markers, remain evaluator-only;
+`has_answer` is mapped onto the same opaque IDs for retrieval scoring. This mapping is part of the
+adapter version, so response caches from the earlier source-ID scheme are not reused.
 
 ### Multimodal personal memory
 
@@ -556,6 +576,16 @@ require hundreds of gigabytes. Long videos are prepared as deterministic bounded
 `.benchmarks/.prepared/`; preparation needs `ffmpeg` and `ffprobe`, and M3-Bench web media also
 needs `yt-dlp`.
 
+Prepared-video cache versions are isolated. A cache entry is reusable only when `ffprobe` finds a
+video stream with at least one real frame; an audio-only or otherwise incomplete derivative is
+rebuilt in the current cache version. The normal one-frame-per-second output stays unchanged when
+it has at least two frames. A shorter output is re-encoded from the same bounded source interval
+with its native cadence, audio mapping, and geometry so no synthetic frame or event time is
+introduced. A consumer whose video processor needs two frames reports a genuine one-frame input as
+unsupported at its own boundary rather than changing the generic prepared-media representation.
+During a cache-version migration, a legacy one-frame derivative is rebuilt instead of reused because
+the former one-frame-per-second sampling may have discarded real source frames.
+
 M3-Bench-web's official release publishes YouTube URLs rather than a durable web-video archive.
 When `yt-dlp` identifies a video as permanently unavailable (for example, private, removed, or
 copyright-blocked), acquisition continues and records the unit and exact reason under
@@ -662,11 +692,14 @@ Three of them need a note before a number is quoted:
   shaped model call the runner does not issue. The per-rubric `llm_judge_score` is reported and
   the composite is left absent rather than approximated.
 - **PersonaMem-v3 is scored on the families the pinned release supports.** Its evaluation
-  repository has drifted from the released data -- the repository's slate scorer reads a `slate`
-  and `origin_by_idx` the release does not publish -- so the reproduced protocols read only
-  released fields: the unified personalization rubric (13 task types), the four task-specific
-  judges, and the deterministic ranking family, whose headline is the graded nDCG@5 that
-  `task_registry.PRIMARY_METRIC` names. The proactive decision judge, the two repetition-fatigue
+  repository has drifted from the released data, so the reproduced protocols read only released
+  fields: the unified personalization rubric (13 task types), the four task-specific judges, and
+  the deterministic ranking family. Ranking freezes the formula at upstream commit
+  `ad80a3b1b322`: positive items have gain +2, fillers +1, and hard negatives -2, with the
+  hidden-persona filler gain set to zero only for historical slates that have no hard negatives.
+  The resulting `ndcg_at_5` is the ranking headline. `target_only_ndcg@5` remains a local
+  diagnostic. The deprecated `ndcg_graded@5` key is a compatibility alias for that target-only
+  diagnostic and is not classified as an upstream metric. The proactive decision judge, the two repetition-fatigue
   cluster tasks, `new_suggestions_chatbot`, `local_recommendation_geo_shift`,
   `active_mistake_prevention` and `short_vs_long_term_lifecycle` are answered and reported but
   carry no official headline -- the last one ranks a slate like the other three, but upstream
@@ -873,7 +906,8 @@ Treat it as a four-sample generalisation.
 
 The two exact labels wired here are joined differently, because the risk differs. LongMemEval marks
 the answering turn as the memories are built, so its label is exact by construction; a turn over
-the part limit becomes several `_B####` blocks and every block of a marked turn is gold.
+the part limit becomes several opaque, source-ordered blocks and every block of a marked turn is
+gold.
 LoCoMo-Refined publishes a separate list that has to be matched onto the stored turns, so an
 evidence ID naming no stored turn is counted in `retrieval.unresolved_gold_evidence_ids` instead of
 being dropped. That count is the join's health: were a release's label vocabulary not the source-ID
@@ -919,6 +953,31 @@ A run in progress also holds `samples.partial.jsonl`, appended as each task fini
 removed when the real artifacts land. It is a crash copy, not an artifact: it carries no results
 document and no digest, and a leftover file means the run it belongs to did not finish. Read it to
 recover the answers of the tasks that completed before an interruption.
+
+The evaluator treats embedding HTTP 401, 403, 404, 405, 408, 429, 5xx, and connection or timeout
+failures as a shared-service outage. It stops recursive ingest isolation after the first such
+failure, and a query-time failure marked with the `embed` stage stops queued questions in that
+unit. Answers already completed remain in the result; the failed and remaining questions retain
+their planned rows as structured errors. Input-specific HTTP 400, 413, 415, and 422 failures still
+use item isolation, and a generation-stage provider failure remains an ordinary per-question
+error.
+
+The standard CLI does not persist each question inside one unfinished task. The frozen long-run
+EgoLife protocol adds that narrower behavior with an attempt-owned benchmark source overlay; it
+does not change `mindbridge-bench eval`. Its private `samples.generation.journal.jsonl` writes and
+fsyncs one checksum-protected record after each completed question. A record contains the composite
+attempt, run, task, unit, question, and arm identity; raw prediction or structured error; the
+canonical expected choice; released day, question type, and audio-needed strata; and cumulative
+usage through that row. Missing questions have no journal row. The journal is never read by the
+runner and never serves as an answer or judge cache.
+
+Offline recovery accepts complete, checksum-valid records and may ignore one unterminated final
+line. It rejects earlier corruption and every duplicate composite identity, including identical
+duplicates. A finalized sample supersedes its matching journal row only when the raw prediction and
+structured error fields agree; a conflict invalidates recovery. Scoring retains the frozen roster's
+full denominator, assigning zero to missing and error outcomes. The journal can recover completed
+quality rows and cumulative usage, while provider work still in flight at process termination is
+outside the last durable usage snapshot.
 
 ### Reporting cadence
 

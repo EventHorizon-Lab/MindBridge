@@ -56,6 +56,7 @@ from mindbridge.types import (
     ContentInput,
     ContextBudget,
     ContextConflict,
+    ContextExcerpt,
     ContextUnknown,
     EvidenceBasis,
     ExportBundle,
@@ -711,6 +712,7 @@ def _compile(memory: Memory, arguments: argparse.Namespace) -> _Document:
         budget=_budget(arguments),
         reference_at=_optional_time(arguments.reference_at, "reference_at"),
         scope=_retrieval_scope(_json_source(arguments.scope)),
+        allow_partial_sources=arguments.allow_partial_sources,
     )
     # `ContextBundle.document()` is the projection REST and MCP publish too, so a section added
     # to the bundle reaches this document without being spelled here a third time.
@@ -735,7 +737,7 @@ def _bundle_entry(entry: object) -> object:
     # `actors` may carry, beside the ranked hits, a person a visible naming assertion names
     # reached through other evidence, or a provisional identity no assertion names. Conflicts
     # carry only strings.
-    if isinstance(entry, ContextConflict | NamedActor | ProvisionalActor):
+    if isinstance(entry, ContextConflict | ContextExcerpt | NamedActor | ProvisionalActor):
         return asdict(entry)
     return entry
 
@@ -851,6 +853,7 @@ def _retention_document(report: RetentionReport) -> _Document:
         "dry_run": report.dry_run,
         "media_memory_ids": list(report.media_memory_ids),
         "forgotten_memory_ids": list(report.forgotten_memory_ids),
+        "cascade_memory_ids": list(report.cascade_memory_ids),
         "asset_ids": list(report.asset_ids),
         "capture_memory_ids": list(report.capture_memory_ids),
         "deleted": report.deleted,
@@ -1272,6 +1275,8 @@ def _remote_compile(arguments: argparse.Namespace) -> tuple[str, str, _Document 
         "scope",
         _retrieval_scope_document(_retrieval_scope(_json_source(arguments.scope))),
     )
+    if arguments.allow_partial_sources:
+        body["allow_partial_sources"] = True
     return "POST", "/v1/context", body
 
 
@@ -2346,6 +2351,11 @@ def _compile_command(
     )
     command.add_argument("--reference-at", metavar="TIME", help="retrieval reference clock")
     command.add_argument("--scope", metavar="JSON", help="temporal/spatial scope, @PATH, or -")
+    command.add_argument(
+        "--allow-partial-sources",
+        action="store_true",
+        help="allow verified partial raw-text sources when a complete record does not fit",
+    )
 
 
 def _content_command(

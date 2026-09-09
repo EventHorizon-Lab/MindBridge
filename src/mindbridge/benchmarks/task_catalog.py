@@ -8,6 +8,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 
 from mindbridge.benchmarks.atm_bench import ATM_BENCH_ADAPTER_VERSION
+from mindbridge.benchmarks.longmemeval import LONGMEMEVAL_ADAPTER_VERSION
 from mindbridge.benchmarks.openeqa import OPENEQA_ADAPTER_VERSION, OPENEQA_SPLITS
 
 DEFAULT_BENCHMARKS_ROOT = Path(".benchmarks")
@@ -348,7 +349,7 @@ TASKS: dict[str, TaskSpec] = {
             "longmemeval-s",
             "LongMemEval",
             "longmemeval/longmemeval_s",
-            "longmemeval_official_v1",
+            LONGMEMEVAL_ADAPTER_VERSION,
             _LONGMEMEVAL,
             digest="08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894",
             variant="s",

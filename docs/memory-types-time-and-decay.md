@@ -150,6 +150,50 @@ commits derived records. Two kinds carry extra visibility rules:
   it, so reinforcing a source, rolling that back, or deleting one recomputes the whole citation
   chain in the same transaction.
 
+A custom `FormationBackend` may set `FormationProposal.evidence_ids` to the ordered IDs of every
+observation in the current `FormationInput` batch that the proposal jointly depends on. The
+primary input's ID must be present; empty, duplicate, foreign, and out-of-batch IDs reject the
+formation response before any derived record commits. `None` retains the legacy primary-source
+link. These IDs declare dependencies, not independent corroboration or a semantic proof that the
+model cited every fact it used.
+
+One explicit tuple is one conjunctive support clause: `{A, B}` means the derived record depends on
+both observations. Several separately emitted clauses are alternatives, so `{A, B}` and `{C}` mean
+`support(claim) = (A AND B) OR C`. Deleting either member retires the whole first clause; it never
+turns into the unsupported singleton `{B}` or `{A}`. `MemoryContext.evidence_ids` is the ordered union of
+members from complete active clauses, so existing callers keep one flat list. An explicit automatic
+`FormationProposal.evidence_ids` tuple creates a conjunction. Each new `CONSOLIDATE` operation also
+treats its complete cited `evidence_ids` set as one conjunction; separate operations can add
+alternative clauses for the same stable derived record. A legacy/custom former that leaves its
+field as `None`, already-persisted consolidation evidence, general `MemoryContext.evidence_ids`,
+and `REINFORCE` retain independent singleton alternatives. Existing rows are not reinterpreted or
+backfilled. A joint proposal contributes one confidence assessment, while singleton alternatives
+retain capture-group maximum and noisy-OR combination; current confidence is the greater of those
+projections. These declarations are dependencies, not proof that model prose cited every fact it
+used.
+
+The context compiler conservatively includes the union of the surviving complete clauses; it does
+not solve for a smallest witness set. Clauses record logical dependency, not calibrated truth
+probabilities. This is ordinary truth-maintenance and how-provenance bookkeeping rather than a
+claim that Boolean support expressions are new. The compiler's cycle guard remains conservative:
+it may refuse a cyclic evidence union even when another clause grounds the record independently.
+
+SQLite schema 17 stores current clauses, their ordered members, and append-only clause versions.
+Retirement, reactivation, confidence changes, and operation rollback each close or append an
+interval at their actual transaction time. Historical `known_at` reads therefore retain periods
+when a clause was active or inactive. An inverse version points to the exact predecessor it
+restored, so newest-first rollback can continue without treating an unrelated equal-valued update
+as ownership. Rollback preserves unrelated alternatives and never shrinks a joint clause. These
+dependency records preserve the existing delete and retirement behavior; they add no new
+physical-erasure guarantee and cannot recover records removed by `delete`.
+
+Deleting evidence traverses only that source's reverse-dependency region and evaluates the region
+to a grounded fixed point; it does not scan or reinterpret unrelated records. Observations and host
+assertions are roots on both native clauses and schema-16 links migrated to singleton clauses. A
+derived record remains only when at least one complete clause is grounded. Unsupported mutual
+cycles cannot keep each other alive, while a cycle reached from an independent observation can
+survive.
+
 A proposal that fails one of those per-proposal rules — an `AFFECT` cue naming a modality the
 source never carried, a pose in another coordinate frame — is dropped, counted on the
 `mindbridge.formation.refused_proposals` span attribute, and costs only itself: the observation's
@@ -162,17 +206,17 @@ or a shape that is not a batch of proposals — fails the write. A refusal is fi
 formation recipe: the source is marked formed, so nothing retries the proposal and re-adding the
 same content forms nothing new.
 
-Formation never rewrites the caller's source record. A derived record inherits its source's event
-time, valid interval, and metric pose, and inherits the symbolic `place_id` and the `metadata` that
-every cited source agrees on, so a place-scoped or metadata-filtered recall reaches the knowledge
-formed in a room and not only the raw observation it came from. Agreement is the rule for formation
-too, because an `ENTITY`, `RELATION`, inferred `TRAIT`, or `RESPONSE_POLICY` is written once and
-later sources only add evidence to it: when a second source disagrees, the shared record keeps
-neither place nor metadata rather than the first source's, since a hard retrieval filter must not
-be guessed. Both columns follow the live evidence rather than the moment the record was written:
-deleting a source or rolling an operation back recomputes them over the sources that remain, so a
-record the survivors agree on is scoped again. A derived record carries no media assets of its own:
-it is text, and its evidence link points at the observation that holds the media.
+Formation never rewrites the caller's source record. A derived record inherits its primary source's
+event time, valid interval, metric pose, symbolic `place_id`, and `metadata`, so a place-scoped or
+metadata-filtered recall reaches the knowledge formed in a room and not only the raw observation it
+came from. Extra declared witnesses do not merge identity, time, pose, place, or metadata. An
+`ENTITY`, `RELATION`, inferred `TRAIT`, or `RESPONSE_POLICY` written separately from several
+primary sources is one shared record; when those primary sources disagree, the shared record keeps
+neither place nor metadata rather than guessing a hard retrieval filter. Both columns follow the
+live evidence rather than the moment the record was written: deleting a source or rolling an
+operation back recomputes them over the sources that remain, so a record the survivors agree on is
+scoped again. A derived record carries no media assets of its own: it is text, and its evidence link
+points at the observation that holds the media.
 
 ### Naming a person is a typed assertion
 
@@ -341,10 +385,15 @@ including records the backend never saw. Those versions are recorded on the log 
 consolidation can supersede an earlier one's record, operations on one lineage reverse newest
 first: `rollback()` returns `False` for an operation a standing later one has built on.
 
+Model simultaneous facts as `RELATION` entries when they may have several standing values: for
+example, a person can speak Chinese and English or like both cats and dogs. A user-stated `TRAIT`
+has one standing value per subject-and-predicate lineage, so a later value replaces the earlier
+version; use it for a preference or characteristic the application intends to treat as current.
+
 | Intent | Kernel semantics |
 | --- | --- |
 | `REINFORCE` | Link an independent source to an existing derived record. Confidence recombines by noisy-OR over independent sources counted per capture, and a hidden inferred `TRAIT` can become visible — as can a record that cites the one reinforced. |
-| `CONSOLIDATE` | Derive one new record citing several sources. The sources stay as evidence, and stay in recall unless the same proposal names them in `target_ids`. |
+| `CONSOLIDATE` | Derive one new record whose cited set is one complete joint support clause. Separate operations are alternative clauses. Sources stay in recall unless the same proposal names them in `target_ids`. |
 | `CORRECT` | Retire the current version of a bad derived inference. History is preserved, not overwritten. |
 | `FORGET` | Set `forgotten_at`. Recall skips the record; audit keeps it. |
 | `IDENTIFY` | Name a recognized person. The kernel turns the `IdentityClaim` into an `ENTITY` assertion bound to that identity, and `identities.name` is a projection of the assertion currently visible. |

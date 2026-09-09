@@ -6,11 +6,13 @@ import math
 import re
 import sys
 from array import array
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx2 as httpx
@@ -50,6 +52,7 @@ from mindbridge._telemetry import (
     operation_span,
     token_modality_attribute,
 )
+from mindbridge.evidence import answer_evidence_payloads
 from mindbridge.exceptions import ModelError, ModelOutputTruncatedError, ValidationError
 from mindbridge.models._media import media_duration_seconds
 from mindbridge.models.base import (
@@ -419,6 +422,7 @@ def test_formation_batches_grounded_observations_and_validates_typed_output(
                                                     "cue_modality": "audio",
                                                     "valence": 0.6,
                                                     "arousal": 0.4,
+                                                    "evidence_observation_ids": ["observation_1"],
                                                 }
                                             ],
                                         },
@@ -433,6 +437,7 @@ def test_formation_batches_grounded_observations_and_validates_typed_output(
                                                     "value": "on",
                                                     "confidence": 0.9,
                                                     "valid_from": "2026-08-27T00:00:00Z",
+                                                    "evidence_observation_ids": ["observation_0"],
                                                 }
                                             ],
                                         },
@@ -469,8 +474,10 @@ def test_formation_batches_grounded_observations_and_validates_typed_output(
 
     assert isinstance(model, FormationBackend)
     assert state[0].kind is MemoryKind.STATE
+    assert state[0].evidence_ids == ("source_text",)
     assert state[0].valid_from == datetime(2026, 8, 27, tzinfo=timezone.utc)
     assert affect[0].kind is MemoryKind.AFFECT
+    assert affect[0].evidence_ids == ("source_audio",)
     assert affect[0].cue_modality is Modality.AUDIO
 
 
@@ -671,6 +678,297 @@ def test_description_reports_its_own_token_cost(tmp_path: Path) -> None:
     assert attributes[GEN_AI_OPENAI_RESPONSE_SYSTEM_FINGERPRINT] == "caption-fingerprint"
 
 
+def test_streamed_json_completion_collects_content_and_terminal_usage(tmp_path: Path) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    requests: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = cast(dict[str, object], json.loads(request.content))
+        requests.append(payload)
+        assert payload["stream"] is True
+        assert payload["stream_options"] == {"include_usage": True}
+        chunks = (
+            {
+                "id": "chatcmpl-caption",
+                "model": "served-caption-model",
+                "system_fingerprint": "caption-fingerprint",
+                "choices": [{"index": 0, "delta": {"content": '{"descriptions": ['}}],
+            },
+            {
+                "id": "chatcmpl-caption",
+                "model": "served-caption-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": '"a red bicycle"]}'},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-caption",
+                "model": "served-caption-model",
+                "choices": [],
+                "usage": {"prompt_tokens": 900, "completion_tokens": 30, "total_tokens": 930},
+            },
+        )
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(
+            _sdk_client(client),
+            generation_model="caption-model",
+            generation_capabilities=frozenset({Modality.IMAGE}),
+            embedding_dimension=2,
+            generation_stream=True,
+        )
+        with model_span(provider.get_tracer("test"), "model", attributes={}):
+            assert model.describe((ModelInput(assets=(picture,)),)) == ("a red bicycle",)
+    provider.shutdown()
+
+    assert len(requests) == 1
+    attributes = exporter.get_finished_spans()[0].attributes
+    assert attributes is not None
+    assert attributes[TOKEN_TOTAL] == 930
+    assert attributes[GEN_AI_RESPONSE_MODEL] == "served-caption-model"
+
+
+def test_streamed_json_completion_without_terminal_usage_is_response_invalid(
+    tmp_path: Path,
+) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        chunk = {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": '{"descriptions": ["bike"]}'},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        return httpx.Response(
+            200,
+            content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(
+            _sdk_client(client),
+            generation_model="caption-model",
+            generation_capabilities=frozenset({Modality.IMAGE}),
+            embedding_dimension=2,
+            generation_stream=True,
+        )
+        with pytest.raises(ModelError) as failure:
+            model.describe((ModelInput(assets=(picture,)),))
+
+    assert failure.value.reason == "response_invalid"
+    assert failure.value.stage == "describe"
+
+
+def test_streamed_json_completion_preserves_the_length_error(tmp_path: Path) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        chunks = (
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": '{"descriptions": ["bike'},
+                        "finish_reason": "length",
+                    }
+                ]
+            },
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            },
+        )
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(
+            _sdk_client(client),
+            generation_model="caption-model",
+            generation_capabilities=frozenset({Modality.IMAGE}),
+            embedding_dimension=2,
+            generation_stream=True,
+        )
+        with pytest.raises(ModelOutputTruncatedError) as failure:
+            model.describe((ModelInput(assets=(picture,)),))
+
+    assert failure.value.stage == "describe"
+
+
+def test_streamed_json_completion_rejects_valid_json_without_a_terminal_marker(
+    tmp_path: Path,
+) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        chunks = (
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": '{"descriptions": ["bike"]}'},
+                    }
+                ]
+            },
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            },
+        )
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIModels(
+            _sdk_client(client),
+            generation_model="caption-model",
+            generation_capabilities=frozenset({Modality.IMAGE}),
+            embedding_dimension=2,
+            generation_stream=True,
+        )
+        with pytest.raises(ModelError) as failure:
+            model.describe((ModelInput(assets=(picture,)),))
+
+    assert failure.value.reason == "response_invalid"
+    assert failure.value.stage == "describe"
+
+
+def test_streamed_json_completion_closes_a_completed_stream() -> None:
+    class _CompletedStream:
+        closed = False
+
+        def __iter__(self) -> Iterator[SimpleNamespace]:
+            return iter(
+                (
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                index=0,
+                                delta=SimpleNamespace(content='{"descriptions": ["bike"]}'),
+                                finish_reason="stop",
+                            )
+                        ],
+                        usage=None,
+                        model="caption-model",
+                        system_fingerprint=None,
+                    ),
+                    SimpleNamespace(
+                        choices=[],
+                        usage={"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+                        model="caption-model",
+                        system_fingerprint=None,
+                    ),
+                )
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = _CompletedStream()
+    response = cast(
+        Any,
+        openai_backend._collect_streamed_completion(
+            stream, subject="vision description", stage="describe"
+        ),
+    )
+
+    assert response.choices[0].message.content == '{"descriptions": ["bike"]}'
+    assert stream.closed is True
+
+
+def test_streamed_json_completion_never_accepts_partial_content_after_an_iterator_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+
+    class _BrokenStream:
+        closed = False
+        emitted = False
+
+        def __iter__(self) -> "_BrokenStream":
+            return self
+
+        def __next__(self) -> SimpleNamespace:
+            if not self.emitted:
+                self.emitted = True
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            index=0,
+                            delta=SimpleNamespace(content='{"descriptions": ["bike"]}'),
+                        )
+                    ],
+                    usage=None,
+                    model="caption-model",
+                    system_fingerprint=None,
+                )
+            raise RuntimeError("connection ended")
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = _BrokenStream()
+
+    def create(**_request: object) -> _BrokenStream:
+        return stream
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr(OpenAIModels, "_client", lambda _self, _operation: fake_client)
+    model = OpenAIModels(
+        generation_model="caption-model",
+        generation_capabilities=frozenset({Modality.IMAGE}),
+        embedding_dimension=2,
+        generation_stream=True,
+    )
+
+    with pytest.raises(ModelError) as failure:
+        model.describe((ModelInput(assets=(picture,)),))
+
+    assert failure.value.reason is None
+    assert failure.value.stage == "describe"
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize(
+    "choices",
+    [
+        None,
+        {},
+        "not-a-list",
+        [SimpleNamespace(index=1, delta=SimpleNamespace(content="{}"))],
+        [
+            SimpleNamespace(index=0, delta=SimpleNamespace(content="{}")),
+            SimpleNamespace(index=1, delta=SimpleNamespace(content="{}")),
+        ],
+        [SimpleNamespace(index=0, delta=SimpleNamespace(content=object()))],
+    ],
+)
+def test_streamed_json_completion_rejects_malformed_choices(choices: object) -> None:
+    responses = [SimpleNamespace(choices=choices, usage=None)]
+
+    with pytest.raises(ModelError) as failure:
+        openai_backend._collect_streamed_completion(
+            responses, subject="vision description", stage="describe"
+        )
+
+    assert failure.value.reason == "response_invalid"
+    assert failure.value.stage == "describe"
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -788,7 +1086,7 @@ def test_one_malformed_description_reply_is_retried_once(tmp_path: Path) -> None
     # `max_retries` never sees this, because the transport call succeeded.
     picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
     replies = [_malformed_reply(), _caption_reply("a red bicycle")]
-    sent: list[object] = []
+    sent: list[dict[str, Any]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
         sent.append(json.loads(request.content))
@@ -800,8 +1098,104 @@ def test_one_malformed_description_reply_is_retried_once(tmp_path: Path) -> None
 
     assert captions == ("a red bicycle",)
     assert len(sent) == 2
-    # The retry repeats the identical request rather than reshaping it.
-    assert sent[0] == sent[1]
+    first_content = sent[0]["messages"][1]["content"]
+    retry_content = sent[1]["messages"][1]["content"]
+    assert retry_content[:-1] == first_content
+    correction = retry_content[-1]
+    assert correction["type"] == "text"
+    assert "was not valid JSON" in correction["text"]
+    assert "exactly 1 non-empty description strings" in correction["text"]
+
+
+def test_description_wrong_count_retry_reports_shape_without_replaying_content(
+    tmp_path: Path,
+) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    rejected = json.dumps(
+        {"descriptions": [f"private rejected caption {index}" for index in range(5)]}
+    )
+    replies = [
+        httpx.Response(
+            200,
+            json={
+                "choices": [{"index": 0, "message": {"content": rejected}, "finish_reason": "stop"}]
+            },
+        ),
+        _caption_reply("a red bicycle"),
+    ]
+    sent: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return replies[len(sent) - 1]
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = _vision_model(
+            _sdk_client(client), capabilities=frozenset({Modality.IMAGE})
+        ).describe((ModelInput(assets=(picture,)),))
+
+    assert result == ("a red bicycle",)
+    assert len(sent) == 2
+    serialized_retry = json.dumps(sent[1])
+    assert "private rejected caption" not in serialized_retry
+    assert 'contained 5 items in \\"descriptions\\"' in serialized_retry
+    assert "exactly 1 non-empty description strings" in serialized_retry
+
+
+@pytest.mark.parametrize(
+    ("content", "observed"),
+    [
+        ("not json", "was not valid JSON"),
+        (json.dumps(["private caption"]), "was not a JSON object"),
+        (json.dumps({"caption": "private caption"}), 'did not contain a "descriptions" list'),
+        (
+            json.dumps({"descriptions": ["private one", "private two", "private three"]}),
+            'contained 3 items in "descriptions"',
+        ),
+        (
+            json.dumps({"descriptions": ["private caption", " "]}),
+            'contained a blank or non-string item in "descriptions"',
+        ),
+    ],
+)
+def test_vision_retry_instruction_reports_only_rejected_shape(
+    content: str,
+    observed: str,
+) -> None:
+    instruction = openai_backend._vision_retry_instruction(content, 2)
+
+    assert observed in instruction
+    assert "exactly 2 non-empty description strings" in instruction
+    assert "private" not in instruction
+
+
+def test_two_wrong_count_description_replies_keep_the_strict_terminal_error(
+    tmp_path: Path,
+) -> None:
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    replies = [
+        _caption_reply("one", "two", "three", "four", "five"),
+        _caption_reply("one", "two"),
+    ]
+    sent = 0
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal sent
+        reply = replies[sent]
+        sent += 1
+        return reply
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        pytest.raises(ModelError) as failure,
+    ):
+        _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE})).describe(
+            (ModelInput(assets=(picture,)),)
+        )
+
+    assert failure.value.reason == "response_invalid"
+    assert failure.value.stage == "describe"
+    assert sent == 2
 
 
 def test_a_second_malformed_reply_is_not_retried_again(tmp_path: Path) -> None:
@@ -1744,6 +2138,107 @@ def test_answer_serializes_temporal_and_metadata_evidence() -> None:
     assert answer.answer == "It arrived on August 26."
 
 
+def test_answer_source_qualifies_shared_provenance_without_selecting_by_label() -> None:
+    valid_from = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    valid_until = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    recorded_at = datetime(2026, 8, 27, 13, tzinfo=timezone.utc)
+    context = MemoryContext(
+        kind=MemoryKind.STATE,
+        basis=EvidenceBasis.MODEL_INFERENCE,
+        confidence=0.6,
+        valid_from=valid_from,
+        valid_until=valid_until,
+        recorded_at=recorded_at,
+        source_id="source-outside-context",
+        subject="parcel",
+        predicate="location",
+        value="hall",
+        evidence_ids=("raw-selected", "source-outside-context"),
+        supersedes_id="corrected-record",
+    )
+    hits = (
+        SearchHit(
+            id="derived-first",
+            content="The parcel is in the hall.",
+            score=0.9,
+            created_at=NOW,
+            context=context,
+        ),
+        SearchHit(
+            id="raw-selected",
+            content="I left the parcel in the hall.",
+            score=0.8,
+            created_at=NOW,
+        ),
+        SearchHit(
+            id="derived-second",
+            content="The hall contains the parcel.",
+            score=0.7,
+            created_at=NOW,
+            context=replace(context, supersedes_id=None),
+        ),
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        request_text = request.content.decode()
+        for private_id in (
+            "derived-first",
+            "raw-selected",
+            "derived-second",
+            "source-outside-context",
+            "corrected-record",
+        ):
+            assert private_id not in request_text
+        messages = json.loads(request_text)["messages"]
+        system = messages[0]["content"]
+        assert (
+            system
+            == openai_backend._GROUNDED_SYSTEM_PROMPT + openai_backend._QUALIFIED_EVIDENCE_PROMPT
+        )
+        assert "unique cited record IDs" in system
+        assert "not independent observations or corroboration" in system
+        assert "media_omitted" not in system
+        payloads = messages[1]["content"]
+        memories = json.loads(payloads)["hits"]
+        assert [item["evidence_label"] for item in memories] == ["E1", "E2", "E3"]
+        assert memories[0]["context"] == {
+            "kind": "state",
+            "basis": "model_inference",
+            "confidence": 0.6,
+            "recorded_at": recorded_at.isoformat(),
+            "valid_from": valid_from.isoformat(),
+            "valid_until": valid_until.isoformat(),
+            "subject": "parcel",
+            "predicate": "location",
+            "value": "hall",
+            "evidence_labels": ["E2", "S1"],
+            "supporting_record_count": 2,
+            "source_label": "S1",
+            "source_not_in_context": True,
+            "sources_not_in_context": ["S1"],
+            "supersedes_label": "S2",
+        }
+        assert memories[2]["context"]["evidence_labels"] == ["E2", "S1"]
+        assert memories[2]["context"]["source_label"] == "S1"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "The parcel is in the hall."},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = _model(_sdk_client(client)).answer("Where is the parcel?", hits)
+
+    assert result.hits == hits
+
+
 def test_answer_instructs_the_reader_to_resolve_relative_time() -> None:
     systems: list[str] = []
 
@@ -1776,6 +2271,8 @@ def test_answer_instructs_the_reader_to_resolve_relative_time() -> None:
     # Anchored on the instruction, not on its wording: rephrasing the sentence is fine, dropping
     # the arithmetic it asks for is not.
     assert "resolve" in systems[0] and "reference time" in systems[0]
+    assert "Evidence labels" not in systems[0]
+    assert "media_omitted" not in systems[0]
 
 
 def test_answer_can_pin_sampling_for_reproducible_evaluation() -> None:
@@ -2137,7 +2634,7 @@ def test_multimodal_answer_budgets_the_final_text_parts(
         )
         for index in range(10)
     )
-    text_parts = openai_backend._answer_text_parts(question, hits)
+    text_parts = openai_backend._answer_text_parts(question, hits, answer_evidence_payloads(hits))
     actual_bytes = sum(len(part.encode()) for part in text_parts)
     monkeypatch.setattr(
         "mindbridge.models.openai_sdk._MAX_GROUNDED_TEXT_BYTES",
@@ -2295,6 +2792,13 @@ def test_answer_retries_provider_rejected_short_hit_video_as_text(
             )
         assert isinstance(content, str)
         assert "The blue toolbox is beside the door." in content
+        messages = cast(list[dict[str, object]], payload["messages"])
+        assert messages[0]["content"] == (
+            openai_backend._GROUNDED_SYSTEM_PROMPT + openai_backend._OMITTED_MEDIA_PROMPT
+        )
+        memory = json.loads(content)["hits"][0]
+        assert memory["content"] == "The blue toolbox is beside the door."
+        assert memory["media_omitted"] == {"video": 1}
         if payload.get("stream"):
             chunk = {
                 "id": "chatcmpl-test",
@@ -2361,6 +2865,38 @@ def test_answer_retries_provider_rejected_short_hit_video_as_text(
     assert attributes[TOKEN_COMPLETE] is False
 
 
+def test_omitted_media_uses_the_global_supplied_asset_union(tmp_path: Path) -> None:
+    question_asset = _asset(tmp_path, "question", Modality.VIDEO, "video/mp4", b"question")
+    shared_asset = _asset(tmp_path, "shared", Modality.VIDEO, "video/mp4", b"shared")
+    omitted_asset = _asset(tmp_path, "omitted", Modality.VIDEO, "video/mp4", b"omitted")
+    original = (
+        SearchHit(
+            id="first",
+            content="first transcript",
+            score=0.9,
+            created_at=NOW,
+            assets=(question_asset, shared_asset, omitted_asset, omitted_asset),
+            modality=Modality.VIDEO,
+        ),
+        SearchHit(
+            id="second",
+            content="second transcript",
+            score=0.8,
+            created_at=NOW,
+            assets=(shared_asset,),
+            modality=Modality.VIDEO,
+        ),
+    )
+    grounded = (
+        replace(original[0], assets=(), modality=Modality.TEXT),
+        original[1],
+    )
+
+    assert openai_backend._omitted_grounding_media(
+        ModelInput(text="What?", assets=(question_asset,)), original, grounded
+    ) == {"first": {"video": 1}}
+
+
 def test_answer_does_not_elide_video_for_an_unrelated_bad_request(tmp_path: Path) -> None:
     video = _asset(tmp_path, "video", Modality.VIDEO, "video/mp4", b"video")
     hit = SearchHit(
@@ -2406,8 +2942,28 @@ def test_answer_sends_shared_media_once_and_bounds_inline_bytes(
     )
 
     def respond(request: httpx.Request) -> httpx.Response:
-        content = json.loads(request.content)["messages"][1]["content"]
+        messages = json.loads(request.content)["messages"]
+        assert messages[0]["content"] == openai_backend._GROUNDED_SYSTEM_PROMPT
+        content = messages[1]["content"]
         assert [part["type"] for part in content].count("image_url") == 1
+        memories = [
+            json.loads(part["text"])["memory"]
+            for part in content
+            if part["type"] == "text" and '"memory"' in part["text"]
+        ]
+        assert (
+            memories
+            == [
+                {
+                    "content": "shared image",
+                    "memory_type": "semantic",
+                    "created_at": NOW.isoformat(),
+                    "metadata": {},
+                    "assets": [image.id],
+                }
+            ]
+            * 2
+        )
         return httpx.Response(
             200,
             json={
@@ -2463,6 +3019,9 @@ def test_answer_keeps_ranked_media_within_budget_and_retains_overflow_text(
             "image_url",
             "text",
         ]
+        memories = [json.loads(content[index]["text"])["memory"] for index in (1, 3)]
+        assert [item["content"] for item in memories] == ["first evidence", "second evidence"]
+        assert all("evidence_label" not in item for item in memories)
         return httpx.Response(
             200,
             json={
@@ -2623,15 +3182,32 @@ def test_answer_caps_grounding_videos_without_dropping_their_text(tmp_path: Path
             content=f"transcript {index}",
             score=1.0 - index / 10,
             created_at=NOW,
-            assets=(video,),
+            # A repeated reference remains one omitted source asset, not two serialization
+            # occurrences, when this last hit falls past the video cap.
+            assets=(video,) if index < 2 else (video, video),
             modality=Modality.VIDEO,
         )
         for index, video in enumerate(videos)
     )
 
     def respond(request: httpx.Request) -> httpx.Response:
-        content = json.loads(request.content)["messages"][1]["content"]
+        messages = json.loads(request.content)["messages"]
+        assert messages[0]["content"] == (
+            openai_backend._GROUNDED_SYSTEM_PROMPT + openai_backend._OMITTED_MEDIA_PROMPT
+        )
+        content = messages[1]["content"]
         assert [part["type"] for part in content].count("video_url") == 2
+        memories = [
+            json.loads(part["text"])["memory"]
+            for part in content
+            if part["type"] == "text" and '"memory"' in part["text"]
+        ]
+        assert [memory.get("media_omitted") for memory in memories] == [
+            None,
+            None,
+            {"video": 1},
+        ]
+        assert memories[2]["content"] == "transcript 2"
         return httpx.Response(
             200,
             json={
@@ -2653,6 +3229,79 @@ def test_answer_caps_grounding_videos_without_dropping_their_text(tmp_path: Path
     assert [len(hit.assets) for hit in result.hits] == [1, 1, 0]
     assert result.hits[2].content == "transcript 2"
     assert result.hits[2].modality is Modality.TEXT
+
+
+def test_answer_combines_typed_provenance_with_later_media_omission(tmp_path: Path) -> None:
+    first_video = _asset(tmp_path, "first-video", Modality.VIDEO, "video/mp4", b"first")
+    omitted_video = _asset(tmp_path, "omitted-video", Modality.VIDEO, "video/mp4", b"second")
+    context = MemoryContext(
+        kind=MemoryKind.STATE,
+        basis=EvidenceBasis.MODEL_INFERENCE,
+        confidence=0.7,
+        valid_from=None,
+        valid_until=None,
+        recorded_at=NOW,
+        source_id="origin-only",
+        evidence_ids=("raw-first", "outside-source", "outside-source"),
+    )
+    hits = (
+        SearchHit(
+            id="raw-first",
+            content="first record",
+            score=0.9,
+            created_at=NOW,
+            assets=(first_video,),
+            modality=Modality.VIDEO,
+        ),
+        SearchHit(
+            id="typed-second",
+            content="typed record",
+            score=0.8,
+            created_at=NOW,
+            assets=(omitted_video,),
+            modality=Modality.VIDEO,
+            context=context,
+        ),
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        messages = json.loads(request.content)["messages"]
+        assert messages[0]["content"] == (
+            openai_backend._GROUNDED_SYSTEM_PROMPT
+            + openai_backend._QUALIFIED_EVIDENCE_PROMPT
+            + openai_backend._OMITTED_MEDIA_PROMPT
+        )
+        content = messages[1]["content"]
+        memories = [
+            json.loads(part["text"])["memory"]
+            for part in content
+            if part["type"] == "text" and '"memory"' in part["text"]
+        ]
+        assert memories[0]["evidence_label"] == "E1"
+        assert "media_omitted" not in memories[0]
+        assert memories[1]["evidence_label"] == "E2"
+        assert memories[1]["media_omitted"] == {"video": 1}
+        assert memories[1]["context"]["supporting_record_count"] == 2
+        assert memories[1]["context"]["evidence_labels"] == ["E1", "S1"]
+        assert memories[1]["context"]["sources_not_in_context"] == ["S1"]
+        assert memories[1]["context"]["source_label"] == "S2"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "grounded"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = _model(_sdk_client(client), generation_video_limit=1).answer("What?", hits)
+
+    assert [len(hit.assets) for hit in result.hits] == [1, 0]
 
 
 def test_inline_media_budget_bounds_encoded_request_bytes(
@@ -3202,6 +3851,7 @@ def _model(
     generation_min_video_seconds: float | None = None,
     generation_video_limit: int | None = 8,
     generation_extra_body: dict[str, object] | None = None,
+    generation_stream: bool = False,
     generation_capabilities: frozenset[Modality] = ALL_MODALITIES,
 ) -> OpenAIModels:
     return OpenAIModels(
@@ -3220,6 +3870,7 @@ def _model(
         generation_min_video_seconds=generation_min_video_seconds,
         generation_video_limit=generation_video_limit,
         generation_extra_body=generation_extra_body,
+        generation_stream=generation_stream,
     )
 
 
@@ -3435,8 +4086,17 @@ def test_a_malformed_proposal_does_not_discard_its_valid_siblings() -> None:
                 {
                     "observation_id": "observation_0",
                     "proposals": [
-                        {"kind": "event", "content": "a real event", "confidence": 0.9},
-                        {"kind": "entity", "confidence": 1.0},
+                        {
+                            "kind": "event",
+                            "content": "a real event",
+                            "confidence": 0.9,
+                            "evidence_observation_ids": ["observation_0"],
+                        },
+                        {
+                            "kind": "entity",
+                            "confidence": 1.0,
+                            "evidence_observation_ids": ["observation_0"],
+                        },
                         {
                             "kind": "state",
                             "subject": "Dad",
@@ -3444,6 +4104,7 @@ def test_a_malformed_proposal_does_not_discard_its_valid_siblings() -> None:
                             "value": True,
                             "content": "a boolean value",
                             "confidence": 0.9,
+                            "evidence_observation_ids": ["observation_0"],
                         },
                     ],
                 }
@@ -3468,6 +4129,44 @@ def test_a_malformed_proposal_does_not_discard_its_valid_siblings() -> None:
         if span.attributes is not None and FORMATION_PROPOSALS_DROPPED in span.attributes
     ]
     assert dropped == [2]
+
+
+@pytest.mark.parametrize(
+    "aliases",
+    (
+        (),
+        ("observation_0", "observation_0"),
+        ("observation_1",),
+    ),
+)
+def test_formation_rejects_invalid_witness_aliases(aliases: tuple[str, ...]) -> None:
+    content = json.dumps(
+        {
+            "items": [
+                {
+                    "observation_id": "observation_0",
+                    "proposals": [
+                        {
+                            "kind": "event",
+                            "content": "A real event.",
+                            "confidence": 0.9,
+                            "evidence_observation_ids": list(aliases),
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    inputs = (
+        FormationInput(
+            memory_id="m0",
+            content=ModelInput(text="x"),
+            context=ObservationContext(source_id="user"),
+        ),
+    )
+
+    with pytest.raises(openai_backend._InvalidStructuredResponse):
+        openai_backend._formation_results(content, inputs)
 
 
 @pytest.mark.parametrize(
@@ -3632,6 +4331,7 @@ def test_one_malformed_formation_reply_is_retried_once() -> None:
                                                 "value": "on",
                                                 "confidence": 0.9,
                                                 "valid_from": "2026-08-27T00:00:00Z",
+                                                "evidence_observation_ids": ["observation_0"],
                                             }
                                         ],
                                     }

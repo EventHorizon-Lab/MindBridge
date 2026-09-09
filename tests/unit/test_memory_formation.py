@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import shutil
+import sqlite3
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,18 +16,22 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from mindbridge import (
     Blob,
+    EmbedTask,
     EvidenceBasis,
     FormationInput,
     FormationProposal,
     Memory,
     MemoryKind,
+    MemoryNotFoundError,
     Modality,
     ModelError,
+    ModelInput,
     ObservationContext,
     RetrievalScope,
     SearchHit,
     SpatialAnchor,
     SpatialContext,
+    ValidationError,
 )
 from mindbridge._telemetry import FORMATION_PROPOSALS_REFUSED
 
@@ -203,6 +210,7 @@ def test_deleting_a_source_removes_unsupported_derived_records(tmp_path: Path) -
         assert memory.delete(source.id) is True
         assert memory.delete(source.id) is False
         assert memory.search("preferred drink", limit=10) == ()
+        assert memory.compile("preferred drink").hits == ()
 
 
 def test_unsupported_source_modality_is_kept_without_calling_the_former(tmp_path: Path) -> None:
@@ -322,6 +330,236 @@ def test_a_damaged_formation_envelope_still_fails_the_write(tmp_path: Path) -> N
             memory.add("I prefer tea")
 
         assert failure.value.reason == "response_invalid"
+
+
+@pytest.mark.parametrize("deleted_source", (0, 1))
+def test_batch_witnesses_are_persisted_and_compiled_as_one_evidence_closure(
+    tmp_path: Path, deleted_source: int
+) -> None:
+    """A proposal resolved from two observations must cite both durable source IDs."""
+
+    class CrossWitnessFormer(PreferenceFormer):
+        def form(
+            self, inputs: Sequence[FormationInput]
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            assert len(inputs) == 2
+            return (
+                (),
+                (
+                    FormationProposal(
+                        kind=MemoryKind.STATE,
+                        content="Lin Yue lives in Suzhou",
+                        subject="Lin Yue",
+                        predicate="lives_in",
+                        value="Suzhou",
+                        confidence=0.6,
+                        evidence_ids=(inputs[0].memory_id, inputs[1].memory_id),
+                    ),
+                ),
+            )
+
+    with Memory(
+        tmp_path / str(deleted_source),
+        embedder=TinyEmbedder(),
+        former=CrossWitnessFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        first, second = memory.add_many(("My sister is named Lin Yue.", "She lives in Suzhou."))
+        formed = next(
+            hit
+            for hit in memory.search("Lin Yue lives Suzhou", limit=10)
+            if hit.context is not None and hit.context.kind is MemoryKind.STATE
+        )
+
+        assert formed.context is not None
+        assert formed.context.evidence_ids == (first.id, second.id)
+        assert formed.context.confidence == pytest.approx(0.6)
+        with closing(sqlite3.connect(memory._store.database_path)) as connection:
+            clauses = connection.execute(
+                """
+                SELECT c.clause_id, m.source_memory_id
+                FROM memory_evidence_clauses AS c
+                JOIN memory_evidence_clause_members AS m
+                  ON m.memory_id = c.memory_id AND m.clause_id = c.clause_id
+                WHERE c.memory_id = ? AND c.retired_at IS NULL
+                ORDER BY c.clause_id, m.position
+                """,
+                (formed.id,),
+            ).fetchall()
+        assert len({str(row[0]) for row in clauses}) == 1
+        assert [str(row[1]) for row in clauses] == [first.id, second.id]
+        bundle = memory.compile("Where does Lin Yue live?")
+        assert {first.id, second.id, formed.id} <= {hit.id for hit in bundle.hits}
+
+        assert memory.delete((first, second)[deleted_source].id) is True
+        with pytest.raises(MemoryNotFoundError):
+            memory.get(formed.id)
+
+
+def test_singleton_alternative_survives_withdrawal_of_joint_witness(
+    tmp_path: Path,
+) -> None:
+    class AlternativeWitnessFormer(PreferenceFormer):
+        def form(
+            self, inputs: Sequence[FormationInput]
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            return (
+                (),
+                (
+                    FormationProposal(
+                        kind=MemoryKind.ENTITY,
+                        content="Lin Yue is a person",
+                        subject="Lin Yue",
+                        evidence_ids=(inputs[0].memory_id, inputs[1].memory_id),
+                    ),
+                ),
+                (
+                    FormationProposal(
+                        kind=MemoryKind.ENTITY,
+                        content="Lin Yue is a person",
+                        subject="Lin Yue",
+                    ),
+                ),
+            )
+
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=AlternativeWitnessFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        first, _second, third = memory.add_many(("A", "B", "C"))
+        entity = next(
+            hit
+            for hit in memory.search("Lin Yue person", limit=10)
+            if hit.context is not None and hit.context.kind is MemoryKind.ENTITY
+        )
+
+        assert memory.delete(first.id) is True
+        survivor = memory.get(entity.id)
+        assert survivor.context is not None
+        assert survivor.context.evidence_ids == (third.id,)
+
+
+def test_missing_index_rebuild_uses_sqlite_clause_withdrawal_without_reembedding(
+    tmp_path: Path,
+) -> None:
+    class CountingEmbedder(TinyEmbedder):
+        def __init__(self) -> None:
+            self.document_inputs = 0
+
+        def embed(
+            self,
+            inputs: Sequence[ModelInput],
+            task: EmbedTask = EmbedTask.DOCUMENT,
+        ) -> tuple[tuple[float, ...], ...]:
+            batch = tuple(inputs)
+            if task is EmbedTask.DOCUMENT:
+                self.document_inputs += len(batch)
+            return super().embed(batch, task)
+
+    class CrossWitnessFormer(PreferenceFormer):
+        def form(
+            self, inputs: Sequence[FormationInput]
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            return (
+                (),
+                (
+                    FormationProposal(
+                        kind=MemoryKind.STATE,
+                        content="Lin Yue lives in Suzhou",
+                        subject="Lin Yue",
+                        predicate="lives_in",
+                        value="Suzhou",
+                        evidence_ids=(inputs[0].memory_id, inputs[1].memory_id),
+                    ),
+                ),
+            )
+
+    data_dir = tmp_path / "rebuild"
+    with Memory(
+        data_dir,
+        embedder=CountingEmbedder(),
+        former=CrossWitnessFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        first, _second = memory.add_many(("My sister is Lin Yue", "She lives in Suzhou"))
+        derived_id = next(
+            hit.id
+            for hit in memory.search("Lin Yue Suzhou", limit=10)
+            if hit.context is not None and hit.context.kind is MemoryKind.STATE
+        )
+
+    shutil.rmtree(data_dir / "zvec")
+    rebuilt = CountingEmbedder()
+    with Memory(
+        data_dir,
+        embedder=rebuilt,
+        former=CrossWitnessFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        assert derived_id in {hit.id for hit in memory.search("Lin Yue Suzhou", limit=10)}
+        assert rebuilt.document_inputs == 0
+        assert memory.delete(first.id) is True
+
+    shutil.rmtree(data_dir / "zvec")
+    rebuilt_after_withdrawal = CountingEmbedder()
+    with Memory(
+        data_dir,
+        embedder=rebuilt_after_withdrawal,
+        former=CrossWitnessFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        assert derived_id not in {hit.id for hit in memory.search("Lin Yue Suzhou", limit=10)}
+        assert rebuilt_after_withdrawal.document_inputs == 0
+
+
+@pytest.mark.parametrize("evidence_ids", ((), ("duplicate", "duplicate")))
+def test_formation_proposal_rejects_empty_or_duplicate_witnesses(
+    evidence_ids: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValidationError):
+        FormationProposal(
+            kind=MemoryKind.EVENT,
+            content="bad",
+            evidence_ids=evidence_ids,
+        )
+
+
+@pytest.mark.parametrize("mode", ("foreign", "missing_primary"))
+def test_invalid_explicit_batch_witnesses_abort_derived_commit(tmp_path: Path, mode: str) -> None:
+    class InvalidWitnessFormer(PreferenceFormer):
+        def form(
+            self, inputs: Sequence[FormationInput]
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            assert len(inputs) == 2
+            evidence_ids = (
+                ("foreign", inputs[0].memory_id) if mode == "foreign" else (inputs[1].memory_id,)
+            )
+            return tuple(
+                (
+                    FormationProposal(
+                        kind=MemoryKind.EVENT,
+                        content="bad",
+                        evidence_ids=evidence_ids,
+                    ),
+                )
+                for _input in inputs
+            )
+
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=InvalidWitnessFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        with pytest.raises(ModelError) as failure:
+            memory.add_many(("first source", "second source"))
+        assert failure.value.reason == "response_invalid"
+        assert all(
+            hit.context is None or hit.context.kind is MemoryKind.OBSERVATION
+            for hit in memory.list().items
+        )
 
 
 def _formed(

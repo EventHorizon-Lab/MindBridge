@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import cast
 
 import pytest
@@ -21,6 +22,7 @@ from mindbridge import (
     AsyncMemory,
     ContextBudget,
     ContextBundle,
+    ContextUnknownKind,
     EvidenceBasis,
     FormationInput,
     FormationProposal,
@@ -34,6 +36,7 @@ from mindbridge import (
     NamedActor,
     ObservationContext,
     ProvisionalActor,
+    RetrievalMode,
     RetrievalScope,
     SearchHit,
     SpatialAnchor,
@@ -42,6 +45,7 @@ from mindbridge import (
 )
 from mindbridge.cli import _LOCAL, _parser
 from mindbridge.context import (
+    EvidenceClosure,
     _frame_cost,
     _heading_cost,
     bundle_cost,
@@ -474,6 +478,42 @@ def test_disagreeing_states_in_one_lineage_produce_one_conflict() -> None:
     assert conflict.memory_ids == ("first", "second")
 
 
+def test_accumulating_relationships_and_inferred_traits_are_not_conflicts() -> None:
+    bundle = _compile(
+        (
+            _hit("child-a", kind=MemoryKind.RELATION, lineage_id="children", value="A"),
+            _hit("child-b", kind=MemoryKind.RELATION, lineage_id="children", value="B"),
+            _hit("hiking", kind=MemoryKind.TRAIT, lineage_id="interests", value="hiking"),
+            _hit("painting", kind=MemoryKind.TRAIT, lineage_id="interests", value="painting"),
+        )
+    )
+
+    assert bundle.conflicts == ()
+
+
+def test_user_stated_traits_in_one_lineage_remain_conflicts() -> None:
+    bundle = _compile(
+        (
+            _hit(
+                "tea",
+                kind=MemoryKind.TRAIT,
+                basis=EvidenceBasis.USER_STATEMENT,
+                lineage_id="drink",
+                value="tea",
+            ),
+            _hit(
+                "coffee",
+                kind=MemoryKind.TRAIT,
+                basis=EvidenceBasis.USER_STATEMENT,
+                lineage_id="drink",
+                value="coffee",
+            ),
+        )
+    )
+
+    assert len(bundle.conflicts) == 1
+
+
 def test_a_conflict_survives_the_budget_dropping_one_side() -> None:
     bundle = _compile(
         (
@@ -489,6 +529,69 @@ def test_a_conflict_survives_the_budget_dropping_one_side() -> None:
     assert bundle.conflicts[0].memory_ids == ("berlin", "paris")
     # The dropped side has no line of its own, so the conflict line says where it is not.
     assert '- ana location: "berlin" [berlin] vs "paris" [paris, not included]' in bundle.render()
+
+
+def test_evidence_closure_is_admitted_atomically_under_the_item_budget() -> None:
+    source = _hit("source", score=0.0)
+    assertion = _hit("assertion", score=0.9, kind=MemoryKind.STATE, evidence_ids=("source",))
+
+    too_small = compile_context(
+        "what is going on",
+        (assertion,),
+        budget=ContextBudget(max_items=1),
+        reference_at=REFERENCE,
+        closures=(EvidenceClosure(assertion, (assertion, source)),),
+    )
+    admitted = compile_context(
+        "what is going on",
+        (assertion,),
+        budget=ContextBudget(max_items=2),
+        reference_at=REFERENCE,
+        closures=(EvidenceClosure(assertion, (assertion, source)),),
+    )
+
+    assert too_small.hits == ()
+    assert {hit.id for hit in admitted.hits} == {"assertion", "source"}
+
+
+def test_a_dependency_conflict_is_closed_to_its_candidate_representatives() -> None:
+    alternative = _hit(
+        "alternative", score=0.7, kind=MemoryKind.STATE, lineage_id="where", value="paris"
+    )
+    source = _hit("source", score=0.8, kind=MemoryKind.STATE, lineage_id="where", value="berlin")
+    anchor = _hit("anchor", score=0.9, kind=MemoryKind.STATE, evidence_ids=("source",))
+    closures = (
+        EvidenceClosure(anchor, (anchor, source)),
+        EvidenceClosure(source, (source,)),
+        EvidenceClosure(alternative, (alternative,)),
+    )
+
+    bundle = compile_context(
+        "what is going on",
+        (anchor, source, alternative),
+        budget=ContextBudget(max_items=3),
+        reference_at=REFERENCE,
+        closures=closures,
+    )
+
+    assert {hit.id for hit in bundle.hits} == {"anchor", "source", "alternative"}
+
+
+def test_an_unavailable_conflict_counterpart_cannot_fall_back_to_flat_selection() -> None:
+    first = _hit("first", score=0.9, kind=MemoryKind.STATE, lineage_id="where", value="berlin")
+    unavailable = _hit(
+        "unavailable", score=0.8, kind=MemoryKind.STATE, lineage_id="where", value="paris"
+    )
+
+    bundle = compile_context(
+        "what is going on",
+        (first, unavailable),
+        budget=ContextBudget(),
+        reference_at=REFERENCE,
+        closures=(EvidenceClosure(first, (first,)),),
+    )
+
+    assert bundle.hits == ()
 
 
 def test_a_conflict_no_included_memory_asserts_is_not_this_bundles_disagreement() -> None:
@@ -951,6 +1054,56 @@ class _Former:
         return None
 
 
+class _ClosureFormer:
+    formation_capabilities = ATOMIC_MODALITIES
+    formation_model = "closure-test"
+    formation_space = "closure-test:v1"
+
+    def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+        return tuple(
+            (
+                FormationProposal(
+                    kind=MemoryKind.STATE,
+                    content="the target answer is amber",
+                    subject="user",
+                    predicate="answer",
+                    value="amber",
+                    confidence=0.9,
+                ),
+            )
+            if "opaque source" in item.content.text
+            else ()
+            for item in inputs
+        )
+
+    def close(self) -> None:
+        return None
+
+
+class _RelationshipFormer:
+    formation_capabilities = ATOMIC_MODALITIES
+    formation_model = "relationship-test"
+    formation_space = "relationship-test:v1"
+
+    def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+        return tuple(
+            (
+                FormationProposal(
+                    kind=MemoryKind.RELATION,
+                    content=f"Parent has child {'A' if 'alpha' in item.content.text else 'B'}",
+                    subject="Parent",
+                    predicate="has_child",
+                    value="A" if "alpha" in item.content.text else "B",
+                    confidence=0.9,
+                ),
+            )
+            for item in inputs
+        )
+
+    def close(self) -> None:
+        return None
+
+
 def _memory(data_dir: Path) -> Memory:
     return Memory(
         data_dir,
@@ -979,6 +1132,145 @@ def test_compile_reuses_the_retrieval_path_and_structures_what_it_returns(tmp_pa
         assert bundle.occurred_from == REFERENCE - timedelta(hours=3)
         assert len(bundle.render()) <= bundle.chars <= bundle.budget.max_chars
         assert note.id in bundle.render()
+
+
+def test_compile_hydrates_a_formed_source_and_admits_it_atomically(tmp_path: Path) -> None:
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=_ClosureFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        source = memory.add("opaque source material")
+        ranked = memory.search("amber answer", limit=40)
+        derived = next(
+            hit
+            for hit in ranked
+            if hit.context is not None and hit.context.kind is MemoryKind.STATE
+        )
+
+        bundle = memory.compile("amber answer", budget=ContextBudget(max_items=2))
+        tight = memory.compile("amber answer", budget=ContextBudget(max_items=1))
+
+    assert {hit.id for hit in bundle.hits} == {derived.id, source.id}
+    assert derived.id not in {hit.id for hit in tight.hits}
+
+
+def test_compile_does_not_atomically_group_multivalued_relationships(tmp_path: Path) -> None:
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=_RelationshipFormer(),
+        minimum_relevance=0,
+        retrieval_mode=RetrievalMode.LEXICAL,
+    ) as memory:
+        memory.add("opaque alpha evidence")
+        memory.add("opaque beta evidence")
+
+        full = memory.compile("Parent has child", budget=ContextBudget(max_items=4))
+        tight = memory.compile("Parent has child", budget=ContextBudget(max_items=2))
+
+    assert {hit.context.value for hit in full.relationships if hit.context is not None} == {
+        "A",
+        "B",
+    }
+    assert full.conflicts == ()
+    assert len(tight.hits) == 2
+    assert tight.conflicts == ()
+    assert len(tight.relationships) == 1
+    relation = tight.relationships[0]
+    assert relation.context is not None
+    assert relation.context.evidence_ids[0] in {hit.id for hit in tight.hits}
+
+
+def test_compile_refuses_a_derived_hit_when_its_stored_source_is_outside_memory_type_scope(
+    tmp_path: Path,
+) -> None:
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=_ClosureFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        source = memory.add("opaque source material", memory_type=MemoryType.PROCEDURAL)
+        bundle = memory.compile(
+            "amber answer",
+            budget=ContextBudget(memory_types=frozenset({MemoryType.SEMANTIC})),
+        )
+
+    assert source.id not in {hit.id for hit in bundle.hits}
+    assert bundle.hits == ()
+    assert any(
+        unknown.kind is ContextUnknownKind.EVIDENCE_UNAVAILABLE for unknown in bundle.unknowns
+    )
+
+
+@pytest.mark.parametrize(
+    ("edges", "root"),
+    (
+        ({"a": ("a",)}, "a"),
+        ({"a": ("b",), "b": ("a",)}, "a"),
+        ({"a": ("b",), "b": ("c",), "c": ("b",)}, "a"),
+    ),
+)
+def test_compile_evidence_cycles_fail_closed(
+    tmp_path: Path,
+    edges: dict[str, tuple[str, ...]],
+    root: str,
+) -> None:
+    hits = tuple(
+        _hit(identifier, kind=MemoryKind.STATE, evidence_ids=evidence_ids)
+        for identifier, evidence_ids in edges.items()
+    )
+    with _memory(tmp_path) as memory:
+        closures, unknowns = memory._evidence_closures(
+            hits,
+            budget=ContextBudget(),
+            reference_at=REFERENCE,
+            scope=None,
+        )
+
+    assert root not in {closure.anchor.id for closure in closures}
+    assert any(
+        unknown.kind is ContextUnknownKind.EVIDENCE_UNAVAILABLE and "cyclic" in unknown.detail
+        for unknown in unknowns
+    )
+
+
+def test_compile_evidence_diamond_reuses_a_shared_source_without_a_cycle(tmp_path: Path) -> None:
+    root = _hit("root", kind=MemoryKind.STATE, evidence_ids=("left", "right"))
+    left = _hit("left", kind=MemoryKind.STATE, evidence_ids=("leaf",))
+    right = _hit("right", kind=MemoryKind.STATE, evidence_ids=("leaf",))
+    leaf = _hit("leaf")
+    with _memory(tmp_path) as memory:
+        closures, unknowns = memory._evidence_closures(
+            (root, left, right, leaf),
+            budget=ContextBudget(),
+            reference_at=REFERENCE,
+            scope=None,
+        )
+
+    closure = next(closure for closure in closures if closure.anchor.id == "root")
+    assert {member.id for member in closure.members} == {"root", "left", "right", "leaf"}
+    assert not unknowns
+
+
+def test_compile_deadline_keeps_a_complete_raw_anchor_while_refusing_unresolved_evidence(
+    tmp_path: Path,
+) -> None:
+    raw = _hit("raw")
+    derived = _hit("derived", kind=MemoryKind.STATE, evidence_ids=("not-hydrated",))
+    with _memory(tmp_path) as memory:
+        closures, unknowns = memory._evidence_closures(
+            (raw, derived),
+            budget=ContextBudget(max_latency_ms=1),
+            reference_at=REFERENCE,
+            scope=None,
+            started_at=perf_counter() - 1.0,
+        )
+
+    assert [closure.anchor.id for closure in closures] == ["raw"]
+    assert any("deadline" in unknown.detail for unknown in unknowns)
 
 
 def test_a_type_only_budget_reaches_past_the_window_the_common_types_fill(

@@ -66,7 +66,8 @@ Documentation changes must pass the same pinned tools and arguments as CI:
 
 ```bash
 docker run --rm -v "$PWD:/workdir:ro" davidanson/markdownlint-cli2:v0.23.0 \
-  "**/*.md" "!.git/**" "!.venv/**" "!.pytest_cache/**" "!.benchmarks/**"
+  "**/*.md" "!.git/**" "!**/.venv/**" "!.pytest_cache/**" "!.benchmarks/**" \
+  "!.claude/worktrees/**"
 docker run --rm -v "$PWD:/input:ro" -w /input lycheeverse/lychee:0.23.0 \
   --no-progress --root-dir /input \
   --exclude '^https://penfieldlabs\.substack\.com/' \

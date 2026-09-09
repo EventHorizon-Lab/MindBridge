@@ -158,6 +158,7 @@ class RunOverrides(_HarnessModel):
     # here.
     compile_max_items: Annotated[int, Field(strict=True, gt=0)] | None = None
     compile_max_chars: Annotated[int, Field(strict=True, gt=0)] | None = None
+    compile_allow_partial_sources: bool | None = None
     ingest: Literal["add", "capture"] | None = None
     output_path: Path | None = None
     run_id: str | None = None

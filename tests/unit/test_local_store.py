@@ -170,6 +170,31 @@ def _state_memory(
     )
 
 
+def _joint_state_memory(
+    memory_id: str,
+    source_memory_ids: tuple[str, ...],
+    *,
+    confidence: float,
+    recorded_at: datetime,
+) -> StoredMemory:
+    memory = _state_memory(
+        memory_id,
+        source_memory_ids[0],
+        "open",
+        valid_from=recorded_at,
+        recorded_at=recorded_at,
+    )
+    assert memory.context is not None
+    return replace(
+        memory,
+        context=replace(
+            memory.context,
+            confidence=confidence,
+            evidence_ids=source_memory_ids,
+        ),
+    )
+
+
 def _install_legacy_identity_schema(
     connection: sqlite3.Connection,
     *,
@@ -682,6 +707,52 @@ def test_read_memory_index_documents_returns_every_part_in_order(tmp_path: Path)
     ]
 
 
+def test_read_memory_embedding_vectors_returns_matching_parts_in_parent_order(
+    tmp_path: Path,
+) -> None:
+    first = _memory("memory-first")
+    second = _memory("memory-second")
+    first_aggregate = _embedding("first-aggregate", first.memory_id)
+    first_child = replace(
+        _embedding("first-child", first.memory_id, object_part=1),
+        values=(1.0, 0.0),
+    )
+    second_aggregate = replace(
+        _embedding("second-aggregate", second.memory_id),
+        values=(0.0, 1.0),
+    )
+    other_space = replace(
+        _embedding("other-space", first.memory_id, object_part=2),
+        space_id="other-space",
+    )
+
+    with LocalStore(tmp_path) as store:
+        store.write_memories(
+            (first, second),
+            (first_child, other_space, second_aggregate, first_aggregate),
+        )
+
+        vectors = tuple(
+            store.iter_memory_embedding_vectors(
+                (second.memory_id, "missing", first.memory_id),
+                space_id="test-space",
+                task="retrieval.document",
+            )
+        )
+
+    by_memory: dict[str, list[tuple[float, ...]]] = {}
+    for memory_id, vector in vectors:
+        by_memory.setdefault(memory_id, []).append(vector)
+    assert set(by_memory) == {first.memory_id, second.memory_id}
+    assert len(by_memory[second.memory_id]) == 1
+    assert by_memory[second.memory_id][0] == pytest.approx(second_aggregate.values)
+    assert len(by_memory[first.memory_id]) == 2
+    assert any(
+        vector == pytest.approx(first_aggregate.values) for vector in by_memory[first.memory_id]
+    )
+    assert any(vector == pytest.approx(first_child.values) for vector in by_memory[first.memory_id])
+
+
 def test_retrieval_reinforcement_is_bounded_and_monotonic(tmp_path: Path) -> None:
     first_access = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
     later_access = first_access + timedelta(hours=1)
@@ -937,6 +1008,39 @@ def test_visual_descriptions_outlive_the_memory_and_die_with_the_asset(tmp_path:
             connection.execute("DELETE FROM media_assets WHERE asset_id = ?", (picture.asset_id,))
             connection.commit()
         assert store.read_visual_descriptions((picture.asset_id,), space_id="caption-v1") == {}
+
+
+def test_orphan_prediction_uses_the_complete_deletion_set_across_sql_batches(
+    tmp_path: Path,
+) -> None:
+    selected_ids = tuple(f"memory-{index:04d}" for index in range(901))
+    outside_id = "memory-outside"
+    cross_batch = _asset(b"cross-batch asset", name="cross-batch.png")
+    externally_referenced = _asset(b"externally referenced asset", name="outside.png")
+
+    def memory(memory_id: str) -> StoredMemory:
+        stored = _memory(memory_id)
+        assets = tuple(
+            asset
+            for asset, owners in (
+                (cross_batch, {selected_ids[0], selected_ids[-1]}),
+                (externally_referenced, {selected_ids[1], outside_id}),
+            )
+            if memory_id in owners
+        )
+        return replace(
+            stored,
+            content="" if assets else stored.content,
+            modality="image" if assets else "text",
+            assets=assets,
+        )
+
+    memories = tuple(memory(memory_id) for memory_id in (*selected_ids, outside_id))
+
+    with LocalStore(tmp_path) as store:
+        store.write_memories(memories)
+
+        assert store.assets_orphaned_by_deletion(selected_ids) == (cross_batch.asset_id,)
 
 
 def test_a_store_without_visual_descriptions_gains_the_table(tmp_path: Path) -> None:
@@ -2181,7 +2285,7 @@ _ADMITTED_INTENTS = (
 def test_schema_v12_migrates_straight_through_to_the_current_version_in_one_open(
     tmp_path: Path,
 ) -> None:
-    """A v12 store opened once lands on v16 with everything the later steps add.
+    """A v12 store opened once lands on v18 with everything the later steps add.
 
     Each step is exercised on its own above (the caption cache, scheduler log, consent intent,
     and naming assertion); this pins that chaining them in a single `LocalStore(...)` open -- the
@@ -2259,7 +2363,7 @@ def test_schema_v12_migrates_straight_through_to_the_current_version_in_one_open
                 )
             ]
 
-    assert version == _SCHEMA_VERSION == 16
+    assert version == _SCHEMA_VERSION == 18
     assert "visual_descriptions" in tables
     assert {
         "memory_deliberations",
@@ -3445,3 +3549,597 @@ def test_the_backfilled_naming_assertion_carries_the_id_the_kernel_would_mint(
     )
     assert store_module._NAMING_RECIPE == memory_module._NAMING_RECIPE
     assert store_module._NAMING_PREDICATE == memory_module._NAMING_PREDICATE
+
+
+def _apply_joint_clause_operation(
+    store: LocalStore,
+    memory: StoredMemory,
+    members: tuple[str, ...],
+    *,
+    confidence: float,
+    applied_at: datetime,
+    key: str,
+) -> StoredOperation:
+    assert store.apply_formation(
+        (memory,),
+        (),
+        evidence=tuple((memory.memory_id, source_id, confidence) for source_id in members),
+        evidence_clauses=((memory.memory_id, members, confidence),),
+        source_memory_ids=(),
+        recipe="joint-clause-test",
+        completed_at=applied_at,
+        operation=StoredOperation(
+            operation_key=key,
+            intent="consolidate",
+            trigger="manual",
+            operation_json="{}",
+            applied_at=applied_at,
+        ),
+    )
+    return store.read_operations(operation_key=key)[0]
+
+
+def test_clause_rollback_retires_only_its_conjunction_and_preserves_a_later_alternative(
+    tmp_path: Path,
+) -> None:
+    recorded_at = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
+    members = ("source-a", "source-b")
+    derived = _joint_state_memory("derived", members, confidence=0.6, recorded_at=recorded_at)
+    assert derived.context is not None
+    without_evidence = replace(derived, context=replace(derived.context, evidence_ids=()))
+    with LocalStore(tmp_path) as store:
+        store.write_memories(
+            (_memory("source-a"), _memory("source-b"), _memory("source-c"), without_evidence),
+            (_embedding("e-derived", "derived"),),
+        )
+        operation = _apply_joint_clause_operation(
+            store,
+            derived,
+            members,
+            confidence=0.6,
+            applied_at=recorded_at + timedelta(minutes=1),
+            key="joint-create",
+        )
+        store.add_memory_evidence(
+            "derived",
+            "source-c",
+            confidence=0.8,
+            recorded_at=recorded_at + timedelta(minutes=2),
+        )
+
+        reverted, _assets = store.rollback_operation(
+            operation.operation_id,
+            rolled_back_at=recorded_at + timedelta(minutes=3),
+            reverse_clause_changes=operation.clause_changes,
+        )
+
+        assert reverted is True
+        current = store.read_memory("derived")
+        assert current is not None and current.context is not None
+        assert current.context.evidence_ids == ("source-c",)
+        assert current.context.confidence == pytest.approx(0.8)
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            active_sizes = connection.execute(
+                """
+                SELECT member_count FROM memory_evidence_clauses
+                WHERE memory_id = 'derived' AND retired_at IS NULL
+                """
+            ).fetchall()
+        assert active_sizes == [(1,)]
+
+
+def test_joint_confidence_is_one_assessment_and_does_not_inflate_singleton_votes(
+    tmp_path: Path,
+) -> None:
+    recorded_at = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
+    members = ("source-a", "source-b")
+    derived = _joint_state_memory("derived", members, confidence=0.9, recorded_at=recorded_at)
+    assert derived.context is not None
+    without_evidence = replace(derived, context=replace(derived.context, evidence_ids=()))
+    with LocalStore(tmp_path) as store:
+        store.write_memories(
+            (_memory("source-a"), _memory("source-b"), _memory("source-c"), without_evidence)
+        )
+        _apply_joint_clause_operation(
+            store,
+            derived,
+            members,
+            confidence=0.9,
+            applied_at=recorded_at + timedelta(minutes=1),
+            key="joint-high-confidence",
+        )
+        store.add_memory_evidence(
+            "derived",
+            "source-a",
+            confidence=0.6,
+            recorded_at=recorded_at + timedelta(minutes=2),
+        )
+        store.add_memory_evidence(
+            "derived",
+            "source-c",
+            confidence=0.6,
+            recorded_at=recorded_at + timedelta(minutes=3),
+        )
+
+        current = store.read_memory("derived")
+        assert current is not None and current.context is not None
+        # Singleton alternatives project to .84; the joint assessment is .9. Treating each
+        # joint member as another vote would incorrectly produce .96 here.
+        assert current.context.confidence == pytest.approx(0.9)
+
+
+def test_source_withdrawal_only_evaluates_its_reverse_dependency_region(
+    tmp_path: Path,
+) -> None:
+    recorded_at = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
+    dependent = _joint_state_memory(
+        "dependent", ("source-a",), confidence=0.8, recorded_at=recorded_at
+    )
+    unrelated = _joint_state_memory(
+        "unrelated", ("never-linked",), confidence=0.8, recorded_at=recorded_at
+    )
+    assert unrelated.context is not None
+    unrelated = replace(unrelated, context=replace(unrelated.context, evidence_ids=()))
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory("source-a"), unrelated))
+        _apply_joint_clause_operation(
+            store,
+            dependent,
+            ("source-a",),
+            confidence=0.8,
+            applied_at=recorded_at + timedelta(minutes=1),
+            key="dependent-clause",
+        )
+
+        removed, identity_projection = store.naming_projection_after_delete("source-a")
+        assert removed == ("source-a", "dependent")
+        assert identity_projection == ()
+        assert store.delete_memory("source-a") is True
+        assert store.read_memory("dependent") is None
+        assert store.read_memory("source-a") is None
+        # This intentionally unsupported fixture is outside source-a's reverse closure. A global
+        # orphan sweep would delete it even though this operation had no authority over it. The
+        # prediction above and the committed result therefore describe the same bounded cascade.
+        assert store.read_memory("unrelated") is not None
+
+
+def test_clause_confidence_rollback_appends_an_inverse_version_at_rollback_time(
+    tmp_path: Path,
+) -> None:
+    recorded_at = datetime(2026, 9, 8, 13, tzinfo=timezone.utc)
+    members = ("source-a", "source-b")
+    derived = _joint_state_memory("derived", members, confidence=0.6, recorded_at=recorded_at)
+    assert derived.context is not None
+    without_evidence = replace(derived, context=replace(derived.context, evidence_ids=()))
+    first_at = recorded_at + timedelta(minutes=1)
+    update_at = recorded_at + timedelta(minutes=2)
+    rollback_at = recorded_at + timedelta(minutes=3)
+    with LocalStore(tmp_path) as store:
+        store.write_memories(
+            (_memory("source-a"), _memory("source-b"), without_evidence),
+            (_embedding("e-derived", "derived"),),
+        )
+        original = _apply_joint_clause_operation(
+            store,
+            derived,
+            members,
+            confidence=0.6,
+            applied_at=first_at,
+            key="joint-original",
+        )
+        updated = _apply_joint_clause_operation(
+            store,
+            derived,
+            members,
+            confidence=0.9,
+            applied_at=update_at,
+            key="joint-update",
+        )
+
+        assert (
+            store.rollback_operation(
+                original.operation_id,
+                rolled_back_at=rollback_at,
+                reverse_clause_changes=original.clause_changes,
+            )[0]
+            is False
+        )
+
+        before = store.read_memories(
+            ("derived",), known_at=first_at + timedelta(seconds=1), active_only=True
+        )[0]
+        during = store.read_memories(
+            ("derived",), known_at=update_at + timedelta(seconds=1), active_only=True
+        )[0]
+        assert before.context is not None and before.context.confidence == pytest.approx(0.6)
+        assert during.context is not None and during.context.confidence == pytest.approx(0.9)
+
+        reverted, _assets = store.rollback_operation(
+            updated.operation_id,
+            rolled_back_at=rollback_at,
+            reverse_clause_changes=updated.clause_changes,
+        )
+        assert reverted is True
+        current = store.read_memory("derived")
+        assert current is not None and current.context is not None
+        assert current.context.confidence == pytest.approx(0.6)
+        # Reading the past still reports the state that stood then; rollback did not rewrite it.
+        still_during = store.read_memories(
+            ("derived",), known_at=update_at + timedelta(seconds=1), active_only=True
+        )[0]
+        assert still_during.context is not None
+        assert still_during.context.confidence == pytest.approx(0.9)
+
+        # Reversing the newer update restores logical ownership to the original operation even
+        # though its state now lives in a fresh history row. Newest-first rollback can continue.
+        assert store.rollback_operation(
+            original.operation_id,
+            rolled_back_at=rollback_at + timedelta(minutes=1),
+            reverse_clause_changes=original.clause_changes,
+        )[0]
+        assert store.read_memories(("derived",), active_only=True) == ()
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            versions = connection.execute(
+                """
+                SELECT confidence, retired_at, restores_version
+                FROM memory_evidence_clause_versions
+                WHERE memory_id = 'derived' ORDER BY version
+                """
+            ).fetchall()
+        assert [float(row[0]) for row in versions] == [0.6, 0.9, 0.6]
+        assert versions[-1][1] is not None
+        assert versions[-1][2] == 1
+
+
+def test_equal_valued_later_clause_update_does_not_bypass_rollback_order(
+    tmp_path: Path,
+) -> None:
+    recorded_at = datetime(2026, 9, 8, 13, tzinfo=timezone.utc)
+    members = ("source-a", "source-b")
+    derived = _joint_state_memory("derived", members, confidence=0.6, recorded_at=recorded_at)
+    assert derived.context is not None
+    without_evidence = replace(derived, context=replace(derived.context, evidence_ids=()))
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory("source-a"), _memory("source-b"), without_evidence))
+        first = _apply_joint_clause_operation(
+            store,
+            derived,
+            members,
+            confidence=0.6,
+            applied_at=recorded_at + timedelta(minutes=1),
+            key="aba-first",
+        )
+        middle = _apply_joint_clause_operation(
+            store,
+            derived,
+            members,
+            confidence=0.9,
+            applied_at=recorded_at + timedelta(minutes=2),
+            key="aba-middle",
+        )
+        later_equal = _apply_joint_clause_operation(
+            store,
+            derived,
+            members,
+            confidence=0.6,
+            applied_at=recorded_at + timedelta(minutes=3),
+            key="aba-later-equal",
+        )
+
+        # Equal confidence is not ownership: the standing A -> B -> A mutation blocks op1.
+        assert not store.rollback_operation(
+            first.operation_id,
+            rolled_back_at=recorded_at + timedelta(minutes=4),
+            reverse_clause_changes=first.clause_changes,
+        )[0]
+        assert store.rollback_operation(
+            later_equal.operation_id,
+            rolled_back_at=recorded_at + timedelta(minutes=4),
+            reverse_clause_changes=later_equal.clause_changes,
+        )[0]
+        assert store.rollback_operation(
+            middle.operation_id,
+            rolled_back_at=recorded_at + timedelta(minutes=5),
+            reverse_clause_changes=middle.clause_changes,
+        )[0]
+        assert store.rollback_operation(
+            first.operation_id,
+            rolled_back_at=recorded_at + timedelta(minutes=6),
+            reverse_clause_changes=first.clause_changes,
+        )[0]
+
+
+def test_rollback_reads_incomplete_schema17_logs_that_only_recorded_clause_ids(
+    tmp_path: Path,
+) -> None:
+    recorded_at = datetime(2026, 9, 8, 13, tzinfo=timezone.utc)
+    members = ("source-a", "source-b")
+    derived = _joint_state_memory("derived", members, confidence=0.7, recorded_at=recorded_at)
+    assert derived.context is not None
+    without_evidence = replace(derived, context=replace(derived.context, evidence_ids=()))
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory("source-a"), _memory("source-b"), without_evidence))
+        operation = _apply_joint_clause_operation(
+            store,
+            derived,
+            members,
+            confidence=0.7,
+            applied_at=recorded_at + timedelta(minutes=1),
+            key="old-schema17-log",
+        )
+        change = operation.clause_changes[0]
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            connection.execute(
+                """
+                UPDATE memory_operations
+                SET effects_json = json_set(
+                    json_remove(effects_json, '$.clause_changes'),
+                    '$.linked_clauses', json_array(json_array(?, ?))
+                )
+                WHERE operation_id = ?
+                """,
+                (change.memory_id, change.clause_id, operation.operation_id),
+            )
+            connection.commit()
+
+        legacy = store.read_operations(operation_id=operation.operation_id)[0]
+        assert legacy.clause_changes == ()
+        assert legacy.linked_clauses == ((change.memory_id, change.clause_id),)
+        assert store.rollback_operation(
+            legacy.operation_id,
+            rolled_back_at=recorded_at + timedelta(minutes=2),
+            retire_clauses=legacy.linked_clauses,
+        )[0]
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            assert (
+                connection.execute(
+                    """
+                SELECT COUNT(*) FROM memory_evidence_clauses
+                WHERE memory_id = 'derived' AND retired_at IS NULL
+                """
+                ).fetchone()[0]
+                == 0
+            )
+
+
+def test_clause_reactivation_preserves_the_historical_inactive_gap(
+    tmp_path: Path,
+) -> None:
+    recorded_at = datetime(2026, 9, 8, 14, tzinfo=timezone.utc)
+    members = ("source-a", "source-b")
+    derived = _joint_state_memory("derived", members, confidence=0.7, recorded_at=recorded_at)
+    assert derived.context is not None
+    without_evidence = replace(derived, context=replace(derived.context, evidence_ids=()))
+    first_at = recorded_at + timedelta(minutes=1)
+    first_rollback_at = recorded_at + timedelta(minutes=2)
+    reactivated_at = recorded_at + timedelta(minutes=3)
+    second_rollback_at = recorded_at + timedelta(minutes=4)
+    with LocalStore(tmp_path) as store:
+        store.write_memories(
+            (_memory("source-a"), _memory("source-b"), without_evidence),
+            (_embedding("e-derived", "derived"),),
+        )
+        original = _apply_joint_clause_operation(
+            store,
+            derived,
+            members,
+            confidence=0.7,
+            applied_at=first_at,
+            key="joint-first-life",
+        )
+        assert store.rollback_operation(
+            original.operation_id,
+            rolled_back_at=first_rollback_at,
+            reverse_clause_changes=original.clause_changes,
+        )[0]
+        reactivated = _apply_joint_clause_operation(
+            store,
+            derived,
+            members,
+            confidence=0.7,
+            applied_at=reactivated_at,
+            key="joint-second-life",
+        )
+
+        assert store.read_memories(
+            ("derived",), known_at=first_at + timedelta(seconds=1), active_only=True
+        )
+        assert (
+            store.read_memories(
+                ("derived",),
+                known_at=first_rollback_at + timedelta(seconds=1),
+                active_only=True,
+            )
+            == ()
+        )
+        assert store.read_memories(
+            ("derived",), known_at=reactivated_at + timedelta(seconds=1), active_only=True
+        )
+        assert store.rollback_operation(
+            reactivated.operation_id,
+            rolled_back_at=second_rollback_at,
+            reverse_clause_changes=reactivated.clause_changes,
+        )[0]
+        assert store.read_memories(("derived",), active_only=True) == ()
+        assert store.read_memories(
+            ("derived",), known_at=reactivated_at + timedelta(seconds=1), active_only=True
+        )
+
+
+def test_schema_v16_migrates_flat_evidence_history_to_singleton_clause_versions(
+    tmp_path: Path,
+) -> None:
+    recorded_at = datetime(2026, 9, 8, 15, tzinfo=timezone.utc)
+    derived = _joint_state_memory("derived", ("source-a",), confidence=0.5, recorded_at=recorded_at)
+    assert derived.context is not None
+    derived = replace(derived, context=replace(derived.context, evidence_ids=()))
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory("source-a"), _memory("source-b"), derived))
+        database_path = store.database_path
+    first = recorded_at + timedelta(minutes=1)
+    retired = recorded_at + timedelta(minutes=2)
+    reactivated = recorded_at + timedelta(minutes=3)
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(
+            """
+            DROP TABLE memory_evidence_clause_versions;
+            DROP TABLE memory_evidence_clause_members;
+            DROP TABLE memory_evidence_clauses;
+            PRAGMA user_version = 16;
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO memory_evidence (
+                memory_id, source_memory_id, source_group_id, position,
+                confidence, recorded_at, retired_at
+            ) VALUES ('derived', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ("source-a", "source-a", 0, 0.3, first.isoformat(), retired.isoformat()),
+                ("source-a", "source-a", 1, 0.5, reactivated.isoformat(), None),
+                ("source-b", "source-b", 2, 0.4, first.isoformat(), retired.isoformat()),
+            ),
+        )
+        connection.commit()
+
+    for _open in range(2):
+        with (
+            LocalStore(tmp_path) as store,
+            closing(sqlite3.connect(store.database_path)) as connection,
+        ):
+            clauses = connection.execute(
+                """
+                    SELECT m.source_memory_id, c.confidence, c.retired_at
+                    FROM memory_evidence_clauses AS c
+                    JOIN memory_evidence_clause_members AS m
+                      ON m.memory_id = c.memory_id AND m.clause_id = c.clause_id
+                    WHERE c.memory_id = 'derived' ORDER BY m.source_memory_id
+                    """
+            ).fetchall()
+            versions = connection.execute(
+                """
+                    SELECT m.source_memory_id, v.version, v.confidence, v.retired_at
+                    FROM memory_evidence_clause_versions AS v
+                    JOIN memory_evidence_clause_members AS m
+                      ON m.memory_id = v.memory_id AND m.clause_id = v.clause_id
+                    WHERE v.memory_id = 'derived'
+                    ORDER BY m.source_memory_id, v.version
+                    """
+            ).fetchall()
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
+        assert clauses == [("source-a", 0.5, None), ("source-b", 0.4, retired.isoformat())]
+        assert versions == [
+            ("source-a", 1, 0.3, retired.isoformat()),
+            ("source-a", 2, 0.5, None),
+            ("source-b", 1, 0.4, retired.isoformat()),
+        ]
+
+    with LocalStore(tmp_path) as store:
+        assert store.delete_memory("source-a") is True
+        assert store.read_memory("derived") is None
+
+
+def test_schema_v16_rejects_a_corrupt_partial_clause_shape_without_advancing(
+    tmp_path: Path,
+) -> None:
+    with LocalStore(tmp_path) as store:
+        database_path = store.database_path
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executescript(
+            """
+            DROP TABLE memory_evidence_clause_versions;
+            DROP TABLE memory_evidence_clause_members;
+            DROP TABLE memory_evidence_clauses;
+            CREATE TABLE memory_evidence_clauses (
+                memory_id TEXT NOT NULL,
+                clause_id TEXT NOT NULL,
+                PRIMARY KEY (memory_id, clause_id)
+            );
+            PRAGMA user_version = 16;
+            """
+        )
+
+    with pytest.raises(UnsupportedSchemaError, match="evidence projection"):
+        LocalStore(tmp_path)
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+    assert "memory_evidence_clauses" in tables
+    assert "memory_evidence_clause_members" not in tables
+    assert "memory_evidence_clause_versions" not in tables
+
+
+@pytest.mark.parametrize(
+    ("corruption", "error"),
+    (
+        (
+            "ALTER TABLE memory_evidence_clauses RENAME COLUMN member_count TO member_total;",
+            "invalid memory_evidence_clauses table",
+        ),
+        (
+            """
+            DROP INDEX memory_evidence_clause_versions_current_idx;
+            DROP TABLE memory_evidence_clause_versions;
+            CREATE TABLE memory_evidence_clause_versions (
+                memory_id TEXT NOT NULL,
+                clause_id TEXT NOT NULL,
+                version INTEGER NOT NULL CHECK (version > 0),
+                confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+                recorded_at TEXT NOT NULL,
+                retired_at TEXT CHECK (retired_at IS NULL OR retired_at > recorded_at),
+                restores_version INTEGER CHECK (restores_version IS NULL OR restores_version > 0),
+                PRIMARY KEY (memory_id, clause_id),
+                FOREIGN KEY (memory_id, clause_id)
+                  REFERENCES memory_evidence_clauses (memory_id, clause_id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX memory_evidence_clause_versions_current_idx
+                ON memory_evidence_clause_versions (memory_id, clause_id)
+                WHERE retired_at IS NULL;
+            """,
+            "invalid memory_evidence_clause_versions primary key",
+        ),
+        (
+            """
+            DROP INDEX memory_evidence_clause_members_source_idx;
+            DROP TABLE memory_evidence_clause_members;
+            CREATE TABLE memory_evidence_clause_members (
+                memory_id TEXT NOT NULL,
+                clause_id TEXT NOT NULL,
+                source_memory_id TEXT NOT NULL,
+                position INTEGER NOT NULL CHECK (position >= 0),
+                PRIMARY KEY (memory_id, clause_id, source_memory_id),
+                UNIQUE (memory_id, clause_id, position)
+            );
+            CREATE INDEX memory_evidence_clause_members_source_idx
+                ON memory_evidence_clause_members (source_memory_id, memory_id, clause_id);
+            """,
+            "invalid foreign keys on memory_evidence_clause_members",
+        ),
+        (
+            "DROP INDEX memory_evidence_clause_members_source_idx;",
+            "invalid indexes on memory_evidence_clause_members",
+        ),
+    ),
+    ids=("column", "primary-key", "foreign-key", "index"),
+)
+def test_current_schema_rejects_corrupt_evidence_clause_tables(
+    tmp_path: Path,
+    corruption: str,
+    error: str,
+) -> None:
+    with LocalStore(tmp_path) as store:
+        database_path = store.database_path
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executescript(corruption)
+
+    with pytest.raises(UnsupportedSchemaError, match=error):
+        LocalStore(tmp_path)
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION

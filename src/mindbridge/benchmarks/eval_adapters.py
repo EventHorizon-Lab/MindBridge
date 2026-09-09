@@ -152,18 +152,43 @@ class LoadedTask:
     units: tuple[EvalUnit, ...]
     input_sha256: Mapping[str, str] = field(default_factory=dict)
     unavailable_units: Mapping[str, str] = field(default_factory=dict)
+    fallback_reference_at: datetime | None = None
+    fallback_reference_question_count: int = 0
 
     def __post_init__(self) -> None:
         unit_ids = tuple(unit.unit_id for unit in self.units)
         if not unit_ids or len(set(unit_ids)) != len(unit_ids):
             raise ValueError("loaded task unit IDs must be non-empty and unique")
+        if self.fallback_reference_at is not None and (
+            self.fallback_reference_at.tzinfo is None
+            or self.fallback_reference_at.utcoffset() is None
+        ):
+            raise ValueError("fallback reference time must include a timezone")
+        if self.fallback_reference_question_count < 0:
+            raise ValueError("fallback reference question count must be non-negative")
+        if bool(self.fallback_reference_at) != bool(self.fallback_reference_question_count):
+            raise ValueError("fallback reference time and question count must be set together")
 
     @property
     def evaluation_sha256(self) -> str:
-        if not self.input_sha256:
-            return self.dataset_sha256
+        base = self.dataset_sha256
+        if self.input_sha256:
+            payload = json.dumps(
+                dict(sorted(self.input_sha256.items())),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            base = hashlib.sha256(payload.encode()).hexdigest()
+        if self.fallback_reference_at is None:
+            return base
         payload = json.dumps(
-            dict(sorted(self.input_sha256.items())),
+            {
+                "base_evaluation_sha256": base,
+                "fallback_reference_at": self.fallback_reference_at.isoformat(),
+                "fallback_reference_question_count": self.fallback_reference_question_count,
+            },
             ensure_ascii=False,
             allow_nan=False,
             sort_keys=True,
@@ -1250,6 +1275,13 @@ def _longmemeval(
                     turn.turn_id,
                     f"[{session.occurred_at.isoformat()}] {turn.role}: {turn.content}",
                     occurred_at=session.occurred_at,
+                )
+                # Release source labels encode answer and abstention annotations. Assign
+                # opaque IDs after filtering and splitting so those labels stay evaluator-only
+                # while the stored content, event time, and block boundaries remain unchanged.
+                items = tuple(
+                    replace(item, source_id=f"M{len(memories) + index:06d}")
+                    for index, item in enumerate(items)
                 )
                 memories.extend(items)
                 if turn.has_answer:

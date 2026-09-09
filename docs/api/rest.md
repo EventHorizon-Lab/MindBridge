@@ -164,7 +164,7 @@ Request fields and defaults are:
 | `AnswerRequest` | required `question`; `limit=5`; optional `memory_type`, `reference_at`, `scope` |
 | `ConsentRequest` | required `state` (`granted`, `withheld`, or `withdrawn`); optional `note` |
 | `RetentionRequest` | `dry_run=false` |
-| `ContextRequest` | required `goal`; optional `budget`, `reference_at`, `scope` |
+| `ContextRequest` | required `goal`; optional `budget`, `reference_at`, `scope`; `allow_partial_sources=false` |
 | `ContextBudgetRequest` | `max_chars=16000`; `max_items=24`; `min_confidence=0.0`; optional `max_media_items` (`0` for a text-only bundle); optional `memory_types` with at least one value; optional `freshness_seconds`; optional `max_latency_ms` |
 | `SettleRequest` | `limit=100`; `max_attempts=3`; optional `memory_ids` with 1–100 IDs |
 | `AnalyzeRequest` | required `memory_id` |
@@ -352,11 +352,14 @@ wrong two numbers. `minimum_relevance` and `ambiguity_margin` are fixed when the
 | `MemoryOperationResponse` | `operation_id`, `intent`, `trigger`, `evidence_ids`, `target_ids`, `claim`, `consent`, `identity`, `proposal`, `rationale`, `model_id`, `recipe`, `created_ids`, `changed_ids`, `forgotten_ids`, `superseded`, `applied_at`, `rolled_back_at`, `outcome`, `outcome_note` |
 | `RecordConsentResponse` | `operation`, or `null` when the same statement already stands |
 | `ExportResponse` | `exported_at`, `identity_id`, `identities`, `records`, `operations` |
-| `RetentionResponse` | `dry_run`, `media_memory_ids`, `forgotten_memory_ids`, `asset_ids`, `capture_memory_ids`, `deleted` |
+| `RetentionResponse` | `dry_run`, `media_memory_ids`, `forgotten_memory_ids`, `cascade_memory_ids`, `asset_ids`, `capture_memory_ids`, `deleted` |
 | `ContextBudgetResponse` | `max_chars`, `max_items`, `max_media_items` or `null`, `memory_types` or `null`, `min_confidence`, `freshness_seconds`, `max_latency_ms` |
 | `ContextConflictResponse` | `lineage_id`, `subject`, `predicate`, `values`, `memory_ids` |
 | `ContextUnknownResponse` | `kind`, `detail` |
-| `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `traits`, the `AffectCueResponse` array `affect`, the mixed `actors` array of hits, `NamedActorResponse`, and `ProvisionalActorResponse` objects, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, `rendered` |
+| `TextSpanPieceResponse` | `role`, half-open `start_codepoint`, `end_codepoint`, exact `source_text`, `sha256` |
+| `TextSpanSelectorResponse` | `parent_content_sha256`, `embedding_input_sha256`, `recipe_version`, ordered `pieces` |
+| `ContextExcerptResponse` | `source_memory_id`, structured `matched_index_id`, partial `content`, `selector`, `score`, creation and occurrence times, `memory_type`, `context`, `place_id` |
+| `ContextBundleResponse` | `goal`, `reference_at`, `budget`, the hit arrays `relationships`, `scene`, `episodes`, `facts`, `procedures`, `traits`, the `AffectCueResponse` array `affect`, the mixed `actors` array of hits, `NamedActorResponse`, and `ProvisionalActorResponse` objects, plus `conflicts`, `unknowns`, `occurred_from`, `occurred_until`, `frames`, `places`, `omitted`, `chars`, `elapsed_ms`, `deadline_exceeded`, separately typed `excerpts`, `rendered` |
 | `ProvisionalActorResponse` | `identity_id`, `memory_ids`: one recognized person in the included evidence whom no visible naming assertion names |
 | `NamedActorResponse` | `identity_id`, `name`, `memory_ids`, `naming_assertion_id`: one person a naming assertion names, reached through other evidence |
 | `AffectCueResponse` | every hit field plus `event_ids`: the events formed from the same observations the cue cites in its own `context.evidence_ids`, which is co-occurrence inside one capture and not an attributed cause |
@@ -375,6 +378,18 @@ subject/predicate/value, spatial pose, and affect cue fields. It is `null` on a 
 without typed context. `forgotten_at` is set on a cognitively forgotten record, which `get`
 still returns and retrieval skips. Asset filesystem paths are never serialized, in bundle sections
 as in hits, and `rendered` is the deterministic text of `ContextBundle.render()`.
+
+An excerpt is an exact partial rendering of a newly written raw text observation, not a shortened
+`MemoryResponse`. The response retains the parent and piece digests for machine verification;
+`rendered` shows the parent memory ID, code-point offsets, source timing, and a warning that omitted
+text may qualify the excerpt, while omitting the digests and `matched_index_id` from model-facing
+text. Older clients that ignore the additive `excerpts` array continue to receive complete hit
+arrays unchanged.
+
+`ContextRequest.allow_partial_sources` must be explicitly true to select excerpts. Its default
+false preserves full-record-only compilation and avoids selector reads; `excerpts` remains an
+additive empty array in that mode. Non-boolean JSON values are rejected rather than coerced into
+the opt-in.
 
 `/healthz` reports liveness and the composition behind the process, so an operator does not have
 to send a probe write to learn what the deployment can do:

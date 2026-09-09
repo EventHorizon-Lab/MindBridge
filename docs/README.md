@@ -10,10 +10,15 @@ have one place to stay current.
 | Understand what MindBridge can do | [Product capabilities](product-capabilities.md) | [Design principles](design-principles.md) |
 | Try MindBridge end to end | [Quick start](quickstart.md) | [Core concepts](concepts.md) |
 | Build a Python integration | [Configuration](configuration.md) | [Python SDK](api/python-sdk.md) |
+| Use a local WeMM embedding service | [Local WeMM deployment](use-local-wemm.md) | [Configuration](configuration.md) |
 | Give an agent a bounded context view | [Context compilation](context-compilation.md) | [Python SDK](api/python-sdk.md) |
 | Expose memory to another process | [REST](api/rest.md), [MCP](api/mcp.md), or [CLI](api/cli.md) | [Deployment](deployment.md) |
 | Run a durable instance | [Architecture](architecture.md) | [Operations](operations.md) and [troubleshooting](troubleshooting.md) |
 | Evaluate memory quality | [Benchmarking](benchmarking.md) | [Example evaluation configuration](examples/eval.example.yaml) |
+| Review the memory backend evidence | [Memory backend audit](research/memory-backend-audit-2026-09-07.md) | [Benchmarking](benchmarking.md) |
+| Compare current memory backends | [Competitor memory backends](research/competitor-memory-backends-2026-09-08.md) | [Hybrid score completion](research/hybrid-score-completion-2026-09-08.md) |
+| Review the measured memory changes | [Memory optimization report](research/memory-optimization-2026-09-07.md) | [Benchmarking](benchmarking.md) |
+| Review the 2026-09-08 memory backend work | [Research](research/2026-09-08-memory-backend-research.md) | [Validation](research/2026-09-08-memory-backend-validation.md) and [evaluation](research/2026-09-08-memory-backend-evaluation.md) |
 | Understand or extend the design | [Design principles](design-principles.md) | [Plugin architecture](plugin-architecture.md) |
 | Follow where the product is going | [Context OS direction](context-os.md) | [Design principles](design-principles.md) |
 
@@ -37,6 +42,8 @@ have one place to stay current.
 - [REST API](api/rest.md) — `/v1` requests, responses, errors, and limits.
 - [MCP tools](api/mcp.md) — the fifteen tool schemas and transport boundary.
 - [Command line](api/cli.md) — commands, input forms, JSON output, and exit codes.
+- [Local WeMM deployment](use-local-wemm.md) — configure a local WeMM embedding service with the
+  public SDK.
 
 ## Deploy and operate
 
@@ -65,6 +72,32 @@ have one place to stay current.
 ## Evaluate
 
 - [Benchmarking](benchmarking.md) — reproducible behavior evaluation and local-index measurement.
+- [Memory backend audit](research/memory-backend-audit-2026-09-07.md) — source-level capability,
+  competitor, benchmark-trust, and research-gate review dated 2026-09-07.
+- [Memory backend source ledger](research/memory-backend-sources-2026-09-07.md) — pinned competitor
+  commits, inspected paths, evidence limits, and falsification tests for that audit.
+- [Competitor memory backends](research/competitor-memory-backends-2026-09-08.md) — current
+  architecture, cost, provenance, and transfer evidence for agent and multimodal memory systems.
+- [Hybrid score completion](research/hybrid-score-completion-2026-09-08.md) — design rationale and
+  acceptance protocol for completing missing dense signals from durable vectors.
+- [Historical out-of-scope EgoLife diagnostics](research/historical-egolife-diagnostics-2026-09-08.md)
+  — retained negative results and rejected hypotheses from a benchmark removed from acceptance.
+- [Timeline neighbor-window risk review](research/timeline-neighbor-window-risk-review-2026-09-08.md)
+  — safety constraints and experiment gates for a proposed same-sequence context window.
+- [Next raw-video memory experiment](research/video-memory-next-experiment-2026-09-08.md) — a
+  retrieval-only plan to separate observation, temporal-neighborhood, and evidence-budget failures.
+- [Memory optimization report](research/memory-optimization-2026-09-07.md) — paired benchmark
+  results, ablations, and the retained memory changes dated 2026-09-07.
+- [Memory backend research](research/2026-09-08-memory-backend-research.md) — evidence-closure
+  design, prior-art analysis, and acceptance criteria.
+- [Memory backend validation](research/2026-09-08-memory-backend-validation.md) — independent
+  review of the implemented compiler and historical-identity constraints.
+- [Memory backend evaluation](research/2026-09-08-memory-backend-evaluation.md) — frozen
+  evaluation protocol, raw and formed tracks, and paired empirical results.
+- [Evidence excerpt experiment](research/2026-09-09-evidence-excerpt-experiment.md) — isolated
+  schema-18 prototype for digest-bound partial raw text under the existing context budget.
+- [Compact context prototype](compact-context-prototype.md) — optional request-local ID aliases,
+  typed citation resolution, and excerpt coverage boundaries without changing compilation.
 - [Annotated example configuration](examples/eval.example.yaml) — every evaluation slot and the
   order in which a run uses it.
 

@@ -52,6 +52,7 @@ from mindbridge.benchmarks.eval import (
     _BorrowedFaceBackend,
     _BorrowedSpeechBackend,
     _cache_namespace,
+    _fallback_reference_at,
     _generation_kwargs,
     _ingest,
     _load_memory_config,
@@ -60,6 +61,7 @@ from mindbridge.benchmarks.eval import (
     _run_identifier,
     _seed_values,
     _video_mme_v2_rating,
+    _with_fallback_reference,
     main,
     run_loaded_task,
 )
@@ -679,8 +681,8 @@ def test_benchmark_speech_backend_satisfies_the_runtime_protocol() -> None:
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_module.EVAL_SCHEMA_VERSION == 14
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v14"
+    assert eval_module.EVAL_SCHEMA_VERSION == 16
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v15"
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(
@@ -704,6 +706,14 @@ def test_response_cache_namespace_changes_with_runner_recipe(
         _cache_namespace(arguments, ModelConfig(generation_min_video_seconds=2.0), {"text": 1})
         != before
     )
+    clocked_arguments = cast(
+        eval_module._Arguments,
+        SimpleNamespace(
+            **vars(arguments),
+            fallback_reference_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
+        ),
+    )
+    assert _cache_namespace(clocked_arguments, ModelConfig(), {"text": 1}) != before
 
 
 def test_backend_pool_warms_query_embedding_before_evaluation(
@@ -1236,6 +1246,118 @@ async def test_memlens_question_date_is_a_reference_clock_not_query_text(tmp_pat
     assert observed == [datetime(2025, 1, 15, 10, tzinfo=timezone.utc)]
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("2026-09-08T08:30:00Z", datetime(2026, 9, 8, 8, 30, tzinfo=timezone.utc)),
+        ("2026-09-08T16:30:00+08:00", datetime(2026, 9, 8, 8, 30, tzinfo=timezone.utc)),
+    ),
+)
+def test_fallback_reference_at_accepts_timezone_aware_iso8601(
+    value: str, expected: datetime
+) -> None:
+    assert _fallback_reference_at(value) == expected
+
+
+@pytest.mark.parametrize("value", ("2026-09-08T08:30:00", "not-a-date", ""))
+def test_fallback_reference_at_rejects_naive_or_invalid_values(value: str) -> None:
+    with pytest.raises(ArgumentTypeError, match="timezone-aware ISO 8601"):
+        _fallback_reference_at(value)
+
+
+def test_invalid_fallback_clock_fails_before_configuration_or_provider_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("argument validation must run first")
+
+    monkeypatch.setattr(eval_module, "_load_memory_config", forbidden)
+
+    with pytest.raises(SystemExit):
+        main(("--fallback-reference-at", "2026-09-08T08:30:00"))
+
+
+def test_fallback_reference_fills_only_missing_question_clocks() -> None:
+    fallback = datetime(2026, 9, 8, tzinfo=timezone.utc)
+    dataset_clock = datetime(2025, 1, 15, 10, tzinfo=timezone.utc)
+    task = LoadedTask(
+        TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        Path("fixture.json"),
+        "1" * 64,
+        (
+            EvalUnit(
+                "unit",
+                (),
+                (
+                    EvalQuestion("missing", ("When?",), ("Now",)),
+                    EvalQuestion("dated", ("When?",), ("Then",), reference_at=dataset_clock),
+                ),
+            ),
+        ),
+    )
+
+    loaded = _with_fallback_reference(task, fallback)
+
+    assert tuple(question.reference_at for question in loaded.units[0].questions) == (
+        fallback,
+        dataset_clock,
+    )
+    assert task.units[0].questions[0].reference_at is None
+    assert loaded.fallback_reference_at == fallback
+    assert loaded.fallback_reference_question_count == 1
+    assert loaded.evaluation_sha256 != task.evaluation_sha256
+
+
+def test_fallback_reference_is_a_noop_when_every_question_is_dated() -> None:
+    clock = datetime(2025, 1, 15, 10, tzinfo=timezone.utc)
+    task = LoadedTask(
+        TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        Path("fixture.json"),
+        "1" * 64,
+        (
+            EvalUnit(
+                "unit", (), (EvalQuestion("dated", ("When?",), ("Then",), reference_at=clock),)
+            ),
+        ),
+    )
+
+    assert _with_fallback_reference(task, datetime(2026, 9, 8, tzinfo=timezone.utc)) is task
+
+
+@pytest.mark.asyncio
+async def test_answer_many_receives_the_fallback_reference_clock() -> None:
+    fallback = datetime(2026, 9, 8, tzinfo=timezone.utc)
+    task = LoadedTask(
+        TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        Path("fixture.json"),
+        "1" * 64,
+        (EvalUnit("unit", (), (EvalQuestion("missing", ("When?",), ("Now",)),)),),
+    )
+    observed: list[datetime | None] = []
+
+    class Memory:
+        async def ask(
+            self,
+            _question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            assert limit == 5
+            observed.append(reference_at)
+            return AnswerResult("Now")
+
+    loaded = _with_fallback_reference(task, fallback)
+    await _answer_many(
+        cast(AsyncMemory, Memory()),
+        loaded.units[0].questions,
+        request_concurrency=1,
+        recall_limit=5,
+    )
+
+    assert observed == [fallback]
+
+
 @pytest.mark.asyncio
 async def test_answer_failure_preserves_the_product_retrieval_ranking(tmp_path: Path) -> None:
     now = datetime(2026, 8, 30, tzinfo=timezone.utc)
@@ -1525,6 +1647,108 @@ async def test_ingest_bisects_a_failed_batch_without_losing_items() -> None:
 
     assert await _ingest(cast(AsyncMemory, memory), items, batch_size=4) == 0
     assert events == ["batch:4", "batch:2", "batch:2"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_stops_after_one_systemic_embedding_failure() -> None:
+    calls = 0
+
+    class UpstreamError(RuntimeError):
+        def __init__(self) -> None:
+            super().__init__("embedding service unavailable")
+            self.response = SimpleNamespace(status_code=502)
+
+    class Memory(_FakeMemory):
+        async def add_many(
+            self, contents: Sequence[object], **_kwargs: object
+        ) -> tuple[object, ...]:
+            nonlocal calls
+            del contents
+            calls += 1
+            raise ModelError("embedding failed", reason="model_failed", stage="embed") from (
+                UpstreamError()
+            )
+
+        async def add(self, content: object, **_kwargs: object) -> object:
+            raise AssertionError(f"systemic failure reached single-item fallback: {content}")
+
+    items = tuple(MemoryItem(f"source-{index}", (str(index),)) for index in range(8))
+
+    with pytest.raises(eval_module._SystemicEmbeddingFailure):
+        await _ingest(cast(AsyncMemory, Memory([])), items, batch_size=8)
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_ingest_keeps_item_isolation_for_an_embedding_400() -> None:
+    batch_sizes: list[int] = []
+    added: list[object] = []
+
+    class InputError(RuntimeError):
+        def __init__(self) -> None:
+            super().__init__("one input is unsupported")
+            self.response = SimpleNamespace(status_code=400)
+
+    class Memory(_FakeMemory):
+        async def add_many(
+            self, contents: Sequence[object], **_kwargs: object
+        ) -> tuple[object, ...]:
+            batch_sizes.append(len(contents))
+            raise ModelError("embedding failed", reason="model_failed", stage="embed") from (
+                InputError()
+            )
+
+        async def add(self, content: object, **_kwargs: object) -> object:
+            added.append(content)
+            return object()
+
+    items = tuple(MemoryItem(f"source-{index}", (str(index),)) for index in range(2))
+
+    assert await _ingest(cast(AsyncMemory, Memory([])), items, batch_size=2) == 0
+    assert batch_sizes == [2, 1, 1]
+    assert [str(content).rsplit("\n", 1)[-1] for content in added] == ["0", "1"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_does_not_misclassify_a_formation_504_as_embedding_failure() -> None:
+    calls: list[str] = []
+
+    class UpstreamError(RuntimeError):
+        def __init__(self) -> None:
+            super().__init__("formation service unavailable")
+            self.response = SimpleNamespace(status_code=504)
+
+    class Memory(_FakeMemory):
+        async def add_many(
+            self, contents: Sequence[object], **_kwargs: object
+        ) -> tuple[object, ...]:
+            del contents
+            calls.append("batch")
+            raise ModelError("formation failed", reason="model_failed", stage="form") from (
+                UpstreamError()
+            )
+
+        async def add(self, content: object, **_kwargs: object) -> object:
+            del content
+            calls.append("single")
+            raise ModelError("formation failed", reason="model_failed", stage="form") from (
+                UpstreamError()
+            )
+
+    failures: list[eval_module.FailureDetail] = []
+
+    assert (
+        await _ingest(
+            cast(AsyncMemory, Memory([])),
+            (MemoryItem("source", ("content",)),),
+            batch_size=1,
+            on_failure=failures.append,
+        )
+        == 1
+    )
+    assert calls == ["batch", "single"]
+    assert failures[0].stage == "form"
 
 
 @pytest.mark.asyncio
@@ -1949,6 +2173,37 @@ async def test_resume_ingests_only_what_the_killed_run_had_not_written(tmp_path:
 
     assert resumed == ["add:[source_id: 2]\n2", "add:[source_id: 3]\n3", "ask:first:5"]
     assert [sample.score for sample in samples] == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_causal_ingest_retains_release_order_at_equal_boundaries(tmp_path: Path) -> None:
+    task = _resumable_task(
+        tmp_path,
+        [
+            MemoryItem("z-first", ("first in release",), end_seconds=5),
+            MemoryItem("a-second", ("second in release",), end_seconds=5),
+            MemoryItem("m-later", ("after cutoff",), end_seconds=15),
+        ],
+        10,
+    )
+    events: list[str] = []
+
+    await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+        memory_factory=_store_factory(events),
+        batch_size=1,
+        unit_concurrency=1,
+        request_concurrency=1,
+        recall_limit=5,
+        ingest_digest="recipe",
+    )
+
+    assert events == [
+        "add:[source_id: z-first]\nfirst in release",
+        "add:[source_id: a-second]\nsecond in release",
+        "ask:first:5",
+    ]
 
 
 @pytest.mark.asyncio
@@ -2754,6 +3009,117 @@ async def test_answer_many_reports_failed_outcome_immediately() -> None:
     outcomes = await pending
     assert isinstance(outcomes[0], eval_module._AnswerOutcome)
     assert isinstance(outcomes[0].error, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_unit_preserves_answers_before_a_systemic_query_embedding_failure(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    class UpstreamError(RuntimeError):
+        def __init__(self) -> None:
+            super().__init__("embedding service unavailable")
+            self.response = SimpleNamespace(status_code=502)
+
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            nonlocal calls
+            del question, limit, reference_at
+            calls += 1
+            if calls == 3:
+                raise ModelError(
+                    "query embedding failed", reason="model_failed", stage="embed"
+                ) from UpstreamError()
+            return AnswerResult("A")
+
+    memory = Memory([])
+
+    class Context:
+        async def __aenter__(self) -> AsyncMemory:
+            return cast(AsyncMemory, memory)
+
+        async def __aexit__(self, *_error: object) -> None:
+            return None
+
+    questions = tuple(
+        EvalQuestion(f"q{index}", (f"question {index}",), references=("A",)) for index in range(5)
+    )
+    unit = EvalUnit("unit", (), questions)
+    task = LoadedTask(
+        TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        tmp_path / "fixture.json",
+        "1" * 64,
+        (unit,),
+    )
+
+    samples = await eval_module._run_unit(
+        task,
+        unit,
+        tmp_path / "store",
+        memory_factory=cast(MemoryFactory, lambda _path: Context()),
+        batch_size=1,
+        request_concurrency=1,
+        request_semaphore=asyncio.Semaphore(1),
+        recall_limit=1,
+        predict_only=False,
+        log_samples=False,
+        response_cache=None,
+    )
+
+    assert calls == 3
+    assert [sample.prediction for sample in samples[:2]] == ["A", "A"]
+    assert all(sample.error_code is None for sample in samples[:2])
+    assert all(sample.error_code == "_SystemicEmbeddingFailure" for sample in samples[2:])
+
+
+@pytest.mark.asyncio
+async def test_generation_502_does_not_trigger_embedding_fail_fast() -> None:
+    calls = 0
+
+    class UpstreamError(RuntimeError):
+        def __init__(self) -> None:
+            super().__init__("generation service unavailable")
+            self.response = SimpleNamespace(status_code=502)
+
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            nonlocal calls
+            del question, limit, reference_at
+            calls += 1
+            if calls == 1:
+                raise ModelError(
+                    "generation failed", reason="model_failed", stage="generate"
+                ) from UpstreamError()
+            return AnswerResult("A")
+
+    outcomes = await _answer_many(
+        cast(AsyncMemory, Memory([])),
+        tuple(
+            EvalQuestion(f"q{index}", (f"question {index}",), references=("A",))
+            for index in range(2)
+        ),
+        request_concurrency=1,
+        recall_limit=1,
+    )
+
+    assert calls == 2
+    assert isinstance(outcomes[0], eval_module._AnswerOutcome)
+    assert isinstance(outcomes[0].error, ModelError)
+    assert isinstance(outcomes[1], eval_module._AnswerOutcome)
+    assert outcomes[1].error is None
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import replace
@@ -90,6 +91,33 @@ class _TinyEmbedder:
         return None
 
 
+class _ExcerptEmbedder:
+    """Force a long aggregate to fall back to its matching bounded text part."""
+
+    embedding_capabilities = frozenset({Modality.TEXT})
+    embedding_model = "excerpt-eval-arm-test"
+    embedding_space = "excerpt-eval-arm-test:2"
+    embedding_dimension = 2
+
+    def embed(
+        self,
+        inputs: Sequence[ModelInput],
+        task: EmbedTask = EmbedTask.DOCUMENT,
+    ) -> tuple[tuple[float, ...], ...]:
+        batch = tuple(inputs)
+        if task is EmbedTask.DOCUMENT and any(len(value.text) > 3_000 for value in batch):
+            raise ModelError("fixture payload is too large", reason="payload_too_large")
+        return tuple(
+            (1.0, 0.0)
+            if task is EmbedTask.QUERY or "Ada signed the contract" in value.text
+            else (0.0, 1.0)
+            for value in batch
+        )
+
+    def close(self) -> None:
+        return None
+
+
 _NOW = datetime(2026, 9, 1, tzinfo=timezone.utc)
 
 
@@ -171,10 +199,17 @@ class _ForbiddenMemory:
 class _RecordingGenerator:
     def __init__(self, reply: str = "Ada") -> None:
         self.calls: list[tuple[str, str | None]] = []
+        self.media_calls: list[dict[str, object]] = []
         self._reply = reply
 
-    async def answer(self, question: str, context: str | None) -> str:
+    async def answer(
+        self,
+        question: str,
+        context: str | None,
+        **_media: object,
+    ) -> str:
         self.calls.append((question, context))
+        self.media_calls.append(_media)
         return self._reply
 
 
@@ -273,14 +308,18 @@ def test_retrieval_candidates_are_not_fetched_without_gold_to_score() -> None:
     assert retrieval_gold_ids("atm-bench", question.metadata) == ()
 
 
-def test_blind_arm_never_reads_memory_and_gets_no_context() -> None:
+def test_blind_arm_never_reads_memory_and_keeps_query_media(tmp_path: Path) -> None:
     generator = _RecordingGenerator()
     arm = _Arm("blind", generator=cast(eval_module._BaselineGenerator, generator))
     _, _, question = _task()
+    query_image = tmp_path / "query.png"
+    query_image.write_bytes(b"query")
+    question = replace(question, content=(*question.content, query_image))
 
     outcome = _outcome(_ForbiddenMemory(), question, arm=arm, context="a stuffed corpus")
 
     assert generator.calls == [("who signed it?", None)]
+    assert generator.media_calls == [{"question_assets": (query_image,)}]
     assert outcome.prediction == "Ada"
     assert outcome.memory_ids == ()
     assert outcome.ranked_source_ids == ()
@@ -686,6 +725,173 @@ def test_compile_arm_answers_from_a_rendered_bundle_via_the_public_sdk(tmp_path:
     assert "Ada signed the contract" in rendered_context
 
 
+def test_compile_arm_records_partial_sources_separately_from_full_evidence(
+    tmp_path: Path,
+) -> None:
+    generator = _RecordingGenerator("Ada")
+    arm = _Arm(
+        "compile",
+        generator=cast(eval_module._BaselineGenerator, generator),
+        allow_partial_sources=True,
+    )
+    task, unit, question = _task()
+    source_text = (
+        "Conversation header\n"
+        + "a" * 2_300
+        + " Ada signed the contract. "
+        + "b" * 2_300
+        + " Later text may qualify that statement."
+    )
+
+    async def run() -> eval_module._AnswerOutcome | BaseException:
+        async with AsyncMemory(
+            tmp_path,
+            embedder=_ExcerptEmbedder(),
+            minimum_relevance=0,
+        ) as memory:
+            source = await memory.add(source_text)
+            answered = await _answer_many(
+                memory,
+                (question,),
+                request_concurrency=1,
+                recall_limit=20,
+                arm=arm,
+                task_name="atm-bench",
+                unit_id="unit",
+                compile_budget=ContextBudget(max_items=1, max_chars=3_000),
+            )
+            outcome = answered[0]
+            if isinstance(outcome, eval_module._AnswerOutcome):
+                assert outcome.excerpt_source_ids == (source.id,)
+            return outcome
+
+    outcome = asyncio.run(run())
+    assert not isinstance(outcome, BaseException)
+    assert outcome.memory_ids == ()
+    assert outcome.evidence == ()
+    assert len(outcome.excerpt_evidence) == 1
+    assert outcome.compiled_items == 1
+    assert outcome.compiled_chars is not None and outcome.compiled_chars <= 3_000
+    assert generator.calls[0][1] is not None
+    assert "partial source" in generator.calls[0][1]
+
+    sample = _sample(
+        task,
+        unit,
+        question,
+        outcome,
+        ingest_failures=0,
+        predict_only=True,
+        log_samples=False,
+        arm=arm,
+    )
+    document = sample.json()
+    assert document["excerpt_source_ids"] == outcome.excerpt_source_ids
+    assert document["excerpt_evidence"]
+    assert sample.metrics["compile_bundle_excerpts"] == 1.0
+
+
+def test_compile_arm_sends_query_and_evidence_images_on_the_final_provider_wire(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native media follows the selected public bundle without consulting gold metadata."""
+    import openai
+
+    requests: list[dict[str, object]] = []
+
+    class Completions:
+        async def create(self, **request: object) -> object:
+            requests.append(request)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="robot"))],
+                usage=None,
+            )
+
+    class Client:
+        def __init__(self, **options: object) -> None:
+            requests.append({"client": options})
+            self.chat = SimpleNamespace(completions=Completions())
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", Client)
+    query_image = tmp_path / "query.png"
+    query_image.write_bytes(b"query-image")
+    evidence_image = tmp_path / "evidence.png"
+    evidence_image.write_bytes(b"evidence-image")
+    question = EvalQuestion(
+        "q-image",
+        ("Which robot is shown?", query_image),
+        references=("robot",),
+        metadata={},
+        source_question="Which robot is shown?",
+    )
+    generator = eval_module._BaselineGenerator(
+        ModelConfig(
+            generation_model="gpt-5-mini",
+            generation_base_url="http://generate/v1",
+            generation_api_key="secret",
+            generation_capabilities=frozenset({Modality.TEXT, Modality.IMAGE}),
+        ),
+        seed=42,
+        gen_kwargs="",
+    )
+
+    async def run() -> eval_module._AnswerOutcome | BaseException:
+        async with AsyncMemory(tmp_path / "store", embedder=_TinyEmbedder()) as memory:
+            await memory.add(
+                ("The evidence shows a robot.", evidence_image),
+                occurred_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+                metadata={"source_id": "turn-1"},
+            )
+            answered = await _answer_many(
+                memory,
+                (question,),
+                request_concurrency=1,
+                recall_limit=20,
+                arm=_Arm("compile", generator=generator),
+                task_name="mem-gallery",
+                unit_id="gallery",
+                compile_budget=ContextBudget(max_items=5, max_chars=16_000),
+            )
+            return answered[0]
+
+    try:
+        outcome = asyncio.run(run())
+    finally:
+        asyncio.run(generator.close())
+    assert not isinstance(outcome, BaseException)
+    assert outcome.error is None
+    assert len(requests) == 2
+    messages = cast(list[dict[str, object]], requests[1]["messages"])
+    content = cast(list[dict[str, object]], messages[1]["content"])
+    image_urls = [
+        cast(dict[str, str], part["image_url"])["url"]
+        for part in content
+        if part["type"] == "image_url"
+    ]
+    assert image_urls == [
+        "data:image/png;base64,cXVlcnktaW1hZ2U=",
+        "data:image/png;base64,ZXZpZGVuY2UtaW1hZ2U=",
+    ]
+    assert "The evidence shows a robot." in cast(str, content[0]["text"])
+    question_binding = json.loads(cast(str, content[1]["text"]))
+    evidence_binding = json.loads(cast(str, content[3]["text"]))["memory_assets"]
+    assert question_binding == {
+        "query_assets": [hashlib.sha256(b"query-image").hexdigest()],
+    }
+    assert evidence_binding["asset_ids"] == [hashlib.sha256(b"evidence-image").hexdigest()]
+    assert evidence_binding["memory_id"] in outcome.memory_ids
+    assert evidence_binding["memory_type"] == "semantic"
+    assert evidence_binding["source_id"] == "turn-1"
+    assert evidence_binding["event_time"] == "2026-01-02T00:00:00+00:00"
+    assert "content" not in evidence_binding
+    wire_text = "\n".join(cast(str, part["text"]) for part in content if part["type"] == "text")
+    assert wire_text.count("The evidence shows a robot.") == 1
+
+
 def test_ingest_capture_produces_real_capture_settle_spans_for_the_compile_arm(
     tmp_path: Path,
 ) -> None:
@@ -1019,6 +1225,20 @@ def test_baseline_generator_uses_the_configured_generation_model(
 
     blind = asyncio.run(generator.answer("who signed it?", None))
     stuffed = asyncio.run(generator.answer("who signed it?", "Ada signed the contract"))
+    stuffed_with_text_hit = asyncio.run(
+        generator.answer(
+            "who signed it?",
+            "Ada signed the contract",
+            evidence_hits=(
+                SearchHit(
+                    id="text-only",
+                    content="Ada signed the contract",
+                    score=1.0,
+                    created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                ),
+            ),
+        )
+    )
     asyncio.run(generator.close())
 
     assert requests[0]["client"] == {
@@ -1026,7 +1246,7 @@ def test_baseline_generator_uses_the_configured_generation_model(
         "base_url": "http://generate/v1",
         "timeout": DEFAULT_TIMEOUT_SECONDS,
     }
-    assert blind == stuffed == "Ada"
+    assert blind == stuffed == stuffed_with_text_hit == "Ada"
     for request in requests[1:]:
         assert request["model"] == "gpt-5-mini"
         assert request["temperature"] == 0.0
@@ -1039,6 +1259,7 @@ def test_baseline_generator_uses_the_configured_generation_model(
     stuffed_messages = cast(list[dict[str, str]], requests[2]["messages"])
     assert stuffed_messages[0]["content"] == eval_module._FULL_CONTEXT_SYSTEM_PROMPT
     assert "Ada signed the contract" in stuffed_messages[1]["content"]
+    assert requests[3] == requests[2]
 
 
 def test_a_failed_answer_keeps_retrieval_but_drops_the_joint_metrics() -> None:

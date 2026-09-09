@@ -108,7 +108,7 @@ mindbridge --embedder openai --former openai --vision openai add @panel.png
 | `search` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--occurred-from`; `--occurred-until` | `{"hits":[...]}` | yes |
 | `search-with-trace` | search options | `{"hits":[...],"trace":{...}}` | yes |
 | `ask` | content; `--limit`; `--memory-type`; `--reference-at`; `--scope`; `--link-identities`/`--no-link-identities` | answer object | yes (`--link-identities` is local-only) |
-| `compile` | content; `--max-chars`; `--max-items`; `--max-media-items`; repeatable `--memory-type`; `--min-confidence`; `--freshness-seconds`; `--max-latency-ms`; `--reference-at`; `--scope` | context bundle plus `rendered` | yes |
+| `compile` | content; `--max-chars`; `--max-items`; `--max-media-items`; repeatable `--memory-type`; `--min-confidence`; `--freshness-seconds`; `--max-latency-ms`; `--reference-at`; `--scope`; `--allow-partial-sources` | context bundle plus `rendered` | yes |
 | `get` | `MEMORY_ID` | memory object | yes |
 | `speech` | `MEMORY_ID` | `{"segments":[...]}` | yes when the owner enables `embodied_operations` |
 | `faces` | `MEMORY_ID` | `{"observations":[...]}` | yes when the owner enables `embodied_operations` |
@@ -148,6 +148,10 @@ they require the matching capability. `compile` mirrors the
 [`ContextBudget` defaults](../context-compilation.md#budget) and repeats `--memory-type` to keep
 more than one type; `--max-latency-ms` is a deadline the compiler checks between stages, and the
 printed bundle carries `elapsed_ms`, `deadline_exceeded`, and `unknowns` alongside its sections.
+`--allow-partial-sources` explicitly enables digest-bound exact spans of eligible raw text parents
+when a full parent does not fit. It is off by default, which preserves full-record-only compilation
+and leaves the additive `excerpts` array empty. Each rendered excerpt line is labelled partial and
+warns that omitted source text may qualify it.
 Each row `operations` prints carries `operation_id`, `intent`, `trigger`, `evidence_ids`,
 `target_ids`, `claim`, `consent`, `identity`, `rationale`, `model_id`, `recipe`, `created_ids`,
 `changed_ids`, `forgotten_ids`, `superseded`, `applied_at`, `rolled_back_at`, `outcome`, and
@@ -184,8 +188,10 @@ it. Media is named by asset identity and digest; no bytes are printed, so a docu
 pipe. Under `--url` the operation rows in an `export` bundle, and the row `record-consent` prints,
 come from the [REST operation object](rest.md#response-objects), which carries the same fields --
 `proposal` included -- so a row is the same document on either transport.
-`apply-retention` prints `dry_run`, `media_memory_ids`, `forgotten_memory_ids`, `asset_ids`,
-`capture_memory_ids`, and `deleted`; it deletes through the same path as `delete`, so
+`apply-retention` prints `dry_run`, `media_memory_ids`, `forgotten_memory_ids`,
+`cascade_memory_ids`, `asset_ids`, `capture_memory_ids`, and `deleted`;
+`cascade_memory_ids` names additional derived records whose support the direct selections remove.
+It deletes through the same path as `delete`, so
 [what `delete` removes](python-sdk.md#what-delete-removes) applies unchanged. Start with
 `--dry-run`.
 

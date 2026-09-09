@@ -155,6 +155,21 @@ def test_memlens_and_locomo_plans_preserve_official_protocol_details() -> None:
     assert locomo.extra_body == {"enable_thinking": False}
     assert '"label"' in locomo.calls[0][0].content
 
+    # These bypass the remote judge, but still carry deterministic primary scores. A caller that
+    # records only judge plans would otherwise turn an exact answer into an unscored row.
+    for prediction, expected in (("A shell", 1.0), ("   ", 0.0)):
+        assert (
+            judge_plan(
+                "locomo-refined",
+                question="What did I buy?",
+                references=("A shell",),
+                prediction=prediction,
+                metadata={},
+            )
+            is None
+        )
+        assert _scores("locomo-refined", prediction, "A shell", {})["llm_judge"] == expected
+
     memlens = judge_plan(
         "memlens-32k",
         question="What is the latest answer?",
@@ -655,6 +670,8 @@ def test_personamem_ranking_is_deterministic_and_reads_both_answer_shapes() -> N
     hit = _scores("personamem-v3", "Ranked indexes: [2, 3, 4, 1, 0]", "gold", dict(metadata))
     assert hit["recall@1"] == 1.0
     assert hit["personamem_score"] == 1.0
+    assert hit["ndcg_at_5"] == 1.0
+    assert hit["target_only_ndcg@5"] == 1.0
     assert hit["negative_in_top3"] == 0.0
 
     # The evaluation repository's current prompt asks for this shape instead.
@@ -665,11 +682,13 @@ def test_personamem_ranking_is_deterministic_and_reads_both_answer_shapes() -> N
     assert miss["recall@1"] == 0.0
     assert miss["mrr"] == pytest.approx(1 / 3)
     assert miss["negative_in_top1"] == 0.0
-    # The headline is upstream's graded nDCG@5, not top-1: burying the gold at
-    # rank 3 costs a position discount rather than the whole score, which is
-    # exactly what separates `ndcg_graded@5` from `recall@1` here.
+    # The current upstream headline rewards neutral fillers and actively
+    # penalizes the hard negatives. The old target-only score remains a
+    # diagnostic and deprecated compatibility alias.
+    assert miss["ndcg_at_5"] == pytest.approx(0.6657465835)
+    assert miss["target_only_ndcg@5"] == pytest.approx(0.5)
     assert miss["ndcg_graded@5"] == pytest.approx(0.5)
-    assert miss["personamem_score"] == pytest.approx(0.5)
+    assert miss["personamem_score"] == pytest.approx(0.6657465835)
 
     # A reply that is not a permutation of the slate is unusable, and so is an
     # answer with no ranking in it. Both fall back to the identity order, which
@@ -679,6 +698,65 @@ def test_personamem_ranking_is_deterministic_and_reads_both_answer_shapes() -> N
     assert identity["negative_in_top1"] == 1.0
     assert _scores("personamem-v3", "Ranked indexes: [2, 2, 3]", "gold", dict(metadata)) == identity
     assert _scores("personamem-v3", "Ranked indexes: [2, 0]", "gold", dict(metadata)) == identity
+
+
+def test_personamem_ranking_matches_current_official_graded_formula() -> None:
+    q4 = {
+        "task_type": "hidden_persona_recommendation",
+        "candidate_count": 16,
+        "positive_indexes": (4,),
+        "negative_indexes": (0, 1, 7, 8, 12, 13, 15),
+    }
+    pre_q4 = _scores(
+        "personamem-v3",
+        "Ranked indexes: [1, 8, 15, 4, 10, 0, 9, 3, 11, 5, 13, 2, 14, 6, 7, 12]",
+        "gold",
+        dict(q4),
+    )
+    witness_q4 = _scores(
+        "personamem-v3",
+        "Ranked indexes: [1, 8, 12, 15, 4, 10, 0, 9, 3, 11, 5, 13, 2, 14, 6, 7]",
+        "gold",
+        dict(q4),
+    )
+    assert pre_q4["ndcg_at_5"] == 0.0
+    assert witness_q4["ndcg_at_5"] == 0.0
+
+    no_negatives = {
+        "candidate_count": 5,
+        "positive_indexes": (2,),
+        "negative_indexes": (),
+    }
+    hidden = _scores(
+        "personamem-v3",
+        "Ranked indexes: [4, 3, 2, 1, 0]",
+        "gold",
+        {**no_negatives, "task_type": "hidden_persona_recommendation"},
+    )
+    at_ai = _scores(
+        "personamem-v3",
+        "Ranked indexes: [4, 3, 2, 1, 0]",
+        "gold",
+        {**no_negatives, "task_type": "at_ai_directive_followup"},
+    )
+    assert hidden["ndcg_at_5"] == pytest.approx(0.5)
+    assert at_ai["ndcg_at_5"] == pytest.approx(0.8733683229)
+
+    q27 = {**no_negatives, "candidate_count": 12, "positive_indexes": (4,)}
+    pre_q27 = _scores(
+        "personamem-v3",
+        "Ranked indexes: [1, 10, 6, 8, 4, 11, 2, 3, 9, 5, 7, 0]",
+        "gold",
+        {**q27, "task_type": "at_ai_directive_followup"},
+    )
+    witness_q27 = _scores(
+        "personamem-v3",
+        "Ranked indexes: [7, 4, 1, 10, 6, 2, 8, 5, 11, 3, 9, 0]",
+        "gold",
+        {**q27, "task_type": "at_ai_directive_followup"},
+    )
+    assert pre_q27["ndcg_at_5"] == pytest.approx(0.8447122854)
+    assert witness_q27["ndcg_at_5"] == pytest.approx(0.9065280315)
 
 
 @pytest.mark.parametrize(
@@ -719,6 +797,9 @@ def test_personamem_leaves_families_it_cannot_reproduce_unscored(task_type: str)
     assert "personamem_score" not in scored
     if task_type != "short_vs_long_term_lifecycle":
         assert scored == {}
+    else:
+        assert "ndcg_at_5" not in scored
+        assert "target_only_ndcg@5" in scored
     assert (
         judge_plan(
             "personamem-v3",
@@ -828,7 +909,7 @@ def test_openeqa_marks_scale_and_clip_exactly_as_upstream() -> None:
         ("atm-bench-hard", "accuracy", True),
         ("mem-gallery", "f1", True),
         ("mm-lifelong", "ref_at_300", True),
-        ("personamem-v3", "ndcg_graded@5", True),
+        ("personamem-v3", "ndcg_at_5", True),
         ("personamem-v3", "pr_combined_personalization_score", True),
         ("openeqa-hm3d", "llm_match_score_1_5", True),
         # Invented here. `_official/atm_score.py` has only `deterministic_accuracy` and
@@ -839,6 +920,8 @@ def test_openeqa_marks_scale_and_clip_exactly_as_upstream() -> None:
         ("mem-gallery", "retrieval_precision@10", False),
         ("mem-gallery", "exact_match", False),
         ("personamem-v3", "negative_in_top1", False),
+        ("personamem-v3", "target_only_ndcg@5", False),
+        ("personamem-v3", "ndcg_graded@5", False),
         # Scored only by the private submission server.
         ("egomemreason", "accuracy", False),
         # No family at all.

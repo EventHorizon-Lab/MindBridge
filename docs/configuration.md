@@ -235,10 +235,16 @@ Three things bound what it costs and what it can do:
   decoded video stills, rather than to a video file that is never uploaded. One malformed reply
   is retried once -- as it is for formation and consolidation, which parse JSON from the same
   endpoint -- because an endpoint can answer `200 OK` with invalid JSON and an SDK retry policy
-  never sees that; a second failure, or any other failure, leaves the memory
+  never sees that. For visual descriptions, the retry adds a short correction that reports only
+  the rejected reply's JSON shape and the required caption count; it never sends the rejected
+  caption text back or accepts a wrong-length list. A second failure, or any other failure, leaves
+  the memory
   stored **without** a caption rather than failing the write. Losing derived text must never lose
   an observation the caller handed over. Those batches are counted on the vision span as
-  `mindbridge.vision.failed_batches`, so the loss is measurable rather than silent.
+  `mindbridge.vision.failed_batches`, so the loss is measurable rather than silent. The failure is
+  not negatively cached, but re-adding the same already-embedded memory is idempotent and does not
+  revisit its caption. Repairing an existing captionless record therefore requires rebuilding it;
+  the retry improves new writes and does not backfill old ones.
 - Captions are not reproducible. The request pins `temperature` 0 and a fixed `seed` unless the
   slot sets its own, but a measured endpoint returned four different completions for four
   identical requests at those values. A caption becomes indexed text, so anything that needs two
@@ -323,6 +329,7 @@ alias):
 | --- | --- | --- |
 | `index_speech` | `True` | Persist configured speech analysis during `add` |
 | `index_quantization` | `none` | Zvec projection mode: `none`, `fp16`, `int8`, or `rabitq` |
+| `retrieval_mode` | `hybrid` | Instance candidate policy: `hybrid`, `dense`, or lexical-only `lexical`; lexical ranks by native normalized full-text relevance (RRF when both text fields apply); use physically isolated stores when comparing modes |
 | `minimum_relevance` | `0.10` | Floor on query-relevant evidence before retention and reinforcement ranking |
 | `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1` |
 | `evidence_budget_chars` | `None` | Widen `ask` grounding while the evidence fits this budget; raises a floor, never a ceiling; `None` grounds on exactly `limit` |
@@ -337,6 +344,16 @@ alias):
 | `query_failure_window_seconds` | `3600.0` | How far back the `QUERY_FAILURE` trigger counts near-equal empty recalls |
 | `query_failure_history` | `512` | How many empty recalls the store keeps at all; the oldest fall out |
 | `retention` | empty | What `apply_retention()` may delete; spell it as the top-level `retention` section below |
+
+Changing `retrieval_mode` does not change stored embeddings or full-text data, so after closing an
+instance you may reopen the same `data_dir` under another mode without reindexing. Separate local
+stores are required for simultaneous or isolated comparisons because one `data_dir` has one live
+owner. `lexical` skips only query embedding; ingestion still requires and writes the configured
+embedder for durable index consistency.
+
+`minimum_relevance` uses the selected route's relevance scale: dense cosine in `dense`, native
+normalized full-text relevance in `lexical`, and the documented hybrid fusion in `hybrid`. Keep
+the default when comparing modes, or calibrate a changed threshold separately for each mode.
 
 A memory declares its composition through `Memory.capabilities`, which reports the modalities,
 model identities, and configured backends the routing layer reads, including
@@ -501,6 +518,12 @@ memory = Memory(
 Omitting `consolidator=` leaves `consolidate()` unavailable and every other operation unchanged;
 see [the memory management loop](memory-types-time-and-decay.md#memory-management-loop) for what a
 consolidator is allowed to propose.
+
+For an OpenAI-compatible gateway that times out while waiting for a complete JSON response, set
+`stream: true` on an `openai` generation, formation, consolidation, or vision configuration. It
+collects the provider's SSE response before parsing it, requires the terminal usage chunk, and is
+off by default. This transport setting does not change `ask_stream()`, which already delivers
+answer deltas to the caller.
 
 Use `MemoryPlugins` with `Memory.from_plugins()` when constructed adapters should travel as one
 value. `resolve_memory_config()` is for hosts that need a `MemoryComposition` before opening

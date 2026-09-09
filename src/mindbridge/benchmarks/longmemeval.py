@@ -12,7 +12,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter
 
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, NonEmptyString
 
-LONGMEMEVAL_ADAPTER_VERSION = "longmemeval_official_v1"
+LONGMEMEVAL_ADAPTER_VERSION = "longmemeval_official_v2"
 
 # The six official question types. `evaluate_qa.py` selects a different judge
 # template per type and raises `NotImplementedError` on anything else, so an
