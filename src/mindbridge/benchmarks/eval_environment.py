@@ -86,10 +86,11 @@ def _repository_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def _git(repository: Path, arguments: Sequence[str]) -> str | None:
+def _run(command: Sequence[str]) -> str | None:
+    """Return one probe's stdout, or `None` when the tool is absent, times out, or fails."""
     try:
         result = subprocess.run(
-            ("git", "-C", str(repository), *arguments),
+            tuple(command),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -98,27 +99,20 @@ def _git(repository: Path, arguments: Sequence[str]) -> str | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    if result.returncode:
-        return None
-    return result.stdout.strip()
+    return None if result.returncode else result.stdout
+
+
+def _git(repository: Path, arguments: Sequence[str]) -> str | None:
+    output = _run(("git", "-C", str(repository), *arguments))
+    return None if output is None else output.strip()
 
 
 def nvidia_smi_rows(query: str) -> list[list[str]]:
     """Return the CSV rows of one `nvidia-smi --query-gpu`, or none when it is absent or fails."""
-    try:
-        result = subprocess.run(
-            ("nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+    output = _run(("nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"))
+    if output is None:
         return []
-    if result.returncode:
-        return []
-    return list(csv.reader(result.stdout.splitlines(), skipinitialspace=True))
+    return [[value.strip() for value in row] for row in csv.reader(output.splitlines())]
 
 
 def _nvidia_gpus() -> list[dict[str, object]]:

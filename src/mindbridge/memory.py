@@ -120,6 +120,7 @@ from mindbridge.infrastructure.local.store import (
     _canonical_subject,
     # The one UTC text form timestamps are compared and hashed under, for the same reason.
     _datetime_text,
+    _optional_datetime_text,
 )
 from mindbridge.infrastructure.local.zvec_index import (
     IndexHit,
@@ -7900,6 +7901,7 @@ class AsyncMemory:
         return cls(Memory.from_config(config, tracer=tracer))
 
     async def __aenter__(self) -> AsyncMemory:
+        self._memory._require_open()
         return self
 
     async def __aexit__(self, *_error: object) -> None:
@@ -9094,9 +9096,7 @@ def _prepare_memory(
     identity: dict[str, object] = {
         "parts": content.canonical_parts,
         "metadata": json.loads(metadata_json),
-        "occurred_at": (
-            None if normalized_occurred_at is None else _datetime_text(normalized_occurred_at)
-        ),
+        "occurred_at": _optional_datetime_text(normalized_occurred_at),
     }
     if normalized_occurred_end is not None:
         identity["occurred_end"] = _datetime_text(normalized_occurred_end)
@@ -9182,10 +9182,8 @@ def _observation_context_identity(context: ObservationContext) -> dict[str, obje
         "basis": context.basis.value,
         "source_id": context.source_id,
         "confidence": context.confidence,
-        "valid_from": (None if context.valid_from is None else _datetime_text(context.valid_from)),
-        "valid_until": (
-            None if context.valid_until is None else _datetime_text(context.valid_until)
-        ),
+        "valid_from": _optional_datetime_text(context.valid_from),
+        "valid_until": _optional_datetime_text(context.valid_until),
     }
     if context.place_id is not None:
         value["place_id"] = context.place_id

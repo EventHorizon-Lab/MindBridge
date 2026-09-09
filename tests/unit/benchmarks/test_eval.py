@@ -742,7 +742,9 @@ def test_backend_pool_warms_query_embedding_before_evaluation(
     assert calls == [((ModelInput(text="MindBridge benchmark warmup"),), EmbedTask.QUERY)]
 
 
-def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_backend_pool_forwards_every_memory_setting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """A hand-written forwarding list drops new policy or a new plugin silently, which is worse
     than crashing: the run measures the default composition while the artifact reports the
     configured one."""
@@ -768,7 +770,7 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
     for name, value in backends.items():
         setattr(pool, f"_{name}", value)
 
-    pool.memory(Path("unused"))
+    pool.memory(tmp_path / "unused")
 
     for entry in fields(MemoryConfig):
         assert captured[entry.name] == getattr(settings, entry.name), entry.name
@@ -781,7 +783,9 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
     assert not unaccepted, f"Memory.__init__ has no keyword for {sorted(unaccepted)}"
 
 
-def test_backend_pool_forwards_every_capability_plugin(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_backend_pool_forwards_every_capability_plugin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """`former` was declared on `MemoryPlugins`, built by the SDK adapter, and used by `Memory`,
     yet the harness never passed it, so no benchmark run has ever exercised derived-memory
     formation. Deriving the expected keywords from the dataclass makes the next omission red."""
@@ -800,7 +804,7 @@ def test_backend_pool_forwards_every_capability_plugin(monkeypatch: pytest.Monke
     for name, marker in markers.items():
         setattr(pool, f"_{name}", marker)
 
-    pool.memory(Path("unused"))
+    pool.memory(tmp_path / "unused")
 
     for name, marker in markers.items():
         assert captured[name] is marker, name

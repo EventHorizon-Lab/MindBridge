@@ -15,7 +15,7 @@ from dataclasses import MISSING, asdict, dataclass, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier, Event, Thread
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
@@ -2317,6 +2317,15 @@ def test_composition_values_require_keywords() -> None:
         MemoryPlugins(_FakeModels())  # type: ignore[call-arg]
     with pytest.raises(TypeError):
         MemoryConfig(True)  # type: ignore[call-arg]
+
+
+def test_async_memory_rejects_anything_but_an_open_memory(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="Memory instance"):
+        AsyncMemory(cast(Any, object()))
+    memory = Memory(tmp_path, embedder=_FakeEmbedder())
+    memory.close()
+    with pytest.raises(StorageError, match="closed"):
+        asyncio.run(AsyncMemory(memory).__aenter__())
 
 
 def test_plugin_composition_stays_in_constructor_parity() -> None:
