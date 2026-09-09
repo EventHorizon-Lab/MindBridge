@@ -13,11 +13,12 @@ import struct
 import unicodedata
 import uuid
 from collections.abc import Collection, Generator, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from itertools import groupby, zip_longest
 from pathlib import Path
+from threading import Lock
 from typing import Literal, NoReturn
 
 from mindbridge.control import load_operation, operation_key
@@ -44,6 +45,9 @@ _SCHEMA_VERSION = 18
 # comment that introduced it instructed: a v12 store is the one that step still has to migrate.
 _PRE_VISUAL_DESCRIPTION_VERSION = 12
 _SQLITE_PARAMETER_BATCH = 900
+# Idle connections retained for reuse. Concurrency above this many simultaneous readers falls
+# back to the previous open-and-close behaviour rather than growing the pool without bound.
+_CONNECTION_POOL_SIZE = 32
 # Which identities one memory is "in": the records whose semantic subject is that identity, plus
 # the records whose media carries a diarised speech segment or a face observation of them. This
 # direction answers the search index projection, one document at a time. A merge re-points every
@@ -1564,6 +1568,9 @@ class LocalStore:
         self.database_path = self.data_dir / "state.sqlite3"
         self._closed = False
         self._schema_ready = False
+        # Idle connections only: one is in the pool exactly while nobody holds it.
+        self._pool: list[sqlite3.Connection] = []
+        self._pool_lock = Lock()
         self._directory_lock = DataDirectoryLock(self.data_dir)
         try:
             self._initialize_schema()
@@ -1583,10 +1590,11 @@ class LocalStore:
         self.close()
 
     def close(self) -> None:
-        """Release the directory; repeated calls are harmless."""
+        """Release the pooled connections and the directory; repeated calls are harmless."""
         if self._closed:
             return
         self._closed = True
+        self._close_pool()
         self._directory_lock.close()
 
     def write_memory(
@@ -5469,10 +5477,17 @@ class LocalStore:
             _validate_evidence_clause_schema(connection)
             _validate_text_selector_schema(connection)
 
-    @contextmanager
-    def _connection(self, *, secure_delete: bool = False) -> Iterator[sqlite3.Connection]:
-        self._require_open()
-        connection = sqlite3.connect(self.database_path, timeout=30, isolation_level=None)
+    def _open_connection(self, *, secure_delete: bool = False) -> sqlite3.Connection:
+        # `check_same_thread=False` disables sqlite3's own guard, not the ownership rule it
+        # approximates. A pooled connection is checked out to exactly one caller at a time, so
+        # no two threads ever execute on it concurrently; without this, a connection could only
+        # ever be reused by the thread that happened to open it.
+        connection = sqlite3.connect(
+            self.database_path,
+            timeout=30,
+            isolation_level=None,
+            check_same_thread=False,
+        )
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA foreign_keys = ON")
@@ -5485,9 +5500,65 @@ class LocalStore:
                 # to erasure: it costs extra page writes on every DELETE, and the outbox
                 # acknowledges by deleting rows on the hot path.
                 connection.execute("PRAGMA secure_delete = ON")
-            yield connection
-        finally:
+        except BaseException:
             connection.close()
+            raise
+        return connection
+
+    @contextmanager
+    def _connection(self, *, secure_delete: bool = False) -> Iterator[sqlite3.Connection]:
+        """Check one connection out of the pool, opening one when the pool is empty.
+
+        Connecting is not free: one `sqlite3_open` plus the four `PRAGMA` statements that make a
+        connection usable. One `add` paid for seven of them and one `search` five, because every
+        helper opened its own; in the steady state they now open none.
+
+        A connection leaves the pool for exactly one `with` block and is returned by the same
+        `finally` that used to close it, so no two callers ever hold the same one -- including
+        two nested blocks, which draw two separate connections exactly as they did before.
+
+        A connection is closed rather than returned when the block raised, because a statement
+        that failed part way through can leave a transaction open that the next borrower would
+        silently join. `secure_delete` and pre-schema connections are never pooled: the first is
+        a persistent per-connection pragma that would make every later DELETE pay for
+        zero-filling, and the second runs during migration.
+        """
+        self._require_open()
+        if secure_delete or not self._schema_ready:
+            connection = self._open_connection(secure_delete=secure_delete)
+            try:
+                yield connection
+            finally:
+                connection.close()
+            return
+        with self._pool_lock:
+            idle = self._pool.pop() if self._pool else None
+        connection = self._open_connection() if idle is None else idle
+        try:
+            yield connection
+        except BaseException:
+            with suppress(sqlite3.Error):
+                connection.close()
+            raise
+        else:
+            self._release_connection(connection)
+
+    def _release_connection(self, connection: sqlite3.Connection) -> None:
+        with self._pool_lock:
+            pooled = not self._closed and len(self._pool) < _CONNECTION_POOL_SIZE
+            if pooled:
+                self._pool.append(connection)
+        if not pooled:
+            with suppress(sqlite3.Error):
+                connection.close()
+
+    def _close_pool(self) -> None:
+        with self._pool_lock:
+            connections = tuple(self._pool)
+            self._pool.clear()
+        for connection in connections:
+            with suppress(sqlite3.Error):
+                connection.close()
 
     @contextmanager
     def _transaction(self, *, secure_delete: bool = False) -> Iterator[sqlite3.Connection]:

@@ -58,6 +58,16 @@ _DEFAULT_EF_SEARCH = 300
 _LEXICAL_RANK_CONSTANT = 60
 _DEFAULT_REBUILD_BATCH_SIZE = 1_024
 _AUTO_OPTIMIZE_UNINDEXED_DOCUMENTS = 100_000
+# Durable segments left unmerged are the dominant cost of a search, and the cost is per segment
+# rather than per document: the grouped dense query that opens every retrieval measured 6.0 ms at
+# 4 segments, 19.7 ms at 16 and 80.1 ms at 63, and 2.4-3.2 ms at any corpus size once merged. So
+# this bound is also the read tax, and 64 is a deliberate choice of the write side of that trade,
+# not an oversight. Lowering it to 8 moved the median search on a 16 000-memory interleaved
+# workload from 53.4 ms to 21.1 ms, and cost 120 single `add` calls on an 8 000-memory store 7.31 s
+# to 13.88 s with p90 latency 74 ms to 452 ms, because one `add` makes one segment however little
+# it carries and `optimize` costs the same ~530 ms whether it merges eight documents or eight
+# thousand. Break-even is around three and a half searches per memory written. Raising
+# `_OUTBOX_BATCH_SIZE` is the part of this that is free, and it is taken.
 _AUTO_OPTIMIZE_FLUSHES = 64
 _AUTO_COMPACT_FLUSHES = 256
 _FILE_DESCRIPTOR_RESERVE = 128

@@ -272,7 +272,14 @@ _LEGACY_INDEX_RECIPES = frozenset(
         ),
     }
 )
-_OUTBOX_BATCH_SIZE = 256
+# One drain applies this many outbox rows before flushing Zvec. A flush is a fixed ~45 ms
+# fsync-class operation whatever it carries -- one document costs the same as a thousand -- and it
+# also creates one durable segment, which every later search pays for until an optimize merges it
+# away. Both costs are therefore per *flush*, so the batch is the largest one the index accepts:
+# Zvec refuses a write batch above 1024 documents. Raising this from 256 quartered both the flush
+# count and the segment count of a bulk `add_many` (8 000 memories: 32 flushes and 32 segments
+# became 8 and 8) for about 32 MiB of transient hydration at 1024 dimensions.
+_OUTBOX_BATCH_SIZE = 1_024
 # `add_stream` group commit bounds. Every item still commits to SQLite on its own, and the Zvec
 # flush that follows it is deferred until one of these two bounds is reached, so a stream pays one
 # fsync-class operation per group instead of one per observation. Both bounds are fixed rather
@@ -5794,6 +5801,17 @@ class Memory:
             candidate_parent_ids = tuple(
                 dict.fromkeys(document.memory_id for document in documents)
             )
+            # The survivor count exists only to decide whether to widen, so it is asked for
+            # only where it can still change that decision. Every other reason to stop is
+            # already known here, and asking first made a second scope pass over the whole
+            # candidate window part of the price of every search that was never going to
+            # widen -- which is every search whose routes came back short, and every one that
+            # had already reached the ceiling.
+            if candidates.exhausted or candidate_limit >= candidate_ceiling:
+                break
+            current_index_ids = set(index_ids)
+            if current_index_ids <= seen_index_ids:
+                break
             with _translate_storage_errors("apply search scope"):
                 # Only the number of survivors decides whether to widen, so count them under
                 # the same predicates instead of hydrating content, media assets and typed
@@ -5815,14 +5833,7 @@ class Memory:
                     identity_id=None if scope is None else scope.identity_id,
                     active_only=True,
                 )
-            if (
-                active_count >= limit
-                or candidates.exhausted
-                or candidate_limit >= candidate_ceiling
-            ):
-                break
-            current_index_ids = set(index_ids)
-            if current_index_ids <= seen_index_ids:
+            if active_count >= limit:
                 break
             seen_index_ids.update(current_index_ids)
             candidate_limit = min(candidate_limit * 2, candidate_ceiling)

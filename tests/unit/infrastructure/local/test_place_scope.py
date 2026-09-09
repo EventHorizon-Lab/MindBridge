@@ -20,7 +20,6 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
 
 import pytest
 
@@ -152,28 +151,28 @@ def test_the_query_a_scoped_hydration_actually_runs_uses_the_place_index(
     text is what gets planned. `(place_id, memory_id)` in that column order lets SQLite probe the
     composite on both terms at once, so a candidate that is not at the place costs one index probe
     and no table read -- and it picks that plan without `ANALYZE`, which no store has ever run.
+
+    The callback is armed on `_open_connection` rather than on `sqlite3.connect`, and before the
+    store exists rather than around the one call: the store pools its connections, so the read
+    under test runs on a connection opened much earlier and a callback installed just beforehand
+    would observe nothing.
     """
     statements: list[str] = []
-    real_connect = sqlite3.connect
+    real_open = LocalStore._open_connection
 
-    def tracing_connect(
-        database: str | Path,
-        *,
-        timeout: float = 5.0,
-        isolation_level: Literal["DEFERRED", "EXCLUSIVE", "IMMEDIATE"] | None = None,
-    ) -> sqlite3.Connection:
-        connection = real_connect(database, timeout=timeout, isolation_level=isolation_level)
+    def tracing_open(store: LocalStore, *, secure_delete: bool = False) -> sqlite3.Connection:
+        connection = real_open(store, secure_delete=secure_delete)
         connection.set_trace_callback(statements.append)
         return connection
 
+    monkeypatch.setattr(LocalStore, "_open_connection", tracing_open)
     with LocalStore(tmp_path) as store:
         for index in range(6):
             place = "kitchen" if index == 0 else None
             store.write_memory(_memory(f"m-{index}", f"observation {index}", place_id=place))
         slate = tuple(f"m-{index}" for index in range(6))
-        monkeypatch.setattr(sqlite3, "connect", tracing_connect)
+        statements.clear()
         scoped = store.read_memories(slate, place_id="kitchen")
-        monkeypatch.setattr(sqlite3, "connect", real_connect)
 
         assert [memory.memory_id for memory in scoped] == ["m-0"]
         # The trace callback reports expanded SQL, so the captured statement needs no bindings

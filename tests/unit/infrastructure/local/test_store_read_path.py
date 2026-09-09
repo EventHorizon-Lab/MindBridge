@@ -221,6 +221,34 @@ def test_a_missing_index_rebuilds_from_stored_vectors_without_re_embedding(
     assert embedder.document_calls == ingest_calls
 
 
+def test_a_search_that_cannot_widen_does_not_count_survivors(tmp_path: Path) -> None:
+    """The survivor count is only asked for where it can still change the widening decision.
+
+    `count_memories` applies every scope predicate over the whole candidate window, and its one
+    caller uses the number for nothing but deciding whether to rank deeper. A store holding fewer
+    memories than one route returns has already exhausted its routes, so the answer cannot change
+    the decision and the pass is pure cost -- on every search such a store ever serves.
+    """
+    counted: list[int] = []
+    real_count = LocalStore.count_memories
+
+    def counting(store: LocalStore, memory_ids: Sequence[str], **scope: object) -> int:
+        counted.append(len(memory_ids))
+        return real_count(store, memory_ids, **scope)  # type: ignore[arg-type]
+
+    with Memory(tmp_path, embedder=_CountingEmbedder()) as memory:
+        kitchen = memory.add("the kitchen at dusk")
+        memory.add("the garden at noon")
+        LocalStore.count_memories = counting  # type: ignore[method-assign]
+        try:
+            results = memory.search("the kitchen at dusk", limit=2)
+        finally:
+            LocalStore.count_memories = real_count  # type: ignore[method-assign]
+
+    assert kitchen.id in {result.id for result in results}
+    assert counted == []
+
+
 def test_reindex_rebuilds_from_stored_vectors_without_re_embedding(tmp_path: Path) -> None:
     """The explicit rebuild entry point reads the same stored vectors as the implicit one."""
     embedder = _CountingEmbedder()
