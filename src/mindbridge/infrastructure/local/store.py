@@ -5501,7 +5501,10 @@ class LocalStore:
                 # acknowledges by deleting rows on the hot path.
                 connection.execute("PRAGMA secure_delete = ON")
         except BaseException:
-            connection.close()
+            # The connection is being discarded either way, so a failure to close it must not
+            # replace the pragma failure the caller has to diagnose.
+            with suppress(sqlite3.Error):
+                connection.close()
             raise
         return connection
 
@@ -5528,7 +5531,11 @@ class LocalStore:
             connection = self._open_connection(secure_delete=secure_delete)
             try:
                 yield connection
-            finally:
+            except BaseException:
+                with suppress(sqlite3.Error):
+                    connection.close()
+                raise
+            else:
                 connection.close()
             return
         with self._pool_lock:

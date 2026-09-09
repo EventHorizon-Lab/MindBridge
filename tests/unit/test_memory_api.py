@@ -4029,15 +4029,13 @@ def test_add_many_hydrates_the_index_outbox_in_batches(
 
 
 def test_outbox_bounds_index_batches(tmp_path: Path) -> None:
-    """A drain larger than the bound splits, and the bound stays inside what Zvec accepts.
+    """A drain larger than the bound splits into batches of it, whatever the bound is.
 
-    Zvec refuses a write batch above 1024 documents, and one batch of outbox rows becomes one
-    `upsert`. A bound above that would make a large `add_many` unrecoverable rather than slow:
-    the rows are already committed to SQLite, so every later drain would re-raise the same
-    rejection. `_DEFAULT_REBUILD_BATCH_SIZE` is pinned to the same ceiling for the same reason.
+    One flush follows each batch and costs the same whatever it carries, which is what makes this
+    bound the knob deciding how many of them a bulk write pays for. What the search index accepts
+    in one write is a separate limit that `ZvecIndex` enforces for itself.
     """
     bound = memory_module._OUTBOX_BATCH_SIZE
-    assert bound <= 1024
     count = bound + bound // 2
     with _memory(tmp_path, _FakeModels()) as memory:
         memory.add_many(tuple(f"memory {index}" for index in range(count)))

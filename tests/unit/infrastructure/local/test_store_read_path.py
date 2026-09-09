@@ -221,7 +221,10 @@ def test_a_missing_index_rebuilds_from_stored_vectors_without_re_embedding(
     assert embedder.document_calls == ingest_calls
 
 
-def test_a_search_that_cannot_widen_does_not_count_survivors(tmp_path: Path) -> None:
+def test_a_search_that_cannot_widen_does_not_count_survivors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The survivor count is only asked for where it can still change the widening decision.
 
     `count_memories` applies every scope predicate over the whole candidate window, and its one
@@ -239,11 +242,8 @@ def test_a_search_that_cannot_widen_does_not_count_survivors(tmp_path: Path) -> 
     with Memory(tmp_path, embedder=_CountingEmbedder()) as memory:
         kitchen = memory.add("the kitchen at dusk")
         memory.add("the garden at noon")
-        LocalStore.count_memories = counting  # type: ignore[method-assign]
-        try:
-            results = memory.search("the kitchen at dusk", limit=2)
-        finally:
-            LocalStore.count_memories = real_count  # type: ignore[method-assign]
+        monkeypatch.setattr(LocalStore, "count_memories", counting)
+        results = memory.search("the kitchen at dusk", limit=2)
 
     assert kitchen.id in {result.id for result in results}
     assert counted == []

@@ -439,6 +439,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   memories now makes 8 flushes and 8 segments where it made 32 and 32. Ingest is 1.3 times
   faster and searches against the resulting store 1.1 times, for about 32 MiB of transient
   hydration at 1024 dimensions.
+- `ZvecIndex.upsert` and `delete` now split a batch that exceeds what Zvec's native writer
+  accepts, which is 1024 documents and is not exposed as a value to check against. Refusing one
+  was not a failure a caller could retry past: one outbox drain becomes one `upsert`, its rows are
+  committed to SQLite before the drain runs, and nothing acknowledges a refused batch, so every
+  later `add`, `search` or `ask` that drained re-read the same rows and re-raised. `reindex` had
+  the same exposure through `rebuild`'s caller-supplied `batch_size`. Both batch sizes above the
+  writer are now free to be chosen for flush cost alone.
 - `search` asks for its survivor count only where the answer can still change whether it ranks
   deeper. `count_memories` applies every scope predicate across the whole candidate window and
   its one caller uses the number for nothing else, so a store holding fewer memories than one
