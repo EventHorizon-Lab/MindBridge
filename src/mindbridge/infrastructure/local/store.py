@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -6597,12 +6598,47 @@ def _migrate_v16(connection: sqlite3.Connection) -> None:
                     row["retired_at"],
                 ),
             )
+        _report_unsupported_derived_records(connection)
         connection.execute("PRAGMA user_version = 17")
         connection.commit()
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
         raise
+
+
+def _report_unsupported_derived_records(connection: sqlite3.Connection) -> int:
+    """Count the derived records the clause projection leaves without any support.
+
+    From schema 17 on, a derived record whose basis is not a host assertion is visible only while
+    it has an active evidence clause. Public `add` cannot write such a record, but a store written
+    before the clause projection may hold them, and they silently drop out of retrieval on the next
+    projection refresh. The upgrade says how many so the operator can decide before noticing.
+    """
+    row = connection.execute(
+        """
+        SELECT COUNT(*) FROM memory_semantics AS s
+        JOIN memory_versions AS v ON v.memory_id = s.memory_id AND v.retired_at IS NULL
+        WHERE s.kind <> ? AND s.basis NOT IN (?, ?)
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_evidence_clauses AS c
+            WHERE c.memory_id = s.memory_id AND c.retired_at IS NULL
+          )
+        """,
+        (
+            MemoryKind.OBSERVATION.value,
+            EvidenceBasis.USER_STATEMENT.value,
+            EvidenceBasis.RESPONSE_FEEDBACK.value,
+        ),
+    ).fetchone()
+    count = 0 if row is None else int(row[0])
+    if count:
+        logging.getLogger(__name__).warning(
+            "schema 17 upgrade: %d derived memory records have no evidence and will stay hidden "
+            "from retrieval until evidence is added or they are deleted",
+            count,
+        )
+    return count
 
 
 def _migrate_v17(connection: sqlite3.Connection) -> None:

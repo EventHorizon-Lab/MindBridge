@@ -332,6 +332,74 @@ def test_a_damaged_formation_envelope_still_fails_the_write(tmp_path: Path) -> N
         assert failure.value.reason == "response_invalid"
 
 
+def test_a_trait_formed_from_two_observations_in_one_batch_is_one_assessment(
+    tmp_path: Path,
+) -> None:
+    """Formation is an AND writer: one proposal citing two observations is one conjunction.
+
+    The two-independent-groups rule for `TRAIT` visibility counts assessments, not cited
+    observations. One model call that read both observations and inferred the trait once must not
+    corroborate itself, so the trait stays hidden until a separate operation supports it, and
+    withdrawing either cited observation withdraws the whole conjunction.
+    """
+
+    class JointTraitFormer(PreferenceFormer):
+        def form(
+            self, inputs: Sequence[FormationInput]
+        ) -> tuple[tuple[FormationProposal, ...], ...]:
+            assert len(inputs) == 2
+            return (
+                (),
+                (
+                    FormationProposal(
+                        kind=MemoryKind.TRAIT,
+                        content="Lin Yue is patient",
+                        subject="Lin Yue",
+                        predicate="disposition",
+                        value="patient",
+                        confidence=0.6,
+                        evidence_ids=(inputs[0].memory_id, inputs[1].memory_id),
+                    ),
+                ),
+            )
+
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=JointTraitFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        first, second = memory.add_many(("Lin Yue waited calmly.", "Lin Yue waited again."))
+        with closing(sqlite3.connect(memory._store.database_path)) as connection:
+            trait_id, visible = connection.execute(
+                """
+                SELECT s.memory_id, v.visible
+                FROM memory_semantics AS s
+                JOIN memory_versions AS v ON v.memory_id = s.memory_id
+                WHERE s.kind = 'trait' AND v.retired_at IS NULL
+                """
+            ).fetchone()
+            clauses = connection.execute(
+                """
+                SELECT c.member_count FROM memory_evidence_clauses AS c
+                WHERE c.memory_id = ? AND c.retired_at IS NULL
+                """,
+                (trait_id,),
+            ).fetchall()
+
+        assert clauses == [(2,)]
+        assert visible == 0
+        assert not [hit for hit in memory.search("patient", limit=10) if hit.id == trait_id]
+        hidden = memory.get(trait_id)
+        assert hidden.context is not None
+        assert hidden.context.evidence_ids == (first.id, second.id)
+
+        # Withdrawing one member of the conjunction withdraws the whole assessment.
+        assert memory.delete(second.id) is True
+        with pytest.raises(MemoryNotFoundError):
+            memory.get(trait_id)
+
+
 @pytest.mark.parametrize("deleted_source", (0, 1))
 def test_batch_witnesses_are_persisted_and_compiled_as_one_evidence_closure(
     tmp_path: Path, deleted_source: int

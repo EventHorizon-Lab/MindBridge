@@ -321,7 +321,10 @@ records.
 The schema-16 to schema-17 migration is automatic, transactional, and idempotent. Opening a store
 with schema 17 is an upgrade: an older SDK that only recognizes schema 16 cannot open it, and there
 is no automatic downgrade. Make and test a backup before upgrading; never use a copied benchmark
-archive as the live migration target.
+archive as the live migration target. From schema 17 on, a derived record whose basis is not a
+host assertion is visible only while it has an active evidence clause. The migration counts the
+records that end up with none and logs a warning with that count; they stay stored and readable by
+ID, but drop out of retrieval until evidence is added or they are deleted.
 
 Schema 18 adds `embedding_text_selectors` and `embedding_text_span_pieces`. A selector belongs to
 one newly written pure-text raw embedding part and stores a parent-content digest, reconstructed
