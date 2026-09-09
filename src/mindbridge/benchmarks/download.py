@@ -127,13 +127,40 @@ def _snapshot(repository: str, revision: str, patterns: Sequence[str], destinati
         raise RuntimeError(
             "benchmark downloads require `uv sync --extra benchmarks --extra local`"
         ) from error
-    snapshot_download(
-        repo_id=repository,
-        repo_type="dataset",
-        revision=revision,
-        allow_patterns=list(patterns),
-        local_dir=destination,
-    )
+
+    def fetch() -> None:
+        snapshot_download(
+            repo_id=repository,
+            repo_type="dataset",
+            revision=revision,
+            allow_patterns=list(patterns),
+            local_dir=destination,
+        )
+
+    try:
+        fetch()
+    except shutil.SameFileError:
+        # A release tree populated by `hf download --local-dir` holds hard links
+        # into the shared hub cache instead of copies of its own. The hub serves
+        # a present file by copying that cache entry over it, which is a copy
+        # onto itself, and the aborted fetch then blocks every task queued
+        # behind a dataset that is already complete. Splitting the links keeps
+        # the bytes and lets the retry reach the no-op this call is meant to be.
+        _unshare(destination)
+        fetch()
+
+
+def _unshare(destination: Path) -> None:
+    """Give every multiply-linked file under `destination` a copy of its own."""
+    for path in destination.rglob("*"):
+        if path.is_symlink() or not path.is_file() or path.stat().st_nlink < 2:
+            continue
+        temporary = path.with_name(f".{path.name}.unshare")
+        try:
+            shutil.copy2(path, temporary)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _extract_zip(

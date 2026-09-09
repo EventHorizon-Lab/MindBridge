@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import zipfile
 from collections.abc import Callable, Iterator, Sequence
@@ -23,7 +24,7 @@ import mindbridge.benchmarks.eval_adapters as eval_adapters
 from mindbridge import MemoryConfig, MemoryPlugins, MindBridgeConfig, Modality
 from mindbridge._telemetry import MODEL_MODULE, SPAN_KIND, mark_model_requests, model_span
 from mindbridge.benchmarks.atm_bench import ATM_BENCH_ADAPTER_VERSION
-from mindbridge.benchmarks.download import acquire_media
+from mindbridge.benchmarks.download import _snapshot, acquire_media
 from mindbridge.benchmarks.eval import _cache_task
 from mindbridge.benchmarks.eval_adapters import (
     EvalQuestion,
@@ -99,6 +100,32 @@ def test_archive_download_is_resumable_and_rejects_traversal(
     with pytest.raises(ValueError, match="outside its directory"):
         acquire_media(_media_spec(), tmp_path, download=False)
     assert not (tmp_path / "escape.mp4").exists()
+
+
+def test_snapshot_splits_hub_cache_links_and_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A release tree hard-linked to the hub cache must not abort the fetch."""
+    cache = tmp_path / "cache" / "blob.json"
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(b"payload")
+    release = tmp_path / "release"
+    (release / "backend").mkdir(parents=True)
+    local = release / "backend" / "blob.json"
+    os.link(cache, local)
+    shared: list[bool] = []
+
+    def snapshot_download(**_: object) -> None:
+        shared.append(local.stat().st_nlink > 1)
+        if shared[-1]:
+            raise shutil.SameFileError(f"{cache} and {local} are the same file")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot_download)
+    _snapshot("owner/dataset", "0" * 40, ("backend/*",), release)
+    assert shared == [True, False]
+    assert local.read_bytes() == b"payload"
+    assert cache.read_bytes() == b"payload"
+    assert not any(path.name.endswith(".unshare") for path in release.rglob("*"))
 
 
 def test_release_media_paths_cannot_escape_the_media_root(tmp_path: Path) -> None:
