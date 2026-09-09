@@ -4036,6 +4036,50 @@ def test_clause_reactivation_preserves_the_historical_inactive_gap(
         )
 
 
+def test_schema_v16_upgrade_reports_derived_records_left_without_evidence(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A pre-clause derived record with no evidence goes hidden; the upgrade has to say so."""
+    recorded_at = datetime(2026, 9, 8, 15, tzinfo=timezone.utc)
+    derived = _joint_state_memory("derived", ("source-a",), confidence=0.5, recorded_at=recorded_at)
+    assert derived.context is not None
+    unsupported = replace(derived, context=replace(derived.context, evidence_ids=()))
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory("source-a"), unsupported))
+        database_path = store.database_path
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executescript(
+            """
+            DROP TABLE memory_evidence_clause_versions;
+            DROP TABLE memory_evidence_clause_members;
+            DROP TABLE memory_evidence_clauses;
+            PRAGMA user_version = 16;
+            """
+        )
+        connection.commit()
+
+    with (
+        caplog.at_level("WARNING", logger="mindbridge.infrastructure.local.store"),
+        LocalStore(tmp_path) as store,
+    ):
+        assert store.read_memory("derived") is not None
+    assert [
+        record.getMessage() for record in caplog.records if "derived memory records" in record.msg
+    ] == [
+        "schema 17 upgrade: 1 derived memory records have no evidence and will stay hidden from"
+        " retrieval until evidence is added or they are deleted"
+    ]
+
+    # Already upgraded: nothing left to report.
+    caplog.clear()
+    with (
+        caplog.at_level("WARNING", logger="mindbridge.infrastructure.local.store"),
+        LocalStore(tmp_path),
+    ):
+        pass
+    assert not [record for record in caplog.records if "derived memory records" in record.msg]
+
+
 def test_schema_v16_migrates_flat_evidence_history_to_singleton_clause_versions(
     tmp_path: Path,
 ) -> None:

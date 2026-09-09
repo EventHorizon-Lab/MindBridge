@@ -149,6 +149,16 @@ commits derived records. Two kinds carry extra visibility rules:
   visible trait. Changing a record's own evidence re-resolves the group on everything that cites
   it, so reinforcing a source, rolling that back, or deleting one recomputes the whole citation
   chain in the same transaction.
+- Support is counted in assessments, not in cited observations. A formation proposal or a
+  `CONSOLIDATE` that cites several observations stores them as one conjunction: one model call
+  read them together and inferred the claim once, so it cannot corroborate itself, and withdrawing
+  any one cited observation withdraws that whole assessment. Independent support is a separate
+  operation — another formation, a `REINFORCE`, or a `CONSOLIDATE` citing different evidence —
+  and those alternatives survive one another's withdrawal. A derived record of any kind other
+  than `OBSERVATION` whose basis is not a host assertion (`USER_STATEMENT`, `RESPONSE_FEEDBACK`)
+  is visible only while it has at least one active evidence clause. `add()` accepts only an
+  `ObservationContext`, so no public surface can write a derived record without evidence; a store
+  written before schema 17 may hold some, and the upgrade logs how many will stay hidden.
 
 A custom `FormationBackend` may set `FormationProposal.evidence_ids` to the ordered IDs of every
 observation in the current `FormationInput` batch that the proposal jointly depends on. The
