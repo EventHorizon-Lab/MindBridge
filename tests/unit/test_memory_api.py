@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import inspect
 import json
 import os
@@ -4361,6 +4362,17 @@ def test_interrupted_reindex_is_completed_from_durable_sqlite(tmp_path: Path) ->
 
     with _memory(tmp_path, _FakeModels()):
         assert set(_FakeIndex.instances[-1].documents) == {record.id for record in records}
+
+
+def test_index_fd_exhaustion_keeps_the_actionable_cause() -> None:
+    with (
+        pytest.raises(IndexUnavailableError, match=r"901 descriptors.*soft limit is 1024"),
+        memory_module._translate_index_errors("update the search index"),
+    ):
+        raise OSError(
+            errno.EMFILE,
+            "901 descriptors are open and the soft limit is 1024",
+        )
 
 
 def test_formation_marker_commits_with_derived_sqlite_before_index_flush(tmp_path: Path) -> None:

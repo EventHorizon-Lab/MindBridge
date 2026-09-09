@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Condition
+from threading import Condition, RLock
 from types import ModuleType
 from typing import Any, NoReturn, cast
 
@@ -61,6 +61,16 @@ _AUTO_OPTIMIZE_UNINDEXED_DOCUMENTS = 100_000
 _AUTO_OPTIMIZE_FLUSHES = 64
 _AUTO_COMPACT_FLUSHES = 256
 _FILE_DESCRIPTOR_RESERVE = 128
+# Maintenance temporarily opens files before it can close old segments. Keep at least one native
+# collection's measured opening footprint beyond the hard safety reserve, but do not reserve more
+# than half of a small process limit or a fixed 256 descriptors in a large process. This makes the
+# pressure signal useful at 256, 512, and 1024 rather than permanently true at the smallest limit.
+_FILE_DESCRIPTOR_COMPACTION_HEADROOM = 32
+_FILE_DESCRIPTOR_MAINTENANCE_RESERVE_MAX = _FILE_DESCRIPTOR_RESERVE * 2
+_PRESSURE_OPTIMIZE_FLUSHES = 8
+_PRESSURE_COMPACT_FLUSHES = 1
+_INDEX_MAINTENANCE_LOCK = RLock()
+_FILE_DESCRIPTOR_FAILURE = re.compile(r"(?:too many open files|\bemfile\b)", re.IGNORECASE)
 _GROUP_OVERSAMPLE = 2
 _GROUP_FALLBACK_MINIMUM = 50
 _MAX_EMBEDDINGS_PER_MEMORY = 129
@@ -213,16 +223,17 @@ class ZvecIndex:
         self._gate = _CollectionGate()
         self._zvec: Any = _load_zvec()
         self._schema = self._build_schema()
-        _require_file_descriptor_headroom(_persisted_index_file_count(self.path))
-        option = self._zvec.CollectionOption(read_only=False, enable_mmap=True)
-        if self.path.exists():
-            self._collection: object | None = self._zvec.open(str(self.path), option=option)
-        else:
-            self._collection = self._zvec.create_and_open(
-                str(self.path),
-                schema=self._schema,
-                option=option,
-            )
+        with _INDEX_MAINTENANCE_LOCK:
+            _require_file_descriptor_headroom(_persisted_index_file_count(self.path))
+            option = self._zvec.CollectionOption(read_only=False, enable_mmap=True)
+            if self.path.exists():
+                self._collection: object | None = self._zvec.open(str(self.path), option=option)
+            else:
+                self._collection = self._zvec.create_and_open(
+                    str(self.path),
+                    schema=self._schema,
+                    option=option,
+                )
         try:
             self._validate_schema(cast(Any, self._collection).schema)
             self._optimization_watermark = _indexed_document_count(
@@ -252,7 +263,6 @@ class ZvecIndex:
         """Idempotently apply a batch, checking every per-document status."""
         if not documents:
             return
-        _require_file_descriptor_headroom()
         docs = []
         ids = []
         for document in documents:
@@ -288,20 +298,23 @@ class ZvecIndex:
                     vectors={_VECTOR_FIELD: list(embedding.values)},
                 )
             )
-        collection = cast(Any, self._require_collection())
-        statuses = cast(Sequence[object], collection.upsert(docs))
+        with _INDEX_MAINTENANCE_LOCK:
+            _require_file_descriptor_headroom()
+            collection = cast(Any, self._require_collection())
+            statuses = cast(Sequence[object], collection.upsert(docs))
         self._check_statuses("upsert", ids, statuses)
 
     def delete(self, ids: Sequence[str]) -> None:
         """Idempotently delete IDs, accepting Zvec's NOT_FOUND status."""
         if not ids:
             return
-        _require_file_descriptor_headroom()
         for document_id in ids:
             if not document_id or document_id != document_id.strip():
                 raise ValueError("index document IDs must be non-empty and trimmed")
-        collection = cast(Any, self._require_collection())
-        statuses = cast(Sequence[object], collection.delete(list(ids)))
+        with _INDEX_MAINTENANCE_LOCK:
+            _require_file_descriptor_headroom()
+            collection = cast(Any, self._require_collection())
+            statuses = cast(Sequence[object], collection.delete(list(ids)))
         self._check_statuses("delete", ids, statuses, allow_not_found=True)
 
     def search(
@@ -398,20 +411,26 @@ class ZvecIndex:
 
     def flush(self) -> None:
         """Make prior Zvec writes durable before SQLite acknowledges its outbox."""
-        _require_file_descriptor_headroom()
-        collection = cast(Any, self._require_collection())
-        collection.flush()
-        self._flushes_since_optimization += 1
-        self._flushes_since_compaction += 1
+        with _INDEX_MAINTENANCE_LOCK:
+            _require_file_descriptor_headroom()
+            collection = cast(Any, self._require_collection())
+            collection.flush()
+            self._flushes_since_optimization += 1
+            self._flushes_since_compaction += 1
+            # Do not leave a window in which every concurrent collection can flush before the
+            # first caller gets to `optimize_if_needed`. Reclaim shared process capacity before
+            # another FD-producing native operation is admitted.
+            self._maintain_under_pressure()
 
     def optimize(self, *, concurrency: int = 0) -> None:
         """Merge pending vectors into HNSW without blocking normal queries."""
         if isinstance(concurrency, bool) or concurrency < 0:
             raise ValueError("concurrency must be a non-negative integer")
-        collection = cast(Any, self._require_collection())
-        collection.optimize(self._zvec.OptimizeOption(concurrency=concurrency))
-        self._optimization_watermark = self.doc_count
-        self._flushes_since_optimization = 0
+        with _INDEX_MAINTENANCE_LOCK:
+            collection = cast(Any, self._require_collection())
+            collection.optimize(self._zvec.OptimizeOption(concurrency=concurrency))
+            self._optimization_watermark = self.doc_count
+            self._flushes_since_optimization = 0
 
     def optimize_if_needed(
         self,
@@ -420,22 +439,52 @@ class ZvecIndex:
     ) -> bool:
         """Run maintenance after a meaningful flat-buffer or durable-segment buildup."""
         _require_positive(minimum_unindexed, "minimum_unindexed")
-        # Zvec optimize compacts search segments but leaves one idmap SST per durable flush.
-        if self._flushes_since_compaction >= _AUTO_COMPACT_FLUSHES:
+        # Every collection shares one process FD table. Serializing maintenance prevents several
+        # otherwise-isolated stores from all opening replacement segments at the same pressure
+        # boundary. Normal reads and writes remain independent.
+        with _INDEX_MAINTENANCE_LOCK:
+            # Zvec optimize compacts search segments but leaves one idmap SST per durable flush.
+            if self._flushes_since_compaction >= _AUTO_COMPACT_FLUSHES:
+                self._compact()
+                return True
+
+            # A fixed flush threshold cannot protect concurrent collections: four collections can
+            # exhaust a 1024-FD process after roughly 32 flushes each, before any one reaches the
+            # old 64-flush optimization boundary. Use the shared resource itself as the early
+            # signal. Mature collections optimize first because merging reclaims most segment
+            # descriptors without copying the collection; young collections replace directly
+            # because opening their full optimized index would increase pressure.
+            if self._maintain_under_pressure():
+                return True
+
+            collection = cast(Any, self._require_collection())
+            stats = collection.stats
+            document_count = int(stats.doc_count)
+            self._optimization_watermark = min(self._optimization_watermark, document_count)
+            indexed = _indexed_document_count(stats)
+            if (
+                self._flushes_since_optimization < _AUTO_OPTIMIZE_FLUSHES
+                and document_count - max(indexed, self._optimization_watermark) < minimum_unindexed
+            ):
+                return False
+            self.optimize()
+            return True
+
+    def _maintain_under_pressure(self) -> bool:
+        """Reclaim process FD capacity while the caller owns the maintenance lock."""
+        under_pressure = _file_descriptor_pressure()
+        maintained = False
+        # Optimizing a new one-segment collection opens its complete HNSW and scalar-index set and
+        # can consume more descriptors than it releases. Only use it once there are enough staged
+        # segments to merge; replacement is the bounded recovery for a younger collection.
+        if under_pressure and self._flushes_since_optimization >= _PRESSURE_OPTIMIZE_FLUSHES:
+            self.optimize()
+            maintained = True
+            under_pressure = _file_descriptor_pressure()
+        if under_pressure and self._flushes_since_compaction >= _PRESSURE_COMPACT_FLUSHES:
             self._compact()
             return True
-        collection = cast(Any, self._require_collection())
-        stats = collection.stats
-        document_count = int(stats.doc_count)
-        self._optimization_watermark = min(self._optimization_watermark, document_count)
-        indexed = _indexed_document_count(stats)
-        if (
-            self._flushes_since_optimization < _AUTO_OPTIMIZE_FLUSHES
-            and document_count - max(indexed, self._optimization_watermark) < minimum_unindexed
-        ):
-            return False
-        self.optimize()
-        return True
+        return maintained
 
     def _compact(self) -> None:
         """Copy visible documents into one flushed collection, then atomically replace it."""
@@ -563,14 +612,15 @@ class ZvecIndex:
         batch_size: int,
         optimize_concurrency: int,
     ) -> int:
-        collection = cast(Any, self._require_collection())
-        collection.destroy()
-        self._collection = None
-        self._collection = self._zvec.create_and_open(
-            str(self.path),
-            schema=self._schema,
-            option=self._zvec.CollectionOption(read_only=False, enable_mmap=True),
-        )
+        with _INDEX_MAINTENANCE_LOCK:
+            collection = cast(Any, self._require_collection())
+            collection.destroy()
+            self._collection = None
+            self._collection = self._zvec.create_and_open(
+                str(self.path),
+                schema=self._schema,
+                option=self._zvec.CollectionOption(read_only=False, enable_mmap=True),
+            )
         self._optimization_watermark = 0
         self._flushes_since_optimization = 0
         self._flushes_since_compaction = 0
@@ -952,9 +1002,14 @@ class ZvecIndex:
                 allow_not_found and native_status.code() == self._zvec.StatusCode.NOT_FOUND
             ):
                 continue
-            failures.append(
-                f"{document_id}: {native_status.code().name}: {native_status.message()}"
-            )
+            message = str(native_status.message())
+            if _FILE_DESCRIPTOR_FAILURE.search(message):
+                raise OSError(
+                    errno.EMFILE,
+                    "Zvec could not open an index file because the process "
+                    "file-descriptor limit was reached",
+                )
+            failures.append(f"{document_id}: {native_status.code().name}: {message}")
         if failures:
             raise ZvecWriteError(f"Zvec {action} failed: {'; '.join(failures)}")
 
@@ -980,12 +1035,38 @@ def _require_file_descriptor_headroom(required: int = 0) -> None:
     opened, soft_limit = usage
     if opened + required + _FILE_DESCRIPTOR_RESERVE <= soft_limit:
         return
+    # Optimize and collection replacement have a short FD peak before old segments close. A
+    # concurrent writer that lands in that peak must wait for the process-wide maintenance owner
+    # and measure again; failing immediately turns successful recovery in another isolated store
+    # into an unrelated index error. RLock keeps the same check safe inside compaction itself.
+    with _INDEX_MAINTENANCE_LOCK:
+        usage = _file_descriptor_usage()
+        if usage is None:
+            return
+        opened, soft_limit = usage
+        if opened + required + _FILE_DESCRIPTOR_RESERVE <= soft_limit:
+            return
     raise OSError(
         errno.EMFILE,
         "Zvec operation refused before file descriptor exhaustion: "
         f"{opened} descriptors are open, {required} persisted index files may be opened, "
         f"and the soft limit is {soft_limit}; rebuild the disposable index to compact segments",
     )
+
+
+def _file_descriptor_pressure() -> bool:
+    usage = _file_descriptor_usage()
+    if usage is None:
+        return False
+    opened, soft_limit = usage
+    reserve = min(
+        _FILE_DESCRIPTOR_MAINTENANCE_RESERVE_MAX,
+        max(
+            _FILE_DESCRIPTOR_RESERVE + _FILE_DESCRIPTOR_COMPACTION_HEADROOM,
+            soft_limit // 2,
+        ),
+    )
+    return opened + reserve > soft_limit
 
 
 def _file_descriptor_usage() -> tuple[int, int] | None:

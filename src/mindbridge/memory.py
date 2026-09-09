@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import builtins
+import errno
 import hashlib
 import io
 import json
@@ -11658,4 +11659,7 @@ def _translate_index_errors(action: str) -> Iterator[None]:
     except MindBridgeError:
         raise
     except Exception as error:
-        raise IndexUnavailableError(f"failed to {action}") from error
+        detail = ""
+        if isinstance(error, OSError) and error.errno == errno.EMFILE:
+            detail = f": {error.strerror or 'too many open files'}"
+        raise IndexUnavailableError(f"failed to {action}{detail}") from error

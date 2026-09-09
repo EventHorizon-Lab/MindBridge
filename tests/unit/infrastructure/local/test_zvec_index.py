@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from threading import Barrier, Event
+from threading import Barrier, Event, Lock
 from typing import Any, NoReturn, cast
 
 import pytest
@@ -60,6 +60,68 @@ def test_every_batch_status_is_checked() -> None:
 
     with pytest.raises(ZvecWriteError, match="embedding_bad: INTERNAL_ERROR: disk full"):
         index.upsert([_document("embedding_bad", "content", (1.0, 0.0))])
+
+
+def test_native_fd_status_becomes_safe_emfile() -> None:
+    index = object.__new__(ZvecIndex)
+    index.dimension = 2
+    index._zvec = _FakeZvec
+    index._collection = _FileDescriptorFailingCollection()
+
+    with pytest.raises(OSError) as failure:
+        index.upsert([_document("embedding_bad", "content", (1.0, 0.0))])
+
+    assert failure.value.errno == errno.EMFILE
+    assert "/private/index/path" not in str(failure.value)
+
+
+def test_native_writes_are_serialized_across_collections() -> None:
+    first_entered = Event()
+    second_attempting = Event()
+    second_entered = Event()
+    release_first = Event()
+    calls = 0
+    calls_lock = Lock()
+
+    class BlockingCollection:
+        def upsert(self, _documents: Sequence[object]) -> list[_Status]:
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+                call = calls
+            if call == 1:
+                first_entered.set()
+                assert release_first.wait(timeout=2)
+            else:
+                second_entered.set()
+            return [_Status(_StatusCode.OK)]
+
+    indexes = []
+    for _number in range(2):
+        index = object.__new__(ZvecIndex)
+        index.dimension = 2
+        index._zvec = _FakeZvec
+        index._collection = BlockingCollection()
+        indexes.append(index)
+
+    def second_write() -> None:
+        second_attempting.set()
+        indexes[1].upsert([_document("second", "content", (1.0, 0.0))])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            indexes[0].upsert,
+            [_document("first", "content", (1.0, 0.0))],
+        )
+        assert first_entered.wait(timeout=2)
+        second = executor.submit(second_write)
+        assert second_attempting.wait(timeout=2)
+        assert not second_entered.wait(timeout=0.1)
+        release_first.set()
+        first.result(timeout=2)
+        second.result(timeout=2)
+
+    assert second_entered.is_set()
 
 
 def test_only_aggregate_vector_carries_full_text() -> None:
@@ -525,6 +587,122 @@ def test_write_refuses_to_consume_the_fd_safety_reserve(
     assert collection.documents == []
 
 
+def test_write_rechecks_headroom_after_concurrent_maintenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    usage = iter(((900, 1_024), (700, 1_024)))
+    monkeypatch.setattr(zvec_index_module, "_file_descriptor_usage", lambda: next(usage))
+
+    zvec_index_module._require_file_descriptor_headroom()
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    (
+        ((95, 256), False),
+        ((97, 256), True),
+        ((255, 512), False),
+        ((257, 512), True),
+        ((767, 1_024), False),
+        ((769, 1_024), True),
+        ((10_000, 1_048_576), False),
+    ),
+)
+def test_fd_pressure_reserve_scales_with_the_process_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    usage: tuple[int, int],
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(zvec_index_module, "_file_descriptor_usage", lambda: usage)
+
+    assert zvec_index_module._file_descriptor_pressure() is expected
+
+
+def test_fd_pressure_optimizes_while_recovery_headroom_remains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index = object.__new__(ZvecIndex)
+    index._flushes_since_optimization = 8
+    index._flushes_since_compaction = 8
+    optimized = 0
+
+    def optimize(*, concurrency: int = 0) -> None:
+        nonlocal optimized
+        assert concurrency == 0
+        optimized += 1
+        index._flushes_since_optimization = 0
+
+    usage = iter(((800, 1_024), (700, 1_024)))
+    monkeypatch.setattr(index, "optimize", optimize)
+    monkeypatch.setattr(zvec_index_module, "_file_descriptor_usage", lambda: next(usage))
+
+    assert index.optimize_if_needed() is True
+    assert optimized == 1
+
+
+def test_fd_pressure_compacts_when_optimization_cannot_restore_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index = object.__new__(ZvecIndex)
+    index._flushes_since_optimization = 8
+    index._flushes_since_compaction = 8
+    optimized = 0
+    compacted = 0
+
+    def optimize(*, concurrency: int = 0) -> None:
+        nonlocal optimized
+        assert concurrency == 0
+        optimized += 1
+        index._flushes_since_optimization = 0
+
+    def compact() -> None:
+        nonlocal compacted
+        compacted += 1
+
+    monkeypatch.setattr(index, "optimize", optimize)
+    monkeypatch.setattr(index, "_compact", compact)
+    monkeypatch.setattr(
+        zvec_index_module,
+        "_file_descriptor_usage",
+        lambda: (800, 1_024),
+    )
+
+    assert index.optimize_if_needed() is True
+    assert optimized == 1
+    assert compacted == 1
+
+
+def test_fd_pressure_compacts_a_young_collection_without_optimizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index = object.__new__(ZvecIndex)
+    index._flushes_since_optimization = 1
+    index._flushes_since_compaction = 1
+    optimized = 0
+    compacted = 0
+
+    def optimize(*, concurrency: int = 0) -> None:
+        nonlocal optimized
+        assert concurrency == 0
+        optimized += 1
+
+    def compact() -> None:
+        nonlocal compacted
+        compacted += 1
+
+    monkeypatch.setattr(index, "optimize", optimize)
+    monkeypatch.setattr(index, "_compact", compact)
+    monkeypatch.setattr(
+        zvec_index_module,
+        "_file_descriptor_usage",
+        lambda: (800, 1_024),
+    )
+
+    assert index.optimize_if_needed() is True
+    assert optimized == 0
+    assert compacted == 1
+
+
 def test_type_and_event_time_filters_apply_to_every_search_mode(tmp_path: Path) -> None:
     _require_zvec()
     start = datetime(2026, 8, 17, tzinfo=timezone.utc)
@@ -701,6 +879,17 @@ class _FailingCollection:
     @staticmethod
     def upsert(_documents: Sequence[object]) -> list[_Status]:
         return [_Status(_StatusCode.INTERNAL_ERROR, "disk full")]
+
+
+class _FileDescriptorFailingCollection:
+    @staticmethod
+    def upsert(_documents: Sequence[object]) -> list[_Status]:
+        return [
+            _Status(
+                _StatusCode.INTERNAL_ERROR,
+                "Too many open files: /private/index/path/0.wal",
+            )
+        ]
 
 
 class _CapturingCollection:
