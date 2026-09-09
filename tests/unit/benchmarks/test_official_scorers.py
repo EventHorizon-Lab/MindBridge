@@ -573,18 +573,28 @@ def test_beam_judges_each_rubric_item_and_truncates_partial_credit() -> None:
     assert "<question>" in plan.calls[0][0].content
     assert "first" in plan.calls[0][0].content
     # Nine categories accumulate with `int(score)`, so 0.5 truncates to 0.
-    assert scores == {"llm_judge_score": 0.5}
+    assert scores == {"llm_judge_score": 0.5, "beam_score": 0.5}
 
-    _, ordering = _judged(
+    ordering_plan, ordering = _judged(
         "beam-100k",
         question="Order the events",
         references=("first", "second"),
-        prediction="An ordering.",
+        prediction="second\nfirst",
         metadata={"category": "event_ordering"},
-        replies=('{"score": 0.5}', '{"score": 1.0}'),
+        replies=("NO", "YES", "YES", "NO", '{"score": 0.5}', '{"score": 1.0}'),
     )
-    # `event_ordering` alone accumulates with `float(score)`.
-    assert ordering == {"llm_judge_score": 0.75}
+    assert len(ordering_plan.calls) == 6
+    assert [message.role for message in ordering_plan.calls[0]] == ["system", "user"]
+    # `event_ordering` keeps the rubric score but the report column is normalized tau.
+    assert ordering == {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "tau_norm": 0.0,
+        "final_score": 0.0,
+        "llm_judge_score": 0.75,
+        "beam_score": 0.0,
+    }
 
 
 def test_personamem_rubric_applies_the_official_deterministic_aggregation() -> None:
@@ -617,7 +627,7 @@ def test_personamem_rubric_applies_the_official_deterministic_aggregation() -> N
     # main 9 - 0.5 x (10 - 4) telegraph deduction = 6.
     assert scores["pr_combined_personalization_score"] == 6.0
     # This task's headline excludes the telegraph deduction.
-    assert scores["pr_preference_alignment_score_gated"] == 9.0
+    assert scores["pr_preference_alignment_score"] == 9.0
     assert scores["personamem_score"] == pytest.approx(0.9)
 
     leaked = clean.replace('"privacy_leak_violated": false', '"privacy_leak_violated": true')
@@ -653,7 +663,7 @@ def test_personamem_ranking_is_deterministic_and_reads_both_answer_shapes() -> N
         is None
     )
     hit = _scores("personamem-v3", "Ranked indexes: [2, 3, 4, 1, 0]", "gold", dict(metadata))
-    assert hit["recall@1"] == 1.0
+    assert hit["recall_at_1"] == 1.0
     assert hit["personamem_score"] == 1.0
     assert hit["negative_in_top3"] == 0.0
 
@@ -662,23 +672,27 @@ def test_personamem_ranking_is_deterministic_and_reads_both_answer_shapes() -> N
     # cannot be mistaken for the fallback below.
     reversed_json = '```json\n{"ranked_indices": [4, 3, 2, 1, 0]}\n```'
     miss = _scores("personamem-v3", reversed_json, "gold", dict(metadata))
-    assert miss["recall@1"] == 0.0
+    assert miss["recall_at_1"] == 0.0
     assert miss["mrr"] == pytest.approx(1 / 3)
     assert miss["negative_in_top1"] == 0.0
     # The headline is upstream's graded nDCG@5, not top-1: burying the gold at
     # rank 3 costs a position discount rather than the whole score, which is
-    # exactly what separates `ndcg_graded@5` from `recall@1` here.
-    assert miss["ndcg_graded@5"] == pytest.approx(0.5)
-    assert miss["personamem_score"] == pytest.approx(0.5)
+    # exactly what separates graded `ndcg_at_5` from `recall_at_1` here.
+    assert miss["ndcg_at_5"] == pytest.approx(0.6657)
+    assert miss["personamem_score"] == pytest.approx(0.6657)
 
-    # A reply that is not a permutation of the slate is unusable, and so is an
-    # answer with no ranking in it. Both fall back to the identity order, which
-    # is what `slate_ranking.run_task_a` does.
-    identity = _scores("personamem-v3", "no idea", "gold", dict(metadata))
-    assert identity["recall@1"] == 0.0
+    # The recommendation runners score an absent ranking as empty and accept
+    # a partial unique list instead of inventing an identity ordering.
+    empty = _scores("personamem-v3", "no idea", "gold", dict(metadata))
+    assert empty["recall_at_1"] == 0.0
+    assert empty["ndcg_at_5"] == 0.0
+    partial = _scores("personamem-v3", "Ranked indexes: [2, 0]", "gold", dict(metadata))
+    assert partial["recall_at_1"] == 1.0
+
+    directive = {**metadata, "task_type": "at_ai_directive_followup"}
+    identity = _scores("personamem-v3", "no idea", "gold", directive)
+    assert identity["hit@1"] == 0.0
     assert identity["negative_in_top1"] == 1.0
-    assert _scores("personamem-v3", "Ranked indexes: [2, 2, 3]", "gold", dict(metadata)) == identity
-    assert _scores("personamem-v3", "Ranked indexes: [2, 0]", "gold", dict(metadata)) == identity
 
 
 @pytest.mark.parametrize(
@@ -793,32 +807,83 @@ def test_openeqa_llm_match_selects_its_prompt_and_trims_the_prediction() -> None
     assert official_judge_model("openeqa-hm3d") == "gpt-4-1106-preview"
     # No deterministic half: LLM-Match is the whole protocol.
     assert _scores("openeqa-hm3d", "brown", "tan", {}) == {}
+    assert _scores("openeqa-hm3d", "", "tan", {}) == {
+        "llm_match": 0.0,
+        "llm_match_score_1_5": 1.0,
+    }
+    assert (
+        judge_plan(
+            "openeqa-hm3d",
+            question="What color is the rug?",
+            references=("tan",),
+            prediction="",
+            metadata={},
+        )
+        is None
+    )
 
 
 def test_openeqa_marks_scale_and_clip_exactly_as_upstream() -> None:
     plan = JudgePlan("p", "openeqa", ((JudgeMessage("user", "prompt"),),))
 
     assert parse_judge_response(plan, "1") == {"llm_match": 0.0, "llm_match_score_1_5": 1.0}
-    assert parse_judge_response(plan, "3") == {"llm_match": 0.5, "llm_match_score_1_5": 3.0}
-    assert parse_judge_response(plan, "5") == {"llm_match": 1.0, "llm_match_score_1_5": 5.0}
+    assert parse_judge_response(plan, "3") == {"llm_match": 50.0, "llm_match_score_1_5": 3.0}
+    assert parse_judge_response(plan, "5") == {"llm_match": 100.0, "llm_match_score_1_5": 5.0}
     # The tagged branch reads only up to the next newline, so a judge that
     # explains itself afterwards still parses.
     assert parse_judge_response(plan, "Your mark: 4\nbecause the color matches") == {
-        "llm_match": 0.75,
+        "llm_match": 75.0,
         "llm_match_score_1_5": 4.0,
     }
     # `evaluate-predictions.py` clips instead of validating: 0 is upstream's own
     # sentinel for a missing prediction and scores zero points, and an
     # overshooting judge is capped rather than discarding the question.
     assert parse_judge_response(plan, "0") == {"llm_match": 0.0, "llm_match_score_1_5": 1.0}
-    assert parse_judge_response(plan, "9") == {"llm_match": 1.0, "llm_match_score_1_5": 5.0}
+    assert parse_judge_response(plan, "9") == {"llm_match": 100.0, "llm_match_score_1_5": 5.0}
     with pytest.raises(ValueError, match="Invalid output string"):
         parse_judge_response(plan, "the response is good")
 
     assert combine_judge_scores(plan, (parse_judge_response(plan, "5"),)) == {
-        "llm_match": 1.0,
+        "llm_match": 100.0,
         "llm_match_score_1_5": 5.0,
     }
+
+
+def test_worldmemarena_qa_labels_and_empty_answer_match_upstream() -> None:
+    scores = local_scores(
+        "worldmemarena",
+        score_kind="text",
+        prediction="",
+        parsed_choice=None,
+        expected_choice=None,
+        references=("blue",),
+        question="What color?",
+        metadata={},
+        evidence_source_ids=(),
+    )
+    assert scores == {
+        "answer_f1": 0.0,
+        "answer_bleu1": 0.0,
+        "correct_ratio": 0.0,
+        "hallucination_ratio": 0.0,
+        "omission_ratio": 1.0,
+    }
+    assert (
+        judge_plan(
+            "worldmemarena",
+            question="What color?",
+            references=("blue",),
+            prediction="",
+            metadata={"gold_evidence_contents": ("the square was blue",)},
+        )
+        is None
+    )
+    plan = JudgePlan("p", "worldmemarena", ((JudgeMessage("user", "prompt"),),))
+    assert parse_judge_response(
+        plan, '{"reasoning":"wrong fact", "evaluation_result":"Hallucination"}'
+    ) == {"correct_ratio": 0.0, "hallucination_ratio": 1.0, "omission_ratio": 0.0}
+    # The release maps an unknown label to Omission.
+    assert parse_judge_response(plan, '{"evaluation_result":"Maybe"}')["omission_ratio"] == 1.0
 
 
 @pytest.mark.parametrize(
@@ -828,7 +893,7 @@ def test_openeqa_marks_scale_and_clip_exactly_as_upstream() -> None:
         ("atm-bench-hard", "accuracy", True),
         ("mem-gallery", "f1", True),
         ("mm-lifelong", "ref_at_300", True),
-        ("personamem-v3", "ndcg_graded@5", True),
+        ("personamem-v3", "ndcg_at_5", True),
         ("personamem-v3", "pr_combined_personalization_score", True),
         ("openeqa-hm3d", "llm_match_score_1_5", True),
         # Invented here. `_official/atm_score.py` has only `deterministic_accuracy` and
@@ -839,8 +904,7 @@ def test_openeqa_marks_scale_and_clip_exactly_as_upstream() -> None:
         ("mem-gallery", "retrieval_precision@10", False),
         ("mem-gallery", "exact_match", False),
         ("personamem-v3", "negative_in_top1", False),
-        # Scored only by the private submission server.
-        ("egomemreason", "accuracy", False),
+        ("worldmemarena", "answer_f1", True),
         # No family at all.
         ("fixture", "accuracy", False),
     ],
@@ -860,6 +924,15 @@ def test_a_faithful_judge_cannot_bless_an_invented_metric() -> None:
     assert metric_is_official("atm-bench", "accuracy", "gpt-4o", uses_judge=True) is False
     assert (
         metric_is_official("atm-bench", "retrieval_recall@10", "gpt-5-mini", uses_judge=True)
+        is False
+    )
+    assert (
+        metric_is_official(
+            "personamem-v3",
+            "sycophancy_resistance_0_10",
+            "gpt-4o",
+            uses_judge=True,
+        )
         is False
     )
 

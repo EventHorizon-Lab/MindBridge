@@ -33,7 +33,6 @@ _VIDEO_FILTER = f"fps=1,{_VIDEO_SCALE_FILTER}"
 # The concat demuxer has no following packet from which the fps filter can infer
 # the final frame's duration. Passing it through keeps N official frames as N seconds.
 _OPENEQA_VIDEO_FILTER = f"fps=1:eof_action=pass,{_VIDEO_SCALE_FILTER}"
-_EGOLIFE_NAME = re.compile(r"^DAY([1-9][0-9]*)_[^_]+_[^_]+_([0-9]{8})$")
 # OpenEQA episode histories are directories of RGB frames with no published
 # video encoding for evaluation -- upstream's `data/frames2videos.py` writes at
 # 30 fps into `viewer/static/videos` for its web viewer, not for scoring. One
@@ -49,13 +48,33 @@ _PREPARATION_WORKERS = min(4, os.cpu_count() or 1)
 _T = TypeVar("_T")
 _R = TypeVar("_R")
 Limit: TypeAlias = int | float | None
+ProgressCallback: TypeAlias = Callable[[int, int], None]
 
 
-def _prepare_many(function: Callable[[_T], _R], values: Sequence[_T]) -> tuple[_R, ...]:
+def _prepare_many(
+    function: Callable[[_T], _R],
+    values: Sequence[_T],
+    on_progress: ProgressCallback | None = None,
+) -> tuple[_R, ...]:
+    total = len(values)
+    if on_progress is not None:
+        on_progress(0, total)
+    completed = 0
+    progress_lock = Lock()
+
+    def prepare(value: _T) -> _R:
+        nonlocal completed
+        result = function(value)
+        if on_progress is not None:
+            with progress_lock:
+                completed += 1
+                on_progress(completed, total)
+        return result
+
     if len(values) < 2 or _PREPARATION_WORKERS == 1:
-        return tuple(map(function, values))
+        return tuple(map(prepare, values))
     with ThreadPoolExecutor(max_workers=min(_PREPARATION_WORKERS, len(values))) as pool:
-        return tuple(pool.map(function, values))
+        return tuple(pool.map(prepare, values))
 
 
 def _serialized_announce(callback: Callable[[str], None] | None) -> Callable[[str], None] | None:
@@ -81,6 +100,7 @@ def prepare_task_media(
     offset: int,
     download: bool,
     announce: Callable[[str], None] | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> Mapping[str, object] | None:
     """Make one task's selected media locally usable, returning an auto manifest if needed."""
     source = spec.media_source
@@ -114,6 +134,7 @@ def prepare_task_media(
         offset,
         announce,
         unavailable_units,
+        on_progress,
     )
 
 
@@ -127,7 +148,9 @@ def _prepared_manifest(
     offset: int,
     announce: Callable[[str], None] | None,
     unavailable_units: Mapping[str, str],
+    on_progress: ProgressCallback | None,
 ) -> Mapping[str, object] | None:
+    segment_announce = None if on_progress is not None else announce
     if spec.name in {"m3-bench-robot", "m3-bench-web"}:
         return {
             "units": _m3_manifest(
@@ -136,33 +159,53 @@ def _prepared_manifest(
                 cache,
                 limit,
                 offset,
-                announce,
+                segment_announce,
                 frozenset(unavailable_units),
+                on_progress,
             ),
             **({"unavailable_units": dict(unavailable_units)} if unavailable_units else {}),
         }
-    if spec.name in {"video-mme", "video-mme-v2", "egotempo"}:
+    if spec.name in {"video-mme-v2", "egotempo"}:
         return {
-            "units": _video_manifest(spec.name, dataset, media_root, cache, limit, offset, announce)
-        }
-    if spec.name in {"egolifeqa", "egomemreason"}:
-        return {
-            "units": _egolife_manifest(
-                spec.name, dataset, media_root, cache, limit, offset, announce
+            "units": _video_manifest(
+                spec.name,
+                dataset,
+                media_root,
+                cache,
+                limit,
+                offset,
+                segment_announce,
+                on_progress,
             )
         }
     if spec.name.startswith("mm-lifelong-"):
         return {
-            "units": _lifelong_manifest(spec, media_root, cache, announce),
+            "units": _lifelong_manifest(spec, media_root, cache, segment_announce, on_progress),
         }
     if spec.name.startswith("openeqa-"):
         return {
-            "units": _openeqa_manifest(spec, dataset, media_root, cache, limit, offset, announce)
+            "units": _openeqa_manifest(
+                spec,
+                dataset,
+                media_root,
+                cache,
+                limit,
+                offset,
+                segment_announce,
+                on_progress,
+            )
         }
     if spec.name == "supermemory-vqa":
         return {
             "units": _supermemory_manifest(
-                dataset, media_root, root, cache, limit, offset, announce
+                dataset,
+                media_root,
+                root,
+                cache,
+                limit,
+                offset,
+                segment_announce,
+                on_progress,
             )
         }
     return None
@@ -225,8 +268,6 @@ def _selected_patterns(spec: TaskSpec, dataset: Path, limit: Limit, offset: int)
             for group in _selected(load_video_mme_v2(dataset), limit, offset)
         }
         return tuple(f"videos/{volume:03d}.zip" for volume in sorted(volumes))
-    if name in {"egolifeqa", "egomemreason"}:
-        return _egolife_patterns(name, dataset, limit, offset)
     if name == "egotempo":
         from mindbridge.benchmarks.egotempo import load_egotempo
 
@@ -267,27 +308,6 @@ def _selected_patterns(spec: TaskSpec, dataset: Path, limit: Limit, offset: int)
     return source.patterns
 
 
-def _egolife_patterns(task_name: str, dataset: Path, limit: Limit, offset: int) -> tuple[str, ...]:
-    if task_name == "egolifeqa":
-        from mindbridge.benchmarks.egolife_qa import load_egolife_qa
-
-        questions = _selected(load_egolife_qa(dataset), limit, offset)
-        horizon = max(question.query_offset_ms for question in questions)
-        return tuple(f"A1_JAKE/DAY{day}/*.mp4" for day in range(1, horizon // 86_400_000 + 2))
-    from mindbridge.benchmarks.egomem_reason import load_egomem_reason
-
-    horizons: dict[str, int] = {}
-    for question in _selected(load_egomem_reason(dataset), limit, offset):
-        horizons[question.identity] = max(
-            horizons.get(question.identity, 0), question.query_offset_ms
-        )
-    return tuple(
-        f"{_component(identity)}/DAY{day}/*.mp4"
-        for identity, horizon in sorted(horizons.items())
-        for day in range(1, horizon // 86_400_000 + 2)
-    )
-
-
 def _m3_manifest(
     dataset: Path,
     media_root: Path,
@@ -296,6 +316,7 @@ def _m3_manifest(
     offset: int,
     announce: Callable[[str], None] | None,
     unavailable_units: frozenset[str] = frozenset(),
+    on_progress: ProgressCallback | None = None,
 ) -> dict[str, list[dict[str, object]]]:
     from mindbridge.benchmarks.m3_bench import M3BenchVideo, load_m3_bench
 
@@ -324,7 +345,7 @@ def _m3_manifest(
         for video in _selected(load_m3_bench(dataset), limit, offset)
         if video.video_id not in unavailable_units
     )
-    return dict(_prepare_many(prepare, videos))
+    return dict(_prepare_many(prepare, videos, on_progress))
 
 
 def _video_manifest(
@@ -335,20 +356,11 @@ def _video_manifest(
     limit: Limit,
     offset: int,
     announce: Callable[[str], None] | None,
+    on_progress: ProgressCallback | None = None,
 ) -> dict[str, list[dict[str, object]]]:
     find_media = _MediaFinder(media_root)
     sources: tuple[tuple[str, Path], ...]
-    if task_name == "video-mme":
-        from mindbridge.benchmarks.video_mme import load_video_mme
-
-        sources = tuple(
-            (
-                video.video_id,
-                find_media(f"{video.source_video_id}.mp4"),
-            )
-            for video in _selected(load_video_mme(dataset), limit, offset)
-        )
-    elif task_name == "video-mme-v2":
+    if task_name == "video-mme-v2":
         from mindbridge.benchmarks.video_mme_v2 import load_video_mme_v2
 
         sources = tuple(
@@ -369,7 +381,7 @@ def _video_manifest(
         unit_id, source = item
         return unit_id, _video_parts(unit_id, source, cache / _component(unit_id), announce)
 
-    return dict(_prepare_many(prepare, sources))
+    return dict(_prepare_many(prepare, sources, on_progress))
 
 
 def _lifelong_manifest(
@@ -377,6 +389,7 @@ def _lifelong_manifest(
     media_root: Path,
     cache: Path,
     announce: Callable[[str], None] | None,
+    on_progress: ProgressCallback | None = None,
 ) -> dict[str, list[dict[str, object]]]:
     files = tuple(
         path.resolve()
@@ -393,7 +406,7 @@ def _lifelong_manifest(
 
     parts: list[dict[str, object]] = []
     timeline = 0.0
-    for relative, segments in _prepare_many(prepare, files):
+    for relative, segments in _prepare_many(prepare, files, on_progress):
         for index, (start, end, path) in enumerate(segments):
             parts.append(
                 _path_part(
@@ -415,6 +428,7 @@ def _openeqa_manifest(
     limit: Limit,
     offset: int,
     announce: Callable[[str], None] | None,
+    on_progress: ProgressCallback | None = None,
 ) -> dict[str, list[dict[str, object]]]:
     from mindbridge.benchmarks.openeqa import load_openeqa
 
@@ -438,7 +452,7 @@ def _openeqa_manifest(
             for index, (start, end, path) in enumerate(segments)
         ]
 
-    return dict(_prepare_many(prepare, episodes))
+    return dict(_prepare_many(prepare, episodes, on_progress))
 
 
 def _openeqa_episode(media_root: Path, split: str, episode: str) -> Path:
@@ -553,72 +567,6 @@ def _segments(
     return _segment_video(source, _grid(duration, ()), cache, announce)
 
 
-def _egolife_manifest(
-    task_name: str,
-    dataset: Path,
-    media_root: Path,
-    cache: Path,
-    limit: Limit,
-    offset: int,
-    announce: Callable[[str], None] | None,
-) -> dict[str, list[dict[str, object]]]:
-    """Map every EgoLife clip preceding the query horizon to one re-encoded segment.
-
-    The release publishes 20 fps 1408x1408 clips, so a single 30 s clip reaches an inline model
-    route as roughly 19 MiB of base64 -- over the 20 MiB per-item cap for 1175 of the 2090 clips a
-    200-question EgoLifeQA slice ingests, which costs those memories their video vector without
-    failing the write. Every other video task already answers this by re-encoding through
-    `_VIDEO_FILTER` (fps=1, at most 640x360); routing EgoLife the same way takes one measured clip
-    from 14.1 MB to 1.3 MB. Each source file is one clip, so the boundary list is a single value
-    and the causal window stays the one the filename declares.
-    """
-    horizons: dict[str, int]
-    if task_name == "egolifeqa":
-        from mindbridge.benchmarks.egolife_qa import load_egolife_qa
-
-        selected = _selected(load_egolife_qa(dataset), limit, offset)
-        horizons = {"A1_JAKE": max(question.query_offset_ms for question in selected)}
-    else:
-        from mindbridge.benchmarks.egomem_reason import load_egomem_reason
-
-        horizons = {}
-        for question in _selected(load_egomem_reason(dataset), limit, offset):
-            horizons[question.identity] = max(
-                horizons.get(question.identity, 0), question.query_offset_ms
-            )
-    units: dict[str, list[dict[str, object]]] = {}
-    jobs: list[tuple[str, Path, float, float]] = []
-    for identity, horizon_ms in sorted(horizons.items()):
-        _component(identity)
-        identity_jobs = []
-        for path in sorted((media_root / identity).glob("DAY*/*.mp4")):
-            start = _egolife_start(path)
-            end = start + _SEGMENT_SECONDS
-            if end * 1_000 > horizon_ms:
-                continue
-            identity_jobs.append((identity, path, start, end))
-        if not identity_jobs:
-            raise FileNotFoundError(
-                f"no complete EgoLife clip for {identity} precedes the selected query horizon"
-            )
-        units[identity] = []
-        jobs.extend(identity_jobs)
-
-    def prepare(job: tuple[str, Path, float, float]) -> tuple[str, dict[str, object]]:
-        identity, path, start, end = job
-        segments = _segment_video(
-            path,
-            (float(_SEGMENT_SECONDS),),
-            cache / _component(identity),
-            announce,
-        )
-        return identity, _path_part(segments[0][2], path.stem, start, end)
-
-    for identity, part in _prepare_many(prepare, jobs):
-        units[identity].append(part)
-    return units
-
-
 def _supermemory_manifest(
     dataset: Path,
     media_root: Path,
@@ -627,6 +575,7 @@ def _supermemory_manifest(
     limit: Limit,
     offset: int,
     announce: Callable[[str], None] | None,
+    on_progress: ProgressCallback | None = None,
 ) -> dict[str, list[dict[str, object]]]:
     questions = _supermemory_questions(dataset, limit, offset)
     starts = _supermemory_starts(dataset, 1)
@@ -685,7 +634,9 @@ def _supermemory_manifest(
             previous = stop
         return tuple(prepared)
 
-    parts = [part for prepared in _prepare_many(prepare, video_ids) for part in prepared]
+    parts = [
+        part for prepared in _prepare_many(prepare, video_ids, on_progress) for part in prepared
+    ]
     if not parts:
         raise FileNotFoundError("SuperMemory-VQA selected no released video or transcript media")
     parts.sort(key=lambda part: (_number(part["end_seconds"]), str(part["source_id"])))
@@ -1065,15 +1016,6 @@ def _find_media(root: Path, *names: str) -> Path:
     return _MediaFinder(root)(*names)
 
 
-def _egolife_start(path: Path) -> float:
-    from mindbridge.benchmarks.egolife_qa import egolife_timecode_offset_ms
-
-    match = _EGOLIFE_NAME.fullmatch(path.stem)
-    if match is None:
-        raise ValueError(f"invalid EgoLife video name: {path.name}")
-    return egolife_timecode_offset_ms(int(match.group(1)), match.group(2)) / 1_000
-
-
 def _grid(end: float, forced: Sequence[float]) -> tuple[float, ...]:
     if end <= 0:
         raise ValueError("selected video horizon must be positive")
@@ -1189,7 +1131,7 @@ def _cached_segments(
         else:
             # With nothing to cut, the segment muxer is not just unnecessary but wrong: given no
             # `-segment_times` it splits at every keyframe it happens to see, and `-tune
-            # zerolatency` emits them often. One 30 s EgoLife clip came back as 13 + 17 frames.
+            # zerolatency` emits them often. One 30 s clip came back as 13 + 17 frames.
             # A single boundary means one output file, which is what any source at or below one
             # segment length asks for.
             command.append(str(working / "segment-00000.mp4"))

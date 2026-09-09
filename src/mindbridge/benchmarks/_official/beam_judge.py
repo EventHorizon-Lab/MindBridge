@@ -18,19 +18,16 @@ reproduced deliberately rather than tidied up:
   "partial compliance" verdict truncates to 0. Only `event_ordering` uses
   `float(...)` and keeps the half point.
 
-Not reproduced: upstream's `event_ordering` composite
-`final_score = tau_norm x f1`. It needs a second, differently shaped model call
-that semantically aligns the response's event list against the rubric before
-Kendall's tau can be computed, and the runner issues one judge shape per
-question. That composite is reported absent rather than approximated; the
-per-rubric `llm_judge_score` upstream also computes for that category is what
-this module returns.
+The `event_ordering` path also reproduces the release's pairwise LLM alignment,
+F1, normalized Kendall tau, and `final_score = tau_norm x f1` composite.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections.abc import Sequence
 
 # Categories whose per-item accumulation truncates a 0.5 verdict to 0, which is
 # every category except `event_ordering`.
@@ -163,3 +160,69 @@ def parse_rubric_item_score(response: str, category: str) -> float:
         raise ValueError("BEAM judge returned a non-numeric score")
     value = float(score)
     return float(int(value)) if category in _TRUNCATING_CATEGORIES else value
+
+
+def build_event_equivalence_prompt(reference: str, candidate: str) -> tuple[str, str]:
+    """Build the system/user pair used by upstream `llm_equivalence`."""
+    system = (
+        "You are a binary classifier.\n"
+        "If the TWO snippets describe the SAME event/fact, reply **YES**\n"
+        "Otherwise reply **NO**. No extra words.\n"
+        "DO NOT provide any exaplanation."
+    )
+    user = f"First snippet: {reference} \nSecond snippet: {candidate}"
+    return system, user
+
+
+def event_ordering_scores(reference: Sequence[str], system: Sequence[str]) -> dict[str, float]:
+    """Score already-canonicalized event lists like upstream `event_ordering_score`."""
+    reference_list = list(reference)
+    system_list = list(system)
+    true_positive = len(set(reference_list) & set(system_list))
+    false_positive = sum(item not in reference_list for item in system_list)
+    false_negative = sum(item not in system_list for item in reference_list)
+    precision = (
+        true_positive / (true_positive + false_positive) if true_positive + false_positive else 0.0
+    )
+    recall = (
+        true_positive / (true_positive + false_negative) if true_positive + false_negative else 0.0
+    )
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    union = list(dict.fromkeys(reference_list + system_list))
+    tie_rank = len(union) + 1
+
+    def ranks(items: Sequence[str]) -> list[int]:
+        positions = {item: index + 1 for index, item in enumerate(items)}
+        return [positions.get(item, tie_rank) for item in union]
+
+    tau = _kendall_tau_b(ranks(reference_list), ranks(system_list))
+    tau_norm = (tau + 1.0) / 2.0
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "tau_norm": tau_norm,
+        "final_score": tau_norm * f1,
+    }
+
+
+def _kendall_tau_b(left: Sequence[int], right: Sequence[int]) -> float:
+    concordant = discordant = left_ties = right_ties = 0
+    for first in range(len(left)):
+        for second in range(first + 1, len(left)):
+            left_delta = left[first] - left[second]
+            right_delta = right[first] - right[second]
+            if left_delta == 0 and right_delta == 0:
+                continue
+            if left_delta == 0:
+                left_ties += 1
+            elif right_delta == 0:
+                right_ties += 1
+            elif left_delta * right_delta > 0:
+                concordant += 1
+            else:
+                discordant += 1
+    denominator = math.sqrt(
+        (concordant + discordant + left_ties) * (concordant + discordant + right_ties)
+    )
+    return (concordant - discordant) / denominator if denominator else -1.0

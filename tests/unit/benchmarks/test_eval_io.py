@@ -6,7 +6,7 @@ import json
 import os
 import stat
 import zipfile
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 from datetime import datetime, timezone
@@ -46,7 +46,6 @@ from mindbridge.benchmarks.eval_telemetry import (
 from mindbridge.benchmarks.model_config import ModelConfig
 from mindbridge.benchmarks.prepare_media import (
     _OPENEQA_FRAME_RATE,
-    _egolife_manifest,
     _find_media,
     _m3_manifest,
     _openeqa_episode,
@@ -234,64 +233,6 @@ def test_media_lookup_keeps_direct_precedence_and_ambiguous_error(
         _find_media(media, "duplicate.mp4")
     assert str(error.value) == f"expected one of duplicate.mp4 under {media}"
     assert scans == 1
-
-
-def test_egolife_ingests_reencoded_segments_at_the_declared_causal_window(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    dataset = tmp_path / "EgoLifeQA_A1_JAKE.json"
-    dataset.write_text(
-        json.dumps(
-            [
-                {
-                    "ID": "q1",
-                    "query_time": {"date": "DAY1", "time": "00003000"},
-                    "type": "EntityLog",
-                    "need_audio": False,
-                    "need_name": False,
-                    "last_time": False,
-                    "question": "Where is it?",
-                    "choice_a": "a",
-                    "choice_b": "b",
-                    "choice_c": "c",
-                    "choice_d": "d",
-                    "answer": "A",
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
-    day = tmp_path / "media" / "A1_JAKE" / "DAY1"
-    day.mkdir(parents=True)
-    source = day / "DAY1_A1_JAKE_00000000.mp4"
-    source.write_bytes(b"video")
-    requested: list[tuple[Path, tuple[float, ...]]] = []
-
-    def segment(
-        source_path: Path, boundaries: tuple[float, ...], cache: Path, _announce: object
-    ) -> tuple[tuple[float, float, Path], ...]:
-        requested.append((source_path, boundaries))
-        prepared = cache / "prepared.mp4"
-        prepared.parent.mkdir(parents=True, exist_ok=True)
-        prepared.write_bytes(b"reduced")
-        return ((0.0, boundaries[-1], prepared),)
-
-    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._segment_video", segment)
-    units = _egolife_manifest(
-        "egolifeqa", dataset, tmp_path / "media", tmp_path / "cache", None, 0, None
-    )
-
-    # One re-encode per source clip, and the indexed part is the reduced copy rather than the
-    # 20 fps original -- while the causal window still comes from the filename's timecode.
-    assert requested == [(source, (30.0,))]
-    assert units["A1_JAKE"] == [
-        {
-            "path": str((tmp_path / "cache" / "A1_JAKE" / "prepared.mp4").resolve()),
-            "source_id": "DAY1_A1_JAKE_00000000",
-            "start_seconds": 0.0,
-            "end_seconds": 30.0,
-        }
-    ]
 
 
 def test_evaluation_digest_tracks_media_root_content(tmp_path: Path) -> None:
@@ -528,6 +469,52 @@ def test_lifelong_preparation_builds_one_ordered_segment_timeline(
     assert [part["end_seconds"] for part in parts] == [12.0, 19.0]
 
 
+def test_media_preparation_reports_sources_without_duplicate_segment_announcements(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    media = tmp_path / "media"
+    media.mkdir()
+    for name in ("first.mp4", "second.mp4"):
+        (media / name).write_bytes(b"video")
+    announcements: list[str] = []
+    progress: list[tuple[int, int]] = []
+
+    def segments(
+        source: Path, cache: Path, announce: Callable[[str], None] | None
+    ) -> tuple[tuple[float, float, Path], ...]:
+        assert announce is None
+        return ((0.0, 1.0, cache / source.name),)
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._segments", segments)
+    spec = TaskSpec(
+        "mm-lifelong-fixture",
+        "MM-Lifelong",
+        "fixture.json",
+        "v1",
+        "owner/repo",
+        "0" * 40,
+        variant="day_test",
+        media_source=MediaSource("fixture-media"),
+    )
+
+    manifest = prepare_task_media(
+        spec,
+        root=tmp_path,
+        dataset_path=tmp_path / "fixture.json",
+        media_root=media,
+        manifest=None,
+        limit=None,
+        offset=0,
+        download=False,
+        announce=announcements.append,
+        on_progress=lambda completed, total: progress.append((completed, total)),
+    )
+
+    assert manifest is not None
+    assert progress == [(0, 2), (1, 2), (2, 2)]
+    assert announcements == []
+
+
 def test_memory_digest_hashes_unique_media_in_parallel(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -632,7 +619,7 @@ def test_single_boundary_segmentation_avoids_the_segment_muxer(
 
     # Asked for one whole clip, ffmpeg must write one named output. Handing this to the segment
     # muxer without `-segment_times` makes it split at every keyframe instead, which turned one
-    # 30 s EgoLife clip into 13 + 17 frames and failed the write.
+    # 30 s clip into 13 + 17 frames and failed the write.
     prepared = _segment_video(source, (30.0,), tmp_path / "cache", None)
 
     assert len(prepared) == 1

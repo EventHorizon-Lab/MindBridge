@@ -277,7 +277,7 @@ benchmark:
     # task_data:
     #   clbench: /corpus/clbench/custom.json
     # media_root:
-    #   egolifeqa: /corpus/egolife/videos
+    #   video-mme-v2: /corpus/video-mme-v2/videos
     # media_manifest: /corpus/.benchmarks/results/prepared/media-manifest.jsonl
 
     # Zero-shot is the only supported setting for these benchmarks.

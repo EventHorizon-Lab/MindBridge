@@ -1,19 +1,16 @@
 """Official Video-MME-v2 adapter, production-path runner, and grouped non-linear scorer.
 
-Video-MME-v2 is a separate benchmark from Video-MME, not a newer split of it, so it gets its
-own adapter rather than widening `video_mme`: the option set is A-H instead of A-D, `options`
-arrives as one newline-joined string instead of a list, the short/medium/long bands are gone,
-and the headline number is a group score rather than an accuracy.
+The option set is A-H, `options` arrives as one newline-joined string, and the headline number is
+a four-question group score rather than question accuracy.
 
 The unit of scoring is a *group* of four questions over one video, and the released evaluator
 slices groups positionally (`all_groups[i // 4]`). That is only safe because the release
 happens to order its rows four-per-video; this adapter turns that positional accident into a
 checked invariant so a subset run cannot silently produce a meaningless rating.
 
-Scores here are on the released evaluator's 0-100 scale rather than the 0-1 fractions
-`video_mme` reports. Reproducing `_rating.json` and `_acc.json` cell for cell is the point of
-this module, and mixing units inside one metrics object is how a leaderboard number gets
-misquoted by a factor of a hundred.
+Scores here are on the released evaluator's 0-100 scale. Reproducing `_rating.json` and
+`_acc.json` cell for cell is the point of this module, and mixing units inside one metrics object
+is how a leaderboard number gets misquoted by a factor of a hundred.
 """
 
 from __future__ import annotations
@@ -154,8 +151,8 @@ class VideoMMEV2QuestionResult(ContractModel):
     mindbridge_error_code: NonEmptyString | None = None
     # One ingest covers the whole video before any of its four questions is asked, so every
     # question in a group carries the same count. A non-zero count marks a group answered over
-    # incomplete memory, which matters more here than in `video_mme`: one missing segment can
-    # break a dependency chain and cost the whole group its score, not one question its point.
+    # incomplete memory: one missing segment can break a dependency chain and cost the whole
+    # group its score, not one question its point.
     mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
 
@@ -197,9 +194,7 @@ class VideoMMEV2Accuracy(ContractModel):
     what the released `get_final_acc` writes to disk. `answered_accuracy` is the answered-only
     number the same script prints as "Simple accuracy (valid only)".
 
-    Note the naming runs opposite to `video_mme`, where `accuracy` is the answered-only figure
-    and `strict_accuracy` the floor. The official artifacts disagree between the two benchmarks
-    and matching each one's own release is what keeps a quoted number checkable.
+    Matching the artifact's exact `accuracy` naming and scale keeps quoted values checkable.
     """
 
     question_count: int = Field(gt=0)

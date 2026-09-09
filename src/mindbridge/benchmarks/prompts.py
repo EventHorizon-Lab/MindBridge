@@ -26,14 +26,6 @@ class PromptSpec:
     refusal: str | None = None
 
 
-EGOMEM_REASON_QUERY_PROMPT = PromptSpec(
-    name="egomem_reason_query",
-    version="egomem_reason_query_v1",
-    purpose="Add the official query-time reference to an EgoMemReason question.",
-    used_by="mindbridge.benchmarks.egolife_runner._answer_egomem_question",
-    text="Query time reference: {query_time}\n{question_with_options}",
-)
-
 MEMLENS_QUERY_PROMPT = PromptSpec(
     name="memlens_query",
     version="memlens_query_v2",
@@ -43,18 +35,6 @@ MEMLENS_QUERY_PROMPT = PromptSpec(
         '{question}\n\nIf the memories are insufficient, answer exactly "Insufficient information".'
     ),
     refusal="Insufficient information",
-)
-
-VIDEO_MME_QUERY_PROMPT = PromptSpec(
-    name="video_mme_query",
-    version="video_mme_query_v1",
-    purpose="Apply the official Video-MME multiple-choice answer instruction.",
-    used_by="mindbridge.benchmarks.video_mme._answer_question",
-    text=(
-        "Select the best answer to the following multiple-choice question based on the video. "
-        "Respond with only the letter (A, B, C, or D) of the correct option.\n"
-        "{question}\n{options}\nThe best answer is:"
-    ),
 )
 
 VIDEO_MME_V2_QUERY_PROMPT = PromptSpec(
@@ -342,9 +322,7 @@ PERSONAMEM_V3_QUERY_PROMPT = PromptSpec(
 )
 
 BENCHMARK_PROMPTS = (
-    EGOMEM_REASON_QUERY_PROMPT,
     MEMLENS_QUERY_PROMPT,
-    VIDEO_MME_QUERY_PROMPT,
     VIDEO_MME_V2_QUERY_PROMPT,
     EGOTEMPO_QUERY_PROMPT,
     OPENEQA_QUERY_PROMPT,

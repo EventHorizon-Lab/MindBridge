@@ -1026,3 +1026,74 @@ def test_longmemeval_reports_no_gold_evidence_when_the_release_marks_no_turn(
 
     assert question.metadata["evidence_ids"] == ()
     assert question.metadata["answer_session_ids"] == ("s1",)
+
+
+def test_worldmemarena_loads_causal_checkpoint_qa_without_leaking_gold_memories(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "worldmemarena"
+    sample = dataset / "agent" / "gui" / "css" / "css_01.json"
+    image = sample.parent / "images" / "css_01" / "frame.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"png")
+    _write(
+        sample,
+        {
+            "sample_id": "css_01",
+            "sessions": [
+                {
+                    "_v2_session_id": "S02",
+                    "dialogue": [
+                        {
+                            "role": "user",
+                            "content": "",
+                            "attachments": [
+                                {
+                                    "image_id": "img_1",
+                                    "file_path": "images/css_01/frame.png",
+                                    "caption": "a blue page",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "_v2_session_id": "S04",
+                    "dialogue": [{"role": "assistant", "content": "later", "attachments": []}],
+                },
+            ],
+            "memory_points": [
+                {"memory_points": [{"memory_id": "mp_S02_1", "memory_content": "blue"}]}
+            ],
+            "qa_checkpoints": [
+                {
+                    "checkpoint_id": "cp1",
+                    "covered_sessions": ["S02"],
+                    "questions": [
+                        {
+                            "question": "What color?",
+                            "answer": "blue",
+                            "question_type": "visual_factual_recall",
+                            "question_type_abbrev": "VFR",
+                            "difficulty": "easy",
+                            "evidence": [{"memory_id": "mp_S02_1"}, {"image_id": "img_1"}],
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    unit = load_task(
+        TASKS["worldmemarena"], root=tmp_path, dataset_path=dataset, verify_digest=False
+    ).units[0]
+
+    assert tuple(item.source_id for item in unit.memories) == (
+        "css_01:S02:T0000",
+        "img_1",
+        "css_01:S04:T0000",
+    )
+    assert unit.questions[0].cutoff_seconds == 100_000.0
+    assert unit.questions[0].metadata["evidence_ids"] == ("img_1",)
+    assert unit.questions[0].metadata["unresolved_evidence_ids"] == ("mp_S02_1",)
+    assert unit.questions[0].metadata["gold_evidence_contents"] == ("blue", "a blue page")

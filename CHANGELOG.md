@@ -10,6 +10,10 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- `mindbridge-bench eval` support for WorldMemArena checkpoint QA using pinned Hugging Face data
+  and upstream protocol revisions. It preserves checkpoint cutoffs and the official
+  Correct/Hallucination/Omission, F1, and BLEU-1 metrics. WorldMemArena's separate memory-snapshot
+  and evidence-coverage judge metrics remain explicitly unavailable instead of being approximated.
 - `mindbridge-bench eval` now persists and can report each task as it finishes, instead of holding
   a whole multi-task run until the last one is done. Every run appends `samples.partial.jsonl` as
   each task stops answering and removes it once the real artifacts land, so an interruption during
@@ -396,6 +400,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- Audited `mindbridge-bench eval` against the pinned Video-MME-v2, BEAM, PersonaMem-v3, and
+  OpenEQA evaluators. Video-MME-v2 now reports official 0--100 accuracy and grouped rating; BEAM
+  uses its event-equivalence and ordering composite; OpenEQA maps the released 1--5 judge mark to
+  the official 0--100 score; PersonaMem-v3 uses its released ranking gains and metric names and
+  withholds the micro headline while unsupported task protocols leave coverage incomplete.
 - **Breaking:** benchmark result schema v11 separates public `search_e2e` from
   `ask_retrieval_core`, measures caller answer latency and TTFT before concurrency admission,
   computes concurrent durations and throughput from interval unions, excludes cached samples from
@@ -990,6 +999,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Removed
 
+- Video-MME, EgoLifeQA, EgoMemReason, and MemEye benchmark tasks, adapters, media preparation, and
+  the EgoMemReason submission artifact. Video-MME-v2 remains supported.
 - The custom OpenAI HTTP client, single-key REST authenticator, and CLI TLS termination.
 - The generic product CLI/server, legacy `mindbridge.sdk` re-export, URL downloader, provider
   credential configuration, combined `ModelBackend`, and custom FunASR vLLM compatibility path.
