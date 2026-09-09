@@ -7,6 +7,7 @@ import math
 import shutil
 import sqlite3
 from collections.abc import Sequence
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -186,7 +187,7 @@ def test_new_raw_parts_store_digest_bound_selectors_without_source_text(tmp_path
     with _memory(tmp_path) as memory:
         record = memory.add(source, occurred_at=REFERENCE)
 
-        with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
             selector_columns = {
                 str(row[1])
                 for row in connection.execute("PRAGMA table_info(embedding_text_selectors)")
@@ -218,7 +219,7 @@ def test_new_raw_parts_store_digest_bound_selectors_without_source_text(tmp_path
         assert all(source[int(row[1]) : int(row[2])] for row in pieces)
 
         assert memory.delete(record.id) is True
-        with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
             assert (
                 connection.execute("SELECT COUNT(*) FROM embedding_text_selectors").fetchone()[0]
                 == 0
@@ -303,7 +304,7 @@ def test_partial_sources_are_explicit_opt_in_and_default_skips_selector_reads(
             reference_at=REFERENCE,
         )
         assert reads == []
-        with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
             failures_after_default = connection.execute(
                 "SELECT COUNT(*) FROM query_failures"
             ).fetchone()[0]
@@ -438,7 +439,7 @@ def test_scope_filtering_happens_before_excerpt_selection(tmp_path: Path) -> Non
 def test_parent_content_tampering_disables_only_the_excerpt(tmp_path: Path) -> None:
     with _memory(tmp_path) as memory:
         record = memory.add(_long_source(), occurred_at=REFERENCE)
-        with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
             connection.execute(
                 "UPDATE memory_records SET content = content || ' tampered' WHERE memory_id = ?",
                 (record.id,),
@@ -485,7 +486,7 @@ def test_selector_tampering_disables_excerpt_but_preserves_full_memory(
 ) -> None:
     with _memory(tmp_path) as memory:
         record = memory.add(_long_source(), occurred_at=REFERENCE)
-        with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
             connection.execute(statement, parameters)
             connection.commit()
 
@@ -514,7 +515,7 @@ def test_schema17_migration_is_empty_idempotent_and_index_rebuild_does_not_embed
     embedder = _PartEmbedder()
     with Memory(tmp_path, embedder=embedder, minimum_relevance=0.0) as memory:
         memory.add(_long_source(), occurred_at=REFERENCE)
-    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
         embedding_count = connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
         connection.executescript(
             """
@@ -529,7 +530,7 @@ def test_schema17_migration_is_empty_idempotent_and_index_rebuild_does_not_embed
         assert reopened.calls == []
     with LocalStore(tmp_path):
         pass
-    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
         assert (
             connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == embedding_count
@@ -542,7 +543,7 @@ def test_schema17_migration_is_empty_idempotent_and_index_rebuild_does_not_embed
     rebuild = _PartEmbedder()
     with Memory(tmp_path, embedder=rebuild, minimum_relevance=0.0):
         assert rebuild.calls == []
-    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
         assert (
             connection.execute("SELECT COUNT(*) FROM embedding_text_selectors").fetchone()[0] == 0
         )
@@ -551,7 +552,7 @@ def test_schema17_migration_is_empty_idempotent_and_index_rebuild_does_not_embed
 def test_partial_schema18_migration_rolls_back(tmp_path: Path) -> None:
     with LocalStore(tmp_path):
         pass
-    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
         connection.executescript(
             """
             DROP TABLE embedding_text_span_pieces;
@@ -561,7 +562,7 @@ def test_partial_schema18_migration_rolls_back(tmp_path: Path) -> None:
 
     with pytest.raises(UnsupportedSchemaError, match="incomplete v18 text selector projection"):
         LocalStore(tmp_path)
-    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert (
             connection.execute(
@@ -574,7 +575,7 @@ def test_partial_schema18_migration_rolls_back(tmp_path: Path) -> None:
 def test_constraint_free_schema18_tables_are_rejected_without_upgrading(tmp_path: Path) -> None:
     with LocalStore(tmp_path):
         pass
-    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
         connection.executescript(
             """
             DROP TABLE embedding_text_span_pieces;
@@ -608,7 +609,7 @@ def test_constraint_free_schema18_tables_are_rejected_without_upgrading(tmp_path
     with pytest.raises(UnsupportedSchemaError, match="invalid embedding_text_selectors table"):
         LocalStore(tmp_path)
 
-    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
         after = tuple(
             connection.execute(
                 "SELECT type, name, sql FROM sqlite_master "
@@ -618,11 +619,11 @@ def test_constraint_free_schema18_tables_are_rejected_without_upgrading(tmp_path
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
     assert after == before
 
-    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
         connection.execute("PRAGMA user_version = 18")
     with pytest.raises(UnsupportedSchemaError, match="invalid embedding_text_selectors table"):
         LocalStore(tmp_path)
-    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
         assert (
             tuple(

@@ -698,6 +698,10 @@ def test_video_segment_cache_rebuilds_a_nonempty_entry_without_video(
         "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
         lambda path: path.is_file() and path.read_bytes() == b"video",
     )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_structural_video",
+        lambda path: path.is_file() and path.read_bytes() == b"video",
+    )
     calls = 0
 
     def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
@@ -814,6 +818,10 @@ def test_partial_cache_repair_does_not_replace_a_valid_sibling(
     (target / "segment-00001.mp4").write_bytes(b"audio-only")
     monkeypatch.setattr(
         "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
+        lambda path: path.is_file() and path.read_bytes() in {b"valid-sibling", b"replacement"},
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_structural_video",
         lambda path: path.is_file() and path.read_bytes() in {b"valid-sibling", b"replacement"},
     )
 

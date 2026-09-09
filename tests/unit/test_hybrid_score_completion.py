@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import struct
 from collections.abc import Iterator, Sequence
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from random import Random
@@ -295,7 +296,7 @@ def test_corrupt_persisted_vector_uses_the_storage_error_path(
             "lexical_search",
             lambda *_args, **_kwargs: (_lexical_hit(record.id),),
         )
-        with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
             connection.execute(
                 "UPDATE embeddings SET vector = ? WHERE embedding_id = ?",
                 (struct.pack("<2f", float("nan"), 0.0), record.id),
