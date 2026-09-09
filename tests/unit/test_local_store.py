@@ -3628,6 +3628,76 @@ def test_clause_rollback_retires_only_its_conjunction_and_preserves_a_later_alte
         assert active_sizes == [(1,)]
 
 
+def test_deleting_one_alternative_keeps_a_claim_supported_by_a_hidden_trait(
+    tmp_path: Path,
+) -> None:
+    """A supported-but-hidden source outside the withdrawal still grounds what cites it."""
+    recorded_at = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
+    trait = replace(
+        _memory("trait", "the user is patient", created_at=recorded_at),
+        context=MemoryContext(
+            kind=MemoryKind.TRAIT,
+            basis=EvidenceBasis.MODEL_INFERENCE,
+            confidence=0.8,
+            valid_from=None,
+            valid_until=None,
+            recorded_at=recorded_at,
+            subject="user",
+            predicate="temperament",
+            value="patient",
+        ),
+    )
+    claim = _joint_state_memory("claim", ("trait",), confidence=0.8, recorded_at=recorded_at)
+    assert claim.context is not None
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory("observation"), _memory("other"), trait))
+        # One evidence group leaves the trait below its two-group visibility threshold.
+        store.add_memory_evidence("trait", "observation", confidence=0.8, recorded_at=recorded_at)
+        store.write_memories((replace(claim, context=replace(claim.context, evidence_ids=())),))
+        store.add_memory_evidence("claim", "trait", confidence=0.8, recorded_at=recorded_at)
+        store.add_memory_evidence("claim", "other", confidence=0.7, recorded_at=recorded_at)
+
+        removed, _projection = store.naming_projection_after_delete("other")
+        assert removed == ("other",)
+        assert store.delete_memory("other") is True
+        current = store.read_memory("claim")
+        assert current is not None and current.context is not None
+        assert current.context.evidence_ids == ("trait",)
+
+
+def test_an_operation_whose_output_was_deleted_can_still_be_rolled_back(
+    tmp_path: Path,
+) -> None:
+    recorded_at = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
+    members = ("source-a", "source-b")
+    derived = _joint_state_memory("derived", members, confidence=0.6, recorded_at=recorded_at)
+    assert derived.context is not None
+    without_evidence = replace(derived, context=replace(derived.context, evidence_ids=()))
+    with LocalStore(tmp_path) as store:
+        store.write_memories((_memory("source-a"), _memory("source-b"), without_evidence))
+        operation = _apply_joint_clause_operation(
+            store,
+            derived,
+            members,
+            confidence=0.6,
+            applied_at=recorded_at + timedelta(minutes=1),
+            key="joint-create",
+        )
+        assert store.delete_memory("derived") is True
+
+        reverted, _assets = store.rollback_operation(
+            operation.operation_id,
+            rolled_back_at=recorded_at + timedelta(minutes=3),
+            delete_memory_ids=("derived",),
+            reverse_clause_changes=operation.clause_changes,
+        )
+
+        # The deletion already was the complete inverse; the operation must still close.
+        assert reverted is True
+        # `read_operations` lists active operations only, so a closed one is gone from it.
+        assert store.read_operations(operation_key="joint-create") == ()
+
+
 def test_joint_confidence_is_one_assessment_and_does_not_inflate_singleton_votes(
     tmp_path: Path,
 ) -> None:

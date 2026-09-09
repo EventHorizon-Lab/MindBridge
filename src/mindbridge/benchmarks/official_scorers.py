@@ -58,7 +58,7 @@ from mindbridge.benchmarks._official.openeqa_llm_match import (
 )
 from mindbridge.benchmarks.personamem_v3 import RANKING_TASK_TYPES
 
-SCORER_VERSION = "official_scorers_v3"
+SCORER_VERSION = "official_scorers_v4"
 
 
 class _Stemmer(Protocol):
@@ -863,7 +863,7 @@ def _personamem_local(prediction: str, metadata: Mapping[str, object]) -> dict[s
         "mrr": pm3.mrr(ranked, positives),
         "target_only_ndcg@5": target_only,
         # Deprecated compatibility alias for artifacts created before
-        # official_scorers_v3. It is intentionally absent from
+        # official_scorers_v4. It is intentionally absent from
         # `_OFFICIAL_METRICS` because this target-only formula is not the
         # current upstream graded metric.
         "ndcg_graded@5": target_only,

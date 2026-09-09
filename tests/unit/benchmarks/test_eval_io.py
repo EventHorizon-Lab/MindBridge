@@ -712,6 +712,9 @@ def test_video_segment_cache_rebuilds_a_nonempty_entry_without_video(
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._run_ffmpeg", run)
     prepared = _segment_video(source, (1.0,), tmp_path / "cache", None)
     prepared[0][2].write_bytes(b"audio-only-but-nonempty")
+    # A completed entry is trusted by its marker; an entry whose completion never landed is
+    # probed again and repaired.
+    (prepared[0][2].parent / ".complete").unlink()
 
     repaired = _segment_video(source, (1.0,), tmp_path / "cache", None)
 

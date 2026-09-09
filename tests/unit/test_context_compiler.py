@@ -592,6 +592,19 @@ def test_an_unavailable_conflict_counterpart_cannot_fall_back_to_flat_selection(
     )
 
     assert bundle.hits == ()
+    # Withheld, not lost: the top-ranked hit is in no section and not in `omitted`, so the
+    # bundle has to say why it is missing.
+    assert [
+        unknown.detail
+        for unknown in bundle.unknowns
+        if unknown.kind is ContextUnknownKind.EVIDENCE_UNAVAILABLE
+    ] == [
+        "1 ranked assertions were withheld because a conflicting assertion's required evidence"
+        " was unavailable"
+    ]
+    assert not any(
+        unknown.kind is ContextUnknownKind.BUDGET_EXCLUDED for unknown in bundle.unknowns
+    )
 
 
 def test_a_conflict_no_included_memory_asserts_is_not_this_bundles_disagreement() -> None:

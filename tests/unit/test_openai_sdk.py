@@ -4134,24 +4134,37 @@ def test_a_malformed_proposal_does_not_discard_its_valid_siblings() -> None:
 @pytest.mark.parametrize(
     "aliases",
     (
+        None,
         (),
         ("observation_0", "observation_0"),
         ("observation_1",),
     ),
 )
-def test_formation_rejects_invalid_witness_aliases(aliases: tuple[str, ...]) -> None:
+def test_formation_drops_only_the_proposal_with_invalid_witness_aliases(
+    aliases: tuple[str, ...] | None,
+) -> None:
+    """Wrong or missing witnesses make one proposal ungroundable, not the whole response.
+
+    The source observation is already committed when formation runs, so raising here would fail
+    a write that succeeded and the retry would fail the same way; the sibling proposal that
+    cites its witnesses correctly must still land.
+    """
+    bad: dict[str, object] = {"kind": "event", "content": "A real event.", "confidence": 0.9}
+    if aliases is not None:
+        bad["evidence_observation_ids"] = list(aliases)
     content = json.dumps(
         {
             "items": [
                 {
                     "observation_id": "observation_0",
                     "proposals": [
+                        bad,
                         {
                             "kind": "event",
-                            "content": "A real event.",
+                            "content": "A grounded event.",
                             "confidence": 0.9,
-                            "evidence_observation_ids": list(aliases),
-                        }
+                            "evidence_observation_ids": ["observation_0"],
+                        },
                     ],
                 }
             ]
@@ -4164,9 +4177,19 @@ def test_formation_rejects_invalid_witness_aliases(aliases: tuple[str, ...]) -> 
             context=ObservationContext(source_id="user"),
         ),
     )
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
 
-    with pytest.raises(openai_backend._InvalidStructuredResponse):
-        openai_backend._formation_results(content, inputs)
+    with provider.get_tracer("test").start_as_current_span("formation"):
+        results = openai_backend._formation_results(content, inputs)
+
+    assert [proposal.content for proposal in results[0]] == ["A grounded event."]
+    assert [
+        span.attributes[FORMATION_PROPOSALS_DROPPED]
+        for span in exporter.get_finished_spans()
+        if span.attributes is not None and FORMATION_PROPOSALS_DROPPED in span.attributes
+    ] == [1]
 
 
 @pytest.mark.parametrize(

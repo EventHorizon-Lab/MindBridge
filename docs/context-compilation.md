@@ -257,6 +257,12 @@ longer reads by score is worse than one missing a section. So with eight section
 `max_items=3` the selection is exactly the top three by rank; the default `max_items=24` leaves
 twelve slots for the floor round and every spanned section still gets one.
 
+The floor round belongs to the flat selector only. When any candidate is a derived assertion
+whose support has to travel with it, or the window holds a conflict, the compiler admits whole
+evidence closures strictly by rank: an anchor's support must not lose its seat to a lower-ranked
+singleton merely because the closure spans several slots, so a section can then go unseated that
+the flat selector would have given one slot.
+
 Remaining slots are filled by score. One oversized hit does not close the bundle: a cheaper
 lower-ranked candidate can still fit. `omitted` counts every candidate that passed the filters
 but did not fit, and `chars` is what the included hits cost.

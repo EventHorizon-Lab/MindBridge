@@ -36,6 +36,7 @@ _VIDEO_FILTER = f"fps=1,{_VIDEO_SCALE_FILTER}"
 # frame: consumers with a stricter processor must report that limitation at their own boundary.
 _VIDEO_FILTER_NATIVE = _VIDEO_SCALE_FILTER
 _MIN_PREPROCESSABLE_VIDEO_FRAMES = 2
+_COMPLETE_MARKER = ".complete"
 # The concat demuxer has no following packet from which the fps filter can infer
 # the final frame's duration. Passing it through keeps N official frames as N seconds.
 _OPENEQA_VIDEO_FILTER = f"fps=1:eof_action=pass,{_VIDEO_SCALE_FILTER}"
@@ -1186,10 +1187,20 @@ def _cached_segments(
 ) -> tuple[tuple[float, float, Path], ...]:
     target = cache / key
     expected = tuple(target / f"segment-{index:05d}.mp4" for index in range(len(boundaries)))
+    # Every object below is probed with a full decode before it is trusted, and the marker is
+    # written only after all of them passed. A completed entry is then a stat per segment on
+    # later runs instead of a decode per segment, which on a thousand-segment corpus is the
+    # difference between seconds and an hour before the first question is asked.
+    # ponytail: a completed entry corrupted in place is trusted; delete the marker to re-probe.
+    complete = target / _COMPLETE_MARKER
+    if complete.is_file() and all(path.is_file() and path.stat().st_size for path in expected):
+        return _timed_paths(boundaries, expected)
     if all(_has_structural_video(path) for path in expected):
+        complete.touch()
         return _timed_paths(boundaries, expected)
     _reuse_valid_legacy(legacy_paths, expected)
     if all(_has_structural_video(path) for path in expected):
+        complete.touch()
         return _timed_paths(boundaries, expected)
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if announce is not None:
@@ -1205,6 +1216,7 @@ def _cached_segments(
                 os.replace(source_path, target_path)
         if not all(_has_structural_video(path) for path in expected):
             raise RuntimeError(f"video segment cache remained incomplete for {source}")
+        complete.touch()
     finally:
         shutil.rmtree(working)
     return _timed_paths(boundaries, expected)

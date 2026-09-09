@@ -7677,11 +7677,21 @@ def _grounded_affected_memory_ids(  # noqa: C901 - bounded support fixed point
         if source_id in affected_set:
             return source_id in grounded
         if source_id not in outside_grounded:
+            # A record outside the withdrawal's subgraph keeps whatever support it had: a hidden
+            # trait still below its visibility threshold is supported, not unsupported, so it
+            # must keep grounding the alternatives that cite it.
             outside_grounded[source_id] = _is_evidence_root(connection, source_id) or (
                 connection.execute(
                     """
-                    SELECT 1 FROM memory_versions
-                    WHERE memory_id = ? AND retired_at IS NULL AND visible = 1
+                    SELECT 1 FROM memory_versions AS v
+                    WHERE v.memory_id = ? AND v.retired_at IS NULL
+                      AND (
+                        v.visible = 1
+                        OR EXISTS (
+                            SELECT 1 FROM memory_evidence_clauses AS c
+                            WHERE c.memory_id = v.memory_id AND c.retired_at IS NULL
+                        )
+                      )
                     """,
                     (source_id,),
                 ).fetchone()
@@ -8582,6 +8592,20 @@ def _evidence_clause_changes_are_current(
     newer operation makes the older one reversible again without weakening the ABA guard.
     """
     for change in changes:
+        # Deleting the output this operation created cascaded its clause and every version of
+        # it. `_reverse_evidence_clause_changes` treats that deletion as the complete inverse;
+        # the currency guard has to agree, or the operation can never be rolled back.
+        if (
+            connection.execute(
+                """
+                SELECT 1 FROM memory_evidence_clauses
+                WHERE memory_id = ? AND clause_id = ?
+                """,
+                (change.memory_id, change.clause_id),
+            ).fetchone()
+            is None
+        ):
+            continue
         applied = connection.execute(
             """
             SELECT confidence, recorded_at

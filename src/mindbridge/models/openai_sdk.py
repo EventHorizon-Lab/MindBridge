@@ -1958,7 +1958,8 @@ def _formation_results(  # noqa: C901 - validates the strict batch witness envel
         parsed: list[FormationProposal | None] = []
         for value in values:
             if not isinstance(value, dict) or "evidence_observation_ids" not in value:
-                raise _invalid_formation_response()
+                parsed.append(None)
+                continue
             aliases = value["evidence_observation_ids"]
             if (
                 not isinstance(aliases, list)
@@ -1967,7 +1968,9 @@ def _formation_results(  # noqa: C901 - validates the strict batch witness envel
                 or len(set(aliases)) != len(aliases)
                 or observation_id not in aliases
             ):
-                raise _invalid_formation_response()
+                # Wrong witnesses make this one proposal ungroundable, not the whole response.
+                parsed.append(None)
+                continue
             evidence_ids = tuple(
                 inputs[int(alias.removeprefix("observation_"))].memory_id for alias in aliases
             )

@@ -311,9 +311,22 @@ def compile_context(
         len(closure.members) == 1 for closure in closure_by_anchor.values()
     )
     closed_mode = closures is not None and not (all_singletons and not has_conflicts)
-    selected_closures = (
-        _expand_conflict_closures(candidates, closure_by_anchor) if closed_mode else ()
+    selected_closures, peer_withheld = (
+        _expand_conflict_closures(candidates, closure_by_anchor) if closed_mode else ((), 0)
     )
+    if peer_withheld:
+        # Fail-closed is the rule; failing silently is not. The anchor is in no section, not in
+        # `omitted`, and not in the caller's unknowns, so it has to be named here.
+        unknowns = (
+            *unknowns,
+            ContextUnknown(
+                kind=ContextUnknownKind.EVIDENCE_UNAVAILABLE,
+                detail=(
+                    f"{peer_withheld} ranked assertions were withheld because a conflicting"
+                    " assertion's required evidence was unavailable"
+                ),
+            ),
+        )
     sections, selected_excerpts = (
         _select_closures(selected_closures, budget, overhead, excerpt_candidates)
         if closed_mode
@@ -378,7 +391,7 @@ def compile_context(
                 )
             }
         )
-        if selected_closures
+        if closed_mode
         else len(candidates) - len(included) - len(selected_excerpts)
     )
     # Conflict detection reads every candidate the filters kept, not only what the budget bought,
@@ -559,12 +572,17 @@ def _select(
 def _expand_conflict_closures(  # noqa: C901 - fixed-point conflict closure is one graph pass
     candidates: Sequence[SearchHit],
     closures: Mapping[str, EvidenceClosure],
-) -> tuple[EvidenceClosure, ...]:
-    """Make candidate-bounded conflicting representatives co-required with an anchor."""
+) -> tuple[tuple[EvidenceClosure, ...], int]:
+    """Make candidate-bounded conflicting representatives co-required with an anchor.
+
+    Returns the expanded closures and how many anchors were withheld because a conflicting
+    representative had no closure of its own.
+    """
     representatives: dict[str, tuple[str, ...]] = {}
     for conflict in _conflicts(candidates, frozenset(hit.id for hit in candidates)):
         representatives[conflict.lineage_id] = conflict.memory_ids
     expanded = []
+    withheld = 0
     for anchor in candidates:
         closure = closures.get(anchor.id)
         if closure is None:
@@ -600,7 +618,9 @@ def _expand_conflict_closures(  # noqa: C901 - fixed-point conflict closure is o
                     pending.extend(representatives.get(member_context.lineage_id, ()))
         if members:
             expanded.append(EvidenceClosure(anchor, tuple(members.values())))
-    return tuple(expanded)
+        else:
+            withheld += 1
+    return tuple(expanded), withheld
 
 
 def _select_closures(
