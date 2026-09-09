@@ -12,7 +12,15 @@ import sqlite3
 import struct
 import unicodedata
 import uuid
-from collections.abc import Collection, Generator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    Callable,
+    Collection,
+    Generator,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -5377,63 +5385,25 @@ class LocalStore:
             cursor = connection.execute("DELETE FROM store_metadata WHERE key = ?", (key,))
         return cursor.rowcount > 0
 
-    def _initialize_schema(self) -> None:  # noqa: C901 - sequential migrations stay explicit
+    def _initialize_schema(self) -> None:
         with self._connection() as connection:
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            version = _user_version(connection)
             tables = _table_names(connection)
             if version == 0:
                 _create_schema(connection, tables)
             elif version == 1:
                 _migrate_v1(connection, tables)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 2:
-                _migrate_v2(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 3:
-                _migrate_v3(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 4:
-                _migrate_v4(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 5:
-                _migrate_v5(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 6:
-                _migrate_v6(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 7:
-                _migrate_v7(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 8:
-                _migrate_v8(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 9:
-                _migrate_v9(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 10:
-                _migrate_v10(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 11:
-                _migrate_v11(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == _PRE_VISUAL_DESCRIPTION_VERSION:
-                _migrate_visual_descriptions(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 13:
-                _migrate_v13(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 14:
-                _migrate_v14(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 15:
-                _migrate_v15(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 16:
-                _migrate_v16(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version == 17:
-                _migrate_v17(connection)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            # Each step advances `user_version` itself and a failed one rolls back without
+            # advancing it, so the version is re-read between steps rather than assumed. A step
+            # that returns without advancing would otherwise loop here, so it fails as the
+            # unsupported version it left behind.
+            while (step := _MIGRATIONS.get(version := _user_version(connection))) is not None:
+                step(connection)
+                if _user_version(connection) <= version:
+                    raise UnsupportedSchemaError(
+                        f"local schema migration from version {version} did not advance it"
+                    )
+            version = _user_version(connection)
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
                 raise UnsupportedSchemaError(
@@ -6290,6 +6260,10 @@ def _delete_unobserved_identities(
     )
 
 
+def _user_version(connection: sqlite3.Connection) -> int:
+    return int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+
 def _table_names(connection: sqlite3.Connection) -> frozenset[str]:
     rows = connection.execute(
         """
@@ -6813,6 +6787,28 @@ def _migrate_v17(connection: sqlite3.Connection) -> None:
         if connection.in_transaction:
             connection.rollback()
         raise
+
+
+# Each migration keyed by the version it upgrades from. `_migrate_v1` stays out of the table
+# because it also needs the table names read before anything ran.
+_MIGRATIONS: Mapping[int, Callable[[sqlite3.Connection], None]] = {
+    2: _migrate_v2,
+    3: _migrate_v3,
+    4: _migrate_v4,
+    5: _migrate_v5,
+    6: _migrate_v6,
+    7: _migrate_v7,
+    8: _migrate_v8,
+    9: _migrate_v9,
+    10: _migrate_v10,
+    11: _migrate_v11,
+    _PRE_VISUAL_DESCRIPTION_VERSION: _migrate_visual_descriptions,
+    13: _migrate_v13,
+    14: _migrate_v14,
+    15: _migrate_v15,
+    16: _migrate_v16,
+    17: _migrate_v17,
+}
 
 
 def _validate_text_selector_schema(connection: sqlite3.Connection) -> None:

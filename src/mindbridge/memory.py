@@ -32,7 +32,7 @@ from collections.abc import (
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, closing, contextmanager, suppress
 from contextvars import ContextVar, copy_context
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from datetime import date, datetime, time, timedelta, timezone
 from functools import partial
 from itertools import zip_longest
@@ -873,33 +873,14 @@ class Memory:
             config = MemoryConfig()
         elif not isinstance(config, MemoryConfig):
             raise ValidationError("config must be a MemoryConfig value")
+        # The constructor takes exactly these two dataclasses' fields flattened -- pinned by
+        # `test_the_async_facade_mirrors_the_sync_signatures` -- so unpacking them is the whole
+        # translation. A field added to either reaches the constructor without a line here.
         return cls(
             data_dir,
-            embedder=plugins.embedder,
-            answerer=plugins.answerer,
-            transcriber=plugins.transcriber,
-            vision_describer=plugins.vision_describer,
-            face_analyzer=plugins.face_analyzer,
-            former=plugins.former,
-            consolidator=plugins.consolidator,
-            index_speech=config.index_speech,
-            index_quantization=config.index_quantization,
-            retrieval_mode=config.retrieval_mode,
-            minimum_relevance=config.minimum_relevance,
-            ambiguity_margin=config.ambiguity_margin,
-            evidence_budget_chars=config.evidence_budget_chars,
-            decay_half_life_days=config.decay_half_life_days,
-            reinforce_on_answer=config.reinforce_on_answer,
-            speaker_similarity=config.speaker_similarity,
-            speaker_margin=config.speaker_margin,
-            face_similarity=config.face_similarity,
-            face_margin=config.face_margin,
-            identity_link_min_assets=config.identity_link_min_assets,
-            memory_budget_records=config.memory_budget_records,
-            query_failure_window_seconds=config.query_failure_window_seconds,
-            query_failure_history=config.query_failure_history,
-            retention=config.retention,
             tracer=tracer,
+            **{field.name: getattr(plugins, field.name) for field in fields(plugins)},
+            **{field.name: getattr(config, field.name) for field in fields(config)},
         )
 
     @classmethod
@@ -7964,33 +7945,14 @@ class AsyncMemory:
             config = MemoryConfig()
         elif not isinstance(config, MemoryConfig):
             raise ValidationError("config must be a MemoryConfig value")
+        # The constructor takes exactly these two dataclasses' fields flattened -- pinned by
+        # `test_the_async_facade_mirrors_the_sync_signatures` -- so unpacking them is the whole
+        # translation. A field added to either reaches the constructor without a line here.
         return cls(
             data_dir,
-            embedder=plugins.embedder,
-            answerer=plugins.answerer,
-            transcriber=plugins.transcriber,
-            vision_describer=plugins.vision_describer,
-            face_analyzer=plugins.face_analyzer,
-            former=plugins.former,
-            consolidator=plugins.consolidator,
-            index_speech=config.index_speech,
-            index_quantization=config.index_quantization,
-            retrieval_mode=config.retrieval_mode,
-            minimum_relevance=config.minimum_relevance,
-            ambiguity_margin=config.ambiguity_margin,
-            evidence_budget_chars=config.evidence_budget_chars,
-            decay_half_life_days=config.decay_half_life_days,
-            reinforce_on_answer=config.reinforce_on_answer,
-            speaker_similarity=config.speaker_similarity,
-            speaker_margin=config.speaker_margin,
-            face_similarity=config.face_similarity,
-            face_margin=config.face_margin,
-            identity_link_min_assets=config.identity_link_min_assets,
-            memory_budget_records=config.memory_budget_records,
-            query_failure_window_seconds=config.query_failure_window_seconds,
-            query_failure_history=config.query_failure_history,
-            retention=config.retention,
             tracer=tracer,
+            **{field.name: getattr(plugins, field.name) for field in fields(plugins)},
+            **{field.name: getattr(config, field.name) for field in fields(config)},
         )
 
     @classmethod
