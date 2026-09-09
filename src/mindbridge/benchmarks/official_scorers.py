@@ -1013,7 +1013,13 @@ def _locomo_f1(prediction: str, reference: str) -> float:
 
 
 def _es_memeval_prediction(value: str) -> str:
-    """Apply the released QA runner's post-generation cleanup."""
+    """Apply the released QA runner's post-generation cleanup.
+
+    `str.strip("Answer:")` strips the character set `A n s w e r :` from both ends, not the
+    prefix, so `"seven"` becomes `"v"` and `"unknown"` becomes `"unknow"`. The released
+    `qa_experiment.py` does exactly this before its F1 and judge, and comparable numbers require
+    reproducing it rather than correcting it.
+    """
     return value.replace("*", "").replace("#", "").strip("Answer:").strip()
 
 

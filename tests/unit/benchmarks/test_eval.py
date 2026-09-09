@@ -3407,6 +3407,7 @@ def test_eval_config_artifact_records_effective_values_without_credentials(tmp_p
 generation:
   provider: openai
   model: configured-model
+  base_url: https://gateway:url-secret@models.example.test/v1
   api_key: configured-generation-secret
   extra_body:
     auth_token: provider-body-secret
@@ -3466,6 +3467,7 @@ benchmark:
         "credentials": "omitted",
     }
     assert document["product"]["generation"]["model"] == "cli-model"
+    assert document["product"]["generation"]["base_url"] == "https://models.example.test/v1"
     assert document["product"]["generation"]["extra_body"] == {
         "configured": True,
         "values": "omitted",

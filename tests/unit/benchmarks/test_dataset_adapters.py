@@ -1090,12 +1090,8 @@ def test_es_memeval_qa_keeps_session_memory_and_visible_evidence_only(tmp_path: 
         "[2025-01-02]\nSarah: I started painting.\nsupporter: That sounds calming.",
     )
     assert unit.questions[0].metadata["evidence_ids"] == ("conv1",)
-    assert unit.questions[0].metadata["annotation_evidence_ids"] == (
-        "event1",
-        "conv1:1",
-        "conv1:2",
-        "bad:9",
-    )
+    # Event annotations are not memory IDs; a malformed turn label is an unresolved gold ID.
+    assert unit.questions[0].metadata["unresolved_evidence_ids"] == ("bad:9",)
     assert unit.questions[0].reference_at == unit.memories[-1].occurred_at
     assert unit.questions[1].refusal == "unknown"
     assert unit.questions[1].metadata["abstention"] is True

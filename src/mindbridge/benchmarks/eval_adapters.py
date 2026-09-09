@@ -1328,8 +1328,11 @@ def _es_memeval(
                     "question_group": question.group_id,
                     # Upstream's session retrieval evaluator marks a session
                     # relevant when any visible turn ID in it occurs in the
-                    # question's evidence list. Event annotations and malformed
-                    # release IDs are scorer-side data and never enter memory.
+                    # question's evidence list. Event annotations are scorer-side
+                    # data and never enter memory; a turn label that names no
+                    # stored turn is a malformed release ID and is reported the
+                    # way every adapter reports one, so `unresolved_gold_evidence_ids`
+                    # keeps exposing the vocabulary mismatch it exists for.
                     "evidence_ids": tuple(
                         dict.fromkeys(
                             turn_sessions[value]
@@ -1337,7 +1340,11 @@ def _es_memeval(
                             if value in turn_sessions
                         )
                     ),
-                    "annotation_evidence_ids": question.evidence,
+                    "unresolved_evidence_ids": tuple(
+                        value
+                        for value in question.evidence
+                        if value not in turn_sessions and "event" not in value.casefold()
+                    ),
                     "abstention": question.capability == "abstention",
                     "retrieval_granularity": "session",
                 },

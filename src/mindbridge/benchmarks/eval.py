@@ -5213,7 +5213,14 @@ def _secret_free_yaml_value(value: object) -> object:
     if isinstance(value, SecretStr):
         # Defensive fallback for a future credential field whose name is not yet `api_key`.
         return "<redacted>"
+    if isinstance(value, str):
+        # A gateway URL can carry basic-auth userinfo; `base_url` and the raw `--model_args`
+        # string both reach this manifest, so the credential is cut out of the URL itself.
+        return _URL_USERINFO.sub("", value)
     return value
+
+
+_URL_USERINFO = re.compile(r"(?<=://)[^/@\s]+@")
 
 
 def _atomic_replace(files: Sequence[tuple[Path, bytes]]) -> None:
