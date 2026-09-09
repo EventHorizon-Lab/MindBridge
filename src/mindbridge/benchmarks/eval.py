@@ -58,6 +58,7 @@ from mindbridge import (
     FunASRTranscriber,
     IndexUnavailableError,
     JinaOmniEmbedder,
+    Memory,
     MemoryConfig,
     MemoryType,
     MindBridgeConfig,
@@ -1286,16 +1287,18 @@ class _BackendPool:
         # `fields(MemoryPlugins)` instead.
         policy = {entry.name: getattr(self._settings, entry.name) for entry in fields(MemoryConfig)}
         return AsyncMemory(
-            data_dir,
-            embedder=self._embedder,
-            answerer=self._answerer,
-            transcriber=self._transcriber,
-            face_analyzer=self._face_analyzer,
-            former=self._former,
-            consolidator=self._consolidator,
-            vision_describer=self._vision_describer,
-            tracer=self._tracer,
-            **policy,
+            Memory(
+                data_dir,
+                embedder=self._embedder,
+                answerer=self._answerer,
+                transcriber=self._transcriber,
+                face_analyzer=self._face_analyzer,
+                former=self._former,
+                consolidator=self._consolidator,
+                vision_describer=self._vision_describer,
+                tracer=self._tracer,
+                **policy,
+            )
         )
 
     def close(self) -> None:

@@ -418,6 +418,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- `AsyncMemory(memory)` now wraps an already-open `Memory` instead of repeating its constructor;
+  open one with `AsyncMemory.from_plugins()`, `AsyncMemory.from_config()`, or
+  `AsyncMemory(Memory(...))`.
+- `mindbridge-bench eval` no longer reports a run-level `resources.energy` block or per-GPU
+  `estimated_energy_watt_hours`. Intel RAPL package counters are not read any more; sampled GPU
+  power still appears as averages and peaks.
 - MCP tool results are validated from the SDK value objects, the way REST already builds its
   responses, instead of through hand-written per-field converters. The published tool schemas and
   their field names are unchanged, and a field added to a value object now reaches both transports

@@ -752,7 +752,8 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
         def __init__(self, _data_dir: object, **values: object) -> None:
             captured.update(values)
 
-    monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
+    monkeypatch.setattr(eval_module, "Memory", Recorder)
+    monkeypatch.setattr(eval_module, "AsyncMemory", lambda memory: memory)
     pool = object.__new__(eval_module._BackendPool)
     settings = MemoryConfig(evidence_budget_chars=4_242, minimum_relevance=0.11)
     pool._settings = settings
@@ -776,9 +777,8 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
     # Deriving the forwarding from the dataclasses is only safe while every declared field names
     # a real constructor keyword; a field added without one would raise at call time instead.
     declared = {entry.name for entry in (*fields(MemoryConfig), *fields(MemoryPlugins))}
-    for constructor in (Memory.__init__, AsyncMemory.__init__):
-        unaccepted = declared - set(signature(constructor).parameters)
-        assert not unaccepted, f"{constructor.__qualname__} has no keyword for {sorted(unaccepted)}"
+    unaccepted = declared - set(signature(Memory.__init__).parameters)
+    assert not unaccepted, f"Memory.__init__ has no keyword for {sorted(unaccepted)}"
 
 
 def test_backend_pool_forwards_every_capability_plugin(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -791,7 +791,8 @@ def test_backend_pool_forwards_every_capability_plugin(monkeypatch: pytest.Monke
         def __init__(self, _data_dir: object, **values: object) -> None:
             captured.update(values)
 
-    monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
+    monkeypatch.setattr(eval_module, "Memory", Recorder)
+    monkeypatch.setattr(eval_module, "AsyncMemory", lambda memory: memory)
     pool = object.__new__(eval_module._BackendPool)
     pool._settings = MemoryConfig()
     pool._tracer = trace.get_tracer(__name__)
@@ -1106,7 +1107,8 @@ def test_backend_pool_borrows_every_configured_plugin_slot(
             captured.update(values)
 
     monkeypatch.setattr(eval_module, "resolve_memory_config", lambda _config: resolved)
-    monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
+    monkeypatch.setattr(eval_module, "Memory", Recorder)
+    monkeypatch.setattr(eval_module, "AsyncMemory", lambda memory: memory)
     pool = eval_module._BackendPool(
         ModelConfig(),
         device=None,

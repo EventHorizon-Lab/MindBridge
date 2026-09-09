@@ -6,7 +6,6 @@ import math
 import os
 import platform
 import resource
-import subprocess
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -51,6 +50,7 @@ from mindbridge._telemetry import (
     VISION_BATCHES_FAILED,
     token_modality_attribute,
 )
+from mindbridge.benchmarks.eval_environment import nvidia_smi_rows
 from mindbridge.benchmarks.eval_statistics import percentile
 
 BENCHMARK_TASK = "mindbridge.benchmark.task"
@@ -1341,7 +1341,6 @@ class _GpuSamples:
                 else None
             ),
             "peak_power_watts": max(power_values) if power_values else None,
-            "estimated_energy_watt_hours": (power_area / 3_600 if power_coverage else None),
             "sample_count": len(readings),
             "power_sample_count": len(power_values),
             "sample_coverage_seconds": coverage,
@@ -1383,13 +1382,8 @@ class ResourceSampler:
         self._started_storage: dict[str, int] | None = None
         self._stopped_storage: dict[str, int] | None = None
         self._gpu_available = False
-        self._rapl_start: dict[str, tuple[int, int | None]] | None = None
-        self._rapl_joules: float | None = None
-        self._rapl_reason: str | None = None
         self._excluded_intervals: list[tuple[float, float]] = []
         self._excluded_cpu_seconds = 0.0
-        self._excluded_rapl_joules = 0.0
-        self._rapl_exclusion_error: str | None = None
         self._excluding = False
 
     def __enter__(self) -> ResourceSampler:
@@ -1397,7 +1391,6 @@ class ResourceSampler:
             self._started_storage = _combined_storage_bytes(self._storage_roots)
         initial = _nvidia_utilization()
         self._started_cpu_seconds = _cpu_seconds()
-        self._rapl_start, self._rapl_reason = _rapl_energy_uj()
         self._started_wall = perf_counter()
         self._gpu_available = bool(initial)
         self._record_gpu(initial, sampled_at=self._started_wall)
@@ -1424,28 +1417,13 @@ class ResourceSampler:
             self._record_gpu(final, sampled_at=self._stopped_wall)
         if self._storage_roots:
             self._stopped_storage = _combined_storage_bytes(self._storage_roots)
-        if self._rapl_start is not None:
-            end, end_reason = _rapl_energy_uj()
-            if end is None:
-                self._rapl_reason = self._rapl_reason or end_reason
-            else:
-                joules_uj, wrap_reason = _rapl_delta_uj(self._rapl_start, end)
-                if joules_uj is None:
-                    self._rapl_reason = self._rapl_reason or wrap_reason
-                elif self._rapl_exclusion_error is not None:
-                    self._rapl_reason = self._rapl_exclusion_error
-                else:
-                    self._rapl_joules = max(
-                        0.0,
-                        joules_uj / 1_000_000 - self._excluded_rapl_joules,
-                    )
 
     @contextmanager
     def exclude(self) -> Iterator[None]:
         """Exclude one synchronous interval from product resource accounting.
 
         The eval runner uses this around per-task judging. Boundary GPU readings split the sampled
-        timeline cleanly, while exact CPU and RAPL deltas are subtracted from the outer window.
+        timeline cleanly, while the exact CPU delta is subtracted from the outer window.
         """
         if not self._started_wall or self._stopped_wall is not None:
             raise RuntimeError("resource exclusions require an active sampler")
@@ -1454,7 +1432,6 @@ class ResourceSampler:
         self._excluding = True
         started_wall = perf_counter()
         started_cpu = _cpu_seconds()
-        started_rapl, started_rapl_reason = _rapl_energy_uj()
         initial = _nvidia_utilization()
         if initial:
             self._gpu_available = True
@@ -1463,10 +1440,6 @@ class ResourceSampler:
             yield
         finally:
             final = _nvidia_utilization()
-            stopped_rapl: dict[str, tuple[int, int | None]] | None = None
-            stopped_rapl_reason: str | None = None
-            if self._rapl_start is not None:
-                stopped_rapl, stopped_rapl_reason = _rapl_energy_uj()
             stopped_cpu = _cpu_seconds()
             stopped_wall = perf_counter()
             if final:
@@ -1474,19 +1447,6 @@ class ResourceSampler:
                 self._record_gpu(final, sampled_at=stopped_wall)
             self._excluded_intervals.append((started_wall, stopped_wall))
             self._excluded_cpu_seconds += max(0.0, stopped_cpu - started_cpu)
-            if self._rapl_start is not None:
-                if started_rapl is None or stopped_rapl is None:
-                    self._rapl_exclusion_error = (
-                        started_rapl_reason
-                        or stopped_rapl_reason
-                        or "RAPL was unavailable at a resource-exclusion boundary"
-                    )
-                else:
-                    excluded_uj, excluded_reason = _rapl_delta_uj(started_rapl, stopped_rapl)
-                    if excluded_uj is None:
-                        self._rapl_exclusion_error = excluded_reason
-                    else:
-                        self._excluded_rapl_joules += excluded_uj / 1_000_000
             self._excluding = False
 
     def json(self, *, wall_seconds: float) -> dict[str, object]:
@@ -1538,7 +1498,6 @@ class ResourceSampler:
                 "gpu_sampling_interval_seconds": self._interval_seconds,
                 "gpu_values": "sampled system-device values; peaks between polls may be missed",
                 "gpu_average_method": "time-weighted trapezoidal integration",
-                "gpu_energy_method": "time-integrated sampled power",
             },
             "cpu": {
                 "seconds": cpu_seconds,
@@ -1555,43 +1514,6 @@ class ResourceSampler:
             },
             "storage": _storage_growth(self._started_storage, self._stopped_storage),
             "gpu": gpu if self._gpu_available else None,
-            "energy": self._energy_json(gpu),
-        }
-
-    def _energy_json(self, gpu: Mapping[str, Mapping[str, object]]) -> dict[str, object]:
-        """Report package and per-GPU energy, or exactly why neither is readable.
-
-        Never a fabricated number: a value is reported only when its source (Intel RAPL for the
-        package, ``nvidia-smi --query-gpu=power.draw`` integrated over the poll interval for the
-        GPU) actually answered.
-        """
-        cpu_joules = self._rapl_joules
-        measured_gpu_joules = {
-            index: watt_hours * 3_600
-            for index, values in gpu.items()
-            if isinstance((watt_hours := values.get("estimated_energy_watt_hours")), (int, float))
-        }
-        gpu_joules = measured_gpu_joules or None
-        reasons = [
-            reason
-            for reason in (
-                self._rapl_reason if cpu_joules is None else None,
-                None
-                if gpu_joules is not None
-                else (
-                    "nvidia-smi did not report power.draw for any GPU"
-                    if self._gpu_available
-                    else "no GPU visible to nvidia-smi"
-                ),
-            )
-            if reason
-        ]
-        available = cpu_joules is not None or gpu_joules is not None
-        return {
-            "cpu_package_joules": cpu_joules,
-            "gpu_joules": gpu_joules,
-            "available": available,
-            "reason": None if available else "; ".join(reasons),
         }
 
     def _poll(self) -> None:
@@ -1652,26 +1574,8 @@ def _nvidia_utilization() -> tuple[tuple[int, float, int, float | None], ...]:
     Power is ``None`` on a card ``nvidia-smi`` cannot meter (reported as ``[N/A]``), which the
     caller must not turn into a fabricated zero.
     """
-    try:
-        result = subprocess.run(
-            (
-                "nvidia-smi",
-                "--query-gpu=index,utilization.gpu,memory.used,power.draw",
-                "--format=csv,noheader,nounits",
-            ),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ()
-    if result.returncode:
-        return ()
     devices = []
-    for line in result.stdout.splitlines():
-        fields = [value.strip() for value in line.split(",")]
+    for fields in nvidia_smi_rows("index,utilization.gpu,memory.used,power.draw"):
         if len(fields) != 4 or not fields[0].isdecimal():
             continue
         try:
@@ -1687,73 +1591,3 @@ def _nvidia_utilization() -> tuple[tuple[int, float, int, float | None], ...]:
         except ValueError:
             continue
     return tuple(devices)
-
-
-# Overridable so a test can point at a fake sysfs tree instead of the real machine.
-_RAPL_ROOT = Path("/sys/class/powercap")
-
-
-def _rapl_energy_uj(
-    root: Path | None = None,
-) -> tuple[dict[str, tuple[int, int | None]] | None, str | None]:
-    """Read each Intel RAPL package's energy counter and the range it wraps at.
-
-    Per package rather than one sum, because ``energy_uj`` wraps at that package's own
-    ``max_energy_range_uj`` and a delta can only be corrected against the counter it came from.
-    ``root`` resolves ``_RAPL_ROOT`` at call time (not as a bound default) so a test can point
-    at a fake sysfs tree by monkeypatching the module attribute.
-    """
-    if root is None:
-        root = _RAPL_ROOT
-    try:
-        packages = sorted(root.glob("intel-rapl:[0-9]*/energy_uj"))
-    except OSError as error:
-        return None, f"cannot list {root}: {error}"
-    if not packages:
-        return None, f"no intel-rapl packages under {root}"
-    readings: dict[str, tuple[int, int | None]] = {}
-    for path in packages:
-        try:
-            energy = int(path.read_text().strip())
-        except (OSError, ValueError) as error:
-            return None, f"cannot read {path}: {error}"
-        readings[path.parent.name] = (energy, _rapl_max_range_uj(path.parent))
-    return readings, None
-
-
-def _rapl_max_range_uj(package: Path) -> int | None:
-    """Return what this package's counter wraps at, or `None` when it does not publish it."""
-    try:
-        return int((package / "max_energy_range_uj").read_text().strip())
-    except (OSError, ValueError):
-        return None
-
-
-def _rapl_delta_uj(
-    start: Mapping[str, tuple[int, int | None]],
-    end: Mapping[str, tuple[int, int | None]],
-) -> tuple[int | None, str | None]:
-    """Sum each package's own delta, correcting the wrap ``energy_uj`` may have made.
-
-    A counter reading lower at the end than at the start wrapped at its
-    ``max_energy_range_uj``, which is tens of minutes on a busy package rather than the hours a
-    sweep can run for. Clamping that to zero published 0 J for a run that burned energy, and
-    summing the packages before subtracting could hide one package's wrap inside another's
-    rise. Corrected per package instead, and refused outright when a package that wrapped does
-    not publish its range, because a wrap nothing can correct is not a measurement.
-
-    ponytail: two samples cannot tell one wrap from two, so a package that wrapped more than
-    once still undercounts by whole ranges. Accumulate in the poll loop instead if a run ever
-    needs to be that long; at a 2 s interval no wrap is missed.
-    """
-    total = 0
-    for name, (start_uj, max_range) in sorted(start.items()):
-        if name not in end:
-            return None, f"{name} stopped reporting energy_uj mid-run"
-        delta = end[name][0] - start_uj
-        if delta < 0:
-            if max_range is None:
-                return None, f"{name} wrapped and publishes no max_energy_range_uj"
-            delta += max_range
-        total += delta
-    return total, None

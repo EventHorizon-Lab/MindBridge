@@ -2321,7 +2321,8 @@ def test_composition_values_require_keywords() -> None:
 
 def test_plugin_composition_stays_in_constructor_parity() -> None:
     parameters = inspect.signature(Memory).parameters
-    assert parameters == inspect.signature(AsyncMemory).parameters
+    # The async facade wraps an open `Memory` rather than repeating its constructor.
+    assert list(inspect.signature(AsyncMemory).parameters) == ["memory"]
     assert (
         inspect.signature(Memory.search).parameters
         == inspect.signature(AsyncMemory.search).parameters
@@ -5708,10 +5709,12 @@ async def test_async_memory_matches_sync_surface(tmp_path: Path) -> None:
     models = _FakeModels()
     embedder = _FakeEmbedder()
     async with AsyncMemory(
-        tmp_path,
-        embedder=embedder,
-        answerer=models,
-        transcriber=models,
+        Memory(
+            tmp_path,
+            embedder=embedder,
+            answerer=models,
+            transcriber=models,
+        )
     ) as memory:
         records = await memory.add_many(("red async memory", "another memory"))
         assert await memory.get(records[0].id) == records[0]
@@ -5737,7 +5740,7 @@ async def test_async_add_stream_consumes_an_async_iterable(tmp_path: Path) -> No
             pulled.append(content)
             yield content
 
-    async with AsyncMemory(tmp_path, embedder=_FakeEmbedder()) as memory:
+    async with AsyncMemory(Memory(tmp_path, embedder=_FakeEmbedder())) as memory:
         stream = memory.add_stream(contents())
         first = await anext(stream)
         assert pulled == ["red async clip"]
@@ -5751,7 +5754,7 @@ async def test_async_add_stream_consumes_an_async_iterable(tmp_path: Path) -> No
 @pytest.mark.asyncio
 async def test_async_ask_stream_yields_the_same_chunks_as_the_sync_stream(tmp_path: Path) -> None:
     models = _CountingStreamer()
-    async with AsyncMemory(tmp_path, embedder=models, answerer=models) as memory:
+    async with AsyncMemory(Memory(tmp_path, embedder=models, answerer=models)) as memory:
         await memory.add("the red toolbox is on the bench")
 
         deltas: list[str] = []
@@ -5778,10 +5781,12 @@ async def test_async_ask_stream_propagates_trace_context_and_reports_queue_time(
     tracer = provider.get_tracer("test")
     models = _CountingStreamer()
     async with AsyncMemory(
-        tmp_path,
-        embedder=models,
-        answerer=models,
-        tracer=tracer,
+        Memory(
+            tmp_path,
+            embedder=models,
+            answerer=models,
+            tracer=tracer,
+        )
     ) as memory:
         await memory.add("the red toolbox is on the bench")
         with tracer.start_as_current_span("caller") as caller:
@@ -5807,10 +5812,12 @@ async def test_async_buffered_ask_reports_executor_queue_in_end_to_end_ttft(
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     models = _CountingStreamer()
     async with AsyncMemory(
-        tmp_path,
-        embedder=models,
-        answerer=models,
-        tracer=provider.get_tracer("test"),
+        Memory(
+            tmp_path,
+            embedder=models,
+            answerer=models,
+            tracer=provider.get_tracer("test"),
+        )
     ) as memory:
         await memory.add("the red toolbox is on the bench")
         answer = await memory.ask("where is the red toolbox?")
@@ -5829,7 +5836,7 @@ async def test_async_ask_stream_rejects_arguments_at_the_call_like_the_sync_stre
     tmp_path: Path,
 ) -> None:
     models = _CountingStreamer()
-    async with AsyncMemory(tmp_path, embedder=models, answerer=models) as memory:
+    async with AsyncMemory(Memory(tmp_path, embedder=models, answerer=models)) as memory:
         # An `async def` generator would defer this to the first `__anext__`, so the two
         # facades would report the same bad argument from two different places.
         with pytest.raises(ValidationError, match="limit must be between 1 and 100"):
@@ -5841,7 +5848,7 @@ async def test_async_ask_stream_releases_the_operation_when_the_caller_stops_ear
     tmp_path: Path,
 ) -> None:
     models = _CountingStreamer()
-    memory = AsyncMemory(tmp_path, embedder=models, answerer=models)
+    memory = AsyncMemory(Memory(tmp_path, embedder=models, answerer=models))
     try:
         await memory.add("the red toolbox is on the bench")
 
@@ -5864,7 +5871,7 @@ async def test_async_add_stream_names_a_source_failure(tmp_path: Path) -> None:
         yield "red async clip"
         raise ValidationError("source failed")
 
-    async with AsyncMemory(tmp_path, embedder=_FakeEmbedder()) as memory:
+    async with AsyncMemory(Memory(tmp_path, embedder=_FakeEmbedder())) as memory:
         stream = memory.add_stream(contents())
         first = await anext(stream)
         with pytest.raises(ValidationError) as failure:

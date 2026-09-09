@@ -103,14 +103,11 @@ def _git(repository: Path, arguments: Sequence[str]) -> str | None:
     return result.stdout.strip()
 
 
-def _nvidia_gpus() -> list[dict[str, object]]:
+def nvidia_smi_rows(query: str) -> list[list[str]]:
+    """Return the CSV rows of one `nvidia-smi --query-gpu`, or none when it is absent or fails."""
     try:
         result = subprocess.run(
-            (
-                "nvidia-smi",
-                f"--query-gpu={','.join(_NVIDIA_QUERY)}",
-                "--format=csv,noheader,nounits",
-            ),
+            ("nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -121,9 +118,12 @@ def _nvidia_gpus() -> list[dict[str, object]]:
         return []
     if result.returncode:
         return []
+    return list(csv.reader(result.stdout.splitlines(), skipinitialspace=True))
 
+
+def _nvidia_gpus() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    for values in csv.reader(result.stdout.splitlines(), skipinitialspace=True):
+    for values in nvidia_smi_rows(",".join(_NVIDIA_QUERY)):
         if len(values) != len(_NVIDIA_QUERY):
             continue
         index = _integer(values[0])

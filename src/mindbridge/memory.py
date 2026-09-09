@@ -118,6 +118,8 @@ from mindbridge.infrastructure.local.store import (
     # The one normalization subjects are compared under. Importing the store's own is what keeps
     # the writer and the comparer from disagreeing about when two subjects are the same.
     _canonical_subject,
+    # The one UTC text form timestamps are compared and hashed under, for the same reason.
+    _datetime_text,
 )
 from mindbridge.infrastructure.local.zvec_index import (
     IndexHit,
@@ -873,9 +875,9 @@ class Memory:
             config = MemoryConfig()
         elif not isinstance(config, MemoryConfig):
             raise ValidationError("config must be a MemoryConfig value")
-        # The constructor takes exactly these two dataclasses' fields flattened -- pinned by
-        # `test_the_async_facade_mirrors_the_sync_signatures` -- so unpacking them is the whole
-        # translation. A field added to either reaches the constructor without a line here.
+        # The constructor takes exactly these two dataclasses' fields flattened, so unpacking them
+        # is the whole translation. A field added to either reaches the constructor without a line
+        # here.
         return cls(
             data_dir,
             tracer=tracer,
@@ -7868,66 +7870,12 @@ class Memory:
 
 
 class AsyncMemory:
-    """Async facade over the same synchronous local-memory core."""
+    """Async facade over one open synchronous `Memory`, which it owns and closes."""
 
-    def __init__(
-        self,
-        data_dir: str | Path = ".mindbridge",
-        *,
-        embedder: EmbeddingBackend,
-        answerer: GenerationBackend | None = None,
-        transcriber: SpeechBackend | TranscriptionBackend | None = None,
-        vision_describer: VisionDescriptionBackend | None = None,
-        face_analyzer: FaceBackend | None = None,
-        former: FormationBackend | None = None,
-        consolidator: ConsolidationBackend | None = None,
-        index_speech: bool = _DEFAULT_CONFIG.index_speech,
-        index_quantization: IndexQuantization = _DEFAULT_CONFIG.index_quantization,
-        retrieval_mode: RetrievalMode = _DEFAULT_CONFIG.retrieval_mode,
-        minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
-        ambiguity_margin: float = _DEFAULT_CONFIG.ambiguity_margin,
-        evidence_budget_chars: int | None = _DEFAULT_CONFIG.evidence_budget_chars,
-        decay_half_life_days: float | None = _DEFAULT_CONFIG.decay_half_life_days,
-        reinforce_on_answer: bool = _DEFAULT_CONFIG.reinforce_on_answer,
-        speaker_similarity: float = _DEFAULT_CONFIG.speaker_similarity,
-        speaker_margin: float = _DEFAULT_CONFIG.speaker_margin,
-        face_similarity: float = _DEFAULT_CONFIG.face_similarity,
-        face_margin: float = _DEFAULT_CONFIG.face_margin,
-        identity_link_min_assets: int = _DEFAULT_CONFIG.identity_link_min_assets,
-        memory_budget_records: int | None = _DEFAULT_CONFIG.memory_budget_records,
-        query_failure_window_seconds: float = _DEFAULT_CONFIG.query_failure_window_seconds,
-        query_failure_history: int = _DEFAULT_CONFIG.query_failure_history,
-        retention: RetentionPolicy = _DEFAULT_CONFIG.retention,
-        tracer: Tracer | None = None,
-    ) -> None:
-        self._memory = Memory(
-            data_dir=data_dir,
-            embedder=embedder,
-            answerer=answerer,
-            transcriber=transcriber,
-            vision_describer=vision_describer,
-            face_analyzer=face_analyzer,
-            former=former,
-            consolidator=consolidator,
-            index_speech=index_speech,
-            index_quantization=index_quantization,
-            retrieval_mode=retrieval_mode,
-            minimum_relevance=minimum_relevance,
-            ambiguity_margin=ambiguity_margin,
-            evidence_budget_chars=evidence_budget_chars,
-            decay_half_life_days=decay_half_life_days,
-            reinforce_on_answer=reinforce_on_answer,
-            speaker_similarity=speaker_similarity,
-            speaker_margin=speaker_margin,
-            face_similarity=face_similarity,
-            face_margin=face_margin,
-            identity_link_min_assets=identity_link_min_assets,
-            memory_budget_records=memory_budget_records,
-            query_failure_window_seconds=query_failure_window_seconds,
-            query_failure_history=query_failure_history,
-            retention=retention,
-            tracer=tracer,
-        )
+    def __init__(self, memory: Memory) -> None:
+        if not isinstance(memory, Memory):
+            raise ValidationError("memory must be a Memory instance")
+        self._memory = memory
 
     @classmethod
     def from_plugins(
@@ -7939,21 +7887,7 @@ class AsyncMemory:
         tracer: Tracer | None = None,
     ) -> AsyncMemory:
         """Open async memory from an explicit capability bundle and local policy."""
-        if not isinstance(plugins, MemoryPlugins):
-            raise ValidationError("plugins must be a MemoryPlugins value")
-        if config is None:
-            config = MemoryConfig()
-        elif not isinstance(config, MemoryConfig):
-            raise ValidationError("config must be a MemoryConfig value")
-        # The constructor takes exactly these two dataclasses' fields flattened -- pinned by
-        # `test_the_async_facade_mirrors_the_sync_signatures` -- so unpacking them is the whole
-        # translation. A field added to either reaches the constructor without a line here.
-        return cls(
-            data_dir,
-            tracer=tracer,
-            **{field.name: getattr(plugins, field.name) for field in fields(plugins)},
-            **{field.name: getattr(config, field.name) for field in fields(config)},
-        )
+        return cls(Memory.from_plugins(data_dir, plugins=plugins, config=config, tracer=tracer))
 
     @classmethod
     def from_config(
@@ -7963,17 +7897,7 @@ class AsyncMemory:
         tracer: Tracer | None = None,
     ) -> AsyncMemory:
         """Open async memory from validated declarative configuration."""
-        resolved = resolve_memory_config(config)
-        try:
-            return cls.from_plugins(
-                resolved.data_dir,
-                plugins=resolved.plugins,
-                config=resolved.settings,
-                tracer=tracer,
-            )
-        except BaseException:
-            resolved.close()
-            raise
+        return cls(Memory.from_config(config, tracer=tracer))
 
     async def __aenter__(self) -> AsyncMemory:
         return self
@@ -11879,10 +11803,6 @@ def _decode_cursor(cursor: object) -> tuple[datetime, str]:
     except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
         raise ValidationError("cursor is invalid") from None
     return created_at, memory_id
-
-
-def _datetime_text(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 @contextmanager
