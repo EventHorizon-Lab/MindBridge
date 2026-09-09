@@ -31,7 +31,7 @@ from mindbridge import (
     TextSpanSelector,
 )
 from mindbridge.api.app import ContextBundleResponse
-from mindbridge.api.mcp import _bundle_result
+from mindbridge.api.mcp import ContextBundleResult
 from mindbridge.cli import _bundle_value
 from mindbridge.exceptions import ModelError, ValidationError
 from mindbridge.infrastructure.local.store import (
@@ -647,7 +647,7 @@ def test_excerpt_serializes_through_rest_mcp_and_cli_contracts(tmp_path: Path) -
         )
 
     rest = ContextBundleResponse.model_validate(bundle.document()).model_dump(mode="json")
-    mcp = _bundle_result(bundle).model_dump(mode="json")
+    mcp = ContextBundleResult.model_validate(bundle.document()).model_dump(mode="json")
     cli = cast(
         "dict[str, Any]",
         {name: _bundle_value(value) for name, value in bundle.document().items()},

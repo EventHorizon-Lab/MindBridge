@@ -21,7 +21,7 @@ import math
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta
 from importlib import import_module
 from importlib.metadata import version
@@ -55,12 +55,8 @@ from mindbridge.types import (
     ContentAtom,
     ContentInput,
     ContextBudget,
-    ContextConflict,
-    ContextExcerpt,
-    ContextUnknown,
     EvidenceBasis,
     ExportBundle,
-    FaceObservation,
     MemoryContext,
     MemoryOperation,
     MemoryOperationRecord,
@@ -69,15 +65,12 @@ from mindbridge.types import (
     MemoryTrigger,
     MemoryType,
     Modality,
-    NamedActor,
     ObservationContext,
-    ProvisionalActor,
     RetentionReport,
     RetrievalScope,
     SearchHit,
     SpatialAnchor,
     SpatialContext,
-    SpeakerSegment,
     StreamInput,
 )
 
@@ -729,17 +722,15 @@ def _bundle_value(value: object) -> object:
 
 
 def _bundle_entry(entry: object) -> object:
-    """Encode one entry of one section; `frames` and `places` carry plain strings."""
+    """Encode one entry of one section; `frames` and `places` carry plain strings.
+
+    Only a hit needs shaping: its assets publish six of `AssetRef`'s seven fields, because the
+    seventh is a local filesystem path. Every other entry is exactly its own fields, so a
+    section added to the bundle reaches the CLI without being named here.
+    """
     if isinstance(entry, SearchHit):
         return _memory_document(entry)
-    if isinstance(entry, ContextUnknown):
-        return {"kind": entry.kind.value, "detail": entry.detail}
-    # `actors` may carry, beside the ranked hits, a person a visible naming assertion names
-    # reached through other evidence, or a provisional identity no assertion names. Conflicts
-    # carry only strings.
-    if isinstance(entry, ContextConflict | ContextExcerpt | NamedActor | ProvisionalActor):
-        return asdict(entry)
-    return entry
+    return _document(entry) if is_dataclass(entry) and not isinstance(entry, type) else entry
 
 
 def _get(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -747,11 +738,11 @@ def _get(memory: Memory, arguments: argparse.Namespace) -> _Document:
 
 
 def _speech(memory: Memory, arguments: argparse.Namespace) -> _Document:
-    return {"segments": [_segment_document(item) for item in memory.speech(arguments.memory_id)]}
+    return {"segments": [_document(item) for item in memory.speech(arguments.memory_id)]}
 
 
 def _faces(memory: Memory, arguments: argparse.Namespace) -> _Document:
-    return {"observations": [_face_document(item) for item in memory.faces(arguments.memory_id)]}
+    return {"observations": [_document(item) for item in memory.faces(arguments.memory_id)]}
 
 
 def _register_speaker(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -829,16 +820,7 @@ def _export_document(bundle: ExportBundle) -> _Document:
     return {
         "exported_at": _encode_time(bundle.exported_at),
         "identity_id": bundle.identity_id,
-        "identities": [
-            {
-                "identity_id": profile.identity_id,
-                "name": profile.name,
-                "relationship": profile.relationship,
-                "confirmed": profile.confirmed,
-                "evidence_ids": list(profile.evidence_ids),
-            }
-            for profile in bundle.identities
-        ],
+        "identities": [_document(profile) for profile in bundle.identities],
         "records": [_memory_document(record) for record in bundle.records],
         "operations": [_operation_document(record) for record in bundle.operations],
     }
@@ -849,15 +831,8 @@ def _apply_retention(memory: Memory, arguments: argparse.Namespace) -> _Document
 
 
 def _retention_document(report: RetentionReport) -> _Document:
-    return {
-        "dry_run": report.dry_run,
-        "media_memory_ids": list(report.media_memory_ids),
-        "forgotten_memory_ids": list(report.forgotten_memory_ids),
-        "cascade_memory_ids": list(report.cascade_memory_ids),
-        "asset_ids": list(report.asset_ids),
-        "capture_memory_ids": list(report.capture_memory_ids),
-        "deleted": report.deleted,
-    }
+    # `deleted` is derived, not a declared field, so it is the one value `asdict` cannot supply.
+    return {**_document(report), "deleted": report.deleted}
 
 
 def _settle(memory: Memory, arguments: argparse.Namespace) -> _Document:
@@ -1709,29 +1684,17 @@ def _spatial_context(value: object) -> SpatialContext | None:
 
 
 def _observation_context_document(context: ObservationContext | None) -> _Document | None:
-    if context is None:
-        return None
-    return {
-        "basis": context.basis.value,
-        "source_id": context.source_id,
-        "confidence": context.confidence,
-        "valid_from": _encode_optional_time(context.valid_from),
-        "valid_until": _encode_optional_time(context.valid_until),
-        "spatial": _spatial_document(context.spatial),
-    }
+    # Every declared field but `place_id`, which the SDK reads from `spatial` on the way in and
+    # never echoes back on this document.
+    return (
+        None
+        if context is None
+        else {name: value for name, value in _document(context).items() if name != "place_id"}
+    )
 
 
 def _retrieval_scope_document(scope: RetrievalScope | None) -> _Document | None:
-    if scope is None:
-        return None
-    return {
-        "valid_at": _encode_optional_time(scope.valid_at),
-        "known_at": _encode_optional_time(scope.known_at),
-        "near": _spatial_document(scope.near),
-        "radius_m": scope.radius_m,
-        "place_id": scope.place_id,
-        "identity_id": scope.identity_id,
-    }
+    return None if scope is None else _document(scope)
 
 
 def _json_source(value: str | None) -> object:
@@ -1831,48 +1794,7 @@ def _memory_document(record: MemoryRecord | SearchHit) -> _Document:
 
 
 def _context_document(context: MemoryContext | None) -> _Document | None:
-    if context is None:
-        return None
-    return {
-        "kind": context.kind.value,
-        "basis": context.basis.value,
-        "confidence": context.confidence,
-        "valid_from": _encode_optional_time(context.valid_from),
-        "valid_until": _encode_optional_time(context.valid_until),
-        "recorded_at": _encode_time(context.recorded_at),
-        "visible": context.visible,
-        "retired_at": _encode_optional_time(context.retired_at),
-        "lineage_id": context.lineage_id,
-        "source_id": context.source_id,
-        "subject": context.subject,
-        "predicate": context.predicate,
-        "value": context.value,
-        "evidence_ids": list(context.evidence_ids),
-        "supersedes_id": context.supersedes_id,
-        "model_id": context.model_id,
-        "recipe": context.recipe,
-        "identity_id": context.identity_id,
-        "spatial": _spatial_document(context.spatial),
-        "cue_modality": None if context.cue_modality is None else context.cue_modality.value,
-        "valence": context.valence,
-        "arousal": context.arousal,
-    }
-
-
-def _spatial_document(spatial: SpatialContext | None) -> _Document | None:
-    if spatial is None:
-        return None
-    return {
-        "frame_id": spatial.frame_id,
-        "anchor": spatial.anchor.value,
-        "x": spatial.x,
-        "y": spatial.y,
-        "z": spatial.z,
-        "orientation_xyzw": (
-            None if spatial.orientation_xyzw is None else list(spatial.orientation_xyzw)
-        ),
-        "position_uncertainty_m": spatial.position_uncertainty_m,
-    }
+    return None if context is None else _document(context)
 
 
 def _asset_document(asset: AssetRef) -> _Document:
@@ -1886,32 +1808,29 @@ def _asset_document(asset: AssetRef) -> _Document:
     }
 
 
-def _segment_document(segment: SpeakerSegment) -> _Document:
-    return {
-        "asset_id": segment.asset_id,
-        "start_ms": segment.start_ms,
-        "end_ms": segment.end_ms,
-        "text": segment.text,
-        "speaker_id": segment.speaker_id,
-        "speaker_name": segment.speaker_name,
-        "identity_score": segment.identity_score,
-    }
-
-
-def _face_document(observation: FaceObservation) -> _Document:
-    return {
-        "asset_id": observation.asset_id,
-        "observed_at_ms": observation.observed_at_ms,
-        "bounding_box": list(observation.bounding_box),
-        "identity_id": observation.identity_id,
-        "identity_name": observation.identity_name,
-        "identity_score": observation.identity_score,
-    }
-
-
 def _encode_time(value: datetime) -> str:
     text = value.isoformat()
     return f"{text[:-6]}Z" if text.endswith("+00:00") else text
+
+
+def _document(value: object) -> _Document:
+    """One JSON-native document for one frozen SDK value, field for declared field.
+
+    `asdict` flattens the nested values; this only encodes what `json` cannot write itself, so a
+    field added to an SDK value reaches every command that prints it without a line here naming
+    it. The result stays JSON-native because it is also what a `--url` request body carries.
+    """
+    return cast("_Document", _json_native(asdict(cast(Any, value))))
+
+
+def _json_native(value: object) -> object:
+    if isinstance(value, datetime):
+        return _encode_time(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_native(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_native(item) for item in value]
+    return value
 
 
 def _encode_optional_time(value: datetime | None) -> str | None:

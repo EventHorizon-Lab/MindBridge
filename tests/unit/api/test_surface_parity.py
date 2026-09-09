@@ -820,7 +820,9 @@ def test_every_surface_publishes_one_context_bundle_document() -> None:
     episodes = cast(list[dict[str, object]], rendered["episodes"])
     actors = cast(list[object], rendered["actors"])
     assert [entry["id"] for entry in episodes] == ["memory_1"]
-    assert actors[1] == {"identity_id": "identity_1", "memory_ids": ("memory_1",)}
+    # A JSON array, not the tuple the value object holds: the CLI document is JSON-native before
+    # it is dumped, because the same document also travels as a `--url` request body.
+    assert actors[1] == {"identity_id": "identity_1", "memory_ids": ["memory_1"]}
 
 
 def test_render_covers_every_section_the_bundle_declares() -> None:
