@@ -17,8 +17,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   candidates get their dense score completed from the stored vectors, and `allow_partial_sources`
   can admit digest-bound raw-text excerpts. Rolling back an operation whose output was already
   deleted now succeeds, and deleting one of several alternatives no longer cascades into a claim
-  that a still-supported but hidden trait continues to ground. Older stores migrate on open; a
-  newer schema is refused.
+  that a still-supported but hidden trait continues to ground. Any other schema version is
+  refused on open.
 - `mindbridge-bench eval --tasks es-memeval` now evaluates the pinned ES-MemEval EvoEmo QA task:
   18 physically isolated seeker histories, 1,427 questions across the five published capabilities,
   automatic digest-verified GitHub acquisition, session-level evidence recall, the published
@@ -1062,6 +1062,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Removed
 
+- Every schema migration. A data directory is created at the current schema or refused, and never
+  converted in place: the refusal names the version it found and says to re-create the directory
+  and re-ingest, or to open it with the MindBridge version that wrote it. This removes seventeen
+  upgrade steps, their DDL, and the twenty-five tests that drove them. **A `data_dir` written by
+  an earlier build of this unreleased version cannot be opened by this one.** Nothing has been
+  released, so no published version is affected.
 - `MemorySettings`, the alias for `MemoryConfig`. Declarative `settings` and
   `Memory.from_plugins(config=...)` are unchanged; the class keeps one public name.
 - `uvicorn` from the `server` and `all` extras. MindBridge never imports an ASGI server, so the

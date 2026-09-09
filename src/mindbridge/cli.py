@@ -21,7 +21,7 @@ import math
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from importlib import import_module
 from importlib.metadata import version
@@ -55,6 +55,9 @@ from mindbridge.types import (
     ContentAtom,
     ContentInput,
     ContextBudget,
+    ContextConflict,
+    ContextExcerpt,
+    ContextUnknown,
     EvidenceBasis,
     ExportBundle,
     MemoryContext,
@@ -65,7 +68,9 @@ from mindbridge.types import (
     MemoryTrigger,
     MemoryType,
     Modality,
+    NamedActor,
     ObservationContext,
+    ProvisionalActor,
     RetentionReport,
     RetrievalScope,
     SearchHit,
@@ -724,13 +729,19 @@ def _bundle_value(value: object) -> object:
 def _bundle_entry(entry: object) -> object:
     """Encode one entry of one section; `frames` and `places` carry plain strings.
 
-    Only a hit needs shaping: its assets publish six of `AssetRef`'s seven fields, because the
-    seventh is a local filesystem path. Every other entry is exactly its own fields, so a
-    section added to the bundle reaches the CLI without being named here.
+    A hit needs shaping: its assets publish six of `AssetRef`'s seven fields, because the seventh
+    is a local filesystem path. The rest are exactly their own fields. The list is closed rather
+    than "any dataclass" for that same reason -- an entry type that later nests an `AssetRef`
+    must fail here instead of quietly publishing the path -- and an unrecognized entry travels
+    on to fail in `json.dump`.
     """
     if isinstance(entry, SearchHit):
         return _memory_document(entry)
-    return _document(entry) if is_dataclass(entry) and not isinstance(entry, type) else entry
+    if isinstance(
+        entry, ContextConflict | ContextExcerpt | ContextUnknown | NamedActor | ProvisionalActor
+    ):
+        return _document(entry)
+    return entry
 
 
 def _get(memory: Memory, arguments: argparse.Namespace) -> _Document:

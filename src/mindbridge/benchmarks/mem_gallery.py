@@ -7,7 +7,6 @@ pinned, the way the MM-Lifelong adapter pins question indices.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -150,15 +149,6 @@ def load_mem_gallery(dialog_directory: Path) -> tuple[MemGalleryTopic, ...]:
     if not paths:
         raise ValueError(f"no Mem-Gallery topic files under {dialog_directory}")
     return tuple(load_mem_gallery_topic(path) for path in paths)
-
-
-def sha256_file(path: Path) -> str:
-    """Hash one release file without loading it into memory."""
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _require_known_references(

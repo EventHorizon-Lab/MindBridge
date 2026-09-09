@@ -13,7 +13,6 @@ import struct
 import unicodedata
 import uuid
 from collections.abc import (
-    Callable,
     Collection,
     Generator,
     Iterable,
@@ -49,9 +48,6 @@ from mindbridge.types import (
 )
 
 _SCHEMA_VERSION = 18
-# `visual_descriptions` is no longer the newest step, so this is pinned to its own literal as the
-# comment that introduced it instructed: a v12 store is the one that step still has to migrate.
-_PRE_VISUAL_DESCRIPTION_VERSION = 12
 _SQLITE_PARAMETER_BATCH = 900
 # Idle connections retained for reuse. Concurrency above this many simultaneous readers falls
 # back to the previous open-and-close behaviour rather than growing the pool without bound.
@@ -127,9 +123,6 @@ _MEMORY_TYPES = frozenset({"semantic", "episodic", "procedural"})
 _ASSET_MODALITIES = frozenset({"image", "video", "audio"})
 _SHA256_HEX_LENGTH = 64
 _MEDIA_TYPE = re.compile(r"[!#$&^_.+0-9A-Za-z-]+/[!#$&^_.+0-9A-Za-z-]+\Z")
-_REQUIRED_V1_TABLES = frozenset(
-    {"embeddings", "memory_records", "search_index_queue", "store_metadata"}
-)
 _REQUIRED_TABLES = frozenset(
     {
         "embeddings",
@@ -253,46 +246,6 @@ BEGIN
     INSERT INTO search_index_queue (embedding_id, action, enqueued_at)
     VALUES (OLD.embedding_id, 'delete', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 END;
-"""
-
-_LEGACY_SPEECH_SCHEMA = """
-CREATE TABLE speech_analyses (
-    asset_id TEXT PRIMARY KEY REFERENCES media_assets (asset_id) ON DELETE CASCADE,
-    model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
-    space_id TEXT NOT NULL CHECK (length(trim(space_id)) > 0),
-    transcript TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE speaker_identities (
-    speaker_id TEXT PRIMARY KEY CHECK (length(trim(speaker_id)) > 0),
-    name TEXT CHECK (name IS NULL OR length(trim(name)) > 0),
-    model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
-    space_id TEXT NOT NULL CHECK (length(trim(space_id)) > 0),
-    dimension INTEGER NOT NULL CHECK (dimension > 0),
-    centroid BLOB NOT NULL CHECK (length(centroid) = dimension * 4),
-    observations INTEGER NOT NULL CHECK (observations > 0),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL CHECK (updated_at >= created_at)
-);
-
-CREATE INDEX speaker_identities_space_idx
-    ON speaker_identities (space_id, dimension, speaker_id);
-
-CREATE TABLE speech_segments (
-    asset_id TEXT NOT NULL REFERENCES speech_analyses (asset_id) ON DELETE CASCADE,
-    position INTEGER NOT NULL CHECK (position >= 0),
-    start_ms INTEGER NOT NULL CHECK (start_ms >= 0),
-    end_ms INTEGER NOT NULL CHECK (end_ms > start_ms),
-    transcript TEXT NOT NULL CHECK (length(trim(transcript)) > 0),
-    speaker_id TEXT REFERENCES speaker_identities (speaker_id) ON DELETE SET NULL,
-    identity_score REAL CHECK (
-        identity_score IS NULL OR (identity_score >= 0.0 AND identity_score <= 1.0)
-    ),
-    PRIMARY KEY (asset_id, position)
-);
-
-CREATE INDEX speech_segments_speaker_idx ON speech_segments (speaker_id);
 """
 
 _IDENTITY_LINK_EVIDENCE_DDL = (
@@ -542,9 +495,8 @@ CREATE TABLE formation_runs (
 );
 """
 
-# Statements rather than a script: `_migrate_v10` creates these inside its own transaction, and
-# `executescript` issues an implicit COMMIT first, which would end that transaction and leave a
-# later failure half-applied under a bumped `user_version`.
+# One statement per entry, joined below. Kept as a tuple so a caller that must stay inside its
+# own transaction can execute them one at a time: `executescript` issues an implicit COMMIT first.
 _CONTROL_SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS capture_queue (
@@ -584,58 +536,6 @@ _CONTROL_SCHEMA = (
     """,
 )
 _CONTROL_SCHEMA_SCRIPT = ";".join(_CONTROL_SCHEMA) + ";"
-
-# SQLite cannot add a REFERENCES column to a populated table with ALTER TABLE unless the value
-# defaults to NULL, which is exactly the shape wanted here: an existing claim is about nobody in
-# particular until something binds it.
-_SEMANTIC_IDENTITY_COLUMN_DDL = """
-ALTER TABLE memory_semantics
-ADD COLUMN identity_id TEXT REFERENCES identities (identity_id) ON DELETE SET NULL
-"""
-
-_SEMANTIC_IDENTITY_INDEX_DDL = """
-CREATE INDEX memory_semantics_identity_idx
-    ON memory_semantics (identity_id, memory_id)
-"""
-
-# Naming a person is its own logged intent, so the log's intent whitelist has to admit it. A
-# CHECK cannot be altered in place, so widening it is the usual copy-and-swap; the rows carry
-# over unchanged because no existing intent name changed.
-_OPERATION_INTENT_REBUILD_DDL = (
-    "ALTER TABLE memory_operations RENAME TO memory_operations_v11",
-    """
-    CREATE TABLE memory_operations (
-        operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
-        intent TEXT NOT NULL CHECK (
-            intent IN ('reinforce', 'consolidate', 'correct', 'forget', 'identify')
-        ),
-        trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
-        model_id TEXT,
-        recipe TEXT,
-        operation_json TEXT NOT NULL,
-        effects_json TEXT NOT NULL,
-        applied_at TEXT NOT NULL,
-        rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at)
-    )
-    """,
-    """
-    INSERT INTO memory_operations (
-        operation_id, operation_key, intent, trigger, model_id, recipe,
-        operation_json, effects_json, applied_at, rolled_back_at
-    )
-    SELECT
-        operation_id, operation_key, intent, trigger, model_id, recipe,
-        operation_json, effects_json, applied_at, rolled_back_at
-    FROM memory_operations_v11
-    """,
-    "DROP TABLE memory_operations_v11",
-    """
-    CREATE UNIQUE INDEX memory_operations_active_key_idx
-        ON memory_operations (operation_key)
-        WHERE rolled_back_at IS NULL
-    """,
-)
 
 # The scheduler's own durable state, added in v13. Two facts the store could not answer before:
 # "has anything already weighed this?" and "which recalls came back empty?".
@@ -680,102 +580,6 @@ CREATE INDEX IF NOT EXISTS query_failures_normalized_idx
     ON query_failures (normalized, failed_at);
 """
 
-# v13 adds the post-hoc outcome columns and widens the intent domain to admit `merge`. Both are
-# CHECK-constrained, and SQLite cannot alter a CHECK in place, so this is the same copy-and-swap
-# the v12 rebuild used. Existing rows carry over unchanged: no intent name changed and the two
-# new columns start NULL, which is exactly "nobody has judged this operation yet".
-_OPERATION_OUTCOME_REBUILD_DDL = (
-    "ALTER TABLE memory_operations RENAME TO memory_operations_v12",
-    "DROP INDEX IF EXISTS memory_operations_active_key_idx",
-    """
-    CREATE TABLE memory_operations (
-        operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
-        intent TEXT NOT NULL CHECK (
-            intent IN ('reinforce', 'consolidate', 'correct', 'forget', 'identify', 'merge')
-        ),
-        trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
-        model_id TEXT,
-        recipe TEXT,
-        operation_json TEXT NOT NULL,
-        effects_json TEXT NOT NULL,
-        applied_at TEXT NOT NULL,
-        rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at),
-        outcome TEXT CHECK (outcome IS NULL OR outcome IN ('confirmed', 'refuted')),
-        outcome_note TEXT CHECK (outcome_note IS NULL OR length(trim(outcome_note)) > 0),
-        CHECK (outcome IS NOT NULL OR outcome_note IS NULL)
-    )
-    """,
-    """
-    INSERT INTO memory_operations (
-        operation_id, operation_key, intent, trigger, model_id, recipe,
-        operation_json, effects_json, applied_at, rolled_back_at
-    )
-    SELECT
-        operation_id, operation_key, intent, trigger, model_id, recipe,
-        operation_json, effects_json, applied_at, rolled_back_at
-    FROM memory_operations_v12
-    """,
-    "DROP TABLE memory_operations_v12",
-    """
-    CREATE UNIQUE INDEX memory_operations_active_key_idx
-        ON memory_operations (operation_key)
-        WHERE rolled_back_at IS NULL
-    """,
-)
-
-# v14 admits the `consent` intent. A consent statement is an identity-bound assertion the host
-# records for its subject, and the log row is what makes it auditable and reversible, so the
-# vocabulary the CHECK enforces has to name it.
-_OPERATION_CONSENT_REBUILD_DDL = (
-    "ALTER TABLE memory_operations RENAME TO memory_operations_v13",
-    "DROP INDEX IF EXISTS memory_operations_active_key_idx",
-    """
-    CREATE TABLE memory_operations (
-        operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        operation_key TEXT NOT NULL CHECK (length(trim(operation_key)) > 0),
-        intent TEXT NOT NULL CHECK (
-            intent IN (
-                'reinforce', 'consolidate', 'correct', 'forget', 'identify', 'merge', 'consent'
-            )
-        ),
-        trigger TEXT NOT NULL CHECK (length(trim(trigger)) > 0),
-        model_id TEXT,
-        recipe TEXT,
-        operation_json TEXT NOT NULL,
-        effects_json TEXT NOT NULL,
-        applied_at TEXT NOT NULL,
-        rolled_back_at TEXT CHECK (rolled_back_at IS NULL OR rolled_back_at >= applied_at),
-        outcome TEXT CHECK (outcome IS NULL OR outcome IN ('confirmed', 'refuted')),
-        outcome_note TEXT CHECK (outcome_note IS NULL OR length(trim(outcome_note)) > 0),
-        CHECK (outcome IS NOT NULL OR outcome_note IS NULL)
-    )
-    """,
-    """
-    INSERT INTO memory_operations (
-        operation_id, operation_key, intent, trigger, model_id, recipe,
-        operation_json, effects_json, applied_at, rolled_back_at, outcome, outcome_note
-    )
-    SELECT
-        operation_id, operation_key, intent, trigger, model_id, recipe,
-        operation_json, effects_json, applied_at, rolled_back_at, outcome, outcome_note
-    FROM memory_operations_v13
-    """,
-    "DROP TABLE memory_operations_v13",
-    """
-    CREATE UNIQUE INDEX memory_operations_active_key_idx
-        ON memory_operations (operation_key)
-        WHERE rolled_back_at IS NULL
-    """,
-)
-
-_PLACE_COLUMN_DDL = """
-ALTER TABLE memory_records
-ADD COLUMN place_id TEXT CHECK (
-    place_id IS NULL OR (length(place_id) > 0 AND place_id = trim(place_id))
-)
-"""
-
 # A symbolic room-level label, complementary to the metric pose on `memory_semantics`: the pose
 # answers "within 2 m of here", this answers "in the kitchen", which is what a household query
 # asks and the only spatial label a robot can supply when it cannot localise. It lives on
@@ -814,61 +618,6 @@ CREATE TABLE visual_descriptions (
     PRIMARY KEY (asset_id, space_id)
 )
 """
-
-_EVIDENCE_CLAUSE_SCHEMA = (
-    """
-    CREATE TABLE IF NOT EXISTS memory_evidence_clauses (
-        memory_id TEXT NOT NULL REFERENCES memory_semantics (memory_id) ON DELETE CASCADE,
-        clause_id TEXT NOT NULL CHECK (
-            length(clause_id) = 64 AND clause_id NOT GLOB '*[^0-9a-f]*'
-        ),
-        member_count INTEGER NOT NULL CHECK (member_count > 0),
-        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
-        recorded_at TEXT NOT NULL,
-        retired_at TEXT CHECK (retired_at IS NULL OR retired_at > recorded_at),
-        PRIMARY KEY (memory_id, clause_id)
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS memory_evidence_clauses_current_idx
-        ON memory_evidence_clauses (memory_id, retired_at, recorded_at)
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS memory_evidence_clause_members (
-        memory_id TEXT NOT NULL,
-        clause_id TEXT NOT NULL,
-        source_memory_id TEXT NOT NULL,
-        position INTEGER NOT NULL CHECK (position >= 0),
-        PRIMARY KEY (memory_id, clause_id, source_memory_id),
-        UNIQUE (memory_id, clause_id, position),
-        FOREIGN KEY (memory_id, clause_id)
-          REFERENCES memory_evidence_clauses (memory_id, clause_id) ON DELETE CASCADE
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS memory_evidence_clause_members_source_idx
-        ON memory_evidence_clause_members (source_memory_id, memory_id, clause_id)
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS memory_evidence_clause_versions (
-        memory_id TEXT NOT NULL,
-        clause_id TEXT NOT NULL,
-        version INTEGER NOT NULL CHECK (version > 0),
-        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
-        recorded_at TEXT NOT NULL,
-        retired_at TEXT CHECK (retired_at IS NULL OR retired_at > recorded_at),
-        restores_version INTEGER CHECK (restores_version IS NULL OR restores_version > 0),
-        PRIMARY KEY (memory_id, clause_id, version),
-        FOREIGN KEY (memory_id, clause_id)
-          REFERENCES memory_evidence_clauses (memory_id, clause_id) ON DELETE CASCADE
-    )
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS memory_evidence_clause_versions_current_idx
-        ON memory_evidence_clause_versions (memory_id, clause_id)
-        WHERE retired_at IS NULL
-    """,
-)
 
 _SCHEMA_CURRENT = f"""
 BEGIN IMMEDIATE;
@@ -945,201 +694,6 @@ CREATE INDEX search_index_queue_order_idx
 {_VISUAL_DESCRIPTION_DDL};
 
 PRAGMA user_version = {_SCHEMA_VERSION};
-COMMIT;
-"""
-
-_MIGRATE_V7_TO_V8 = f"""
-BEGIN IMMEDIATE;
-{_SEMANTIC_SCHEMA}
-PRAGMA user_version = 8;
-COMMIT;
-"""
-
-_MIGRATE_V5_TO_V6 = """
-BEGIN IMMEDIATE;
-ALTER TABLE memory_records ADD COLUMN occurred_end TEXT CHECK (
-    occurred_end IS NULL OR (occurred_at IS NOT NULL AND occurred_end > occurred_at)
-);
-PRAGMA user_version = 6;
-COMMIT;
-"""
-
-_MIGRATE_V6_TO_V7 = """
-BEGIN IMMEDIATE;
-
-CREATE TABLE identities (
-    identity_id TEXT PRIMARY KEY CHECK (length(trim(identity_id)) > 0),
-    name TEXT CHECK (name IS NULL OR length(trim(name)) > 0),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL CHECK (updated_at >= created_at)
-);
-
-INSERT INTO identities (identity_id, name, created_at, updated_at)
-SELECT speaker_id, name, created_at, updated_at
-FROM speaker_identities;
-
-CREATE TABLE identity_aliases (
-    alias_id TEXT PRIMARY KEY CHECK (length(trim(alias_id)) > 0),
-    identity_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE CASCADE,
-    created_at TEXT NOT NULL,
-    CHECK (alias_id <> identity_id)
-);
-
-CREATE INDEX identity_aliases_identity_idx ON identity_aliases (identity_id);
-
-CREATE TABLE identity_exemplars (
-    identity_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE CASCADE,
-    modality TEXT NOT NULL CHECK (modality IN ('face', 'voice')),
-    position INTEGER NOT NULL CHECK (position >= 0),
-    model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
-    space_id TEXT NOT NULL CHECK (length(trim(space_id)) > 0),
-    dimension INTEGER NOT NULL CHECK (dimension > 0),
-    vector BLOB NOT NULL CHECK (length(vector) = dimension * 4),
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (identity_id, modality, position)
-);
-
-INSERT INTO identity_exemplars (
-    identity_id, modality, position, model_id, space_id, dimension, vector, created_at
-)
--- A legacy name-only speaker is still authoritative identity data. Preserve its identity above,
--- but do not invent a biometric vector merely to satisfy the new exemplar schema.
-SELECT speaker_id, 'voice', 0, model_id, space_id, dimension, centroid, created_at
-FROM speaker_identities
-WHERE centroid IS NOT NULL;
-
-CREATE INDEX identity_exemplars_space_idx
-    ON identity_exemplars (modality, space_id, dimension, identity_id, position);
-
-CREATE TABLE speech_segments_v7 (
-    asset_id TEXT NOT NULL REFERENCES speech_analyses (asset_id) ON DELETE CASCADE,
-    position INTEGER NOT NULL CHECK (position >= 0),
-    start_ms INTEGER NOT NULL CHECK (start_ms >= 0),
-    end_ms INTEGER NOT NULL CHECK (end_ms > start_ms),
-    transcript TEXT NOT NULL CHECK (length(trim(transcript)) > 0),
-    speaker_id TEXT REFERENCES identities (identity_id) ON DELETE SET NULL,
-    identity_score REAL CHECK (
-        identity_score IS NULL OR (identity_score >= 0.0 AND identity_score <= 1.0)
-    ),
-    PRIMARY KEY (asset_id, position)
-);
-
-INSERT INTO speech_segments_v7 (
-    asset_id, position, start_ms, end_ms, transcript, speaker_id, identity_score
-)
-SELECT asset_id, position, start_ms, end_ms, transcript, speaker_id, identity_score
-FROM speech_segments;
-
-DROP TABLE speech_segments;
-DROP TABLE speaker_identities;
-ALTER TABLE speech_segments_v7 RENAME TO speech_segments;
-CREATE INDEX speech_segments_speaker_idx ON speech_segments (speaker_id);
-
-CREATE TABLE face_analyses (
-    asset_id TEXT PRIMARY KEY REFERENCES media_assets (asset_id) ON DELETE CASCADE,
-    model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
-    space_id TEXT NOT NULL CHECK (length(trim(space_id)) > 0),
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE face_observations (
-    asset_id TEXT NOT NULL REFERENCES face_analyses (asset_id) ON DELETE CASCADE,
-    position INTEGER NOT NULL CHECK (position >= 0),
-    observed_at_ms INTEGER CHECK (observed_at_ms IS NULL OR observed_at_ms >= 0),
-    box_x REAL NOT NULL CHECK (box_x >= 0.0 AND box_x <= 1.0),
-    box_y REAL NOT NULL CHECK (box_y >= 0.0 AND box_y <= 1.0),
-    box_width REAL NOT NULL CHECK (box_width > 0.0 AND box_x + box_width <= 1.0),
-    box_height REAL NOT NULL CHECK (box_height > 0.0 AND box_y + box_height <= 1.0),
-    identity_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE RESTRICT,
-    identity_score REAL CHECK (
-        identity_score IS NULL OR (identity_score >= 0.0 AND identity_score <= 1.0)
-    ),
-    PRIMARY KEY (asset_id, position)
-);
-
-CREATE INDEX face_observations_identity_idx ON face_observations (identity_id);
-
-PRAGMA user_version = 7;
-COMMIT;
-"""
-
-_MIGRATE_V1_TO_V2 = f"""
-BEGIN IMMEDIATE;
-
-DROP TRIGGER IF EXISTS embeddings_queue_insert;
-DROP TRIGGER IF EXISTS embeddings_queue_update;
-DROP TRIGGER IF EXISTS embeddings_queue_delete;
-DROP INDEX IF EXISTS embeddings_memory_idx;
-DROP INDEX IF EXISTS memory_records_created_idx;
-
-ALTER TABLE embeddings RENAME TO embeddings_v1;
-ALTER TABLE memory_records RENAME TO memory_records_v1;
-
-CREATE TABLE memory_records (
-    memory_id TEXT PRIMARY KEY,
-    content TEXT NOT NULL,
-    modality TEXT NOT NULL CHECK (modality IN ('text', 'image', 'video', 'audio', 'omni')),
-    metadata_json TEXT NOT NULL,
-    occurred_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL CHECK (updated_at >= created_at)
-);
-
-INSERT INTO memory_records (
-    memory_id, content, modality, metadata_json, occurred_at, created_at, updated_at
-)
-SELECT memory_id, content, 'text', metadata_json, occurred_at, created_at, updated_at
-FROM memory_records_v1;
-
-CREATE INDEX memory_records_created_idx
-    ON memory_records (created_at DESC, memory_id DESC);
-
-CREATE TABLE embeddings (
-    embedding_id TEXT PRIMARY KEY,
-    memory_id TEXT NOT NULL REFERENCES memory_records (memory_id) ON DELETE CASCADE,
-    object_part INTEGER NOT NULL DEFAULT 0 CHECK (object_part >= 0),
-    model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
-    space_id TEXT NOT NULL CHECK (length(trim(space_id)) > 0),
-    task TEXT NOT NULL CHECK (length(trim(task)) > 0),
-    dimension INTEGER NOT NULL CHECK (dimension > 0),
-    normalized INTEGER NOT NULL CHECK (normalized IN (0, 1)),
-    vector BLOB NOT NULL CHECK (length(vector) = dimension * 4),
-    created_at TEXT NOT NULL,
-    UNIQUE (memory_id, object_part, model_id, task)
-);
-
-INSERT INTO embeddings (
-    embedding_id, memory_id, object_part, model_id, space_id, task,
-    dimension, normalized, vector, created_at
-)
-SELECT embedding_id, memory_id, object_part, model_id, space_id, task,
-       dimension, normalized, vector, created_at
-FROM embeddings_v1;
-
-CREATE INDEX embeddings_memory_idx ON embeddings (memory_id);
-
-DROP TABLE embeddings_v1;
-DROP TABLE memory_records_v1;
-
-{_ASSET_SCHEMA}
-{_INDEX_TRIGGERS}
-
-PRAGMA user_version = 2;
-COMMIT;
-"""
-
-_MIGRATE_V2_TO_V4 = f"""
-BEGIN IMMEDIATE;
-{_LEGACY_SPEECH_SCHEMA}
-PRAGMA user_version = 4;
-COMMIT;
-"""
-
-_MIGRATE_V3_TO_V4 = """
-BEGIN IMMEDIATE;
-ALTER TABLE speaker_identities
-ADD COLUMN name TEXT CHECK (name IS NULL OR length(trim(name)) > 0);
-PRAGMA user_version = 4;
 COMMIT;
 """
 
@@ -5386,28 +4940,28 @@ class LocalStore:
         return cursor.rowcount > 0
 
     def _initialize_schema(self) -> None:
+        """Create the current schema in an empty directory, or refuse any other version.
+
+        This build has no upgrade path. A directory written by an older MindBridge is refused
+        rather than converted, because SQLite is the authoritative copy: re-create the directory
+        and re-ingest, or open it with the version that wrote it.
+        """
         with self._connection() as connection:
             version = _user_version(connection)
             tables = _table_names(connection)
             if version == 0:
                 _create_schema(connection, tables)
-            elif version == 1:
-                _migrate_v1(connection, tables)
-            # Each step advances `user_version` itself and a failed one rolls back without
-            # advancing it, so the version is re-read between steps rather than assumed. A step
-            # that returns without advancing would otherwise loop here, so it fails as the
-            # unsupported version it left behind.
-            while (step := _MIGRATIONS.get(version := _user_version(connection))) is not None:
-                step(connection)
-                if _user_version(connection) <= version:
-                    raise UnsupportedSchemaError(
-                        f"local schema migration from version {version} did not advance it"
-                    )
-            version = _user_version(connection)
-            tables = _table_names(connection)
+                version = _user_version(connection)
+                tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
                 raise UnsupportedSchemaError(
-                    f"unsupported local schema version {version}; expected {_SCHEMA_VERSION}"
+                    f"unsupported local schema version {version}; expected {_SCHEMA_VERSION}. "
+                    + (
+                        "Re-create the data directory and re-ingest, or open it with the "
+                        "MindBridge version that wrote it."
+                        if version < _SCHEMA_VERSION
+                        else "This directory was written by a newer MindBridge."
+                    )
                 )
             missing_tables = _REQUIRED_TABLES - tables
             if missing_tables:
@@ -6316,419 +5870,6 @@ def _create_schema(
         raise
 
 
-def _migrate_v1(
-    connection: sqlite3.Connection,
-    existing_tables: frozenset[str],
-) -> None:
-    missing_tables = _REQUIRED_V1_TABLES - existing_tables
-    if missing_tables:
-        names = ", ".join(sorted(missing_tables))
-        raise UnsupportedSchemaError(f"local schema v1 is missing required tables: {names}")
-    connection.execute("PRAGMA foreign_keys = OFF")
-    try:
-        connection.executescript(_MIGRATE_V1_TO_V2)
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-    finally:
-        connection.execute("PRAGMA foreign_keys = ON")
-    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-        raise UnsupportedSchemaError("local schema migration produced invalid foreign keys")
-
-
-def _migrate_v2(connection: sqlite3.Connection) -> None:
-    try:
-        connection.executescript(_MIGRATE_V2_TO_V4)
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_v3(connection: sqlite3.Connection) -> None:
-    try:
-        connection.executescript(_MIGRATE_V3_TO_V4)
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_v4(connection: sqlite3.Connection) -> None:
-    try:
-        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(memory_records)")}
-        connection.execute("BEGIN IMMEDIATE")
-        if "memory_type" not in columns:
-            connection.execute(
-                """
-                ALTER TABLE memory_records
-                ADD COLUMN memory_type TEXT NOT NULL DEFAULT 'semantic'
-                    CHECK (memory_type IN ('semantic', 'episodic', 'procedural'))
-                """
-            )
-        if "last_accessed_at" not in columns:
-            connection.execute("ALTER TABLE memory_records ADD COLUMN last_accessed_at TEXT")
-        if "access_count" not in columns:
-            connection.execute(
-                """
-                ALTER TABLE memory_records
-                ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0
-                    CHECK (access_count BETWEEN 0 AND 20)
-                """
-            )
-        connection.execute("PRAGMA user_version = 5")
-        connection.commit()
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_v5(connection: sqlite3.Connection) -> None:
-    try:
-        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(memory_records)")}
-        if "occurred_end" not in columns:
-            connection.executescript(_MIGRATE_V5_TO_V6)
-        else:
-            connection.execute("PRAGMA user_version = 6")
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_v6(connection: sqlite3.Connection) -> None:
-    try:
-        connection.executescript(_MIGRATE_V6_TO_V7)
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_v7(connection: sqlite3.Connection) -> None:
-    try:
-        semantic_tables = {
-            "formation_runs",
-            "memory_evidence",
-            "memory_semantics",
-            "memory_versions",
-        }
-        existing = semantic_tables & _table_names(connection)
-        if existing == semantic_tables:
-            connection.execute("PRAGMA user_version = 8")
-            return
-        if existing:
-            names = ", ".join(sorted(semantic_tables - existing))
-            raise UnsupportedSchemaError(
-                f"local schema has an incomplete v8 semantic projection; missing: {names}"
-            )
-        # Test and recovery fixtures may remove the v8 projection from a newer database to
-        # exercise this rung. Clause tables cannot stand without that projection, so discard
-        # those empty-or-orphaned descendants before recreating the v8 shape.
-        for table in (
-            "memory_evidence_clause_versions",
-            "memory_evidence_clause_members",
-            "memory_evidence_clauses",
-        ):
-            if table in _table_names(connection):
-                connection.execute(f"DROP TABLE {table}")
-        connection.executescript(_MIGRATE_V7_TO_V8)
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_v8(connection: sqlite3.Connection) -> None:
-    try:
-        identity_columns = {
-            str(row[1]) for row in connection.execute("PRAGMA table_info(identities)")
-        }
-        alias_columns = {
-            str(row[1]) for row in connection.execute("PRAGMA table_info(identity_aliases)")
-        }
-        has_evidence = "identity_link_evidence" in _table_names(connection)
-        connection.execute("BEGIN IMMEDIATE")
-        if "relationship" not in identity_columns:
-            connection.execute(
-                """
-                ALTER TABLE identities
-                ADD COLUMN relationship TEXT
-                    CHECK (relationship IS NULL OR length(trim(relationship)) > 0)
-                """
-            )
-        if "contributed_modality" not in alias_columns:
-            connection.execute(
-                """
-                ALTER TABLE identity_aliases
-                ADD COLUMN contributed_modality TEXT
-                    CHECK (
-                        contributed_modality IS NULL
-                        OR contributed_modality IN ('face', 'voice')
-                    )
-                """
-            )
-        if not has_evidence:
-            for statement in _IDENTITY_LINK_EVIDENCE_DDL:
-                connection.execute(statement)
-        connection.execute("PRAGMA user_version = 9")
-        connection.commit()
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_v9(connection: sqlite3.Connection) -> None:
-    try:
-        record_columns = {
-            str(row[1]) for row in connection.execute("PRAGMA table_info(memory_records)")
-        }
-        indexes = {
-            str(row[1])
-            for row in connection.execute("PRAGMA index_list(memory_records)")
-            if row[1] is not None
-        }
-        connection.execute("BEGIN IMMEDIATE")
-        if "place_id" not in record_columns:
-            connection.execute(_PLACE_COLUMN_DDL)
-        if "memory_records_place_idx" not in indexes:
-            connection.execute(_PLACE_INDEX_DDL)
-        connection.execute("PRAGMA user_version = 10")
-        connection.commit()
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_v10(connection: sqlite3.Connection) -> None:
-    """Add forgetting state and the control-plane tables.
-
-    A store created by a v10 development build may carry either the place column or the
-    forgetting column but not both, so every step is guarded rather than assumed.
-    """
-    try:
-        record_columns = {
-            str(row[1]) for row in connection.execute("PRAGMA table_info(memory_records)")
-        }
-        indexes = {
-            str(row[1])
-            for row in connection.execute("PRAGMA index_list(memory_records)")
-            if row[1] is not None
-        }
-        connection.execute("BEGIN IMMEDIATE")
-        if "place_id" not in record_columns:
-            connection.execute(_PLACE_COLUMN_DDL)
-        if "memory_records_place_idx" not in indexes:
-            connection.execute(_PLACE_INDEX_DDL)
-        if "forgotten_at" not in record_columns:
-            connection.execute("ALTER TABLE memory_records ADD COLUMN forgotten_at TEXT")
-        for statement in _CONTROL_SCHEMA:
-            connection.execute(statement)
-        connection.execute("PRAGMA user_version = 11")
-        connection.commit()
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_v11(connection: sqlite3.Connection) -> None:
-    """Bind typed claims to the recognized person they are about, and admit `identify`.
-
-    `ON DELETE SET NULL` is the erasure promise in the schema: forgetting a person drops the
-    attribution and keeps the claim, the same way forgetting a person keeps the evening.
-    """
-    try:
-        semantic_columns = {
-            str(row[1]) for row in connection.execute("PRAGMA table_info(memory_semantics)")
-        }
-        indexes = {
-            str(row[1])
-            for row in connection.execute("PRAGMA index_list(memory_semantics)")
-            if row[1] is not None
-        }
-        connection.execute("BEGIN IMMEDIATE")
-        if "identity_id" not in semantic_columns:
-            connection.execute(_SEMANTIC_IDENTITY_COLUMN_DDL)
-        if "memory_semantics_identity_idx" not in indexes:
-            connection.execute(_SEMANTIC_IDENTITY_INDEX_DDL)
-        for statement in _OPERATION_INTENT_REBUILD_DDL:
-            connection.execute(statement)
-        connection.execute("PRAGMA user_version = 12")
-        connection.commit()
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_visual_descriptions(connection: sqlite3.Connection) -> None:
-    """Add the caption cache to an existing store. Purely additive: no row is read or rewritten."""
-    has_descriptions = "visual_descriptions" in _table_names(connection)
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        if not has_descriptions:
-            connection.execute(_VISUAL_DESCRIPTION_DDL)
-        connection.execute("PRAGMA user_version = 13")
-        connection.commit()
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_v13(connection: sqlite3.Connection) -> None:
-    """Add the scheduler's durable state, the post-hoc outcome, and the `merge` intent.
-
-    The operation-log rebuild is skipped when the table already carries `outcome`, because a
-    store created by a v10 or v11 development build ran `_CONTROL_SCHEMA`, which now declares
-    the v14 shape outright.
-    """
-    try:
-        operation_columns = {
-            str(row[1]) for row in connection.execute("PRAGMA table_info(memory_operations)")
-        }
-        connection.execute("BEGIN IMMEDIATE")
-        connection.executescript(_SCHEDULER_SCHEMA)
-        if "outcome" not in operation_columns:
-            for statement in _OPERATION_OUTCOME_REBUILD_DDL:
-                connection.execute(statement)
-        connection.execute("PRAGMA user_version = 14")
-        connection.commit()
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_v14(connection: sqlite3.Connection) -> None:
-    """Admit the `consent` intent, so a data subject's own statement can be logged.
-
-    A store created by a v12 development build ran `_CONTROL_SCHEMA`, which now declares the v15
-    vocabulary outright, so the rebuild is skipped when the constraint already names `consent`.
-    """
-    try:
-        declared = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memory_operations'"
-        ).fetchone()
-        connection.execute("BEGIN IMMEDIATE")
-        if declared is None or "'consent'" not in str(declared[0]):
-            for statement in _OPERATION_CONSENT_REBUILD_DDL:
-                connection.execute(statement)
-        connection.execute("PRAGMA user_version = 15")
-
-        connection.commit()
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_v15(connection: sqlite3.Connection) -> None:
-    """Index recalled records, re-key the log, and give old names an assertion.
-
-    One transaction, idempotent steps.
-    """
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        _v16_accessed_index(connection)
-        _v16_rekey_operations(connection)
-        _v16_backfill_naming_assertions(connection)
-        connection.execute("PRAGMA user_version = 16")
-        connection.commit()
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-def _migrate_v16(connection: sqlite3.Connection) -> None:
-    """Represent every historic flat link as its own singleton alternative clause."""
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        clause_tables = {
-            "memory_evidence_clauses",
-            "memory_evidence_clause_members",
-            "memory_evidence_clause_versions",
-        }
-        existing = clause_tables & _table_names(connection)
-        if existing:
-            if existing != clause_tables:
-                missing = ", ".join(sorted(clause_tables - existing))
-                raise UnsupportedSchemaError(
-                    f"local schema has an incomplete v17 evidence projection; missing: {missing}"
-                )
-            _validate_evidence_clause_schema(connection)
-        for statement in _EVIDENCE_CLAUSE_SCHEMA:
-            connection.execute(statement)
-        _validate_evidence_clause_schema(connection)
-        versions: dict[tuple[str, str], int] = {}
-        for row in connection.execute(
-            """
-            SELECT memory_id, source_memory_id, confidence, recorded_at, retired_at
-            FROM memory_evidence ORDER BY memory_id, position
-            """
-        ).fetchall():
-            memory_id = _row_text(row, "memory_id")
-            source_id = _row_text(row, "source_memory_id")
-            clause_id = _evidence_clause_id((source_id,))
-            key = (memory_id, clause_id)
-            version = versions.get(key, 0) + 1
-            versions[key] = version
-            connection.execute(
-                """
-                INSERT INTO memory_evidence_clauses (
-                    memory_id, clause_id, member_count, confidence, recorded_at, retired_at
-                ) VALUES (?, ?, 1, ?, ?, ?)
-                ON CONFLICT (memory_id, clause_id) DO UPDATE SET
-                    confidence = excluded.confidence,
-                    recorded_at = excluded.recorded_at,
-                    retired_at = excluded.retired_at
-                """,
-                (
-                    memory_id,
-                    clause_id,
-                    float(row["confidence"]),
-                    _row_text(row, "recorded_at"),
-                    row["retired_at"],
-                ),
-            )
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO memory_evidence_clause_members (
-                    memory_id, clause_id, source_memory_id, position
-                ) VALUES (?, ?, ?, 0)
-                """,
-                (memory_id, clause_id, source_id),
-            )
-            connection.execute(
-                """
-                INSERT INTO memory_evidence_clause_versions (
-                    memory_id, clause_id, version, confidence, recorded_at, retired_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    memory_id,
-                    clause_id,
-                    version,
-                    float(row["confidence"]),
-                    _row_text(row, "recorded_at"),
-                    row["retired_at"],
-                ),
-            )
-        _report_unsupported_derived_records(connection)
-        connection.execute("PRAGMA user_version = 17")
-        connection.commit()
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
 def _report_unsupported_derived_records(connection: sqlite3.Connection) -> int:
     """Count the derived records the clause projection leaves without any support.
 
@@ -6761,54 +5902,6 @@ def _report_unsupported_derived_records(connection: sqlite3.Connection) -> int:
             count,
         )
     return count
-
-
-def _migrate_v17(connection: sqlite3.Connection) -> None:
-    """Add exact selectors only for embedding parts written by schema 18 or later.
-
-    Existing vectors deliberately receive no selector: their original chunk construction is not
-    durable, and inferring offsets while opening a store would manufacture provenance.
-    """
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        selector_tables = {"embedding_text_selectors", "embedding_text_span_pieces"}
-        existing = selector_tables & _table_names(connection)
-        if existing and existing != selector_tables:
-            missing = ", ".join(sorted(selector_tables - existing))
-            raise UnsupportedSchemaError(
-                f"local schema has an incomplete v18 text selector projection; missing: {missing}"
-            )
-        for statement in _TEXT_SELECTOR_SCHEMA:
-            connection.execute(statement)
-        _validate_text_selector_schema(connection)
-        connection.execute("PRAGMA user_version = 18")
-        connection.commit()
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
-
-
-# Each migration keyed by the version it upgrades from. `_migrate_v1` stays out of the table
-# because it also needs the table names read before anything ran.
-_MIGRATIONS: Mapping[int, Callable[[sqlite3.Connection], None]] = {
-    2: _migrate_v2,
-    3: _migrate_v3,
-    4: _migrate_v4,
-    5: _migrate_v5,
-    6: _migrate_v6,
-    7: _migrate_v7,
-    8: _migrate_v8,
-    9: _migrate_v9,
-    10: _migrate_v10,
-    11: _migrate_v11,
-    _PRE_VISUAL_DESCRIPTION_VERSION: _migrate_visual_descriptions,
-    13: _migrate_v13,
-    14: _migrate_v14,
-    15: _migrate_v15,
-    16: _migrate_v16,
-    17: _migrate_v17,
-}
 
 
 def _validate_text_selector_schema(connection: sqlite3.Connection) -> None:
