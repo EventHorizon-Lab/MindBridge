@@ -37,6 +37,23 @@ MEMLENS_QUERY_PROMPT = PromptSpec(
     refusal="Insufficient information",
 )
 
+ES_MEMEVAL_QA_QUERY_PROMPT = PromptSpec(
+    name="es_memeval_qa_query",
+    version="es_memeval_qa_query_v1",
+    purpose="Apply the ES-MemEval QA answer and abstention contract.",
+    used_by="mindbridge.benchmarks.eval_adapters._es_memeval",
+    # The upstream runner wraps the same three requirements in a longer system
+    # example. This compact transport keeps their semantics while avoiding a
+    # false claim that MindBridge presents an in-request `Relevant Memory`
+    # block: evidence is supplied through Memory.ask instead.
+    text=(
+        "Answer the question concisely and accurately using only the retrieved memories. "
+        'If the memories do not contain the answer, respond exactly "unknown".\n\n'
+        "Question: {question}"
+    ),
+    refusal="unknown",
+)
+
 VIDEO_MME_V2_QUERY_PROMPT = PromptSpec(
     name="video_mme_v2_query",
     version="video_mme_v2_query_v1",

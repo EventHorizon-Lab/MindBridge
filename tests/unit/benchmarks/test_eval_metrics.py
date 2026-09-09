@@ -566,6 +566,39 @@ def test_resource_sampler_reports_gpu_average_peak_power_and_estimated_energy(
     assert gpu["1"]["average_power_watts"] is None
 
 
+def test_resource_sampler_excludes_interleaved_judge_cpu_and_wall_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cpu = iter((10.0, 12.0, 17.0, 20.0))
+    wall = iter((100.0, 102.0, 105.0, 110.0))
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.eval_telemetry._nvidia_utilization",
+        lambda: (),
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.eval_telemetry._rapl_energy_uj",
+        lambda root=None: (None, "unavailable"),
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.eval_telemetry._cpu_seconds",
+        lambda: next(cpu),
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.eval_telemetry.perf_counter",
+        lambda: next(wall),
+    )
+
+    with ResourceSampler() as sampler, sampler.exclude():
+        pass
+
+    resources = sampler.json(wall_seconds=99.0)
+    measurement = cast(Mapping[str, object], resources["measurement"])
+    measured_cpu = cast(Mapping[str, object], resources["cpu"])
+    assert measurement["excluded_window_count"] == 1
+    assert measurement["wall_seconds"] == 7.0
+    assert measured_cpu["seconds"] == 5.0
+
+
 def test_storage_bytes_separates_media_rows_and_vectors(tmp_path: Path) -> None:
     (tmp_path / "assets").mkdir()
     (tmp_path / "zvec" / "nested").mkdir(parents=True)

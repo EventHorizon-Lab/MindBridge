@@ -140,6 +140,10 @@ def test_official_judge_response_parsers_keep_upstream_mappings() -> None:
     assert parse_judge_response(JudgePlan("p", "gallery", message), '{"score": "0.5"}') == {
         "llm_judge": 0.5
     }
+    assert parse_judge_response(JudgePlan("p", "es_memeval", message), "Score: 1") == {
+        "llm_judge": 0.5,
+        "judge_score_0_2": 1.0,
+    }
 
 
 def test_memlens_and_locomo_plans_preserve_official_protocol_details() -> None:
@@ -192,6 +196,44 @@ def test_m3_plan_preserves_the_official_system_message() -> None:
     assert plan is not None
     assert plan.calls[0][0] == JudgeMessage("system", "You are an expert in video understanding.")
     assert plan.calls[0][1].role == "user"
+
+
+def test_es_memeval_uses_its_set_overlap_f1_and_gpt4o_judge() -> None:
+    # Upstream deduplicates the overlap while retaining repeated prediction
+    # tokens in the denominator: 2 * (2/4 * 2/2) / (2/4 + 2/2).
+    assert _scores(
+        "es-memeval-qa",
+        "Painting helps painting helps",
+        "Painting helps",
+        {"capability": "information extraction"},
+    ) == {"f1": pytest.approx(2 / 3)}
+    assert _scores(
+        "es-memeval-qa",
+        "**Answer: Painting**",
+        "Painting",
+        {"capability": "information extraction"},
+    ) == {"f1": 1.0}
+
+    plan = judge_plan(
+        "es-memeval-qa",
+        question="What hobby did Sarah start?",
+        references=("Painting",),
+        prediction="**Answer: She started painting.**",
+        metadata={"capability": "information extraction"},
+    )
+
+    assert plan is not None
+    assert plan.parser == "es_memeval"
+    assert plan.max_tokens == 16
+    assert plan.calls[0][0] == JudgeMessage("system", "You are a strict evaluator.")
+    assert "Score: X" in plan.calls[0][1].content
+    assert "Model answer: She started painting." in plan.calls[0][1].content
+    assert "Model answer: **" not in plan.calls[0][1].content
+    assert official_judge_model("es-memeval-qa") == "gpt-4o"
+    assert judge_model_is_official("es-memeval-qa", "openai/gpt-4o")
+    assert task_primary_metric("es-memeval-qa") == "llm_judge"
+    assert metric_is_official("es-memeval-qa", "f1", "", uses_judge=False)
+    assert not metric_is_official("es-memeval-qa", "llm_judge", "gpt-4o", uses_judge=True)
 
 
 @pytest.mark.asyncio

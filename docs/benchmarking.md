@@ -31,9 +31,9 @@ List the current task groups, pinned revisions, and local-data readiness:
 mindbridge-bench eval --list-tasks
 ```
 
-The catalog currently covers LoCoMo-Refined, M3-Bench, Video-MME-v2, WorldMemArena, EgoTempo,
-MemLens, MM-Lifelong, SuperMemory-VQA, ATM-Bench, Mem-Gallery, LongMemEval, CL-Bench, BEAM,
-PersonaMem-v3, and OpenEQA. Use the listing command
+The catalog currently covers LoCoMo-Refined, ES-MemEval, M3-Bench, Video-MME-v2, WorldMemArena,
+EgoTempo, MemLens, MM-Lifelong, SuperMemory-VQA, ATM-Bench, Mem-Gallery, LongMemEval, CL-Bench,
+BEAM, PersonaMem-v3, and OpenEQA. Use the listing command
 instead of copying task names from this page; it is generated from the catalog used by the
 runner.
 
@@ -71,6 +71,16 @@ uv run --frozen mindbridge-bench eval \
 
 The resulting `results.jsonl` reports `unit_count`, `question_count`, `dataset_sha256`, and
 `evaluation_sha256` for each selected task.
+
+ES-MemEval's QA task is selected through its family name; `--limit 1` means one seeker and all of
+that seeker's questions:
+
+```bash
+uv run --frozen mindbridge-bench eval \
+  --tasks es-memeval \
+  --limit 1 \
+  --output-path .benchmarks/results/es-memeval-qa-smoke
+```
 
 ## Run a bounded evaluation
 
@@ -371,7 +381,7 @@ there, not what an arm can see once ingest finishes.
 
 ## Supported benchmark categories and primary metrics
 
-The executable catalog currently contains 17 benchmark families expanded to 31 concrete tasks.
+The executable catalog currently contains 16 benchmark families expanded to 30 concrete tasks.
 They fall into three dataset categories and one local systems microbenchmark. Classification follows
 the primary workload; several suites deliberately overlap categories.
 
@@ -401,8 +411,9 @@ from `mindbridge.benchmarks.task_catalog`; `--list-tasks` remains authoritative.
 | LoCoMo-Refined (`locomo-refined`) | Multi-session dialogue QA, temporal questions, captioned-image turns, and exact source-ID retrieval; use for conversational long-term memory | `llm_judge`; judge `qwen3-14b` | Pinned GitHub JSON; automatic |
 | MemLens (`memlens`: 32K/64K/128K/256K) | Information extraction, multi-session and temporal reasoning, knowledge updates, and refusal over dated conversations; use for scaling context length | `accuracy`; judge `qwen3-235b-judge` | Pinned Hugging Face JSON and 195-question subset; automatic; published captions need no runtime media |
 | LongMemEval (`longmemeval-s`) | User, assistant, and preference recall plus multi-session reasoning, updates, abstention, and exact turn-level retrieval; use for established long-term dialogue behaviors | `accuracy`; judge `gpt-4o-2024-08-06` | Pinned Hugging Face JSON; automatic |
-| BEAM (`beam`: 100K/500K/1M/10M) | Very-long dialogue with contradiction resolution, ordering, extraction, updates, summarization, and temporal reasoning; use for length scaling | Official category metrics; `event_ordering` uses `tau_norm`, other categories use `llm_judge_score`; judge `gpt-4.1-mini` | Pinned GitHub tier directories; automatic |
-| PersonaMem-v3 (`personamem-v3`) | Causally masked cross-app personalization, preference shifts, sycophancy, privacy, hallucination, and candidate ranking; use for personal-agent behavior | `accuracy_pct_micro` (0--100), published only with complete scorer coverage; judged families use `gpt-5.5`, ranking rows are deterministic | Pinned Hugging Face backend JSON; automatic; scorer-only `profile.json` is excluded |
+| ES-MemEval (`es-memeval`, task `es-memeval-qa`) | Personalized long-term emotional-support dialogue QA across information extraction, temporal reasoning, conflict detection, abstention, and user modeling | `llm_judge` (the 0--2 rubric normalized to 0--1); judge `gpt-4o`; published `f1` is also reported; the semantically transcribed judge is marked non-official | Pinned GitHub EvoEmo JSON; automatic; upstream declares no license at the pinned revision |
+| BEAM (`beam`: 100K/500K/1M/10M) | Very-long dialogue with contradiction resolution, ordering, extraction, updates, summarization, and temporal reasoning; use for length scaling | `llm_judge_score`; judge `gpt-4.1-mini` | Pinned GitHub tier directories; automatic |
+| PersonaMem-v3 (`personamem-v3`) | Causally masked cross-app personalization, preference shifts, sycophancy, privacy, hallucination, and candidate ranking; use for personal-agent behavior | `personamem_score`; judged families use `gpt-5.5`, ranking rows are deterministic | Pinned Hugging Face backend JSON; automatic; scorer-only `profile.json` is excluded |
 | CL-Bench (`clbench`) | Learning a long reference document and following open-ended instructions; use for task-local context learning, not gold-source retrieval | `solving_rate`; judge `gpt-5.1` | Pinned Hugging Face JSONL; automatic |
 
 ### Multimodal personal memory
@@ -528,7 +539,8 @@ Video-MME-v2's grouped `rating` and question-level `accuracy` are both on a 0--1
 
 Protocol boundaries that affect interpretation are explicit rather than approximated:
 
-- `locomo-refined`, `memlens`, `longmemeval-s`, `clbench`, `beam`, and `personamem-v3` need no
+- `locomo-refined`, `memlens`, `longmemeval-s`, `es-memeval-qa`, `clbench`, `beam`, and
+  `personamem-v3` need no
   runtime media preparation; LoCoMo-Refined and MemLens ingest the releases' published captions.
 - CL-Bench has no separate question field. The adapter splits the final user turn at its last
   blank-line paragraph break and marks oversized residual questions with `question_unsliced`.
@@ -641,7 +653,7 @@ Four choices decide whether a number here is comparable with the leaderboard:
 
 ## Benchmarks without runtime media preparation
 
-Six benchmark families read text, structured annotations, or published captions without opening
+Seven benchmark families read text, structured annotations, or published captions without opening
 runtime media, so they need neither `ffmpeg` nor a preparation pass:
 
 | Task | Unit | Corpus | Official headline |
@@ -649,11 +661,21 @@ runtime media, so they need neither `ffmpeg` nor a preparation pass:
 | `locomo-refined` | one conversation | multi-session dialogue plus published image captions | `llm_judge`, the official correctness judge |
 | `memlens-32k` … `memlens-256k` | one question | dated conversation sessions plus published image captions | `accuracy`, the official question-type judge |
 | `longmemeval-s` | one question | its own 50-session haystack | `accuracy`, the yes/no answer-check judge |
+| `es-memeval-qa` | one seeker | every dated seeker/supporter session and all of that seeker's QA items | non-official adapted `llm_judge`, the GPT-4o 0--2 rubric normalized to 0--1 |
 | `clbench` | one task | the reference document behind its question | `solving_rate`, the binary rubric judge |
 | `beam-100k` … `beam-10m` | one conversation | the whole transcript | Category metrics: `tau_norm` for event ordering, `llm_judge_score` otherwise |
 | `personamem-v3` | one persona | five engagement logs plus a calendar stream | `accuracy_pct_micro`, 0--100 when scorer coverage is complete |
 
-Three of them need a note before a number is quoted:
+Four of them need a note before a number is quoted:
+
+- **ES-MemEval support covers the QA task.** The upstream suite also contains summarization and
+  dialogue-generation experiments, whose multi-turn and event-based scoring contracts do not fit
+  this QA runner. The adapter matches the published session-level RAG corpus, reports the upstream
+  set-overlap `f1`, and retains the raw judge mark as `judge_score_0_2`. Because the pinned upstream
+  repository has no declared license, the judge prompt is a compact semantic transcription rather
+  than copied text, and both judge metrics carry `official_metric: false`. The paper's BERTScore is
+  not run because it requires a separate learned evaluator and model download. Verify permission
+  before downloading or using EvoEmo.
 
 - **CL-Bench publishes no `question` field.** Each record's final turn mixes a reference document
   -- up to ~150,000 characters -- with the query in one string, and the loader splits it at the
@@ -857,6 +879,7 @@ which is the honest state and not a defect to paper over.
 | --- | --- | --- |
 | `locomo-refined` | `qa[].evidence`, a list of `dia_id` values | Exact: `dia_id` is the stored source ID |
 | `longmemeval` | `has_answer` on the answering turn, and the coarser `answer_session_ids` | Exact at turn level |
+| `es-memeval` | QA `evidence` turn IDs; event IDs are scorer-only annotations | Exact at the published session retrieval granularity: a session is gold when it contains at least one labelled visible turn |
 | `atm-bench` | `evidence_ids` naming emails and media records | Exact |
 | `mem-gallery` | `clue_ids`, the clue round IDs | Exact |
 | `worldmemarena` | Gold `image_id` and scorer-authored `memory_id` points | Exact for image IDs; `mp_*` memory points are unresolved rather than leaked into memory |
@@ -871,7 +894,7 @@ which is the honest state and not a defect to paper over.
 | `openeqa` | `episode_history`, which is the unit | Not derivable |
 | `video-mme-v2` | Nothing beyond the answer | Not derivable |
 
-So exact retrieval quality is measurable on four families in the catalog, plus the image-labelled
+So exact retrieval quality is measurable on five families in the catalog, plus the image-labelled
 subset of WorldMemArena. Its `recall_at_20` remains a diagnostic for those compatible source-ID
 labels, not a universal benchmark metric.
 
@@ -911,6 +934,11 @@ than that is inside the run-to-run noise band and is not a result. `--compare` r
 
 Each completed `eval` output directory contains:
 
+- `config.yaml`: a resolved comparison manifest containing the effective product, judge, download,
+  server-observation, and run settings after file, environment, and command-line precedence. API
+  credentials and unconstrained provider-specific `extra_body` values are omitted. This generated
+  manifest describes the completed run; it is not intended to be passed back to `--config` as an
+  input document.
 - `samples.jsonl`: one prediction and its native metrics, evidence intervals, retrieval diagnostics,
   `ranked_source_ids_complete`, and structured failure fields per sample, per arm.
 - `results.jsonl`: one aggregate record with dataset and implementation pins, arm definitions,
@@ -924,23 +952,18 @@ recover the answers of the tasks that completed before an interruption.
 
 ### Reporting cadence
 
-A multi-task run answers its tasks in order and reports every task at the end, because judging and
-the standalone search replay are deliberately run-global second passes: replaying or judging one
-task while a later task is still answering changes the load on the shared model service and moves
-both tasks' latency and token measurements.
+A multi-task run answers its tasks in order. By default, each task is judged and its interim table is
+printed before the next task starts, so a six-task run shows its first score after the first task
+instead of waiting for all six inference phases. The interim tables use the same arithmetic as the
+final document, minus the standalone search replay, which still runs once at the end, and every
+answer is judged exactly once.
 
-`--stream-results` (`benchmark.run.stream_results`) trades that away for feedback. Each task is
-judged and printed as soon as it stops answering, so a six-task run shows its first table after the
-first task instead of after the last. The interim tables are the same arithmetic as the final
-document, minus the standalone search replay, which still runs once at the end, and every answer is
-judged exactly once: the scores, controls, and confidence intervals in the final `results.jsonl` are
-what the same run would have produced without the flag.
-
-Performance is a different matter, and it is the reason the flag is opt-in. Later tasks answer while
-earlier tasks are being judged, so their `performance` blocks -- `avg ms`, token usage, throughput --
-describe a contended model service and are not comparable with a normal run or with each other.
-Leave the flag off for any run whose latency numbers will be quoted, or fed to `--compare` with
-`--performance-budget`.
+`--no-stream-results` (or `benchmark.run.stream_results: false`) restores the former run-global
+judging pass when a protocol requires every inference phase to finish before any judging begins. It
+also defers every task table until the end. Under the default cadence, client resource sampling and
+optional model-server counter deltas split around each judge pass, so judge work is excluded from
+the product measurement window. `--stream-results` remains accepted as an explicit spelling of the
+default.
 
 Three result fields carry a caveat that decides whether they can be quoted:
 

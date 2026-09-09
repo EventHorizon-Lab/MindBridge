@@ -68,7 +68,7 @@ from mindbridge.benchmarks._official.worldmemarena_qa import (
 )
 from mindbridge.benchmarks.personamem_v3 import RANKING_TASK_TYPES
 
-SCORER_VERSION = "official_scorers_v3"
+SCORER_VERSION = "official_scorers_v4"
 
 
 class _Stemmer(Protocol):
@@ -102,6 +102,7 @@ class JudgePlan:
         "beam_event",
         "personamem_v3",
         "openeqa",
+        "es_memeval",
         "worldmemarena",
     ]
     calls: tuple[tuple[JudgeMessage, ...], ...]
@@ -127,6 +128,7 @@ _PROTOCOLS = {
     "beam": "beam_unified_rubric_3e12035532eb",
     "personamem-v3": "personamem_v3_rubric_7b00a090b35b",
     "openeqa": "openeqa_llm_match_cfa3fce4595c",
+    "es-memeval": "es_memeval_qa_judge_692624208acc_v1",
 }
 
 _OFFICIAL_JUDGE_MODELS = {
@@ -149,6 +151,8 @@ _OFFICIAL_JUDGE_MODELS = {
     # `llm_match.get_llm_match_score`'s `openai_model` default, which
     # `evaluate-predictions.py` never overrides.
     "openeqa": "gpt-4-1106-preview",
+    # `common_configurations.py` supplies this ID to every released QA script.
+    "es-memeval": "gpt-4o",
 }
 
 # Metrics the pinned upstream protocol reports itself. `metric_is_official` reads this registry
@@ -208,6 +212,9 @@ _OFFICIAL_METRICS: dict[str, frozenset[str]] = {
         }
     ),
     "openeqa": frozenset({"llm_match", "llm_match_score_1_5"}),
+    # The release also reports BERTScore. It is intentionally not calculated
+    # here because it requires a second learned scorer and model download.
+    "es-memeval": frozenset({"f1", "llm_judge", "judge_score_0_2"}),
 }
 
 # One family scores an open dimension vocabulary upstream: `score_unified_rubric` names every
@@ -241,8 +248,14 @@ _JUDGE_METRICS = {
         }
     ),
     "openeqa": frozenset({"llm_match", "llm_match_score_1_5"}),
+    "es-memeval": frozenset({"llm_judge", "judge_score_0_2"}),
     "worldmemarena": frozenset({"correct_ratio", "hallucination_ratio", "omission_ratio"}),
 }
+
+# The pinned ES-MemEval repository has no declared license. Its judge wording
+# is therefore represented by a semantic transcription rather than copied
+# verbatim, which makes the result useful but not protocol-identical.
+_ADAPTED_JUDGE_PROTOCOLS = frozenset({"es-memeval"})
 
 # PersonaMem-v3 headline per task type, and the divisor that maps it onto the
 # internal 0-1 row value from which the official micro percentage is computed
@@ -312,6 +325,7 @@ def task_primary_metric(task: str) -> str:
         "beam": "beam_score",
         "personamem-v3": "accuracy_pct_micro",
         "openeqa": "llm_match",
+        "es-memeval": "llm_judge",
     }[family]
 
 
@@ -368,6 +382,8 @@ def metric_is_official(task: str, metric: str, judge_model: str, *, uses_judge: 
     )
     if not requires_judge or not uses_judge:
         return True
+    if _family_or_none(task) in _ADAPTED_JUDGE_PROTOCOLS:
+        return False
     return judge_model_is_official(task, judge_model)
 
 
@@ -473,6 +489,8 @@ def local_scores(  # noqa: C901 - direct task dispatch mirrors official scorer f
         }
         scores.update(_gallery_retrieval(metadata, evidence_source_ids))
         return scores
+    if family == "es-memeval":
+        return {"f1": _es_memeval_f1(_es_memeval_prediction(prediction), references[0])}
     return {}
 
 
@@ -688,6 +706,23 @@ def judge_plan(  # noqa: C901 - direct task dispatch keeps official protocols au
             # `openai_max_tokens=32` in `get_llm_match_score`.
             32,
         )
+    if family == "es-memeval":
+        prompt = _ES_MEMEVAL_JUDGE_PROMPT.format(
+            question=question,
+            gold=reference,
+            prediction=_es_memeval_prediction(prediction),
+        )
+        return JudgePlan(
+            protocol,
+            "es_memeval",
+            (
+                (
+                    JudgeMessage("system", "You are a strict evaluator."),
+                    JudgeMessage("user", prompt),
+                ),
+            ),
+            16,
+        )
     if family == "worldmemarena":
         declared = metadata.get("gold_evidence_contents", ())
         evidence = (
@@ -791,6 +826,15 @@ def parse_judge_response(  # noqa: C901 - mirrors seven incompatible upstream pa
     if plan.parser == "gallery":
         score = _gallery_judge_score(response)
         return {"llm_judge": 0.0 if score < 0.25 else 0.5 if score < 0.75 else 1.0}
+    if plan.parser == "es_memeval":
+        # The released parser takes the first digit 0, 1, or 2. Keep the raw
+        # table value and a normalized primary score for this runner's common
+        # 0-1 comparison and confidence-interval contract.
+        match = re.search(r"[0-2]", response)
+        if match is None:
+            raise ValueError("ES-MemEval judge did not return a 0-2 score")
+        es_score = float(match.group())
+        return {"llm_judge": es_score / 2.0, "judge_score_0_2": es_score}
     raise AssertionError(f"unhandled judge parser: {plan.parser}")
 
 
@@ -1135,6 +1179,40 @@ def _locomo_f1(prediction: str, reference: str) -> float:
     if not overlap:
         return 0.0
     precision, recall = overlap / len(predicted), overlap / len(expected)
+    return 2 * precision * recall / (precision + recall)
+
+
+def _es_memeval_prediction(value: str) -> str:
+    """Apply the released QA runner's post-generation cleanup.
+
+    `str.strip("Answer:")` strips the character set `A n s w e r :` from both ends, not the
+    prefix, so `"seven"` becomes `"v"` and `"unknown"` becomes `"unknow"`. The released
+    `qa_experiment.py` does exactly this before its F1 and judge, and comparable numbers require
+    reproducing it rather than correcting it.
+    """
+    return value.replace("*", "").replace("#", "").strip("Answer:").strip()
+
+
+def _es_memeval_f1(prediction: str, reference: str) -> float:
+    """Reproduce ES-MemEval's set-overlap token F1.
+
+    Upstream deduplicates the overlap but divides by the original token counts,
+    so repeated words still affect precision and recall. Its implementation
+    raises on an empty answer before checking the overlap; a failed or empty
+    generation is a legitimate benchmark outcome here and receives zero.
+    """
+
+    def tokens(value: str) -> list[str]:
+        return re.sub(r"\W+", " ", value.lower()).strip().split()
+
+    expected, predicted = tokens(reference), tokens(prediction)
+    if not expected or not predicted:
+        return 0.0
+    common = set(expected) & set(predicted)
+    if not common:
+        return 0.0
+    precision = len(common) / len(predicted)
+    recall = len(common) / len(expected)
     return 2 * precision * recall / (precision + recall)
 
 
@@ -1489,6 +1567,20 @@ _ATM_PROMPT = (
     '"true" or "false".  Question: {{question}}  Ground truth: {{answer}}  '
     "Prediction: {{prediction}}"
 )
+
+# slptongji/ES-MemEval@692624208acc077b8867698c1d6fcd998dee641a.
+# This is a compact semantic transcription of `QaExperiment.llm_as_a_judge`,
+# not copied source text. The upstream repository declares no software license
+# at the pinned revision; see `_official/NOTICE.md`.
+_ES_MEMEVAL_JUDGE_PROMPT = """Evaluate the model answer against the reference answer.
+
+Give 0 when it is wrong or irrelevant, 1 when it is partly correct but incomplete or vague, and 2 when it is completely correct and contextually accurate.
+
+Question: {question}
+Reference answer: {gold}
+Model answer: {prediction}
+
+Return one line only in this form: Score: X"""
 
 # YuanchenBei/Mem-Gallery@a93959e1e978a6a7d77798ae92c2ffe41c538c62
 _GALLERY_PROMPT = """You are an impartial judge evaluating the memory capabilities of an AI assistant with the question-answering task.

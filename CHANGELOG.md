@@ -10,6 +10,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- `mindbridge-bench eval --tasks es-memeval` now evaluates the pinned ES-MemEval EvoEmo QA task:
+  18 physically isolated seeker histories, 1,427 questions across the five published capabilities,
+  automatic digest-verified GitHub acquisition, session-level evidence recall, the published
+  set-overlap F1, and the GPT-4o 0--2 judge retained both raw and as a normalized 0--1 headline.
+  Summarization, dialogue generation, and BERTScore remain explicitly outside this adapter.
 - `mindbridge-bench eval` support for WorldMemArena checkpoint QA using pinned Hugging Face data
   and upstream protocol revisions. It preserves checkpoint cutoffs and the official
   Correct/Hallucination/Omission, F1, and BLEU-1 metrics. WorldMemArena's separate memory-snapshot
@@ -20,11 +25,15 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   the sixth task no longer discards the first five tasks' answers. The copy holds predictions and
   is written before anything that can fail, and it is guarded like the artifacts it stands in for:
   a rerun into the same output directory refuses without `--overwrite` rather than deleting the
-  record of a crashed run. `--stream-results` (`benchmark.run.stream_results`, off by default)
-  additionally judges and prints each task's table at that point, using the same arithmetic as the
-  final document, so the scores and controls in `results.jsonl` are unchanged either way. Only the
-  `performance` blocks change, which is why the flag is opt-in: judging one task overlaps the next
-  task's answering, so later tasks' latency and token figures describe a contended service.
+  record of a crashed run. By default, each task is then judged and printed before the next task
+  starts; `--no-stream-results` restores the former end-of-run reporting cadence. Client resource
+  sampling and optional model-server counter deltas split around each immediate judge pass, so
+  judge work is not charged to the product measurement window and the final arithmetic is the same
+  under either cadence.
+- Completed `eval` output directories now retain `config.yaml` as a resolved comparison manifest.
+  It records the effective product, judge, download, server-observation, and run settings after
+  file, environment, and command-line precedence, while omitting every API credential and the
+  values of unconstrained provider-specific `extra_body` mappings.
 - `ask_stream()` on `Memory` and `AsyncMemory`, and the `AnswerChunk` value it yields. `ask()`
   already consumed a provider's token stream, timed the first token into the
   `mindbridge.model.time_to_first_token` span attribute, and then returned only the joined text,

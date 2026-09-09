@@ -1243,6 +1243,81 @@ def _longmemeval(
     return tuple(units)
 
 
+def _es_memeval(
+    _spec: TaskSpec,
+    dataset: Path,
+    _media: MediaResolver,
+    _root: Path,
+    limit: Limit,
+    offset: int,
+) -> tuple[EvalUnit, ...]:
+    from mindbridge.benchmarks.es_memeval import load_es_memeval
+    from mindbridge.benchmarks.prompts import ES_MEMEVAL_QA_QUERY_PROMPT
+
+    units = []
+    for seeker in _selected(load_es_memeval(dataset), limit, offset):
+        # ES-MemEval's published RAG QA baseline indexes one document per
+        # dialogue session. Preserve that granularity and its exact rendering:
+        # the seeker's name identifies human turns and "supporter" identifies
+        # assistant turns, while the date is prepended at retrieval time.
+        memories = tuple(
+            MemoryItem(
+                session.session_id,
+                (
+                    f"[{session.occurred_at.date().isoformat()}]\n"
+                    + "\n".join(
+                        f"{seeker.name if turn.role == 'seeker' else 'supporter'}: {turn.content}"
+                        for turn in session.turns
+                    ),
+                ),
+                occurred_at=session.occurred_at,
+            )
+            for session in seeker.sessions
+        )
+        turn_sessions = {
+            turn.source_id: session.session_id
+            for session in seeker.sessions
+            for turn in session.turns
+        }
+        questions = tuple(
+            EvalQuestion(
+                question.question_id,
+                (ES_MEMEVAL_QA_QUERY_PROMPT.text.format(question=question.question),),
+                (question.answer,),
+                metadata={
+                    "capability": question.capability,
+                    "question_group": question.group_id,
+                    # Upstream's session retrieval evaluator marks a session
+                    # relevant when any visible turn ID in it occurs in the
+                    # question's evidence list. Event annotations are scorer-side
+                    # data and never enter memory; a turn label that names no
+                    # stored turn is a malformed release ID and is reported the
+                    # way every adapter reports one, so `unresolved_gold_evidence_ids`
+                    # keeps exposing the vocabulary mismatch it exists for.
+                    "evidence_ids": tuple(
+                        dict.fromkeys(
+                            turn_sessions[value]
+                            for value in question.evidence
+                            if value in turn_sessions
+                        )
+                    ),
+                    "unresolved_evidence_ids": tuple(
+                        value
+                        for value in question.evidence
+                        if value not in turn_sessions and "event" not in value.casefold()
+                    ),
+                    "abstention": question.capability == "abstention",
+                    "retrieval_granularity": "session",
+                },
+                source_question=question.question,
+                refusal=ES_MEMEVAL_QA_QUERY_PROMPT.refusal,
+            )
+            for question in seeker.questions
+        )
+        units.append(EvalUnit(seeker.seeker_id, memories, questions))
+    return tuple(units)
+
+
 def _clbench(
     _spec: TaskSpec,
     dataset: Path,
@@ -1474,6 +1549,7 @@ _LOADERS = {
     "atm-bench-hard-sgm": _atm,
     "mem-gallery": _mem_gallery,
     "longmemeval-s": _longmemeval,
+    "es-memeval-qa": _es_memeval,
     "clbench": _clbench,
     "beam-100k": _beam,
     "beam-500k": _beam,
