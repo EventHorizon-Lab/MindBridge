@@ -4029,10 +4029,21 @@ def test_add_many_hydrates_the_index_outbox_in_batches(
 
 
 def test_outbox_bounds_index_batches(tmp_path: Path) -> None:
-    with _memory(tmp_path, _FakeModels()) as memory:
-        memory.add_many(tuple(f"memory {index}" for index in range(600)))
+    """A drain larger than the bound splits into batches of it, whatever the bound is.
 
-    assert [len(batch) for batch in _FakeIndex.instances[-1].upsert_calls] == [256, 256, 88]
+    One flush follows each batch and costs the same whatever it carries, which is what makes this
+    bound the knob deciding how many of them a bulk write pays for. What the search index accepts
+    in one write is a separate limit that `ZvecIndex` enforces for itself.
+    """
+    bound = memory_module._OUTBOX_BATCH_SIZE
+    count = bound + bound // 2
+    with _memory(tmp_path, _FakeModels()) as memory:
+        memory.add_many(tuple(f"memory {index}" for index in range(count)))
+
+    assert [len(batch) for batch in _FakeIndex.instances[-1].upsert_calls] == [
+        bound,
+        count - bound,
+    ]
 
 
 def test_concurrent_adds_share_one_durable_index_flush(

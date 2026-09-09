@@ -57,7 +57,25 @@ _RABITQ_NUM_CLUSTERS = 16
 _DEFAULT_EF_SEARCH = 300
 _LEXICAL_RANK_CONSTANT = 60
 _DEFAULT_REBUILD_BATCH_SIZE = 1_024
+# Zvec's native writer refuses a batch above this many documents, and does not expose the limit as
+# a Python value to check against -- it surfaces only as `ValueError: Too many docs: N exceeds max
+# write batch size of 1024`. Refusing one is not a failure a caller can retry past: one outbox
+# drain becomes one `upsert`, its rows are already committed to SQLite, and nothing acknowledges
+# them, so every later drain re-reads the same batch and re-raises. Both native write paths chunk
+# on this, which is what lets `_OUTBOX_BATCH_SIZE` and `rebuild`'s public `batch_size` be chosen
+# for flush cost alone.
+_MAX_WRITE_BATCH = 1_024
 _AUTO_OPTIMIZE_UNINDEXED_DOCUMENTS = 100_000
+# Durable segments left unmerged are the dominant cost of a search, and the cost is per segment
+# rather than per document: the grouped dense query that opens every retrieval measured 6.0 ms at
+# 4 segments, 19.7 ms at 16 and 80.1 ms at 63, and 2.4-3.2 ms at any corpus size once merged. So
+# this bound is also the read tax, and 64 is a deliberate choice of the write side of that trade,
+# not an oversight. Lowering it to 8 moved the median search on a 16 000-memory interleaved
+# workload from 53.4 ms to 21.1 ms, and cost 120 single `add` calls on an 8 000-memory store 7.31 s
+# to 13.88 s with p90 latency 74 ms to 452 ms, because one `add` makes one segment however little
+# it carries and `optimize` costs the same ~530 ms whether it merges eight documents or eight
+# thousand. Break-even is around three and a half searches per memory written. Raising
+# `_OUTBOX_BATCH_SIZE` is the part of this that is free, and it is taken.
 _AUTO_OPTIMIZE_FLUSHES = 64
 _AUTO_COMPACT_FLUSHES = 256
 _FILE_DESCRIPTOR_RESERVE = 128
@@ -298,11 +316,22 @@ class ZvecIndex:
                     vectors={_VECTOR_FIELD: list(embedding.values)},
                 )
             )
+        # Chunked because the native writer refuses a batch above `_MAX_WRITE_BATCH`, and
+        # refusing one is unrecoverable rather than retryable. `rebuild` reaches the same guard,
+        # so its caller-supplied `batch_size` cannot exceed the writer either. The chunks are one
+        # write as far as the maintenance lock is concerned: another writer's segments must not
+        # land between two chunks of one drain.
+        written = []
         with _INDEX_MAINTENANCE_LOCK:
             _require_file_descriptor_headroom()
             collection = cast(Any, self._require_collection())
-            statuses = cast(Sequence[object], collection.upsert(docs))
-        self._check_statuses("upsert", ids, statuses)
+            for start in range(0, len(docs), _MAX_WRITE_BATCH):
+                end = start + _MAX_WRITE_BATCH
+                written.append(
+                    (ids[start:end], cast(Sequence[object], collection.upsert(docs[start:end])))
+                )
+        for batch_ids, statuses in written:
+            self._check_statuses("upsert", batch_ids, statuses)
 
     def delete(self, ids: Sequence[str]) -> None:
         """Idempotently delete IDs, accepting Zvec's NOT_FOUND status."""
@@ -311,11 +340,15 @@ class ZvecIndex:
         for document_id in ids:
             if not document_id or document_id != document_id.strip():
                 raise ValueError("index document IDs must be non-empty and trimmed")
+        deleted = []
         with _INDEX_MAINTENANCE_LOCK:
             _require_file_descriptor_headroom()
             collection = cast(Any, self._require_collection())
-            statuses = cast(Sequence[object], collection.delete(list(ids)))
-        self._check_statuses("delete", ids, statuses, allow_not_found=True)
+            for start in range(0, len(ids), _MAX_WRITE_BATCH):
+                batch = list(ids[start : start + _MAX_WRITE_BATCH])
+                deleted.append((batch, cast(Sequence[object], collection.delete(batch))))
+        for batch, statuses in deleted:
+            self._check_statuses("delete", batch, statuses, allow_not_found=True)
 
     def search(
         self,
@@ -582,9 +615,17 @@ class ZvecIndex:
     def _upsert_native(
         self, collection: object, documents: Sequence[object], *, action: str
     ) -> None:
-        ids = [str(cast(Any, document).id) for document in documents]
-        statuses = cast(Sequence[object], cast(Any, collection).upsert(list(documents)))
-        self._check_statuses(action, ids, statuses)
+        """Copy already-native documents, in batches the writer will accept.
+
+        Only `_compact` reaches this, and its documents come from `iter_docs`, so each carries
+        the id the status check reports. `upsert` keeps its own list instead: the ids it needs are
+        on the `IndexDocument`, not on the native document it builds from one.
+        """
+        for start in range(0, len(documents), _MAX_WRITE_BATCH):
+            batch = list(documents[start : start + _MAX_WRITE_BATCH])
+            ids = [str(cast(Any, document).id) for document in batch]
+            statuses = cast(Sequence[object], cast(Any, collection).upsert(batch))
+            self._check_statuses(action, ids, statuses)
 
     def rebuild(
         self,

@@ -16,6 +16,7 @@ import pytest
 import mindbridge.infrastructure.local.zvec_index as zvec_index_module
 from mindbridge.infrastructure.local.store import IndexDocument, StoredEmbedding
 from mindbridge.infrastructure.local.zvec_index import (
+    _MAX_WRITE_BATCH,
     IndexHit,
     ZvecIndex,
     ZvecUnavailableError,
@@ -805,6 +806,39 @@ def test_rebuild_replaces_all_documents_and_delete_is_idempotent(tmp_path: Path)
         assert rebuilt[0].relevance == pytest.approx(1.0)
 
         index.delete(["missing", "embedding_new"])
+        index.flush()
+        assert index.doc_count == 0
+
+
+def test_a_write_batch_above_the_native_limit_is_chunked_rather_than_refused(
+    tmp_path: Path,
+) -> None:
+    """Zvec refuses a batch above `_MAX_WRITE_BATCH`, and refusing one is unrecoverable.
+
+    One outbox drain becomes one `upsert`, and its rows are committed to SQLite before the drain
+    runs. A refused batch therefore never acknowledges, so every later drain re-reads it and
+    re-raises the same rejection: the store stops accepting writes and stops serving reads that
+    drain, permanently. Both native write paths chunk, so the batch sizes above them --
+    `_OUTBOX_BATCH_SIZE` and `rebuild`'s public `batch_size` -- are free to be chosen for flush
+    cost without knowing the writer's limit.
+    """
+    _require_zvec()
+    count = _MAX_WRITE_BATCH + 1
+    documents = tuple(
+        _document(f"embedding-{index:05d}", f"note {index}", (float(index), 1.0))
+        for index in range(count)
+    )
+
+    with ZvecIndex(tmp_path / "index", dimension=2) as index:
+        index.upsert(documents)
+        index.flush()
+        assert index.doc_count == count
+
+        # `rebuild` takes its batch size from a caller, so it must survive one above the limit too.
+        assert index.rebuild(documents, batch_size=count) == count
+        assert index.doc_count == count
+
+        index.delete([document.embedding.embedding_id for document in documents])
         index.flush()
         assert index.doc_count == 0
 
