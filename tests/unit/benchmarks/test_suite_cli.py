@@ -64,7 +64,7 @@ def test_dispatch_lazily_calls_each_supported_runner(
 
     assert cli.main(["local-index", "--rows", "10"]) == 0
     assert cli.main(["locomo-refined", "--limit", "2"]) == 0
-    assert cli.main(["eval", "--tasks", "video-mme"]) == 0
+    assert cli.main(["eval", "--tasks", "video-mme-v2"]) == 0
     assert calls == [
         ("local-index", ("--rows", "10"), "mindbridge-bench local-index"),
         (
@@ -72,7 +72,7 @@ def test_dispatch_lazily_calls_each_supported_runner(
             ("--limit", "2"),
             "mindbridge-bench locomo-refined",
         ),
-        ("eval", ("--tasks", "video-mme"), "mindbridge-bench eval"),
+        ("eval", ("--tasks", "video-mme-v2"), "mindbridge-bench eval"),
     ]
 
 

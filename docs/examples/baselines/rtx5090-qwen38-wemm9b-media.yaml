@@ -1,5 +1,5 @@
 # Reference media profile for the RTX 5090 benchmark client.
-# ATM-Bench raw exercises image and video ingestion. EgoLifeQA adds video with audio, so the
+# ATM-Bench raw exercises image and video ingestion. Video-MME-v2 adds long-form video, so the
 # FunASR path is measured as ASR rather than replaced by a caption-only/SGM variant.
 # EMPTY is an explicit non-secret sentinel, so an ambient OPENAI_API_KEY is never forwarded.
 
@@ -48,7 +48,7 @@ benchmark:
     benchmarks_root: .benchmarks
     data_root: .benchmarks/data
   run:
-    tasks: atm-bench-main,egolifeqa
+    tasks: atm-bench-main,video-mme-v2
     arms: mindbridge
     limit: all
     batch_size: "1"

@@ -20,7 +20,11 @@ from mindbridge.benchmarks._official.atm_score import (
     deterministic_accuracy as atm_deterministic_accuracy,
 )
 from mindbridge.benchmarks._official.atm_score import list_jaccard_score
+from mindbridge.benchmarks._official.beam_judge import (
+    build_event_equivalence_prompt as build_beam_equivalence_prompt,
+)
 from mindbridge.benchmarks._official.beam_judge import build_rubric_item_prompt as build_beam_prompt
+from mindbridge.benchmarks._official.beam_judge import event_ordering_scores
 from mindbridge.benchmarks._official.beam_judge import parse_rubric_item_score as parse_beam_item
 from mindbridge.benchmarks._official.clbench_judge import (
     build_grading_prompt as build_clbench_prompt,
@@ -56,9 +60,15 @@ from mindbridge.benchmarks._official.openeqa_llm_match import (
 from mindbridge.benchmarks._official.openeqa_llm_match import (
     truncate_prediction as truncate_openeqa_prediction,
 )
+from mindbridge.benchmarks._official.worldmemarena_qa import (
+    build_qa_prompt as build_worldmemarena_prompt,
+)
+from mindbridge.benchmarks._official.worldmemarena_qa import (
+    parse_qa_response as parse_worldmemarena_response,
+)
 from mindbridge.benchmarks.personamem_v3 import RANKING_TASK_TYPES
 
-SCORER_VERSION = "official_scorers_v4"
+SCORER_VERSION = "official_scorers_v5"
 
 
 class _Stemmer(Protocol):
@@ -89,8 +99,11 @@ class JudgePlan:
         "longmemeval",
         "clbench",
         "beam",
+        "beam_event",
         "personamem_v3",
         "openeqa",
+        "es_memeval",
+        "worldmemarena",
     ]
     calls: tuple[tuple[JudgeMessage, ...], ...]
     max_tokens: int | None = None
@@ -102,10 +115,8 @@ class JudgePlan:
 _PROTOCOLS = {
     "locomo-refined": "locomo_refined_judge_887091190789",
     "m3-bench": "m3_agent_judge_0e3e41939bd8_system_v1",
-    "video-mme": "video_mme_mcq_ead1408f75b6",
     "video-mme-v2": "video_mme_v2_6e4bebb03202",
-    "egolifeqa": "egolifeqa_mcq_143fb319be7a",
-    "egomemreason": "egomemreason_private_submission_7e581505b9dc",
+    "worldmemarena": "worldmemarena_checkpoint_qa_15ea25b723d9",
     "egotempo": "egotempo_gemini_judge_7022ba77b4d8",
     "memlens": "memlens_judge_77f3ab9a52fa",
     "mm-lifelong": "mm_lifelong_judge_248aa82039a5",
@@ -117,6 +128,7 @@ _PROTOCOLS = {
     "beam": "beam_unified_rubric_3e12035532eb",
     "personamem-v3": "personamem_v3_rubric_7b00a090b35b_ranking_ad80a3b1b322",
     "openeqa": "openeqa_llm_match_cfa3fce4595c",
+    "es-memeval": "es_memeval_qa_judge_692624208acc_v1",
 }
 
 _OFFICIAL_JUDGE_MODELS = {
@@ -139,6 +151,8 @@ _OFFICIAL_JUDGE_MODELS = {
     # `llm_match.get_llm_match_score`'s `openai_model` default, which
     # `evaluate-predictions.py` never overrides.
     "openeqa": "gpt-4-1106-preview",
+    # `common_configurations.py` supplies this ID to every released QA script.
+    "es-memeval": "gpt-4o",
 }
 
 # Metrics the pinned upstream protocol reports itself. `metric_is_official` reads this registry
@@ -149,12 +163,12 @@ _OFFICIAL_METRICS: dict[str, frozenset[str]] = {
     # `evaluate.py` keeps the F1 and BLEU-1 of the accepted reference beside its judge label.
     "locomo-refined": frozenset({"llm_judge", "token_f1", "bleu_1"}),
     "m3-bench": frozenset({"accuracy"}),
-    "video-mme": frozenset({"accuracy"}),
-    # The leaderboard rating and the per-question accuracy it is built from.
-    "video-mme-v2": frozenset({"accuracy", "question_accuracy", "rating"}),
-    "egolifeqa": frozenset({"accuracy"}),
-    # Scored by the private submission server; nothing here is an upstream number.
-    "egomemreason": frozenset(),
+    # The two files emitted by the released scorer. `question_accuracy` is an internal 0-1
+    # building block; the official `_acc.json` value is exposed as `accuracy` on 0-100.
+    "video-mme-v2": frozenset({"accuracy", "rating"}),
+    "worldmemarena": frozenset(
+        {"correct_ratio", "hallucination_ratio", "omission_ratio", "answer_f1", "answer_bleu1"}
+    ),
     "egotempo": frozenset({"accuracy", "judge_score_0_5"}),
     "memlens": frozenset({"accuracy"}),
     # `Ref@300` is MM-Lifelong's own quantized temporal IoU.
@@ -167,18 +181,22 @@ _OFFICIAL_METRICS: dict[str, frozenset[str]] = {
     "mem-gallery": frozenset({"llm_judge", "f1", "bleu", "bleu_1", "bleu_2"}),
     "longmemeval": frozenset({"accuracy"}),
     "clbench": frozenset({"solving_rate", "requirement_ratio"}),
-    "beam": frozenset({"llm_judge_score"}),
+    "beam": frozenset({"llm_judge_score", "precision", "recall", "f1", "tau_norm", "final_score"}),
     # Everything `_official/personamem_v3_scoring.py` emits: the unified rubric's `pr_` dims
     # (see `_OFFICIAL_METRIC_PREFIXES`), the four task-specific judges' coercions, the ranking
-    # metrics `compute_ranking_metrics` reports, and the 0-1 aggregate headline.
+    # metrics the task runners report, and the 0-100 micro aggregate headline.
     "personamem-v3": frozenset(
         {
-            "personamem_score",
-            "recall@1",
+            "accuracy_pct_micro",
+            "recall_at_1",
+            "recall_at_3",
+            "recall_at_5",
+            "hit_at_1",
+            "hit_at_3",
+            # The @ai directive runner retains these historical spellings.
             "recall@3",
             "recall@5",
             "hit@1",
-            "hit@3",
             "mrr",
             "ndcg_at_5",
             "sycophancy_caved",
@@ -194,6 +212,9 @@ _OFFICIAL_METRICS: dict[str, frozenset[str]] = {
         }
     ),
     "openeqa": frozenset({"llm_match", "llm_match_score_1_5"}),
+    # The release also reports BERTScore. It is intentionally not calculated
+    # here because it requires a second learned scorer and model download.
+    "es-memeval": frozenset({"f1", "llm_judge", "judge_score_0_2"}),
 }
 
 # One family scores an open dimension vocabulary upstream: `score_unified_rubric` names every
@@ -210,32 +231,55 @@ _JUDGE_METRICS = {
     "mem-gallery": frozenset({"llm_judge"}),
     "longmemeval": frozenset({"accuracy"}),
     "clbench": frozenset({"solving_rate", "requirement_ratio"}),
-    "beam": frozenset({"llm_judge_score"}),
-    "personamem-v3": frozenset({"personamem_score"}),
+    "beam": frozenset({"llm_judge_score", "precision", "recall", "f1", "tau_norm", "final_score"}),
+    "personamem-v3": frozenset(
+        {
+            "accuracy_pct_micro",
+            "sycophancy_caved",
+            "sycophancy_resistance_0_10",
+            "used_outdated_stance",
+            "preference_shift_consistency",
+            "deep_motivation_alignment",
+            "surface_query_satisfaction",
+            "preference_alignment",
+            "telegraph_avoidance_fail",
+            "privacy_leak_fail",
+            "abstention_quality_0_10",
+        }
+    ),
     "openeqa": frozenset({"llm_match", "llm_match_score_1_5"}),
+    "es-memeval": frozenset({"llm_judge", "judge_score_0_2"}),
+    "worldmemarena": frozenset({"correct_ratio", "hallucination_ratio", "omission_ratio"}),
 }
 
+# The pinned ES-MemEval repository has no declared license. Its judge wording
+# is therefore represented by a semantic transcription rather than copied
+# verbatim, which makes the result useful but not protocol-identical.
+_ADAPTED_JUDGE_PROTOCOLS = frozenset({"es-memeval"})
+
 # PersonaMem-v3 headline per task type, and the divisor that maps it onto the
-# 0-1 `personamem_score` its aggregator compares across tasks
+# internal 0-1 row value from which the official micro percentage is computed
 # (`evaluation/task_registry.py: PRIMARY_METRIC`).
 _PERSONAMEM_HEADLINES: dict[str, tuple[str, float]] = {
-    "chatbot_personalized_response": ("pr_preference_alignment_score_gated", 10.0),
+    "chatbot_personalized_response": ("pr_preference_alignment_score", 10.0),
     "over_personalization_sycophancy": ("sycophancy_resistance_0_10", 10.0),
     "preference_shift_followthrough": ("preference_shift_consistency", 10.0),
     "personal_qa_hallucination": ("abstention_quality_0_10", 10.0),
     "hidden_persona_implicit_qa": ("deep_motivation_alignment", 3.0),
 }
 _PERSONAMEM_RUBRIC_HEADLINE = ("pr_combined_personalization_score", 10.0)
-# PersonaMem-v3 commit ad80a3b1b322 gives all three single-target ranking
-# tasks a shared graded NDCG@5 headline: target +2, filler +1 and hard negative
-# -2. Hidden-persona slates alone use filler 0 when they contain no hard
-# negatives. The target-only score remains a separately named diagnostic.
+# `task_registry.PRIMARY_METRIC` -- the column upstream's aggregator reads --
+# gives all three single-target ranking tasks a graded nDCG@5, chosen over a
+# binary top-1 because the gold is "subtle by design" and nDCG rewards
+# surfacing it high with a smooth position discount. `compute_ranking_metrics`
+# also reports top-k diagnostics, but those are not the aggregator headline.
+# The shared graded metric uses positive +2, filler +1, and negative -2.
 _PERSONAMEM_RANKING_HEADLINE = ("ndcg_at_5", 1.0)
 
 # Ranks a slate like the other three, but its upstream headline is
 # `lifecycle_score` -- the delta between a paired pre-row's and post-row's
 # match rate -- which no single row can carry. It also has 2 to 5 targets per
-# row, so `recall@1`, which divides by the target count, could never exceed
+# row, so a top-1 recall, which divides by the target count, could never exceed
 # 0.5 there. It keeps its ranking diagnostics and takes no headline, like the
 # other paired families.
 _PERSONAMEM_PAIRED_RANKING = frozenset({"short_vs_long_term_lifecycle"})
@@ -266,10 +310,8 @@ def task_primary_metric(task: str) -> str:
     return {
         "locomo-refined": "llm_judge",
         "m3-bench": "accuracy",
-        "video-mme": "accuracy",
         "video-mme-v2": "rating",
-        "egolifeqa": "accuracy",
-        "egomemreason": "submission",
+        "worldmemarena": "correct_ratio",
         "egotempo": "accuracy",
         "memlens": "accuracy",
         "mm-lifelong": "answer_accuracy",
@@ -278,19 +320,23 @@ def task_primary_metric(task: str) -> str:
         "mem-gallery": "f1",
         "longmemeval": "accuracy",
         "clbench": "solving_rate",
-        "beam": "llm_judge_score",
-        "personamem-v3": "personamem_score",
+        # Upstream publishes one column per category and uses `tau_norm` for event ordering.
+        # This mixed per-row selector is useful as a runner headline but is not itself upstream.
+        "beam": "beam_score",
+        "personamem-v3": "accuracy_pct_micro",
         "openeqa": "llm_match",
+        "es-memeval": "llm_judge",
     }[family]
 
 
 def sample_primary_metric(task: str) -> str:
     """Return the per-question metric used for comparisons and grouped scoring."""
-    return (
-        "question_accuracy"
-        if _family_or_none(task) == "video-mme-v2"
-        else task_primary_metric(task)
-    )
+    family = _family_or_none(task)
+    if family == "video-mme-v2":
+        return "question_accuracy"
+    if family == "personamem-v3":
+        return "personamem_score"
+    return task_primary_metric(task)
 
 
 def official_judge_model(task: str) -> str | None:
@@ -330,8 +376,14 @@ def metric_is_official(task: str, metric: str, judge_model: str, *, uses_judge: 
     """
     if not metric_is_upstream(task, metric):
         return False
-    if metric not in _JUDGE_METRICS.get(_family_or_none(task) or "", ()) or not uses_judge:
+    family = _family_or_none(task) or ""
+    requires_judge = metric in _JUDGE_METRICS.get(family, ()) or (
+        family == "personamem-v3" and metric.startswith("pr_")
+    )
+    if not requires_judge or not uses_judge:
         return True
+    if _family_or_none(task) in _ADAPTED_JUDGE_PROTOCOLS:
+        return False
     return judge_model_is_official(task, judge_model)
 
 
@@ -379,7 +431,8 @@ def local_scores(  # noqa: C901 - direct task dispatch mirrors official scorer f
             if family == "video-mme-v2"
             else ("qa_accuracy" if family == "supermemory-vqa" else "accuracy")
         )
-        return {metric: float(parsed_choice == expected_choice)}
+        score = float(parsed_choice == expected_choice)
+        return {metric: score}
     if family == "locomo-refined":
         normalized = _locomo_prediction(prediction)
         if any(normalized == reference for reference in references):
@@ -411,6 +464,20 @@ def local_scores(  # noqa: C901 - direct task dispatch mirrors official scorer f
         return finalize_scores(task, scores)
     if family == "personamem-v3":
         return _personamem_local(prediction, metadata)
+    if family == "openeqa" and not prediction.strip():
+        # `get_llm_match_score` returns its zero sentinel without contacting
+        # the judge; the released aggregation clips that sentinel to 1/5 and
+        # converts it to zero percent.
+        return {"llm_match": 0.0, "llm_match_score_1_5": 1.0}
+    if family == "worldmemarena":
+        reference = references[0]
+        scores = {
+            "answer_f1": _gallery_f1(prediction, reference),
+            "answer_bleu1": _gallery_bleu(prediction, reference, (1.0, 0.0, 0.0, 0.0)),
+        }
+        if not prediction.strip():
+            scores.update({"correct_ratio": 0.0, "hallucination_ratio": 0.0, "omission_ratio": 1.0})
+        return scores
     if family == "mem-gallery":
         reference = references[0]
         scores = {
@@ -422,6 +489,8 @@ def local_scores(  # noqa: C901 - direct task dispatch mirrors official scorer f
         }
         scores.update(_gallery_retrieval(metadata, evidence_source_ids))
         return scores
+    if family == "es-memeval":
+        return {"f1": _es_memeval_f1(_es_memeval_prediction(prediction), references[0])}
     return {}
 
 
@@ -460,6 +529,10 @@ def judge_plan(  # noqa: C901 - direct task dispatch keeps official protocols au
     if family == "clbench" and not prediction.strip():
         # `process_single_item` scores an empty output 0 without calling the
         # judge at all.
+        return None
+    if family == "openeqa" and not prediction.strip():
+        return None
+    if family == "worldmemarena" and not prediction.strip():
         return None
     if family == "memlens" and len(_memlens_prediction(prediction).split()) > 500:
         return None
@@ -570,6 +643,29 @@ def judge_plan(  # noqa: C901 - direct task dispatch keeps official protocols au
         return JudgePlan(protocol, "clbench", ((JudgeMessage("user", prompt),),))
     if family == "beam":
         category = str(metadata.get("category", ""))
+        if category == "event_ordering":
+            system = prediction.split("\n")
+            equivalence_calls = tuple(
+                (
+                    JudgeMessage("system", build_beam_equivalence_prompt(reference, candidate)[0]),
+                    JudgeMessage("user", build_beam_equivalence_prompt(reference, candidate)[1]),
+                )
+                for candidate in system
+                for reference in references
+            )
+            rubric_calls = tuple(
+                (JudgeMessage("user", build_beam_prompt(item, prediction)),) for item in references
+            )
+            return JudgePlan(
+                protocol,
+                "beam_event",
+                (*equivalence_calls, *rubric_calls),
+                details={
+                    "category": category,
+                    "reference": json.dumps(list(references), ensure_ascii=False),
+                    "system": json.dumps(system, ensure_ascii=False),
+                },
+            )
         return JudgePlan(
             protocol,
             "beam",
@@ -609,6 +705,42 @@ def judge_plan(  # noqa: C901 - direct task dispatch keeps official protocols au
             ),
             # `openai_max_tokens=32` in `get_llm_match_score`.
             32,
+        )
+    if family == "es-memeval":
+        prompt = _ES_MEMEVAL_JUDGE_PROMPT.format(
+            question=question,
+            gold=reference,
+            prediction=_es_memeval_prediction(prediction),
+        )
+        return JudgePlan(
+            protocol,
+            "es_memeval",
+            (
+                (
+                    JudgeMessage("system", "You are a strict evaluator."),
+                    JudgeMessage("user", prompt),
+                ),
+            ),
+            16,
+        )
+    if family == "worldmemarena":
+        declared = metadata.get("gold_evidence_contents", ())
+        evidence = (
+            tuple(str(value) for value in declared)
+            if isinstance(declared, Sequence) and not isinstance(declared, str | bytes)
+            else ()
+        )
+        return JudgePlan(
+            protocol,
+            "worldmemarena",
+            (
+                (
+                    JudgeMessage(
+                        "user",
+                        build_worldmemarena_prompt(question, reference, evidence, prediction),
+                    ),
+                ),
+            ),
         )
     if family == "mem-gallery":
         prompt = (
@@ -671,6 +803,10 @@ def parse_judge_response(  # noqa: C901 - mirrors seven incompatible upstream pa
         return {"solving_rate": score, "requirement_ratio": ratio}
     if plan.parser == "beam":
         return {"llm_judge_score": parse_beam_item(response, plan.details.get("category", ""))}
+    if plan.parser == "beam_event":
+        if response.lstrip().startswith(("{", "```")):
+            return {"llm_judge_score": parse_beam_item(response, "event_ordering")}
+        return {"equivalent": float("yes" in response.lower())}
     if plan.parser == "personamem_v3":
         return _personamem_judge_scores(plan, response)
     if plan.parser == "openeqa":
@@ -680,12 +816,25 @@ def parse_judge_response(  # noqa: C901 - mirrors seven incompatible upstream pa
         # one that overshoots is capped instead of discarding the question.
         clipped = min(max(parse_openeqa_score(response), OPENEQA_MIN_SCORE), OPENEQA_MAX_SCORE)
         return {
-            "llm_match": (clipped - OPENEQA_MIN_SCORE) / (OPENEQA_MAX_SCORE - OPENEQA_MIN_SCORE),
+            "llm_match": 100.0
+            * (clipped - OPENEQA_MIN_SCORE)
+            / (OPENEQA_MAX_SCORE - OPENEQA_MIN_SCORE),
             "llm_match_score_1_5": float(clipped),
         }
+    if plan.parser == "worldmemarena":
+        return dict(parse_worldmemarena_response(response))
     if plan.parser == "gallery":
         score = _gallery_judge_score(response)
         return {"llm_judge": 0.0 if score < 0.25 else 0.5 if score < 0.75 else 1.0}
+    if plan.parser == "es_memeval":
+        # The released parser takes the first digit 0, 1, or 2. Keep the raw
+        # table value and a normalized primary score for this runner's common
+        # 0-1 comparison and confidence-interval contract.
+        match = re.search(r"[0-2]", response)
+        if match is None:
+            raise ValueError("ES-MemEval judge did not return a 0-2 score")
+        es_score = float(match.group())
+        return {"llm_judge": es_score / 2.0, "judge_score_0_2": es_score}
     raise AssertionError(f"unhandled judge parser: {plan.parser}")
 
 
@@ -711,11 +860,41 @@ def combine_judge_scores(
         # Every `evaluate_*` divides the accumulated per-item scores by the
         # number of rubric items, so the category score is their mean.
         values = [score["llm_judge_score"] for score in scores]
-        return {"llm_judge_score": sum(values) / len(values)}
+        score = sum(values) / len(values)
+        return {"llm_judge_score": score, "beam_score": score}
+    if plan.parser == "beam_event":
+        return _combine_beam_event(plan, scores)
     if len(scores) == 1:
         return dict(scores[0])
     names = set().union(*(score.keys() for score in scores))
     return {name: max(score[name] for score in scores if name in score) for name in names}
+
+
+def _combine_beam_event(plan: JudgePlan, scores: Sequence[Mapping[str, float]]) -> dict[str, float]:
+    reference = cast(list[str], json.loads(plan.details["reference"]))
+    system = cast(list[str], json.loads(plan.details["system"]))
+    pair_count = len(reference) * len(system)
+    pair_scores, rubric_scores = scores[:pair_count], scores[pair_count:]
+    canonical = []
+    used: set[int] = set()
+    for system_index, candidate in enumerate(system):
+        matched = None
+        for reference_index, reference_item in enumerate(reference):
+            pair = pair_scores[system_index * len(reference) + reference_index]
+            if reference_index not in used and pair.get("equivalent") == 1.0:
+                matched = reference_index
+                canonical.append(reference_item)
+                used.add(reference_index)
+                break
+        if matched is None:
+            canonical.append(candidate)
+    result = event_ordering_scores(reference, canonical)
+    result["llm_judge_score"] = sum(score["llm_judge_score"] for score in rubric_scores) / len(
+        rubric_scores
+    )
+    # `report_results.py` uses normalized tau for the event-ordering column.
+    result["beam_score"] = result["tau_norm"]
+    return result
 
 
 def _personamem_metric(task_type: str) -> tuple[str, float] | None:
@@ -780,19 +959,46 @@ def _personamem_plan(
 def _personamem_evidence(question: str, metadata: Mapping[str, object]) -> str:
     """Serialise the evidence block the unified rubric judge reads.
 
-    Upstream assembles this with `personalization_rubric.build_source_a`, which
-    queries the persona's backend for the same-day avoid slice, the privacy
-    flags and the contradiction set. Those queries need the backend, not the
-    question, so this block carries the evidence the released row itself
-    publishes: the held-out preference, its distractors, and the row's rubric
-    tags. It is narrower than upstream's, which makes the hard-rule checks that
-    depend on the avoid slice under-fire relative to a full-harness run.
+    The dataset's frozen instance payload contains the same source-A slices
+    consumed by the released judge: relevant preferences, same-day avoids,
+    privacy flags, contradictions, voice references, and friend records.
     """
+    released = metadata.get("judge_evidence")
+    released = released if isinstance(released, Mapping) else {}
+    gt_slice = released.get("gt_slice")
+    gt_slice = gt_slice if isinstance(gt_slice, Mapping) else {}
+    top_preferences = released.get("top_k_relevant_prefs")
+    if not isinstance(top_preferences, Sequence) or isinstance(top_preferences, str | bytes):
+        top_preferences = ()
+    held_out = released.get("held_out_preference") or metadata.get("groundtruth_preference")
+    if not top_preferences and held_out:
+        top_preferences = (held_out,)
     payload = {
         "query_text": question,
-        "held_out_preference": metadata.get("groundtruth_preference", ""),
-        "distractor_preferences": list(_metadata_values(metadata, "distractor_preferences")),
-        "rubric_tags": list(_metadata_values(metadata, "rubric_tags")),
+        "user_top_preferences": list(top_preferences),
+        "user_negatives_nearby": list(
+            gt_slice.get("avoid", ()) if isinstance(gt_slice.get("avoid", ()), Sequence) else ()
+        ),
+        "privacy_flagged_prefs": list(
+            released.get("privacy_flagged_prefs", ())
+            if isinstance(released.get("privacy_flagged_prefs", ()), Sequence)
+            else ()
+        ),
+        "update_history_contradictions": list(
+            released.get("update_history_contradictions", ())
+            if isinstance(released.get("update_history_contradictions", ()), Sequence)
+            else ()
+        ),
+        "user_style_refs": list(
+            released.get("user_style_refs", ())
+            if isinstance(released.get("user_style_refs", ()), Sequence)
+            else ()
+        ),
+        "user_friends": list(
+            released.get("user_friends", ())
+            if isinstance(released.get("user_friends", ()), Sequence)
+            else ()
+        ),
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -847,71 +1053,53 @@ def _personamem_local(prediction: str, metadata: Mapping[str, object]) -> dict[s
     }
     if not positives:
         return {}
-    ranked = _parse_ranking(prediction, count)
+    task_type = str(metadata.get("task_type", ""))
+    ranked = _parse_ranking(
+        prediction, count, identity_fallback=task_type == "at_ai_directive_followup"
+    )
     negatives = {
         index for index in _index_values(metadata, "negative_indexes") if 0 <= index < count
     }
-    task_type = str(metadata.get("task_type", ""))
+    # `_graded_ndcg_at_k` defaults the filler grade to +1; only the hidden-persona runner passes
+    # 0 when its slate carries no hard negatives, and the result is clamped to [0, 1].
     filler_gain = 0.0 if task_type == "hidden_persona_recommendation" and not negatives else 1.0
-    target_only = pm3.ndcg_at_k([3.0 if index in positives else 0.0 for index in ranked], 5)
+    gains = [
+        2.0 if index in positives else -2.0 if index in negatives else filler_gain
+        for index in ranked
+    ]
+    ideal = sorted(gains, reverse=True)
+    denominator = pm3.dcg(ideal[:5])
+    ndcg_at_5 = min(1.0, max(0.0, pm3.dcg(gains[:5]) / denominator)) if denominator > 0 else 0.0
     scores = {
-        "recall@1": pm3.recall_at_k(ranked, positives, 1),
-        "recall@3": pm3.recall_at_k(ranked, positives, 3),
-        "recall@5": pm3.recall_at_k(ranked, positives, 5),
-        "hit@1": pm3.hit_at_k(ranked, positives, 1),
-        "hit@3": pm3.hit_at_k(ranked, positives, 3),
+        "recall_at_1": pm3.recall_at_k(ranked, positives, 1),
+        "recall_at_3": pm3.recall_at_k(ranked, positives, 3),
+        "recall_at_5": pm3.recall_at_k(ranked, positives, 5),
+        "hit_at_1": pm3.hit_at_k(ranked, positives, 1),
+        "hit_at_3": pm3.hit_at_k(ranked, positives, 3),
         "mrr": pm3.mrr(ranked, positives),
-        "target_only_ndcg@5": target_only,
-        # Deprecated compatibility alias for artifacts created before
-        # official_scorers_v4. It is intentionally absent from
-        # `_OFFICIAL_METRICS` because this target-only formula is not the
-        # current upstream graded metric.
-        "ndcg_graded@5": target_only,
+        "ndcg_at_5": round(ndcg_at_5, 4),
         "negative_in_top1": float(bool(ranked) and ranked[0] in negatives),
         "negative_in_top3": float(any(index in negatives for index in ranked[:3])),
     }
-    if task_type not in _PERSONAMEM_PAIRED_RANKING:
-        scores["ndcg_at_5"] = _personamem_official_ndcg(
-            ranked,
-            positives,
-            negatives,
-            filler_gain=filler_gain,
-            k=5,
+    if task_type == "at_ai_directive_followup":
+        scores.update(
+            {
+                "hit@1": scores["hit_at_1"],
+                "recall@3": scores["recall_at_3"],
+                "recall@5": scores["recall_at_5"],
+            }
         )
     return _personamem_headline(task_type, scores)
 
 
-def _personamem_official_ndcg(
-    ranked: Sequence[int],
-    positives: set[int],
-    negatives: set[int],
-    *,
-    filler_gain: float,
-    k: int,
-) -> float:
-    """Reproduce PersonaMem-v3 ad80a3b1's current graded NDCG."""
-
-    def relevance(index: int) -> float:
-        if index in positives:
-            return 2.0
-        return -2.0 if index in negatives else filler_gain
-
-    gains = [relevance(index) for index in ranked]
-    ideal = sorted(gains, reverse=True)[:k]
-    denominator = pm3.dcg(ideal)
-    if denominator <= 0:
-        return 0.0
-    return min(1.0, max(0.0, pm3.dcg(gains[:k]) / denominator))
-
-
-def _parse_ranking(prediction: str, count: int) -> tuple[int, ...]:
+def _parse_ranking(prediction: str, count: int, *, identity_fallback: bool) -> tuple[int, ...]:
     """Read a ranking out of an answer, in either published shape.
 
     The pinned release's own `example_response` is `Ranked indexes: [...]`; the
     evaluation repository's current prompt asks for a fenced-JSON
-    `ranked_indices`. Both are accepted. A reply that is not a permutation of
-    the slate falls back to the identity order, which is what
-    `slate_ranking.run_task_a` does.
+    `ranked_indices`. Both are accepted. The @ai directive runner replaces an
+    invalid permutation with identity order; the other ranking runners score
+    an absent or partial list as returned.
     """
     match = _RANKED_JSON.search(prediction) or _RANKED_INDEXES.search(prediction)
     if match is not None:
@@ -919,9 +1107,9 @@ def _parse_ranking(prediction: str, count: int) -> tuple[int, ...]:
             ranked = [int(part) for part in match.group(1).replace(",", " ").split()]
         except ValueError:
             ranked = []
-        if sorted(ranked) == list(range(count)):
+        if len(ranked) == len(set(ranked)) and all(0 <= index < count for index in ranked):
             return tuple(ranked)
-    return tuple(range(count))
+    return tuple(range(count)) if identity_fallback else ()
 
 
 def _index_values(metadata: Mapping[str, object], key: str) -> tuple[int, ...]:
@@ -996,6 +1184,40 @@ def _locomo_f1(prediction: str, reference: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+def _es_memeval_prediction(value: str) -> str:
+    """Apply the released QA runner's post-generation cleanup.
+
+    `str.strip("Answer:")` strips the character set `A n s w e r :` from both ends, not the
+    prefix, so `"seven"` becomes `"v"` and `"unknown"` becomes `"unknow"`. The released
+    `qa_experiment.py` does exactly this before its F1 and judge, and comparable numbers require
+    reproducing it rather than correcting it.
+    """
+    return value.replace("*", "").replace("#", "").strip("Answer:").strip()
+
+
+def _es_memeval_f1(prediction: str, reference: str) -> float:
+    """Reproduce ES-MemEval's set-overlap token F1.
+
+    Upstream deduplicates the overlap but divides by the original token counts,
+    so repeated words still affect precision and recall. Its implementation
+    raises on an empty answer before checking the overlap; a failed or empty
+    generation is a legitimate benchmark outcome here and receives zero.
+    """
+
+    def tokens(value: str) -> list[str]:
+        return re.sub(r"\W+", " ", value.lower()).strip().split()
+
+    expected, predicted = tokens(reference), tokens(prediction)
+    if not expected or not predicted:
+        return 0.0
+    common = set(expected) & set(predicted)
+    if not common:
+        return 0.0
+    precision = len(common) / len(predicted)
+    recall = len(common) / len(expected)
+    return 2 * precision * recall / (precision + recall)
+
+
 def _bleu_1(
     prediction: str,
     reference: str,
@@ -1056,6 +1278,8 @@ def _gallery_bleu(
     prediction: str,
     reference: str,
     weights: tuple[float, float, float, float],
+    *,
+    tokenizer: Callable[[str], list[str]] = _gallery_tokens,
 ) -> float:
     try:
         from nltk.translate.bleu_score import (  # type: ignore[import-untyped]
@@ -1064,7 +1288,7 @@ def _gallery_bleu(
         )
     except ImportError:
         raise RuntimeError("Mem-Gallery scoring requires mindbridge[benchmarks]") from None
-    predicted, expected = _gallery_tokens(prediction), _gallery_tokens(reference)
+    predicted, expected = tokenizer(prediction), tokenizer(reference)
     if not predicted or not expected:
         return 0.0
     return float(
@@ -1345,6 +1569,20 @@ _ATM_PROMPT = (
     '"true" or "false".  Question: {{question}}  Ground truth: {{answer}}  '
     "Prediction: {{prediction}}"
 )
+
+# slptongji/ES-MemEval@692624208acc077b8867698c1d6fcd998dee641a.
+# This is a compact semantic transcription of `QaExperiment.llm_as_a_judge`,
+# not copied source text. The upstream repository declares no software license
+# at the pinned revision; see `_official/NOTICE.md`.
+_ES_MEMEVAL_JUDGE_PROMPT = """Evaluate the model answer against the reference answer.
+
+Give 0 when it is wrong or irrelevant, 1 when it is partly correct but incomplete or vague, and 2 when it is completely correct and contextually accurate.
+
+Question: {question}
+Reference answer: {gold}
+Model answer: {prediction}
+
+Return one line only in this form: Score: X"""
 
 # YuanchenBei/Mem-Gallery@a93959e1e978a6a7d77798ae92c2ffe41c538c62
 _GALLERY_PROMPT = """You are an impartial judge evaluating the memory capabilities of an AI assistant with the question-answering task.

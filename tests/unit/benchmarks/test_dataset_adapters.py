@@ -1096,3 +1096,179 @@ def test_longmemeval_reports_no_gold_evidence_when_the_release_marks_no_turn(
 
     assert question.metadata["evidence_ids"] == ()
     assert question.metadata["answer_session_ids"] == ("s1",)
+
+
+def test_es_memeval_qa_keeps_session_memory_and_visible_evidence_only(tmp_path: Path) -> None:
+    dataset = _write(
+        tmp_path / "es-memeval" / "data" / "evo_emo.json",
+        [
+            {
+                "id": "p1",
+                "basic_info": {"name": "Sarah"},
+                "dialog_history": [
+                    {
+                        "id": "conv1",
+                        "timestamp": "2025-01-02",
+                        "dialogue": [
+                            {"idx": 1, "role": "seeker", "content": "I started painting."},
+                            {"idx": 2, "role": "supporter", "content": "That sounds calming."},
+                        ],
+                    },
+                    {
+                        "id": "conv2",
+                        "timestamp": "2025-02-03",
+                        "dialogue": [
+                            {"idx": 1, "role": "seeker", "content": "I still paint."},
+                        ],
+                    },
+                ],
+                "questions": [
+                    {
+                        "id": "timeline",
+                        "questions": [
+                            {
+                                "idx": 1,
+                                "capability": "information extraction",
+                                "question": "What hobby did Sarah start?",
+                                "answer": "Painting",
+                                # Event annotations and malformed IDs are not
+                                # visible inputs. Both turn IDs map to the one
+                                # session document used by the upstream RAG QA.
+                                "evidence": ["event1", "conv1:1", "conv1:2", "bad:9"],
+                            },
+                            {
+                                "idx": 2,
+                                "capability": "abstention",
+                                "question": "What brand of paint did she buy?",
+                                "answer": "Unknown",
+                                "evidence": [],
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+
+    unit = load_task(
+        TASKS["es-memeval-qa"], root=tmp_path, dataset_path=dataset, verify_digest=False
+    ).units[0]
+
+    assert unit.unit_id == "p1"
+    assert [memory.source_id for memory in unit.memories] == ["conv1", "conv2"]
+    assert unit.memories[0].content == (
+        "[2025-01-02]\nSarah: I started painting.\nsupporter: That sounds calming.",
+    )
+    assert unit.questions[0].metadata["evidence_ids"] == ("conv1",)
+    # Event annotations are not memory IDs; a malformed turn label is an unresolved gold ID.
+    assert unit.questions[0].metadata["unresolved_evidence_ids"] == ("bad:9",)
+    assert unit.questions[0].reference_at == unit.memories[-1].occurred_at
+    assert unit.questions[1].refusal == "unknown"
+    assert unit.questions[1].metadata["abstention"] is True
+
+
+def test_es_memeval_rejects_unknown_dialogue_roles(tmp_path: Path) -> None:
+    dataset = _write(
+        tmp_path / "evo_emo.json",
+        [
+            {
+                "id": "p1",
+                "basic_info": {"name": "Sarah"},
+                "dialog_history": [
+                    {
+                        "id": "conv1",
+                        "timestamp": "2025-01-02",
+                        "dialogue": [{"idx": 1, "role": "observer", "content": "Text"}],
+                    }
+                ],
+                "questions": [
+                    {
+                        "id": "timeline",
+                        "questions": [
+                            {
+                                "idx": 1,
+                                "capability": "abstention",
+                                "question": "Question?",
+                                "answer": "Unknown",
+                                "evidence": [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="invalid ES-MemEval dialogue role"):
+        load_task(TASKS["es-memeval-qa"], root=tmp_path, dataset_path=dataset, verify_digest=False)
+
+
+def test_worldmemarena_loads_causal_checkpoint_qa_without_leaking_gold_memories(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "worldmemarena"
+    sample = dataset / "agent" / "gui" / "css" / "css_01.json"
+    image = sample.parent / "images" / "css_01" / "frame.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"png")
+    _write(
+        sample,
+        {
+            "sample_id": "css_01",
+            "sessions": [
+                {
+                    "_v2_session_id": "S02",
+                    "dialogue": [
+                        {
+                            "role": "user",
+                            "content": "",
+                            "attachments": [
+                                {
+                                    "image_id": "img_1",
+                                    "file_path": "images/css_01/frame.png",
+                                    "caption": "a blue page",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "_v2_session_id": "S04",
+                    "dialogue": [{"role": "assistant", "content": "later", "attachments": []}],
+                },
+            ],
+            "memory_points": [
+                {"memory_points": [{"memory_id": "mp_S02_1", "memory_content": "blue"}]}
+            ],
+            "qa_checkpoints": [
+                {
+                    "checkpoint_id": "cp1",
+                    "covered_sessions": ["S02"],
+                    "questions": [
+                        {
+                            "question": "What color?",
+                            "answer": "blue",
+                            "question_type": "visual_factual_recall",
+                            "question_type_abbrev": "VFR",
+                            "difficulty": "easy",
+                            "evidence": [{"memory_id": "mp_S02_1"}, {"image_id": "img_1"}],
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    unit = load_task(
+        TASKS["worldmemarena"], root=tmp_path, dataset_path=dataset, verify_digest=False
+    ).units[0]
+
+    assert tuple(item.source_id for item in unit.memories) == (
+        "css_01:S02:T0000",
+        "img_1",
+        "css_01:S04:T0000",
+    )
+    assert unit.questions[0].cutoff_seconds == 100_000.0
+    assert unit.questions[0].metadata["evidence_ids"] == ("img_1",)
+    assert unit.questions[0].metadata["unresolved_evidence_ids"] == ("mp_S02_1",)
+    assert unit.questions[0].metadata["gold_evidence_contents"] == ("blue", "a blue page")

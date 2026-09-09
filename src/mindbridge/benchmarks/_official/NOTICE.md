@@ -3,6 +3,15 @@
 MindBridge's Apache-2.0 license does not replace the terms for the third-party benchmark material
 described below.
 
+## Upstream repository without a declared license
+
+The pinned `slptongji/ES-MemEval@692624208acc077b8867698c1d6fcd998dee641a` repository contains
+the EvoEmo dataset and evaluator source but no license file or license declaration. MindBridge does
+not redistribute either. Its downloader retrieves `data/evo_emo.json` from the pinned repository
+only when an operator requests the ES-MemEval task. The query and judge instructions in MindBridge
+are compact semantic transcriptions, not copied source text. Confirm permission with the upstream
+rights holders before downloading, using, or redistributing EvoEmo.
+
 ## MIT evaluator material
 
 - MEMLENS, copyright 2026 Xiyu Ren, Zhaowei Wang, and the MemLens Authors.
@@ -12,6 +21,7 @@ described below.
 - BEAM, copyright 2025 Mohammad Tavakoli.
 - PersonaMem-v3 evaluation code, copyright 2026 The PersonaMem-v3 Authors.
 - OpenEQA, copyright Meta Platforms, Inc. and affiliates.
+- WorldMemArena, copyright 2026 WorldMemArena Authors.
 
 Those components are provided under the MIT License:
 

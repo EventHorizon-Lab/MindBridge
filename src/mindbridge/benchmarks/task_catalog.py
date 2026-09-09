@@ -8,8 +8,10 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 
 from mindbridge.benchmarks.atm_bench import ATM_BENCH_ADAPTER_VERSION
+from mindbridge.benchmarks.es_memeval import ES_MEMEVAL_ADAPTER_VERSION
 from mindbridge.benchmarks.longmemeval import LONGMEMEVAL_ADAPTER_VERSION
 from mindbridge.benchmarks.openeqa import OPENEQA_ADAPTER_VERSION, OPENEQA_SPLITS
+from mindbridge.benchmarks.worldmemarena import WORLDMEMARENA_ADAPTER_VERSION
 
 DEFAULT_BENCHMARKS_ROOT = Path(".benchmarks")
 
@@ -59,13 +61,11 @@ class TaskSpec:
 
 _LOCOMO = ("mem-eval-suite/LoCoMo_refined", "887091190789e8d6760e70b9edd696539923dc4f")
 _M3 = ("ByteDance-Seed/m3-agent", "0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c")
-_VIDEO_MME = ("lmms-eval/Video-MME", "ead1408f75b618502df9a1d8e0950166bf0a2a0b")
 _VIDEO_MME_V2 = (
     "MME-Benchmarks/Video-MME-v2",
     "6e4bebb03202e1ddbf3d37703e560e51c5aa2d64",
 )
-_EGOLIFE = ("lmms-lab/EgoLife", "143fb319be7aa5ae210c936bf4f0f3a86092afb0")
-_EGOMEM = ("Ted412/EgoMemReason", "7e581505b9dce0e85193a27ae689ff899d0bc507")
+_WORLDMEMARENA = ("LCZZZZ/WorldMemArena", "e2148757921fc7e2d66d8ed899823b763227c341")
 _EGOTEMPO = (
     "google-research-datasets/egotempo",
     "7022ba77b4d89f51cf34e499767995ccd5c90c7a",
@@ -79,6 +79,7 @@ _SUPERMEMORY = (
 _ATM = ("Jingbiao/ATM-Bench", "78e826dc07e97466b2f54443831ef9a83ab8b27c")
 _GALLERY = ("Ethan-Bei/Mem-Gallery", "af912daba984e896e253016b7c7e334ef92c2a6f")
 _LONGMEMEVAL = ("xiaowu0162/longmemeval", "2ec2a557f339b6c0369619b1ed5793734cc87533")
+_ES_MEMEVAL = ("slptongji/ES-MemEval", "692624208acc077b8867698c1d6fcd998dee641a")
 _CLBENCH = ("tencent/CL-bench", "b28a5832a09b0d96c0cf4c22e90d7c60ede25b80")
 _BEAM = ("mohammadtavakoli78/BEAM", "3e12035532eb85768f1a7cd779832b650c4b2ef9")
 _PERSONAMEM_V3 = (
@@ -97,9 +98,7 @@ _M3_ROBOT_MEDIA = MediaSource(
     ("videos/robot/*",),
 )
 _M3_WEB_MEDIA = MediaSource("m3-bench", acquirer="youtube")
-_VIDEO_MME_MEDIA = MediaSource("video-mme", *_VIDEO_MME, ("videos_chunked_*.zip",))
 _VIDEO_MME_V2_MEDIA = MediaSource("video-mme-v2", *_VIDEO_MME_V2, ("videos/*.zip",))
-_EGOLIFE_MEDIA = MediaSource("egolife", *_EGOLIFE, ("A?_*/DAY*/*.mp4",))
 _EGOTEMPO_MEDIA = MediaSource("egotempo", acquirer="ego4d")
 _LIFELONG_MEDIA = MediaSource("mm-lifelong", *_LIFELONG, ("videos/*",))
 _SUPERMEMORY_MEDIA = MediaSource("supermemory-vqa", *_SUPERMEMORY, ("data/video/*",))
@@ -182,16 +181,6 @@ TASKS: dict[str, TaskSpec] = {
             media_source=_M3_WEB_MEDIA,
         ),
         _task(
-            "video-mme",
-            "Video-MME",
-            "video-mme/videomme/test-00000-of-00001.parquet",
-            "video_mme_official_v1",
-            _VIDEO_MME,
-            digest="7fffab8ed38ecc2f9f0eca4c44d8a11636f0ee96116ede83580c8b9ae0faf986",
-            media="video-mme/data",
-            media_source=_VIDEO_MME_MEDIA,
-        ),
-        _task(
             "video-mme-v2",
             "Video-MME-v2",
             "video-mme-v2/test.parquet",
@@ -202,25 +191,17 @@ TASKS: dict[str, TaskSpec] = {
             media_source=_VIDEO_MME_V2_MEDIA,
         ),
         _task(
-            "egolifeqa",
-            "EgoLifeQA",
-            "egolife/EgoLifeQA/EgoLifeQA_A1_JAKE.json",
-            "egolife_qa_official_v3",
-            _EGOLIFE,
-            digest="688ae079f458132f13150711b7e099fbe4fdedd97f19f5a33bdebb7bfde74a52",
-            variant="A1_JAKE",
-            media="egolife",
-            media_source=_EGOLIFE_MEDIA,
-        ),
-        _task(
-            "egomemreason",
-            "EgoMemReason",
-            "egomem-reason/annotations_public.jsonl",
-            "egomem_reason_official_v2",
-            _EGOMEM,
-            digest="8ec70ea94396df5fd405dd1fa890e1c70cd8ccdeb7d85ba73689083cd92c2a3b",
-            media="egolife",
-            media_source=_EGOLIFE_MEDIA,
+            "worldmemarena",
+            "WorldMemArena",
+            "worldmemarena",
+            WORLDMEMARENA_ADAPTER_VERSION,
+            _WORLDMEMARENA,
+            dataset_patterns=(
+                "agent/**/*.json",
+                "agent/**/*.png",
+                "lifelong/**/*.json",
+                "lifelong/**/*.png",
+            ),
         ),
         _task(
             "egotempo",
@@ -355,6 +336,15 @@ TASKS: dict[str, TaskSpec] = {
             variant="s",
         ),
         _task(
+            "es-memeval-qa",
+            "ES-MemEval",
+            "es-memeval/data/evo_emo.json",
+            ES_MEMEVAL_ADAPTER_VERSION,
+            _ES_MEMEVAL,
+            digest="f30698e87fddaeff51270a666c654da604f487a3456ec60d2b6ae08a6fecd420",
+            variant="qa",
+        ),
+        _task(
             "clbench",
             "CL-Bench",
             "clbench/CL-bench.jsonl",
@@ -445,14 +435,13 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "atm-bench": tuple(name for name in TASKS if name.startswith("atm-bench-")),
     "beam": tuple(name for name in TASKS if name.startswith("beam-")),
     "openeqa": tuple(name for name in TASKS if name.startswith("openeqa-")),
+    "es-memeval": ("es-memeval-qa",),
     "all": tuple(TASKS),
 }
 
 ALIASES = {
-    "egolife": "egolifeqa",
-    "ego-life-qa": "egolifeqa",
-    "egomem": "egomemreason",
-    "ego-mem-reason": "egomemreason",
+    "world-mem-arena": "worldmemarena",
+    "worldmem": "worldmemarena",
     "m3": "m3-bench",
     "m3-robot": "m3-bench-robot",
     "m3-web": "m3-bench-web",
@@ -465,6 +454,8 @@ ALIASES = {
     "atm-hard-sgm": "atm-bench-hard-sgm",
     "longmemeval": "longmemeval-s",
     "longmemeval-small": "longmemeval-s",
+    "evoemo": "es-memeval",
+    "evo-emo": "es-memeval",
     "cl-bench": "clbench",
     "personamem": "personamem-v3",
     "open-eqa": "openeqa",

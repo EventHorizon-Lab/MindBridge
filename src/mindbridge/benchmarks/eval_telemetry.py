@@ -7,7 +7,8 @@ import os
 import platform
 import resource
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
@@ -1296,8 +1297,19 @@ class _GpuSamples:
     ) -> None:
         self.readings.append((sampled_at, utilization, memory_used, power_watts))
 
-    def json(self, started: float, stopped: float) -> dict[str, object]:
-        readings = sorted(reading for reading in self.readings if reading[0] <= stopped)
+    def json(
+        self,
+        started: float,
+        stopped: float,
+        *,
+        excluded: Sequence[tuple[float, float]] = (),
+    ) -> dict[str, object]:
+        readings = sorted(
+            reading
+            for reading in self.readings
+            if reading[0] <= stopped
+            and not any(left < reading[0] < right for left, right in excluded)
+        )
         if not readings:
             raise RuntimeError("GPU sample set is empty")
         utilization_area = memory_area = power_area = power_coverage = 0.0
@@ -1305,6 +1317,11 @@ class _GpuSamples:
         for first, second in pairwise(readings):
             left = max(started, first[0])
             right = min(stopped, second[0])
+            if any(
+                excluded_left < right and excluded_right > left
+                for excluded_left, excluded_right in excluded
+            ):
+                continue
             seconds = max(0.0, right - left)
             if not seconds:
                 continue
@@ -1374,6 +1391,11 @@ class ResourceSampler:
         self._rapl_start: dict[str, tuple[int, int | None]] | None = None
         self._rapl_joules: float | None = None
         self._rapl_reason: str | None = None
+        self._excluded_intervals: list[tuple[float, float]] = []
+        self._excluded_cpu_seconds = 0.0
+        self._excluded_rapl_joules = 0.0
+        self._rapl_exclusion_error: str | None = None
+        self._excluding = False
 
     def __enter__(self) -> ResourceSampler:
         if self._storage_roots:
@@ -1415,28 +1437,94 @@ class ResourceSampler:
                 joules_uj, wrap_reason = _rapl_delta_uj(self._rapl_start, end)
                 if joules_uj is None:
                     self._rapl_reason = self._rapl_reason or wrap_reason
+                elif self._rapl_exclusion_error is not None:
+                    self._rapl_reason = self._rapl_exclusion_error
                 else:
-                    self._rapl_joules = joules_uj / 1_000_000
+                    self._rapl_joules = max(
+                        0.0,
+                        joules_uj / 1_000_000 - self._excluded_rapl_joules,
+                    )
+
+    @contextmanager
+    def exclude(self) -> Iterator[None]:
+        """Exclude one synchronous interval from product resource accounting.
+
+        The eval runner uses this around per-task judging. Boundary GPU readings split the sampled
+        timeline cleanly, while exact CPU and RAPL deltas are subtracted from the outer window.
+        """
+        if not self._started_wall or self._stopped_wall is not None:
+            raise RuntimeError("resource exclusions require an active sampler")
+        if self._excluding:
+            raise RuntimeError("resource exclusions cannot be nested")
+        self._excluding = True
+        started_wall = perf_counter()
+        started_cpu = _cpu_seconds()
+        started_rapl, started_rapl_reason = _rapl_energy_uj()
+        initial = _nvidia_utilization()
+        if initial:
+            self._gpu_available = True
+            self._record_gpu(initial, sampled_at=started_wall)
+        try:
+            yield
+        finally:
+            final = _nvidia_utilization()
+            stopped_rapl: dict[str, tuple[int, int | None]] | None = None
+            stopped_rapl_reason: str | None = None
+            if self._rapl_start is not None:
+                stopped_rapl, stopped_rapl_reason = _rapl_energy_uj()
+            stopped_cpu = _cpu_seconds()
+            stopped_wall = perf_counter()
+            if final:
+                self._gpu_available = True
+                self._record_gpu(final, sampled_at=stopped_wall)
+            self._excluded_intervals.append((started_wall, stopped_wall))
+            self._excluded_cpu_seconds += max(0.0, stopped_cpu - started_cpu)
+            if self._rapl_start is not None:
+                if started_rapl is None or stopped_rapl is None:
+                    self._rapl_exclusion_error = (
+                        started_rapl_reason
+                        or stopped_rapl_reason
+                        or "RAPL was unavailable at a resource-exclusion boundary"
+                    )
+                else:
+                    excluded_uj, excluded_reason = _rapl_delta_uj(started_rapl, stopped_rapl)
+                    if excluded_uj is None:
+                        self._rapl_exclusion_error = excluded_reason
+                    else:
+                        self._excluded_rapl_joules += excluded_uj / 1_000_000
+            self._excluding = False
 
     def json(self, *, wall_seconds: float) -> dict[str, object]:
         """Return one JSON-ready resource record for the completed evaluation."""
         ended_wall = self._stopped_wall if self._stopped_wall is not None else perf_counter()
         measured_wall_seconds = (
-            max(0.0, ended_wall - self._started_wall)
+            max(
+                0.0,
+                ended_wall
+                - self._started_wall
+                - sum(right - left for left, right in self._excluded_intervals),
+            )
             if self._started_wall
             else max(0.0, wall_seconds)
         )
         ended_cpu = (
             self._stopped_cpu_seconds if self._stopped_cpu_seconds is not None else _cpu_seconds()
         )
-        cpu_seconds = max(0.0, ended_cpu - self._started_cpu_seconds)
+        cpu_seconds = max(
+            0.0,
+            ended_cpu - self._started_cpu_seconds - self._excluded_cpu_seconds,
+        )
         try:
             cores = len(os.sched_getaffinity(0))
         except (AttributeError, OSError):
             cores = os.cpu_count() or 1
         with self._lock:
             gpu = {
-                str(index): samples.json(self._started_wall, ended_wall)
+                str(index): samples.json(
+                    self._started_wall,
+                    ended_wall,
+                    excluded=self._excluded_intervals,
+                )
                 for index, samples in sorted(self._gpu.items())
             }
         return {
@@ -1445,6 +1533,11 @@ class ResourceSampler:
                 "phase": "product_execution_including_post_answer_search_replay",
                 "exclusive_attribution": False,
                 "wall_seconds": measured_wall_seconds,
+                "excluded_window_count": len(self._excluded_intervals),
+                "excluded_windows": (
+                    "per-task judging, interim aggregation, reporting, and metrics snapshots"
+                ),
+                "judge_traffic_excluded": True,
                 "storage_scope": "selected_run_directories",
                 "storage_root_count": len(self._storage_roots),
                 "gpu_sampling_interval_seconds": self._interval_seconds,

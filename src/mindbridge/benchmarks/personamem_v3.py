@@ -252,6 +252,7 @@ class _RawInstance(BaseModel):
     matching_indices: list[int] = Field(default_factory=list)
     hard_negative_idxs: list[int] = Field(default_factory=list)
     carveout_indices: list[int] = Field(default_factory=list)
+    surface_decoy_indices: list[int] = Field(default_factory=list)
 
 
 class _RawPreference(BaseModel):
@@ -407,7 +408,12 @@ def _query(persona_id: str, raw: _RawQuery) -> PersonaMemQuery | None:
             instance.positive_indices,
             instance.matching_indices,
         ),
-        negative_indexes=_indexes(None, instance.hard_negative_idxs, instance.carveout_indices),
+        negative_indexes=_indexes(
+            None,
+            instance.hard_negative_idxs,
+            instance.carveout_indices,
+            instance.surface_decoy_indices,
+        ),
         judge_evidence={
             key: value for key, value in payload.items() if key not in _EVIDENCE_EXCLUDED
         },

@@ -22,6 +22,7 @@ _GITHUB_REPOSITORIES = frozenset(
         "google-research-datasets/egotempo",
         "mohammadtavakoli78/BEAM",
         "facebookresearch/open-eqa",
+        "slptongji/ES-MemEval",
     }
 )
 
