@@ -47,6 +47,7 @@ all = [
     "starlette>=0.46,<2",
     "torch>=2.6,<3",
     "torchaudio>=2.11,<3",
+    "torchvision>=0.26,<0.27",
     "tqdm>=4.66,<5",
     "uvicorn>=0.35,<1",
 ]
@@ -92,6 +93,9 @@ local = [
     "torch>=2.6,<3",
     # Fun-ASR-Nano uses torchaudio.functional.forced_align for its native timestamps.
     "torchaudio>=2.11,<3",
+    # sentence-transformers[image] imports torchvision; declaring it directly lets uv select the
+    # matching CUDA build instead of mixing PyPI's default build with the pinned torch build.
+    "torchvision>=0.26,<0.27",
 ]
 server = [
     "fastapi>=0.116,<1",
@@ -104,6 +108,22 @@ mcp = [
 
 [tool.uv]
 required-version = "==0.12.5"
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchaudio = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 # Keep contributor-specific uv mirrors out of the shared lockfile.
 [[tool.uv.index]]
