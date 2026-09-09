@@ -16,7 +16,7 @@ from collections.abc import Collection, Generator, Iterable, Iterator, Mapping, 
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from itertools import zip_longest
+from itertools import groupby, zip_longest
 from pathlib import Path
 from typing import Literal, NoReturn
 
@@ -98,11 +98,16 @@ _CONSENT_BASIS = EvidenceBasis.USER_STATEMENT.value
 # Recognition against exemplars already held is unaffected: erasing what is held is
 # `forget_identity`, and answering a question about a photo is not new processing of a person.
 _RESTRAINING_CONSENT = frozenset({ConsentState.WITHHELD.value, ConsentState.WITHDRAWN.value})
-# Kinds whose claims can contradict inside one lineage. This must stay the set the context
-# compiler reports conflicts for; `tests/unit/test_memory_control_plane.py` asserts they agree,
-# because the compiler is a product module and this is infrastructure.
-_CONFLICT_KINDS: tuple[str, ...] = ("state", "relation", "trait")
-_CONFLICT_KIND_PLACEHOLDERS = ", ".join("?" for _kind in _CONFLICT_KINDS)
+# Claims whose write contract gives one lineage one standing value. Relations are accumulating,
+# as are model-inferred traits; only a person's own trait assertion has the single-value contract.
+# Keep the complete SQL predicate in one place so all functional scans agree about which claims
+# can participate in a conflict.
+_FUNCTIONAL_CLAIM_SQL = "(s.kind = ? OR (s.kind = ? AND s.basis = ?))"
+_FUNCTIONAL_CLAIM_PARAMETERS = (
+    MemoryKind.STATE.value,
+    MemoryKind.TRAIT.value,
+    EvidenceBasis.USER_STATEMENT.value,
+)
 _FACE_EXEMPLAR_LIMIT = 10
 _VOICE_EXEMPLAR_LIMIT = 20
 _MEMORY_MODALITIES = frozenset({"text", "image", "video", "audio", "omni"})
@@ -2672,6 +2677,102 @@ class LocalStore:
             )
         }
         return tuple(by_id[memory_id] for memory_id in memory_ids if memory_id in by_id)
+
+    def read_functional_lineage_representatives(
+        self,
+        lineage_ids: Sequence[str],
+        *,
+        per_lineage_limit: int,
+        valid_at: datetime | None = None,
+        known_at: datetime | None = None,
+        near: SpatialContext | None = None,
+        radius_m: float | None = None,
+        place_id: str | None = None,
+        identity_id: str | None = None,
+    ) -> tuple[tuple[StoredMemory, ...], frozenset[str]]:
+        """Read bounded current representatives for functional claim lineages.
+
+        This is a completion read for context compilation, not a second retrieval route.  It starts
+        from the lineage index, then uses ``read_memories`` for authoritative bitemporal, place,
+        identity, and metric-scope filtering before it retains the rows for each distinct value.
+        The compiler chooses one deliverable representative only after confidence, support, and
+        consent checks, so an ineligible copy cannot hide an eligible copy of the same assertion.
+        The value bound is applied after scope, so repeated or historical copies of the same
+        assertion do not by themselves make a current claim incomplete.  The read may scan all
+        current visible candidate rows of a requested lineage before identity and metric scope
+        can prove which values survive; it never scans an unrelated lineage or uses a relevance
+        score to choose a representative.
+        """
+        if not lineage_ids:
+            return (), frozenset()
+        for lineage_id in lineage_ids:
+            _require_identifier(lineage_id, "lineage_id")
+        if (
+            isinstance(per_lineage_limit, bool)
+            or not isinstance(per_lineage_limit, int)
+            or per_lineage_limit <= 0
+        ):
+            raise ValueError("per_lineage_limit must be a positive integer")
+        query_valid_at = valid_at or datetime.now(timezone.utc)
+        query_known_at = known_at or datetime.now(timezone.utc)
+        valid_text = _datetime_text(query_valid_at)
+        known_text = _datetime_text(query_known_at)
+        selected_ids: list[str] = []
+        with self._read_transaction() as connection:
+            for lineage_id in dict.fromkeys(lineage_ids):
+                rows = connection.execute(
+                    f"""
+                    SELECT s.memory_id AS memory_id
+                    FROM memory_semantics AS s
+                    JOIN memory_versions AS v ON v.memory_id = s.memory_id
+                    JOIN memory_records AS r ON r.memory_id = s.memory_id
+                    WHERE s.lineage_id = ?
+                      AND {_FUNCTIONAL_CLAIM_SQL}
+                      AND r.forgotten_at IS NULL
+                      AND v.visible = 1
+                      AND v.recorded_at <= ?
+                      AND (v.retired_at IS NULL OR v.retired_at > ?)
+                      AND (v.valid_from IS NULL OR v.valid_from <= ?)
+                      AND (v.valid_until IS NULL OR v.valid_until > ?)
+                    ORDER BY s.memory_id
+                    """,
+                    (
+                        lineage_id,
+                        *_FUNCTIONAL_CLAIM_PARAMETERS,
+                        known_text,
+                        known_text,
+                        valid_text,
+                        valid_text,
+                    ),
+                ).fetchall()
+                selected_ids.extend(_row_text(row, "memory_id") for row in rows)
+        scoped = self.read_memories(
+            selected_ids,
+            valid_at=valid_at,
+            known_at=known_at,
+            near=near,
+            radius_m=radius_m,
+            place_id=place_id,
+            identity_id=identity_id,
+            active_only=True,
+        )
+        representatives: list[StoredMemory] = []
+        values: dict[str, set[str]] = {}
+        incomplete: set[str] = set()
+        for memory in scoped:
+            context = memory.context
+            if context is None or context.lineage_id is None or context.value is None:
+                continue
+            lineage_values = values.setdefault(context.lineage_id, set())
+            if context.value in lineage_values:
+                representatives.append(memory)
+                continue
+            if len(lineage_values) >= per_lineage_limit:
+                incomplete.add(context.lineage_id)
+                continue
+            lineage_values.add(context.value)
+            representatives.append(memory)
+        return tuple(representatives), frozenset(incomplete)
 
     def count_memories(
         self,
@@ -8955,55 +9056,132 @@ def _contradiction_candidates(
     has changed since it was last weighed, and returns as soon as a further claim is recorded in
     it. The signal is the newest transaction time among the disagreeing claims.
     """
-    lineages = {
-        _row_text(row, "lineage_id"): int(row["values_count"])
-        for row in connection.execute(
-            f"""
-            SELECT s.lineage_id AS lineage_id, COUNT(DISTINCT s.value) AS values_count
-            FROM memory_semantics AS s
-            JOIN memory_versions AS v ON v.memory_id = s.memory_id
-            JOIN memory_records AS r ON r.memory_id = s.memory_id
-            WHERE v.retired_at IS NULL AND v.visible = 1 AND r.forgotten_at IS NULL
-              AND s.value IS NOT NULL AND s.kind IN ({_CONFLICT_KIND_PLACEHOLDERS})
-            GROUP BY s.lineage_id
-            HAVING values_count > 1
-            ORDER BY s.lineage_id
-            LIMIT ?
-            """,
-            (*_CONFLICT_KINDS, limit),
-        ).fetchall()
-    }
-    if not lineages:
-        return []
-    placeholders = ", ".join("?" for _lineage_id in lineages)
-    members: dict[str, list[str]] = {lineage_id: [] for lineage_id in lineages}
-    signal: dict[str, datetime] = {}
-    for row in connection.execute(
+    entries: dict[str, list[tuple[str, str, datetime]]] = {}
+    # A correlated overlap predicate made SQLite re-discover the same conflicting peers for each
+    # member (and then do it again while hydrating members).  Claims in a lineage are instead
+    # consumed together.  The two sweeps retain only the best two endpoints for distinct values:
+    # an interval participates iff an earlier or later interval with another value overlaps it.
+    rows = connection.execute(
         f"""
-        SELECT s.lineage_id AS lineage_id, s.memory_id AS memory_id, v.recorded_at AS recorded_at
+        SELECT s.lineage_id AS lineage_id, s.memory_id AS memory_id, s.value AS value,
+               v.recorded_at AS recorded_at, v.valid_from AS valid_from,
+               v.valid_until AS valid_until
         FROM memory_semantics AS s
         JOIN memory_versions AS v ON v.memory_id = s.memory_id
         JOIN memory_records AS r ON r.memory_id = s.memory_id
         WHERE v.retired_at IS NULL AND v.visible = 1 AND r.forgotten_at IS NULL
-          AND s.value IS NOT NULL AND s.lineage_id IN ({placeholders})
+          AND s.lineage_id IS NOT NULL AND s.value IS NOT NULL AND {_FUNCTIONAL_CLAIM_SQL}
         ORDER BY s.lineage_id, s.memory_id
         """,
-        tuple(lineages),
-    ).fetchall():
-        lineage_id = _row_text(row, "lineage_id")
-        members[lineage_id].append(_row_text(row, "memory_id"))
-        recorded_at = _parse_datetime(_row_text(row, "recorded_at"))
-        if lineage_id not in signal or recorded_at > signal[lineage_id]:
-            signal[lineage_id] = recorded_at
-    return [
-        StoredCandidate(
-            trigger="contradiction",
-            memory_ids=tuple(dict.fromkeys(memory_ids)),
-            evidence_count=lineages[lineage_id],
+        _FUNCTIONAL_CLAIM_PARAMETERS,
+    )
+    for lineage_id, lineage_rows in groupby(rows, key=lambda row: _row_text(row, "lineage_id")):
+        members = _overlapping_functional_members(lineage_rows)
+        if members:
+            entries[lineage_id] = members
+            # The old query applies the lineage limit before due-state filtering.  Stop here so a
+            # previously weighed earlier lineage continues to consume a slot in exactly the same way.
+            if len(entries) == limit:
+                break
+    candidates: list[StoredCandidate] = []
+    for lineage_entries in entries.values():
+        memory_ids = tuple(entry[0] for entry in lineage_entries)
+        signal_at = max(entry[2] for entry in lineage_entries)
+        if _is_due(signal_at, memory_ids, weighed):
+            candidates.append(
+                StoredCandidate(
+                    trigger="contradiction",
+                    memory_ids=memory_ids,
+                    evidence_count=len({entry[1] for entry in lineage_entries}),
+                )
+            )
+    return candidates
+
+
+def _overlapping_functional_members(
+    rows: Iterable[sqlite3.Row],
+) -> list[tuple[str, str, datetime]]:
+    """Return only members with a differently-valued half-open overlap in one lineage."""
+    intervals = [
+        (
+            _row_text(row, "memory_id"),
+            _row_text(row, "value"),
+            _parse_datetime(_row_text(row, "recorded_at")),
+            _optional_datetime_from_row(row, "valid_from"),
+            _optional_datetime_from_row(row, "valid_until"),
         )
-        for lineage_id, memory_ids in members.items()
-        if memory_ids and _is_due(signal[lineage_id], memory_ids, weighed)
+        for row in rows
     ]
+    intervals.sort(key=lambda entry: (entry[3] is not None, entry[3], entry[0]))
+    overlapping_ids: set[str] = set()
+
+    # Each entry is (value, endpoint).  An endpoint of None means unbounded: -infinity for a
+    # start and +infinity for an end.  Keeping two different values is sufficient because a
+    # query excludes only its own value; a discarded value cannot become extremal without a later
+    # row of that value re-entering the two slots.
+    latest_ends: list[tuple[str, datetime | None]] = []
+    for memory_id, value, _recorded_at, valid_from, valid_until in intervals:
+        other_end = _other_extremum(latest_ends, value)
+        if other_end is not None and _end_after(other_end[1], valid_from):
+            overlapping_ids.add(memory_id)
+        _update_endpoint_extrema(latest_ends, value, valid_until, latest=True)
+
+    earliest_starts: list[tuple[str, datetime | None]] = []
+    for memory_id, value, _recorded_at, valid_from, valid_until in reversed(intervals):
+        other_start = _other_extremum(earliest_starts, value)
+        if other_start is not None and _end_after(valid_until, other_start[1]):
+            overlapping_ids.add(memory_id)
+        _update_endpoint_extrema(earliest_starts, value, valid_from, latest=False)
+
+    members = [
+        (memory_id, value, recorded_at)
+        for memory_id, value, recorded_at, _valid_from, _valid_until in intervals
+        if memory_id in overlapping_ids
+    ]
+    return sorted(members, key=lambda entry: entry[0])
+
+
+def _other_extremum(
+    extrema: Sequence[tuple[str, datetime | None]], value: str
+) -> tuple[str, datetime | None] | None:
+    for other_value, endpoint in extrema:
+        if other_value != value:
+            return other_value, endpoint
+    return None
+
+
+def _end_after(end: datetime | None, start: datetime | None) -> bool:
+    return end is None or start is None or end > start
+
+
+def _update_endpoint_extrema(
+    extrema: list[tuple[str, datetime | None]],
+    value: str,
+    endpoint: datetime | None,
+    *,
+    latest: bool,
+) -> None:
+    """Update two distinct value extrema in constant time."""
+    for index, (known_value, known_endpoint) in enumerate(extrema):
+        if known_value == value:
+            if _endpoint_precedes(known_endpoint, endpoint, latest=latest):
+                extrema[index] = (value, endpoint)
+            break
+    else:
+        extrema.append((value, endpoint))
+    extrema.sort(key=lambda item: _endpoint_sort_key(item[1], latest=latest), reverse=latest)
+    del extrema[2:]
+
+
+def _endpoint_precedes(left: datetime | None, right: datetime | None, *, latest: bool) -> bool:
+    if latest:
+        return _endpoint_sort_key(left, latest=True) < _endpoint_sort_key(right, latest=True)
+    return _endpoint_sort_key(left, latest=False) > _endpoint_sort_key(right, latest=False)
+
+
+def _endpoint_sort_key(endpoint: datetime | None, *, latest: bool) -> tuple[bool, datetime | None]:
+    # For latest ends, None sorts after all timestamps; for earliest starts, before them.
+    return (endpoint is None if latest else endpoint is not None, endpoint)
 
 
 def _is_due(

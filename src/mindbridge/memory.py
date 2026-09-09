@@ -22,6 +22,7 @@ from collections.abc import (
     AsyncIterable,
     AsyncIterator,
     Callable,
+    Collection,
     Generator,
     Iterable,
     Iterator,
@@ -454,6 +455,10 @@ _MAX_INDEX_SEARCH_WORKERS = 4
 # window has to hold what they will remove for `candidates_exhausted` to mean the store ran
 # out rather than the window did.
 _POST_FILTER_WINDOW = 3
+# Context compilation may complete an affirmative functional claim with low-relevance competing
+# values.  This is an obligation lookup, never a second relevance route, so a finite cap must
+# refuse rather than silently make a prefix look complete.
+_LINEAGE_COMPLETION_REPRESENTATIVES = 8
 _TODAY_ISO_DATE = re.compile(r"\btoday\s+is\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
 _MONTH_NAME = (
     r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
@@ -1812,18 +1817,69 @@ class Memory:
             # The same transcript cache `search()` writes for a spoken query. It is a cache of
             # the query's own audio, not a memory: `compile()` stores nothing it retrieved.
             self._persist_transcripts(assets)
-            closures, unavailable = self._evidence_closures(
+            completion_hits, capped_lineages = self._competing_lineage_hits(
                 outcome.hits,
+                scope=scope,
+            )
+            candidate_by_id = {hit.id: hit for hit in outcome.hits}
+            for hit in completion_hits:
+                candidate_by_id.setdefault(hit.id, hit)
+            candidates = tuple(candidate_by_id.values())
+            closures, unavailable = self._evidence_closures(
+                candidates,
                 budget=budget,
                 reference_at=reference,
                 scope=scope,
                 started_at=started_at,
             )
+            closure_ids = frozenset(closure.anchor.id for closure in closures)
+            values_by_lineage = _functional_representatives(candidates)
+            competing_values = {
+                lineage_id: values
+                for lineage_id, values in values_by_lineage.items()
+                if len(values) > 1
+            }
+            incomplete_lineages = _incomplete_functional_lineages(
+                competing_values,
+                candidate_by_id,
+                closure_ids,
+                budget,
+                reference,
+                capped_lineages,
+            )
+            if incomplete_lineages:
+                # A functional assertion is never affirmative by itself once its indexed
+                # lineage completion found an unrenderable competitor or reached its cap.  The
+                # raw observations supporting it remain ordinary evidence, but every claim in
+                # the unsafe lineage is withheld before the compiler can fall back to flat rank.
+                withheld_ids = frozenset(
+                    hit.id
+                    for hit in candidates
+                    if (functional := _functional_lineage(hit)) is not None
+                    and functional[0] in incomplete_lineages
+                )
+                ranked_withheld = sum(1 for hit in outcome.hits if hit.id in withheld_ids)
+                candidates = tuple(hit for hit in candidates if hit.id not in withheld_ids)
+                closures = tuple(
+                    closure
+                    for closure in closures
+                    if not _closure_contains_functional_lineage(closure, incomplete_lineages)
+                )
+                unavailable = (
+                    *unavailable,
+                    ContextUnknown(
+                        kind=ContextUnknownKind.EVIDENCE_UNAVAILABLE,
+                        detail=(
+                            f"{ranked_withheld} ranked assertions required complete competing"
+                            " evidence under the requested scope"
+                        ),
+                    ),
+                )
             closure_hits = tuple(
                 {
                     hit.id: hit
                     for hit in (
-                        *outcome.hits,
+                        *candidates,
                         *(hit for closure in closures for hit in closure.members),
                     )
                 }.values()
@@ -1839,14 +1895,75 @@ class Memory:
                 ),
             )
             permitted_ids = {hit.id for hit in permitted}
-            before_consent = len(closures)
+            closures_before_consent = closures
             closures = tuple(
                 closure
                 for closure in closures
                 if all(member.id in permitted_ids for member in closure.members)
             )
-            withheld_closures = len(closures) < before_consent
-            hits = tuple(hit for hit in outcome.hits if hit.id in permitted_ids)
+            hits = tuple(hit for hit in candidates if hit.id in permitted_ids)
+            consent_closure_ids = frozenset(closure.anchor.id for closure in closures)
+            withheld_closures = _consent_withheld_required_closure(
+                closures_before_consent,
+                consent_closure_ids,
+                values_by_lineage,
+                candidate_by_id,
+                budget,
+                reference,
+            )
+            consent_incomplete_lineages = {
+                lineage_id
+                for lineage_id, values in competing_values.items()
+                if lineage_id not in incomplete_lineages
+                if any(
+                    not any(
+                        memory_id in permitted_ids and memory_id in consent_closure_ids
+                        for memory_id in representatives
+                    )
+                    for representatives in values.values()
+                )
+            }
+            if consent_incomplete_lineages:
+                # Consent cannot turn a previously known competitor into a silent agreement.  Do
+                # not name the withheld identity or value here: the only safe presentation is
+                # that the affirmative claim's competing evidence is unavailable.
+                consent_withheld_ids = frozenset(
+                    hit.id
+                    for hit in hits
+                    if (functional := _functional_lineage(hit)) is not None
+                    and functional[0] in consent_incomplete_lineages
+                )
+                hits = tuple(hit for hit in hits if hit.id not in consent_withheld_ids)
+                closures = tuple(
+                    closure
+                    for closure in closures
+                    if not _closure_contains_functional_lineage(
+                        closure, consent_incomplete_lineages
+                    )
+                )
+                unavailable = (
+                    *unavailable,
+                    ContextUnknown(
+                        kind=ContextUnknownKind.EVIDENCE_UNAVAILABLE,
+                        detail="one or more ranked assertions required competing evidence withheld by consent",
+                    ),
+                )
+            consent_closure_ids = frozenset(closure.anchor.id for closure in closures)
+            deliverable_functional_ids = _deliverable_functional_representatives(
+                hits, consent_closure_ids, budget, reference
+            )
+            hits = tuple(
+                hit
+                for hit in hits
+                if (functional := _functional_lineage(hit)) is None
+                or hit.id in deliverable_functional_ids
+            )
+            closures = tuple(
+                closure
+                for closure in closures
+                if _functional_lineage(closure.anchor) is None
+                or closure.anchor.id in deliverable_functional_ids
+            )
             excerpts = (
                 self._context_excerpts(
                     hits,
@@ -1925,6 +2042,41 @@ class Memory:
                     excerpts[hit.id] = excerpt
                     break
         return excerpts
+
+    def _competing_lineage_hits(
+        self,
+        anchors: Sequence[SearchHit],
+        *,
+        scope: RetrievalScope | None,
+    ) -> tuple[tuple[SearchHit, ...], frozenset[str]]:
+        """Complete ranked functional claims with bounded, scope-correct competitors.
+
+        Retrieval chooses the anchors.  This indexed SQLite read only asks whether a ranked
+        functional lineage has a differently valued claim the context compiler must carry or
+        withhold.  It assigns zero relevance to the completed rows, so they cannot become a new
+        relevance route or displace an ordinary result except as an anchor's own obligation.
+        """
+        lineage_ids = tuple(
+            dict.fromkeys(
+                functional[0]
+                for anchor in anchors
+                if (functional := _functional_lineage(anchor)) is not None
+            )
+        )
+        if not lineage_ids:
+            return (), frozenset()
+        with _translate_storage_errors("complete competing lineage evidence"):
+            memories, incomplete = self._store.read_functional_lineage_representatives(
+                lineage_ids,
+                per_lineage_limit=_LINEAGE_COMPLETION_REPRESENTATIVES,
+                valid_at=None if scope is None else scope.valid_at,
+                known_at=None if scope is None else scope.known_at,
+                near=None if scope is None else scope.near,
+                radius_m=None if scope is None else scope.radius_m,
+                place_id=None if scope is None else scope.place_id,
+                identity_id=None if scope is None else scope.identity_id,
+            )
+        return tuple(self._search_hit(memory, 0.0) for memory in memories), incomplete
 
     def _evidence_closures(  # noqa: C901 - bounded graph traversal keeps scope checks in one place
         self,
@@ -9187,6 +9339,128 @@ def _observation_from_record(record: MemoryRecord) -> ObservationContext:
 
 def _formation_memory_type(kind: MemoryKind) -> MemoryType:
     return KIND_MEMORY_TYPES.get(kind, MemoryType.SEMANTIC)
+
+
+def _functional_lineage(hit: SearchHit) -> tuple[str, str] | None:
+    """Return the claim key whose competing values make delivery non-affirmative.
+
+    This matches the compiler and slow-loop contract: relations and inferred traits can
+    accumulate values, while STATE and a user-stated TRAIT have one functional value at a scoped
+    point in time.
+    """
+    context = hit.context
+    if (
+        context is None
+        or context.lineage_id is None
+        or context.value is None
+        or not (
+            context.kind is MemoryKind.STATE
+            or (context.kind is MemoryKind.TRAIT and context.basis is EvidenceBasis.USER_STATEMENT)
+        )
+    ):
+        return None
+    return context.lineage_id, context.value
+
+
+def _functional_representatives(
+    hits: Sequence[SearchHit],
+) -> dict[str, dict[str, list[str]]]:
+    """Group candidate IDs by functional lineage and value, preserving rank order."""
+    values_by_lineage: dict[str, dict[str, list[str]]] = {}
+    for hit in hits:
+        functional = _functional_lineage(hit)
+        if functional is None:
+            continue
+        lineage_id, value = functional
+        values_by_lineage.setdefault(lineage_id, {}).setdefault(value, []).append(hit.id)
+    return values_by_lineage
+
+
+def _incomplete_functional_lineages(
+    competing_values: Mapping[str, Mapping[str, Sequence[str]]],
+    candidates: Mapping[str, SearchHit],
+    closure_ids: Collection[str],
+    budget: ContextBudget,
+    reference_at: datetime,
+    capped_lineages: Collection[str],
+) -> set[str]:
+    """Return lineages with a value that has no filter-eligible evidence closure."""
+    incomplete = set(capped_lineages)
+    for lineage_id, values in competing_values.items():
+        if any(
+            not any(
+                memory_id in closure_ids
+                and _rejection(candidates[memory_id], budget, reference_at) is None
+                for memory_id in representatives
+            )
+            for representatives in values.values()
+        ):
+            incomplete.add(lineage_id)
+    return incomplete
+
+
+def _consent_withheld_required_closure(
+    closures: Sequence[EvidenceClosure],
+    consent_closure_ids: Collection[str],
+    values_by_lineage: Mapping[str, Mapping[str, Sequence[str]]],
+    candidates: Mapping[str, SearchHit],
+    budget: ContextBudget,
+    reference_at: datetime,
+) -> bool:
+    """Whether consent removed a closure without leaving a same-value alternative."""
+    for closure in closures:
+        if closure.anchor.id in consent_closure_ids:
+            continue
+        functional = _functional_lineage(closure.anchor)
+        if functional is None:
+            return True
+        lineage_id, value = functional
+        if not any(
+            representative_id in consent_closure_ids
+            and _rejection(candidates[representative_id], budget, reference_at) is None
+            for representative_id in values_by_lineage[lineage_id][value]
+        ):
+            return True
+    return False
+
+
+def _deliverable_functional_representatives(
+    hits: Sequence[SearchHit],
+    closure_ids: Collection[str],
+    budget: ContextBudget,
+    reference_at: datetime,
+) -> set[str]:
+    """Choose the first deliverable candidate for every functional value."""
+    selected_ids: set[str] = set()
+    selected_values: set[tuple[str, str]] = set()
+    for hit in hits:
+        functional = _functional_lineage(hit)
+        if functional is None or functional in selected_values:
+            continue
+        if hit.id not in closure_ids or _rejection(hit, budget, reference_at) is not None:
+            continue
+        selected_values.add(functional)
+        selected_ids.add(hit.id)
+    return selected_ids
+
+
+def _closure_contains_functional_lineage(
+    closure: EvidenceClosure,
+    lineage_ids: Collection[str],
+) -> bool:
+    """Whether one closure carries a claim in a lineage this compilation withheld.
+
+    Completion finds unsafe lineages only for ranked functional anchors.  A separately ranked
+    derived assertion may still cite one as support, and closed selection would otherwise
+    materialize that support through the derived closure.  This check deliberately makes no new
+    discovery beneath arbitrary support: it only enforces the concrete obligations completion
+    already found for this compilation.
+    """
+    return any(
+        functional is not None and functional[0] in lineage_ids
+        for member in closure.members
+        if (functional := _functional_lineage(member)) is not None
+    )
 
 
 def _formation_refusal(

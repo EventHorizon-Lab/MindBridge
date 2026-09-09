@@ -27,15 +27,15 @@ import yaml
 
 from mindbridge.configuration import MindBridgeConfig, resolve_memory_config
 from mindbridge.memory import Memory
-from mindbridge.models.base import ConsolidationBackend, EmbeddingBackend
+from mindbridge.models.base import ConsolidationBackend, EmbeddingBackend, FormationInput
 from mindbridge.types import (
+    EvidenceBasis,
     FormationProposal,
     MemoryIntent,
     MemoryKind,
-    MemoryOperation,
     MemoryOperationRecord,
     MemoryOutcome,
-    MemoryRecord,
+    Modality,
 )
 
 # The scenario's own clock. Fixed, so two runs of one seed ingest byte-identical occurrence times.
@@ -73,17 +73,57 @@ class _Ingest:
     queries: list[str] = field(default_factory=list)
 
 
+class _PreferenceFormer:
+    """Make each injected first-person preference a user-stated functional claim."""
+
+    formation_capabilities = frozenset({Modality.TEXT})
+    formation_model = "control-plane-ground-truth"
+    formation_space = "control-plane-ground-truth:v1"
+
+    def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+        proposals: list[tuple[FormationProposal, ...]] = []
+        for item in inputs:
+            content = item.content.text.rstrip(".")
+            marker = (
+                " now says their only seat preference is "
+                if " now says their only seat preference is " in content
+                else " says their only seat preference is "
+            )
+            if marker not in content:
+                proposals.append(())
+                continue
+            subject, value = content.split(marker, 1)
+            proposals.append(
+                (
+                    FormationProposal(
+                        kind=MemoryKind.TRAIT,
+                        basis=EvidenceBasis.USER_STATEMENT,
+                        content=item.content.text,
+                        subject=subject,
+                        predicate="only-seat-preference",
+                        value=value,
+                        confidence=0.9,
+                    ),
+                )
+            )
+        return tuple(proposals)
+
+    def close(self) -> None:
+        pass
+
+
 def build_scenario(memory: Memory, *, persons: int, seed: int) -> Scenario:
     """Ingest one seeded synthetic long run and return its ground truth.
 
-    Each preference flip is asserted twice more, as a host-authored claim per side (see
-    `_claim`), because the control plane can only correct or supersede a *derived* record.
+    Each exclusive preference flip is formed as one user-stated trait per side in the same
+    `add_many` transaction. Both claims therefore stand for the loop to weigh, while the raw
+    observations remain the benchmark's source evidence.
 
     Order matters and is part of the design. The failing recalls come last, because a candidate
     is dropped while nothing about it has changed since an operation last weighed it -- and the
-    claims above are applied operations over the very records the failing query is nearest to.
-    They are still genuinely empty recalls: the window they ask about is after everything this
-    scenario ever recorded, which is exactly the shape of a real miss.
+    claims above are derived from the very records the failing query is nearest to. They are still
+    genuinely empty recalls: the window they ask about is after everything this scenario ever
+    recorded, which is exactly the shape of a real miss.
     """
     if persons < 1 or persons > len(_NAMES):
         raise ValueError(f"persons must be between 1 and {len(_NAMES)}")
@@ -102,15 +142,15 @@ def build_scenario(memory: Memory, *, persons: int, seed: int) -> Scenario:
                 f"{name} works as a {job}.",
                 f"{name} drinks a {drink} every morning.",
                 f"{name} has a {drink} every single morning without fail.",
-                f"{name} prefers {stale}.",
-                f"{name} now prefers {current}.",
+                f"{name} says their only seat preference is {stale}.",
+                f"{name} now says their only seat preference is {current}.",
             ),
             occurred_at=[base + timedelta(hours=hour) for hour in range(5)],
         )
         built.gold.add(gold.id)
         built.duplicates.append(frozenset({first.id, second.id}))
-        stale_claim = _claim(memory, older, name, stale)
-        current_claim = _claim(memory, newer, name, current)
+        stale_claim = _claim(memory, name, stale)
+        current_claim = _claim(memory, name, current)
         built.contradictions.append((stale_claim, current_claim))
         built.ingested.update(
             {gold.id, first.id, second.id, older.id, newer.id, stale_claim, current_claim}
@@ -131,38 +171,20 @@ def build_scenario(memory: Memory, *, persons: int, seed: int) -> Scenario:
     )
 
 
-def _claim(memory: Memory, source: MemoryRecord, subject: str, value: str) -> str:
-    """Derive one host-authored preference claim from one observation, and return its ID.
-
-    `CORRECT` and consolidation forgetting only reach *derived* records, so a contradiction the
-    slow loop can resolve has to stand as a pair of claims rather than as two raw observations:
-    a `CORRECT` on an observation is refused `not_derived` however right it is. `Memory.apply`
-    is the public host path to a claim, and it needs no former and no model.
-
-    `RELATION` is the kind that lets both sides stand until the loop retires one. A `STATE` is
-    superseded by lineage reconciliation the moment the second claim lands, and a
-    model-inferred `TRAIT` stays invisible until a second evidence group supports it -- either
-    way `consolidation_candidates()` would never see two disagreeing visible claims in one
-    lineage, which is exactly what its `CONTRADICTION` trigger looks for.
-    """
-    record = memory.apply(
-        MemoryOperation(
-            intent=MemoryIntent.CONSOLIDATE,
-            evidence_ids=(source.id,),
-            proposal=FormationProposal(
-                kind=MemoryKind.RELATION,
-                content=source.content,
-                subject=subject,
-                # One predicate for both sides, so the two claims share a lineage and disagree
-                # in it. The lineage key is `(kind, subject, predicate)`.
-                predicate="prefers",
-                value=value,
-                confidence=0.9,
-            ),
-            rationale="the scenario's ground truth, asserted by the host that holds it",
-        )
-    )
-    return record.created_ids[0]
+def _claim(memory: Memory, subject: str, value: str) -> str:
+    """Find one typed preference claim the deterministic scenario former just committed."""
+    for hit in memory.search(f"{subject} only seat preference {value}", limit=100):
+        context = hit.context
+        if (
+            context is not None
+            and context.kind is MemoryKind.TRAIT
+            and context.basis is EvidenceBasis.USER_STATEMENT
+            and context.subject == subject
+            and context.predicate == "only-seat-preference"
+            and context.value == value
+        ):
+            return hit.id
+    raise RuntimeError(f"the control-plane scenario did not form {subject!r} preference {value!r}")
 
 
 def run_benchmark(
@@ -179,6 +201,7 @@ def run_benchmark(
     with Memory(
         Path(data_dir),
         embedder=embedder,
+        former=_PreferenceFormer(),
         consolidator=consolidator,
         # The deliberation window must cover the whole scenario, and reinforcement must not make
         # one query's retrieval depend on which earlier one ran. Both are measurement policy.

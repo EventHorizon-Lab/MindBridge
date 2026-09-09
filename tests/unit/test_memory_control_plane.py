@@ -1822,15 +1822,9 @@ def test_a_deliberated_candidate_leaves_the_queue_until_new_evidence_arrives(
         ] == []
 
 
-def test_feedback_and_contradiction_are_derived_from_state_the_store_already_holds(
+def test_feedback_ignores_accumulating_relation_and_inferred_trait_disagreement(
     tmp_path: Path,
 ) -> None:
-    from mindbridge.infrastructure.local.store import _CONFLICT_KINDS as _STORE_CONFLICT_KINDS
-
-    # Consolidation may inspect accumulating claims, while compilation only groups lineages whose
-    # write contract gives them one standing value.
-    assert set(_STORE_CONFLICT_KINDS) == {"state", "relation", "trait"}
-
     consolidator = ScriptedConsolidator()
     with _memory(tmp_path / "due-feedback", consolidator) as memory:
         sources = _observations(
@@ -1855,17 +1849,317 @@ def test_feedback_and_contradiction_are_derived_from_state_the_store_already_hol
                     )
                 )
                 memory.consolidate(evidence_ids=(source.id,))
+        for source, value in zip(sources[:2], ("tea", "coffee"), strict=True):
+            consolidator._scripts.append(
+                (
+                    MemoryOperation(
+                        intent=MemoryIntent.CONSOLIDATE,
+                        evidence_ids=(source.id,),
+                        proposal=FormationProposal(
+                            kind=MemoryKind.RELATION,
+                            content=f"Ana likes {value}",
+                            subject="Ana",
+                            predicate="likes",
+                            value=value,
+                        ),
+                    ),
+                )
+            )
+            memory.consolidate(evidence_ids=(source.id,))
         memory.reinforce((sources[0].id,))
 
         due = memory.consolidation_candidates()
         by_trigger = {row.trigger: row for row in due}
 
-        contradiction = by_trigger[MemoryTrigger.CONTRADICTION]
-        assert contradiction.evidence_count == 2
-        assert len(contradiction.memory_ids) == 2
+        assert MemoryTrigger.CONTRADICTION not in by_trigger
         feedback = by_trigger[MemoryTrigger.FEEDBACK]
         assert feedback.memory_ids == (sources[0].id,)
         assert feedback.evidence_count == 1
+
+
+class FunctionalConflictFormer:
+    """Forms independent functional claims in one transaction so neither silently wins."""
+
+    formation_capabilities = ATOMIC_MODALITIES
+    formation_model = "functional-conflict-former"
+    formation_space = "functional-conflict-former:v1"
+
+    def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+        values = (
+            (MemoryKind.STATE, EvidenceBasis.MODEL_INFERENCE, "location", "kitchen"),
+            (MemoryKind.STATE, EvidenceBasis.MODEL_INFERENCE, "location", "garden"),
+            (MemoryKind.TRAIT, EvidenceBasis.USER_STATEMENT, "drink", "tea"),
+            (MemoryKind.TRAIT, EvidenceBasis.USER_STATEMENT, "drink", "coffee"),
+        )
+        assert len(inputs) == len(values)
+        return tuple(
+            (
+                FormationProposal(
+                    kind=kind,
+                    basis=basis,
+                    content=f"Ana {predicate} is {value}",
+                    subject="Ana",
+                    predicate=predicate,
+                    value=value,
+                ),
+            )
+            for kind, basis, predicate, value in values
+        )
+
+    def close(self) -> None:
+        pass
+
+
+class DisjointStateFormer:
+    """Forms two values in one lineage whose half-open validity intervals do not overlap."""
+
+    formation_capabilities = ATOMIC_MODALITIES
+    formation_model = "disjoint-state-former"
+    formation_space = "disjoint-state-former:v1"
+
+    def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+        split = OCCURRED + timedelta(hours=1)
+        intervals = ((OCCURRED, split, "kitchen"), (split, split + timedelta(hours=1), "garden"))
+        assert len(inputs) == len(intervals)
+        return tuple(
+            (
+                FormationProposal(
+                    kind=MemoryKind.STATE,
+                    content=f"Ana is in the {value}",
+                    subject="Ana",
+                    predicate="location",
+                    value=value,
+                    valid_from=valid_from,
+                    valid_until=valid_until,
+                ),
+            )
+            for valid_from, valid_until, value in intervals
+        )
+
+    def close(self) -> None:
+        pass
+
+
+class PartlyOverlappingStateFormer:
+    """Forms one conflicting pair and one later state in the same lineage."""
+
+    formation_capabilities = ATOMIC_MODALITIES
+    formation_model = "partly-overlapping-state-former"
+    formation_space = "partly-overlapping-state-former:v1"
+
+    def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+        intervals = (
+            (OCCURRED, OCCURRED + timedelta(hours=2), "kitchen"),
+            (OCCURRED + timedelta(hours=1), OCCURRED + timedelta(hours=3), "garden"),
+            (OCCURRED + timedelta(hours=4), OCCURRED + timedelta(hours=5), "office"),
+        )
+        assert len(inputs) == len(intervals)
+        return tuple(
+            (
+                FormationProposal(
+                    kind=MemoryKind.STATE,
+                    content=f"Ana is in the {value}",
+                    subject="Ana",
+                    predicate="location",
+                    value=value,
+                    valid_from=valid_from,
+                    valid_until=valid_until,
+                ),
+            )
+            for valid_from, valid_until, value in intervals
+        )
+
+    def close(self) -> None:
+        pass
+
+
+class FunctionalIntervalsFormer:
+    """Forms configurable STATE intervals for conflict-discovery boundary cases."""
+
+    formation_capabilities = ATOMIC_MODALITIES
+    formation_model = "functional-intervals-former"
+    formation_space = "functional-intervals-former:v1"
+
+    def __init__(
+        self,
+        intervals: Sequence[tuple[str, str, datetime | None, datetime | None, str]],
+    ) -> None:
+        self._intervals = intervals
+
+    def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+        assert len(inputs) == len(self._intervals)
+        return tuple(
+            (
+                FormationProposal(
+                    kind=MemoryKind.STATE,
+                    content=f"{subject} is {value}",
+                    subject=subject,
+                    predicate=predicate,
+                    value=value,
+                    valid_from=valid_from,
+                    valid_until=valid_until,
+                ),
+            )
+            for subject, predicate, valid_from, valid_until, value in self._intervals
+        )
+
+    def close(self) -> None:
+        pass
+
+
+def test_functional_state_and_user_trait_disagreement_create_contradiction_work(
+    tmp_path: Path,
+) -> None:
+    with _memory(tmp_path / "functional-conflict", former=FunctionalConflictFormer()) as memory:
+        memory.add_many(
+            ("Ana is in the kitchen", "Ana is in the garden", "Ana likes tea", "Ana likes coffee"),
+            occurred_at=(OCCURRED,) * 4,
+        )
+
+        contradictions = tuple(
+            row
+            for row in memory.consolidation_candidates()
+            if row.trigger is MemoryTrigger.CONTRADICTION
+        )
+        assert len(contradictions) == 2
+        assert {row.evidence_count for row in contradictions} == {2}
+        contexts = {
+            memory.get(memory_id).context for row in contradictions for memory_id in row.memory_ids
+        }
+        assert {context.kind for context in contexts if context is not None} == {
+            MemoryKind.STATE,
+            MemoryKind.TRAIT,
+        }
+        assert all(
+            context is not None
+            and (context.kind is MemoryKind.STATE or context.basis is EvidenceBasis.USER_STATEMENT)
+            for context in contexts
+        )
+
+
+def test_successive_non_overlapping_state_values_are_not_contradiction_work(tmp_path: Path) -> None:
+    with _memory(tmp_path / "successive-states", former=DisjointStateFormer()) as memory:
+        memory.add_many(
+            ("Ana was in the kitchen", "Ana later moved to the garden"),
+            occurred_at=(OCCURRED, OCCURRED + timedelta(hours=1)),
+        )
+
+        assert _trigger_rows(memory, MemoryTrigger.CONTRADICTION) == ()
+
+
+def test_contradiction_work_excludes_a_non_overlapping_value_in_the_same_lineage(
+    tmp_path: Path,
+) -> None:
+    with _memory(tmp_path / "partly-overlapping", former=PartlyOverlappingStateFormer()) as memory:
+        records = memory.add_many(
+            ("Ana was in the kitchen", "Ana was in the garden", "Ana was later in the office"),
+            occurred_at=(OCCURRED, OCCURRED + timedelta(hours=1), OCCURRED + timedelta(hours=4)),
+        )
+
+        contradictions = _trigger_rows(memory, MemoryTrigger.CONTRADICTION)
+        assert len(contradictions) == 1
+        assert contradictions[0].evidence_count == 2
+        assert set(contradictions[0].memory_ids).isdisjoint(record.id for record in records)
+        contexts = tuple(
+            memory.get(memory_id).context for memory_id in contradictions[0].memory_ids
+        )
+        assert all(context is not None for context in contexts)
+        assert {context.value for context in contexts if context is not None} == {
+            "kitchen",
+            "garden",
+        }
+
+
+def test_contradiction_work_includes_unbounded_and_nested_same_value_members(
+    tmp_path: Path,
+) -> None:
+    intervals = (
+        ("Ana", "location", None, None, "kitchen"),
+        ("Ana", "location", OCCURRED, OCCURRED + timedelta(hours=2), "garden"),
+        (
+            "Ana",
+            "location",
+            OCCURRED + timedelta(minutes=30),
+            OCCURRED + timedelta(hours=1),
+            "kitchen",
+        ),
+    )
+    with _memory(
+        tmp_path / "unbounded-nested", former=FunctionalIntervalsFormer(intervals)
+    ) as memory:
+        memory.add_many(
+            tuple(f"claim {index}" for index in range(len(intervals))), occurred_at=(OCCURRED,) * 3
+        )
+
+        contradictions = _trigger_rows(memory, MemoryTrigger.CONTRADICTION)
+        assert len(contradictions) == 1
+        assert contradictions[0].evidence_count == 2
+        contexts = tuple(
+            memory.get(memory_id).context for memory_id in contradictions[0].memory_ids
+        )
+        assert all(context is not None for context in contexts)
+        values = tuple(context.value for context in contexts if context is not None)
+        assert values.count("kitchen") == 2
+        assert values.count("garden") == 1
+
+
+def test_contradiction_work_keeps_the_earliest_later_same_value_interval(tmp_path: Path) -> None:
+    intervals = (
+        ("Ana", "location", OCCURRED, OCCURRED + timedelta(hours=5), "kitchen"),
+        (
+            "Ana",
+            "location",
+            OCCURRED + timedelta(hours=4),
+            OCCURRED + timedelta(hours=4, minutes=30),
+            "garden",
+        ),
+        (
+            "Ana",
+            "location",
+            OCCURRED + timedelta(hours=10),
+            OCCURRED + timedelta(hours=11),
+            "garden",
+        ),
+    )
+    with _memory(
+        tmp_path / "repeated-later-value", former=FunctionalIntervalsFormer(intervals)
+    ) as memory:
+        memory.add_many(
+            tuple(f"claim {index}" for index in range(len(intervals))), occurred_at=(OCCURRED,) * 3
+        )
+
+        contradictions = _trigger_rows(memory, MemoryTrigger.CONTRADICTION)
+        assert len(contradictions) == 1
+        contexts = tuple(
+            memory.get(memory_id).context for memory_id in contradictions[0].memory_ids
+        )
+        assert {context.value for context in contexts if context is not None} == {
+            "kitchen",
+            "garden",
+        }
+        assert len(contexts) == 2
+
+
+def test_contradiction_lineage_limit_precedes_due_filtering(tmp_path: Path) -> None:
+    intervals = (
+        ("Ana", "location", None, None, "kitchen"),
+        ("Ana", "location", None, None, "garden"),
+        ("Bea", "location", None, None, "office"),
+        ("Bea", "location", None, None, "studio"),
+    )
+    with _memory(tmp_path / "lineage-limit", former=FunctionalIntervalsFormer(intervals)) as memory:
+        memory.add_many(
+            tuple(f"claim {index}" for index in range(len(intervals))), occurred_at=(OCCURRED,) * 4
+        )
+
+        all_contradictions = _trigger_rows(memory, MemoryTrigger.CONTRADICTION)
+        limited = tuple(
+            row
+            for row in memory.consolidation_candidates(limit=2)
+            if row.trigger is MemoryTrigger.CONTRADICTION
+        )
+        assert len(all_contradictions) == 2
+        assert limited == (all_contradictions[0],)
 
 
 def test_a_concurrent_duplicate_is_refused_inside_the_transaction(tmp_path: Path) -> None:
@@ -2434,35 +2728,23 @@ def test_a_zero_yield_deliberation_stops_the_candidate_coming_back(tmp_path: Pat
 
 def test_a_contradiction_nothing_resolved_stops_being_relisted(tmp_path: Path) -> None:
     """A model that cannot settle a disagreement must not be asked about it every round."""
+    with _memory(tmp_path, former=FunctionalConflictFormer()) as memory:
+        memory.add_many(
+            ("Ana is in the kitchen", "Ana is in the garden", "Ana likes tea", "Ana likes coffee"),
+            occurred_at=(OCCURRED,) * 4,
+        )
+
     consolidator = ScriptedConsolidator()
     with _memory(tmp_path, consolidator) as memory:
-        sources = _observations(
-            memory,
-            "Ana waited calmly",
-            "Ana waited again, calmly",
-            "Ana snapped at the delay",
-            "Ana snapped again at the delay",
-        )
-        for pair, value in (((0, 1), "patient"), ((2, 3), "impatient")):
-            proposal = _trait("Ana", value)
-            for position in pair:
-                cited = (sources[position].id,)
-                consolidator._scripts.append(
-                    (
-                        MemoryOperation(
-                            intent=MemoryIntent.CONSOLIDATE,
-                            evidence_ids=cited,
-                            proposal=proposal,
-                        ),
-                    )
-                )
-                memory.consolidate(evidence_ids=cited)
-
         due = _trigger_rows(memory, MemoryTrigger.CONTRADICTION)
-        assert len(due) == 1
+        assert len(due) == 2
         # Weighed and unresolved: both claims still stand, and the lineage still disagrees, but
         # nothing about it has changed since the attempt.
-        memory.consolidate(evidence_ids=due[0].memory_ids, trigger=MemoryTrigger.CONTRADICTION)
+        for candidate in due:
+            memory.consolidate(
+                evidence_ids=candidate.memory_ids,
+                trigger=MemoryTrigger.CONTRADICTION,
+            )
         assert _trigger_rows(memory, MemoryTrigger.CONTRADICTION) == ()
 
 
@@ -2573,29 +2855,11 @@ class ResolvingConsolidator:
 
 def test_deliberate_runs_candidates_to_a_fixed_point(tmp_path: Path) -> None:
     """The loop entity: candidates -> consolidate -> repeat, ending because nothing is due."""
-    scripted = ScriptedConsolidator()
-    with _memory(tmp_path, scripted) as memory:
-        sources = _observations(
-            memory,
-            "Ana waited calmly",
-            "Ana waited again, calmly",
-            "Ana snapped at the delay",
-            "Ana snapped again at the delay",
+    with _memory(tmp_path, former=FunctionalConflictFormer()) as memory:
+        memory.add_many(
+            ("Ana is in the kitchen", "Ana is in the garden", "Ana likes tea", "Ana likes coffee"),
+            occurred_at=(OCCURRED,) * 4,
         )
-        for pair, value in (((0, 1), "patient"), ((2, 3), "impatient")):
-            proposal = _trait("Ana", value)
-            for position in pair:
-                cited = (sources[position].id,)
-                scripted._scripts.append(
-                    (
-                        MemoryOperation(
-                            intent=MemoryIntent.CONSOLIDATE,
-                            evidence_ids=cited,
-                            proposal=proposal,
-                        ),
-                    )
-                )
-                memory.consolidate(evidence_ids=cited)
 
     resolver = ResolvingConsolidator()
     with _memory(tmp_path, resolver) as memory:

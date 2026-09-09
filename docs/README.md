@@ -19,6 +19,7 @@ have one place to stay current.
 | Compare current memory backends | [Competitor memory backends](research/competitor-memory-backends-2026-09-08.md) | [Hybrid score completion](research/hybrid-score-completion-2026-09-08.md) |
 | Review the measured memory changes | [Memory optimization report](research/memory-optimization-2026-09-07.md) | [Benchmarking](benchmarking.md) |
 | Review the 2026-09-08 memory backend work | [Chinese conclusions](research/2026-09-09-memory-backend-conclusions-zh.md) | [Research](research/2026-09-08-memory-backend-research.md), [validation](research/2026-09-08-memory-backend-validation.md), and [evaluation](research/2026-09-08-memory-backend-evaluation.md) |
+| Review companion evidence obligations | [Companion evidence obligations](research/2026-09-09-companion-evidence-obligations-zh.md) | [Affective memory](affective-memory.md) and [Context compilation](context-compilation.md) |
 | Understand or extend the design | [Design principles](design-principles.md) | [Plugin architecture](plugin-architecture.md) |
 | Follow where the product is going | [Context OS direction](context-os.md) | [Design principles](design-principles.md) |
 
@@ -96,6 +97,9 @@ have one place to stay current.
   evaluation protocol, raw and formed tracks, and paired empirical results.
 - [Memory backend conclusions in Chinese](research/2026-09-09-memory-backend-conclusions-zh.md) —
   concise implemented-versus-prior-art boundary, causal results, failures, and next bottleneck.
+- [Companion evidence obligations in Chinese](research/2026-09-09-companion-evidence-obligations-zh.md)
+  — incremental primary-source synthesis on indexed competition completion, affect source roles,
+  multimodal and embodied memory, benchmark coverage, and falsifiable acceptance plans.
 - [Evidence excerpt experiment](research/2026-09-09-evidence-excerpt-experiment.md) — isolated
   schema-18 prototype for digest-bound partial raw text under the existing context budget.
 - [Compact context prototype](compact-context-prototype.md) — optional request-local ID aliases,

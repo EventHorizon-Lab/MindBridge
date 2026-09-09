@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -1093,6 +1094,60 @@ class _ClosureFormer:
         return None
 
 
+class _CompetingStateFormer:
+    formation_capabilities = ATOMIC_MODALITIES
+    formation_model = "competing-state-test"
+    formation_space = "competing-state-test:v1"
+
+    def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+        return tuple(
+            (
+                FormationProposal(
+                    kind=MemoryKind.STATE,
+                    content=f"the user is in {value}",
+                    subject="user",
+                    predicate="location",
+                    value=value,
+                    confidence=0.9,
+                ),
+            )
+            for value in (_competing_state_value(item.content.text) for item in inputs)
+        )
+
+    def close(self) -> None:
+        return None
+
+
+class _AlternativeStateFormer:
+    formation_capabilities = ATOMIC_MODALITIES
+    formation_model = "alternative-state-test"
+    formation_space = "alternative-state-test:v1"
+
+    def form(self, inputs: Sequence[FormationInput]) -> tuple[tuple[FormationProposal, ...], ...]:
+        return tuple(
+            (
+                FormationProposal(
+                    kind=MemoryKind.STATE,
+                    content=item.content.text,
+                    subject="user",
+                    predicate="location",
+                    value="paris" if "paris" in item.content.text else "berlin",
+                    confidence=0.1 if item.content.text.startswith("weak") else 0.9,
+                ),
+            )
+            for item in inputs
+        )
+
+    def close(self) -> None:
+        return None
+
+
+def _competing_state_value(text: str) -> str:
+    if text.startswith("value:"):
+        return text.removeprefix("value:")
+    return "berlin" if "berlin" in text else "paris" if "paris" in text else "berlin"
+
+
 class _RelationshipFormer:
     formation_capabilities = ATOMIC_MODALITIES
     formation_model = "relationship-test"
@@ -1167,6 +1222,540 @@ def test_compile_hydrates_a_formed_source_and_admits_it_atomically(tmp_path: Pat
 
     assert {hit.id for hit in bundle.hits} == {derived.id, source.id}
     assert derived.id not in {hit.id for hit in tight.hits}
+
+
+def test_compile_completes_a_low_ranked_competing_state_before_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A state counterpart outside retrieval is an obligation, not a second ranked result."""
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=_CompetingStateFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        memory.add_many(("berlin source", "paris source"))
+        states = tuple(
+            record
+            for record in memory.list(limit=20).items
+            if record.context is not None and record.context.kind is MemoryKind.STATE
+        )
+        berlin = next(
+            record for record in states if record.context and record.context.value == "berlin"
+        )
+        berlin_stored = memory._store.read_memory(berlin.id)
+        assert berlin_stored is not None
+        original_search = memory._search_prepared
+
+        def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(
+                hits=(memory._search_hit(berlin_stored, 0.9),),
+                matched_dense_index_ids={},
+            )
+
+        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
+        complete = memory.compile("where is the user", budget=ContextBudget(max_items=4))
+        tight = memory.compile("where is the user", budget=ContextBudget(max_items=3))
+        monkeypatch.setattr(memory, "_search_prepared", original_search)
+
+    assert {hit.context.value for hit in complete.scene if hit.context} == {"berlin", "paris"}
+    assert len(complete.conflicts) == 1
+    # The two state records and their independent raw sources cost four items.  A smaller bundle
+    # withholds both claims; it must never deliver the retrieval winner by itself.
+    assert not tight.scene
+    assert {hit.context.value for hit in tight.hits if hit.context} == set()
+
+
+def test_compile_does_not_invent_a_conflict_for_the_same_functional_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=_CompetingStateFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        memory.add_many(("berlin source one", "berlin source two"))
+        berlin = next(
+            record
+            for record in memory.list(limit=20).items
+            if record.context is not None and record.context.kind is MemoryKind.STATE
+        )
+        berlin_stored = memory._store.read_memory(berlin.id)
+        assert berlin_stored is not None
+
+        def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(
+                hits=(memory._search_hit(berlin_stored, 0.9),),
+                matched_dense_index_ids={},
+            )
+
+        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
+        bundle = memory.compile("where is the user", budget=ContextBudget(max_items=2))
+
+    assert [hit.context.value for hit in bundle.scene if hit.context] == ["berlin"]
+    assert bundle.conflicts == ()
+
+
+def test_competing_lineage_uses_a_confident_copy_of_a_ranked_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A weak ranked copy cannot hide a confident completion copy of the same value."""
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=_AlternativeStateFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        memory.add_many(("berlin source", "weak paris source", "healthy paris source"))
+        states = tuple(
+            record
+            for record in memory.list(limit=20).items
+            if record.context is not None and record.context.kind is MemoryKind.STATE
+        )
+        berlin = next(
+            record
+            for record in states
+            if record.context is not None and record.context.value == "berlin"
+        )
+        weak_paris = next(
+            record
+            for record in states
+            if record.context is not None
+            and record.context.value == "paris"
+            and record.context.confidence < 0.5
+        )
+        ranked = tuple(
+            memory._search_hit(stored, score)
+            for record, score in ((berlin, 0.9), (weak_paris, 0.1))
+            if (stored := memory._store.read_memory(record.id)) is not None
+        )
+
+        def ranked_weak_copy(*args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(hits=ranked, matched_dense_index_ids={})
+
+        monkeypatch.setattr(memory, "_search_prepared", ranked_weak_copy)
+        bundle = memory.compile(
+            "where is the user",
+            budget=ContextBudget(max_items=4, min_confidence=0.5),
+        )
+
+    assert {hit.content for hit in bundle.scene} == {"berlin source", "healthy paris source"}
+    assert len(bundle.conflicts) == 1
+
+
+def test_competing_lineage_uses_a_supported_copy_of_a_ranked_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    berlin = _hit(
+        "berlin",
+        score=0.9,
+        kind=MemoryKind.STATE,
+        lineage_id="location",
+        value="berlin",
+    )
+    unsupported_paris = _hit(
+        "unsupported-paris",
+        score=0.8,
+        kind=MemoryKind.STATE,
+        lineage_id="location",
+        value="paris",
+        evidence_ids=("missing",),
+    )
+    supported_paris = _hit(
+        "supported-paris",
+        score=0.0,
+        kind=MemoryKind.STATE,
+        lineage_id="location",
+        value="paris",
+    )
+    with Memory(tmp_path, embedder=TinyEmbedder(), minimum_relevance=0) as memory:
+
+        def ranked_unsupported_copy(*args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(
+                hits=(berlin, unsupported_paris),
+                matched_dense_index_ids={},
+            )
+
+        monkeypatch.setattr(memory, "_search_prepared", ranked_unsupported_copy)
+        monkeypatch.setattr(
+            memory,
+            "_competing_lineage_hits",
+            lambda *args, **kwargs: ((supported_paris,), frozenset()),
+        )
+        bundle = memory.compile("where is the user", budget=ContextBudget(max_items=2))
+
+    assert [hit.id for hit in bundle.scene] == ["berlin", "supported-paris"]
+    assert len(bundle.conflicts) == 1
+
+
+def test_competing_lineage_uses_a_consented_copy_of_a_ranked_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    berlin = _hit(
+        "berlin",
+        score=0.9,
+        kind=MemoryKind.STATE,
+        lineage_id="location",
+        value="berlin",
+    )
+    withheld_paris = _hit(
+        "withheld-paris",
+        score=0.8,
+        kind=MemoryKind.STATE,
+        lineage_id="location",
+        value="paris",
+    )
+    permitted_paris = replace(withheld_paris, id="permitted-paris", score=0.0)
+    with Memory(tmp_path, embedder=TinyEmbedder(), minimum_relevance=0) as memory:
+
+        def ranked_withheld_copy(*args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(hits=(berlin, withheld_paris), matched_dense_index_ids={})
+
+        def withhold_one_copy(
+            hits: Sequence[SearchHit],
+            named: object,
+            *,
+            observed_identity_ids: frozenset[str] = frozenset(),
+        ) -> tuple[
+            tuple[SearchHit, ...], dict[str, tuple[object, ...]], tuple[object, ...], frozenset[str]
+        ]:
+            del named, observed_identity_ids
+            return tuple(hit for hit in hits if hit.id != withheld_paris.id), {}, (), frozenset()
+
+        monkeypatch.setattr(memory, "_search_prepared", ranked_withheld_copy)
+        monkeypatch.setattr(
+            memory,
+            "_competing_lineage_hits",
+            lambda *args, **kwargs: ((permitted_paris,), frozenset()),
+        )
+        monkeypatch.setattr(memory, "_consented_actors", withhold_one_copy)
+        bundle = memory.compile("where is the user", budget=ContextBudget(max_items=2))
+
+    assert [hit.id for hit in bundle.scene] == ["berlin", "permitted-paris"]
+    assert len(bundle.conflicts) == 1
+    assert not any("withheld by consent" in unknown.detail for unknown in bundle.unknowns)
+
+
+def test_competing_lineage_completion_obeys_the_requested_valid_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    january = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    february = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=_CompetingStateFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        memory.add_many(
+            ("berlin source", "paris source"),
+            context=(
+                ObservationContext(valid_from=january, valid_until=february),
+                ObservationContext(valid_from=february),
+            ),
+        )
+        berlin = next(
+            record
+            for record in memory.list(limit=20).items
+            if record.context is not None
+            and record.context.kind is MemoryKind.STATE
+            and record.context.value == "berlin"
+        )
+        berlin_stored = memory._store.read_memory(berlin.id)
+        assert berlin_stored is not None
+
+        def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(
+                hits=(memory._search_hit(berlin_stored, 0.9),),
+                matched_dense_index_ids={},
+            )
+
+        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
+        bundle = memory.compile(
+            "where was the user",
+            scope=RetrievalScope(valid_at=january),
+            budget=ContextBudget(max_items=2),
+        )
+
+    assert [hit.context.value for hit in bundle.scene if hit.context] == ["berlin"]
+    assert bundle.conflicts == ()
+
+
+def test_competing_lineage_completion_ignores_repeated_same_value_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The value bound follows authoritative scope, rather than raw duplicate row count."""
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=_CompetingStateFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        memory.add_many((*tuple(f"berlin source {index}" for index in range(8)), "paris source"))
+        berlin = next(
+            record
+            for record in memory.list(limit=30).items
+            if record.context is not None
+            and record.context.kind is MemoryKind.STATE
+            and record.context.value == "berlin"
+        )
+        berlin_stored = memory._store.read_memory(berlin.id)
+        assert berlin_stored is not None
+
+        def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(
+                hits=(memory._search_hit(berlin_stored, 0.9),),
+                matched_dense_index_ids={},
+            )
+
+        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
+        bundle = memory.compile("where is the user", budget=ContextBudget(max_items=20))
+
+    assert {hit.context.value for hit in bundle.scene if hit.context} == {"berlin", "paris"}
+    assert len(bundle.conflicts) == 1
+
+
+def test_competing_lineage_completion_keeps_more_than_256_same_value_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A common repeated state never exhausts the distinct-value obligation cap."""
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=_CompetingStateFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        memory.add_many(tuple(f"berlin source {index}" for index in range(257)))
+        berlin = next(
+            record
+            for record in memory.list(limit=100).items
+            if record.context is not None
+            and record.context.kind is MemoryKind.STATE
+            and record.context.value == "berlin"
+        )
+        berlin_stored = memory._store.read_memory(berlin.id)
+        assert berlin_stored is not None
+
+        def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(
+                hits=(memory._search_hit(berlin_stored, 0.9),),
+                matched_dense_index_ids={},
+            )
+
+        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
+        bundle = memory.compile("where is the user", budget=ContextBudget(max_items=2))
+
+    assert [hit.context.value for hit in bundle.scene if hit.context] == ["berlin"]
+    assert bundle.conflicts == ()
+    assert not any(
+        unknown.kind is ContextUnknownKind.EVIDENCE_UNAVAILABLE
+        and "complete competing evidence" in unknown.detail
+        for unknown in bundle.unknowns
+    )
+
+
+def test_competing_lineage_completion_ignores_superseded_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=_CompetingStateFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        for index in range(9):
+            memory.add(f"berlin source revision {index}")
+        berlin = next(
+            record
+            for record in memory.list(limit=30).items
+            if record.context is not None
+            and record.context.kind is MemoryKind.STATE
+            and record.context.retired_at is None
+        )
+        berlin_stored = memory._store.read_memory(berlin.id)
+        assert berlin_stored is not None
+
+        def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(
+                hits=(memory._search_hit(berlin_stored, 0.9),),
+                matched_dense_index_ids={},
+            )
+
+        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
+        bundle = memory.compile("where is the user", budget=ContextBudget(max_items=2))
+
+    assert [hit.context.value for hit in bundle.scene if hit.context] == ["berlin"]
+    assert bundle.conflicts == ()
+
+
+def test_competing_lineage_completion_refuses_more_than_its_bounded_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=_CompetingStateFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        memory.add_many(tuple(f"value:city-{index}" for index in range(9)))
+        first = next(
+            record
+            for record in memory.list(limit=30).items
+            if record.context is not None
+            and record.context.kind is MemoryKind.STATE
+            and record.context.value == "city-0"
+        )
+        first_stored = memory._store.read_memory(first.id)
+        assert first_stored is not None
+
+        def ranked_first(*args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(
+                hits=(memory._search_hit(first_stored, 0.9),),
+                matched_dense_index_ids={},
+            )
+
+        monkeypatch.setattr(memory, "_search_prepared", ranked_first)
+        bundle = memory.compile("where is the user", budget=ContextBudget(max_items=20))
+
+    assert bundle.scene == ()
+    assert any(
+        unknown.kind is ContextUnknownKind.EVIDENCE_UNAVAILABLE
+        and "complete competing evidence" in unknown.detail
+        for unknown in bundle.unknowns
+    )
+    assert not any("consent" in unknown.detail for unknown in bundle.unknowns)
+
+
+def test_competing_lineage_refusal_does_not_leak_through_a_derived_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-functional anchor cannot materialize a functional lineage we withheld."""
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=_CompetingStateFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        memory.add_many(tuple(f"value:city-{index}" for index in range(9)))
+        first = next(
+            record
+            for record in memory.list(limit=30).items
+            if record.context is not None
+            and record.context.kind is MemoryKind.STATE
+            and record.context.value == "city-0"
+        )
+        first_stored = memory._store.read_memory(first.id)
+        assert first_stored is not None
+        state = memory._search_hit(first_stored, 0.9)
+        derived = _hit(
+            "derived-trait",
+            score=0.8,
+            kind=MemoryKind.TRAIT,
+            content="the user has an inferred trait",
+            evidence_ids=(state.id,),
+        )
+
+        def ranked_state_and_derived(*args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(
+                hits=(state, derived),
+                matched_dense_index_ids={},
+            )
+
+        def derived_closure(
+            anchors: Sequence[SearchHit],
+            **kwargs: object,
+        ) -> tuple[tuple[EvidenceClosure, ...], tuple[object, ...]]:
+            del anchors, kwargs
+            return (EvidenceClosure(derived, (derived, state)),), ()
+
+        monkeypatch.setattr(memory, "_search_prepared", ranked_state_and_derived)
+        monkeypatch.setattr(memory, "_evidence_closures", derived_closure)
+        bundle = memory.compile("what do you know", budget=ContextBudget(max_items=4))
+
+    assert bundle.hits == ()
+    assert bundle.traits == ()
+    assert bundle.scene == ()
+
+
+def test_competing_lineage_completion_rechecks_after_consent_filtering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authorization filter cannot make a previously known disagreement look affirmative."""
+    with Memory(
+        tmp_path,
+        embedder=TinyEmbedder(),
+        former=_CompetingStateFormer(),
+        minimum_relevance=0,
+    ) as memory:
+        memory.add_many(("berlin source", "paris source"))
+        berlin = next(
+            record
+            for record in memory.list(limit=20).items
+            if record.context is not None
+            and record.context.kind is MemoryKind.STATE
+            and record.context.value == "berlin"
+        )
+        berlin_stored = memory._store.read_memory(berlin.id)
+        assert berlin_stored is not None
+
+        def ranked_berlin(*args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(
+                hits=(memory._search_hit(berlin_stored, 0.9),),
+                matched_dense_index_ids={},
+            )
+
+        def withhold_competitor(
+            hits: Sequence[SearchHit],
+            named: object,
+            *,
+            observed_identity_ids: frozenset[str] = frozenset(),
+        ) -> tuple[
+            tuple[SearchHit, ...], dict[str, tuple[object, ...]], tuple[object, ...], frozenset[str]
+        ]:
+            del named, observed_identity_ids
+            return (
+                tuple(hit for hit in hits if hit.context is None or hit.context.value != "paris"),
+                {},
+                (),
+                frozenset(),
+            )
+
+        monkeypatch.setattr(memory, "_search_prepared", ranked_berlin)
+        monkeypatch.setattr(memory, "_consented_actors", withhold_competitor)
+        bundle = memory.compile("where is the user", budget=ContextBudget(max_items=4))
+
+    assert bundle.scene == ()
+    assert "paris" not in bundle.render()
+    assert any(
+        unknown.kind is ContextUnknownKind.EVIDENCE_UNAVAILABLE
+        and "competing evidence withheld by consent" in unknown.detail
+        for unknown in bundle.unknowns
+    )
 
 
 def test_compile_does_not_atomically_group_multivalued_relationships(tmp_path: Path) -> None:

@@ -16,6 +16,7 @@ import pytest
 
 from mindbridge import (
     EmbedTask,
+    EvidenceBasis,
     FormationProposal,
     Memory,
     MemoryIntent,
@@ -130,19 +131,23 @@ def _person(evidence: Sequence[MemoryRecord], memory_id: str) -> str:
 
 
 def _disagreeing_claims(evidence: Sequence[MemoryRecord], *, newest: bool) -> list[str]:
-    """One side of each pair of disagreeing preference claims the trigger handed over."""
+    """One side of each pair of exclusive preference claims the trigger handed over."""
     by_subject: dict[str, list[MemoryRecord]] = {}
     for record in evidence:
         context = record.context
-        if context is None or context.kind is not MemoryKind.RELATION:
+        if (
+            context is None
+            or context.kind is not MemoryKind.TRAIT
+            or context.basis is not EvidenceBasis.USER_STATEMENT
+        ):
             continue
         by_subject.setdefault(f"{context.subject}/{context.predicate}", []).append(record)
     stale = []
     for records in by_subject.values():
         if len({record.context.value for record in records if record.context}) < 2:
             continue
-        # "now prefers" is what the newer observation says, so it also sorts the two claims.
-        ordered = sorted(records, key=lambda item: " now prefers " in item.content)
+        # "now says" is what the newer observation says, so it also sorts the two claims.
+        ordered = sorted(records, key=lambda item: " now says " in item.content)
         stale.append(ordered[-1].id if newest else ordered[0].id)
     return stale
 
@@ -162,7 +167,12 @@ def _drink_pairs(evidence: Sequence[MemoryRecord]) -> list[tuple[str, ...]]:
 
 
 def test_the_scenario_is_deterministic_and_declares_its_ground_truth(tmp_path: Path) -> None:
-    with Memory(tmp_path, embedder=_TinyEmbedder(), minimum_relevance=0) as memory:
+    with Memory(
+        tmp_path,
+        embedder=_TinyEmbedder(),
+        former=control_plane._PreferenceFormer(),
+        minimum_relevance=0,
+    ) as memory:
         scenario = control_plane.build_scenario(memory, persons=3, seed=7)
 
     assert len(scenario.ingested) == 21
@@ -275,9 +285,9 @@ def test_the_outcome_verdict_is_recorded_on_every_applied_operation(tmp_path: Pa
     with Memory(tmp_path, embedder=_TinyEmbedder(), minimum_relevance=0) as memory:
         logged = memory.operations()
 
-    # Only the loop's own rows are judged: the host's `apply()` rows that built the scenario's
-    # claims are ground truth, not something the loop proposed for the ground truth to score.
-    assert [record.trigger for record in logged].count(MemoryTrigger.MANUAL) == 4
+    # The deterministic former creates scenario ground truth without management operations, so
+    # every logged row belongs to the loop and receives a verdict.
+    assert [record.trigger for record in logged].count(MemoryTrigger.MANUAL) == 0
     assert all(
         (record.outcome is MemoryOutcome.CONFIRMED) is (record.trigger is not MemoryTrigger.MANUAL)
         for record in logged

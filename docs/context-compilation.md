@@ -386,16 +386,31 @@ are admitted as one atomic group or all withheld when the group does not fit. An
 `relation` can validly hold several values, such as two children, and model-inferred traits can
 accumulate evidence; differing values in either kind are not automatically contradictions.
 
-Detection is bounded by the eligible ranked candidate window. It does not claim to find a
-counterpart elsewhere in the corpus. Within that window, a conflict cannot be made to disappear by
-admitting only one representative: every representative and its recursively required support must
-satisfy the request's scope and filters and fit the shared item, character, and media budgets. If a
-counterpart's support is unavailable or the complete group does not fit, no affirmative member of
-that group is included.
+Detection starts with the eligible ranked candidate window, then completes an affirmative
+functional claim's own lineage through an indexed SQLite read. This completion is an obligation,
+not another relevance route: a low-ranked competing value gets zero retrieval score and can enter
+only with the ranked claim that requires it. The read reuses authoritative identity, place,
+metric-space, `valid_at`, and `known_at` hydration before it decides whether two values compete. It
+may inspect all current visible candidate rows in that requested lineage before identity and metric
+space are applied, so repeated values and superseded history do not consume its distinct-value
+bound. Copies of the same value remain alternatives until confidence, source-closure, and consent
+eligibility are known; the first deliverable copy represents the value, so an ineligible copy cannot
+hide an eligible one or make an unranked duplicate consume bundle budget. The read never scans
+unrelated lineages. A finite per-lineage value cap is conservative: exceeding
+it withholds the ranked functional claim and reports
+`evidence_unavailable`, rather than treating the returned values as complete.
 
-A candidate a *filter* removed -- `memory_types`, `min_confidence`, or `freshness` -- is not
-compared, and neither is a superseded version bitemporal filtering already excluded. `conflicts`
-describes eligible functional claims known to this bounded retrieval, not a corpus-wide
+The compiler does not scan unrelated lineages or infer competitors from query text. Every completed
+representative and its recursively required support must satisfy the request's scope and filters and
+fit the shared item, character, and media budgets. If a counterpart's support is unavailable or the
+complete group does not fit, no affirmative member of that group is included. The completion read
+still records that obligation when a counterpart fails a context-policy bound such as type,
+confidence, or freshness; the eligible value is withheld rather than made certain by the filter.
+Likewise, if consent later removes a counterpart or one of its support records, the compiler
+withholds the remaining value without naming the withheld value or identity.
+
+A superseded version bitemporal filtering already excluded is not compared. `conflicts` describes
+eligible functional claims known to this bounded retrieval, not a corpus-wide
 belief-revision history; read `memory_versions` through the control plane for that.
 
 ## Rendered text

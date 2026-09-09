@@ -443,9 +443,9 @@ makes without a model; the other three intents exist only as backend proposals.
 "Update" is not a separate intent. It is what a `CONSOLIDATE` into an existing lineage does: the
 new version supersedes the prior one at transaction time and history is kept. That reconciliation
 runs for `STATE` and for `USER_STATEMENT` `TRAIT`. Any other kind gains a second record in the
-same lineage rather than superseding, which is why a model-inferred `TRAIT` can end up
-contradicting itself — and why the loop is given a way to see that. Proposing a replacement value
-for a wrong inference is a `CORRECT` and a `CONSOLIDATE` in the same batch, which the
+same lineage rather than superseding. Multi-valued `RELATION` and model-inferred `TRAIT` records
+accumulate and do not create `CONTRADICTION` work merely because their values differ. Proposing a
+replacement value for a wrong inference is a `CORRECT` and a `CONSOLIDATE` in the same batch, which the
 consumed-evidence rule allows: correcting a derived record retires that record, not the sources
 the replacement is built from.
 
@@ -464,8 +464,11 @@ report distinguishes from hitting `max_rounds`. The two primitives stay availabl
 wants to schedule the halves itself.
 
 `EVIDENCE` rows are derived records that gained independent evidence nothing has weighed — what
-the formation path leaves behind. `CONTRADICTION` rows are lineages whose current visible claims
-disagree. `FEEDBACK` rows are records confirmed through `reinforce()`, or cited by an `ask()`
+the formation path leaves behind. `CONTRADICTION` rows are functional lineages whose current
+visible `STATE` claims or user-stated `TRAIT` claims have different values over overlapping
+validity intervals. Accumulating `RELATION` and
+model-inferred `TRAIT` lineages are not contradiction work. `FEEDBACK` rows are records confirmed
+through `reinforce()`, or cited by an `ask()`
 answer under the default `reinforce_on_answer`. `QUERY_FAILURE` rows are near-equal recalls that
 came back empty at least twice inside the configured window, named against the nearest records
 the store does hold. `PRESSURE` rows appear only over a declared `memory_budget_records`, because
