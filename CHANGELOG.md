@@ -10,6 +10,15 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- Local storage advances to schema v18. Evidence is stored as clauses: a `CONSOLIDATE` operation's
+  cited set is one conjunction, separate operations are alternatives, and withdrawing a source
+  retires only the clauses it belonged to, so `(A AND B) OR C` keeps `C` when `A` goes. Derived
+  claims enter a compiled context only together with eligible support, lexical-only hybrid
+  candidates get their dense score completed from the stored vectors, and `allow_partial_sources`
+  can admit digest-bound raw-text excerpts. Rolling back an operation whose output was already
+  deleted now succeeds, and deleting one of several alternatives no longer cascades into a claim
+  that a still-supported but hidden trait continues to ground. Older stores migrate on open; a
+  newer schema is refused.
 - `mindbridge-bench eval --tasks es-memeval` now evaluates the pinned ES-MemEval EvoEmo QA task:
   18 physically isolated seeker histories, 1,427 questions across the five published capabilities,
   automatic digest-verified GitHub acquisition, session-level evidence recall, the published

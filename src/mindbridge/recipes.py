@@ -207,6 +207,7 @@ class _OwnedClientModels(OpenAIModels):
         generation_video_limit: int | None = 8,
         generation_min_video_seconds: float | None = None,
         generation_extra_body: Mapping[str, object] | None = None,
+        generation_stream: bool = False,
     ) -> None:
         super().__init__(
             client,
@@ -225,6 +226,7 @@ class _OwnedClientModels(OpenAIModels):
             generation_video_limit=generation_video_limit,
             generation_min_video_seconds=generation_min_video_seconds,
             generation_extra_body=generation_extra_body,
+            generation_stream=generation_stream,
         )
         self._owned_client = client
         self._owned_client_closed = False
@@ -259,6 +261,7 @@ def _owned_openai_models(
     generation_video_limit: int | None = 8,
     generation_min_video_seconds: float | None = None,
     generation_extra_body: Mapping[str, object] | None = None,
+    generation_stream: bool = False,
 ) -> OpenAIModels:
     """Build the SDK adapter and own the client created for declarative composition."""
     connection = {
@@ -290,6 +293,7 @@ def _owned_openai_models(
             generation_video_limit=generation_video_limit,
             generation_min_video_seconds=generation_min_video_seconds,
             generation_extra_body=generation_extra_body,
+            generation_stream=generation_stream,
         )
     except BaseException:
         client.close()

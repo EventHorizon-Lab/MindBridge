@@ -79,6 +79,7 @@ from mindbridge.types import (
     AnswerResult,
     AssetRef,
     Blob,
+    ContentInput,
     ContextBudget,
     EvidenceBasis,
     FormationProposal,
@@ -95,6 +96,7 @@ from mindbridge.types import (
     Modality,
     ObservationContext,
     ProvisionalActor,
+    RetrievalMode,
     RetrievalScope,
     SearchHit,
     SpatialAnchor,
@@ -483,6 +485,7 @@ def _memory(
     evidence_budget_chars: int | None = None,
     minimum_relevance: float = MemoryConfig().minimum_relevance,
     index_speech: bool = MemoryConfig().index_speech,
+    retrieval_mode: RetrievalMode = RetrievalMode.HYBRID,
     reinforce_on_answer: bool = True,
 ) -> Memory:
     models = models or _FakeModels()
@@ -495,6 +498,7 @@ def _memory(
         evidence_budget_chars=evidence_budget_chars,
         minimum_relevance=minimum_relevance,
         index_speech=index_speech,
+        retrieval_mode=retrieval_mode,
         reinforce_on_answer=reinforce_on_answer,
     )
 
@@ -532,6 +536,131 @@ def test_crud_search_ask_and_stable_duplicate(tmp_path: Path) -> None:
 
     assert models.closed is True
     assert models.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_dense_calls", "expected_lexical_calls", "expects_query_embedding"),
+    (
+        (RetrievalMode.DENSE, 1, 0, True),
+        (RetrievalMode.LEXICAL, 0, 1, False),
+    ),
+)
+def test_instance_retrieval_mode_uses_an_independent_candidate_route(
+    tmp_path: Path,
+    mode: RetrievalMode,
+    expected_dense_calls: int,
+    expected_lexical_calls: int,
+    expects_query_embedding: bool,
+) -> None:
+    models = _FakeModels()
+    with _memory(
+        tmp_path,
+        models,
+        minimum_relevance=0,
+        retrieval_mode=mode,
+    ) as memory:
+        record = memory.add("the marigold is in the courtyard")
+        index = _FakeIndex.instances[-1]
+        models.embed_inputs.clear()
+        models.embed_tasks.clear()
+
+        hits = memory.search("where is the marigold?")
+
+    assert [hit.id for hit in hits] == [record.id]
+    assert index.dense_search_calls == expected_dense_calls
+    assert index.lexical_search_calls == expected_lexical_calls
+    assert (EmbedTask.QUERY in models.embed_tasks) is expects_query_embedding
+
+
+def test_lexical_mode_ranks_by_native_full_text_relevance(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with _memory(
+        tmp_path,
+        models,
+        retrieval_mode=RetrievalMode.LEXICAL,
+    ) as memory:
+        first = memory.add("marigold courtyard first")
+        second = memory.add("marigold courtyard second")
+        index = _FakeIndex.instances[-1]
+        parent_by_embedding = {
+            embedding_id: document.embedding.memory_id
+            for embedding_id, document in index.documents.items()
+        }
+        first_embedding_id = next(
+            embedding_id
+            for embedding_id, memory_id in parent_by_embedding.items()
+            if memory_id == first.id
+        )
+        second_embedding_id = next(
+            embedding_id
+            for embedding_id, memory_id in parent_by_embedding.items()
+            if memory_id == second.id
+        )
+        index.lexical_hits_override = (
+            IndexHit(id=first_embedding_id, relevance=0.2, lexical_match=True),
+            IndexHit(id=second_embedding_id, relevance=0.9, lexical_match=True),
+        )
+
+        hits = memory.search("where is the marigold?")
+
+    assert [hit.id for hit in hits] == [second.id, first.id]
+
+
+@pytest.mark.parametrize(
+    "query",
+    ("the", Blob(b"query image", "image/png", "query.png")),
+    ids=("stopwords", "media_only"),
+)
+def test_lexical_mode_handles_a_query_with_no_lexical_terms_without_embedding(
+    tmp_path: Path,
+    query: ContentInput,
+) -> None:
+    models = _FakeModels()
+    with _memory(
+        tmp_path,
+        models,
+        minimum_relevance=0,
+        retrieval_mode=RetrievalMode.LEXICAL,
+    ) as memory:
+        memory.add("marigold courtyard")
+        index = _FakeIndex.instances[-1]
+        models.embed_tasks.clear()
+
+        assert memory.search(query) == ()
+
+    assert index.dense_search_calls == 0
+    assert index.lexical_search_calls == 0
+    assert EmbedTask.QUERY not in models.embed_tasks
+
+
+def test_lexical_mode_trace_preserves_native_relevance_for_a_stale_candidate(
+    tmp_path: Path,
+) -> None:
+    models = _FakeModels()
+    with _memory(
+        tmp_path,
+        models,
+        retrieval_mode=RetrievalMode.LEXICAL,
+    ) as memory:
+        record = memory.add("marigold courtyard")
+        index = _FakeIndex.instances[-1]
+        live_embedding_id = next(
+            embedding_id
+            for embedding_id, document in index.documents.items()
+            if document.embedding.memory_id == record.id
+        )
+        index.lexical_hits_override = (
+            IndexHit(id=live_embedding_id, relevance=0.9, lexical_match=True),
+            IndexHit(id="stale-lexical", relevance=0.4, lexical_match=True),
+        )
+
+        traced = memory.search_with_trace("where is the marigold?")
+
+    stale = next(candidate for candidate in traced.trace.candidates if candidate.memory_id is None)
+    assert stale.rejected_by is RetrievalRejection.STALE_INDEX
+    assert stale.lexical_match is True
+    assert stale.lexical_relevance == pytest.approx(0.4)
+    assert stale.gate_relevance == pytest.approx(0.4)
 
 
 def test_ask_observes_the_pre_grounding_ranking_without_affecting_answers(
@@ -1143,8 +1272,11 @@ def test_search_with_trace_exposes_every_lexical_ranking_input(tmp_path: Path) -
         minimum_relevance=0,
         ambiguity_margin=0,
     ) as memory:
-        first = memory.add("rare alpha")
-        second = memory.add("rare beta")
+        # The fake maps "red" documents onto the first axis and this query onto the second.
+        # Score completion therefore observes exact cosine zero while the test remains focused
+        # on the lexical route's rank and full-coverage inputs.
+        first = memory.add("red rare alpha")
+        second = memory.add("red rare beta")
         first_index = memory._store.read_memory_index_documents((first.id,))[
             0
         ].embedding.embedding_id
@@ -1506,16 +1638,19 @@ def test_temporal_search_reads_lexical_evidence_from_authoritative_time_range(
     # 0.55 now does, since the full-text contribution was rescaled to stop it depending on the
     # embedder. Measured: 0.30 stops early, 0.55 returns empty, 0.40 reproduces the case.
     with _memory(tmp_path, _FakeModels(), minimum_relevance=0.40) as memory:
+        # `_FakeModels` maps "red" documents orthogonally to this query. That keeps this test on
+        # its lexical temporal-deepening path after persisted-vector score completion was added;
+        # cosine-one documents would instead make every candidate a full semantic match.
         outside = memory.add_many(
-            tuple(f"shared witness outside {index}" for index in range(130)),
+            tuple(f"red common witness outside {index}" for index in range(130)),
             occurred_at=(datetime(2026, 1, 1, tzinfo=timezone.utc),) * 130,
         )
         weak = memory.add(
-            "shared witness weak",
+            "red common witness weak",
             occurred_at=datetime(2024, 5, 1, tzinfo=timezone.utc),
         )
         target = memory.add(
-            "shared witness target",
+            "red common witness target",
             occurred_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
         )
         index = _FakeIndex.instances[-1]
@@ -1528,12 +1663,12 @@ def test_temporal_search_reads_lexical_evidence_from_authoritative_time_range(
             )
             for record in (*outside[:99], weak, *outside[99:], target)
         )
-        hits = memory.search("shared witness in 2024", limit=1)
+        hits = memory.search("common witness in 2024", limit=1)
         assert hits and hits[0].id == target.id
         assert index.lexical_search_calls == 2
 
         monkeypatch.setattr(memory._store, "read_memories", lambda _memory_ids, **_scope: ())
-        assert memory.search("shared witness in 2024", limit=1) == ()
+        assert memory.search("common witness in 2024", limit=1) == ()
 
 
 def test_scope_filter_expands_past_unscoped_top_k_candidates(tmp_path: Path) -> None:

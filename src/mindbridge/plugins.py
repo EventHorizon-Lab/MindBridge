@@ -18,7 +18,7 @@ from mindbridge.models.base import (
     TranscriptionBackend,
     VisionDescriptionBackend,
 )
-from mindbridge.types import IndexQuantization, RetentionPolicy
+from mindbridge.types import IndexQuantization, RetentionPolicy, RetrievalMode
 
 _StrictBool = Annotated[bool, Field(strict=True)]
 _UnitInterval = Annotated[float, Field(strict=True, ge=0, le=1)]
@@ -82,6 +82,9 @@ class MemoryConfig:
     # reaches the index through the separate transcript-derivation path either way.
     index_speech: _StrictBool = True
     index_quantization: IndexQuantization = IndexQuantization.NONE
+    # A stable instance policy for diagnostics and lexical fallback. It selects candidate routes;
+    # it does not introduce a request-local visibility scope.
+    retrieval_mode: RetrievalMode = RetrievalMode.HYBRID
     # A floor on evidence relevance: the cosine the dense route reports, or the demoted full-text
     # contribution when only the lexical route matched, adjusted by temporal proximity when the
     # query asked about a time and by the observation's own confidence. Relevance is floored at 0,

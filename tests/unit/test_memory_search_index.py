@@ -19,14 +19,15 @@ import math
 import os
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from mindbridge import Memory
+from mindbridge import Memory, RetrievalScope
 from mindbridge.exceptions import ModelError
+from mindbridge.infrastructure.local.store import LocalStore
 from mindbridge.memory import (
     _LEXICAL_FULL_COVERAGE,
     _LEXICAL_FULL_COVERAGE_RELEVANCE,
@@ -148,13 +149,14 @@ class _DirectionalEmbedder:
 
     def __init__(self, cosines: Mapping[str, float]) -> None:
         self._cosines = dict(cosines)
+        self.tasks: list[EmbedTask] = []
 
     def embed(
         self,
         inputs: Sequence[ModelInput],
         task: EmbedTask = EmbedTask.DOCUMENT,
     ) -> tuple[tuple[float, ...], ...]:
-        del task
+        self.tasks.append(task)
         vectors = []
         for value in inputs:
             cosine = 1.0
@@ -354,6 +356,92 @@ def test_the_lexical_route_survives_a_floor_above_the_old_flat_constant(tmp_path
 
         assert [hit.id for hit in hits] == [covering.id]
         assert hits[0].score >= 0.7
+
+
+def test_partial_lexical_candidate_outside_the_ann_window_gets_its_persisted_score(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedder = _DirectionalEmbedder({"distractor": 0.81, "rescue-target": 0.8})
+    requested: list[tuple[str, ...]] = []
+    original_read = LocalStore.iter_memory_embedding_vectors
+
+    def observed_read(
+        store: LocalStore,
+        memory_ids: Sequence[str],
+        *,
+        space_id: str,
+        task: str,
+    ) -> Iterator[tuple[str, tuple[float, ...]]]:
+        requested.append(tuple(memory_ids))
+        return original_read(store, memory_ids, space_id=space_id, task=task)
+
+    monkeypatch.setattr(LocalStore, "iter_memory_embedding_vectors", observed_read)
+    with Memory(tmp_path, embedder=embedder, minimum_relevance=0.1) as memory:
+        memory.add_many([f"distractor ordinary weather note {index}" for index in range(100)])
+        known_before_target = datetime.now(timezone.utc)
+        target = memory.add("rescue-target zibaldone drift")
+        target_index_id = memory._store.read_memory_index_documents((target.id,))[
+            0
+        ].embedding.embedding_id
+
+        dense_window = memory._index.search(
+            (1.0, 0.0),
+            limit=100,
+            space_id=embedder.embedding_space,
+            task=EmbedTask.DOCUMENT.value,
+        )
+        assert target_index_id not in {hit.id for hit in dense_window}
+
+        before_search_tasks = tuple(embedder.tasks)
+        scoped = memory.search(
+            "zibaldone quokka nephoscope",
+            scope=RetrievalScope(known_at=known_before_target),
+        )
+        assert target.id not in {hit.id for hit in scoped}
+        assert requested == [], "historically invisible parents must not be score-completed"
+
+        traced = memory.search_with_trace("zibaldone quokka nephoscope")
+
+        assert traced.hits[0].id == target.id
+        candidate = next(item for item in traced.trace.candidates if item.memory_id == target.id)
+        assert candidate.lexical_match is True
+        assert candidate.lexical_relevance == 0.0, "the query has only partial term coverage"
+        assert candidate.dense_relevance == pytest.approx(0.8)
+        assert candidate.dense_confidence == pytest.approx(0.9)
+        assert requested == [(target.id,)]
+        assert embedder.tasks[len(before_search_tasks) :] == [
+            EmbedTask.QUERY,
+            EmbedTask.QUERY,
+        ]
+
+        memory.forget((target.id,))
+        requested.clear()
+        assert target.id not in {hit.id for hit in memory.search("zibaldone quokka nephoscope")}
+        assert requested == [], "forgotten parents must not be score-completed"
+
+
+def test_dense_candidates_keep_the_index_score_without_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedder = _DirectionalEmbedder({"target": 0.6, "other": 0.2})
+
+    def unexpected_read(
+        *_args: object, **_kwargs: object
+    ) -> Iterator[tuple[str, tuple[float, ...]]]:
+        raise AssertionError("a parent already scored by the dense route was completed again")
+
+    monkeypatch.setattr(LocalStore, "iter_memory_embedding_vectors", unexpected_read)
+    with Memory(tmp_path, embedder=embedder, minimum_relevance=0.1) as memory:
+        target = memory.add("target zibaldone drift")
+        memory.add("other weather note")
+
+        traced = memory.search_with_trace("zibaldone quokka nephoscope")
+
+        candidate = next(item for item in traced.trace.candidates if item.memory_id == target.id)
+        assert candidate.dense_relevance == pytest.approx(0.6)
+        assert candidate.dense_confidence == pytest.approx(0.8)
 
 
 def test_a_text_only_embedder_reaches_an_image_through_the_describer(tmp_path: Path) -> None:
@@ -967,3 +1055,27 @@ def test_the_modality_floor_never_evicts_the_top_hit(tmp_path: Path) -> None:
             Modality.VIDEO,
             Modality.AUDIO,
         }
+
+
+def test_evidence_budget_skips_an_oversized_extra_and_keeps_a_later_fit() -> None:
+    """The optional budget extension is not closed by one expensive lower-ranked record."""
+    from mindbridge.context import evidence_cost
+    from mindbridge.memory import _grounding_hits
+    from mindbridge.types import SearchHit
+
+    created = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
+    ranking = tuple(
+        SearchHit(id=name, content=content, score=score, created_at=created)
+        for name, content, score in (
+            ("required", "a", 0.9),
+            ("oversized", "0123456789", 0.8),
+            ("fits", "bc", 0.7),
+        )
+    )
+
+    grounded = _grounding_hits(ranking, limit=1, budget_chars=3)
+
+    assert [hit.id for hit in grounded] == ["required", "fits"]
+    # This is the live ask budget's unit: text characters plus any text-equivalent media cost.
+    # It intentionally is not represented as a model-token guarantee.
+    assert sum(evidence_cost(hit) for hit in grounded) == 3

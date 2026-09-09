@@ -1,0 +1,24 @@
+{
+  "protocol": {
+    "arms": ["pre_witness", "witness"],
+    "budget": {"max_items": 12, "max_chars": 8000},
+    "model": "Qwen3.8-27B",
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 8192,
+    "stream": true,
+    "occurred_at": "2026-09-08T00:00:00+00:00",
+    "fresh_data_dir_per_case_per_arm": true,
+    "ingest": "one add_many call per case"
+  },
+  "cases": [
+    {"id": "identity", "observations": ["我的姐姐叫林玥，弟弟叫周明。", "她现在住在苏州。"], "question": "林玥现在住在哪里？", "target_dependencies": [0, 1]},
+    {"id": "pet", "observations": ["我养的猫叫豆包。", "它最喜欢蓝色的玩具球。"], "question": "豆包最喜欢什么玩具？", "target_dependencies": [0, 1]},
+    {"id": "time", "observations": ["这次对话里提到的周末，专指2026年9月12日和13日。", "我会在周末去南京看望陈阿姨。"], "question": "这次去南京看望陈阿姨是在哪两天？", "target_dependencies": [0, 1]},
+    {"id": "affect_attribution", "observations": ["这里的小林是我的同事林悦，不是邻居林宇。", "小林说：我今天有点紧张，因为下午要做第一次汇报。"], "question": "谁说自己今天有点紧张，原因是什么？", "target_dependencies": [0, 1]},
+    {"id": "spatial", "observations": ["客厅靠窗的柜子叫A柜，门边的柜子叫B柜。", "备用钥匙在B柜第二层。"], "question": "备用钥匙在靠窗还是门边的柜子里？", "target_dependencies": [0, 1]},
+    {"id": "alias_distractor", "observations": ["我的同事阿岚英文名是Aran。", "我的朋友阿梅英文名是May。", "Aran昨天搬到了成都。"], "question": "阿岚昨天搬到了哪里？", "target_dependencies": [0, 2]},
+    {"id": "independent_linyue", "observations": ["我昨天在公园散步。", "林玥现在住在苏州。"], "question": "林玥现在住在哪里？", "target_dependencies": [1]},
+    {"id": "independent_aran", "observations": ["我喜欢蓝色。", "阿岚的自行车停在公司门口。", "阿梅今天在家休息。"], "question": "阿岚的自行车停在哪里？", "target_dependencies": [1]}
+  ]
+}

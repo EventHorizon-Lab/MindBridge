@@ -30,6 +30,13 @@ _VIDEO_SCALE_FILTER = (
     "force_original_aspect_ratio=decrease:force_divisible_by=2"
 )
 _VIDEO_FILTER = f"fps=1,{_VIDEO_SCALE_FILTER}"
+# Retain the source's real cadence only when the standard 1 fps representation leaves fewer than
+# two frames. Qwen's video processor cannot consume a one-frame video, and duplicating a frame
+# would invent a temporal observation. A generic prepared-media cache still accepts one real
+# frame: consumers with a stricter processor must report that limitation at their own boundary.
+_VIDEO_FILTER_NATIVE = _VIDEO_SCALE_FILTER
+_MIN_PREPROCESSABLE_VIDEO_FRAMES = 2
+_COMPLETE_MARKER = ".complete"
 # The concat demuxer has no following packet from which the fps filter can infer
 # the final frame's duration. Passing it through keeps N official frames as N seconds.
 _OPENEQA_VIDEO_FILTER = f"fps=1:eof_action=pass,{_VIDEO_SCALE_FILTER}"
@@ -45,6 +52,10 @@ _OPENEQA_FRAME_RATE = 1
 # ponytail: ffmpeg is already multithreaded; bound source-level fan-out at four unless profiling
 # on supported hardware demonstrates that a public tuning knob pays for itself.
 _PREPARATION_WORKERS = min(4, os.cpu_count() or 1)
+_PREPARED_MEDIA_CACHE_VERSION = "ffmpeg-v2"
+_VIDEO_SEGMENT_CACHE_KEY_VERSION = "video-segment-v3"
+_LEGACY_PREPARED_MEDIA_CACHE_VERSION = "ffmpeg-v1"
+_LEGACY_VIDEO_SEGMENT_CACHE_KEY_VERSION = "video-segment-v2"
 _T = TypeVar("_T")
 _R = TypeVar("_R")
 Limit: TypeAlias = int | float | None
@@ -128,7 +139,7 @@ def prepare_task_media(
         spec,
         dataset_path,
         effective_root,
-        root / ".prepared" / "ffmpeg-v1" / spec.name,
+        root / ".prepared" / _PREPARED_MEDIA_CACHE_VERSION / spec.name,
         root,
         limit,
         offset,
@@ -1037,21 +1048,25 @@ def _segment_video(
     if not ordered or ordered[0] <= 0:
         raise ValueError("video segment boundaries must be positive")
     stat_result = source.stat()
-    key = hashlib.sha256(
-        json.dumps(
-            [
-                "video-segment-v2",
-                str(source.resolve()),
-                stat_result.st_size,
-                stat_result.st_mtime_ns,
-                ordered,
-                _ffmpeg_id(),
-            ],
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()[:20]
 
-    def command(_working: Path) -> list[str]:
+    def cache_key(version: str) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                [
+                    version,
+                    str(source.resolve()),
+                    stat_result.st_size,
+                    stat_result.st_mtime_ns,
+                    ordered,
+                    _ffmpeg_id(),
+                ],
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:20]
+
+    key = cache_key(_VIDEO_SEGMENT_CACHE_KEY_VERSION)
+
+    def command(_working: Path, video_filter: str = _VIDEO_FILTER) -> list[str]:
         return [
             _executable("ffmpeg"),
             "-nostdin",
@@ -1068,7 +1083,7 @@ def _segment_video(
             "-map",
             "0:a:0?",
             "-vf",
-            _VIDEO_FILTER,
+            video_filter,
             "-c:v",
             "libx264",
             "-preset",
@@ -1087,7 +1102,18 @@ def _segment_video(
             "-1",
         ]
 
-    return _cached_segments(source, ordered, cache, key, command, announce)
+    return _cached_segments(
+        source,
+        ordered,
+        cache,
+        key,
+        command,
+        announce,
+        fallback_command=lambda working: command(working, _VIDEO_FILTER_NATIVE),
+        legacy_paths=_legacy_segment_paths(
+            cache, cache_key(_LEGACY_VIDEO_SEGMENT_CACHE_KEY_VERSION), ordered
+        ),
+    )
 
 
 def _cached_segments(
@@ -1097,60 +1123,149 @@ def _cached_segments(
     key: str,
     build_command: Callable[[Path], list[str]],
     announce: Callable[[str], None] | None,
+    *,
+    fallback_command: Callable[[Path], list[str]] | None = None,
+    legacy_paths: Sequence[Path] = (),
 ) -> tuple[tuple[float, float, Path], ...]:
     target = cache / key
     expected = tuple(target / f"segment-{index:05d}.mp4" for index in range(len(boundaries)))
-    if all(path.is_file() and path.stat().st_size for path in expected):
+    # Every object below is probed with a full decode before it is trusted, and the marker is
+    # written only after all of them passed. A completed entry is then a stat per segment on
+    # later runs instead of a decode per segment, which on a thousand-segment corpus is the
+    # difference between seconds and an hour before the first question is asked.
+    # ponytail: a completed entry corrupted in place is trusted; delete the marker to re-probe.
+    complete = target / _COMPLETE_MARKER
+    if complete.is_file() and all(path.is_file() and path.stat().st_size for path in expected):
+        return _timed_paths(boundaries, expected)
+    if all(_has_structural_video(path) for path in expected):
+        complete.touch()
+        return _timed_paths(boundaries, expected)
+    _reuse_valid_legacy(legacy_paths, expected)
+    if all(_has_structural_video(path) for path in expected):
+        complete.touch()
         return _timed_paths(boundaries, expected)
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if announce is not None:
         announce(f"preparing {len(boundaries)} causal segments from {source.name}")
     working = Path(mkdtemp(prefix=f".{key}.", dir=target.parent))
-    temporary_path: Path | None = working
     try:
-        output = working / "segment-%05d.mp4"
-        cuts = boundaries[:-1]
-        command = build_command(working)
-        if cuts:
-            times = ",".join(f"{value:.3f}" for value in cuts)
-            command.extend(
-                (
-                    "-force_key_frames",
-                    times,
-                    "-segment_times",
-                    times,
-                    "-f",
-                    "segment",
-                    "-segment_format",
-                    "mp4",
-                    "-reset_timestamps",
-                    "1",
-                    str(output),
-                )
-            )
-        else:
-            # With nothing to cut, the segment muxer is not just unnecessary but wrong: given no
-            # `-segment_times` it splits at every keyframe it happens to see, and `-tune
-            # zerolatency` emits them often. One 30 s clip came back as 13 + 17 frames.
-            # A single boundary means one output file, which is what any source at or below one
-            # segment length asks for.
-            command.append(str(working / "segment-00000.mp4"))
-        _run_ffmpeg(command, source)
-        produced = tuple(sorted(working.glob("segment-*.mp4")))
-        if len(produced) != len(expected) or any(not path.stat().st_size for path in produced):
-            raise RuntimeError(
-                f"ffmpeg produced {len(produced)} of {len(expected)} segments for {source}"
-            )
+        produced = _produce_segments(source, boundaries, working, build_command, fallback_command)
         target.mkdir(mode=0o700, exist_ok=True)
         for source_path, target_path in zip(produced, expected, strict=True):
-            if not target_path.is_file() or not target_path.stat().st_size:
+            # A partial cache can contain valid earlier segments beside a failed tail segment.
+            # Never overwrite those immutable bytes while repairing only their invalid siblings.
+            if not _has_structural_video(target_path):
                 os.replace(source_path, target_path)
-        if not all(path.is_file() and path.stat().st_size for path in expected):
+        if not all(_has_structural_video(path) for path in expected):
             raise RuntimeError(f"video segment cache remained incomplete for {source}")
+        complete.touch()
     finally:
-        if temporary_path is not None:
-            shutil.rmtree(temporary_path)
+        shutil.rmtree(working)
     return _timed_paths(boundaries, expected)
+
+
+def _reuse_valid_legacy(legacy_paths: Sequence[Path], expected: Sequence[Path]) -> None:
+    """Reuse only legacy segments that already meet the processor's two-frame threshold.
+
+    A legacy one-frame object may have lost real source frames to the old fps representation. It
+    must therefore take the native-cadence repair path instead of becoming a completed V2 entry.
+    """
+    if len(legacy_paths) != len(expected):
+        return
+    expected[0].parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for legacy_path, target_path in zip(legacy_paths, expected, strict=True):
+        if _has_structural_video(target_path) or not _has_preprocessable_video(legacy_path):
+            continue
+        target_path.unlink(missing_ok=True)
+        try:
+            os.link(legacy_path, target_path)
+        except OSError:
+            shutil.copy2(legacy_path, target_path)
+
+
+def _produce_segments(
+    source: Path,
+    boundaries: Sequence[float],
+    working: Path,
+    build_command: Callable[[Path], list[str]],
+    fallback_command: Callable[[Path], list[str]] | None,
+) -> tuple[Path, ...]:
+    normal = working / "normal"
+    normal.mkdir()
+    output = normal / "segment-%05d.mp4"
+    command = _segment_output_command(build_command(normal), boundaries, output)
+    _run_ffmpeg(command, source)
+    produced = tuple(normal / f"segment-{index:05d}.mp4" for index in range(len(boundaries)))
+    if len(produced) == len(boundaries) and all(
+        _has_preprocessable_video(path) for path in produced
+    ):
+        return produced
+    if fallback_command is None:
+        if all(_has_structural_video(path) for path in produced):
+            return produced
+        raise RuntimeError(
+            f"ffmpeg produced {len(produced)} structurally invalid video segments for {source}"
+        )
+    native = working / "native"
+    native.mkdir()
+    native_output = native / "segment-%05d.mp4"
+    command = _segment_output_command(fallback_command(native), boundaries, native_output)
+    _run_ffmpeg(command, source)
+    fallback = tuple(native / f"segment-{index:05d}.mp4" for index in range(len(boundaries)))
+    selected = tuple(
+        normal_path
+        if _has_preprocessable_video(normal_path)
+        else fallback_path
+        if _has_preprocessable_video(fallback_path)
+        else normal_path
+        if _has_structural_video(normal_path)
+        else fallback_path
+        for normal_path, fallback_path in zip(produced, fallback, strict=True)
+    )
+    if not all(_has_structural_video(path) for path in selected):
+        raise RuntimeError(f"ffmpeg produced structurally invalid video segments for {source}")
+    return selected
+
+
+def _segment_output_command(
+    command: list[str], boundaries: Sequence[float], output: Path
+) -> list[str]:
+    cuts = boundaries[:-1]
+    if cuts:
+        times = ",".join(f"{value:.3f}" for value in cuts)
+        command.extend(
+            (
+                "-force_key_frames",
+                times,
+                "-segment_times",
+                times,
+                "-f",
+                "segment",
+                "-segment_format",
+                "mp4",
+                "-reset_timestamps",
+                "1",
+                str(output),
+            )
+        )
+    else:
+        # The segment muxer splits an uncut source at its keyframes. A single boundary needs one
+        # named output regardless of the source's keyframe cadence.
+        command.append(str(output.with_name("segment-00000.mp4")))
+    return command
+
+
+def _legacy_segment_paths(cache: Path, key: str, boundaries: Sequence[float]) -> tuple[Path, ...]:
+    """Locate only the prior prepared-media namespace for a matching legacy cache key."""
+    parts = cache.parts
+    try:
+        index = parts.index(_PREPARED_MEDIA_CACHE_VERSION)
+    except ValueError:
+        return ()
+    legacy_root = Path(*parts[:index], _LEGACY_PREPARED_MEDIA_CACHE_VERSION, *parts[index + 1 :])
+    return tuple(
+        legacy_root / key / f"segment-{offset:05d}.mp4" for offset in range(len(boundaries))
+    )
 
 
 def _timed_paths(
@@ -1321,6 +1436,45 @@ def _has_audio(path: Path) -> bool:
         check=False,
     )
     return completed.returncode == 0 and bool(completed.stdout.strip())
+
+
+def _video_frame_count(path: Path) -> int:
+    """Return the number of real decoded frames, or zero for a missing or invalid stream."""
+    if not path.is_file() or not path.stat().st_size:
+        return 0
+    completed = subprocess.run(
+        (
+            _executable("ffprobe"),
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        frame_count = int(completed.stdout.strip())
+    except ValueError:
+        return 0
+    return frame_count if completed.returncode == 0 else 0
+
+
+def _has_structural_video(path: Path) -> bool:
+    """Accept a cache object with at least one real video frame."""
+    return _has_preprocessable_video(path) or _video_frame_count(path) == 1
+
+
+def _has_preprocessable_video(path: Path) -> bool:
+    """Identify the two-real-frame minimum required by the WeMM/Qwen video processor."""
+    return _video_frame_count(path) >= _MIN_PREPROCESSABLE_VIDEO_FRAMES
 
 
 def _component(value: str) -> str:

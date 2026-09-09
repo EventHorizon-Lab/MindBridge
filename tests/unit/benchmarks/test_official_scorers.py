@@ -159,6 +159,21 @@ def test_memlens_and_locomo_plans_preserve_official_protocol_details() -> None:
     assert locomo.extra_body == {"enable_thinking": False}
     assert '"label"' in locomo.calls[0][0].content
 
+    # These bypass the remote judge, but still carry deterministic primary scores. A caller that
+    # records only judge plans would otherwise turn an exact answer into an unscored row.
+    for prediction, expected in (("A shell", 1.0), ("   ", 0.0)):
+        assert (
+            judge_plan(
+                "locomo-refined",
+                question="What did I buy?",
+                references=("A shell",),
+                prediction=prediction,
+                metadata={},
+            )
+            is None
+        )
+        assert _scores("locomo-refined", prediction, "A shell", {})["llm_judge"] == expected
+
     memlens = judge_plan(
         "memlens-32k",
         question="What is the latest answer?",
@@ -707,6 +722,7 @@ def test_personamem_ranking_is_deterministic_and_reads_both_answer_shapes() -> N
     hit = _scores("personamem-v3", "Ranked indexes: [2, 3, 4, 1, 0]", "gold", dict(metadata))
     assert hit["recall_at_1"] == 1.0
     assert hit["personamem_score"] == 1.0
+    assert hit["ndcg_at_5"] == 1.0
     assert hit["negative_in_top3"] == 0.0
 
     # The evaluation repository's current prompt asks for this shape instead.
@@ -735,6 +751,65 @@ def test_personamem_ranking_is_deterministic_and_reads_both_answer_shapes() -> N
     identity = _scores("personamem-v3", "no idea", "gold", directive)
     assert identity["hit@1"] == 0.0
     assert identity["negative_in_top1"] == 1.0
+
+
+def test_personamem_ranking_matches_current_official_graded_formula() -> None:
+    q4 = {
+        "task_type": "hidden_persona_recommendation",
+        "candidate_count": 16,
+        "positive_indexes": (4,),
+        "negative_indexes": (0, 1, 7, 8, 12, 13, 15),
+    }
+    pre_q4 = _scores(
+        "personamem-v3",
+        "Ranked indexes: [1, 8, 15, 4, 10, 0, 9, 3, 11, 5, 13, 2, 14, 6, 7, 12]",
+        "gold",
+        dict(q4),
+    )
+    witness_q4 = _scores(
+        "personamem-v3",
+        "Ranked indexes: [1, 8, 12, 15, 4, 10, 0, 9, 3, 11, 5, 13, 2, 14, 6, 7]",
+        "gold",
+        dict(q4),
+    )
+    assert pre_q4["ndcg_at_5"] == 0.0
+    assert witness_q4["ndcg_at_5"] == 0.0
+
+    no_negatives = {
+        "candidate_count": 5,
+        "positive_indexes": (2,),
+        "negative_indexes": (),
+    }
+    hidden = _scores(
+        "personamem-v3",
+        "Ranked indexes: [4, 3, 2, 1, 0]",
+        "gold",
+        {**no_negatives, "task_type": "hidden_persona_recommendation"},
+    )
+    at_ai = _scores(
+        "personamem-v3",
+        "Ranked indexes: [4, 3, 2, 1, 0]",
+        "gold",
+        {**no_negatives, "task_type": "at_ai_directive_followup"},
+    )
+    assert hidden["ndcg_at_5"] == pytest.approx(0.5)
+    assert at_ai["ndcg_at_5"] == pytest.approx(0.8734, abs=5e-5)
+
+    q27 = {**no_negatives, "candidate_count": 12, "positive_indexes": (4,)}
+    pre_q27 = _scores(
+        "personamem-v3",
+        "Ranked indexes: [1, 10, 6, 8, 4, 11, 2, 3, 9, 5, 7, 0]",
+        "gold",
+        {**q27, "task_type": "at_ai_directive_followup"},
+    )
+    witness_q27 = _scores(
+        "personamem-v3",
+        "Ranked indexes: [7, 4, 1, 10, 6, 2, 8, 5, 11, 3, 9, 0]",
+        "gold",
+        {**q27, "task_type": "at_ai_directive_followup"},
+    )
+    assert pre_q27["ndcg_at_5"] == pytest.approx(0.8447, abs=5e-5)
+    assert witness_q27["ndcg_at_5"] == pytest.approx(0.9065, abs=5e-5)
 
 
 @pytest.mark.parametrize(

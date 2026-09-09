@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from collections.abc import Container, Mapping, Sequence
@@ -81,6 +82,35 @@ class ContextUnknownKind(str, Enum):
     MODALITY_UNSUPPORTED = "modality_unsupported"
     STAGE_SKIPPED = "stage_skipped"
     CONSENT_WITHHELD = "consent_withheld"
+    EVIDENCE_UNAVAILABLE = "evidence_unavailable"
+
+
+class ContextSymbolNamespace(str, Enum):
+    """The durable identifier family one request-local context symbol represents."""
+
+    MEMORY = "memory"
+    IDENTITY = "identity"
+
+
+class ContextSymbolCoverage(str, Enum):
+    """How much of a symbol's memory source is present in this presentation."""
+
+    FULL = "full"
+    PARTIAL = "partial"
+    REFERENCE_ONLY = "reference_only"
+
+
+class ContextSymbolRole(str, Enum):
+    """How a stable identifier is used by one compact context presentation."""
+
+    HIT = "hit"
+    EXCERPT = "excerpt"
+    EVIDENCE = "evidence"
+    AFFECT_EVENT = "affect_event"
+    ACTOR = "actor"
+    OBSERVED_IN = "observed_in"
+    NAMING_ASSERTION = "naming_assertion"
+    CONFLICT = "conflict"
 
 
 class SpatialAnchor(str, Enum):
@@ -104,6 +134,14 @@ class IndexQuantization(str, Enum):
     FP16 = "fp16"
     INT8 = "int8"
     RABITQ = "rabitq"
+
+
+class RetrievalMode(str, Enum):
+    """Candidate route policy for one local memory instance."""
+
+    HYBRID = "hybrid"
+    DENSE = "dense"
+    LEXICAL = "lexical"
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,7 +404,12 @@ class RetrievalScope:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FormationProposal:
-    """One typed, source-grounded semantic memory proposed by a model adapter."""
+    """One typed, source-grounded semantic memory proposed by a model adapter.
+
+    ``evidence_ids`` is ``None`` for the legacy primary-source link. A supplied tuple declares
+    the ordered observations from the current formation batch the proposal jointly depends on;
+    the memory kernel verifies batch membership and the primary source before it commits.
+    """
 
     kind: MemoryKind
     content: str
@@ -381,6 +424,7 @@ class FormationProposal:
     cue_modality: Modality | None = None
     valence: float | None = None
     arousal: float | None = None
+    evidence_ids: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:  # noqa: C901 - kind-specific boundary validation
         if not isinstance(self.kind, MemoryKind):
@@ -436,6 +480,26 @@ class FormationProposal:
             "formation valid_from",
             "formation valid_until",
         )
+        if self.evidence_ids is not None:
+            if isinstance(self.evidence_ids, str | bytes):
+                raise ValidationError(
+                    "formation evidence_ids must be a non-empty sequence of memory IDs"
+                )
+            try:
+                evidence_ids = tuple(self.evidence_ids)
+            except TypeError:
+                raise ValidationError(
+                    "formation evidence_ids must be a non-empty sequence of memory IDs"
+                ) from None
+            if not evidence_ids or any(
+                not isinstance(value, str) or not value.strip() for value in evidence_ids
+            ):
+                raise ValidationError(
+                    "formation evidence_ids must be a non-empty sequence of memory IDs"
+                )
+            if len(set(evidence_ids)) != len(evidence_ids):
+                raise ValidationError("formation evidence_ids must be unique")
+            object.__setattr__(self, "evidence_ids", evidence_ids)
         if self.spatial is not None and not isinstance(self.spatial, SpatialContext):
             raise ValidationError("formation spatial context is invalid")
         if self.cue_modality is not None:
@@ -1721,6 +1785,8 @@ class RetentionReport:
     media_memory_ids: tuple[str, ...] = ()
     # Memories deleted because they had been cognitively forgotten longer than `forgotten_days`.
     forgotten_memory_ids: tuple[str, ...] = ()
+    # Additional derived records deleted because every complete support clause was lost.
+    cascade_memory_ids: tuple[str, ...] = ()
     # Media descriptors and their bytes removed because no memory referenced them any more.
     asset_ids: tuple[str, ...] = ()
     # Capture-queue rows abandoned; the memories themselves stay.
@@ -1732,6 +1798,7 @@ class RetentionReport:
         for name in (
             "media_memory_ids",
             "forgotten_memory_ids",
+            "cascade_memory_ids",
             "asset_ids",
             "capture_memory_ids",
         ):
@@ -1740,7 +1807,13 @@ class RetentionReport:
     @property
     def deleted(self) -> int:
         """How many memories this pass removed, which is what a policy is judged on."""
-        return len(self.media_memory_ids) + len(self.forgotten_memory_ids)
+        return len(
+            {
+                *self.media_memory_ids,
+                *self.forgotten_memory_ids,
+                *self.cascade_memory_ids,
+            }
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1833,7 +1906,13 @@ class MemoryCapabilities:
 
 @dataclass(frozen=True, slots=True)
 class RetrievalCandidateTrace:
-    """Effective score components and final disposition for one considered parent memory."""
+    """Effective score components and final disposition for one considered parent memory.
+
+    Dense values can come from an ANN hit or from exact scoring of persisted vectors when only
+    the lexical route admitted the parent. ``index_ids`` are the index candidates that admitted
+    the parent; they neither identify the admitting route nor list every persisted part used by
+    score completion.
+    """
 
     memory_id: str | None
     index_ids: tuple[str, ...]
@@ -2230,6 +2309,217 @@ class AffectCue(SearchHit):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class TextSpanPiece:
+    """One exact source range in a contextual text embedding input."""
+
+    role: Literal["context", "body"]
+    start_codepoint: int
+    end_codepoint: int
+    source_text: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.role not in {"context", "body"}:
+            raise ValidationError("text span role must be context or body")
+        if (
+            isinstance(self.start_codepoint, bool)
+            or not isinstance(self.start_codepoint, int)
+            or isinstance(self.end_codepoint, bool)
+            or not isinstance(self.end_codepoint, int)
+            or self.start_codepoint < 0
+            or self.end_codepoint <= self.start_codepoint
+        ):
+            raise ValidationError("text span offsets must be a non-empty half-open interval")
+        if not isinstance(self.source_text, str) or not self.source_text:
+            raise ValidationError("text span source_text must not be empty")
+        if not isinstance(self.sha256, str) or _SHA256.fullmatch(self.sha256) is None:
+            raise ValidationError("text span sha256 must be 64 lowercase hexadecimal characters")
+        if hashlib.sha256(self.source_text.encode("utf-8")).hexdigest() != self.sha256:
+            raise ValidationError("text span source_text does not match its sha256")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TextSpanSelector:
+    """Digest-bound exact source pieces which produced one text embedding input."""
+
+    parent_content_sha256: str
+    embedding_input_sha256: str
+    recipe_version: str
+    pieces: tuple[TextSpanPiece, ...]
+
+    def __post_init__(self) -> None:
+        for name in ("parent_content_sha256", "embedding_input_sha256"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+                raise ValidationError(f"text selector {name} must be a SHA-256 identifier")
+        object.__setattr__(
+            self,
+            "recipe_version",
+            _text(self.recipe_version, "text selector recipe_version"),
+        )
+        if not self.pieces or any(not isinstance(piece, TextSpanPiece) for piece in self.pieces):
+            raise ValidationError("text selector pieces must contain TextSpanPiece values")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ContextExcerpt:
+    """One compiler-selected partial rendering of an authoritative raw observation."""
+
+    source_memory_id: str
+    matched_index_id: str
+    content: str
+    selector: TextSpanSelector
+    score: float
+    created_at: datetime
+    occurred_at: datetime | None = None
+    occurred_end: datetime | None = None
+    memory_type: MemoryType = MemoryType.SEMANTIC
+    context: MemoryContext | None = None
+    place_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "source_memory_id", _text(self.source_memory_id, "source_memory_id")
+        )
+        object.__setattr__(
+            self, "matched_index_id", _text(self.matched_index_id, "matched_index_id")
+        )
+        if not isinstance(self.content, str) or not self.content:
+            raise ValidationError("context excerpt content must not be empty")
+        if not isinstance(self.selector, TextSpanSelector):
+            raise ValidationError("context excerpt selector must be a TextSpanSelector")
+        if (
+            isinstance(self.score, bool)
+            or not isinstance(self.score, int | float)
+            or not math.isfinite(self.score)
+            or not 0.0 <= self.score <= 1.0
+        ):
+            raise ValidationError("context excerpt score must be between zero and one")
+        _require_aware(self.created_at, "created_at")
+        _require_interval(self.occurred_at, self.occurred_end)
+        if not isinstance(self.memory_type, MemoryType):
+            raise ValidationError("context excerpt memory_type is invalid")
+        if self.context is not None and not isinstance(self.context, MemoryContext):
+            raise ValidationError("context excerpt context is invalid")
+        object.__setattr__(self, "place_id", _optional_text(self.place_id, "place_id"))
+
+
+@dataclass(frozen=True, slots=True)
+class ContextSymbol:
+    """One request-local alias and its presentation coverage."""
+
+    symbol: str
+    namespace: ContextSymbolNamespace
+    stable_id: str
+    coverage: ContextSymbolCoverage
+    roles: tuple[ContextSymbolRole, ...]
+    selector: TextSpanSelector | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.namespace, ContextSymbolNamespace):
+            raise ValidationError("context symbol namespace is invalid")
+        expected_prefix = "m" if self.namespace is ContextSymbolNamespace.MEMORY else "i"
+        if not re.fullmatch(rf"{expected_prefix}[1-9][0-9]*", self.symbol):
+            raise ValidationError("context symbol is invalid for its namespace")
+        object.__setattr__(self, "stable_id", _text(self.stable_id, "context symbol stable_id"))
+        if not isinstance(self.coverage, ContextSymbolCoverage):
+            raise ValidationError("context symbol coverage is invalid")
+        if not self.roles or any(not isinstance(role, ContextSymbolRole) for role in self.roles):
+            raise ValidationError("context symbol roles are invalid")
+        object.__setattr__(self, "roles", tuple(dict.fromkeys(self.roles)))
+        _validate_context_symbol_coverage(self)
+
+
+def _validate_context_symbol_coverage(symbol: ContextSymbol) -> None:
+    if symbol.namespace is ContextSymbolNamespace.IDENTITY:
+        if symbol.coverage is not ContextSymbolCoverage.REFERENCE_ONLY:
+            raise ValidationError("identity symbols must have reference-only coverage")
+        if symbol.selector is not None:
+            raise ValidationError("identity symbols cannot carry a text selector")
+    elif symbol.coverage is ContextSymbolCoverage.PARTIAL:
+        if not isinstance(symbol.selector, TextSpanSelector):
+            raise ValidationError("partial memory symbols require a text selector")
+    elif symbol.selector is not None:
+        raise ValidationError("only partial memory symbols can carry a text selector")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCitation:
+    """A decoded full or partial memory citation from one exact presentation.
+
+    Constructing this value does not prove that its source or selector was emitted by MindBridge;
+    callers validate model aliases through `ContextPresentation.resolve_citation()`.
+    """
+
+    memory_id: str
+    coverage: ContextSymbolCoverage
+    selector: TextSpanSelector | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "memory_id", _text(self.memory_id, "context citation memory_id"))
+        if not isinstance(self.coverage, ContextSymbolCoverage) or self.coverage not in {
+            ContextSymbolCoverage.FULL,
+            ContextSymbolCoverage.PARTIAL,
+        }:
+            raise ValidationError("context citation coverage must be full or partial")
+        if self.coverage is ContextSymbolCoverage.PARTIAL:
+            if not isinstance(self.selector, TextSpanSelector):
+                raise ValidationError("partial context citations require a text selector")
+        elif self.selector is not None:
+            raise ValidationError("full context citations cannot carry a text selector")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextPresentation:
+    """Frozen request-local text and typed aliases needed to interpret citations.
+
+    Symbols have no meaning outside this object. The text and symbol table together are
+    reversible; the compact text by itself is not an ID-preserving rewrite of arbitrary goals or
+    stored content.
+    """
+
+    text: str
+    symbols: tuple[ContextSymbol, ...]
+    chars: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "text", _text(self.text, "context presentation text"))
+        if self.chars != len(self.text):
+            raise ValidationError("context presentation chars must equal the text length")
+        if any(not isinstance(symbol, ContextSymbol) for symbol in self.symbols):
+            raise ValidationError("context presentation symbols are invalid")
+        keys = tuple((symbol.namespace, symbol.symbol) for symbol in self.symbols)
+        stable = tuple((symbol.namespace, symbol.stable_id) for symbol in self.symbols)
+        if len(set(keys)) != len(keys) or len(set(stable)) != len(stable):
+            raise ValidationError("context presentation symbols must be unique")
+
+    def resolve(self, symbol: str, *, namespace: ContextSymbolNamespace) -> str:
+        """Decode one alias without asserting delivery, eligibility, or evidentiary support."""
+        if not isinstance(namespace, ContextSymbolNamespace):
+            raise ValidationError("context symbol namespace is invalid")
+        for entry in self.symbols:
+            if entry.namespace is namespace and entry.symbol == symbol:
+                return entry.stable_id
+        raise ValidationError("context symbol is unknown in this presentation")
+
+    def resolve_citation(self, symbol: str) -> ContextCitation:
+        """Decode an eligible memory citation, rejecting identities and reference-only IDs."""
+        for entry in self.symbols:
+            if entry.symbol != symbol:
+                continue
+            if entry.namespace is not ContextSymbolNamespace.MEMORY:
+                raise ValidationError("identity symbols cannot be memory citations")
+            if entry.coverage is ContextSymbolCoverage.REFERENCE_ONLY:
+                raise ValidationError("reference-only memory symbols cannot be citations")
+            return ContextCitation(
+                memory_id=entry.stable_id,
+                coverage=entry.coverage,
+                selector=entry.selector,
+            )
+        raise ValidationError("context symbol is unknown in this presentation")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ContextBundle:
     """One bounded, structured context view compiled for a goal."""
 
@@ -2255,6 +2545,7 @@ class ContextBundle:
     chars: int
     elapsed_ms: int
     deadline_exceeded: bool
+    excerpts: tuple[ContextExcerpt, ...] = ()
 
     def __post_init__(self) -> None:
         # The affect section is the one whose entries carry more than a hit does, and every
@@ -2262,6 +2553,10 @@ class ContextBundle:
         # affect cue with an empty hop, so the type is enforced rather than defaulted.
         if any(not isinstance(cue, AffectCue) for cue in self.affect):
             raise ValidationError("affect entries must be AffectCue")
+        if any(not isinstance(excerpt, ContextExcerpt) for excerpt in self.excerpts):
+            raise ValidationError("excerpts must contain ContextExcerpt values")
+        if {hit.id for hit in self.hits} & {excerpt.source_memory_id for excerpt in self.excerpts}:
+            raise ValidationError("a bundle cannot contain a full hit and excerpt of one source")
 
     @property
     def hits(self) -> tuple[SearchHit, ...]:
@@ -2279,7 +2574,7 @@ class ContextBundle:
 
     def render(self) -> str:
         """Return the bundle as deterministic sectioned text carrying `[id]` provenance."""
-        included = len(self.hits)
+        included = len(self.hits) + len(self.excerpts)
         lines = [
             f"# Context: {self.goal}",
             CONTEXT_READING_GUIDE,
@@ -2292,6 +2587,9 @@ class ContextBundle:
                 continue
             lines.extend(("", f"## {heading}"))
             lines.extend(_section_line(entry) for entry in section)
+        if self.excerpts:
+            lines.extend(("", "## Partial sources"))
+            lines.extend(render_excerpt_line(excerpt) for excerpt in self.excerpts)
         if self.conflicts:
             lines.extend(("", "## Conflicts"))
             included_ids = {hit.id for hit in self.hits}
@@ -2302,6 +2600,17 @@ class ContextBundle:
         if self.omitted > 0:
             lines.extend(("", f"Omitted: {self.omitted} lower-ranked candidates"))
         return "\n".join(lines)
+
+    def compact(self) -> ContextPresentation:
+        """Return an optional compact view without changing selection or budget accounting.
+
+        Only identifier fields held structurally by the formatter are aliased. Stored content,
+        the goal, conflict values, and diagnostic prose are never searched or rewritten. The
+        existing `render()`, `hits`, and transport document remain the stable-ID presentation.
+        """
+        symbols = _context_symbols(self)
+        text = _compact_context_text(self, symbols)
+        return ContextPresentation(text=text, symbols=symbols, chars=len(text))
 
     def document(self) -> dict[str, object]:
         """Return the field-keyed projection REST, MCP, and the CLI each publish.
@@ -2334,6 +2643,294 @@ class ContextBundle:
         )
 
 
+def _entry_symbol_references(
+    entry: SearchHit | NamedActor | ProvisionalActor,
+) -> tuple[tuple[ContextSymbolNamespace, str, ContextSymbolRole], ...]:
+    if isinstance(entry, SearchHit):
+        references = [
+            (ContextSymbolNamespace.MEMORY, entry.id, ContextSymbolRole.HIT),
+            *(
+                (ContextSymbolNamespace.MEMORY, evidence_id, ContextSymbolRole.EVIDENCE)
+                for evidence_id in (() if entry.context is None else entry.context.evidence_ids)
+            ),
+        ]
+        if isinstance(entry, AffectCue):
+            references.extend(
+                (ContextSymbolNamespace.MEMORY, event_id, ContextSymbolRole.AFFECT_EVENT)
+                for event_id in entry.event_ids
+            )
+        return tuple(references)
+    references = [
+        (ContextSymbolNamespace.IDENTITY, entry.identity_id, ContextSymbolRole.ACTOR),
+        *(
+            (ContextSymbolNamespace.MEMORY, memory_id, ContextSymbolRole.OBSERVED_IN)
+            for memory_id in entry.memory_ids
+        ),
+    ]
+    if isinstance(entry, NamedActor) and entry.naming_assertion_id is not None:
+        references.append(
+            (
+                ContextSymbolNamespace.MEMORY,
+                entry.naming_assertion_id,
+                ContextSymbolRole.NAMING_ASSERTION,
+            )
+        )
+    return tuple(references)
+
+
+def _context_symbols(bundle: ContextBundle) -> tuple[ContextSymbol, ...]:
+    full_memory_ids = {hit.id for hit in bundle.hits}
+    partial_by_memory_id = {excerpt.source_memory_id: excerpt for excerpt in bundle.excerpts}
+    ordered: list[tuple[ContextSymbolNamespace, str]] = []
+    roles: dict[tuple[ContextSymbolNamespace, str], list[ContextSymbolRole]] = {}
+
+    for _heading, section in bundle._sections():
+        for entry in section:
+            for namespace, stable_id, role in _entry_symbol_references(entry):
+                _add_context_symbol_reference(ordered, roles, namespace, stable_id, role)
+    for excerpt in bundle.excerpts:
+        _add_context_symbol_reference(
+            ordered,
+            roles,
+            ContextSymbolNamespace.MEMORY,
+            excerpt.source_memory_id,
+            ContextSymbolRole.EXCERPT,
+        )
+    for conflict in bundle.conflicts:
+        for memory_id in conflict.memory_ids:
+            _add_context_symbol_reference(
+                ordered,
+                roles,
+                ContextSymbolNamespace.MEMORY,
+                memory_id,
+                ContextSymbolRole.CONFLICT,
+            )
+
+    next_number = {ContextSymbolNamespace.MEMORY: 1, ContextSymbolNamespace.IDENTITY: 1}
+    result: list[ContextSymbol] = []
+    for namespace, stable_id in ordered:
+        number = next_number[namespace]
+        next_number[namespace] += 1
+        coverage = _context_symbol_coverage(
+            namespace,
+            stable_id,
+            full_memory_ids,
+            partial_by_memory_id,
+        )
+        result.append(
+            ContextSymbol(
+                symbol=f"{'m' if namespace is ContextSymbolNamespace.MEMORY else 'i'}{number}",
+                namespace=namespace,
+                stable_id=stable_id,
+                coverage=coverage,
+                roles=tuple(roles[(namespace, stable_id)]),
+                selector=(
+                    partial_by_memory_id[stable_id].selector
+                    if coverage is ContextSymbolCoverage.PARTIAL
+                    else None
+                ),
+            )
+        )
+    return tuple(result)
+
+
+def _add_context_symbol_reference(
+    ordered: list[tuple[ContextSymbolNamespace, str]],
+    roles: dict[tuple[ContextSymbolNamespace, str], list[ContextSymbolRole]],
+    namespace: ContextSymbolNamespace,
+    stable_id: str,
+    role: ContextSymbolRole,
+) -> None:
+    key = (namespace, stable_id)
+    if key not in roles:
+        ordered.append(key)
+        roles[key] = []
+    if role not in roles[key]:
+        roles[key].append(role)
+
+
+def _context_symbol_coverage(
+    namespace: ContextSymbolNamespace,
+    stable_id: str,
+    full_memory_ids: Container[str],
+    partial_by_memory_id: Mapping[str, ContextExcerpt],
+) -> ContextSymbolCoverage:
+    if namespace is ContextSymbolNamespace.IDENTITY:
+        return ContextSymbolCoverage.REFERENCE_ONLY
+    if stable_id in full_memory_ids:
+        return ContextSymbolCoverage.FULL
+    if stable_id in partial_by_memory_id:
+        return ContextSymbolCoverage.PARTIAL
+    return ContextSymbolCoverage.REFERENCE_ONLY
+
+
+def _compact_context_text(
+    bundle: ContextBundle,
+    symbols: Sequence[ContextSymbol],
+) -> str:
+    included = len(bundle.hits) + len(bundle.excerpts)
+    lines = [
+        f"# Context: {bundle.goal}",
+        (
+            "Each line is one memory or labelled partial source: [mN] aliases a memory ID and"
+            " [iN] an identity ID. Partial sources include exact offsets and a warning that"
+            " omitted text may qualify them."
+        ),
+        f"Reference time: {bundle.reference_at.isoformat()}",
+        f"Grounding budget: {bundle.chars}/{bundle.budget.max_chars} chars, "
+        f"{included}/{bundle.budget.max_items} items",
+    ]
+    for heading, section in bundle._sections():
+        if not section:
+            continue
+        lines.extend(("", f"## {heading}"))
+        lines.extend(_compact_section_line(entry, symbols) for entry in section)
+    if bundle.excerpts:
+        lines.extend(("", "## Partial sources"))
+        lines.extend(_compact_excerpt_line(excerpt, symbols) for excerpt in bundle.excerpts)
+    if bundle.conflicts:
+        lines.extend(("", "## Conflicts"))
+        included_ids = {hit.id for hit in bundle.hits}
+        lines.extend(
+            _compact_conflict_line(conflict, included_ids, symbols) for conflict in bundle.conflicts
+        )
+    if bundle.unknowns:
+        lines.extend(("", "## Unknowns"))
+        lines.extend(f"- {item.kind.value}: {item.detail}" for item in bundle.unknowns)
+    if bundle.omitted > 0:
+        lines.extend(("", f"Omitted: {bundle.omitted} lower-ranked candidates"))
+    return "\n".join(lines)
+
+
+def _compact_section_line(
+    entry: SearchHit | NamedActor | ProvisionalActor,
+    symbols: Sequence[ContextSymbol],
+) -> str:
+    if isinstance(entry, SearchHit):
+        return _compact_hit_line(entry, symbols)
+    identity = _symbol(entry.identity_id, ContextSymbolNamespace.IDENTITY, symbols)
+    seen = ", ".join(
+        f"[{_symbol(memory_id, ContextSymbolNamespace.MEMORY, symbols)}]"
+        for memory_id in entry.memory_ids
+    )
+    if isinstance(entry, NamedActor):
+        provenance = (
+            "; named by "
+            f"[{_symbol(entry.naming_assertion_id, ContextSymbolNamespace.MEMORY, symbols)}]"
+            if entry.naming_assertion_id
+            else ""
+        )
+        return f"- [{identity}] {entry.name} present (seen in {seen}{provenance})"
+    return f"- [{identity}] unnamed person present (provisional identity; seen in {seen})"
+
+
+def _compact_hit_line(hit: SearchHit, symbols: Sequence[ContextSymbol]) -> str:
+    confidence = 1.0 if hit.context is None else hit.context.confidence
+    marks = (
+        f"confidence {confidence:.2f}{_compact_basis_and_evidence_marks(hit, symbols)}"
+        f"{_affect_marks(hit)}{_validity(hit)}{_compact_affect_hop(hit, symbols)}"
+    )
+    anchor = _symbol(hit.id, ContextSymbolNamespace.MEMORY, symbols)
+    return f"- [{anchor}] {' '.join(hit.content.split())} ({marks})"
+
+
+def _compact_excerpt_line(
+    excerpt: ContextExcerpt,
+    symbols: Sequence[ContextSymbol],
+) -> str:
+    confidence = 1.0 if excerpt.context is None else excerpt.context.confidence
+    offsets = ", ".join(
+        f"{piece.role}:{piece.start_codepoint}-{piece.end_codepoint}"
+        for piece in excerpt.selector.pieces
+    )
+    occurrence = ""
+    if excerpt.occurred_at is not None:
+        occurrence = f"; occurred {excerpt.occurred_at.isoformat()}"
+        if excerpt.occurred_end is not None:
+            occurrence += f"..{excerpt.occurred_end.isoformat()}"
+    validity = ""
+    if excerpt.context is not None:
+        start = excerpt.context.valid_from
+        end = excerpt.context.valid_until
+        if start is not None or end is not None:
+            validity = (
+                "; valid "
+                f"{start.isoformat() if start is not None else '-inf'}"
+                f"..{end.isoformat() if end is not None else '+inf'}"
+            )
+    source = _symbol(excerpt.source_memory_id, ContextSymbolNamespace.MEMORY, symbols)
+    return (
+        f"- [partial source {source}; omitted text may qualify it; offsets {offsets}] "
+        f"{excerpt.content} (confidence {confidence:.2f}{occurrence}{validity})"
+    )
+
+
+def _compact_basis_and_evidence_marks(
+    hit: SearchHit,
+    symbols: Sequence[ContextSymbol],
+) -> str:
+    context = hit.context
+    if context is None or not context.evidence_ids:
+        return ""
+    marks = "" if isinstance(hit, AffectCue) else f"; basis {context.basis.value}"
+    if not isinstance(hit, AffectCue):
+        marks += f"; evidence {_compact_id_list(context.evidence_ids, symbols)}"
+    return marks
+
+
+def _compact_affect_hop(hit: SearchHit, symbols: Sequence[ContextSymbol]) -> str:
+    if not isinstance(hit, AffectCue):
+        return ""
+    marks = ""
+    evidence_ids = () if hit.context is None else hit.context.evidence_ids
+    if evidence_ids:
+        marks += f"; from {_compact_id_list(evidence_ids, symbols)}"
+    if hit.event_ids:
+        marks += f"; co-occurring events {_compact_id_list(hit.event_ids, symbols)}"
+    return marks
+
+
+def _compact_id_list(
+    memory_ids: Sequence[str],
+    symbols: Sequence[ContextSymbol],
+) -> str:
+    shown = ", ".join(
+        f"[{_symbol(memory_id, ContextSymbolNamespace.MEMORY, symbols)}]"
+        for memory_id in memory_ids[:_MAX_CUE_IDS]
+    )
+    remaining = len(memory_ids) - _MAX_CUE_IDS
+    return shown if remaining <= 0 else f"{shown}, +{remaining} more"
+
+
+def _compact_conflict_line(
+    conflict: ContextConflict,
+    included: Container[str],
+    symbols: Sequence[ContextSymbol],
+) -> str:
+    label = " ".join(part for part in (conflict.subject, conflict.predicate) if part)
+    values = " vs ".join(
+        f'"{value}" [{_symbol(memory_id, ContextSymbolNamespace.MEMORY, symbols)}]'
+        if memory_id in included
+        else (
+            f'"{value}" '
+            f"[{_symbol(memory_id, ContextSymbolNamespace.MEMORY, symbols)}, not included]"
+        )
+        for value, memory_id in zip(conflict.values, conflict.memory_ids, strict=True)
+    )
+    return f"- {label or conflict.lineage_id}: {values}"
+
+
+def _symbol(
+    stable_id: str,
+    namespace: ContextSymbolNamespace,
+    symbols: Sequence[ContextSymbol],
+) -> str:
+    for entry in symbols:
+        if entry.namespace is namespace and entry.stable_id == stable_id:
+            return entry.symbol
+    raise RuntimeError("compact context formatter omitted a structural identifier")
+
+
 def _section_line(entry: SearchHit | NamedActor | ProvisionalActor) -> str:
     if isinstance(entry, SearchHit):
         return render_hit_line(entry)
@@ -2363,6 +2960,35 @@ def render_provisional_actor_line(actor: ProvisionalActor) -> str:
     return f"- [{actor.identity_id}] unnamed person present (provisional identity; seen in {seen})"
 
 
+def render_excerpt_line(excerpt: ContextExcerpt) -> str:
+    """Render an exact partial source without presenting it as a complete memory."""
+    confidence = 1.0 if excerpt.context is None else excerpt.context.confidence
+    offsets = ", ".join(
+        f"{piece.role}:{piece.start_codepoint}-{piece.end_codepoint}"
+        for piece in excerpt.selector.pieces
+    )
+    occurrence = ""
+    if excerpt.occurred_at is not None:
+        occurrence = f"; occurred {excerpt.occurred_at.isoformat()}"
+        if excerpt.occurred_end is not None:
+            occurrence += f"..{excerpt.occurred_end.isoformat()}"
+    validity = ""
+    if excerpt.context is not None:
+        start = excerpt.context.valid_from
+        end = excerpt.context.valid_until
+        if start is not None or end is not None:
+            validity = (
+                "; valid "
+                f"{start.isoformat() if start is not None else '-inf'}"
+                f"..{end.isoformat() if end is not None else '+inf'}"
+            )
+    return (
+        f"- [partial source {excerpt.source_memory_id}; omitted text may qualify it;"
+        f" offsets {offsets}] "
+        f"{excerpt.content} (confidence {confidence:.2f}{occurrence}{validity})"
+    )
+
+
 def render_hit_line(hit: SearchHit) -> str:
     """Return the one line `render()` writes for this hit.
 
@@ -2370,9 +2996,23 @@ def render_hit_line(hit: SearchHit) -> str:
     come from the same function and cannot drift.
     """
     confidence = 1.0 if hit.context is None else hit.context.confidence
-    marks = f"confidence {confidence:.2f}{_affect_marks(hit)}{_validity(hit)}{_affect_hop(hit)}"
+    marks = (
+        f"confidence {confidence:.2f}{_basis_and_evidence_marks(hit)}"
+        f"{_affect_marks(hit)}{_validity(hit)}{_affect_hop(hit)}"
+    )
     # One hit is one line, so stored newlines collapse rather than break the section shape.
     return f"- [{hit.id}] {' '.join(hit.content.split())} ({marks})"
+
+
+def _basis_and_evidence_marks(hit: SearchHit) -> str:
+    """Render typed provenance without claiming that a source entails its assertion."""
+    context = hit.context
+    if context is None or not context.evidence_ids:
+        return ""
+    marks = "" if isinstance(hit, AffectCue) else f"; basis {context.basis.value}"
+    if context.evidence_ids and not isinstance(hit, AffectCue):
+        marks += f"; evidence {_id_list(context.evidence_ids)}"
+    return marks
 
 
 def _affect_marks(hit: SearchHit) -> str:

@@ -1092,6 +1092,7 @@ def test_remote_mode_compiles_over_v1(
         "3600",
         "--max-latency-ms",
         "250",
+        "--allow-partial-sources",
     )
 
     assert calls == [
@@ -1109,6 +1110,7 @@ def test_remote_mode_compiles_over_v1(
                     "freshness_seconds": 3600.0,
                     "max_latency_ms": 250,
                 },
+                "allow_partial_sources": True,
             },
         ),
     ]

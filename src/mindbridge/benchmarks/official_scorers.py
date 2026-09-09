@@ -68,7 +68,7 @@ from mindbridge.benchmarks._official.worldmemarena_qa import (
 )
 from mindbridge.benchmarks.personamem_v3 import RANKING_TASK_TYPES
 
-SCORER_VERSION = "official_scorers_v4"
+SCORER_VERSION = "official_scorers_v5"
 
 
 class _Stemmer(Protocol):
@@ -126,7 +126,7 @@ _PROTOCOLS = {
     "longmemeval": "longmemeval_anscheck_2ec2a557f339",
     "clbench": "clbench_binary_rubric_b28a5832a09b",
     "beam": "beam_unified_rubric_3e12035532eb",
-    "personamem-v3": "personamem_v3_rubric_7b00a090b35b",
+    "personamem-v3": "personamem_v3_rubric_7b00a090b35b_ranking_ad80a3b1b322",
     "openeqa": "openeqa_llm_match_cfa3fce4595c",
     "es-memeval": "es_memeval_qa_judge_692624208acc_v1",
 }
@@ -1060,14 +1060,16 @@ def _personamem_local(prediction: str, metadata: Mapping[str, object]) -> dict[s
     negatives = {
         index for index in _index_values(metadata, "negative_indexes") if 0 <= index < count
     }
-    filler_gain = 0.0 if not negatives else 1.0
+    # `_graded_ndcg_at_k` defaults the filler grade to +1; only the hidden-persona runner passes
+    # 0 when its slate carries no hard negatives, and the result is clamped to [0, 1].
+    filler_gain = 0.0 if task_type == "hidden_persona_recommendation" and not negatives else 1.0
     gains = [
         2.0 if index in positives else -2.0 if index in negatives else filler_gain
         for index in ranked
     ]
     ideal = sorted(gains, reverse=True)
     denominator = pm3.dcg(ideal[:5])
-    ndcg_at_5 = max(0.0, pm3.dcg(gains[:5]) / denominator) if denominator > 0 else 0.0
+    ndcg_at_5 = min(1.0, max(0.0, pm3.dcg(gains[:5]) / denominator)) if denominator > 0 else 0.0
     scores = {
         "recall_at_1": pm3.recall_at_k(ranked, positives, 1),
         "recall_at_3": pm3.recall_at_k(ranked, positives, 3),

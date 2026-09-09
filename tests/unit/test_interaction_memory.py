@@ -154,6 +154,24 @@ def _trait_over(memory: Memory, evidence_ids: Sequence[str]) -> MemoryRecord:
     return memory.get(report.operations[0].created_ids[0])
 
 
+def _trait_over_separate_operations(memory: Memory, evidence_ids: Sequence[str]) -> MemoryRecord:
+    """Assert the same trait once per evidence item, making the operations alternatives."""
+    derived_id: str | None = None
+    for evidence_id in evidence_ids:
+        report = memory.consolidate(evidence_ids=(evidence_id,))
+        assert report.rejected == ()
+        assert len(report.operations) == 1
+        record = report.operations[0]
+        changed = (*record.created_ids, *record.changed_ids)
+        assert len(changed) == 1
+        if derived_id is None:
+            derived_id = changed[0]
+        else:
+            assert changed[0] == derived_id
+    assert derived_id is not None
+    return memory.get(derived_id)
+
+
 def test_multimodal_affect_keeps_conflicting_cues_separate(tmp_path: Path) -> None:
     with Memory(
         tmp_path,
@@ -358,7 +376,7 @@ def test_affect_cues_from_two_observations_support_a_trait(tmp_path: Path) -> No
         first = _observe_cues(memory, "I am fine", "session-1")
         second = _observe_cues(memory, "I am okay", "session-2")
 
-        derived = _trait_over(memory, (first[0], second[0]))
+        derived = _trait_over_separate_operations(memory, (first[0], second[0]))
 
         assert derived.context is not None
         assert derived.context.visible is True
@@ -375,7 +393,7 @@ def test_a_derived_cue_and_an_unrelated_observation_are_two_sources(tmp_path: Pa
             context=ObservationContext(source_id="session-2"),
         )
 
-        derived = _trait_over(memory, (cues[0], raw.id))
+        derived = _trait_over_separate_operations(memory, (cues[0], raw.id))
 
         assert derived.context is not None
         assert derived.context.visible is True
@@ -390,7 +408,7 @@ def test_cues_from_two_observations_of_one_capture_are_one_independent_source(
         first = _observe_cues(memory, "I am fine", "session-1")
         second = _observe_cues(memory, "I am okay", "session-1")
 
-        derived = _trait_over(memory, (first[0], second[0]))
+        derived = _trait_over_separate_operations(memory, (first[0], second[0]))
 
         # Independence is counted per capture, not per observation: both captures declared the
         # same `source_id`, so two observations and every cue under them are one group.
@@ -402,7 +420,7 @@ def test_cues_from_two_observations_of_one_capture_are_one_independent_source(
         assert _visible(memory, derived.id) is True
 
 
-def test_rolling_back_a_reinforcement_hides_the_trait_that_cited_it(tmp_path: Path) -> None:
+def test_joint_dependent_does_not_count_its_members_as_independent(tmp_path: Path) -> None:
     with _cue_memory(tmp_path) as memory:
         first = _observe_cues(memory, "I am fine", "session-1")
         second = _observe_cues(memory, "I am okay", "session-2")
@@ -413,18 +431,19 @@ def test_rolling_back_a_reinforcement_hides_the_trait_that_cited_it(tmp_path: Pa
         assert _visible(memory, cited.id) is True
 
         dependent = _trait_over(memory, (cited.id, first[0]))
-        assert _visible(memory, dependent.id) is True
+        assert _visible(memory, dependent.id) is False
 
         assert memory.rollback(reinforcement.operations[0].operation_id) is True
 
-        # The reinforcement was what made the cited trait a group of its own. Rolling it back
-        # puts the cited trait back on `session-1`, which is the only group the dependent has.
+        # The reinforcement made the cited trait visible, but one consolidation operation over
+        # that trait and its cue is still one joint assessment. Rolling the reinforcement back
+        # also hides the cited trait; it cannot authorize the dependent through the remaining cue.
         assert _visible(memory, cited.id) is False
         assert _visible(memory, dependent.id) is False
         assert not any(hit.id == dependent.id for hit in memory.search("reassurance", limit=10))
 
 
-def test_reinforcing_a_cited_cue_makes_the_trait_that_cited_it_visible(tmp_path: Path) -> None:
+def test_reinforcing_one_joint_member_does_not_create_an_alternative(tmp_path: Path) -> None:
     with _cue_memory(tmp_path) as memory:
         cues = _observe_cues(memory, "I am fine", "session-1")
         dependent_id = _trait_over(memory, cues).id
@@ -444,13 +463,13 @@ def test_reinforcing_a_cited_cue_makes_the_trait_that_cited_it_visible(tmp_path:
         # The target has to be shown to the consolidator for it to reinforce it.
         memory.consolidate(evidence_ids=(cues[0], raw.id))
 
-        # The reinforced cue now spans two captures, so it stops inheriting `session-1` and
-        # counts as a group of its own -- a second group for the trait that cites it.
-        assert _visible(memory, dependent_id) is True
-        assert any(hit.id == dependent_id for hit in memory.search("reassurance", limit=10))
+        # Reinforcing one member does not split the earlier operation's joint assertion into two
+        # alternative assessments for the trait that cites both cues.
+        assert _visible(memory, dependent_id) is False
+        assert not any(hit.id == dependent_id for hit in memory.search("anxious", limit=10))
 
 
-def test_deleting_an_observation_hides_the_trait_that_cited_the_dependent(tmp_path: Path) -> None:
+def test_deleting_a_joint_source_cannot_leave_dependent_content_authorized(tmp_path: Path) -> None:
     with _cue_memory(tmp_path) as memory:
         cues = _observe_cues(memory, "I am fine", "session-1")
         raw = memory.add(
@@ -458,10 +477,10 @@ def test_deleting_an_observation_hides_the_trait_that_cited_the_dependent(tmp_pa
             context=ObservationContext(source_id="session-2"),
         )
 
-        cited = _trait_over(memory, (cues[0], raw.id))
+        cited = _trait_over_separate_operations(memory, (cues[0], raw.id))
         dependent = _trait_over(memory, (cited.id, cues[0]))
         assert _visible(memory, cited.id) is True
-        assert _visible(memory, dependent.id) is True
+        assert _visible(memory, dependent.id) is False
 
         assert memory.delete(raw.id) is True
 

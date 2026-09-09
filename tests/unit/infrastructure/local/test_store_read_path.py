@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import struct
 from collections.abc import Sequence
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -83,14 +84,12 @@ def test_hydration_does_not_re_validate_a_stored_vector(tmp_path: Path) -> None:
         _memory_id, embedding_id = _store_one(store, "corrupt", "the kitchen at dusk")
         database_path = store.database_path
 
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.execute(
             "UPDATE embeddings SET vector = ? WHERE embedding_id = ?",
             (struct.pack("<2f", float("nan"), 9.0), embedding_id),
         )
         connection.commit()
-    connection.close()
-
     with LocalStore(directory) as store:
         documents = store.read_index_documents((embedding_id,))
         assert len(documents) == 1

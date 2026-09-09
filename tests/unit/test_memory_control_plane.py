@@ -336,7 +336,7 @@ def test_consolidate_without_a_backend_reports_the_missing_capability(tmp_path: 
 # CONSOLIDATE
 
 
-def test_two_independent_sources_consolidate_into_one_derived_record(tmp_path: Path) -> None:
+def test_two_sources_consolidate_as_one_joint_assessment(tmp_path: Path) -> None:
     consolidator = ScriptedConsolidator()
     with _memory(tmp_path / "derive", consolidator) as memory:
         first, second = _observations(memory, "Ana waited calmly", "Ana waited again, calmly")
@@ -364,11 +364,109 @@ def test_two_independent_sources_consolidate_into_one_derived_record(tmp_path: P
         assert derived.context is not None
         assert derived.context.kind is MemoryKind.TRAIT
         assert set(derived.context.evidence_ids) == {first.id, second.id}
-        # Noisy-OR over two independent sources, not the single-source proposal confidence.
-        assert derived.context.confidence == pytest.approx(1 - 0.4 * 0.4)
-        # A model-inferred trait needs two independent sources to be visible at all.
-        assert derived.context.visible is True
-        assert any(hit.id == derived.id for hit in memory.search("patient", limit=10))
+        # One operation asserted one claim over the full cited set. Its two members are one
+        # assessment, so neither confidence nor the inferred-trait visibility threshold inflates.
+        assert derived.context.confidence == pytest.approx(0.6)
+        assert derived.context.visible is False
+        assert not [hit for hit in memory.search("patient", limit=10) if hit.id == derived.id]
+
+
+def _relation_summary() -> FormationProposal:
+    return FormationProposal(
+        kind=MemoryKind.RELATION,
+        content="Ana waited calmly on Monday and brought tea on Tuesday",
+        subject="Ana",
+        predicate="weekly_routine",
+        value="waited calmly and brought tea",
+        confidence=0.6,
+    )
+
+
+def test_withdrawing_one_member_removes_a_joint_consolidation(tmp_path: Path) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "withdraw-joint", consolidator) as memory:
+        first, second = _observations(
+            memory,
+            "Ana waited calmly on Monday",
+            "Ana brought tea on Tuesday",
+        )
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id, second.id),
+                    proposal=_relation_summary(),
+                ),
+            )
+        )
+        created = memory.consolidate(evidence_ids=(first.id, second.id)).operations[0]
+        derived_id = created.created_ids[0]
+        derived = memory.get(derived_id)
+        assert derived.context is not None
+        assert set(derived.context.evidence_ids) == {first.id, second.id}
+        assert derived.context.confidence == pytest.approx(0.6)
+
+        assert memory.delete(first.id) is True
+        with pytest.raises(MemoryNotFoundError):
+            memory.get(derived_id)
+        assert memory.get(second.id).id == second.id
+
+
+def test_separate_consolidation_keeps_an_independent_alternative(tmp_path: Path) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "consolidation-alternative", consolidator) as memory:
+        first, second, independent = _observations(
+            memory,
+            "Ana waited calmly on Monday",
+            "Ana brought tea on Tuesday",
+            "A separate diary states Ana's Monday and Tuesday routine",
+        )
+        proposal = _relation_summary()
+        consolidator._scripts.extend(
+            (
+                (
+                    MemoryOperation(
+                        intent=MemoryIntent.CONSOLIDATE,
+                        evidence_ids=(first.id, second.id),
+                        proposal=proposal,
+                    ),
+                ),
+                (
+                    MemoryOperation(
+                        intent=MemoryIntent.CONSOLIDATE,
+                        evidence_ids=(independent.id,),
+                        proposal=proposal,
+                    ),
+                ),
+            )
+        )
+        joint = memory.consolidate(evidence_ids=(first.id, second.id)).operations[0]
+        alternative = memory.consolidate(evidence_ids=(independent.id,)).operations[0]
+        assert alternative.changed_ids == joint.created_ids
+        derived_id = joint.created_ids[0]
+
+        assert memory.delete(first.id) is True
+        surviving = memory.get(derived_id)
+        assert surviving.context is not None
+        assert surviving.context.evidence_ids == (independent.id,)
+        assert surviving.context.confidence == pytest.approx(0.6)
+        assert any(hit.id == derived_id for hit in memory.search("weekly routine", limit=10))
+
+        assert memory.rollback(alternative.operation_id) is True
+        unsupported = memory.get(derived_id)
+        assert unsupported.context is not None
+        assert unsupported.context.evidence_ids == ()
+        assert unsupported.context.confidence == 0
+        assert unsupported.context.visible is False
+        assert not [
+            hit for hit in memory.search("weekly routine", limit=10) if hit.id == derived_id
+        ]
+        assert derived_id not in {
+            hit.id
+            for hit in memory.compile(
+                "weekly routine", budget=ContextBudget(min_confidence=0.0)
+            ).hits
+        }
 
 
 def test_re_proposing_the_same_consolidation_is_rejected_as_a_duplicate(tmp_path: Path) -> None:
@@ -604,6 +702,158 @@ def test_rollback_retires_only_the_evidence_the_operation_added(tmp_path: Path) 
         assert reverted.context.evidence_ids == (first.id,)
 
 
+def test_reactivated_evidence_keeps_public_search_history_across_the_inactive_gap(
+    tmp_path: Path,
+) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / "history", consolidator) as memory:
+        first, second = _observations(
+            memory,
+            "Ana waited calmly",
+            "Ana listened without interrupting",
+        )
+        proposal = _trait("Ana", "patient")
+        consolidator._scripts.append(
+            (
+                MemoryOperation(
+                    intent=MemoryIntent.CONSOLIDATE,
+                    evidence_ids=(first.id,),
+                    proposal=proposal,
+                ),
+            )
+        )
+        created = memory.consolidate(evidence_ids=(first.id,)).operations[0]
+        derived_id = created.created_ids[0]
+        before_reinforce = datetime.now(timezone.utc)
+
+        reinforcement = MemoryOperation(
+            intent=MemoryIntent.REINFORCE,
+            target_ids=(derived_id,),
+            evidence_ids=(second.id,),
+        )
+        consolidator._scripts.append((reinforcement,))
+        reinforced = memory.consolidate(evidence_ids=(second.id, derived_id)).operations[0]
+        during_first_life = datetime.now(timezone.utc)
+        assert memory.rollback(reinforced.operation_id) is True
+        inactive_gap = datetime.now(timezone.utc)
+
+        consolidator._scripts.append((reinforcement,))
+        reactivated = memory.consolidate(evidence_ids=(second.id, derived_id)).operations[0]
+        during_second_life = datetime.now(timezone.utc)
+
+        def historical(known_at: datetime) -> SearchHit | None:
+            return next(
+                (
+                    hit
+                    for hit in memory.search(
+                        "Ana patient",
+                        limit=20,
+                        scope=RetrievalScope(known_at=known_at),
+                    )
+                    if hit.id == derived_id
+                ),
+                None,
+            )
+
+        before = historical(before_reinforce)
+        first_life = historical(during_first_life)
+        gap = historical(inactive_gap)
+        second_life = historical(during_second_life)
+        assert before is None
+        assert first_life is not None and first_life.context is not None
+        assert gap is None
+        assert second_life is not None and second_life.context is not None
+        assert first_life.context.evidence_ids == (first.id, second.id)
+        assert second_life.context.evidence_ids == (first.id, second.id)
+
+        assert memory.rollback(reactivated.operation_id) is True
+        # The inverse is a new interval: it does not rewrite either earlier active period.
+        retained = historical(during_first_life)
+        assert retained is not None and retained.context is not None
+        assert retained.context.evidence_ids == (
+            first.id,
+            second.id,
+        )
+
+
+@pytest.mark.parametrize("independent_alternative", (False, True))
+def test_source_withdrawal_does_not_let_a_reinforcement_cycle_ground_itself(
+    tmp_path: Path,
+    independent_alternative: bool,
+) -> None:
+    consolidator = ScriptedConsolidator()
+    with _memory(tmp_path / str(independent_alternative), consolidator) as memory:
+        source = memory.add("Ana supplied the original observation", occurred_at=OCCURRED)
+        independent = (
+            memory.add("A separate observation supports B", occurred_at=OCCURRED)
+            if independent_alternative
+            else None
+        )
+        proposals = (
+            FormationProposal(
+                kind=MemoryKind.STATE,
+                content="Derived fact B",
+                subject="Ana",
+                predicate="fact_b",
+                value="true",
+            ),
+            FormationProposal(
+                kind=MemoryKind.STATE,
+                content="Derived fact C",
+                subject="Ana",
+                predicate="fact_c",
+                value="true",
+            ),
+        )
+        derived_ids: list[str] = []
+        for proposal in proposals:
+            consolidator._scripts.append(
+                (
+                    MemoryOperation(
+                        intent=MemoryIntent.CONSOLIDATE,
+                        evidence_ids=(source.id,),
+                        proposal=proposal,
+                    ),
+                )
+            )
+            derived_ids.append(
+                memory.consolidate(evidence_ids=(source.id,)).operations[0].created_ids[0]
+            )
+        derived_b, derived_c = derived_ids
+
+        for target_id, evidence_id in ((derived_b, derived_c), (derived_c, derived_b)):
+            consolidator._scripts.append(
+                (
+                    MemoryOperation(
+                        intent=MemoryIntent.REINFORCE,
+                        target_ids=(target_id,),
+                        evidence_ids=(evidence_id,),
+                    ),
+                )
+            )
+            assert memory.consolidate(evidence_ids=(target_id, evidence_id)).operations
+        if independent is not None:
+            consolidator._scripts.append(
+                (
+                    MemoryOperation(
+                        intent=MemoryIntent.REINFORCE,
+                        target_ids=(derived_b,),
+                        evidence_ids=(independent.id,),
+                    ),
+                )
+            )
+            assert memory.consolidate(evidence_ids=(derived_b, independent.id)).operations
+
+        assert memory.delete(source.id) is True
+        if independent is None:
+            for derived_id in derived_ids:
+                with pytest.raises(MemoryNotFoundError):
+                    memory.get(derived_id)
+        else:
+            assert memory.get(derived_b).id == derived_b
+            assert memory.get(derived_c).id == derived_c
+
+
 def test_reinforcement_refuses_a_proposal_that_re_cites_an_existing_source(
     tmp_path: Path,
 ) -> None:
@@ -646,18 +896,19 @@ def test_correction_retires_a_derived_inference_and_rollback_restores_it(tmp_pat
     consolidator = ScriptedConsolidator()
     with _memory(tmp_path / "correct", consolidator) as memory:
         first, second = _observations(memory, "Ana waited calmly", "Ana waited again")
-        consolidator._scripts.append(
-            (
-                MemoryOperation(
-                    intent=MemoryIntent.CONSOLIDATE,
-                    evidence_ids=(first.id, second.id),
-                    proposal=_trait("Ana", "patient"),
-                ),
+        proposal = _trait("Ana", "patient")
+        for source in (first, second):
+            consolidator._scripts.append(
+                (
+                    MemoryOperation(
+                        intent=MemoryIntent.CONSOLIDATE,
+                        evidence_ids=(source.id,),
+                        proposal=proposal,
+                    ),
+                )
             )
-        )
-        derived_id = (
-            memory.consolidate(evidence_ids=(first.id, second.id)).operations[0].created_ids[0]
-        )
+            operation = memory.consolidate(evidence_ids=(source.id,)).operations[0]
+        derived_id = operation.created_ids[0] if operation.created_ids else operation.changed_ids[0]
         before = memory.get(derived_id)
         assert before.context is not None
 
@@ -1149,7 +1400,10 @@ def test_consolidation_can_retire_the_detail_its_derived_record_replaces(tmp_pat
         assert set(record.forgotten_ids) == {first.id, second.id}
         assert [row.operation.intent for row in memory.operations()] == [MemoryIntent.CONSOLIDATE]
         assert not [hit for hit in memory.search("Ana waited", limit=10) if hit.id == first.id]
-        assert [hit.id for hit in memory.search("patient", limit=10) if hit.id == derived_id]
+        # The two cited sources are one joint assessment, so this inferred trait is retained for
+        # audit but remains below the two-assessment visibility threshold.
+        assert memory.get(derived_id).context is not None
+        assert not [hit for hit in memory.search("patient", limit=10) if hit.id == derived_id]
         # Lineage survives: the sources are still readable and still cited as evidence.
         assert memory.get(first.id).forgotten_at == record.applied_at
         derived = memory.get(derived_id)
@@ -1571,11 +1825,11 @@ def test_a_deliberated_candidate_leaves_the_queue_until_new_evidence_arrives(
 def test_feedback_and_contradiction_are_derived_from_state_the_store_already_holds(
     tmp_path: Path,
 ) -> None:
-    from mindbridge.context import _CONFLICT_KINDS
     from mindbridge.infrastructure.local.store import _CONFLICT_KINDS as _STORE_CONFLICT_KINDS
 
-    # One infrastructure copy of the compiler's rule; they must not drift apart.
-    assert set(_STORE_CONFLICT_KINDS) == {kind.value for kind in _CONFLICT_KINDS}
+    # Consolidation may inspect accumulating claims, while compilation only groups lineages whose
+    # write contract gives them one standing value.
+    assert set(_STORE_CONFLICT_KINDS) == {"state", "relation", "trait"}
 
     consolidator = ScriptedConsolidator()
     with _memory(tmp_path / "due-feedback", consolidator) as memory:
@@ -1586,26 +1840,21 @@ def test_feedback_and_contradiction_are_derived_from_state_the_store_already_hol
             "Ana snapped at the delay",
             "Ana snapped again at the delay",
         )
-        consolidator._scripts.append(
-            (
-                MemoryOperation(
-                    intent=MemoryIntent.CONSOLIDATE,
-                    evidence_ids=(sources[0].id, sources[1].id),
-                    proposal=_trait("Ana", "patient"),
-                ),
-            )
-        )
-        memory.consolidate(evidence_ids=(sources[0].id, sources[1].id))
-        consolidator._scripts.append(
-            (
-                MemoryOperation(
-                    intent=MemoryIntent.CONSOLIDATE,
-                    evidence_ids=(sources[2].id, sources[3].id),
-                    proposal=_trait("Ana", "impatient"),
-                ),
-            )
-        )
-        memory.consolidate(evidence_ids=(sources[2].id, sources[3].id))
+        for evidence, proposal in (
+            (sources[:2], _trait("Ana", "patient")),
+            (sources[2:], _trait("Ana", "impatient")),
+        ):
+            for source in evidence:
+                consolidator._scripts.append(
+                    (
+                        MemoryOperation(
+                            intent=MemoryIntent.CONSOLIDATE,
+                            evidence_ids=(source.id,),
+                            proposal=proposal,
+                        ),
+                    )
+                )
+                memory.consolidate(evidence_ids=(source.id,))
         memory.reinforce((sources[0].id,))
 
         due = memory.consolidation_candidates()
@@ -1819,7 +2068,9 @@ def test_lineage_supersession_is_logged_and_reversed(tmp_path: Path) -> None:
 
         # The second pass only ever saw `second`; the record it superseded was never shown.
         assert consolidator.calls[-1][0] == (second.id,)
-        assert garden.superseded == ((kitchen_id, 1),)
+        # The explicit support clause restamps the first assertion into version 2 before the
+        # later lineage write supersedes it.
+        assert garden.superseded == ((kitchen_id, 2),)
         retired = memory.get(kitchen_id)
         assert retired.context is not None and retired.context.retired_at is not None
         assert not [hit for hit in memory.search("kitchen", limit=10) if hit.id == kitchen_id]
@@ -1845,8 +2096,8 @@ def test_operations_on_one_lineage_reverse_newest_first(tmp_path: Path) -> None:
         kitchen = _consolidate_state(memory, consolidator, first, "kitchen")
         garden = _consolidate_state(memory, consolidator, second, "garden")
         hall = _consolidate_state(memory, consolidator, third, "hall")
-        assert garden.superseded == ((kitchen.created_ids[0], 1),)
-        assert hall.superseded == ((garden.created_ids[0], 1),)
+        assert garden.superseded == ((kitchen.created_ids[0], 2),)
+        assert hall.superseded == ((garden.created_ids[0], 2),)
 
         # Reversing the middle operation first would restore the kitchen claim beside the hall
         # claim and delete the record the hall claim supersedes. Refused, and nothing moves.
@@ -2001,12 +2252,12 @@ def test_a_query_gathered_window_is_never_widened(tmp_path: Path) -> None:
         assert memory.operations() == ()
 
 
-def _consolidate_trait(
+def _consolidate_relation(
     memory: Memory,
     consolidator: ScriptedConsolidator,
     *sources: tuple[str | None, str],
 ) -> MemoryRecord:
-    """Consolidate one trait out of one observation per `(place_id, household tag)` pair."""
+    """Consolidate one visible relation from one observation per place/tag pair."""
     observed = _observations(
         memory,
         *(f"Ana waited calmly, time {index}" for index in range(len(sources))),
@@ -2019,7 +2270,14 @@ def _consolidate_trait(
             MemoryOperation(
                 intent=MemoryIntent.CONSOLIDATE,
                 evidence_ids=evidence_ids,
-                proposal=_trait("Ana", "patient"),
+                proposal=FormationProposal(
+                    kind=MemoryKind.RELATION,
+                    content="Ana follows a calm waiting routine",
+                    subject="Ana",
+                    predicate="waiting_style",
+                    value="calm",
+                    confidence=0.6,
+                ),
             ),
         )
     )
@@ -2039,18 +2297,22 @@ def test_a_consolidation_inherits_what_all_of_its_evidence_agrees_on(tmp_path: P
     """
     agreeing = ScriptedConsolidator()
     with _memory(tmp_path / "agree", agreeing) as memory:
-        derived = _consolidate_trait(memory, agreeing, ("kitchen", "flat-2"), ("kitchen", "flat-2"))
+        derived = _consolidate_relation(
+            memory, agreeing, ("kitchen", "flat-2"), ("kitchen", "flat-2")
+        )
 
         assert derived.place_id == "kitchen"
         assert derived.metadata == {"household": "flat-2"}
         assert derived.id in {
             hit.id
-            for hit in memory.search("patient", limit=10, scope=RetrievalScope(place_id="kitchen"))
+            for hit in memory.search(
+                "calm waiting", limit=10, scope=RetrievalScope(place_id="kitchen")
+            )
         }
 
     disagreeing = ScriptedConsolidator()
     with _memory(tmp_path / "disagree", disagreeing) as memory:
-        derived = _consolidate_trait(
+        derived = _consolidate_relation(
             memory, disagreeing, ("kitchen", "flat-2"), ("garage", "flat-9")
         )
 
@@ -2058,7 +2320,9 @@ def test_a_consolidation_inherits_what_all_of_its_evidence_agrees_on(tmp_path: P
         assert derived.metadata == {}
         assert derived.id not in {
             hit.id
-            for hit in memory.search("patient", limit=10, scope=RetrievalScope(place_id="kitchen"))
+            for hit in memory.search(
+                "calm waiting", limit=10, scope=RetrievalScope(place_id="kitchen")
+            )
         }
 
 
@@ -2180,17 +2444,19 @@ def test_a_contradiction_nothing_resolved_stops_being_relisted(tmp_path: Path) -
             "Ana snapped again at the delay",
         )
         for pair, value in (((0, 1), "patient"), ((2, 3), "impatient")):
-            cited = (sources[pair[0]].id, sources[pair[1]].id)
-            consolidator._scripts.append(
-                (
-                    MemoryOperation(
-                        intent=MemoryIntent.CONSOLIDATE,
-                        evidence_ids=cited,
-                        proposal=_trait("Ana", value),
-                    ),
+            proposal = _trait("Ana", value)
+            for position in pair:
+                cited = (sources[position].id,)
+                consolidator._scripts.append(
+                    (
+                        MemoryOperation(
+                            intent=MemoryIntent.CONSOLIDATE,
+                            evidence_ids=cited,
+                            proposal=proposal,
+                        ),
+                    )
                 )
-            )
-            memory.consolidate(evidence_ids=cited)
+                memory.consolidate(evidence_ids=cited)
 
         due = _trigger_rows(memory, MemoryTrigger.CONTRADICTION)
         assert len(due) == 1
@@ -2317,17 +2583,19 @@ def test_deliberate_runs_candidates_to_a_fixed_point(tmp_path: Path) -> None:
             "Ana snapped again at the delay",
         )
         for pair, value in (((0, 1), "patient"), ((2, 3), "impatient")):
-            cited = (sources[pair[0]].id, sources[pair[1]].id)
-            scripted._scripts.append(
-                (
-                    MemoryOperation(
-                        intent=MemoryIntent.CONSOLIDATE,
-                        evidence_ids=cited,
-                        proposal=_trait("Ana", value),
-                    ),
+            proposal = _trait("Ana", value)
+            for position in pair:
+                cited = (sources[position].id,)
+                scripted._scripts.append(
+                    (
+                        MemoryOperation(
+                            intent=MemoryIntent.CONSOLIDATE,
+                            evidence_ids=cited,
+                            proposal=proposal,
+                        ),
+                    )
                 )
-            )
-            memory.consolidate(evidence_ids=cited)
+                memory.consolidate(evidence_ids=cited)
 
     resolver = ResolvingConsolidator()
     with _memory(tmp_path, resolver) as memory:

@@ -158,6 +158,10 @@ UNKNOWN = ContextUnknown(
     kind=ContextUnknownKind.BUDGET_EXCLUDED,
     detail="3 candidates did not fit 24 items and 16000 chars",
 )
+EVIDENCE_UNAVAILABLE = ContextUnknown(
+    kind=ContextUnknownKind.EVIDENCE_UNAVAILABLE,
+    detail="a required supporting memory was unavailable",
+)
 
 
 class FakeMemory:
@@ -252,9 +256,10 @@ class FakeMemory:
         budget: ContextBudget | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        allow_partial_sources: bool = False,
     ) -> ContextBundle:
         self._fail()
-        self.calls.append(("compile", goal, budget, reference_at, scope))
+        self.calls.append(("compile", goal, budget, reference_at, scope, allow_partial_sources))
         return _bundle(budget or ContextBudget(), reference_at or NOW)
 
     def reinforce(self, memory_ids: Sequence[str]) -> int:
@@ -387,7 +392,13 @@ async def test_mcp_publishes_only_the_flat_local_tools() -> None:
             "explain",
         },
         "ask_memory": {"question", "limit", "memory_type", "reference_at", "scope"},
-        "compile_context": {"goal", "budget", "reference_at", "scope"},
+        "compile_context": {
+            "goal",
+            "budget",
+            "reference_at",
+            "scope",
+            "allow_partial_sources",
+        },
         "get_memory": {"memory_id"},
         "list_memories": {"limit", "cursor"},
         "delete_memory": {"memory_id"},
@@ -1151,6 +1162,7 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
                     "max_latency_ms": 250,
                 },
                 "reference_at": NOW.isoformat(),
+                "allow_partial_sources": True,
             },
         )
         defaulted = await client.call_tool("compile_context", {"goal": "What should I bring?"})
@@ -1170,8 +1182,9 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
             ),
             NOW,
             None,
+            True,
         ),
-        ("compile", "What should I bring?", None, None, None),
+        ("compile", "What should I bring?", None, None, None, False),
     ]
     bundle = compiled.structured_content
     assert bundle is not None
@@ -1207,7 +1220,11 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
         {
             "kind": "budget_excluded",
             "detail": "3 candidates did not fit 24 items and 16000 chars",
-        }
+        },
+        {
+            "kind": "evidence_unavailable",
+            "detail": "a required supporting memory was unavailable",
+        },
     ]
     assert bundle["frames"] == ["home/map"]
     assert bundle["places"] == ["kitchen"]
@@ -1240,6 +1257,20 @@ async def test_the_compile_tool_returns_the_whole_bundle_without_local_asset_pat
     }
 
 
+@pytest.mark.parametrize("value", (1, "true"))
+async def test_the_compile_tool_requires_a_real_boolean_for_partial_sources(value: object) -> None:
+    memory = FakeMemory()
+    async with Client(build_mcp_server(cast(Memory, memory))) as client:
+        result = await client.call_tool(
+            "compile_context",
+            {"goal": "What should I bring?", "allow_partial_sources": value},
+        )
+
+    assert result.is_error is True
+    assert _error_envelope(result)["code"] == "validation_error"
+    assert memory.calls == []
+
+
 async def test_the_compile_tool_reports_a_named_actor_too() -> None:
     """Mirrors the provisional-actor case above for a person a naming assertion already names.
 
@@ -1257,8 +1288,15 @@ async def test_the_compile_tool_reports_a_named_actor_too() -> None:
         budget: ContextBudget | None = None,
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
+        allow_partial_sources: bool = False,
     ) -> ContextBundle:
-        bundle = original_compile(goal, budget=budget, reference_at=reference_at, scope=scope)
+        bundle = original_compile(
+            goal,
+            budget=budget,
+            reference_at=reference_at,
+            scope=scope,
+            allow_partial_sources=allow_partial_sources,
+        )
         return replace(bundle, actors=(NAMED,))
 
     memory.compile = compile_with_named_actor  # type: ignore[method-assign]
@@ -1518,7 +1556,7 @@ def _bundle(budget: ContextBudget, reference_at: datetime) -> ContextBundle:
         affect=(_affect_cue(),),
         traits=(),
         conflicts=(CONFLICT,),
-        unknowns=(UNKNOWN,),
+        unknowns=(UNKNOWN, EVIDENCE_UNAVAILABLE),
         occurred_from=OCCURRED_FROM,
         occurred_until=OCCURRED_UNTIL,
         frames=("home/map",),

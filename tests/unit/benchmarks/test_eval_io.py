@@ -46,7 +46,10 @@ from mindbridge.benchmarks.eval_telemetry import (
 from mindbridge.benchmarks.model_config import ModelConfig
 from mindbridge.benchmarks.prepare_media import (
     _OPENEQA_FRAME_RATE,
+    _cached_segments,
     _find_media,
+    _has_preprocessable_video,
+    _has_structural_video,
     _m3_manifest,
     _openeqa_episode,
     _openeqa_segments,
@@ -606,6 +609,10 @@ def test_single_boundary_segmentation_avoids_the_segment_muxer(
 
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
+        lambda path: path.is_file() and path.stat().st_size > 0,
+    )
     commands: list[tuple[str, ...]] = []
     expected_segments = [1]
 
@@ -645,6 +652,10 @@ def test_video_segment_cache_repairs_an_interrupted_entry(
 
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
+        lambda path: path.is_file() and path.stat().st_size > 0,
+    )
 
     def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
         assert "0:a:0?" in command
@@ -661,6 +672,260 @@ def test_video_segment_cache_repairs_an_interrupted_entry(
     repaired = _segment_video(source, (1.0, 2.0), tmp_path / "cache", None)
 
     assert [part[2].read_bytes() for part in repaired] == [b"segment", b"segment"]
+
+
+def test_video_segment_cache_rebuilds_a_nonempty_entry_without_video(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
+        lambda path: path.is_file() and path.read_bytes() == b"video",
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_structural_video",
+        lambda path: path.is_file() and path.read_bytes() == b"video",
+    )
+    calls = 0
+
+    def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
+        nonlocal calls
+        calls += 1
+        Path(command[-1]).write_bytes(b"video")
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._run_ffmpeg", run)
+    prepared = _segment_video(source, (1.0,), tmp_path / "cache", None)
+    prepared[0][2].write_bytes(b"audio-only-but-nonempty")
+    # A completed entry is trusted by its marker; an entry whose completion never landed is
+    # probed again and repaired.
+    (prepared[0][2].parent / ".complete").unlink()
+
+    repaired = _segment_video(source, (1.0,), tmp_path / "cache", None)
+
+    assert calls == 2
+    assert repaired[0][2].read_bytes() == b"video"
+
+
+def test_video_segment_retries_only_an_invalid_normal_fps_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
+        lambda path: path.is_file() and path.read_bytes() == b"video",
+    )
+    filters: list[str] = []
+
+    def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
+        video_filter = command[command.index("-vf") + 1]
+        filters.append(video_filter)
+        Path(command[-1]).write_bytes(b"video" if not video_filter.startswith("fps=") else b"audio")
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._run_ffmpeg", run)
+
+    prepared = _segment_video(source, (1.0,), tmp_path / "cache", None)
+
+    assert prepared[0][2].read_bytes() == b"video"
+    assert filters[0].startswith("fps=1,")
+    assert filters[1].startswith("scale=")
+    assert "fps=" not in filters[1]
+
+
+def test_video_segment_native_retry_keeps_valid_normal_segments_byte_identical(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
+        lambda path: path.is_file() and path.read_bytes() in {b"normal", b"native"},
+    )
+    commands: list[tuple[str, ...]] = []
+
+    def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
+        commands.append(tuple(command))
+        output = Path(command[-1])
+        if command[command.index("-vf") + 1].startswith("fps="):
+            Path(str(output).replace("%05d", "00000")).write_bytes(b"normal")
+            Path(str(output).replace("%05d", "00001")).write_bytes(b"one-frame")
+        else:
+            Path(str(output).replace("%05d", "00000")).write_bytes(b"native")
+            Path(str(output).replace("%05d", "00001")).write_bytes(b"native")
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._run_ffmpeg", run)
+
+    prepared = _segment_video(source, (1.0, 2.0), tmp_path / "cache", None)
+
+    assert [part[2].read_bytes() for part in prepared] == [b"normal", b"native"]
+    assert commands[0][commands[0].index("-vf") + 1].startswith("fps=1,")
+    assert commands[1][commands[1].index("-vf") + 1].startswith("scale=")
+
+
+def test_fresh_cache_reuses_only_a_valid_legacy_video_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    cache = tmp_path / ".prepared" / "ffmpeg-v2" / "fixture"
+    legacy = tmp_path / ".prepared" / "ffmpeg-v1" / "fixture" / "legacy" / "segment-00000.mp4"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"video")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
+        lambda path: path.is_file() and path.read_bytes() == b"video",
+    )
+
+    prepared = _cached_segments(
+        source,
+        (1.0,),
+        cache,
+        "fresh",
+        lambda _working: pytest.fail("a valid legacy entry must not be re-encoded"),
+        None,
+        legacy_paths=(legacy,),
+    )
+
+    assert prepared[0][2].read_bytes() == b"video"
+    assert legacy.read_bytes() == b"video"
+
+
+def test_partial_cache_repair_does_not_replace_a_valid_sibling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    target = tmp_path / "cache" / "partial"
+    target.mkdir(parents=True)
+    (target / "segment-00000.mp4").write_bytes(b"valid-sibling")
+    (target / "segment-00001.mp4").write_bytes(b"audio-only")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
+        lambda path: path.is_file() and path.read_bytes() in {b"valid-sibling", b"replacement"},
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_structural_video",
+        lambda path: path.is_file() and path.read_bytes() in {b"valid-sibling", b"replacement"},
+    )
+
+    def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
+        output = Path(command[-1])
+        Path(str(output).replace("%05d", "00000")).write_bytes(b"replacement")
+        Path(str(output).replace("%05d", "00001")).write_bytes(b"replacement")
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._run_ffmpeg", run)
+
+    prepared = _cached_segments(
+        source,
+        (1.0, 2.0),
+        tmp_path / "cache",
+        "partial",
+        lambda working: ["ffmpeg", "-vf", "fps=1", str(working / "segment-%05d.mp4")],
+        None,
+    )
+
+    assert [part[2].read_bytes() for part in prepared] == [b"valid-sibling", b"replacement"]
+
+
+def test_legacy_one_frame_entry_is_repaired_but_new_v2_one_frame_is_reused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    cache = tmp_path / ".prepared" / "ffmpeg-v2" / "fixture"
+    legacy = tmp_path / ".prepared" / "ffmpeg-v1" / "fixture" / "legacy" / "segment-00000.mp4"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"legacy-one-frame")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_structural_video",
+        lambda path: (
+            path.is_file() and path.read_bytes() in {b"legacy-one-frame", b"normal-one", b"native"}
+        ),
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
+        lambda path: path.is_file() and path.read_bytes() == b"native",
+    )
+    filters: list[str] = []
+
+    def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
+        filters.append(command[command.index("-vf") + 1])
+        Path(command[-1]).write_bytes(b"normal-one" if len(filters) == 1 else b"native")
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._run_ffmpeg", run)
+
+    prepared = _cached_segments(
+        source,
+        (1.0,),
+        cache,
+        "fresh",
+        lambda working: ["ffmpeg", "-vf", "fps=1", str(working / "segment-%05d.mp4")],
+        None,
+        fallback_command=lambda working: [
+            "ffmpeg",
+            "-vf",
+            "scale=640:360",
+            str(working / "segment-%05d.mp4"),
+        ],
+        legacy_paths=(legacy,),
+    )
+
+    assert prepared[0][2].read_bytes() == b"native"
+    assert legacy.read_bytes() == b"legacy-one-frame"
+    assert filters == ["fps=1", "scale=640:360"]
+
+    prepared[0][2].write_bytes(b"new-v2-one-frame")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_structural_video",
+        lambda path: path.is_file() and path.read_bytes() == b"new-v2-one-frame",
+    )
+    _cached_segments(
+        source,
+        (1.0,),
+        cache,
+        "fresh",
+        lambda _working: pytest.fail("a completed V2 one-frame object must be reused"),
+        None,
+    )
+
+
+def test_has_preprocessable_video_requires_two_real_frames(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"container")
+    counts = iter(("1\n", "2\n"))
+
+    def probe(_command: tuple[str, ...], **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout=next(counts))
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media.subprocess.run", probe)
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffprobe")
+
+    assert not _has_preprocessable_video(clip)
+    assert _has_preprocessable_video(clip)
+
+
+def test_has_structural_video_accepts_one_real_frame(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"container")
+
+    def probe(_command: tuple[str, ...], **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout="1\n")
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media.subprocess.run", probe)
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffprobe")
+
+    assert _has_structural_video(clip)
 
 
 def test_supermemory_download_keeps_the_whole_causal_subject_history(tmp_path: Path) -> None:
@@ -722,6 +987,10 @@ def test_openeqa_encodes_episode_frames_directly_into_causal_segments(
 
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
+        lambda path: path.is_file() and path.stat().st_size > 0,
+    )
     commands: list[tuple[str, ...]] = []
     listings: list[str] = []
 
@@ -791,6 +1060,10 @@ def test_openeqa_segments_keep_every_frame_at_thirty_second_boundaries(
 
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
+        lambda path: path.is_file() and path.stat().st_size > 0,
+    )
 
     def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
         assert command[command.index("-segment_times") + 1] == ",".join(
@@ -960,6 +1233,10 @@ def test_openeqa_accepts_episode_histories_already_in_the_managed_root(
     _openeqa_episode_frames(frames / episodes[1], "00001", "00002")
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._ffmpeg_id", lambda: "ffmpeg")
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.prepare_media._has_preprocessable_video",
+        lambda path: path.is_file() and path.stat().st_size > 0,
+    )
     monkeypatch.setattr(
         "mindbridge.benchmarks.prepare_media._run_ffmpeg",
         lambda command, _source: Path(command[-1]).write_bytes(b"episode"),

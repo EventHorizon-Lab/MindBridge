@@ -9,7 +9,7 @@ Authoritative visibility and scope were applied by the retrieval path that produ
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from datetime import datetime
 from time import perf_counter
 from types import MappingProxyType
@@ -24,14 +24,18 @@ from mindbridge.types import (
     ContextBudget,
     ContextBundle,
     ContextConflict,
+    ContextExcerpt,
     ContextUnknown,
     ContextUnknownKind,
+    EvidenceBasis,
+    MemoryContext,
     MemoryKind,
     MemoryType,
     Modality,
     NamedActor,
     ProvisionalActor,
     SearchHit,
+    render_excerpt_line,
     render_hit_line,
     render_named_actor_line,
     render_provisional_actor_line,
@@ -99,8 +103,6 @@ _SECTION_MEMORY_TYPES: Mapping[str, frozenset[MemoryType]] = MappingProxyType(
         for name in _SECTIONS
     }
 )
-# Kinds that assert one value about one subject, so two of them in a lineage can disagree.
-_CONFLICT_KINDS = frozenset({MemoryKind.STATE, MemoryKind.RELATION, MemoryKind.TRAIT})
 # Why a candidate the retrieval kernel returned never became a bundle line. Reported as counts
 # under `unknowns` so a caller reading a thin bundle knows which bound produced it.
 _EXCLUSIONS: Mapping[str, str] = MappingProxyType(
@@ -115,6 +117,24 @@ _Claim: TypeAlias = tuple[str, str, str | None, str | None]
 # Resolves affect memory IDs to the event IDs their own observations also formed. The compiler
 # calls it once, for the affect entries the budget actually bought, and never past the deadline.
 _CoDerivedEvents: TypeAlias = Callable[[Sequence[str]], Mapping[str, Sequence[str]]]
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceClosure:
+    """One ranked assertion and every scoped record required to support it.
+
+    This remains an internal compiler value.  `anchor` has its retrieval score; dependencies
+    use zero because they were not query-ranked.  Selection admits `members` atomically.
+    """
+
+    anchor: SearchHit
+    members: tuple[SearchHit, ...]
+
+    def __post_init__(self) -> None:
+        members = tuple(dict.fromkeys(self.members))
+        if self.anchor.id not in {member.id for member in members}:
+            raise ValidationError("an evidence closure must contain its anchor")
+        object.__setattr__(self, "members", members)
 
 
 def evidence_cost(hit: SearchHit) -> int:
@@ -142,6 +162,11 @@ def bundle_cost(hit: SearchHit) -> int:
     more than the zero characters they render as, so the number is an upper bound on the text.
     """
     return len(render_hit_line(hit)) + 1 + _asset_cost(hit)
+
+
+def excerpt_cost(excerpt: ContextExcerpt) -> int:
+    """Return the exact rendered cost of one partial source."""
+    return len(render_excerpt_line(excerpt)) + 1
 
 
 def named_actor_cost(actor: NamedActor) -> int:
@@ -196,6 +221,8 @@ def compile_context(
     provisional: Mapping[str, Sequence[str]] = MappingProxyType({}),
     named: Mapping[str, Sequence[NamedActorLink]] = MappingProxyType({}),
     co_derived_events: _CoDerivedEvents | None = None,
+    closures: Sequence[EvidenceClosure] | None = None,
+    excerpts: Mapping[str, ContextExcerpt] = MappingProxyType({}),
 ) -> ContextBundle:
     """Partition, filter, and budget ranked hits into one bundle.
 
@@ -249,7 +276,62 @@ def compile_context(
     # basis, cue modality, valence, arousal, and evidence IDs on the line: pricing the plain hit
     # and rendering the cue is what let a bundle overrun the `max_chars` it reported.
     candidates = [_affect_cue(hit, ()) if _section(hit) == "affect" else hit for hit in candidates]
-    sections = _select(candidates, budget, overhead)
+    excerpt_candidates = {
+        candidate.id: excerpt
+        for candidate in candidates
+        if (excerpt := excerpts.get(candidate.id)) is not None
+    }
+    closure_by_anchor = {
+        closure.anchor.id: EvidenceClosure(
+            anchor=next(hit for hit in candidates if hit.id == closure.anchor.id),
+            members=tuple(
+                _affect_cue(
+                    next(
+                        (candidate for candidate in candidates if candidate.id == member.id), member
+                    ),
+                    (),
+                )
+                if _section(
+                    next(
+                        (candidate for candidate in candidates if candidate.id == member.id), member
+                    )
+                )
+                == "affect"
+                else next(
+                    (candidate for candidate in candidates if candidate.id == member.id), member
+                )
+                for member in closure.members
+            ),
+        )
+        for closure in closures or ()
+        if any(hit.id == closure.anchor.id for hit in candidates)
+    }
+    has_conflicts = bool(_conflicts(candidates, frozenset(hit.id for hit in candidates)))
+    all_singletons = len(closure_by_anchor) == len(candidates) and all(
+        len(closure.members) == 1 for closure in closure_by_anchor.values()
+    )
+    closed_mode = closures is not None and not (all_singletons and not has_conflicts)
+    selected_closures, peer_withheld = (
+        _expand_conflict_closures(candidates, closure_by_anchor) if closed_mode else ((), 0)
+    )
+    if peer_withheld:
+        # Fail-closed is the rule; failing silently is not. The anchor is in no section, not in
+        # `omitted`, and not in the caller's unknowns, so it has to be named here.
+        unknowns = (
+            *unknowns,
+            ContextUnknown(
+                kind=ContextUnknownKind.EVIDENCE_UNAVAILABLE,
+                detail=(
+                    f"{peer_withheld} ranked assertions were withheld because a conflicting"
+                    " assertion's required evidence was unavailable"
+                ),
+            ),
+        )
+    sections, selected_excerpts = (
+        _select_closures(selected_closures, budget, overhead, excerpt_candidates)
+        if closed_mode
+        else _select(candidates, budget, overhead, excerpt_candidates)
+    )
     # The deadline is checked here, between section assembly and the optional enrichment that
     # follows it. Nothing already computed is discarded and no stage is cut in half, so a bundle
     # under a deadline is a prefix of the one without it, never a different one.
@@ -268,7 +350,20 @@ def compile_context(
             _affect_cue(hit, hops[hit.id]) if isinstance(hit, AffectCue) and hit.id in hops else hit
             for hit in candidates
         ]
-        sections = _select(candidates, budget, overhead)
+        candidate_by_id = {candidate.id: candidate for candidate in candidates}
+        selected_closures = tuple(
+            EvidenceClosure(
+                anchor=candidate_by_id[closure.anchor.id],
+                members=tuple(candidate_by_id.get(member.id, member) for member in closure.members),
+            )
+            for closure in selected_closures
+        )
+        # Affect hops annotate rather than support records, so closed selection stays unchanged.
+        sections, selected_excerpts = (
+            _select_closures(selected_closures, budget, overhead, excerpt_candidates)
+            if closed_mode
+            else _select(candidates, budget, overhead, excerpt_candidates)
+        )
     # Every candidate in this section was converted above; the branch keeps the declared type
     # total rather than asserting it.
     affect = tuple(
@@ -283,7 +378,22 @@ def compile_context(
             key=lambda hit: (-hit.score, hit.id),
         )
     )
-    omitted = len(candidates) - len(included)
+    omitted = (
+        len(selected_closures)
+        - len(
+            {
+                closure.anchor.id
+                for closure in selected_closures
+                if closure.anchor.id
+                in (
+                    {member.id for section in sections.values() for member in section}
+                    | {excerpt.source_memory_id for excerpt in selected_excerpts}
+                )
+            }
+        )
+        if closed_mode
+        else len(candidates) - len(included) - len(selected_excerpts)
+    )
     # Conflict detection reads every candidate the filters kept, not only what the budget bought,
     # so dropping one side of a disagreement for want of a slot cannot make it disappear.
     conflicts = (
@@ -294,16 +404,17 @@ def compile_context(
             frozenset(hit.id for hit in included),
         )
     )
-    occurred_from, occurred_until = _occurred_range(included)
+    selected_evidence: tuple[SearchHit | ContextExcerpt, ...] = (*included, *selected_excerpts)
+    occurred_from, occurred_until = _occurred_range(selected_evidence)
     elapsed_ms = _elapsed_ms(started_at)
     # Actor lines are priced and fit in after the ranked hits, into whatever `_select` left of
     # `max_chars`: `_bundle_chars` already bounds that at or below `max_chars`, so this can
     # never push the total over it. A named identity is never also reported provisional, even
     # if a stale `provisional` entry still names it.
-    base_chars = _bundle_chars(overhead, sections)
-    named_actors = _named_actors(included, named)
+    base_chars = _bundle_chars(overhead, sections, selected_excerpts)
+    named_actors = _named_actors(selected_evidence, named)
     provisional_actors = _provisional_actors(
-        included,
+        selected_evidence,
         provisional,
         exclude=frozenset(actor.identity_id for actor in named_actors),
     )
@@ -341,6 +452,7 @@ def compile_context(
             unknowns,
             budget,
             sections,
+            selected_excerpts,
             excluded,
             omitted,
             skipped=skipped,
@@ -354,14 +466,15 @@ def compile_context(
         ),
         occurred_from=occurred_from,
         occurred_until=occurred_until,
-        frames=_frames(included),
-        places=tuple(sorted({hit.place_id for hit in included if hit.place_id})),
+        frames=_frames(selected_evidence),
+        places=tuple(sorted({hit.place_id for hit in selected_evidence if hit.place_id})),
         omitted=omitted,
         chars=base_chars + actors_heading + actor_chars,
         elapsed_ms=elapsed_ms,
         deadline_exceeded=(
             budget.max_latency_ms is not None and elapsed_ms > budget.max_latency_ms
         ),
+        excerpts=selected_excerpts,
     )
 
 
@@ -396,7 +509,8 @@ def _select(
     candidates: Sequence[SearchHit],
     budget: ContextBudget,
     overhead: int,
-) -> dict[str, tuple[SearchHit, ...]]:
+    excerpts: Mapping[str, ContextExcerpt] = MappingProxyType({}),
+) -> tuple[dict[str, tuple[SearchHit, ...]], tuple[ContextExcerpt, ...]]:
     """Rank decides the top half of `max_items`; the bottom half seats the sections it missed.
 
     Section diversity must not cost rank readability. A floor slot per section at a small budget
@@ -405,7 +519,9 @@ def _select(
     `max_items` can seat every section the candidates span; below that, rank decides all of it.
     """
     sections: dict[str, list[SearchHit]] = {name: [] for name in _SECTIONS}
+    selected_excerpts: list[ContextExcerpt] = []
     taken: set[str] = set()
+    represented: set[str] = set()
     used = overhead
     media = 0
     head = -(-budget.max_items // 2)
@@ -420,7 +536,7 @@ def _select(
             if len(taken) >= ceiling:
                 break
             section = _section(hit)
-            if hit.id in taken or (floor and sections[section]):
+            if hit.id in taken or (floor and section in represented):
                 continue
             if budget.max_media_items is not None and (
                 media + len(hit.assets) > budget.max_media_items
@@ -430,12 +546,154 @@ def _select(
             # One oversized hit does not close the bundle: a cheaper lower-ranked candidate can
             # still fit, and `omitted` reports everything the budget could not buy.
             if used + cost > budget.max_chars:
+                excerpt = excerpts.get(hit.id)
+                if excerpt is None:
+                    continue
+                partial_heading = 0 if selected_excerpts else _heading_cost("partial sources")
+                partial_cost = excerpt_cost(excerpt) + partial_heading
+                if used + partial_cost > budget.max_chars:
+                    continue
+                selected_excerpts.append(excerpt)
+                taken.add(hit.id)
+                represented.add(section)
+                used += partial_cost
                 continue
             sections[section].append(hit)
             taken.add(hit.id)
+            represented.add(section)
             used += cost
             media += len(hit.assets)
-    return {name: tuple(section) for name, section in sections.items()}
+    return (
+        {name: tuple(section) for name, section in sections.items()},
+        tuple(selected_excerpts),
+    )
+
+
+def _expand_conflict_closures(  # noqa: C901 - fixed-point conflict closure is one graph pass
+    candidates: Sequence[SearchHit],
+    closures: Mapping[str, EvidenceClosure],
+) -> tuple[tuple[EvidenceClosure, ...], int]:
+    """Make candidate-bounded conflicting representatives co-required with an anchor.
+
+    Returns the expanded closures and how many anchors were withheld because a conflicting
+    representative had no closure of its own.
+    """
+    representatives: dict[str, tuple[str, ...]] = {}
+    for conflict in _conflicts(candidates, frozenset(hit.id for hit in candidates)):
+        representatives[conflict.lineage_id] = conflict.memory_ids
+    expanded = []
+    withheld = 0
+    for anchor in candidates:
+        closure = closures.get(anchor.id)
+        if closure is None:
+            continue
+        members = {member.id: member for member in closure.members}
+        # Conflict edges are equivalence edges rather than provenance: following them does not
+        # create a bad cycle.  Iterate to a fixed point so a dependency which is itself one side
+        # of an eligible candidate conflict cannot enter alone.
+        pending = [
+            peer_id
+            for member in members.values()
+            if (member_context := member.context) is not None
+            and member_context.lineage_id is not None
+            for peer_id in representatives.get(member_context.lineage_id, ())
+        ]
+        examined: set[str] = set()
+        while pending:
+            peer_id = pending.pop()
+            if peer_id in examined:
+                continue
+            examined.add(peer_id)
+            peer = closures.get(peer_id)
+            if peer is None:
+                # This representative was eligible in the candidate window but its own required
+                # support failed.  A sibling may not make the conflict look complete by itself.
+                members = {}
+                break
+            for member in peer.members:
+                if member.id not in members:
+                    members[member.id] = member
+                member_context = member.context
+                if member_context is not None and member_context.lineage_id is not None:
+                    pending.extend(representatives.get(member_context.lineage_id, ()))
+        if members:
+            expanded.append(EvidenceClosure(anchor, tuple(members.values())))
+        else:
+            withheld += 1
+    return tuple(expanded), withheld
+
+
+def _select_closures(
+    closures: Sequence[EvidenceClosure],
+    budget: ContextBudget,
+    overhead: int,
+    excerpts: Mapping[str, ContextExcerpt] = MappingProxyType({}),
+) -> tuple[dict[str, tuple[SearchHit, ...]], tuple[ContextExcerpt, ...]]:
+    """Greedily admit ranked evidence closures, counting each materialized hit once.
+
+    Unlike the singleton selector, the diversity half-round is deliberately absent: an anchor's
+    support must not lose to a lower-ranked singleton merely because its closure spans slots.
+    """
+    sections: dict[str, list[SearchHit]] = {name: [] for name in _SECTIONS}
+    taken: set[str] = set()
+    media = 0
+    selected_excerpts: dict[str, ContextExcerpt] = {}
+    for closure in closures:
+        marginal = tuple(member for member in closure.members if member.id not in taken)
+        replacing = {member.id for member in marginal if member.id in selected_excerpts}
+        proposed_sections = {name: list(section) for name, section in sections.items()}
+        for member in marginal:
+            proposed_sections[_section(member)].append(member)
+        proposed_excerpts = tuple(
+            excerpt
+            for memory_id, excerpt in selected_excerpts.items()
+            if memory_id not in replacing
+        )
+        item_count = len(taken) + len(marginal) + len(proposed_excerpts)
+        media_cost = sum(len(member.assets) for member in marginal)
+        cost = _bundle_chars(
+            overhead,
+            {name: tuple(section) for name, section in proposed_sections.items()},
+            proposed_excerpts,
+        )
+        full_fits = (
+            item_count <= budget.max_items
+            and (budget.max_media_items is None or media + media_cost <= budget.max_media_items)
+            and cost <= budget.max_chars
+        )
+        if full_fits:
+            sections = proposed_sections
+            for memory_id in replacing:
+                selected_excerpts.pop(memory_id)
+            taken.update(member.id for member in marginal)
+            media += media_cost
+            continue
+        if (
+            len(closure.members) != 1
+            or closure.anchor.id in taken
+            or closure.anchor.id in selected_excerpts
+        ):
+            continue
+        excerpt = excerpts.get(closure.anchor.id)
+        if excerpt is None:
+            continue
+        proposed_excerpts = (*selected_excerpts.values(), excerpt)
+        if len(taken) + len(proposed_excerpts) > budget.max_items:
+            continue
+        if (
+            _bundle_chars(
+                overhead,
+                {name: tuple(section) for name, section in sections.items()},
+                proposed_excerpts,
+            )
+            > budget.max_chars
+        ):
+            continue
+        selected_excerpts[closure.anchor.id] = excerpt
+    return (
+        {name: tuple(section) for name, section in sections.items()},
+        tuple(selected_excerpts.values()),
+    )
 
 
 def _affect_cue(hit: SearchHit, event_ids: Sequence[str]) -> AffectCue:
@@ -452,12 +710,24 @@ def _affect_cue(hit: SearchHit, event_ids: Sequence[str]) -> AffectCue:
     )
 
 
-def _bundle_chars(overhead: int, sections: Mapping[str, tuple[SearchHit, ...]]) -> int:
+def _bundle_chars(
+    overhead: int,
+    sections: Mapping[str, tuple[SearchHit, ...]],
+    excerpts: Sequence[ContextExcerpt] = (),
+) -> int:
     """Return what this bundle charged against `max_chars`, priced exactly as `_select` did."""
-    return overhead + sum(
-        _heading_cost(name) + sum(bundle_cost(hit) for hit in section)
-        for name, section in sections.items()
-        if section
+    return (
+        overhead
+        + sum(
+            _heading_cost(name) + sum(bundle_cost(hit) for hit in section)
+            for name, section in sections.items()
+            if section
+        )
+        + (
+            _heading_cost("partial sources") + sum(excerpt_cost(excerpt) for excerpt in excerpts)
+            if excerpts
+            else 0
+        )
     )
 
 
@@ -472,6 +742,7 @@ def _unknowns(
     supplied: Sequence[ContextUnknown],
     budget: ContextBudget,
     sections: Mapping[str, tuple[SearchHit, ...]],
+    excerpts: Sequence[ContextExcerpt],
     excluded: Mapping[str, int],
     omitted: int,
     *,
@@ -517,7 +788,7 @@ def _unknowns(
                 ),
             )
         )
-    found.extend(_section_empty(budget, sections))
+    found.extend(_section_empty(budget, sections, excerpts))
     if skipped:
         found.append(
             ContextUnknown(
@@ -534,6 +805,7 @@ def _unknowns(
 def _section_empty(
     budget: ContextBudget,
     sections: Mapping[str, tuple[SearchHit, ...]],
+    excerpts: Sequence[ContextExcerpt],
 ) -> tuple[ContextUnknown, ...]:
     """Name each section a `memory_types` request left empty, and why it is empty.
 
@@ -551,6 +823,7 @@ def _section_empty(
     if requested is None:
         return ()
     present = frozenset(hit.memory_type for section in sections.values() for hit in section)
+    present |= frozenset(excerpt.memory_type for excerpt in excerpts)
     found: list[ContextUnknown] = []
     for name in _SECTIONS:
         if sections[name]:
@@ -581,7 +854,7 @@ def _conflicts(
     lineages: dict[str, list[_Claim]] = {}
     for hit in hits:
         context = hit.context
-        if context is None or context.kind not in _CONFLICT_KINDS:
+        if context is None or not _has_functional_lineage(context):
             continue
         lineage_id, value = context.lineage_id, context.value
         if lineage_id is None or value is None:
@@ -595,6 +868,13 @@ def _conflicts(
         for lineage_id, claims in lineages.items()
         if any(memory_id in included_ids for _value, memory_id, _subject, _predicate in claims)
         and (conflict := _lineage_conflict(lineage_id, claims)) is not None
+    )
+
+
+def _has_functional_lineage(context: MemoryContext) -> bool:
+    """Match the claims whose write contract gives one standing value per lineage."""
+    return context.kind is MemoryKind.STATE or (
+        context.kind is MemoryKind.TRAIT and context.basis is EvidenceBasis.USER_STATEMENT
     )
 
 
@@ -614,7 +894,9 @@ def _lineage_conflict(lineage_id: str, claims: Sequence[_Claim]) -> ContextConfl
     )
 
 
-def _occurred_range(hits: Sequence[SearchHit]) -> tuple[datetime | None, datetime | None]:
+def _occurred_range(
+    hits: Sequence[SearchHit | ContextExcerpt],
+) -> tuple[datetime | None, datetime | None]:
     spans = tuple(
         (hit.occurred_at, hit.occurred_end or hit.occurred_at)
         for hit in hits
@@ -625,7 +907,7 @@ def _occurred_range(hits: Sequence[SearchHit]) -> tuple[datetime | None, datetim
     return min(start for start, _end in spans), max(end for _start, end in spans)
 
 
-def _frames(hits: Sequence[SearchHit]) -> tuple[str, ...]:
+def _frames(hits: Sequence[SearchHit | ContextExcerpt]) -> tuple[str, ...]:
     return tuple(
         sorted(
             {
@@ -638,7 +920,7 @@ def _frames(hits: Sequence[SearchHit]) -> tuple[str, ...]:
 
 
 def _provisional_actors(
-    hits: Sequence[SearchHit],
+    hits: Sequence[SearchHit | ContextExcerpt],
     provisional: Mapping[str, Sequence[str]],
     *,
     exclude: frozenset[str] = frozenset(),
@@ -654,12 +936,13 @@ def _provisional_actors(
         return ()
     observed: dict[str, list[str]] = {}
     for hit in hits:
-        for identity_id in provisional.get(hit.id, ()):
+        memory_id = _evidence_id(hit)
+        for identity_id in provisional.get(memory_id, ()):
             if identity_id in exclude:
                 continue
             memory_ids = observed.setdefault(identity_id, [])
-            if hit.id not in memory_ids:
-                memory_ids.append(hit.id)
+            if memory_id not in memory_ids:
+                memory_ids.append(memory_id)
     return tuple(
         ProvisionalActor(identity_id=identity_id, memory_ids=tuple(memory_ids))
         for identity_id, memory_ids in sorted(observed.items())
@@ -667,7 +950,7 @@ def _provisional_actors(
 
 
 def _named_actors(
-    hits: Sequence[SearchHit],
+    hits: Sequence[SearchHit | ContextExcerpt],
     named: Mapping[str, Sequence[NamedActorLink]],
 ) -> tuple[NamedActor, ...]:
     """Name every identity the included evidence's identity edge names, in identity order.
@@ -682,12 +965,13 @@ def _named_actors(
     assertions: dict[str, str | None] = {}
     observed: dict[str, list[str]] = {}
     for hit in hits:
-        for identity_id, name, naming_assertion_id in named.get(hit.id, ()):
+        memory_id = _evidence_id(hit)
+        for identity_id, name, naming_assertion_id in named.get(memory_id, ()):
             names[identity_id] = name
             assertions[identity_id] = naming_assertion_id
             memory_ids = observed.setdefault(identity_id, [])
-            if hit.id not in memory_ids:
-                memory_ids.append(hit.id)
+            if memory_id not in memory_ids:
+                memory_ids.append(memory_id)
     return tuple(
         NamedActor(
             identity_id=identity_id,
@@ -697,6 +981,10 @@ def _named_actors(
         )
         for identity_id, memory_ids in sorted(observed.items())
     )
+
+
+def _evidence_id(hit: SearchHit | ContextExcerpt) -> str:
+    return hit.id if isinstance(hit, SearchHit) else hit.source_memory_id
 
 
 def _fit_actors(

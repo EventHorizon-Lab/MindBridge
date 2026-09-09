@@ -20,7 +20,7 @@ from mindbridge.benchmarks.clbench import (
     split_question,
 )
 from mindbridge.benchmarks.download import _patterns
-from mindbridge.benchmarks.eval_adapters import load_task
+from mindbridge.benchmarks.eval_adapters import LoadedTask, load_task
 from mindbridge.benchmarks.longmemeval import load_longmemeval
 from mindbridge.benchmarks.memlens import load_memlens
 from mindbridge.benchmarks.openeqa import OPENEQA_SPLITS, episode_frames, load_openeqa
@@ -950,9 +950,9 @@ def test_longmemeval_labels_the_answer_turn_and_every_block_it_was_split_into(
 ) -> None:
     """`has_answer` marks the turn, which is finer than `answer_session_ids`.
 
-    A turn over the part limit is stored as several `_B####` blocks, and every block
-    of a marked turn is gold: labelling only the unsplit ID would score a correct
-    retrieval as a miss on exactly the long turns that motivated the split.
+    A turn over the part limit is stored as several blocks, and every block of a
+    marked turn is gold: labelling only one block would score a correct retrieval
+    as a miss on exactly the long turns that motivated the split.
     """
     from mindbridge.benchmarks.eval_adapters import _TEXT_BLOCK_CHARACTERS, load_task
 
@@ -992,17 +992,87 @@ def test_longmemeval_labels_the_answer_turn_and_every_block_it_was_split_into(
     gold = question.metadata["evidence_ids"]
 
     assert stored == (
-        "S0000_s1_T0000",
-        "S0000_s1_T0001",
-        "S0001_s2_T0000",
-        "S0001_s2_T0001_B0000",
-        "S0001_s2_T0001_B0001",
+        "M000000",
+        "M000001",
+        "M000002",
+        "M000003",
+        "M000004",
     )
-    assert gold == ("S0001_s2_T0001_B0000", "S0001_s2_T0001_B0001")
+    assert gold == ("M000003", "M000004")
     assert set(gold) <= set(stored)
     # The coarser session label the release also publishes stays available and stays
     # separate: it is not a source-level ID and must not be read as one.
     assert question.metadata["answer_session_ids"] == ("s2",)
+
+
+def test_longmemeval_source_labels_are_evaluator_only(tmp_path: Path) -> None:
+    """Changing release labels cannot change stored memories or their gold join."""
+    from mindbridge.benchmarks.eval import _cache_task, _memory_content, _memory_metadata
+    from mindbridge.benchmarks.longmemeval import LONGMEMEVAL_ADAPTER_VERSION
+
+    def load_with_labels(first: str, second: str) -> LoadedTask:
+        _write(
+            tmp_path / "longmemeval" / "longmemeval_s",
+            [
+                _longmemeval_question(
+                    question_id="opaque-labels",
+                    haystack_dates=[
+                        "2023/05/20 (Sat) 02:21",
+                        "2023/05/21 (Sun) 03:22",
+                    ],
+                    haystack_session_ids=[first, second],
+                    haystack_sessions=[
+                        [
+                            {
+                                "role": "user",
+                                "content": "The literal _answer_ token belongs in my note.",
+                            }
+                        ],
+                        [
+                            {
+                                "role": "assistant",
+                                "content": "The appointment is Tuesday.",
+                                "has_answer": True,
+                            }
+                        ],
+                    ],
+                    answer_session_ids=[second],
+                )
+            ],
+        )
+        return load_task(TASKS["longmemeval-s"], root=tmp_path, verify_digest=False)
+
+    plain = load_with_labels("plain-first", "plain-second")
+    labelled = load_with_labels("release_answer_7_abs", "answer_session_answer_9")
+    plain_unit = plain.units[0]
+    labelled_unit = labelled.units[0]
+
+    assert plain_unit.memories == labelled_unit.memories
+    assert tuple(item.source_id for item in labelled_unit.memories) == (
+        "M000000",
+        "M000001",
+    )
+    assert len({item.source_id for item in labelled_unit.memories}) == len(labelled_unit.memories)
+    assert tuple(_memory_content(item) for item in plain_unit.memories) == tuple(
+        _memory_content(item) for item in labelled_unit.memories
+    )
+    assert tuple(_memory_metadata(item) for item in plain_unit.memories) == tuple(
+        _memory_metadata(item) for item in labelled_unit.memories
+    )
+    assert "_answer_" in str(_memory_content(labelled_unit.memories[0]))
+    assert all(
+        metadata["source_id"] == item.source_id
+        for item, metadata in ((item, _memory_metadata(item)) for item in labelled_unit.memories)
+    )
+    assert plain_unit.questions[0].metadata["evidence_ids"] == ("M000001",)
+    assert labelled_unit.questions[0].metadata["evidence_ids"] == ("M000001",)
+    assert (
+        plain_unit.questions[0].metadata["answer_session_ids"]
+        != labelled_unit.questions[0].metadata["answer_session_ids"]
+    )
+    assert LONGMEMEVAL_ADAPTER_VERSION == "longmemeval_official_v2"
+    assert TASKS["longmemeval-s"].adapter_version == LONGMEMEVAL_ADAPTER_VERSION
+    assert f":{LONGMEMEVAL_ADAPTER_VERSION}:" in _cache_task(labelled)
 
 
 def test_longmemeval_reports_no_gold_evidence_when_the_release_marks_no_turn(

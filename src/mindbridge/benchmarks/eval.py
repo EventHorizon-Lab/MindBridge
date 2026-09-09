@@ -52,6 +52,7 @@ from mindbridge import (
     AsyncMemory,
     ContextBudget,
     ContextBundle,
+    ContextExcerpt,
     FaceAnalysis,
     FunASRTranscriber,
     IndexUnavailableError,
@@ -189,6 +190,7 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_REVISION,
 )
 from mindbridge.models.openai_sdk import (
+    _json_text,
     _model_usage,
     _record_openai_provenance,
     _record_usage_batch,
@@ -202,8 +204,8 @@ _GOLD_EVIDENCE_KEYS = ("evidence_ids", "clue_ids")
 _UNRESOLVED_EVIDENCE_KEY = "unresolved_evidence_ids"
 _RECALL_CUTOFFS = (1, 5, 10, 20)
 _MANDATORY_CONTROLS = ("random_ranker", "blind", "recall_at_20")
-EVAL_SCHEMA_VERSION = 15
-EVAL_RUNNER_VERSION = "mindbridge_eval_official_v15"
+EVAL_SCHEMA_VERSION = 17
+EVAL_RUNNER_VERSION = "mindbridge_eval_official_v16"
 DEFAULT_ARM = "mindbridge"
 BASELINE_ARMS = ("blind", "full-context", "random", "compile")
 ARMS = (DEFAULT_ARM, *BASELINE_ARMS)
@@ -312,6 +314,7 @@ class _Arguments:
     deliberate: bool
     compile_max_items: int
     compile_max_chars: int
+    compile_allow_partial_sources: bool
     model_args: str
     memory_config: Path | None
     judge_model_args: str
@@ -335,6 +338,7 @@ class _Arguments:
     overwrite: bool
     resume: bool
     quiet: bool
+    fallback_reference_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,6 +378,62 @@ class FailureDetail:
             "stage": self.stage,
             "cause_type": self.cause_type,
         }
+
+
+class _SystemicEmbeddingFailure(RuntimeError):
+    """Stop a benchmark unit when the shared embedding service cannot serve requests."""
+
+
+_SYSTEMIC_EMBEDDING_HTTP_STATUSES = frozenset({401, 403, 404, 405, 408, 429, *range(500, 600)})
+
+
+def _exception_chain(error: BaseException) -> tuple[BaseException, ...]:
+    chain: list[BaseException] = []
+    pending: BaseException | None = error
+    seen: set[int] = set()
+    while pending is not None and id(pending) not in seen:
+        seen.add(id(pending))
+        chain.append(pending)
+        pending = pending.__cause__ or pending.__context__
+    return tuple(chain)
+
+
+def _systemic_embedding_failure(error: BaseException) -> bool:
+    """Recognize failures for which recursive item isolation only amplifies an outage."""
+    for current in _exception_chain(error):
+        response = getattr(current, "response", None)
+        status = getattr(response, "status_code", None)
+        if status is None:
+            status = getattr(current, "status_code", None)
+        if status in _SYSTEMIC_EMBEDDING_HTTP_STATUSES:
+            return True
+        transport_type = type(current)
+        if isinstance(current, (TimeoutError, ConnectionError)) or (
+            transport_type.__module__.split(".", maxsplit=1)[0] in {"httpx", "httpcore"}
+            and transport_type.__name__
+            in {
+                "ConnectError",
+                "ConnectTimeout",
+                "PoolTimeout",
+                "ReadTimeout",
+                "TimeoutException",
+                "WriteTimeout",
+            }
+        ):
+            return True
+    return False
+
+
+def _raise_if_systemic_embedding(error: Exception, message: str) -> None:
+    if _systemic_embedding_stage_failure(error):
+        raise _SystemicEmbeddingFailure(message) from error
+
+
+def _systemic_embedding_stage_failure(error: Exception) -> bool:
+    return _systemic_embedding_failure(error) and any(
+        isinstance(current, MindBridgeError) and current.stage == "embed"
+        for current in _exception_chain(error)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,6 +479,10 @@ class SampleResult:
     prompt: tuple[str, ...] | None = None
     references: tuple[str, ...] | None = None
     evidence: tuple[EvidenceInterval, ...] = ()
+    # Partial sources stay separate so a scorer cannot silently credit an omitted span as if the
+    # full parent had been delivered.
+    excerpt_source_ids: tuple[str, ...] = ()
+    excerpt_evidence: tuple[EvidenceInterval, ...] = ()
     ref_at_300: float | None = None
     metrics: Mapping[str, float] = field(default_factory=dict)
     scorer_protocol: str | None = None
@@ -457,6 +521,8 @@ class SampleResult:
             "memory_ids": self.memory_ids,
             "candidate_count": self.candidate_count,
             "evidence": tuple(item.json() for item in self.evidence),
+            "excerpt_source_ids": self.excerpt_source_ids,
+            "excerpt_evidence": tuple(item.json() for item in self.excerpt_evidence),
             "ref_at_300": self.ref_at_300,
             "metrics": dict(self.metrics),
             "scorer_protocol": self.scorer_protocol,
@@ -524,6 +590,8 @@ class _AnswerOutcome:
     # computable per answered question without a second call to reconstruct it.
     compiled_chars: int | None = None
     compiled_items: int | None = None
+    excerpt_source_ids: tuple[str, ...] = ()
+    excerpt_evidence: tuple[EvidenceInterval, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,6 +601,7 @@ class _Arm:
     name: str
     generator: _BaselineGenerator | None = None
     seed: int = 0
+    allow_partial_sources: bool = False
 
     @property
     def retrieves(self) -> bool:
@@ -604,23 +673,54 @@ class _BaselineGenerator:
             if stanza.max_tokens is not None and self._max_tokens is None:
                 self._max_tokens = stanza.max_tokens
         self._extra_body = extra_body or None
+        self._generation_capabilities = config.generation_capabilities
+        self._query_asset_cache: dict[Path, AssetRef] = {}
+        self._native_media = OpenAIModels(
+            generation_client=cast(Any, self._client),
+            generation_model=self._model,
+            generation_capabilities=self._generation_capabilities,
+            generation_seed=self._seed,
+            generation_temperature=0.0,
+            generation_max_tokens=self._max_tokens,
+            generation_min_video_seconds=config.generation_min_video_seconds,
+            generation_video_limit=(8 if stanza is None else stanza.video_limit),
+            generation_extra_body=self._extra_body,
+        )
 
-    async def answer(self, question: str, context: str | None) -> str:
+    async def answer(
+        self,
+        question: str,
+        context: str | None,
+        *,
+        question_assets: Sequence[Path] = (),
+        evidence_hits: Sequence[SearchHit] = (),
+    ) -> str:
         system = _BLIND_SYSTEM_PROMPT if context is None else _FULL_CONTEXT_SYSTEM_PROMPT
         user = question if context is None else f"Context:\n{context}\n\nQuestion:\n{question}"
-        request: dict[str, Any] = {
-            "model": self._model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0.0,
-            "seed": self._seed,
-        }
-        if self._max_tokens is not None:
-            request["max_tokens"] = self._max_tokens
-        if self._extra_body is not None:
-            request["extra_body"] = self._extra_body
+        resolved_question_assets = tuple(self._query_asset(path) for path in question_assets)
+        if resolved_question_assets or any(hit.assets for hit in evidence_hits):
+            request, modalities = self._native_media_request(
+                question,
+                user,
+                system,
+                resolved_question_assets,
+                evidence_hits,
+            )
+        else:
+            request = {
+                "model": self._model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0.0,
+                "seed": self._seed,
+            }
+            if self._max_tokens is not None:
+                request["max_tokens"] = self._max_tokens
+            if self._extra_body is not None:
+                request["extra_body"] = self._extra_body
+            modalities = frozenset({Modality.TEXT})
         with model_span(
             self._tracer,
             "mindbridge.model.generation",
@@ -630,7 +730,9 @@ class _BaselineGenerator:
                 "gen_ai.operation.name": "chat",
                 "gen_ai.request.model": self._model,
                 "mindbridge.model.batch_size": 1,
-                "mindbridge.input.modalities": (Modality.TEXT.value,),
+                "mindbridge.input.modalities": tuple(
+                    sorted(modality.value for modality in modalities)
+                ),
             },
         ):
             usages = []
@@ -641,13 +743,198 @@ class _BaselineGenerator:
                 usages.append(
                     _model_usage(
                         response,
-                        input_modalities=frozenset({Modality.TEXT}),
+                        input_modalities=modalities,
                         output_modalities=frozenset({Modality.TEXT}),
                     )
                 )
                 return str(response.choices[0].message.content or "").strip()
             finally:
                 _record_usage_batch(usages, request_count=1)
+
+    def _query_asset(self, path: Path) -> AssetRef:
+        resolved = path.expanduser().resolve(strict=True)
+        cached = self._query_asset_cache.get(resolved)
+        if cached is not None:
+            return cached
+        modality = _MODALITY_BY_SUFFIX.get(resolved.suffix.casefold())
+        if modality is None:
+            raise ValueError(f"benchmark query media has unsupported suffix: {resolved}")
+        media_types = {
+            Modality.AUDIO: {
+                ".aac": "audio/aac",
+                ".flac": "audio/flac",
+                ".m4a": "audio/mp4",
+                ".mp3": "audio/mpeg",
+                ".wav": "audio/wav",
+            },
+            Modality.IMAGE: {".jpeg": "image/jpeg", ".jpg": "image/jpeg", ".png": "image/png"},
+            Modality.VIDEO: {
+                ".mkv": "video/x-matroska",
+                ".mov": "video/quicktime",
+                ".mp4": "video/mp4",
+                ".webm": "video/webm",
+            },
+        }
+        digest = hashlib.sha256()
+        with resolved.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        asset_id = digest.hexdigest()
+        asset = AssetRef(
+            id=asset_id,
+            modality=modality,
+            media_type=media_types[modality][resolved.suffix.casefold()],
+            size_bytes=resolved.stat().st_size,
+            sha256=asset_id,
+            name=resolved.name,
+            path=resolved,
+        )
+        self._query_asset_cache[resolved] = asset
+        return asset
+
+    def _native_media_request(
+        self,
+        question: str,
+        user: str,
+        system: str,
+        question_assets: tuple[AssetRef, ...],
+        evidence_hits: Sequence[SearchHit],
+    ) -> tuple[dict[str, Any], frozenset[Modality]]:
+        # Reuse the product adapter's capability checks, integrity checks, media-size fitting,
+        # video limits, and native part preparation. The benchmark then restores its existing
+        # context prompt; no benchmark labels or reference answers participate in this request.
+        hits = tuple(evidence_hits)
+        if not hits:
+            hits = (
+                SearchHit(
+                    id="benchmark-compiled-context",
+                    content=user,
+                    score=1.0,
+                    created_at=datetime(1970, 1, 1, tzinfo=timezone.utc),
+                ),
+            )
+        prepared = self._native_media._answer_request(
+            ModelInput(text=question, assets=question_assets), hits
+        )
+        if isinstance(prepared, AbstentionReason):
+            raise RuntimeError("native-media preparation rejected a compiled context")
+        request, grounded, _prepared_modalities = prepared
+        messages = cast(list[dict[str, object]], request["messages"])
+        native_content = messages[-1]["content"]
+        if isinstance(native_content, str):
+            content: str | list[dict[str, object]] = user
+        else:
+            content = self._bound_native_content(
+                user,
+                question_assets,
+                grounded,
+                cast(Sequence[dict[str, object]], native_content),
+            )
+        request["messages"] = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ]
+        modalities = {Modality.TEXT}
+        kind_to_modality = {
+            "image_url": Modality.IMAGE,
+            "video_url": Modality.VIDEO,
+            "input_audio": Modality.AUDIO,
+        }
+        if not isinstance(content, str):
+            modalities.update(
+                kind_to_modality[kind]
+                for part in content
+                if isinstance((kind := part.get("type")), str) and kind in kind_to_modality
+            )
+        return cast(dict[str, Any], request), frozenset(modalities)
+
+    @classmethod
+    def _bound_native_content(
+        cls,
+        user: str,
+        question_assets: Sequence[AssetRef],
+        grounded: Sequence[SearchHit],
+        native_content: Sequence[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        groups = cls._native_media_groups(native_content)
+        if len(groups) != len(grounded) + 1:
+            raise RuntimeError("native-media preparation did not align with selected hits")
+        content: list[dict[str, object]] = [{"type": "text", "text": user}]
+        seen_assets: set[str] = set()
+        query_media = groups[0]
+        query_asset_ids = cls._unseen_asset_ids(question_assets, seen_assets)
+        if bool(query_media) != bool(query_asset_ids):
+            raise RuntimeError("native query media did not align with its asset references")
+        if query_media:
+            content.append({"type": "text", "text": _json_text({"query_assets": query_asset_ids})})
+            content.extend(query_media)
+        for hit, media in zip(grounded, groups[1:], strict=True):
+            asset_ids = cls._unseen_asset_ids(hit.assets, seen_assets)
+            if bool(media) != bool(asset_ids):
+                raise RuntimeError("native evidence media did not align with its source hit")
+            if media:
+                content.append(
+                    {
+                        "type": "text",
+                        "text": _json_text({"memory_assets": cls._media_binding(hit, asset_ids)}),
+                    }
+                )
+                content.extend(media)
+        return content
+
+    @staticmethod
+    def _unseen_asset_ids(assets: Sequence[AssetRef], seen: set[str]) -> tuple[str, ...]:
+        ids: list[str] = []
+        for asset in assets:
+            if asset.id in seen:
+                continue
+            seen.add(asset.id)
+            ids.append(asset.id)
+        return tuple(ids)
+
+    @staticmethod
+    def _native_media_groups(
+        content: Sequence[dict[str, object]],
+    ) -> tuple[tuple[dict[str, object], ...], ...]:
+        """Split product-prepared native parts at their existing JSON text labels."""
+        groups: list[tuple[dict[str, object], ...]] = []
+        media: list[dict[str, object]] | None = None
+        for part in content:
+            if part.get("type") == "text":
+                if media is not None:
+                    groups.append(tuple(media))
+                media = []
+            elif media is None:
+                raise RuntimeError("native-media preparation emitted an unlabeled media part")
+            else:
+                media.append(part)
+        if media is None:
+            raise RuntimeError("native-media preparation emitted no text labels")
+        groups.append(tuple(media))
+        return tuple(groups)
+
+    @staticmethod
+    def _media_binding(hit: SearchHit, asset_ids: Sequence[str]) -> dict[str, object]:
+        """Bind media to the already-rendered memory without repeating its content."""
+        context = hit.context
+        source_id = None if context is None else context.source_id
+        if source_id is None:
+            candidate = hit.metadata.get("source_id")
+            source_id = candidate if isinstance(candidate, str) and candidate else None
+        binding: dict[str, object] = {
+            "memory_id": hit.id,
+            "memory_type": hit.memory_type.value,
+            "event_time": (hit.occurred_at or hit.created_at).isoformat(),
+            "asset_ids": tuple(asset_ids),
+        }
+        if source_id is not None:
+            binding["source_id"] = source_id
+        if hit.occurred_end is not None:
+            binding["event_end"] = hit.occurred_end.isoformat()
+        if context is not None:
+            binding["kind"] = context.kind.value
+            binding["basis"] = context.basis.value
+        return binding
 
     async def close(self) -> None:
         await self._client.close()
@@ -1295,20 +1582,52 @@ def _load_tasks(
     manifest_directory: Path | None,
 ) -> tuple[LoadedTask, ...]:
     return tuple(
-        load_task(
-            TASKS[name],
-            root=arguments.benchmarks_root,
-            dataset_path=arguments.dataset_overrides.get(name),
-            media_root=arguments.media_overrides.get(name),
-            media_manifest=manifest,
-            manifest_directory=manifest_directory,
-            limit=arguments.limit,
-            offset=arguments.offset,
-            verify_digest=not (
-                arguments.allow_unverified_data and name in arguments.dataset_overrides
+        _with_fallback_reference(
+            load_task(
+                TASKS[name],
+                root=arguments.benchmarks_root,
+                dataset_path=arguments.dataset_overrides.get(name),
+                media_root=arguments.media_overrides.get(name),
+                media_manifest=manifest,
+                manifest_directory=manifest_directory,
+                limit=arguments.limit,
+                offset=arguments.offset,
+                verify_digest=not (
+                    arguments.allow_unverified_data and name in arguments.dataset_overrides
+                ),
             ),
+            getattr(arguments, "fallback_reference_at", None),
         )
         for name in arguments.tasks
+    )
+
+
+def _with_fallback_reference(
+    task: LoadedTask,
+    fallback: datetime | None,
+) -> LoadedTask:
+    """Fill only missing question clocks after dataset and corpus clocks are resolved."""
+    if fallback is None:
+        return task
+    count = sum(question.reference_at is None for unit in task.units for question in unit.questions)
+    if not count:
+        return task
+    return replace(
+        task,
+        units=tuple(
+            replace(
+                unit,
+                questions=tuple(
+                    question
+                    if question.reference_at is not None
+                    else replace(question, reference_at=fallback)
+                    for question in unit.questions
+                ),
+            )
+            for unit in task.units
+        ),
+        fallback_reference_at=fallback,
+        fallback_reference_question_count=count,
     )
 
 
@@ -1806,6 +2125,9 @@ async def _run_all(
             name,
             generator=generator if name in generated_arms else None,
             seed=arguments.seed,
+            allow_partial_sources=(
+                arguments.compile_allow_partial_sources if name == "compile" else False
+            ),
         )
         for name in arguments.arms
     )
@@ -2302,10 +2624,10 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
     memories = tuple(
         sorted(
             unit.memories,
-            key=lambda item: (
-                math.inf if item.end_seconds is None else item.end_seconds,
-                item.source_id,
-            ),
+            # Python's sort is stable, so equal causal boundaries retain the adapter's
+            # release order.  Source IDs identify evidence; they are not a chronology and
+            # using them as a tie-breaker silently reordered dialogue turns and media parts.
+            key=_memory_end,
         )
     )
     stuffs_context = any(arm.name == "full-context" and pending_questions[arm.name] for arm in arms)
@@ -2358,38 +2680,44 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                 context = (
                     _full_context(memories[:pending], full_context_chars) if stuffs_context else ""
                 )
-                results.update(
-                    await _answer_arms(
-                        memory,
-                        task,
-                        unit,
-                        arms=arms,
-                        questions_by_arm={
-                            arm.name: pending_questions[arm.name].get(cutoff, []) for arm in arms
-                        },
-                        context=context,
-                        ingest_failures=ingest_failures,
-                        ingest_failure_details=tuple(ingest_failure_details),
-                        request_concurrency=request_concurrency,
-                        request_semaphore=request_semaphore,
-                        recall_limit=recall_limit,
-                        predict_only=predict_only,
-                        log_samples=log_samples,
-                        response_cache=response_cache,
-                        compile_budget=compile_budget,
-                        tracer=tracer,
-                        on_sample_completed=on_sample_completed,
-                    )
+                cutoff_results = await _answer_arms(
+                    memory,
+                    task,
+                    unit,
+                    arms=arms,
+                    questions_by_arm={
+                        arm.name: pending_questions[arm.name].get(cutoff, []) for arm in arms
+                    },
+                    context=context,
+                    ingest_failures=ingest_failures,
+                    ingest_failure_details=tuple(ingest_failure_details),
+                    request_concurrency=request_concurrency,
+                    request_semaphore=request_semaphore,
+                    recall_limit=recall_limit,
+                    predict_only=predict_only,
+                    log_samples=log_samples,
+                    response_cache=response_cache,
+                    compile_budget=compile_budget,
+                    tracer=tracer,
+                    on_sample_completed=on_sample_completed,
                 )
+                results.update(cutoff_results)
+                if any(
+                    sample.error_code == "_SystemicEmbeddingFailure"
+                    for sample in cutoff_results.values()
+                ):
+                    raise _SystemicEmbeddingFailure(
+                        "systemic query embedding failure; remaining questions aborted"
+                    )
     except BaseException as error:
         if not isinstance(error, Exception):
             raise
-        if len(results) == len(ordered):
+        if len(results) == len(ordered) and not isinstance(error, _SystemicEmbeddingFailure):
             raise
         for arm, question in ordered:
-            results.setdefault(
-                (arm.name, question.question_id),
-                _sample(
+            identity = (arm.name, question.question_id)
+            if identity not in results:
+                results[identity] = _sample(
                     task,
                     unit,
                     question,
@@ -2399,8 +2727,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                     predict_only=predict_only,
                     log_samples=log_samples,
                     arm=arm,
-                ),
-            )
+                )
     else:
         notify_store_ready()
     return tuple(results[(arm.name, question.question_id)] for arm, question in ordered)
@@ -2698,7 +3025,10 @@ async def _ingest(
             return 0
         except IndexUnavailableError:
             raise
-        except Exception:
+        except Exception as error:
+            _raise_if_systemic_embedding(
+                error, "systemic embedding provider failure; item isolation aborted"
+            )
             if len(chunk) > 1:
                 middle = len(chunk) // 2
                 return await add_chunk(chunk[:middle]) + await add_chunk(chunk[middle:])
@@ -2714,6 +3044,9 @@ async def _ingest(
         except IndexUnavailableError:
             raise
         except Exception as error:
+            _raise_if_systemic_embedding(
+                error, "systemic embedding provider failure; single-item fallback aborted"
+            )
             _announce_first_ingest_failure(error, chunk[0].source_id)
             if on_failure is not None:
                 on_failure(_failure_detail(error, source_id=chunk[0].source_id))
@@ -2757,6 +3090,79 @@ def _candidate_count(unit: EvalUnit, question: EvalQuestion) -> int:
     return len({item.source_id for item in unit.memories if _memory_end(item) <= boundary})
 
 
+def _require_active_embedding_service(systemic_stop: asyncio.Event) -> None:
+    if systemic_stop.is_set():
+        raise _SystemicEmbeddingFailure("systemic query embedding failure; queued question aborted")
+
+
+async def _guarded_answer(
+    memory: AsyncMemory,
+    question: EvalQuestion,
+    *,
+    semaphore: asyncio.Semaphore,
+    systemic_stop: asyncio.Event,
+    arm: _Arm,
+    task_name: str,
+    unit_id: str,
+    recall_limit: int,
+    context: str,
+    compile_budget: ContextBudget,
+    tracer: Tracer | None,
+    on_answer: Callable[[EvalQuestion, _AnswerOutcome], None] | None,
+    on_complete: Callable[[], None] | None,
+) -> _AnswerOutcome:
+    identity = f"{task_name}/{unit_id}/{question.question_id}"
+    sample_id = identity if arm.name == DEFAULT_ARM else f"{arm.name}:{identity}"
+    try:
+        _require_active_embedding_service(systemic_stop)
+        if not arm.generates:
+            async with semaphore:
+                _require_active_embedding_service(systemic_stop)
+                outcome = await _arm_answer(
+                    memory,
+                    question,
+                    arm=arm,
+                    task_name=task_name,
+                    recall_limit=recall_limit,
+                    context=context,
+                    compile_budget=compile_budget,
+                    tracer=tracer,
+                    sample_id=sample_id,
+                    started=time.perf_counter(),
+                    answer_span=None,
+                )
+        else:
+            # This caller span starts before request admission. Its latency and TTFT therefore
+            # include benchmark queueing; nested SDK/model spans expose service time.
+            with _answer_span(tracer, task_name, sample_id, arm.name) as (answer_span, started):
+                async with semaphore:
+                    _require_active_embedding_service(systemic_stop)
+                    outcome = await _arm_answer(
+                        memory,
+                        question,
+                        arm=arm,
+                        task_name=task_name,
+                        recall_limit=recall_limit,
+                        context=context,
+                        compile_budget=compile_budget,
+                        tracer=tracer,
+                        sample_id=sample_id,
+                        started=started,
+                        answer_span=answer_span,
+                    )
+                    if outcome.error is not None and answer_span is not None:
+                        answer_span.set_status(StatusCode.ERROR)
+        if arm.generates and on_answer is not None:
+            on_answer(question, outcome)
+        return outcome
+    except _SystemicEmbeddingFailure:
+        systemic_stop.set()
+        raise
+    finally:
+        if on_complete is not None:
+            on_complete()
+
+
 async def _answer_many(
     memory: AsyncMemory,
     questions: Sequence[EvalQuestion],
@@ -2774,63 +3180,30 @@ async def _answer_many(
     tracer: Tracer | None = None,
 ) -> tuple[_AnswerOutcome | BaseException, ...]:
     semaphore = request_semaphore or asyncio.Semaphore(request_concurrency)
-
-    def sample_identity(question: EvalQuestion) -> str:
-        identity = f"{task_name}/{unit_id}/{question.question_id}"
-        return identity if arm.name == DEFAULT_ARM else f"{arm.name}:{identity}"
-
-    async def answer(question: EvalQuestion) -> _AnswerOutcome:
-        try:
-            sample_id = sample_identity(question)
-            if not arm.generates:
-                async with semaphore:
-                    outcome = await _arm_answer(
-                        memory,
-                        question,
-                        arm=arm,
-                        task_name=task_name,
-                        recall_limit=recall_limit,
-                        context=context,
-                        compile_budget=compile_budget,
-                        tracer=tracer,
-                        sample_id=sample_id,
-                        started=time.perf_counter(),
-                        answer_span=None,
-                    )
-            else:
-                # This caller span starts before request admission. Its latency and TTFT therefore
-                # include benchmark queueing; nested SDK/model spans expose service time.
-                with _answer_span(tracer, task_name, sample_id, arm.name) as (
-                    answer_span,
-                    started,
-                ):
-                    async with semaphore:
-                        outcome = await _arm_answer(
-                            memory,
-                            question,
-                            arm=arm,
-                            task_name=task_name,
-                            recall_limit=recall_limit,
-                            context=context,
-                            compile_budget=compile_budget,
-                            tracer=tracer,
-                            sample_id=sample_id,
-                            started=started,
-                            answer_span=answer_span,
-                        )
-                        if outcome.error is not None and answer_span is not None:
-                            answer_span.set_status(StatusCode.ERROR)
-            if arm.generates and on_answer is not None:
-                on_answer(question, outcome)
-            return outcome
-        finally:
-            if on_complete is not None:
-                on_complete()
+    systemic_stop = asyncio.Event()
 
     with _arm_run_span(tracer, task_name, arm.name):
         answered = tuple(
             await asyncio.gather(
-                *(answer(question) for question in questions), return_exceptions=True
+                *(
+                    _guarded_answer(
+                        memory,
+                        question,
+                        semaphore=semaphore,
+                        systemic_stop=systemic_stop,
+                        arm=arm,
+                        task_name=task_name,
+                        unit_id=unit_id,
+                        recall_limit=recall_limit,
+                        context=context,
+                        compile_budget=compile_budget,
+                        tracer=tracer,
+                        on_answer=on_answer,
+                        on_complete=on_complete,
+                    )
+                    for question in questions
+                ),
+                return_exceptions=True,
             )
         )
 
@@ -2871,7 +3244,7 @@ def _compile_span(tracer: Tracer | None, bundle: ContextBundle) -> Iterator[None
         attributes={
             SPAN_KIND: "stage",
             BENCHMARK_COMPILE_CHARS: bundle.chars,
-            BENCHMARK_COMPILE_ITEMS: len(bundle.hits),
+            BENCHMARK_COMPILE_ITEMS: len(bundle.hits) + len(bundle.excerpts),
             # Grounded parts, not memories carrying them, because that is the quantity
             # `ContextBudget.max_media_items` bounds: an omni memory with a still and a clip is
             # two parts against the budget and has to be two here, or a multi-asset bundle
@@ -2984,12 +3357,18 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                 content,
                 budget=compile_budget,
                 reference_at=question.reference_at,
+                allow_partial_sources=arm.allow_partial_sources,
             )
             with _compile_span(tracer, bundle):
                 rendered = bundle.render()
             if arm.generator is None:
                 raise RuntimeError("the compile arm requires a generator")
-            prediction = await arm.generator.answer(_question_text(question), rendered)
+            prediction = await arm.generator.answer(
+                _question_text(question),
+                rendered,
+                question_assets=tuple(atom for atom in question.content if isinstance(atom, Path)),
+                evidence_hits=bundle.hits,
+            )
             return _AnswerOutcome(
                 prediction,
                 (time.perf_counter() - latency_started) * 1_000,
@@ -2998,12 +3377,15 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                 tuple(_evidence(hit) for hit in bundle.hits),
                 ranked_source_ids=_source_ids(ranked),
                 compiled_chars=bundle.chars,
-                compiled_items=len(bundle.hits),
+                compiled_items=len(bundle.hits) + len(bundle.excerpts),
+                excerpt_source_ids=tuple(excerpt.source_memory_id for excerpt in bundle.excerpts),
+                excerpt_evidence=tuple(_excerpt_evidence(excerpt) for excerpt in bundle.excerpts),
             )
         if arm.generator is not None:
             prediction = await arm.generator.answer(
                 _question_text(question),
                 context if arm.name == "full-context" else None,
+                question_assets=tuple(atom for atom in question.content if isinstance(atom, Path)),
             )
             return _AnswerOutcome(
                 prediction,
@@ -3040,6 +3422,10 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                 if result is None:
                     raise RuntimeError("answer stream ended without a terminal result")
     except Exception as error:
+        if _systemic_embedding_stage_failure(error):
+            raise _SystemicEmbeddingFailure(
+                "systemic query embedding provider failure; answer matrix aborted"
+            ) from error
         return _AnswerOutcome(
             "",
             (time.perf_counter() - latency_started) * 1_000,
@@ -3117,6 +3503,8 @@ def _sample(
 ) -> SampleResult:
     memory_ids: tuple[str, ...]
     evidence: tuple[EvidenceInterval, ...]
+    excerpt_source_ids: tuple[str, ...]
+    excerpt_evidence: tuple[EvidenceInterval, ...]
     error_code: str | None
     error_detail: FailureDetail | None
     retrieval_diagnostic_error: FailureDetail | None = None
@@ -3131,6 +3519,7 @@ def _sample(
             (),
             False,
         )
+        excerpt_source_ids, excerpt_evidence = (), ()
         error_detail = _failure_detail(outcome)
         error_code = error_detail.code
         abstained = False
@@ -3141,6 +3530,8 @@ def _sample(
         confidence = outcome.confidence
         memory_ids = outcome.memory_ids
         evidence = outcome.evidence
+        excerpt_source_ids = outcome.excerpt_source_ids
+        excerpt_evidence = outcome.excerpt_evidence
         cached = outcome.cached
         ranked_source_ids = outcome.ranked_source_ids
         ranked_source_ids_complete = outcome.ranked_source_ids_complete
@@ -3189,6 +3580,7 @@ def _sample(
             **metrics,
             "compile_bundle_chars": float(outcome.compiled_chars),
             "compile_bundle_items": float(outcome.compiled_items),
+            "compile_bundle_excerpts": float(len(outcome.excerpt_source_ids)),
         }
     return SampleResult(
         task=task.spec.name,
@@ -3219,6 +3611,8 @@ def _sample(
         prompt=tuple(str(part) for part in question.content) if log_samples else None,
         references=question.references if log_samples else None,
         evidence=evidence,
+        excerpt_source_ids=excerpt_source_ids,
+        excerpt_evidence=excerpt_evidence,
         ref_at_300=(
             _reference_grounding(task, unit, question, evidence) if arm.generates else None
         ),
@@ -3658,6 +4052,17 @@ def _evidence(hit: SearchHit) -> EvidenceInterval:
     )
 
 
+def _excerpt_evidence(excerpt: ContextExcerpt) -> EvidenceInterval:
+    """Describe a partial source without promoting it to full grounded evidence."""
+    context = excerpt.context
+    return EvidenceInterval(
+        excerpt.source_memory_id,
+        None if context is None else context.source_id,
+        None,
+        None,
+    )
+
+
 def _optional_seconds(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
@@ -3813,6 +4218,12 @@ def _task_rows(
                 "dataset_sha256": task.dataset_sha256,
                 "input_sha256": dict(task.input_sha256),
                 "evaluation_sha256": task.evaluation_sha256,
+                "fallback_reference_at": (
+                    None
+                    if task.fallback_reference_at is None
+                    else task.fallback_reference_at.isoformat()
+                ),
+                "fallback_reference_question_count": task.fallback_reference_question_count,
                 "batch_size": batch_sizes[task.spec.name],
                 "input_modalities": _task_modalities(task),
                 "performance": dict(performance.get(task.spec.name, {}).get(arm, {})),
@@ -3837,6 +4248,7 @@ def _results(
     resources: Mapping[str, object] | None = None,
     embedding_warmup_count: int | None = None,
 ) -> dict[str, object]:
+    fallback_reference_at = getattr(arguments, "fallback_reference_at", None)
     task_rows = _task_rows(
         arguments,
         tasks,
@@ -3888,6 +4300,12 @@ def _results(
         "allow_unverified_data": arguments.allow_unverified_data,
         "limit": arguments.limit,
         "offset": arguments.offset,
+        "fallback_reference_at": (
+            None if fallback_reference_at is None else fallback_reference_at.isoformat()
+        ),
+        "fallback_reference_question_count": sum(
+            task.fallback_reference_question_count for task in tasks
+        ),
         "data_root": str(arguments.data_root),
         "media_manifest_path": (
             None if arguments.media_manifest is None else str(arguments.media_manifest.resolve())
@@ -4064,6 +4482,7 @@ def _arm_provenance(
             "prompt": FULL_CONTEXT_PROMPT_VERSION,
             "budget_max_items": arguments.compile_max_items,
             "budget_max_chars": arguments.compile_max_chars,
+            "allow_partial_sources": getattr(arguments, "compile_allow_partial_sources", False),
             "official_metrics": False,
         },
     }
@@ -5539,12 +5958,26 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         help="ContextBudget.max_chars for the compile arm",
     )
     parser.add_argument(
+        "--compile-allow-partial-sources",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="opt the compile arm into verified partial raw-text sources",
+    )
+    parser.add_argument(
         "--deliberate",
         action="store_true",
         help=(
             "run Memory.deliberate() after each cutoff's ingest and before its questions, so "
             "the slow loop's effect on QA scores is measurable; requires a config declaring "
             "`consolidation`"
+        ),
+    )
+    parser.add_argument(
+        "--fallback-reference-at",
+        type=_fallback_reference_at,
+        help=(
+            "timezone-aware ISO 8601 clock used only when a selected question and its corpus "
+            "provide no reference time"
         ),
     )
     parser.add_argument(
@@ -5765,6 +6198,11 @@ def _arguments(
     compile_max_chars = _picked(
         parsed.compile_max_chars, run.compile_max_chars, DEFAULT_COMPILE_BUDGET.max_chars
     )
+    compile_allow_partial_sources = _picked(
+        parsed.compile_allow_partial_sources,
+        run.compile_allow_partial_sources,
+        False,
+    )
     ingest = _picked(parsed.ingest, run.ingest, DEFAULT_INGEST_MODE)
     bootstrap_samples = _picked(
         parsed.bootstrap_samples, run.bootstrap_samples, DEFAULT_BOOTSTRAP_SAMPLES
@@ -5853,6 +6291,7 @@ def _arguments(
         deliberate=parsed.deliberate,
         compile_max_items=compile_max_items,
         compile_max_chars=compile_max_chars,
+        compile_allow_partial_sources=compile_allow_partial_sources,
         model_args=parsed.model_args,
         memory_config=(
             None if parsed.memory_config is None else parsed.memory_config.expanduser().resolve()
@@ -5880,6 +6319,7 @@ def _arguments(
         overwrite=overwrite,
         resume=bool(parsed.resume),
         quiet=quiet or verbosity in {"ERROR", "CRITICAL"},
+        fallback_reference_at=parsed.fallback_reference_at,
     )
 
 
@@ -6470,10 +6910,28 @@ def _cache_namespace(
         "deliberate": arguments.deliberate,
         "compile_max_items": arguments.compile_max_items,
         "compile_max_chars": arguments.compile_max_chars,
+        "compile_allow_partial_sources": getattr(arguments, "compile_allow_partial_sources", False),
     }
+    fallback_reference_at = getattr(arguments, "fallback_reference_at", None)
+    if fallback_reference_at is not None:
+        payload["fallback_reference_at"] = fallback_reference_at.isoformat()
     if memory_config is not None:
         payload["memory_config"] = _memory_config_payload(memory_config)
     return hashlib.sha256(_json_bytes(payload)).hexdigest()
+
+
+def _fallback_reference_at(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "--fallback-reference-at must be a timezone-aware ISO 8601 datetime"
+        ) from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise argparse.ArgumentTypeError(
+            "--fallback-reference-at must be a timezone-aware ISO 8601 datetime"
+        )
+    return parsed.astimezone(timezone.utc)
 
 
 def _implementation_identity() -> str:

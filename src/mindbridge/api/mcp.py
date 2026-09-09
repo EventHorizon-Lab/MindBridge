@@ -8,7 +8,7 @@ import logging
 from collections.abc import Callable, Mapping, Sequence
 from functools import wraps
 from time import perf_counter_ns
-from typing import Annotated, Any, ParamSpec, TypeVar, cast
+from typing import Annotated, Any, Literal, ParamSpec, TypeVar, cast
 from uuid import uuid4
 
 from mcp.server import MCPServer
@@ -39,6 +39,7 @@ from mindbridge.types import (
     ContextBudget,
     ContextBundle,
     ContextConflict,
+    ContextExcerpt,
     ContextUnknown,
     ContextUnknownKind,
     FaceObservation,
@@ -117,7 +118,9 @@ _TOOL_ARGUMENTS = {
         }
     ),
     "ask_memory": frozenset({"question", "limit", "memory_type", "reference_at", "scope"}),
-    "compile_context": frozenset({"goal", "budget", "reference_at", "scope"}),
+    "compile_context": frozenset(
+        {"goal", "budget", "reference_at", "scope", "allow_partial_sources"}
+    ),
     "get_memory": frozenset({"memory_id"}),
     "list_memories": frozenset({"limit", "cursor"}),
     "delete_memory": frozenset({"memory_id"}),
@@ -353,6 +356,35 @@ class ContextUnknownResult(BaseModel):
     detail: str
 
 
+class TextSpanPieceResult(BaseModel):
+    role: Literal["context", "body"]
+    start_codepoint: int
+    end_codepoint: int
+    source_text: str
+    sha256: str
+
+
+class TextSpanSelectorResult(BaseModel):
+    parent_content_sha256: str
+    embedding_input_sha256: str
+    recipe_version: str
+    pieces: tuple[TextSpanPieceResult, ...]
+
+
+class ContextExcerptResult(BaseModel):
+    source_memory_id: str
+    matched_index_id: str
+    content: str
+    selector: TextSpanSelectorResult
+    score: Annotated[float, Field(ge=0.0, le=1.0)]
+    created_at: AwareDatetime
+    occurred_at: AwareDatetime | None
+    occurred_end: AwareDatetime | None
+    memory_type: MemoryType
+    context: MemoryContext | None
+    place_id: str | None
+
+
 class ContextBundleResult(BaseModel):
     goal: str
     reference_at: AwareDatetime
@@ -378,6 +410,7 @@ class ContextBundleResult(BaseModel):
     chars: int
     elapsed_ms: int
     deadline_exceeded: bool
+    excerpts: tuple[ContextExcerptResult, ...] = ()
     rendered: str
 
 
@@ -614,6 +647,16 @@ def build_mcp_server(
             AwareDatetime | None, Field(description=_REFERENCE_AT_DESCRIPTION)
         ] = None,
         scope: Annotated[RetrievalScope | None, Field(description=_SCOPE_DESCRIPTION)] = None,
+        allow_partial_sources: Annotated[
+            bool,
+            Field(
+                strict=True,
+                description=(
+                    "Opt in to verified partial raw-text sources when the complete record cannot"
+                    " fit. False keeps full-record-only compilation."
+                ),
+            ),
+        ] = False,
     ) -> ContextBundleResult:
         """Compile the stored memories that bear on a goal into one bounded context bundle.
 
@@ -640,6 +683,7 @@ def build_mcp_server(
                 budget=context_budget(budget),
                 reference_at=reference_at,
                 scope=scope,
+                allow_partial_sources=allow_partial_sources,
             )
         )
 
@@ -1164,6 +1208,8 @@ def _bundle_entry(entry: object) -> object:
     # the `event_ids` the cue exists to carry.
     if isinstance(entry, AffectCue):
         return _affect_cue_result(entry)
+    if isinstance(entry, ContextExcerpt):
+        return ContextExcerptResult.model_validate(entry, from_attributes=True)
     if isinstance(entry, SearchHit):
         return _search_hit_result(entry)
     # A person a visible naming assertion names, reached through evidence other than the
