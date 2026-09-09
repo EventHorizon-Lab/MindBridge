@@ -1,7 +1,8 @@
 # Memory backend evaluation — 2026-09-08
 
-This report records the frozen diagnostic evaluation of the evidence-closed context compiler. The
-For the original compiler-v3 phase, the product baseline is the exact initial dirty-tree snapshot in
+This report records a multi-phase diagnostic evaluation of memory formation, evidence persistence,
+context compilation, and answer behavior. For the original compiler-v3 phase, the product baseline
+is the exact initial dirty-tree snapshot in
 `.benchmarks/research/2026-09-08-e2e-baseline-current/extracted/src`; its archive SHA-256 is
 `34744596f185f6dc9280dea0b0f21a385a309c429f632f940e468bf6ed9ddff0`. That phase's candidate is
 compiler final v3 in
@@ -24,7 +25,7 @@ separately frozen phases; results from one are not relabelled as results from th
 | --- | --- | --- |
 | Compiler-v3 closed-store pair | Baseline archive `34744596…`; compiler candidate archive `0c9abfc8…` | LoCoMo declared-evidence closure improved from 2/138 to 138/138 bundles, while the common cached judge tied 97/138 to 97/138. This is a structural gain without demonstrated semantic gain. |
 | Schema-17 fresh writer | Pre-witness snapshot versus clean archive `11655a14…` | Held-out LoCoMo conv-30 moved 52/72 to 54/72 with 5/7 discordance and no source-recall gain. One conversation is not independent replication. The retrospective Persona2 run exposed future sources on 106/149 questions and is not a causal score; its 2,930 clauses were all singleton. |
-| Schema-18 excerpt experiment | Frozen archive `db8ccb82…`, default excerpt delivery off | Raw causal-prefix capture, 298 fresh answers and task-dependent scoring completed with zero future-source delivery. Results are mixed and one baseline judge row remains an explicit error; fresh formed writers are still running. Selector persistence and exact span containment do not prove semantic sufficiency. |
+| Schema-18 causal-prefix experiments | Frozen archive `db8ccb82…`; excerpts default off | Raw and fresh formed runs delivered zero future sources. Raw partial excerpts had mixed task results and one explicit judge error. The formed full arm was also mixed; compact presentation cut prompt tokens by 12.0% while its task directions were split. Selector persistence and exact span containment do not prove semantic sufficiency. |
 | Current main after the frozen experiments | Schema-18 plus the corrected Persona ranking scorer and post-v3 general-consolidation clause change | Current full validation is 1,876/1,876 tests on CPython 3.12.11. New general `CONSOLIDATE` operations treat one cited set as an AND clause and separate operations as OR alternatives. No large-model result in this report used that post-v3 consolidation change. |
 
 No phase establishes a state-of-the-art result, a population-level semantic improvement, or a
@@ -373,23 +374,26 @@ backend comparisons.
 
 Attribution is based on the exact initial dirty working tree, whose archive SHA-256 is
 `34744596f185f6dc9280dea0b0f21a385a309c429f632f940e468bf6ed9ddff0`, rather than Git status.
-The phase inventory is
-`.benchmarks/research/2026-09-08-e2e-recovery-v1/change-attribution.json`. Its accepted product
-comparison target is the clean bytecode-free schema-17 v3 archive
-`11655a1494403c8845ba8a6fcbafa7a825c77f97f914dc705187ec85c729538e`, with source manifest
-`11baaa66f0ca3fbffb7c752016df788c6ac2f9fd882d95c0a19dc2e84bc5780c`. In particular,
-`src/mindbridge/benchmarks/eval_journal.py` existed in that initial snapshot and is still byte-identical
-(SHA-256 `b861a7ec09880745b3f181e277ed584b9075bf985976c45147154b27099e9629`);
-its untracked status does not make it a change from this work. The inventory remains a phase snapshot
-for final product bytes rather than an attribution of individual overlapping lines to an agent.
+The final filesystem inventory compares it with both the clean bytecode-free schema-18 v3 experiment
+archive `db8ccb827be5a8f4f18ee44a7a8478868e33e945cc7c04328b842212166df8c8` and current main. It is
+`.benchmarks/research/2026-09-09-initial-snapshot-change-attribution-v2/source-and-worktree-inventory.json`.
+From the initial snapshot to current main, the scoped source tree has 20 added files, 50 changed
+files and no removals: 12 product files, 16 benchmark files, 20 tests, 21 documentation files and one
+project file. The post-v3 changes include the corrected Persona scorer, general-consolidation
+joint-clause rule and runtime-neutral paired-replay typing cleanup. Generated `.benchmarks` artifacts
+remain outside this source count. In particular, `src/mindbridge/benchmarks/eval_journal.py` existed
+in the initial snapshot and remains byte-identical (SHA-256
+`b861a7ec09880745b3f181e277ed584b9075bf985976c45147154b27099e9629`); its untracked status does
+not make it a change from this work. The inventory attributes final filesystem bytes, not individual
+overlapping lines to an agent.
 
 The held-out Persona2 plan contains 149 questions across 21 task types. It has no dedicated affect
 inference/calibration or biometric/cross-modal identity questions. Eighteen rows concern restraint
 around sensitive events, and 17 use simulated voice or relationship-profile rubrics; neither validates
 sensor affect or real-person identity. The no-gold answer roster and complete execution contract are
 `.benchmarks/research/2026-09-08-personamem-writer-validation-v1/answer-roster.jsonl` and
-`.benchmarks/research/2026-09-08-personamem-writer-validation-v1/answer-plan.json`. The writer report
-will keep generation failures, unsupported proposals, persisted joint clauses, all-input citation
+`.benchmarks/research/2026-09-08-personamem-writer-validation-v1/answer-plan.json`. The evaluation
+keeps generation failures, unsupported proposals, persisted joint clauses, all-input citation
 inflation, output-resolution coverage, and support closure separate from task scores.
 
 Both Persona2 source stores are now closed. Each contains all 2,575 scheduled observations and 2,575
@@ -504,7 +508,7 @@ house-savings statement. The preserved scores were not rejudged. This bounded as
 
 ### Fresh formed causal-prefix pair
 
-A separate in-progress pair rebuilds formed memory under the same causal firewall. It compares the
+A separate pair rebuilt formed memory under the same causal firewall. It compares the
 pre-witness archive `fd70d57c…` with the frozen schema-18 archive `db8ccb82…`; partial excerpts stay
 disabled in the candidate. Both arms use the same 2,575-source release-order schedule, 116 cutoffs,
 367 batches capped at eight observations, Qwen formation configuration, and exact source/query
@@ -530,12 +534,111 @@ validation may still leave all raw observations committed and then be recovered 
 singleton `settle` calls. The audit reports fully qualified scheduled batches and singleton
 recoveries separately, validates every actual request roster and response, replays declared record
 projection updates, checks the complete runtime/owner chain, and requires every delivered derived
-branch to terminate in an eligible raw observation. Passing this structural audit will not turn a
+branch to terminate in an eligible raw observation. Passing this structural audit does not turn a
 singleton recovery into evidence that the former saw joint context. The accepted finalizer review is
-`.benchmarks/research/2026-09-09-personamem-causal-formed-finalizer-v3-independent-review/receipt.json`
-(SHA-256 `d2c39d487147e5e913247b1ee448ae40e4c0ccfb4e04089fc4a8d9b2c2169a7b`).
-Fresh formed answers and task-specific scores remain pending until both writers and this audit close;
-no retrospective Persona2 score is transferred into the pair.
+`.benchmarks/research/2026-09-09-personamem-causal-formed-finalizer-v4-independent-review-v1/receipt.json`
+(SHA-256 `5bdb1546e97222ebaa48a12cff055b23aa5459558e51d2cc521fcca166f824d3`).
+Both arms now have 149 captures over all 116 cutoffs, with zero future raw delivery or future raw
+ancestor. The baseline completed 367 qualified scheduled batches without recovery. The candidate
+completed 365 qualified scheduled batches and recovered batches 12 and 127 through eight qualified
+single-source requests each; three original multi-source responses remain explicitly unqualified.
+The baseline's 367 qualified responses declared 3,322 proposals and used 697,749 prompt plus 344,455
+completion tokens. The candidate's 381 qualified responses declared 3,051 proposals—3,036 from
+complete scheduled batches and 15 from recovery—and used 727,337 prompt plus 351,503 completion
+tokens in qualified responses. The candidate's two recovery episodes consumed 19 provider calls—
+three failed full-batch calls plus 16 qualified singleton calls—and 27,407 tokens. Across all
+attempts it used 1,093,543 formation tokens, 51,339 or 4.93% more than baseline. These are actual
+formation-response counts rather than one-call-per-scheduled-batch claims, and they do not support a
+lower construction-cost claim.
+The two stores have the same 2,575 raw records and versions over the declared non-transaction fields,
+and the same 2,966 raw embedding rows with byte-identical FP32 vectors and structural fields; this is
+not whole-SQLite-byte equality. After NFKC normalization, whitespace collapse and case folding, the
+active derived-claim multisets intersect on 1,682 rows out of a 4,123-row union (Jaccard 0.408). When
+active confidence, validity and visibility are included, the intersection is 771 out of 5,035
+(Jaccard 0.153). These are syntactic overlaps rather than semantic equivalence judgments. The
+qualified proposal streams contained 78 baseline and 36 candidate modality-policy refusals over
+3,322 and 3,051 proposals, respectively. There is no separate accepted-proposal journal, so accepted
+applications can only be inferred by subtraction; neither refusal count is interpreted as a safety
+improvement. The truncated batch-127 response has an unknown proposal and joint-witness count.
+Both stores have all 2,575 formation runs, empty queues, zero foreign-key errors and passing SQLite
+integrity. The candidate has 2,886 active singleton clauses and no joint clause, so this cohort does
+not exercise the new AND-clause behavior. The capture-gap processes were garbage-collected before
+their terminal systemd status was preserved; their exit status remains unknown, while bound startup
+PIDs, absent processes, completed journals and the exact 149-capture/116-cutoff audits establish data
+closure. The baseline full, candidate full and candidate compact presentation each completed 149
+fresh generations with no error; no retrospective Persona2 answer or score was transferred. Their
+total generation usage was 724,712, 727,601 and 641,670 tokens, respectively. The compact arm reused
+the candidate's selected bundle without repacking or requerying and changed only its typed
+presentation; it reduced prompt usage from 712,466 to 626,878 tokens, or 12.0%, and total generation
+usage by 11.8%. These are presentation-cost measurements rather than a quality result.
+
+The corrected task-dependent scorer completed all 447 rows without error: 213 rows resolved locally,
+95 reused an exact successful judge request, and 139 made a network judge call. It reports no
+cross-task mean because PersonaMem declares heterogeneous metrics. Direction counts across those
+task-specific primary scalars were:
+
+| Comparison | Candidate higher | Baseline/full higher | Equal | No comparable scalar |
+| --- | ---: | ---: | ---: | ---: |
+| Pre-witness full → schema-18 full | 20 | 12 | 91 | 26 |
+| Schema-18 full → compact | 14 | 15 | 94 | 26 |
+| Pre-witness full → compact | 23 | 16 | 84 | 26 |
+
+Only the current upstream `ndcg_at_5` is a checked official local primary metric for the three
+single-target ranking tasks:
+
+| PersonaMem ranking task | Questions | Pre-witness full | Schema-18 full | Compact |
+| --- | ---: | ---: | ---: | ---: |
+| At-AI directive follow-up | 12 | 0.84246 | 0.87374 | 0.85816 |
+| Hidden persona recommendation | 6 | 0.16884 | 0.16884 | 0.16884 |
+| Personalized recommendation | 27 | 0.17863 | 0.18483 | 0.18743 |
+
+The full-arm request changed on 98 questions and was byte-identical on 51. Within the equal-wire
+stratum, one arm scored higher once each, 38 tied and 11 had no comparable scalar; 38 predictions
+were also byte-identical. The other identical requests expose provider or judge nondeterminism, so
+none receives backend credit. Compact changed every final request because it changed the
+presentation. Its 14/15 direction split against full does not establish lossless quality. On the 12
+sensitive-event questions, the task's primary-score mean fell from 0.74583 to 0.66667; the bounded
+review found no offsetting improved case and did not validate the flagged disclosures as literal
+specific-event leakage. Because every candidate clause in this cohort is singleton and formation
+regenerated many derived claims,
+the mixed answer differences cannot be assigned to joint-witness persistence.
+
+Generation itself followed the common causal capture order rather than the frozen release order.
+All three arms had the exact 149-QID set and the same physical order, but 70 positions from zero-based
+index 69 through 138 differed after gap-repair rows were appended. The first scorer stopped before
+creating output, reading its response cache or making a judge call. A versioned assembler then
+reordered the same decoded rows by exact arm and QID solely for scoring; provider requests,
+predictions and usage did not change. This material reproducibility deviation is preserved in
+`.benchmarks/research/2026-09-09-personamem-persona2-causal-formed-downstream-v1/scoring-order-deviation-ledger.v1.json`
+(SHA-256 `b94d6b4d38fc676e1c302111401160c111e9cfdcd9c0c2fe5283ce30a6aecb08`).
+The independent 447-row verification and correction of the earlier provider-input order
+interpretation are under
+`.benchmarks/research/2026-09-09-personamem-causal-formed-scoring-independent-review-v1/`
+(receipt SHA-256 `1461718cddbf50b6ebc4a50186eb8d5f60f742941e365e0f092b5728bbc2c56b`).
+The full task-stratified analysis is
+`.benchmarks/results/e2e-personamem-persona2-causal-formed-v1/analysis-v3/paired-task-wire-summary.v3.json`
+(SHA-256 `ec84710b23a9c9453ccbbff4f94c870adb15583ad9c6bc700d547e231480efc1`).
+The bounded root-agent review read all 18 fixed directional slates, all 12 sensitive-event rows, all
+13 equal-wire answer divergences, seven targeted task rows, and the exact sources for q0006, q0008,
+q0023, q0079 and q0081. It found that q0023's full-arm gain came from a judge rationale claiming
+missing evidence that was present in all three contexts; q0079's invented doctor name was absent from
+all provider bodies; and q0081 had a valid citation to an assistant's tentative old explanation but
+used it as an affirmative present causal claim. Other privacy, relationship and telegraph flags were
+also inconsistent with literal answer content or across equal evidence. Scores remain unchanged;
+these cases reinforce speaker, certainty and applicability as the next bottleneck and provide no
+privacy, safety or semantic-improvement claim. The frozen review is
+`.benchmarks/research/2026-09-09-personamem-causal-formed-root-adjudication-v1.md` (SHA-256
+`9977e795ce7877bb769ae498df7a007c239b09a41e3fe4a4ed3ab2a04f4adda3`).
+The canonical completion output is
+`.benchmarks/research/2026-09-09-personamem-persona2-causal-formed-v1/causal-formed-completion-v4.json`
+(SHA-256 `b8cbb65c6278cf060da04c4c31eaeedcd25f3e67ad17e2b75e81141f2f64ae1a`).
+The independently reproduced construction analysis is
+`.benchmarks/research/2026-09-09-personamem-causal-formed-construction-independent-review-v1/receipt.v2.json`
+(SHA-256 `e9960fc0252bc8d37e8452ee6befb045c45467a995301726b5c5696762e4ae74`).
+The final downstream owner receipt binds the completion gate, all 447 answer and score rows, both
+independent reviews, the order-correction chain, task analysis and generation/judge usage. It is
+`.benchmarks/research/2026-09-09-personamem-persona2-causal-formed-downstream-v1/final-owner-receipt.v1.json`
+(SHA-256 `ff2739fec2315008a6ada95d28f0e2eb7d517a71ba115a34ce4286767c2fc873`).
 
 The candidate close manifest is
 `.benchmarks/research/2026-09-08-personamem-writer-validation-v1/closed/schema17-witness-persona2-manifest.json`
@@ -570,16 +673,17 @@ generated.
 The frozen compiler-v3 snapshot passed the locked dependency check, Ruff format and lint, mypy, all
 1,800 tests, `git diff --check`, the pinned Markdown check, and the pinned link check. The later
 formation-SSE integration passed 1,811 tests under its own phase gate. The paired replay driver and
-benchmark-only recovery workers have separate focused checks and durable manifests. All fixed
-diagnostic coverage described above is complete. Schema-17 witness-clause work remains outside the
+benchmark-only recovery workers have separate focused checks and durable manifests. All fixed source
+coverage described above is complete. Schema-17 witness-clause work remains outside the
 frozen compiler-v3 benchmark. Its clean v3 snapshot passed all 1,840 tests with warnings as errors
 on CPython 3.12.11 under Linux 6.8.0-138-generic x86_64 with glibc 2.35,
 plus the lock, Ruff, mypy, diff, Markdown and link gates. A separate default-scope migration replay
 preserved all 138/138 conv-26 provider request bytes and hit state, with zero candidate embedding
 network calls. The conv-30 writer comparison is complete. The retrospective Persona2 pair is also
 complete. Its raw causal-prefix correction and fresh scoring are complete with no transferred
-scores; the fresh formed causal-prefix pair remains in progress and is reported separately from the
-raw result. After the post-v3 consolidation change, corrected Persona ranking scorer, and final
+scores; the fresh formed causal-prefix stores, captures, 447 answers and task-dependent scores are
+complete and remain separate from the raw result. After the post-v3 consolidation change,
+corrected Persona ranking scorer, and final
 benchmark-only paired-replay typing correction, the current tree passed the lock check, Ruff format
 and lint, mypy, `git diff --check`, and all 1,876 tests with warnings as errors on CPython 3.12.11.
 The source-bound receipt is
