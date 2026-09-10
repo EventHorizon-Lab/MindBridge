@@ -4582,7 +4582,14 @@ def test_the_recall_planner_rejects_an_unusable_request(
 
 
 def test_the_default_answer_policy_sends_the_same_request_as_asking_for_abstention() -> None:
-    """`answer_policy` is opt-in: the default path must be byte-identical to what it was."""
+    """`answer_policy` is opt-in: the default and an explicit `strict` are one request.
+
+    What `strict` keeps is the abstention instruction, word for word. The prompt around it is
+    not what it was before the policy existed -- the answer-shaping sentence was added to both
+    policies at the same time, taking it from 654 to 1,001 characters -- so both sentences are
+    asserted here as the literals the model is actually sent, rather than by comparing the
+    request against the constant that built it.
+    """
     requests: list[dict[str, object]] = []
     hit = SearchHit(id="memory_1", content="the toolbox is blue", score=0.9, created_at=NOW)
     with httpx.Client(transport=_answer_policy_transport(requests, "Blue.")) as client:
@@ -4591,15 +4598,67 @@ def test_the_default_answer_policy_sends_the_same_request_as_asking_for_abstenti
         model.answer("What colour?", (hit,), answer_policy="strict")
 
     assert requests[0] == requests[1]
-    assert requests[0]["messages"] == [
-        {"role": "system", "content": openai_backend._GROUNDED_SYSTEM_PROMPT},
-        cast(list[dict[str, object]], requests[0]["messages"])[1],
-    ]
+    system = cast(list[dict[str, str]], requests[0]["messages"])[0]["content"]
     assert (
-        f"If the hits do not contain enough evidence, reply with exactly "
-        f"{openai_backend._ABSTENTION_MARKER} and nothing else, whatever language the question "
-        "uses."
-    ) in openai_backend._GROUNDED_SYSTEM_PROMPT
+        "If the hits do not contain enough evidence, reply with exactly "
+        "[insufficient_evidence] and nothing else, whatever language the question uses."
+    ) in system
+    assert (
+        "Answer every part of the question that was asked -- one asking for two things, such as "
+        "a date and a time, is not answered by either alone -- give the shortest complete "
+        "answer, a word or a phrase rather than a sentence unless the question asks you to "
+        "explain, and when the answer is a list include exactly the items the hits support and "
+        "no others."
+    ) in system
+
+
+@pytest.mark.parametrize(
+    ("exhaustive", "expected", "refused"),
+    [
+        (False, "their order is rank, not chronology.", "recall program's order"),
+        (
+            True,
+            "their order is the recall program's order, which is time order for the matched "
+            "records.",
+            "order is rank",
+        ),
+    ],
+    ids=("a-ranking", "a-recall-program"),
+)
+def test_the_prompt_describes_the_evidence_order_the_caller_actually_supplied(
+    exhaustive: bool,
+    expected: str,
+    refused: str,
+) -> None:
+    """An exhaustive recall program hands over matched records in time order, not a ranking.
+
+    The user message says so in as many words, so a system prompt calling that order "rank, not
+    chronology" contradicts the evidence's own note about itself -- on exactly the question shape
+    whose answer depends on reading the set as a timeline.
+    """
+    requests: list[dict[str, object]] = []
+    hit = SearchHit(
+        id="memory_1",
+        content="the toolbox is blue",
+        score=0.0,
+        created_at=NOW,
+        context=MemoryContext(
+            kind=MemoryKind.EVENT,
+            basis=EvidenceBasis.OBSERVATION,
+            confidence=0.9,
+            valid_from=None,
+            valid_until=None,
+            recorded_at=NOW,
+        ),
+    )
+    with httpx.Client(transport=_answer_policy_transport(requests, "Blue.")) as client:
+        _model(_sdk_client(client)).answer("What colour?", (hit,), exhaustive=exhaustive)
+
+    system = cast(list[dict[str, str]], requests[0]["messages"])[0]["content"]
+    assert expected in system
+    assert refused not in system
+    # Everything else the labels need said about them is one body, shared by both orders.
+    assert "supporting_record_count counts unique cited record IDs" in system
 
 
 def test_both_policies_ask_for_a_whole_answer_in_the_shortest_complete_form() -> None:

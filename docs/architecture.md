@@ -221,7 +221,10 @@ The answerer is asked for a recall plan -- a question shape and bounded reads --
 that are not `similar` are answered by predicate rather than by rank: substring matching over
 `content`, an event-time window, the records adjacent in corpus order, or the records one
 identity is in. They read SQLite only, hydrate through the same authoritative scoped read as
-every other hit, and are bounded by an explicit row count. The evidence set is a union with ID
+every other hit, and are bounded by an explicit row count. Because that bound is applied while
+IDs are selected and bitemporal, spatial and metric scope is applied while they are hydrated,
+each read reports how many records it selected as well as the rows it returned: only the
+selection count can say whether the bound truncated anything. The evidence set is a union with ID
 dedup and no recomputed score -- exhaustive rows in time order, then similarity rows by rank --
 and the answer prompt states which reads produced it and whether the set is complete, because
 completeness is what licenses a count or a list. Any missing capability, planner failure, or

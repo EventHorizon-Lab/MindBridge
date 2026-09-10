@@ -667,14 +667,13 @@ def test_benchmark_speech_backend_satisfies_the_runtime_protocol() -> None:
     assert backend.transcription_space == "speech-space"
 
 
-def test_response_cache_namespace_changes_with_runner_recipe(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    assert eval_module.EVAL_SCHEMA_VERSION == 17
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v16"
-    arguments = cast(
+def _namespace_arguments() -> eval_module._Arguments:
+    """The subset of a run's arguments the response-cache namespace is built from."""
+    return cast(
         eval_module._Arguments,
         SimpleNamespace(
+            tasks=("m3-bench-robot", "locomo-refined"),
+            answer_policy=None,
             device=None,
             seed=7,
             gen_kwargs="{}",
@@ -686,6 +685,41 @@ def test_response_cache_namespace_changes_with_runner_recipe(
             compile_max_chars=16000,
         ),
     )
+
+
+def test_response_cache_namespace_changes_with_the_answer_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached answer is an answer to the policy that was requested, per task.
+
+    Without the policy in the namespace, a `best_effort` arm run over an existing cache replays
+    the strict refusals already in it and records them as `best_effort` -- the arm reports the
+    baseline's refusal rate as its own. The resolved per-task policy is in there too, so widening
+    `BEST_EFFORT_TASKS` cannot replay a task's older strict answers under its new default.
+    """
+    from mindbridge.benchmarks import prompts
+
+    arguments = _namespace_arguments()
+    before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
+
+    for override in ("strict", "best_effort"):
+        forced = cast(
+            eval_module._Arguments,
+            SimpleNamespace(**{**vars(arguments), "answer_policy": override}),
+        )
+        assert _cache_namespace(forced, ModelConfig(), {"text": 1}) != before
+
+    monkeypatch.setattr(prompts, "BEST_EFFORT_TASKS", frozenset({"locomo-refined"}))
+
+    assert _cache_namespace(arguments, ModelConfig(), {"text": 1}) != before
+
+
+def test_response_cache_namespace_changes_with_runner_recipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert eval_module.EVAL_SCHEMA_VERSION == 17
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v16"
+    arguments = _namespace_arguments()
     before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
 
     monkeypatch.setattr(eval_module, "EVAL_RUNNER_VERSION", "next-runner-recipe")
@@ -981,6 +1015,8 @@ def test_eval_config_reuses_the_declarative_memory_schema(tmp_path: Path) -> Non
             seed=7,
             device="cuda:1",
             recall_limit=20,
+            tasks=("atm-bench",),
+            answer_policy=None,
             model="mindbridge",
             blind=False,
             ingest="add",
@@ -5232,7 +5268,7 @@ def test_run_arms_hands_every_task_to_the_completion_callback(tmp_path: Path) ->
     assert [sample.prediction for sample in samples] == ["rewritten", "rewritten"]
 
 
-def test_only_the_two_tasks_whose_protocol_credits_no_abstention_ask_for_a_guess() -> None:
+def test_only_the_task_whose_protocol_credits_no_abstention_asks_for_a_guess() -> None:
     """Pinned as a set: widening it silently turns a reported refusal into an invented answer.
 
     Every other task measures abstention in some form -- LongMemEval and MEMLENS carry abstention

@@ -39,7 +39,7 @@ from itertools import zip_longest
 from pathlib import Path
 from threading import Condition, RLock, local
 from time import perf_counter, sleep
-from typing import Literal, Protocol, TypeVar, cast, get_args
+from typing import Any, Literal, Protocol, TypeVar, cast, get_args
 
 from opentelemetry import trace
 from opentelemetry.trace import Span, Tracer
@@ -109,6 +109,7 @@ from mindbridge.infrastructure.local.store import (
     IndexCandidate,
     IndexDocument,
     LocalStore,
+    RecallRead,
     SpeechRollback,
     StaleOperationError,
     StoredAsset,
@@ -152,6 +153,7 @@ from mindbridge.plugins import MemoryConfig, MemoryPlugins
 from mindbridge.recall import (
     RecallPlan,
     RecallResult,
+    RecallRows,
     execute,
     fallback_plan,
     parse_recall_plan,
@@ -313,6 +315,11 @@ _STREAM_GROUP_SECONDS = 0.25
 _REINDEX_PAGE_SIZE = 256
 _REEMBED_PAGE_SIZE = 32
 _RERANK_CANDIDATES = 100
+# How many media rows an exhaustive plan may ground on, as a multiple of the window the caller
+# asked for. Media is the one kind of evidence whose grounding costs writes -- face and speech
+# recognition run on each row before the answer call, and again on a replan -- so a set read that
+# matched every clip in the corpus is bounded here rather than by the character budget alone.
+_RECALL_MEDIA_FACTOR = 2
 # One empty recall is a question nobody had asked before; two near-equal ones inside the
 # configured window is a gap. Not configurable: below two there is no repetition to speak of, and
 # a host that wants a stricter threshold narrows the window instead.
@@ -761,9 +768,10 @@ class _RecallReads:
         self._memory = memory
         self._context = context
 
-    def similar(self, query: str, *, k: int) -> tuple[SearchHit, ...]:
+    def similar(self, query: str, *, k: int) -> RecallRows:
         del query
-        return self._context.ranked[:k]
+        rows = self._context.ranked[:k]
+        return RecallRows(rows, len(rows))
 
     def match(
         self,
@@ -776,7 +784,7 @@ class _RecallReads:
         memory_type: MemoryType | None,
         max_rows: int,
         identity_id: str | None = None,
-    ) -> tuple[SearchHit, ...]:
+    ) -> RecallRows:
         scope = self._context.scope or RetrievalScope()
         return self._hits(
             self._memory._store.match_memories(
@@ -804,7 +812,7 @@ class _RecallReads:
         modality: Modality | None,
         memory_type: MemoryType | None,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]:
+    ) -> RecallRows:
         scope = self._context.scope or RetrievalScope()
         return self._hits(
             self._memory._store.memories_in_window(
@@ -829,7 +837,7 @@ class _RecallReads:
         before: int,
         after: int,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]:
+    ) -> RecallRows:
         scope = self._context.scope or RetrievalScope()
         return self._hits(
             self._memory._store.neighbor_memories(
@@ -846,7 +854,7 @@ class _RecallReads:
             )
         )
 
-    def entity(self, name: str, *, max_rows: int) -> tuple[SearchHit, ...]:
+    def entity(self, name: str, *, max_rows: int) -> RecallRows:
         """Read what is known about one person, by identity when the name resolves to one.
 
         A name no identity carries is not an error: the store may hold the person only as words
@@ -869,8 +877,17 @@ class _RecallReads:
         chosen = self._context.memory_type or requested
         return None if chosen is None else chosen.value
 
-    def _hits(self, memories: Sequence[StoredMemory]) -> tuple[SearchHit, ...]:
-        return tuple(self._memory._search_hit(memory, 0.0) for memory in memories)
+    def _hits(self, read: RecallRead) -> RecallRows:
+        """Hydrate one primitive's rows, keeping the count its predicate selected.
+
+        The rows can be fewer than the selection: the bound is applied in SQL and the caller's
+        bitemporal, spatial and metric scope is applied by the one hydrating read behind it. Only
+        the selection count says whether the bound truncated anything.
+        """
+        return RecallRows(
+            tuple(self._memory._search_hit(memory, 0.0) for memory in read),
+            read.selected,
+        )
 
 
 class Memory:
@@ -1929,30 +1946,25 @@ class Memory:
                 link_identities=link_identities,
                 answer_policy=answer_policy,
             )
-            attempted = ""
-            for attempt in range(self._recall_rounds if self._recall_planning else 1):
-                # `closing` rather than plain iteration: an abandoned stream throws
-                # `GeneratorExit` at the yield below, and without this the inner generator would
-                # only be closed when the cleared frame drops its last reference. That defers
-                # closing the provider's response and ends `mindbridge.model.generation` after
-                # its own parent, which loses the call's model usage and emits a malformed trace.
-                with closing(self._recall_round(round_context, attempted=attempted)) as deltas:
-                    while True:
-                        try:
-                            delta = next(deltas)
-                        except StopIteration as complete:
-                            result, hits = complete.value
-                            break
-                        if delta.strip() and not operation_ttft_recorded:
-                            operation_ttft_ms = (perf_counter() - started) * 1_000.0
-                            if queue_time_ms is not None:
-                                operation_ttft_ms += queue_time_ms
-                            span.set_attribute(OPERATION_TTFT, operation_ttft_ms)
-                            operation_ttft_recorded = True
-                        yield AnswerChunk(text=delta)
-                if not self._replan_wanted(result, round_context, attempt=attempt):
-                    break
-                attempted = _attempt_note(hits, result)
+            # `closing` rather than plain iteration: an abandoned stream throws `GeneratorExit`
+            # at the yield below, and without this the inner generator would only be closed when
+            # the cleared frame drops its last reference. That defers closing the provider's
+            # response and ends `mindbridge.model.generation` after its own parent, which loses
+            # the call's model usage and emits a malformed trace.
+            with closing(self._answer_rounds(round_context)) as deltas:
+                while True:
+                    try:
+                        delta = next(deltas)
+                    except StopIteration as complete:
+                        result, hits = complete.value
+                        break
+                    if delta.strip() and not operation_ttft_recorded:
+                        operation_ttft_ms = (perf_counter() - started) * 1_000.0
+                        if queue_time_ms is not None:
+                            operation_ttft_ms += queue_time_ms
+                        span.set_attribute(OPERATION_TTFT, operation_ttft_ms)
+                        operation_ttft_recorded = True
+                    yield AnswerChunk(text=delta)
             used_ids = {hit.id for hit in result.hits}
             grounding = tuple(hit for hit in hits if hit.id in used_ids)
             # Reinforcement is part of answering, so it stays inside the operation and runs
@@ -7718,6 +7730,39 @@ class Memory:
                 _normalized_vector(vector, self._embedding_dimension) for vector in vectors
             )
 
+    def _answer_rounds(
+        self,
+        context: _RecallContext,
+    ) -> Generator[str, None, tuple[AnswerResult, tuple[SearchHit, ...]]]:
+        """Answer this question, replanning once when the first round's own answer asked for it.
+
+        A round another round may replace is held rather than streamed. Two complete answers on
+        one wire with no boundary between them is not something a caller can render, and the
+        terminal result has to be the text that was streamed -- so the deltas of a replannable
+        round are buffered and yielded only if that round is the one that stands. Every other
+        round, the common case and always the last one, streams as the provider produces it.
+        """
+        attempted = ""
+        for attempt in range(self._recall_rounds if self._recall_planning else 1):
+            held: builtins.list[str] = []
+            replannable = self._replan_possible(context, attempt=attempt)
+            with closing(self._recall_round(context, attempted=attempted)) as deltas:
+                while True:
+                    try:
+                        delta = next(deltas)
+                    except StopIteration as complete:
+                        result, hits = complete.value
+                        break
+                    if replannable:
+                        held.append(delta)
+                    else:
+                        yield delta
+            if not (result.abstained and replannable):
+                yield from held
+                break
+            attempted = _attempt_note(hits, result)
+        return result, hits
+
     def _recall_round(
         self,
         context: _RecallContext,
@@ -7749,22 +7794,37 @@ class Memory:
         )
         self._persist_transcripts(context.assets)
         with closing(
-            self._answer_chunks(question, routed_hits, answer_policy=context.answer_policy)
+            self._answer_chunks(
+                question,
+                routed_hits,
+                answer_policy=context.answer_policy,
+                # The reader cannot see that these rows are a predicate's whole set in time order
+                # rather than a ranking, and the note above says they are, so the prompt's own
+                # description of their order has to agree with it.
+                exhaustive=program is not None and program.plan.exhaustive,
+            )
         ) as deltas:
             result = yield from deltas
         return result, hits
 
     def _recall_program(self, context: _RecallContext, *, attempted: str) -> RecallResult | None:
-        """Plan and run this question's reads, or None when planning is off."""
+        """Plan and run this question's reads, or None when planning is off.
+
+        Inside its own stage: the `mindbridge.retrieve` leg closes on the ranked hits, and the
+        planning call and the exhaustive reads happen after it -- a model call and a set of table
+        scans that a trace without this span attributes to nothing, leaving the operation's own
+        duration as the only evidence they ran at all.
+        """
         if not self._recall_planning:
             return None
-        plan = self._recall_plan(
-            context.prepared.text,
-            reference_at=context.reference,
-            k=context.limit,
-            attempted=attempted,
-        )
-        return execute(plan, _RecallReads(self, context))
+        with self._trace("mindbridge.recall", kind="stage"):
+            plan = self._recall_plan(
+                context.prepared.text,
+                reference_at=context.reference,
+                k=context.limit,
+                attempted=attempted,
+            )
+            return execute(plan, _RecallReads(self, context))
 
     def _grounded_recall(
         self,
@@ -7782,27 +7842,30 @@ class Memory:
         if program is None or not program.plan.exhaustive:
             budget = self._evidence_budget
             return _grounding_hits(context.ranked, context.limit, budget_chars=budget), None
-        hits, omitted = _budgeted_recall(program, self._recall_set_budget)
+        hits, omitted = _budgeted_recall(
+            program,
+            # `evidence_budget_chars` is what a caller who cares about prompt size sets, and a
+            # set plan used to walk straight past it. The set budget may narrow that ceiling and
+            # never widen it; with no ceiling set, the set budget is the only bound.
+            self._recall_set_budget
+            if self._evidence_budget is None
+            else min(self._recall_set_budget, self._evidence_budget),
+            media_limit=_RECALL_MEDIA_FACTOR * context.limit,
+        )
         return hits, recall_note(program, omitted=omitted)
 
-    def _replan_wanted(
-        self,
-        result: AnswerResult,
-        context: _RecallContext,
-        *,
-        attempt: int,
-    ) -> bool:
-        """Spend another round only on the failure the first round's own answer reported.
+    def _replan_possible(self, context: _RecallContext, *, attempt: int) -> bool:
+        """Whether a later round could replace this one, which is what makes it unstreamable.
 
-        A committed answer the answerer flagged as thin is the one case where reading again is
-        known to be worth a call: under `strict` the same signal is already the caller's
-        reported refusal, and re-reading behind their back would answer a question they were
-        told could not be answered.
+        Another round is spent only on the failure a round's own answer reports, and only when
+        the caller asked for a committed answer: under `strict` that same signal is already the
+        refusal they were given, and re-reading behind their back would answer a question they
+        were told could not be answered. This is everything but the failure, which is what a
+        round has to know before it starts.
         """
         return (
             self._recall_planning
             and context.answer_policy == "best_effort"
-            and result.abstained
             and attempt + 1 < self._recall_rounds
         )
 
@@ -7875,6 +7938,7 @@ class Memory:
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> Generator[str, None, AnswerResult]:
         """Yield answer deltas in provider order and return the validated grounded result.
 
@@ -7902,11 +7966,14 @@ class Memory:
             mark_model_requests(1)
             buffered = False
             # The protocols are `runtime_checkable`, so `isinstance` proves the method exists but
-            # not that it takes this keyword. A backend written against the two-argument signature
-            # keeps working as long as the default asks for nothing new.
-            policy: dict[str, AnswerPolicy] = (
+            # not that it takes these keywords. A backend written against the two-argument
+            # signature keeps working as long as the defaults ask for nothing new, so each one is
+            # sent only when the caller or the plan moved it off its default.
+            policy: dict[str, Any] = (
                 {} if answer_policy == "strict" else {"answer_policy": answer_policy}
             )
+            if exhaustive:
+                policy["exhaustive"] = True
             try:
                 if isinstance(self._answerer, StreamingGenerationBackend):
                     started = perf_counter()
@@ -11602,23 +11669,34 @@ def _batch_values(
 def _budgeted_recall(
     program: RecallResult,
     budget_chars: int,
+    *,
+    media_limit: int,
 ) -> tuple[tuple[SearchHit, ...], int]:
     """Ground on the set the program produced, chronologically, up to the character budget.
 
-    Exhaustive rows come first because they are the answer's shape; similarity rows spend what
-    is left. The returned count is how many rows the budget left out, which is what turns a
-    complete set into an incomplete one for the reader.
+    Exhaustive rows come first because they are the answer's shape; similarity rows spend what is
+    left. The returned count is how many of the *exhaustive* rows were left out, which is what
+    turns a complete set into an incomplete one for the reader -- a ranking cut short is still a
+    ranking, and counting one of its rows as a missing "matched record" told a reader holding
+    every record its predicate matched that it did not have them.
+
+    Media rows are capped separately. An exhaustive read can name every clip in a corpus, and
+    each media row reaching the answer call carries face and speech recognition -- writes, paid
+    again on every replan round -- so a set's media rows stop at `media_limit` while its text
+    rows do not.
     """
     selected: builtins.list[SearchHit] = []
     spent = 0
+    media = 0
     omitted = 0
-    for hit in program.hits:
-        cost = len(hit.content)
-        if selected and spent + cost > budget_chars:
-            omitted += 1
+    for index, hit in enumerate(program.hits):
+        cost = evidence_cost(hit)
+        if (selected and spent + cost > budget_chars) or (hit.assets and media >= media_limit):
+            omitted += 1 if index < len(program.exhaustive) else 0
             continue
         selected.append(hit)
         spent += cost
+        media += 1 if hit.assets else 0
     return tuple(selected), omitted
 
 
@@ -11632,21 +11710,24 @@ def _with_recall_note(question: ModelInput, note: str | None) -> ModelInput:
 def _attempt_note(hits: Sequence[SearchHit], result: AnswerResult) -> str:
     """Describe what one round read and what it could not answer, for the next plan.
 
-    Labels and event times only: the planner decides which reads to make next, and handing it
-    the evidence text would make it summarize records instead of planning over them.
+    How much was read, over what dates, and why it was not enough. No evidence text: the planner
+    decides which reads to make next, and handing it records would make it summarize them
+    instead. No labels either -- the answer prompt numbers only the qualified subset of the
+    evidence, so an `E3` here would name a different record than the one the reader saw, or none.
     """
-    read = ", ".join(
-        f"E{index}"
-        + ("" if hit.occurred_at is None else f" at {hit.occurred_at.date().isoformat()}")
-        for index, hit in enumerate(hits, start=1)
+    dates = sorted(
+        hit.occurred_at.date().isoformat() for hit in hits if hit.occurred_at is not None
     )
+    span = ""
+    if dates:
+        span = f" dated {dates[0]}" + ("" if dates[0] == dates[-1] else f" to {dates[-1]}")
     reason = (
         "no usable evidence"
         if result.abstention_reason is None
         else (result.abstention_reason.value)
     )
     return (
-        f"read {len(hits)} records ({read or 'none'}) and reported {reason}; "
+        f"read {len(hits)} records{span} and reported {reason}; "
         "the answer was a low-confidence guess"
     )
 

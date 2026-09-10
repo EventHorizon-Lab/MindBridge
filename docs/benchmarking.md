@@ -1028,8 +1028,6 @@ Three result fields carry a caveat that decides whether they can be quoted:
 - **`abstentions` undercounts.** It counts two things: the opaque marker the answer backend emits
   when it declines, and -- for a task whose own prompt mandates a refusal wording -- an answer
   equal to that wording. A model that refuses in its own free wording, on a task that mandates
-  none, is still not counted. Treat the field as a lower bound and read the predictions before
-  drawing a conclusion about refusal rates.
   none, is still not counted. Measured under the older exact-sentence detector, an EgoLifeQA slice
   reported 2 of 51 while 14 of 51 answers read as refusals; treat the field as a lower bound and
   read the predictions before drawing a conclusion about refusal rates.
@@ -1175,6 +1173,11 @@ is rejected if either artifact's TTFT distribution is incomplete.
 
 Use `--use-cache .benchmarks/response-cache` to persist deterministic generation responses across
 isolated reruns. The cache is an optimization, not a substitute for the result artifacts.
+
+Everything that decides what a request asked for is part of the cache namespace, so a cached
+answer is only ever reused for the same question. That includes `--answer-policy` and the policy
+each task resolves to, because an arm that asks for a committed answer must not be handed the
+refusal a strict run already cached and report it as its own.
 
 ## Resume an interrupted run
 

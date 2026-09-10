@@ -230,6 +230,7 @@ def test_a_former_is_declaratively_reachable_but_never_implicit(
             hits: Sequence[SearchHit],
             *,
             answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> AnswerResult:
             raise AssertionError("composition must not call the model")
 
@@ -633,6 +634,7 @@ class _FormingEmbedder(TinyEmbedder):
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> AnswerResult:
         raise AssertionError("not called")
 
@@ -815,6 +817,7 @@ class _ConsolidatingEmbedder(TinyEmbedder):
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> AnswerResult:
         raise AssertionError("not called")
 

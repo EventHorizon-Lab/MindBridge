@@ -14,17 +14,23 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `False`). Similarity answers "what is most like this"; it has no way to express what a count, a
   list of "all", an adjacency, or "everything about this person" asks for, and measured on the
   round's artifacts those question classes sit at the blind rate while the median gold rank on
-  point questions is already 1. With the setting on, the answerer returns a JSON recall plan --
-  a shape and up to six bounded reads over `similar`, `match`, `match` in a time window,
-  `neighbors` in corpus order, and `entity` -- which MindBridge validates and executes against
-  SQLite. The evidence set is a union with ID dedup and no recomputed score: exhaustive rows in
-  time order up to `recall_set_budget_chars`, then similarity rows by rank. The prompt states
-  what the reads were and whether the set is complete, so a count is licensed by completeness
-  instead of guessed. Under `answer_policy="best_effort"`, an answer the answerer flagged as
-  thin buys one replan round (`recall_rounds`, default 2) that is told what the first round
-  read. A backend without the new optional `RecallPlanningBackend.plan_recall` capability, a
-  planner error, and any plan the kernel will not run all fall back to the single search `ask`
-  has always made, so the default path is unchanged.
+  point questions is already 1. With the setting on, the answerer returns a JSON recall plan -- a
+  shape and up to six bounded reads over `similar`, `match`, `match` in a time window, `neighbors`
+  in corpus order, and `entity` -- which MindBridge validates and executes against SQLite. The
+  evidence set is a union with ID dedup and no recomputed score: exhaustive rows in time order up
+  to `recall_set_budget_chars` -- never past `evidence_budget_chars` when a caller set one, and
+  never more than twice `limit` media rows, since grounding media runs recognition over it -- then
+  similarity rows by rank. The prompt states what the reads were and whether the set is complete,
+  so a count is licensed by completeness instead of guessed, and a new defaulted `exhaustive`
+  keyword on `GenerationBackend.answer` and `StreamingGenerationBackend.stream_answer` tells a
+  reader that its evidence order is the program's rather than a ranking's. Under
+  `answer_policy="best_effort"`, an answer the answerer flagged as thin buys one replan round
+  (`recall_rounds`, default 2) that is told how much the first round read, over what dates, and
+  why it was not enough; `ask_stream()` still yields one answer, because a round a replan may
+  replace is held back and reaches the caller only if it is the round that stands. A backend
+  without the new optional `RecallPlanningBackend.plan_recall` capability, a planner error, and
+  any plan the kernel will not run all fall back to the single search `ask` has always made, so
+  the default path is unchanged.
 - Every grounded answer prompt now asks for the whole question to be answered, in the shortest
   complete form, with a list holding exactly the items the hits support. Measured on questions
   the reader did answer rather than refuse: a question asking for two things came back with one,
@@ -36,20 +42,21 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `mindbridge`. Abstaining is a policy the caller owns, not a fixed product behaviour: an
   unanswerable question deserves a refusal, while a multiple-choice caller, or one whose protocol
   gives no credit for "unknown", loses the whole answer to one. The default `"strict"` is
-  unchanged in behaviour and sends a byte-identical prompt. `"best_effort"` instructs the answerer
-  to commit to the single most likely answer the evidence supports -- for a multiple-choice
-  question, always one of the offered options -- and to flag low confidence with the structured
-  marker on its own line before the answer, which MindBridge reads and removes. The result then
-  carries the same `abstained` and `abstention_reason` alongside a usable `answer`, so the
-  confidence signal survives. A `"best_effort"` question that retrieved nothing at all now reaches
-  the model as a guess instead of returning early, and is still reported as abstained with
-  `AbstentionReason.NO_EVIDENCE`. `GenerationBackend.answer` and
-  `StreamingGenerationBackend.stream_answer` take the same keyword-only argument, defaulted, so a
-  custom backend only needs it once a caller opts in. The benchmark harness sets `"best_effort"`
-  for exactly `m3-bench-robot`, whose official evaluation credits no abstention and whose
-  question set holds no unanswerable item; every other task keeps `"strict"`. `--answer-policy`
-  and `benchmark.run.answer_policy` override that table for one run, and both the task and the
-  sample rows record the policy the request carried.
+  unchanged in behaviour and keeps its abstention instruction word for word; the prompt around it
+  is not byte-identical, because the answer-shaping sentence below was added to both policies at
+  the same time. `"best_effort"` instructs the answerer to commit to the single most likely answer
+  the evidence supports -- for a multiple-choice question, always one of the offered options --
+  and to flag low confidence with the structured marker on its own line before the answer, which
+  MindBridge reads and removes. The result then carries the same `abstained` and
+  `abstention_reason` alongside a usable `answer`, so the confidence signal survives. A
+  `"best_effort"` question that retrieved nothing at all now reaches the model as a guess instead
+  of returning early, and is still reported as abstained with `AbstentionReason.NO_EVIDENCE`.
+  `GenerationBackend.answer` and `StreamingGenerationBackend.stream_answer` take the same
+  keyword-only argument, defaulted, so a custom backend only needs it once a caller opts in. The
+  benchmark harness sets `"best_effort"` for exactly `m3-bench-robot`, whose official evaluation
+  credits no abstention and whose question set holds no unanswerable item; every other task keeps
+  `"strict"`. `--answer-policy` and `benchmark.run.answer_policy` override that table for one run,
+  and both the task and the sample rows record the policy the request carried.
 - Local storage advances to schema v18. Evidence is stored as clauses: a `CONSOLIDATE` operation's
   cited set is one conjunction, separate operations are alternatives, and withdrawing a source
   retires only the clauses it belonged to, so `(A AND B) OR C` keeps `C` when `A` goes. Derived

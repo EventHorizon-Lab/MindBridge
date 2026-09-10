@@ -19,11 +19,14 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
-from typing import Literal, Protocol, TypeVar, cast
+from typing import Literal, NamedTuple, Protocol, TypeVar, cast
 
-# The store's own bound on one primitive read. Imported rather than restated so a plan can never
-# ask for more rows than the read will return.
+# The store's own bounds on one primitive read. Imported rather than restated so a plan can never
+# ask for more rows than the read will return, nor for a term the read will refuse.
 from mindbridge.infrastructure.local.store import _RECALL_MAX_ROWS as RECALL_MAX_ROWS
+from mindbridge.infrastructure.local.store import (
+    _RECALL_MAX_TERM_CHARS as RECALL_MAX_TERM_CHARS,
+)
 from mindbridge.types import MemoryType, Modality, SearchHit
 
 RecallShape = Literal["point", "set", "sequence", "entity", "composite"]
@@ -66,6 +69,11 @@ _HONOURED: Mapping[str, frozenset[str]] = {
 _MAX_STEPS = 6
 _MAX_TERMS = 8
 _MAX_NEIGHBOURS = 10
+# How many of an anchor step's rows a `neighbors` step reads around. The store walks corpus order
+# twice per anchor with no index behind it, so the cost is anchors x (before + after): 500 anchors
+# at 10 and 10 measured 4.3 seconds of scanning. A sequence question is asked about the records
+# nearest what was found, so the deepest anchors buy nothing the shallowest do not.
+_MAX_NEIGHBOR_ANCHORS = 20
 DEFAULT_SIMILAR_K = 12
 DEFAULT_MAX_ROWS = 200
 
@@ -106,13 +114,28 @@ class RecallPlan:
         return any(step.op in _EXHAUSTIVE_OPS for step in self.steps)
 
 
+class RecallRows(NamedTuple):
+    """What one read answered with: the rows, and how many records it selected.
+
+    `selected` is the count the row bound was applied to. It is `len(rows)` for a read nothing
+    filtered afterwards, and larger when the caller's scope dropped a selected row during
+    hydration -- which is why completeness is decided from it and never from the rows.
+    """
+
+    rows: tuple[SearchHit, ...]
+    selected: int
+
+
 @dataclass(frozen=True, slots=True)
 class RecallStepResult:
     """What one executed step read, for the trace and the grounding prompt."""
 
     op: RecallOp
     rows: int
-    # True when the read returned exactly its bound, so rows beyond it were never read.
+    # True when the read selected as many records as its bound allowed, so records beyond it were
+    # never read. Decided on the selection rather than on the rows: a scope filter can shrink a
+    # truncated read below its own bound, and reading that as "everything" is what licenses a
+    # total over a set the caller does not hold.
     bounded: bool
 
 
@@ -139,9 +162,15 @@ class RecallResult:
 
 
 class RecallReader(Protocol):
-    """The reads a recall program may make. `Memory` implements it over its own store."""
+    """The reads a recall program may make. `Memory` implements it over its own store.
 
-    def similar(self, query: str, *, k: int) -> tuple[SearchHit, ...]: ...
+    Every read answers with its rows and the number of records its predicate selected. The two
+    differ when the caller's own bitemporal, spatial or metric scope drops a selected row while
+    it is hydrated, which happens after the row bound was applied -- so only the selection count
+    can say whether rows beyond the bound exist, and only it may decide completeness.
+    """
+
+    def similar(self, query: str, *, k: int) -> RecallRows: ...
 
     def match(
         self,
@@ -153,7 +182,7 @@ class RecallReader(Protocol):
         modality: Modality | None,
         memory_type: MemoryType | None,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]: ...
+    ) -> RecallRows: ...
 
     def window(
         self,
@@ -163,7 +192,7 @@ class RecallReader(Protocol):
         modality: Modality | None,
         memory_type: MemoryType | None,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]: ...
+    ) -> RecallRows: ...
 
     def neighbors(
         self,
@@ -172,9 +201,9 @@ class RecallReader(Protocol):
         before: int,
         after: int,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]: ...
+    ) -> RecallRows: ...
 
-    def entity(self, name: str, *, max_rows: int) -> tuple[SearchHit, ...]: ...
+    def entity(self, name: str, *, max_rows: int) -> RecallRows: ...
 
 
 def fallback_plan(question: str, *, k: int = DEFAULT_SIMILAR_K) -> RecallPlan:
@@ -229,10 +258,18 @@ def execute(plan: RecallPlan, reader: RecallReader) -> RecallResult:
     ranked: dict[str, SearchHit] = {}
     by_step: list[tuple[SearchHit, ...]] = []
     for step in plan.steps:
-        rows = _run(step, reader, by_step)
-        by_step.append(rows)
         bound = step.k if step.op == "similar" else step.max_rows
-        executed.append(RecallStepResult(op=step.op, rows=len(rows), bounded=len(rows) >= bound))
+        try:
+            rows, selected = _run(step, reader, by_step)
+        except ValueError:
+            # A primitive rejecting its own arguments is a read that did not happen. Every field
+            # reaching one came from a model's plan text, and `ask()` raising a bare `ValueError`
+            # from that would make model output an exception; reporting the step as having filled
+            # its bound says the truth instead, which is that records this predicate matches were
+            # never read.
+            rows, selected = (), bound
+        by_step.append(rows)
+        executed.append(RecallStepResult(op=step.op, rows=len(rows), bounded=selected >= bound))
         target = ranked if step.op == "similar" else exhaustive
         for hit in rows:
             target.setdefault(hit.id, hit)
@@ -303,7 +340,7 @@ def _run(
     step: RecallStep,
     reader: RecallReader,
     by_step: Sequence[tuple[SearchHit, ...]],
-) -> tuple[SearchHit, ...]:
+) -> RecallRows:
     """Dispatch one step, or read nothing when its own inputs are missing."""
     if step.op == "similar":
         return reader.similar(step.query or "", k=step.k)
@@ -319,7 +356,7 @@ def _run(
         )
     if step.op == "window":
         if step.occurred_from is None or step.occurred_until is None:
-            return ()
+            return RecallRows((), 0)
         return reader.window(
             occurred_from=step.occurred_from,
             occurred_until=step.occurred_until,
@@ -328,16 +365,22 @@ def _run(
             max_rows=step.max_rows,
         )
     if step.op == "neighbors":
-        anchors = () if step.of is None else tuple(hit.id for hit in by_step[step.of])
+        anchors = (
+            ()
+            if step.of is None
+            else tuple(hit.id for hit in by_step[step.of][:_MAX_NEIGHBOR_ANCHORS])
+        )
         if not anchors:
-            return ()
+            return RecallRows((), 0)
         return reader.neighbors(
             anchors,
             before=step.before,
             after=step.after,
             max_rows=step.max_rows,
         )
-    return () if step.name is None else reader.entity(step.name, max_rows=step.max_rows)
+    if step.name is None:
+        return RecallRows((), 0)
+    return reader.entity(step.name, max_rows=step.max_rows)
 
 
 def _chronological(hit: SearchHit) -> tuple[datetime, str]:
@@ -417,7 +460,9 @@ def _usable(step: RecallStep) -> RecallStep | None:
         return None
     if step.op == "neighbors" and (step.of is None or step.before + step.after == 0):
         return None
-    if step.op == "entity" and not step.name:
+    # The name reaches the store as a match term when no identity carries it, so the same length
+    # the store refuses is the length that makes an entity step unrunnable here.
+    if step.op == "entity" and (not step.name or len(step.name) > RECALL_MAX_TERM_CHARS):
         return None
     return step
 
@@ -427,12 +472,23 @@ def _text(value: object) -> str | None:
 
 
 def _terms(value: object) -> tuple[str, ...] | None:
+    """Keep the terms the store will accept, dropping the rest rather than raising.
+
+    The count is capped and so is the length: the store refuses a term over
+    `RECALL_MAX_TERM_CHARS` with a `ValueError`, and a planner that pasted a paragraph into
+    `terms` must not turn model output into an exception out of `ask()`. A `match` step left with
+    no term at all is unusable, which `_usable` turns into the fallback plan.
+    """
     if value is None:
         return ()
     if not isinstance(value, list):
         return None
     terms = tuple(
-        dict.fromkeys(term.strip() for term in value if isinstance(term, str) and term.strip())
+        dict.fromkeys(
+            term.strip()
+            for term in value
+            if isinstance(term, str) and term.strip() and len(term.strip()) <= RECALL_MAX_TERM_CHARS
+        )
     )
     return terms[:_MAX_TERMS]
 

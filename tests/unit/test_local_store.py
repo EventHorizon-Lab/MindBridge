@@ -3539,6 +3539,38 @@ def test_recall_primitives_scope_to_one_identity(tmp_path: Path) -> None:
         assert unknown == ()
 
 
+def test_a_recall_primitive_reports_what_it_selected_not_what_hydration_kept(
+    tmp_path: Path,
+) -> None:
+    """`max_rows` is applied while IDs are selected; scope is applied while they are hydrated.
+
+    A caller cannot tell a truncated set from a complete one out of the row count alone, because
+    a scope filter shrinks a read that did fill its bound to fewer rows than the bound. The
+    selection count is the only thing that carries the difference, so the primitives report it.
+    """
+    elsewhere = SpatialContext(
+        frame_id="workshop",
+        anchor=SpatialAnchor.OBSERVER,
+        x=0.0,
+        y=0.0,
+        z=0.0,
+    )
+    with LocalStore(tmp_path) as store:
+        _recall_corpus(store)
+
+        bounded = store.match_memories(("cairo",), max_rows=2)
+        nowhere = store.match_memories(("cairo",), max_rows=2, near=elsewhere, radius_m=1.0)
+        neighbors = store.neighbor_memories(("turn-3", "turn-4"), before=1, after=1, max_rows=1)
+
+    assert [memory.memory_id for memory in bounded] == ["turn-1", "turn-3"]
+    assert bounded.selected == 2
+    # Every selected row has no pose, so `near` drops all of them -- while the predicate still
+    # matched more rows than the bound allowed.
+    assert nowhere.selected == 2
+    assert tuple(nowhere) == ()
+    assert neighbors.selected == 1
+
+
 def test_identity_id_for_name_resolves_through_a_merge_and_declines_a_stranger(
     tmp_path: Path,
 ) -> None:

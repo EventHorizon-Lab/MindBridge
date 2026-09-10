@@ -3075,6 +3075,7 @@ class Abstainer:
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> AnswerResult:
         return AnswerResult(
             answer="I do not know",

@@ -139,10 +139,8 @@ rejected. The MCP-specific media bounds are listed below.
 | --- | --- | --- | --- |
 | `add_memory` | required `content`; `occurred_at=None`; `occurred_end=None`; `metadata=None`; `memory_type="semantic"`; `context=None` | `MemoryResult` | write, idempotent |
 | `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None`; `explain=false` | `{"hits":[SearchHitResult,...],"trace":null}` | write, not idempotent |
-| `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None` | `AnswerResponse` | write, not idempotent |
-| `compile_context` | required `goal`; `budget=None`; `reference_at=None`; `scope=None`; `allow_partial_sources=false` | `ContextBundleResult` | write, not idempotent |
 | `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None`; `answer_policy="strict"` | `AnswerResponse` | write, not idempotent |
-| `compile_context` | required `goal`; `budget=None`; `reference_at=None`; `scope=None` | `ContextBundleResult` | write, not idempotent |
+| `compile_context` | required `goal`; `budget=None`; `reference_at=None`; `scope=None`; `allow_partial_sources=false` | `ContextBundleResult` | write, not idempotent |
 | `get_memory` | required `memory_id` | `MemoryResult` | read-only |
 | `list_memories` | `limit=100`; `cursor=None` | `PageResult` | read-only |
 | `delete_memory` | required `memory_id` | `{"deleted":bool}` | destructive, idempotent |

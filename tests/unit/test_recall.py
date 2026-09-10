@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
 import pytest
 
+from mindbridge.infrastructure.local.store import _RECALL_MAX_TERM_CHARS
 from mindbridge.recall import (
+    _MAX_NEIGHBOR_ANCHORS,
     DEFAULT_MAX_ROWS,
     RecallPlan,
+    RecallRows,
     RecallStep,
+    RecallStepResult,
     execute,
     fallback_plan,
     parse_recall_plan,
@@ -30,15 +35,30 @@ def _hit(identifier: str, *, minutes: int = 0, score: float = 0.5) -> SearchHit:
 
 
 class _Reader:
-    """Records every read a plan makes and replays a scripted answer for each op."""
+    """Records every read a plan makes and replays a scripted answer for each op.
 
-    def __init__(self, **rows: tuple[SearchHit, ...]) -> None:
+    `selected` scripts a read whose predicate selected more records than it returned rows for,
+    which is what the caller's own scope does to a hydrated read; by default a read selects
+    exactly the rows it answers with.
+    """
+
+    def __init__(
+        self,
+        *,
+        selected: Mapping[str, int] | None = None,
+        **rows: tuple[SearchHit, ...],
+    ) -> None:
         self.rows = rows
+        self.selected = dict(selected or {})
         self.calls: list[tuple[str, object]] = []
 
-    def similar(self, query: str, *, k: int) -> tuple[SearchHit, ...]:
+    def _answer(self, op: str) -> RecallRows:
+        rows = self.rows.get(op, ())
+        return RecallRows(rows, self.selected.get(op, len(rows)))
+
+    def similar(self, query: str, *, k: int) -> RecallRows:
         self.calls.append(("similar", (query, k)))
-        return self.rows.get("similar", ())
+        return self._answer("similar")
 
     def match(
         self,
@@ -50,9 +70,9 @@ class _Reader:
         modality: Modality | None,
         memory_type: MemoryType | None,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]:
+    ) -> RecallRows:
         self.calls.append(("match", (tuple(terms), any_of, modality, memory_type, max_rows)))
-        return self.rows.get("match", ())
+        return self._answer("match")
 
     def window(
         self,
@@ -62,9 +82,9 @@ class _Reader:
         modality: Modality | None,
         memory_type: MemoryType | None,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]:
+    ) -> RecallRows:
         self.calls.append(("window", (occurred_from, occurred_until, modality, max_rows)))
-        return self.rows.get("window", ())
+        return self._answer("window")
 
     def neighbors(
         self,
@@ -73,13 +93,13 @@ class _Reader:
         before: int,
         after: int,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]:
+    ) -> RecallRows:
         self.calls.append(("neighbors", (tuple(memory_ids), before, after, max_rows)))
-        return self.rows.get("neighbors", ())
+        return self._answer("neighbors")
 
-    def entity(self, name: str, *, max_rows: int) -> tuple[SearchHit, ...]:
+    def entity(self, name: str, *, max_rows: int) -> RecallRows:
         self.calls.append(("entity", (name, max_rows)))
-        return self.rows.get("entity", ())
+        return self._answer("entity")
 
 
 def test_the_fallback_plan_is_todays_behaviour() -> None:
@@ -155,6 +175,8 @@ def test_a_full_plan_parses_every_op_with_its_own_fields() -> None:
         {"shape": "set", "steps": [{"op": "entity", "name": None}]},
         {"shape": "set", "steps": [{"op": "similar", "query": "q"}], "notes": "hi"},
         {"shape": "set", "steps": [{"op": "similar", "query": "q"}] * 7},
+        {"shape": "set", "steps": [{"op": "match", "terms": ["x" * 201]}]},
+        {"shape": "entity", "steps": [{"op": "entity", "name": "L" * 201}]},
     ],
     ids=[
         "unknown-shape",
@@ -176,6 +198,8 @@ def test_a_full_plan_parses_every_op_with_its_own_fields() -> None:
         "entity-without-a-name",
         "unknown-top-level-key",
         "too-many-steps",
+        "term-longer-than-the-store-accepts",
+        "name-longer-than-the-store-accepts",
     ],
 )
 def test_an_unrunnable_plan_falls_back_instead_of_running_something_else(
@@ -372,3 +396,104 @@ def test_a_step_whose_anchor_read_nothing_reads_nothing_itself() -> None:
 
     assert [name for name, _arguments in reader.calls] == ["match"]
     assert result.hits == ()
+
+
+def test_a_term_the_store_accepts_at_its_limit_still_plans() -> None:
+    """The cap is the store's own, so the longest term it takes is still a runnable plan."""
+    payload = json.dumps(
+        {"shape": "set", "steps": [{"op": "match", "terms": ["x" * _RECALL_MAX_TERM_CHARS]}]}
+    )
+
+    plan = parse_recall_plan(payload, reference_at=NOW)
+
+    assert plan is not None
+    assert plan.steps[0].terms == ("x" * _RECALL_MAX_TERM_CHARS,)
+
+
+def test_a_primitive_that_refuses_its_arguments_is_a_read_that_did_not_happen() -> None:
+    """A store `ValueError` must not leave `ask()` raising on model-authored plan text.
+
+    The step reads nothing and is reported as bounded: the rows its predicate matched were never
+    read, so the other steps' rows are not a complete set and no count is licensed over them.
+    """
+
+    class Refusing(_Reader):
+        def match(self, terms: Sequence[str], **arguments: object) -> RecallRows:
+            del terms, arguments
+            raise ValueError("a term must be at most 200 characters")
+
+    reader = Refusing(similar=(_hit("s-1"),))
+    plan = parse_recall_plan(
+        json.dumps(
+            {
+                "shape": "composite",
+                "steps": [
+                    {"op": "match", "terms": ["cairo"]},
+                    {"op": "similar", "query": "cairo"},
+                ],
+            }
+        ),
+        reference_at=NOW,
+    )
+
+    assert plan is not None
+    result = execute(plan, reader)
+
+    assert result.executed[0] == RecallStepResult(op="match", rows=0, bounded=True)
+    assert result.complete is False
+    assert [hit.id for hit in result.hits] == ["s-1"]
+
+
+def test_a_neighbors_step_anchors_on_a_bounded_head_of_what_it_follows() -> None:
+    """The store scans corpus order twice per anchor, so the anchor list cannot be a whole set.
+
+    Measured: 500 anchors at 10 before and 10 after spent 4.3 seconds in index-less scans. The
+    question is about what sits next to what was found, and the deepest anchors of a large match
+    buy nothing the first ones do not.
+    """
+    reader = _Reader(
+        match=tuple(_hit(f"m-{index}", minutes=index) for index in range(50)),
+        neighbors=(_hit("n-1", minutes=-5),),
+    )
+    plan = parse_recall_plan(
+        json.dumps(
+            {
+                "shape": "sequence",
+                "steps": [
+                    {"op": "match", "terms": ["wrench"]},
+                    {"op": "neighbors", "of": "step:0", "before": 10, "after": 10},
+                ],
+            }
+        ),
+        reference_at=NOW,
+    )
+
+    assert plan is not None
+    execute(plan, reader)
+
+    anchors = cast(tuple[tuple[str, ...], int, int, int], reader.calls[1][1])[0]
+    assert anchors == tuple(f"m-{index}" for index in range(_MAX_NEIGHBOR_ANCHORS))
+
+
+def test_a_read_the_bound_truncated_stays_bounded_when_a_scope_drops_a_row() -> None:
+    """Completeness follows the selection, not the rows the caller was allowed to see.
+
+    The bound is applied while the IDs are selected and the caller's bitemporal, spatial and
+    metric scope is applied while they are hydrated, so a truncated read can come back shorter
+    than its own bound. Reading that as "everything the predicate matched" is what lets a count
+    be stated over a set the answer does not hold.
+    """
+    reader = _Reader(
+        match=(_hit("m-1", minutes=0),),
+        selected={"match": 3},
+    )
+    plan = parse_recall_plan(
+        json.dumps({"shape": "set", "steps": [{"op": "match", "terms": ["a"], "max_rows": 3}]}),
+        reference_at=NOW,
+    )
+
+    assert plan is not None
+    result = execute(plan, reader)
+
+    assert result.executed[0] == RecallStepResult(op="match", rows=1, bounded=True)
+    assert result.complete is False
