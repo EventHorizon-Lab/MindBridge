@@ -1024,8 +1024,6 @@ Three result fields carry a caveat that decides whether they can be quoted:
 - **`abstentions` undercounts.** It counts two things: the opaque marker the answer backend emits
   when it declines, and -- for a task whose own prompt mandates a refusal wording -- an answer
   equal to that wording. A model that refuses in its own free wording, on a task that mandates
-  none, is still not counted. Treat the field as a lower bound and read the predictions before
-  drawing a conclusion about refusal rates.
   none, is still not counted. Measured under the older exact-sentence detector, an EgoLifeQA slice
   reported 2 of 51 while 14 of 51 answers read as refusals; treat the field as a lower bound and
   read the predictions before drawing a conclusion about refusal rates.
