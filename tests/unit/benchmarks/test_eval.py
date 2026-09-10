@@ -3632,6 +3632,70 @@ def test_a_task_worded_refusal_counts_as_an_abstention() -> None:
     assert not eval_module._declined("Insufficient information", replace(question, refusal=None))
 
 
+def test_memlens_attaches_its_published_images_only_where_the_file_is_present(
+    tmp_path: Path,
+) -> None:
+    # 65.7% of MEMLENS answers live in the image rather than its BLIP caption, so a present
+    # file must reach the model as media. The release ships those images separately, and a
+    # checkout without them must keep emitting exactly the captioned text it emitted before.
+    dataset = tmp_path / "memlens.json"
+    dataset.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "q1",
+                    "question_type": "information_extraction",
+                    "question": "What did the receipt total?",
+                    "answer": "$42.00",
+                    "question_date": "2025/01/15 (Wed) 10:00",
+                    "haystack_dates": ["2025/01/14 (Tue) 09:00"],
+                    "haystack_sessions": [
+                        [
+                            {
+                                "role": "user",
+                                "content": "Here is the receipt.",
+                                "images": [
+                                    {
+                                        "file": "needle_images/present.jpg",
+                                        "blip_caption": "a photo of a receipt",
+                                    },
+                                    {
+                                        "file": "needle_images/absent.jpg",
+                                        "blip_caption": "a photo of a menu",
+                                    },
+                                ],
+                            }
+                        ]
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    auxiliary = tmp_path / "memlens" / "agent_subset_195.json"
+    auxiliary.parent.mkdir()
+    auxiliary.write_text(json.dumps({"n_questions": 1, "question_ids": ["q1"]}), encoding="utf-8")
+    captioned = (
+        "[2025-01-14T09:00:00+00:00] user: Here is the receipt."
+        "\nImage needle_images/present.jpg: a photo of a receipt"
+        "\nImage needle_images/absent.jpg: a photo of a menu"
+    )
+
+    def content() -> tuple[str | Path, ...]:
+        loaded = load_task(
+            TASKS["memlens-32k"], root=tmp_path, dataset_path=dataset, verify_digest=False
+        )
+        return loaded.units[0].memories[0].content
+
+    assert content() == (captioned,)
+
+    image = tmp_path / "memlens" / "release_images" / "needle_images" / "present.jpg"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"\xff\xd8\xff")
+
+    assert content() == (captioned, image.resolve())
+
+
 def test_memlens_questions_declare_the_refusal_their_own_prompt_mandates(tmp_path: Path) -> None:
     # Loading the real task, not the helper in isolation: a declaration the loader never attaches
     # returns the reported refusal rate to zero while the model keeps refusing, and a test of the
