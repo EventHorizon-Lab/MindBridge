@@ -7392,6 +7392,28 @@ def test_one_round_is_a_configured_ceiling_on_replanning(tmp_path: Path) -> None
     assert len(models.answer_calls) == 1
 
 
+def test_a_streaming_caller_sees_both_rounds_and_one_terminal_result(tmp_path: Path) -> None:
+    """A second round is a second answer on the wire, and the caller has to be able to tell.
+
+    The deltas are the provider's own, so a replanned question streams the thin attempt and
+    then the committed one; the single terminal chunk carries the round that stands.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    models.abstentions = 1
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        chunks = list(memory.ask_stream("how many wrenches?", limit=2, answer_policy="best_effort"))
+
+    deltas = [chunk.text for chunk in chunks if chunk.result is None]
+    finals = [chunk.result for chunk in chunks if chunk.result is not None]
+    assert len(deltas) == 2
+    assert len(finals) == 1
+    assert finals[0].answer == deltas[1]
+    assert finals[0].abstained is False
+
+
 @pytest.mark.parametrize(
     ("setting", "value", "error"),
     [
