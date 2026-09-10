@@ -5750,7 +5750,11 @@ class Memory:
                 ),
                 assets=memory.assets,
                 modality=Modality(memory.modality),
-                canonical_parts=(("text", base),) if base else (),
+                # Recovered section by section, not handed over as one string: the derived
+                # sections were embedded as their own atomic keys on the way in, and merging
+                # them here would key 2048-character windows of the whole document instead --
+                # on exactly the memories a stated name reindexes.
+                canonical_parts=_stored_canonical_parts(base, memory.assets),
                 audio_transcript=_has_stream_transcript(base, memory.assets),
                 visual_description=_has_stream_description(base, memory.assets),
             )
@@ -7860,7 +7864,12 @@ class Memory:
                             text=memory.content,
                             assets=memory.assets,
                             modality=Modality(memory.modality),
-                            canonical_parts=((("text", memory.content),) if memory.content else ()),
+                            # Same reason as `_refresh_speaker_memories`: an embedder swap has to
+                            # re-key each stored row the way `add()` keyed it, section by section.
+                            canonical_parts=_stored_canonical_parts(
+                                memory.content,
+                                memory.assets,
+                            ),
                             audio_transcript=_has_stream_transcript(
                                 memory.content,
                                 memory.assets,
