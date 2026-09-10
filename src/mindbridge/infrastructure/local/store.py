@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import math
 import os
 import re
@@ -28,8 +27,6 @@ from pathlib import Path
 from threading import Lock
 from typing import Literal, NoReturn
 
-from mindbridge.control import load_operation, operation_key
-from mindbridge.exceptions import StorageError
 from mindbridge.infrastructure.local._lock import DataDirectoryLock
 from mindbridge.models.base import FaceAnalysis, SpeechAnalysis
 from mindbridge.types import (
@@ -5870,40 +5867,6 @@ def _create_schema(
         raise
 
 
-def _report_unsupported_derived_records(connection: sqlite3.Connection) -> int:
-    """Count the derived records the clause projection leaves without any support.
-
-    From schema 17 on, a derived record whose basis is not a host assertion is visible only while
-    it has an active evidence clause. Public `add` cannot write such a record, but a store written
-    before the clause projection may hold them, and they silently drop out of retrieval on the next
-    projection refresh. The upgrade says how many so the operator can decide before noticing.
-    """
-    row = connection.execute(
-        """
-        SELECT COUNT(*) FROM memory_semantics AS s
-        JOIN memory_versions AS v ON v.memory_id = s.memory_id AND v.retired_at IS NULL
-        WHERE s.kind <> ? AND s.basis NOT IN (?, ?)
-          AND NOT EXISTS (
-            SELECT 1 FROM memory_evidence_clauses AS c
-            WHERE c.memory_id = s.memory_id AND c.retired_at IS NULL
-          )
-        """,
-        (
-            MemoryKind.OBSERVATION.value,
-            EvidenceBasis.USER_STATEMENT.value,
-            EvidenceBasis.RESPONSE_FEEDBACK.value,
-        ),
-    ).fetchone()
-    count = 0 if row is None else int(row[0])
-    if count:
-        logging.getLogger(__name__).warning(
-            "schema 17 upgrade: %d derived memory records have no evidence and will stay hidden "
-            "from retrieval until evidence is added or they are deleted",
-            count,
-        )
-    return count
-
-
 def _validate_text_selector_schema(connection: sqlite3.Connection) -> None:
     """Reject a partial or incompatible selector projection before accepting schema 18."""
     expected_columns = {
@@ -6092,44 +6055,6 @@ def _validate_evidence_clause_schema(connection: sqlite3.Connection) -> None:
             raise UnsupportedSchemaError(f"local schema has invalid indexes on {table}")
 
 
-def _v16_accessed_index(connection: sqlite3.Connection) -> None:
-    indexes = {
-        str(row[1])
-        for row in connection.execute("PRAGMA index_list(memory_records)")
-        if row[1] is not None
-    }
-    if "memory_records_accessed_idx" not in indexes:
-        connection.execute(_ACCESSED_INDEX_DDL)
-
-
-def _v16_rekey_operations(connection: sqlite3.Connection) -> None:
-    """Recompute every logged `operation_key` under the current algorithm.
-
-    Adding `claim` to the key payload without re-keying stopped deduplication dead on an existing
-    log: a repeated proposal recomputes to a key no stored row carries, so it applies again. The
-    key is a pure function of the stored payload and recipe, so recomputing one already written
-    under the current algorithm returns it unchanged and this rung is safe to re-run.
-    """
-    rows = connection.execute(
-        "SELECT operation_id, operation_key, operation_json, recipe FROM memory_operations"
-    ).fetchall()
-    for row in rows:
-        try:
-            operation = load_operation(_row_text(row, "operation_json"))
-        except StorageError:
-            # The log is auditable history; a payload this build cannot read is left as it is
-            # rather than refusing to open the store.
-            continue
-        # The row's own recipe, never the live one: a recipe whose version marker moved since is
-        # a different reasoner, and re-keying its log under today's marker would forge the match.
-        current = operation_key(operation, recipe=row["recipe"])
-        if current != _row_text(row, "operation_key"):
-            connection.execute(
-                "UPDATE memory_operations SET operation_key = ? WHERE operation_id = ?",
-                (current, int(row["operation_id"])),
-            )
-
-
 # The kernel derives a naming assertion's IDs in `memory.py`; importing it here would invert the
 # dependency, so the two payloads are restated for the migration and pinned by a contract test
 # that registers the same name through the kernel and compares the IDs it mints.
@@ -6178,90 +6103,6 @@ def _naming_assertion_ids(
 
 def _canonical_json(payload: Mapping[str, object]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _v16_backfill_naming_assertions(connection: sqlite3.Connection) -> None:
-    """Give every name registered before #151 the assertion its projection now rests on.
-
-    Naming used to be a column somebody wrote. Every read path derives that column from a visible
-    ENTITY assertion now, so a name with nothing behind it reports unconfirmed, never answers
-    `identity_for_subject`, and compiles as an unnamed provisional actor. This writes what the
-    kernel would have written, under the ID the kernel derives, so re-registering the same name
-    stays the no-op it is documented to be rather than minting a second assertion.
-
-    The record carries no vectors: embedding needs a model a migration must not call. Each one is
-    therefore enqueued in `capture_queue`, which is the store's standing "this record still owes
-    model work" queue, so the next `settle()` embeds and indexes it exactly as it settles a
-    captured record -- `reindex()` cannot, because it replays the embeddings SQLite already holds
-    and a record with none is invisible to it. The projection, which is what a registered name is
-    for, is correct as soon as the store opens, and `pending_captures()` names what is still owed.
-    """
-    rows = connection.execute(
-        """
-        SELECT identity_id, name, relationship, created_at
-        FROM identities AS i
-        WHERE i.name IS NOT NULL
-          AND NOT EXISTS (
-              SELECT 1 FROM memory_semantics AS s
-              WHERE s.identity_id = i.identity_id AND s.kind = ?
-          )
-        """,
-        (MemoryKind.ENTITY.value,),
-    ).fetchall()
-    for row in rows:
-        identity_id = _row_text(row, "identity_id")
-        name = _row_text(row, "name")
-        relationship = _optional_row_text(row, "relationship")
-        memory_id, lineage_id = _naming_assertion_ids(identity_id, name, relationship)
-        recorded_at = _row_text(row, "created_at")
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO memory_records (
-                memory_id, content, modality, memory_type, metadata_json, created_at, updated_at
-            ) VALUES (?, ?, 'text', 'semantic', '{}', ?, ?)
-            """,
-            (
-                memory_id,
-                (
-                    f"{name} is a recognized person."
-                    if relationship is None
-                    else f"{name} is a recognized person, {relationship}."
-                ),
-                recorded_at,
-                recorded_at,
-            ),
-        )
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO memory_semantics (
-                memory_id, lineage_id, kind, basis,
-                subject, predicate, value, recipe, identity_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                memory_id,
-                lineage_id,
-                MemoryKind.ENTITY.value,
-                EvidenceBasis.USER_STATEMENT.value,
-                name,
-                _NAMING_PREDICATE,
-                relationship,
-                _NAMING_RECIPE,
-                identity_id,
-            ),
-        )
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO memory_versions (
-                memory_id, version, confidence, recorded_at, visible
-            ) VALUES (?, 1, 1.0, ?, 1)
-            """,
-            (memory_id, recorded_at),
-        )
-        connection.execute(
-            "INSERT OR IGNORE INTO capture_queue (memory_id, enqueued_at) VALUES (?, ?)",
-            (memory_id, recorded_at),
-        )
 
 
 def _write_memory_context(

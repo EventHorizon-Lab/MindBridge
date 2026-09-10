@@ -418,6 +418,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- `AsyncMemory(memory)` now wraps an already-open `Memory` instead of repeating its constructor;
+  open one with `AsyncMemory.from_plugins()`, `AsyncMemory.from_config()`, or
+  `AsyncMemory(Memory(...))`.
+- `mindbridge-bench eval` no longer reports a run-level `resources.energy` block or per-GPU
+  `estimated_energy_watt_hours`. Intel RAPL package counters are not read any more; sampled GPU
+  power still appears as averages and peaks.
 - MCP tool results are validated from the SDK value objects, the way REST already builds its
   responses, instead of through hand-written per-field converters. The published tool schemas and
   their field names are unchanged, and a field added to a value object now reaches both transports
@@ -475,7 +481,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   usage now reports per-component completeness instead of treating unknown input, output, cached,
   or reasoning tokens as zero; retry attempts and mixed response provenance remain attributable.
   Result artifacts also include fresh-store/warmup/repeat protocol, client hardware and sampled
-  power/energy, optional process-global vLLM `/metrics` deltas, and comparable performance budgets.
+  power, optional process-global vLLM `/metrics` deltas, and comparable performance budgets.
 - **Breaking:** MindBridge-generated benchmark results, media manifests, and LoCoMo sibling
   manifests are now JSONL artifacts with `.jsonl` filenames. The externally specified
   EgoMemReason submission remains a JSON array named `egomemreason_submission.json`.
@@ -808,12 +814,6 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `ContextBudget.max_media_items` bounds. It counted hits carrying any asset, so an omni memory
   with a still and a clip reported one part instead of two and multi-asset bundles looked as
   thrifty as single-asset ones.
-- `energy.cpu_package_joules` differences each Intel RAPL package against its own counter and
-  corrects the wrap at that package's `max_energy_range_uj`. A run longer than the wrap period --
-  tens of minutes on a busy package, well inside a sweep -- subtracted to a negative delta that
-  was clamped to zero, publishing 0 J for a run that burned energy; summing the packages before
-  subtracting could also hide one package's wrap inside another's rise. A wrap on a package that
-  publishes no range now makes the value absent with that as its `reason`.
 - The benchmark description cache accepts calls from every unit worker thread. It is opened once
   for a run while units ingest on worker threads, and SQLite's per-thread binding made every
   worker-side describe fail; the write path counted each as a failed batch and fell open, so a

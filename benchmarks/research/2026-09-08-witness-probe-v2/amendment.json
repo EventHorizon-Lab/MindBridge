@@ -1,8 +1,0 @@
-{
-  "amended_before_model_calls": true,
-  "parent_manifest": "../2026-09-08-witness-probe-v1/manifest.json",
-  "parent_manifest_sha256": "e65bf4809de4cda618620d21a0b6e4c1d08f2f3d51333dc33ce76f989c1bfcd0",
-  "amended_manifest_sha256": "0f784891d55bc20b47a3830a8cd79955a050474d8cb154f1727e3ac88db6c8fa",
-  "reason": "Case time originally used the ordinary weekend immediately after the fixed 2026-09-08 reference date, so the primary observation alone could resolve September 12 and 13. The amended contextual definition names September 19 and 20, making observation 0 necessary while leaving every other case and field unchanged.",
-  "model_calls_before_amendment": 0
-}

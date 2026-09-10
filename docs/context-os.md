@@ -343,7 +343,7 @@ context utility under the target device's latency, resource, and privacy constra
 
 | Outcome | Required measurements |
 | --- | --- |
-| Real-time behavior | Capture acknowledgement and search p50, p95, and p99; time to searchable; speculative first-hit latency; CPU, memory, energy, and disk. |
+| Real-time behavior | Capture acknowledgement and search p50, p95, and p99; time to searchable; speculative first-hit latency; CPU, memory, and disk. |
 | Context utility | Downstream task success against no-memory, full-context, and retrieval-only baselines; useful evidence per token and per millisecond. |
 | Embodied quality | Multimodal, temporal, and spatial recall; identity false merge and fragmentation; affect attribution and trait false positives. |
 | Slow-loop quality | Consolidation precision, contradiction recovery, false retirement, rollback success, model cost, and formation lag. `mindbridge-bench control-plane` measures the first five; formation lag is still unmeasured. |
@@ -362,8 +362,7 @@ defaults or justify superiority claims.
    The [benchmark harness](benchmarking.md#reported-performance-and-resource-metrics) can now
    produce most of these numbers from a real run: capture acknowledgement, time to searchable,
    and formation lag from `mindbridge-bench eval --ingest capture`, search and answer latency
-   from any run, and CPU, memory, disk, and energy (Intel RAPL and `nvidia-smi` power draw, where
-   the platform exposes them) for the whole run. Speculative first-hit latency stays unmeasured:
+   from any run, and CPU, memory, and disk for the whole run. Speculative first-hit latency stays unmeasured:
    the streaming prefetch path issues an ordinary `Memory.search()`, indistinguishable in
    telemetry from any other search, and the harness does not exercise streaming ingest. Running
    this on named hardware and publishing the result is still what closes the gate.

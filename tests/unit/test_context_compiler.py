@@ -1981,11 +1981,13 @@ class _Answerer:
 def test_async_compile_and_capabilities_mirror_the_sync_surface(tmp_path: Path) -> None:
     async def run() -> tuple[ContextBundle, MemoryCapabilities]:
         async with AsyncMemory(
-            tmp_path,
-            embedder=TinyEmbedder(),
-            former=_Former(),
-            consolidator=ScriptedConsolidator(),
-            minimum_relevance=0,
+            Memory(
+                tmp_path,
+                embedder=TinyEmbedder(),
+                former=_Former(),
+                consolidator=ScriptedConsolidator(),
+                minimum_relevance=0,
+            )
         ) as memory:
             await memory.add("the spare key is in the blue toolbox")
             return await memory.compile(

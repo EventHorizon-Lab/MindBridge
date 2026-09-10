@@ -1117,13 +1117,6 @@ def _index_values(metadata: Mapping[str, object], key: str) -> tuple[int, ...]:
     return tuple(item for item in value if isinstance(item, int) and not isinstance(item, bool))
 
 
-def _family(task: str) -> str:
-    family = _family_or_none(task)
-    if family is not None:
-        return family
-    raise ValueError(f"no official scorer registered for task {task}")
-
-
 def _family_or_none(task: str) -> str | None:
     for family in sorted(_PROTOCOLS, key=len, reverse=True):
         if task == family or task.startswith(f"{family}-"):

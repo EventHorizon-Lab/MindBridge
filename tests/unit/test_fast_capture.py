@@ -426,9 +426,11 @@ def test_a_capture_that_survived_a_crash_settles_under_a_new_owner(tmp_path: Pat
 def test_async_capture_settle_and_pending_mirror_the_synchronous_surface(tmp_path: Path) -> None:
     async def scenario() -> None:
         async with AsyncMemory(
-            tmp_path,
-            embedder=CountingEmbedder(),
-            minimum_relevance=0,
+            Memory(
+                tmp_path,
+                embedder=CountingEmbedder(),
+                minimum_relevance=0,
+            )
         ) as memory:
             record = await memory.capture("the ladder is in the garage")
 

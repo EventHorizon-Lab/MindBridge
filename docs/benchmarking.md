@@ -806,18 +806,6 @@ so that adding this measurement never touched product code. Pair `compile_bundle
 `compile_bundle_items` (in a sample's `metrics`) with that sample's answer-quality metric to compute
 "useful evidence per token" for one question; the run does not compute the ratio itself.
 
-The run-level `resources.energy` block adds host CPU-package energy from Intel RAPL counters
-(`/sys/class/powercap/intel-rapl:*/energy_uj`) and per-device GPU energy from the same time-integrated
-`nvidia-smi --query-gpu=power.draw` samples used by the GPU resource block. Neither is a calibrated
-per-process meter, and an unreadable source remains absent with a `reason` instead of a fabricated
-number.
-
-Each RAPL package is differenced against its own counter, because `energy_uj` wraps at that
-package's `max_energy_range_uj` -- tens of minutes on a busy package, well inside the length of a
-sweep. A package that wrapped is corrected by its published range; one that wrapped without
-publishing a range makes `cpu_package_joules` absent with that as its `reason`, rather than a
-number nothing can correct.
-
 `search_e2e` and `ask_retrieval_core` must not be conflated. The former is a standalone,
 post-answer warm-store replay of each fresh product question through public `Memory.search`; all
 selected tasks finish their formal answers before this run-global second pass begins. It is the
@@ -856,7 +844,7 @@ The run-level `resources` object has two attribution scopes:
 
 - client CPU uses process CPU time and the current CPU affinity; memory is the process-lifetime
   resident high-water mark; storage growth is measured over the selected run directories;
-- local GPU utilization, memory, and power are sampled from `nvidia-smi`. Averages and energy use
+- local GPU utilization, memory, and power are sampled from `nvidia-smi`. Averages use
   time-weighted integration; peaks between polls may be missed. These are system-device readings,
   not per-process values, and are marked non-exclusive.
 

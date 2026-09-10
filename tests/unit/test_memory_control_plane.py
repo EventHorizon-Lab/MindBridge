@@ -1105,10 +1105,12 @@ def test_async_memory_mirrors_the_control_plane(tmp_path: Path) -> None:
 
     async def scenario() -> None:
         memory = AsyncMemory(
-            tmp_path / "async",
-            embedder=TinyEmbedder(),
-            consolidator=consolidator,
-            minimum_relevance=0,
+            Memory(
+                tmp_path / "async",
+                embedder=TinyEmbedder(),
+                consolidator=consolidator,
+                minimum_relevance=0,
+            )
         )
         try:
             first = await memory.add("Ana waited calmly", occurred_at=OCCURRED)

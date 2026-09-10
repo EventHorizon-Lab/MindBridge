@@ -236,10 +236,6 @@ def _chain_progress(correct: tuple[bool, ...], structure: VideoMMEV2LogicStructu
     return progress
 
 
-def _mean(scores: tuple[_Score, ...]) -> _Score:
-    return sum(scores) / len(scores) if scores else 0.0
-
-
 def _group(rows: list[_RawQuestion]) -> VideoMMEV2Group:
     first = rows[0]
     metadata = (first.video_id, first.url, first.group_type, first.group_structure)

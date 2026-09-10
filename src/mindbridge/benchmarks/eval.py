@@ -14,7 +14,6 @@ import platform
 import random
 import re
 import statistics
-import subprocess
 import sys
 import time
 from collections.abc import (
@@ -58,6 +57,7 @@ from mindbridge import (
     FunASRTranscriber,
     IndexUnavailableError,
     JinaOmniEmbedder,
+    Memory,
     MemoryConfig,
     MemoryType,
     MindBridgeConfig,
@@ -95,6 +95,7 @@ from mindbridge.benchmarks.eval_cache import (
 from mindbridge.benchmarks.eval_environment import (
     acceleration_runtime_metadata,
     hardware_metadata,
+    nvidia_smi_rows,
     source_metadata,
     unavailable_server_resources,
 )
@@ -1286,16 +1287,18 @@ class _BackendPool:
         # `fields(MemoryPlugins)` instead.
         policy = {entry.name: getattr(self._settings, entry.name) for entry in fields(MemoryConfig)}
         return AsyncMemory(
-            data_dir,
-            embedder=self._embedder,
-            answerer=self._answerer,
-            transcriber=self._transcriber,
-            face_analyzer=self._face_analyzer,
-            former=self._former,
-            consolidator=self._consolidator,
-            vision_describer=self._vision_describer,
-            tracer=self._tracer,
-            **policy,
+            Memory(
+                data_dir,
+                embedder=self._embedder,
+                answerer=self._answerer,
+                transcriber=self._transcriber,
+                face_analyzer=self._face_analyzer,
+                former=self._former,
+                consolidator=self._consolidator,
+                vision_describer=self._vision_describer,
+                tracer=self._tracer,
+                **policy,
+            )
         )
 
     def close(self) -> None:
@@ -1704,29 +1707,11 @@ def _physical_cuda_identity(device: str) -> str | None:
 
 
 def _nvidia_device_uuids() -> dict[int, str]:
-    try:
-        result = subprocess.run(
-            (
-                "nvidia-smi",
-                "--query-gpu=index,uuid",
-                "--format=csv,noheader,nounits",
-            ),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    if result.returncode:
-        return {}
-    devices = {}
-    for line in result.stdout.splitlines():
-        index, separator, uuid = line.partition(",")
-        if separator and index.strip().isdecimal() and uuid.strip():
-            devices[int(index.strip())] = uuid.strip()
-    return devices
+    return {
+        int(row[0]): row[1]
+        for row in nvidia_smi_rows("index,uuid")
+        if len(row) >= 2 and row[0].isdecimal() and row[1]
+    }
 
 
 def _release_device_memory(device: str | None) -> None:

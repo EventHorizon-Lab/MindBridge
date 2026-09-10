@@ -1149,12 +1149,6 @@ def _remote_add_many(arguments: argparse.Namespace) -> tuple[str, str, _Document
     return "POST", "/v1/memories/batch", body
 
 
-def _remote_capture(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    # The route takes the same body `POST /v1/memories` does, so the encoding is the same too.
-    _method, _path, body = _remote_add(arguments)
-    return "POST", "/v1/capture", body
-
-
 def _remote_settle(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
     body: _Document = {"limit": arguments.limit, "max_attempts": arguments.max_attempts}
     _put(body, "memory_ids", list(arguments.memory_ids) or None)
@@ -1166,54 +1160,21 @@ def _remote_pending_captures(arguments: argparse.Namespace) -> tuple[str, str, _
     return "GET", f"/v1/pending_captures?{urlencode(query)}", None
 
 
-def _remote_search(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    return "POST", "/v1/memories/search", _remote_query("query", arguments)
-
-
-def _remote_search_with_trace(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    # One route serves both searches; `explain` is what selects the traced SDK operation.
-    return "POST", "/v1/memories/search", {**_remote_query("query", arguments), "explain": True}
-
-
-def _remote_reinforce(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    return "POST", "/v1/memories/reinforce", {"memory_ids": list(arguments.memory_ids)}
-
-
-def _remote_speech(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    return "POST", "/v1/speech", {"memory_id": arguments.memory_id}
-
-
-def _remote_faces(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    return "POST", "/v1/faces", {"memory_id": arguments.memory_id}
-
-
 def _remote_register_identity(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
     body: _Document = {"identity_id": arguments.identity_id, "name": arguments.name}
     _put(body, "relationship", arguments.relationship)
     return "POST", "/v1/identities", body
 
 
-def _remote_identity(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    return "GET", f"/v1/identities/{quote(arguments.identity_id, safe='')}", None
-
-
-def _remote_unlink_identity(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    return "POST", f"/v1/identities/{quote(arguments.alias_id, safe='')}/unlink", None
-
-
-def _remote_forget_identity(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    return "DELETE", f"/v1/identities/{quote(arguments.identity_id, safe='')}", None
-
-
 def _remote_record_consent(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
     body: _Document = {"state": arguments.state}
     _put(body, "note", arguments.note)
-    identity_id = quote(arguments.identity_id, safe="")
-    return "POST", f"/v1/identities/{identity_id}/consent", body
+    return "POST", f"/v1/identities/{_segment(arguments.identity_id)}/consent", body
 
 
-def _remote_consent(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    return "GET", f"/v1/identities/{quote(arguments.identity_id, safe='')}/consent", None
+def _segment(value: str) -> str:
+    """Quote one ID as a whole path segment; `/` in an ID must not become a route boundary."""
+    return quote(value, safe="")
 
 
 def _remote_export(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
@@ -1223,14 +1184,6 @@ def _remote_export(arguments: argparse.Namespace) -> tuple[str, str, _Document |
         else [("memory_ids", value) for value in arguments.memory_ids]
     )
     return "GET", f"/v1/export?{urlencode(query)}", None
-
-
-def _remote_apply_retention(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    return "POST", "/v1/retention", {"dry_run": arguments.dry_run}
-
-
-def _remote_ask(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    return "POST", "/v1/answers", _remote_query("question", arguments)
 
 
 def _remote_query(field: str, arguments: argparse.Namespace) -> _Document:
@@ -1266,14 +1219,6 @@ def _remote_compile(arguments: argparse.Namespace) -> tuple[str, str, _Document 
     return "POST", "/v1/context", body
 
 
-def _remote_get(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    return "GET", f"/v1/memories/{quote(arguments.memory_id, safe='')}", None
-
-
-def _remote_delete(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
-    return "DELETE", f"/v1/memories/{quote(arguments.memory_id, safe='')}", None
-
-
 def _remote_list(arguments: argparse.Namespace) -> tuple[str, str, _Document | None]:
     query = {"limit": arguments.limit}
     if arguments.cursor is not None:
@@ -1290,27 +1235,33 @@ def _remote_list(arguments: argparse.Namespace) -> tuple[str, str, _Document | N
 _REMOTE: Mapping[str, Callable[[argparse.Namespace], tuple[str, str, _Document | None]]] = {
     "add": _remote_add,
     "add-many": _remote_add_many,
-    "capture": _remote_capture,
+    # The route takes the same body `POST /v1/memories` does, so the encoding is the same too.
+    "capture": lambda a: ("POST", "/v1/capture", _remote_add(a)[2]),
     "settle": _remote_settle,
     "pending-captures": _remote_pending_captures,
-    "search": _remote_search,
-    "search-with-trace": _remote_search_with_trace,
-    "ask": _remote_ask,
+    "search": lambda a: ("POST", "/v1/memories/search", _remote_query("query", a)),
+    # One route serves both searches; `explain` is what selects the traced SDK operation.
+    "search-with-trace": lambda a: (
+        "POST",
+        "/v1/memories/search",
+        {**_remote_query("query", a), "explain": True},
+    ),
+    "ask": lambda a: ("POST", "/v1/answers", _remote_query("question", a)),
     "compile": _remote_compile,
-    "get": _remote_get,
-    "speech": _remote_speech,
-    "faces": _remote_faces,
+    "get": lambda a: ("GET", f"/v1/memories/{_segment(a.memory_id)}", None),
+    "speech": lambda a: ("POST", "/v1/speech", {"memory_id": a.memory_id}),
+    "faces": lambda a: ("POST", "/v1/faces", {"memory_id": a.memory_id}),
     "register-identity": _remote_register_identity,
-    "identity": _remote_identity,
+    "identity": lambda a: ("GET", f"/v1/identities/{_segment(a.identity_id)}", None),
     "record-consent": _remote_record_consent,
-    "consent": _remote_consent,
-    "forget-identity": _remote_forget_identity,
-    "unlink-identity": _remote_unlink_identity,
-    "reinforce": _remote_reinforce,
+    "consent": lambda a: ("GET", f"/v1/identities/{_segment(a.identity_id)}/consent", None),
+    "forget-identity": lambda a: ("DELETE", f"/v1/identities/{_segment(a.identity_id)}", None),
+    "unlink-identity": lambda a: ("POST", f"/v1/identities/{_segment(a.alias_id)}/unlink", None),
+    "reinforce": lambda a: ("POST", "/v1/memories/reinforce", {"memory_ids": list(a.memory_ids)}),
     "export": _remote_export,
-    "apply-retention": _remote_apply_retention,
+    "apply-retention": lambda a: ("POST", "/v1/retention", {"dry_run": a.dry_run}),
     "list": _remote_list,
-    "delete": _remote_delete,
+    "delete": lambda a: ("DELETE", f"/v1/memories/{_segment(a.memory_id)}", None),
 }
 # Which `create_app` switch registers each gated route, so a 404 from an owner that never opted
 # in names the switch instead of reaching the caller as an unexplained exit 1.

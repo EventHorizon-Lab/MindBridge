@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import math
-import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -540,11 +539,11 @@ def test_resource_sampler_reports_cpu_memory_and_media_dominated_storage_growth(
     assert resources["gpu"] is None
 
 
-def test_resource_sampler_reports_gpu_average_peak_power_and_estimated_energy(
+def test_resource_sampler_reports_gpu_average_and_peak_power(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "mindbridge.benchmarks.eval_telemetry.subprocess.run",
+        "mindbridge.benchmarks.eval_environment.subprocess.run",
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0,
             stdout="0, 50, 1024, 200.5\n1, 25, 512, [N/A]\n",
@@ -562,7 +561,6 @@ def test_resource_sampler_reports_gpu_average_peak_power_and_estimated_energy(
     assert gpu["0"]["average_utilization_percent"] == 50.0
     assert gpu["0"]["peak_memory_used_bytes"] == 1024 * 1_048_576
     assert gpu["0"]["average_power_watts"] == 200.5
-    assert cast(float, gpu["0"]["estimated_energy_watt_hours"]) >= 0.0
     assert gpu["1"]["average_power_watts"] is None
 
 
@@ -574,10 +572,6 @@ def test_resource_sampler_excludes_interleaved_judge_cpu_and_wall_time(
     monkeypatch.setattr(
         "mindbridge.benchmarks.eval_telemetry._nvidia_utilization",
         lambda: (),
-    )
-    monkeypatch.setattr(
-        "mindbridge.benchmarks.eval_telemetry._rapl_energy_uj",
-        lambda root=None: (None, "unavailable"),
     )
     monkeypatch.setattr(
         "mindbridge.benchmarks.eval_telemetry._cpu_seconds",
@@ -615,157 +609,6 @@ def test_storage_bytes_separates_media_rows_and_vectors(tmp_path: Path) -> None:
         "other": 1,
         "total": 15,
     }
-
-
-def test_resource_sampler_integrates_gpu_power_into_energy(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "mindbridge.benchmarks.eval_telemetry._nvidia_utilization",
-        lambda: ((0, 50.0, 1024, 120.0),),
-    )
-    monkeypatch.setattr(
-        "mindbridge.benchmarks.eval_telemetry._rapl_energy_uj",
-        lambda root=None: (None, "no intel-rapl packages under /sys/class/powercap"),
-    )
-    with ResourceSampler(interval_seconds=0.05) as sampler:
-        time.sleep(0.12)
-
-    energy = cast(Mapping[str, object], sampler.json(wall_seconds=1.0)["energy"])
-    gpu_joules = cast(Mapping[str, float], energy["gpu_joules"])
-    # Rectangle-rule integral of at least two 120 W samples over ~0.05 s each.
-    assert gpu_joules["0"] > 0.0
-    assert energy["cpu_package_joules"] is None
-    assert energy["available"] is True
-    assert energy["reason"] is None
-
-
-def test_resource_sampler_reports_unavailable_energy_with_a_reason(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "mindbridge.benchmarks.eval_telemetry._nvidia_utilization",
-        lambda: (),
-    )
-    monkeypatch.setattr(
-        "mindbridge.benchmarks.eval_telemetry._rapl_energy_uj",
-        lambda root=None: (None, "no intel-rapl packages under /sys/class/powercap"),
-    )
-    with ResourceSampler(interval_seconds=0.05) as sampler:
-        pass
-
-    energy = cast(Mapping[str, object], sampler.json(wall_seconds=1.0)["energy"])
-    assert energy == {
-        "cpu_package_joules": None,
-        "gpu_joules": None,
-        "available": False,
-        "reason": (
-            "no intel-rapl packages under /sys/class/powercap; no GPU visible to nvidia-smi"
-        ),
-    }
-
-
-def _rapl_tree(tmp_path: Path, packages: Sequence[tuple[int, int | None]]) -> Path:
-    """Write a fake powercap tree, one package per `(energy_uj, max_energy_range_uj)` pair."""
-    root = tmp_path / "powercap"
-    for index, (energy, max_range) in enumerate(packages):
-        package = root / f"intel-rapl:{index}"
-        package.mkdir(parents=True)
-        (package / "energy_uj").write_text(str(energy))
-        if max_range is not None:
-            (package / "max_energy_range_uj").write_text(str(max_range))
-    return root
-
-
-def test_rapl_energy_reads_each_package_with_the_range_it_wraps_at(tmp_path: Path) -> None:
-    root = _rapl_tree(tmp_path, ((1_000_000, 262_143_328_850), (2_500_000, None)))
-
-    readings, reason = eval_telemetry_module._rapl_energy_uj(root)
-
-    assert readings == {
-        "intel-rapl:0": (1_000_000, 262_143_328_850),
-        "intel-rapl:1": (2_500_000, None),
-    }
-    assert reason is None
-
-
-def test_rapl_deltas_are_summed_per_package(tmp_path: Path) -> None:
-    start = {"intel-rapl:0": (1_000_000, 100_000_000), "intel-rapl:1": (500_000, 100_000_000)}
-    end = {"intel-rapl:0": (3_000_000, 100_000_000), "intel-rapl:1": (900_000, 100_000_000)}
-
-    total, reason = eval_telemetry_module._rapl_delta_uj(start, end)
-
-    assert total == 2_400_000
-    assert reason is None
-
-
-def test_a_wrapped_rapl_counter_is_corrected_against_its_own_range() -> None:
-    """A run longer than a package's wrap period reported 0 J for real energy.
-
-    `energy_uj` wraps at `max_energy_range_uj` -- tens of minutes on a busy package -- so a
-    sweep that crossed one subtracted to a negative delta, which was clamped to zero. Worse,
-    the packages were summed before subtracting, so one package's wrap could hide inside
-    another's rise and publish a plausible, wrong number.
-    """
-    max_range = 100_000_000
-    # The first package wrapped 2 000 000 uj past its range; the second rose normally.
-    start = {"intel-rapl:0": (99_000_000, max_range), "intel-rapl:1": (1_000_000, max_range)}
-    end = {"intel-rapl:0": (1_000_000, max_range), "intel-rapl:1": (4_000_000, max_range)}
-
-    total, reason = eval_telemetry_module._rapl_delta_uj(start, end)
-
-    assert total == 2_000_000 + 3_000_000
-    assert reason is None
-
-
-def test_a_wrap_with_no_published_range_is_refused_rather_than_guessed(tmp_path: Path) -> None:
-    start = {"intel-rapl:0": (99_000_000, None)}
-    end = {"intel-rapl:0": (1_000_000, None)}
-
-    total, reason = eval_telemetry_module._rapl_delta_uj(start, end)
-
-    assert total is None
-    assert reason is not None and "max_energy_range_uj" in reason
-
-
-def test_a_sampler_whose_counter_wrapped_reports_the_corrected_energy(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("mindbridge.benchmarks.eval_telemetry._nvidia_utilization", lambda: ())
-    readings = iter(
-        (
-            ({"intel-rapl:0": (99_000_000, 100_000_000)}, None),
-            ({"intel-rapl:0": (1_000_000, 100_000_000)}, None),
-        )
-    )
-    monkeypatch.setattr(
-        "mindbridge.benchmarks.eval_telemetry._rapl_energy_uj",
-        lambda root=None: next(readings),
-    )
-
-    with ResourceSampler(interval_seconds=0.05) as sampler:
-        pass
-
-    energy = cast(Mapping[str, object], sampler.json(wall_seconds=1.0)["energy"])
-    # 2 000 000 uj across the wrap, not the 0.0 the clamp used to publish.
-    assert energy["cpu_package_joules"] == pytest.approx(2.0)
-
-
-def test_rapl_energy_reports_why_it_could_not_read_anything(tmp_path: Path) -> None:
-    total, reason = eval_telemetry_module._rapl_energy_uj(tmp_path / "missing")
-
-    assert total is None
-    assert reason is not None and "no intel-rapl packages" in reason
-
-
-def test_rapl_energy_reports_the_unreadable_file(tmp_path: Path) -> None:
-    root = tmp_path / "powercap"
-    package = root / "intel-rapl:0"
-    package.mkdir(parents=True)
-    (package / "energy_uj").write_text("not-a-number")
-
-    total, reason = eval_telemetry_module._rapl_energy_uj(root)
-
-    assert total is None
-    assert reason is not None and "energy_uj" in reason
 
 
 # --- family 6: fast-plane and compiler telemetry (capture, settle, compile) -----------------

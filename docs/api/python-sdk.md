@@ -914,8 +914,10 @@ recognition and streaming generation are available. It is a field read: it canno
 
 ### AsyncMemory
 
-`AsyncMemory` has the same constructor, class methods, keyword parameters, defaults, and result
-values as `Memory`. Finite operations are awaited and `close()` is asynchronous. It mirrors every
+`AsyncMemory(memory: Memory)` wraps one open `Memory`, which it owns and closes;
+`AsyncMemory.from_plugins()` and `AsyncMemory.from_config()` take the same parameters as their
+`Memory` counterparts and open one for you. Its operations have the same keyword parameters,
+defaults, and result values as `Memory`. Finite operations are awaited and `close()` is asynchronous. It mirrors every
 listed operation except `forget_identity`; identity erasure currently requires synchronous
 `Memory`. Its stream boundary is:
 

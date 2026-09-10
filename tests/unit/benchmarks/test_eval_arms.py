@@ -24,6 +24,7 @@ from mindbridge import (
     AsyncMemory,
     ContextBudget,
     EmbedTask,
+    Memory,
     MemoryConfig,
     MindBridgeConfig,
     Modality,
@@ -694,7 +695,9 @@ def test_compile_arm_answers_from_a_rendered_bundle_via_the_public_sdk(tmp_path:
     _, _, question = _task()
 
     async def run() -> eval_module._AnswerOutcome | BaseException:
-        async with AsyncMemory(tmp_path, embedder=_TinyEmbedder(), minimum_relevance=0) as memory:
+        async with AsyncMemory(
+            Memory(tmp_path, embedder=_TinyEmbedder(), minimum_relevance=0)
+        ) as memory:
             await memory.add("Ada signed the contract")
             await memory.add("a lunch invitation")
             answered = await _answer_many(
@@ -745,9 +748,11 @@ def test_compile_arm_records_partial_sources_separately_from_full_evidence(
 
     async def run() -> eval_module._AnswerOutcome | BaseException:
         async with AsyncMemory(
-            tmp_path,
-            embedder=_ExcerptEmbedder(),
-            minimum_relevance=0,
+            Memory(
+                tmp_path,
+                embedder=_ExcerptEmbedder(),
+                minimum_relevance=0,
+            )
         ) as memory:
             source = await memory.add(source_text)
             answered = await _answer_many(
@@ -840,7 +845,7 @@ def test_compile_arm_sends_query_and_evidence_images_on_the_final_provider_wire(
     )
 
     async def run() -> eval_module._AnswerOutcome | BaseException:
-        async with AsyncMemory(tmp_path / "store", embedder=_TinyEmbedder()) as memory:
+        async with AsyncMemory(Memory(tmp_path / "store", embedder=_TinyEmbedder())) as memory:
             await memory.add(
                 ("The evidence shows a robot.", evidence_image),
                 occurred_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
@@ -905,7 +910,7 @@ def test_ingest_capture_produces_real_capture_settle_spans_for_the_compile_arm(
 
     def memory_factory(path: Path) -> AsyncMemory:
         return AsyncMemory(
-            path, embedder=_TinyEmbedder(), minimum_relevance=0, tracer=telemetry.tracer
+            Memory(path, embedder=_TinyEmbedder(), minimum_relevance=0, tracer=telemetry.tracer)
         )
 
     try:

@@ -742,7 +742,9 @@ def test_backend_pool_warms_query_embedding_before_evaluation(
     assert calls == [((ModelInput(text="MindBridge benchmark warmup"),), EmbedTask.QUERY)]
 
 
-def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_backend_pool_forwards_every_memory_setting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """A hand-written forwarding list drops new policy or a new plugin silently, which is worse
     than crashing: the run measures the default composition while the artifact reports the
     configured one."""
@@ -752,7 +754,8 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
         def __init__(self, _data_dir: object, **values: object) -> None:
             captured.update(values)
 
-    monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
+    monkeypatch.setattr(eval_module, "Memory", Recorder)
+    monkeypatch.setattr(eval_module, "AsyncMemory", lambda memory: memory)
     pool = object.__new__(eval_module._BackendPool)
     settings = MemoryConfig(evidence_budget_chars=4_242, minimum_relevance=0.11)
     pool._settings = settings
@@ -767,7 +770,7 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
     for name, value in backends.items():
         setattr(pool, f"_{name}", value)
 
-    pool.memory(Path("unused"))
+    pool.memory(tmp_path / "unused")
 
     for entry in fields(MemoryConfig):
         assert captured[entry.name] == getattr(settings, entry.name), entry.name
@@ -776,12 +779,13 @@ def test_backend_pool_forwards_every_memory_setting(monkeypatch: pytest.MonkeyPa
     # Deriving the forwarding from the dataclasses is only safe while every declared field names
     # a real constructor keyword; a field added without one would raise at call time instead.
     declared = {entry.name for entry in (*fields(MemoryConfig), *fields(MemoryPlugins))}
-    for constructor in (Memory.__init__, AsyncMemory.__init__):
-        unaccepted = declared - set(signature(constructor).parameters)
-        assert not unaccepted, f"{constructor.__qualname__} has no keyword for {sorted(unaccepted)}"
+    unaccepted = declared - set(signature(Memory.__init__).parameters)
+    assert not unaccepted, f"Memory.__init__ has no keyword for {sorted(unaccepted)}"
 
 
-def test_backend_pool_forwards_every_capability_plugin(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_backend_pool_forwards_every_capability_plugin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """`former` was declared on `MemoryPlugins`, built by the SDK adapter, and used by `Memory`,
     yet the harness never passed it, so no benchmark run has ever exercised derived-memory
     formation. Deriving the expected keywords from the dataclass makes the next omission red."""
@@ -791,7 +795,8 @@ def test_backend_pool_forwards_every_capability_plugin(monkeypatch: pytest.Monke
         def __init__(self, _data_dir: object, **values: object) -> None:
             captured.update(values)
 
-    monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
+    monkeypatch.setattr(eval_module, "Memory", Recorder)
+    monkeypatch.setattr(eval_module, "AsyncMemory", lambda memory: memory)
     pool = object.__new__(eval_module._BackendPool)
     pool._settings = MemoryConfig()
     pool._tracer = trace.get_tracer(__name__)
@@ -799,7 +804,7 @@ def test_backend_pool_forwards_every_capability_plugin(monkeypatch: pytest.Monke
     for name, marker in markers.items():
         setattr(pool, f"_{name}", marker)
 
-    pool.memory(Path("unused"))
+    pool.memory(tmp_path / "unused")
 
     for name, marker in markers.items():
         assert captured[name] is marker, name
@@ -1106,7 +1111,8 @@ def test_backend_pool_borrows_every_configured_plugin_slot(
             captured.update(values)
 
     monkeypatch.setattr(eval_module, "resolve_memory_config", lambda _config: resolved)
-    monkeypatch.setattr(eval_module, "AsyncMemory", Recorder)
+    monkeypatch.setattr(eval_module, "Memory", Recorder)
+    monkeypatch.setattr(eval_module, "AsyncMemory", lambda memory: memory)
     pool = eval_module._BackendPool(
         ModelConfig(),
         device=None,
