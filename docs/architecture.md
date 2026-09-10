@@ -117,10 +117,13 @@ runs under one process-wide settlement lock, so a concurrent `settle()` or an `a
 captured content waits instead of running the model stages twice.
 
 Enrichment appends. Derived text is added to `memory_records.content` behind a per-asset marker —
-`[transcript:<asset_id>]`, `[visual description:<asset_id>]`, or `[speech identities:<asset_id>]`
-— so the caller's own text stays byte-identical at the front of the record and model
-interpretation stays separable from evidence. Media bytes are never rewritten: they stay in
-`assets/` under their digest, and a transcript is also cached on the asset row.
+`[transcript:<asset_id>]`, `[visual description:<asset_id>]`, `[facts:<asset_id>]`, or
+`[speech identities:<asset_id>]` — so the caller's own text stays byte-identical at the front of
+the record and model interpretation stays separable from evidence. Media bytes are never
+rewritten: they stay in `assets/` under their digest, and a transcript is also cached on the asset
+row. A described visual yields two of those sections: the labelled description of what is
+visible, and the durable facts distilled from it and from the clip's own transcript, kept apart
+because one is observation and the other a distillation that outlives the clip.
 
 `settle()` attempts every record it read: a failing one keeps its queue row, its attempt count,
 and its reason while the records behind it still settle, and the first failure is raised once the

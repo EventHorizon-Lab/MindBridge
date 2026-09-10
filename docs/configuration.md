@@ -215,6 +215,17 @@ whatever the caller wrote, each section carrying a `[visual description:<asset_i
 `get` shows which assets were described, and the asset is still embedded natively: the derived
 text is added to the record, never substituted for it.
 
+A caption is labelled lines rather than prose -- what is shown, readable text transcribed exactly,
+counts, place cues, a visible date or clock, and index tags -- because a question days later asks
+for the sign or the count, and free prose names whichever of those the model found interesting. A
+visual described while a speech backend is configured is also shown that clip's diarised
+transcript, and answers with `Fact:` lines: short declarative statements that stay true after the
+clip ends ("Lily is allergic to peanuts", "the yoga mat lives in the storage room"). Those land in
+their own `[facts:<asset_id>]` section, so the distillation is correctable separately from the
+observation, and where the dialogue itself states a diarised speaker's name that fact also
+registers the name against the recognized identity, so every later clip resolving to the same
+person is indexed under it.
+
 Three things bound what it costs and what it can do:
 
 - `modalities` is the visual capability set and accepts only `image` and `video`. An asset outside
@@ -245,6 +256,14 @@ Three things bound what it costs and what it can do:
   not negatively cached, but re-adding the same already-embedded memory is idempotent and does not
   revisit its caption. Repairing an existing captionless record therefore requires rebuilding it;
   the retry improves new writes and does not backfill old ones.
+- A throttled or overloaded endpoint is waited out before that fail-open, not straight through it.
+  A batch refused as `rate_limited`, with a timeout, on a dropped connection, or with a 5xx is
+  described again after 1 s, 4 s, and 16 s; a refusal that an identical request cannot clear --
+  `quota_exhausted`, `auth_failed`, `request_rejected` -- is not retried at all. The SDK client's
+  own `max_retries` budget is spent inside each of those attempts, so `max_retries` on this slot
+  raises the per-attempt budget and is worth setting above the SDK default for a long ingest. A
+  provider that throttles a corpus throttles it for minutes, which is long enough for a
+  fail-open to store an entire ingest with no captions behind one log line.
 - Captions are not reproducible. The request pins `temperature` 0 and a fixed `seed` unless the
   slot sets its own, but a measured endpoint returned four different completions for four
   identical requests at those values. A caption becomes indexed text, so anything that needs two

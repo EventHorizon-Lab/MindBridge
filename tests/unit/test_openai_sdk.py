@@ -557,6 +557,91 @@ def test_description_numbers_every_visual_in_one_request_and_sends_video_as_stil
     assert "video/mp4" not in serialized
 
 
+def test_description_follows_a_clips_stills_with_the_transcript_it_arrived_with(
+    tmp_path: Path,
+) -> None:
+    """A clip's own derived context travels as text after its stills, labelled as a transcript.
+
+    A durable fact about a person cannot be read off four stills: only the dialogue says which
+    person is called Lily. The transcript follows the pixels so the labelled description is still
+    written from what is visible, and it is named a transcript so its words are never reported as
+    text visible in the frame.
+    """
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    clip = _video_asset(tmp_path, "clip", 12)
+    seen: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return _caption_reply("Shown: a red bicycle", "Shown: a kitchen\nFact: speaker_1 cooks")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _vision_model(
+            _sdk_client(client),
+            capabilities=frozenset({Modality.IMAGE, Modality.VIDEO}),
+        )
+        captions = model.describe(
+            (
+                ModelInput(assets=(picture,)),
+                ModelInput(text="speaker_1: pass the salt", assets=(clip,)),
+            )
+        )
+
+    assert captions == ("Shown: a red bicycle", "Shown: a kitchen\nFact: speaker_1 cooks")
+    parts = seen[0]["messages"][1]["content"]
+    # The image gets no transcript part at all; the clip's follows its four stills.
+    assert [part["type"] for part in parts] == [
+        "text",
+        "image_url",
+        "text",
+        *("image_url",) * 4,
+        "text",
+    ]
+    assert parts[-1]["text"] == (
+        "Visual 2 transcript, speaker labels as diarised:\nspeaker_1: pass the salt"
+    )
+
+
+def test_description_accepts_a_transcript_a_visual_only_capability_set_does_not_declare(
+    tmp_path: Path,
+) -> None:
+    """Text is not a routing question for a chat completion, and the describer declares neither.
+
+    `Memory` narrows a describer to image and video at construction, so requiring text of it
+    would refuse every clip that arrived with a transcript -- the whole reason the context exists.
+    """
+    clip = _video_asset(tmp_path, "clip", 12)
+
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda _request: _caption_reply("Shown: a kitchen"))
+    ) as client:
+        result = _vision_model(
+            _sdk_client(client), capabilities=frozenset({Modality.VIDEO})
+        ).describe((ModelInput(text="speaker_1: hello", assets=(clip,)),))
+
+    assert result == ("Shown: a kitchen",)
+
+
+def test_a_caption_keeps_its_labelled_lines_and_never_a_blank_line(tmp_path: Path) -> None:
+    """Single newlines carry the structure; a blank line would end the section that labels it.
+
+    A caption is stored under a `[visual description:<asset_id>]` marker line inside a document
+    whose sections are separated by a blank line. A blank line inside the caption would leave
+    everything after it as an unlabelled section of the memory's own text.
+    """
+    picture = _asset(tmp_path, "picture", Modality.IMAGE, "image/png", b"png-bytes")
+    reply = _caption_reply(
+        "  Shown:   two   people \n\n\n  Counts: 2 people  \n \n Fact: speaker_1 is called Lily "
+    )
+
+    with httpx.Client(transport=httpx.MockTransport(lambda _request: reply)) as client:
+        model = _vision_model(_sdk_client(client), capabilities=frozenset({Modality.IMAGE}))
+        captions = model.describe((ModelInput(assets=(picture,)),))
+
+    assert captions == ("Shown: two people\nCounts: 2 people\nFact: speaker_1 is called Lily",)
+    assert "\n\n" not in captions[0]
+
+
 def test_description_sizes_sampled_video_frames_instead_of_the_unuploaded_source(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1938,7 +2023,7 @@ def test_vision_space_identifies_the_prompt_as_well_as_the_model(
     edited prompt serve captions written under the old one forever, with nothing to notice it.
     """
     baseline = OpenAIModels().vision_space
-    assert baseline.startswith(f"{DEFAULT_GENERATION_MODEL}:mindbridge-vision-v1:")
+    assert baseline.startswith(f"{DEFAULT_GENERATION_MODEL}:mindbridge-vision-v2:")
     # Stable for one configuration: two identical compositions must share cached captions.
     assert OpenAIModels().vision_space == baseline
     # Distinct from `formation_space`, which digests the same knobs under a different prompt.
