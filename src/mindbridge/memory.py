@@ -11252,11 +11252,31 @@ def _transient_vision_failure(error: ModelError) -> bool:
     say about every other operation. A 5xx is deliberately not in it and is the other answer a
     loaded endpoint gives a write burst, so it is read off the provider exception's own status
     code: duck-typed, because the SDK that raised it is an optional adapter dependency.
+
+    One inner-prism gateway also answers a 400 -- `request_rejected`, not in `RETRYABLE_REASONS`
+    -- when it aborts JSON generation mid-response rather than rejecting the request itself, and
+    an identical retry 5s later succeeds. Measured live: 'Model output became abnormal while
+    generating a JSON response for response_format. The generation was aborted because the
+    partial output may be incomplete or invalid JSON. Please retry the request or adjust your
+    prompt or JSON schema.' Most 400s (a malformed prompt, an unsupported image) are not
+    transient, so this is a narrow message match rather than a status-code rule, and it is scoped
+    to this function alone -- `answer` and `formation` never call it, so their 400s are unchanged.
     """
     if error.retryable:
         return True
-    status = getattr(error.__cause__, "status_code", None)
-    return isinstance(status, int) and 500 <= status < 600
+    cause = error.__cause__
+    status = getattr(cause, "status_code", None)
+    if isinstance(status, int) and 500 <= status < 600:
+        return True
+    if status != 400:
+        return False
+    body = getattr(cause, "body", None)
+    message = body.get("message") if isinstance(body, Mapping) else None
+    return (
+        isinstance(message, str)
+        and "model output became abnormal" in message.casefold()
+        and "generation was aborted" in message.casefold()
+    )
 
 
 def _validated_descriptions(

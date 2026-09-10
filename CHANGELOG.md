@@ -435,7 +435,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   that still has a wait left is counted on `mindbridge.vision.retried_batches`, apart from
   `mindbridge.vision.failed_batches`, which now counts only the attempt that actually lost the
   caption -- summing every attempt into one counter could not tell a provider that throttled an
-  ingest from one that ate it.
+  ingest from one that ate it. Also retried: a 400 whose provider message says it aborted
+  `response_format` JSON generation mid-reply ("Model output became abnormal ... The generation
+  was aborted ... Please retry the request"), measured live on an inner-prism gateway where an
+  identical retry 5s later succeeds. `request_rejected` otherwise stays a permanent 400 and out of
+  the closed `RETRYABLE_REASONS` vocabulary -- this is a narrow message match scoped to describe's
+  own retry loop, not a reclassification, and an ordinary rejected request (an unsupported image)
+  still fails open on the first attempt.
 
 ### Changed
 

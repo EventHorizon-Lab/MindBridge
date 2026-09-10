@@ -260,7 +260,12 @@ Three things bound what it costs and what it can do:
 - A throttled or overloaded endpoint is waited out before that fail-open, not straight through it.
   A batch refused as `rate_limited`, with a timeout, on a dropped connection, or with a 5xx is
   described again after 1 s, 4 s, and 16 s; a refusal that an identical request cannot clear --
-  `quota_exhausted`, `auth_failed`, `request_rejected` -- is not retried at all. The SDK client's
+  `quota_exhausted`, `auth_failed`, `request_rejected` -- is not retried at all, with one narrow
+  exception: a `request_rejected` whose provider message says generation itself was aborted
+  while producing the JSON reply ("Model output became abnormal ... generation was aborted ...
+  Please retry") is retried the same way, because an identical request there routinely succeeds
+  seconds later; every other `request_rejected` -- a rejected image, an unsupported request --
+  still fails open on the first attempt. The SDK client's
   own `max_retries` budget is spent inside each of those attempts, so `max_retries` on this slot
   raises the per-attempt budget and is worth setting above the SDK default for a long ingest. A
   provider that throttles a corpus throttles it for minutes, which is long enough for a

@@ -22,7 +22,7 @@ import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast
+from typing import ClassVar, cast
 
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
@@ -1618,7 +1618,57 @@ def _server_error() -> ModelError:
     return error
 
 
-@pytest.mark.parametrize("failure", [_rate_limited, _server_error])
+class _AbortedJsonGeneration(Exception):
+    """Stands in for the provider SDK's `BadRequestError` when it aborts mid-response.
+
+    The message is the inner-prism gateway's own, verbatim, from a live ATM raw-arm run: a 400
+    that an identical retry 5s later clears, unlike an ordinary rejected request.
+    """
+
+    status_code = 400
+    body: ClassVar[dict[str, object]] = {
+        "message": (
+            "<400> InternalError.Algo.InvalidParameter: Model output became abnormal while "
+            "generating a JSON response for response_format. The generation was aborted because "
+            "the partial output may be incomplete or invalid JSON. Please retry the request or "
+            "adjust your prompt or JSON schema."
+        ),
+        "type": "invalid_request_error",
+        "param": None,
+        "code": "invalid_parameter_error",
+    }
+
+
+def _aborted_json_generation() -> ModelError:
+    error = ModelError(
+        "vision description request failed", reason="request_rejected", stage="describe"
+    )
+    error.__cause__ = _AbortedJsonGeneration()
+    return error
+
+
+class _RejectedImage(Exception):
+    """An ordinary 400: the same status code, a permanent cause, no aborted-generation wording."""
+
+    status_code = 400
+    body: ClassVar[dict[str, object]] = {
+        "message": "invalid image",
+        "type": "invalid_request_error",
+        "param": None,
+        "code": "invalid_parameter_error",
+    }
+
+
+def _rejected_image() -> ModelError:
+    """A 400 that really is permanent, to prove the narrow message match does not over-retry."""
+    error = ModelError(
+        "vision description request failed", reason="request_rejected", stage="describe"
+    )
+    error.__cause__ = _RejectedImage()
+    return error
+
+
+@pytest.mark.parametrize("failure", [_rate_limited, _server_error, _aborted_json_generation])
 def test_a_throttled_describe_is_retried_before_the_caption_is_given_up(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1658,6 +1708,24 @@ def test_a_permanent_describe_refusal_is_not_retried_and_still_fails_open(
         assert memory.get(record.id).content == ""
 
 
+def test_an_ordinary_400_is_still_not_retried(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The narrow message match for the aborted-JSON-generation quirk must not swallow every 400.
+
+    Same status code as the transient case, a permanent cause: an unsupported or rejected image
+    is not going to describe successfully on a second try, so this must still fail open on
+    attempt one, the way it did before the aborted-generation case was recognized.
+    """
+    monkeypatch.setattr("mindbridge.memory._VISION_RETRY_BACKOFF", (0.0, 0.0, 0.0))
+    describer = _ThrottledDescriber(4, _rejected_image())
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        record = memory.add(Blob(b"bicycle-frame", "image/png"))
+
+        assert describer.calls == 1
+        assert memory.get(record.id).content == ""
+
+
 def test_a_sustained_refusal_gives_up_after_a_bounded_number_of_waits(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1684,6 +1752,7 @@ def test_waiting_out_a_throttled_describe_is_counted_apart_from_losing_the_capti
         (_ThrottledDescriber(2, _rate_limited()), 0, 2),
         (_ThrottledDescriber(99, _rate_limited()), 1, 2),
         (_ThrottledDescriber(99, _out_of_quota()), 1, 0),
+        (_ThrottledDescriber(1, _aborted_json_generation()), 0, 1),
     )
     for index, (describer, failed, retried) in enumerate(cases):
         provider = TracerProvider()
