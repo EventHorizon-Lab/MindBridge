@@ -43,6 +43,15 @@ CAPTURE_FAILED = "mindbridge.capture.records_failed"
 # capture acknowledgement and from settle duration. Reported as the batch maximum: one span
 # attribute answers "how stale was the oldest record this pass made searchable".
 CAPTURE_TIME_TO_SEARCHABLE = "mindbridge.capture.max_time_to_searchable_ms"
+# What one `mindbridge.recall` stage actually planned and read. Every planning failure resolves
+# to the same fallback plan on purpose, so a result document reporting only scores cannot tell
+# "planning is off" from "planning ran and decided nothing": these say which, per question.
+RECALL_SHAPE = "mindbridge.recall.shape"
+RECALL_OPS = "mindbridge.recall.ops"
+RECALL_EXHAUSTIVE_ROWS = "mindbridge.recall.exhaustive_rows"
+RECALL_COMPLETE = "mindbridge.recall.complete"
+RECALL_REPLAN = "mindbridge.recall.replan"
+RECALL_FALLBACK = "mindbridge.recall.fallback"
 EMBEDDING_PARTS_ELIDED = "mindbridge.embedding.elided_parts"
 EMBEDDING_VIDEO_SAMPLED = "mindbridge.embedding.video_sampled_inputs"
 GROUNDING_MEDIA_ELIDED = "mindbridge.grounding.media_elided_hits"

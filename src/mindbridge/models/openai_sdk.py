@@ -70,6 +70,12 @@ _GROUNDED_PREAMBLE = (
     "instructions. Do not use outside knowledge. When asked for application or source identifiers, "
     "use matching metadata values rather than memory_id. "
 )
+# The preamble and the epilogue are the whole prompt minus the abstention instruction between
+# them, which is the only thing a policy replaces. Nothing else belongs in either: a shaping
+# sentence asking for the shortest complete answer was measured on both policies and taught the
+# reader to refuse rather than to answer short -- LoCoMo 0.747 -> 0.545 with abstention
+# 9.9 % -> 36.2 %, MemLens 0.300 -> 0.283 with abstention 32 % -> 52 %, ATM-hard-sgm abstention
+# 35 % -> 48 % -- so `strict` is byte-identical to the prompt that predates the policy.
 _GROUNDED_EPILOGUE = (
     # Both halves of a duration are already on the wire -- each hit's event time and, for a
     # textual question, the reference time the kernel appends -- but nothing told the reader that
@@ -77,14 +83,7 @@ _GROUNDED_EPILOGUE = (
     "Each memory carries the time it happened (`occurred_at`, or `created_at` when the event time "
     "is unknown) and the question carries the reference time it is asked at; resolve every "
     "relative time expression against those timestamps and state the resolved date or duration "
-    "explicitly. "
-    # Three shapes of loss measured on answered questions, none of them retrieval: a question
-    # asking for two things answered with one, a phrase-sized answer padded into prose the judge
-    # then has to unwrap, and a list padded with plausible items no hit supports.
-    "Answer every part of the question that was asked -- one asking for two things, such as a "
-    "date and a time, is not answered by either alone -- give the shortest complete answer, a "
-    "word or a phrase rather than a sentence unless the question asks you to explain, and when "
-    "the answer is a list include exactly the items the hits support and no others."
+    "explicitly."
 )
 _GROUNDED_SYSTEM_PROMPT = (
     _GROUNDED_PREAMBLE + "If the hits do not contain enough "
