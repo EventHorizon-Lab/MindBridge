@@ -256,6 +256,14 @@ Three things bound what it costs and what it can do:
   not negatively cached, but re-adding the same already-embedded memory is idempotent and does not
   revisit its caption. Repairing an existing captionless record therefore requires rebuilding it;
   the retry improves new writes and does not backfill old ones.
+- A throttled or overloaded endpoint is waited out before that fail-open, not straight through it.
+  A batch refused as `rate_limited`, with a timeout, on a dropped connection, or with a 5xx is
+  described again after 1 s, 4 s, and 16 s; a refusal that an identical request cannot clear --
+  `quota_exhausted`, `auth_failed`, `request_rejected` -- is not retried at all. The SDK client's
+  own `max_retries` budget is spent inside each of those attempts, so `max_retries` on this slot
+  raises the per-attempt budget and is worth setting above the SDK default for a long ingest. A
+  provider that throttles a corpus throttles it for minutes, which is long enough for a
+  fail-open to store an entire ingest with no captions behind one log line.
 - Captions are not reproducible. The request pins `temperature` 0 and a fixed `seed` unless the
   slot sets its own, but a measured endpoint returned four different completions for four
   identical requests at those values. A caption becomes indexed text, so anything that needs two

@@ -38,7 +38,7 @@ from functools import partial
 from itertools import zip_longest
 from pathlib import Path
 from threading import Condition, RLock, local
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Literal, Protocol, TypeVar, cast
 
 from opentelemetry import trace
@@ -465,6 +465,11 @@ _NAME_BINDING = re.compile(
     r"speakers?[ _-]?(?P<index>\d{1,3})\s+is\s+called\s+(?P<name>[^.;]+?)\s*[.;]?",
     re.IGNORECASE,
 )
+# Seconds to wait before describing a throttled or overloaded batch again. Coarse and short: the
+# SDK client has already spent its own `max_retries` budget on this batch by the time one of
+# these failures reaches us, and what is left to wait out is a provider throttling a whole ingest
+# rather than one request. Module-level so a test can shorten it.
+_VISION_RETRY_BACKOFF = (1.0, 4.0, 16.0)
 _MAX_METADATA_BYTES = 262_144
 _TEXT_KEY_CHARACTERS = 2_048
 _TEXT_KEY_OVERLAP = 256
@@ -5399,27 +5404,7 @@ class Memory:
             # re-ingests a described corpus reports zero vision cost because it paid none.
             return dict(cached)
         try:
-            descriptions = self._vision_descriptions(
-                tuple(
-                    self._resolved_model_input(
-                        replace(
-                            _asset_content(asset),
-                            # Whatever this write already knows the clip says, under the same
-                            # `speaker_N` labels the index projection prints. A durable fact
-                            # about a person is in the words, not the pixels: four stills say
-                            # two people are at a table, and only the dialogue says which one
-                            # is called Lily. Empty for an image and for any composition with
-                            # no speech backend, which then describes pixels exactly as before.
-                            text=_speaker_prose(
-                                asset.asset_id,
-                                operation.speech_segments.get(asset.asset_id, ()),
-                            )
-                            or "",
-                        )
-                    )
-                    for asset in pending
-                )
-            )
+            descriptions = self._described_batch(pending, operation)
         except ModelError as error:
             _LOGGER.warning(
                 "vision description failed for %d asset(s); storing them without a caption: %s",
@@ -5437,6 +5422,56 @@ class Memory:
         fresh = dict(zip((asset.asset_id for asset in pending), descriptions, strict=True))
         operation.descriptions.update(fresh)
         return {**cached, **fresh}
+
+    def _described_batch(
+        self,
+        pending: Sequence[StoredAsset],
+        operation: _OperationAssets,
+    ) -> tuple[str, ...]:
+        """Describe one batch of visuals, waiting out a throttled or overloaded endpoint first.
+
+        The SDK client retries a 429 or a 5xx on its own `max_retries` budget, which is seconds.
+        A provider throttling a whole ingest throttles it for minutes, and the caller's fail-open
+        then stores every asset in the burst without a caption, behind one log line -- a round of
+        write-path measurement lost an entire arm to exactly that. Three bounded waits, then the
+        batch fails open as it did before, uncached, so a later ingest retries it.
+
+        ponytail: the wait is taken under the write lock when speech is indexed, the same lock
+        the describe call itself already holds for seconds. Move it outside `_speech_index_guard`
+        if concurrent writers ever matter more than the caption does.
+        """
+        inputs = tuple(
+            self._resolved_model_input(
+                replace(
+                    _asset_content(asset),
+                    # Whatever this write already knows the clip says, under the same `speaker_N`
+                    # labels the index projection prints. A durable fact about a person is in the
+                    # words, not the pixels: four stills say two people are at a table, and only
+                    # the dialogue says which one is called Lily. Empty for an image and for any
+                    # composition with no speech backend, which then describes pixels as before.
+                    text=_speaker_prose(
+                        asset.asset_id,
+                        operation.speech_segments.get(asset.asset_id, ()),
+                    )
+                    or "",
+                )
+            )
+            for asset in pending
+        )
+        for wait in _VISION_RETRY_BACKOFF:
+            try:
+                return self._vision_descriptions(inputs)
+            except ModelError as error:
+                if not _transient_vision_failure(error):
+                    raise
+                _LOGGER.warning(
+                    "describing %d visual(s) was refused as %s; retrying in %.0fs",
+                    len(inputs),
+                    error.reason or "a provider failure",
+                    wait,
+                )
+                sleep(wait)
+        return self._vision_descriptions(inputs)
 
     def _stage_speaker_names(
         self,
@@ -11078,6 +11113,21 @@ def _with_reference_time(question: ModelInput, reference_at: datetime) -> ModelI
     """Append the answering clock as the final line of what the reader is handed."""
     note = f"Reference time for relative dates: {reference_at.isoformat(timespec='seconds')}"
     return replace(question, text=f"{question.text}\n\n{note}" if question.text else note)
+
+
+def _transient_vision_failure(error: ModelError) -> bool:
+    """Whether describing the same batch again could plausibly work.
+
+    `retryable` is the closed public vocabulary -- a 429, a timeout, a dropped connection -- and
+    REST, MCP, and the CLI all publish it, so widening it here would change what those surfaces
+    say about every other operation. A 5xx is deliberately not in it and is the other answer a
+    loaded endpoint gives a write burst, so it is read off the provider exception's own status
+    code: duck-typed, because the SDK that raised it is an optional adapter dependency.
+    """
+    if error.retryable:
+        return True
+    status = getattr(error.__cause__, "status_code", None)
+    return isinstance(status, int) and 500 <= status < 600
 
 
 def _validated_descriptions(

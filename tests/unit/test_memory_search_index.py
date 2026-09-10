@@ -19,7 +19,7 @@ import math
 import os
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1384,3 +1384,95 @@ def test_a_stated_name_binds_nothing_without_a_speech_backend(tmp_path: Path) ->
 
         assert _section(stored, f"[facts:{record.assets[0].id}]") == "speaker_1 is called Lily"
         assert memory.operations() == ()
+
+
+class _ThrottledDescriber:
+    """A describer that refuses a set number of batches the way a loaded endpoint does."""
+
+    vision_capabilities = frozenset({Modality.IMAGE, Modality.VIDEO})
+    vision_model = "fake-describer"
+    vision_space = "fake-describer:throttled-v2"
+
+    def __init__(self, refusals: int, error: ModelError) -> None:
+        self.refusals = refusals
+        self.error = error
+        self.calls = 0
+
+    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+        batch = tuple(inputs)
+        self.calls += 1
+        if self.calls <= self.refusals:
+            raise self.error
+        return tuple("Shown: a red bicycle" for _ in batch)
+
+    def close(self) -> None:
+        return None
+
+
+def _rate_limited() -> ModelError:
+    return ModelError("slow down", reason="rate_limited", stage="describe")
+
+
+class _UpstreamFailure(Exception):
+    """Stands in for the provider SDK's own 5xx exception, which carries a status code."""
+
+    status_code = 503
+
+
+def _server_error() -> ModelError:
+    """A 5xx as it really arrives: unclassified, with the status only on the provider's cause."""
+    error = ModelError("upstream", stage="describe")
+    error.__cause__ = _UpstreamFailure()
+    return error
+
+
+@pytest.mark.parametrize("failure", [_rate_limited, _server_error])
+def test_a_throttled_describe_is_retried_before_the_caption_is_given_up(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: Callable[[], ModelError],
+) -> None:
+    """A provider throttling an ingest throttles it for minutes; fail-open costs the whole arm.
+
+    The SDK client has already spent its own retry budget by the time the failure arrives here,
+    so without a wait every asset in the burst is stored with no caption behind one log line. A
+    5xx is not in the closed retryable vocabulary and has to be recognized by its status code.
+    """
+    monkeypatch.setattr("mindbridge.memory._VISION_RETRY_BACKOFF", (0.0, 0.0, 0.0))
+    describer = _ThrottledDescriber(2, failure())
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        record = memory.add(Blob(b"bicycle-frame", "image/png"))
+
+        assert describer.calls == 3
+        assert _caption(memory.get(record.id).content) == "Shown: a red bicycle"
+
+
+def test_a_permanent_describe_refusal_is_not_retried_and_still_fails_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Exhausted billing retried forever is worse than a missing caption, and costs per attempt.
+
+    The memory is the caller's; the caption is derived convenience. So the write still lands with
+    an empty document, uncached, and a later ingest retries the description.
+    """
+    monkeypatch.setattr("mindbridge.memory._VISION_RETRY_BACKOFF", (0.0, 0.0, 0.0))
+    describer = _ThrottledDescriber(
+        4, ModelError("no quota", reason="quota_exhausted", stage="describe")
+    )
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        record = memory.add(Blob(b"bicycle-frame", "image/png"))
+
+        assert describer.calls == 1
+        assert memory.get(record.id).content == ""
+
+
+def test_a_sustained_refusal_gives_up_after_a_bounded_number_of_waits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("mindbridge.memory._VISION_RETRY_BACKOFF", (0.0, 0.0))
+    describer = _ThrottledDescriber(99, _rate_limited())
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        record = memory.add(Blob(b"bicycle-frame", "image/png"))
+
+        assert describer.calls == 3, "one attempt per wait, plus the last one"
+        assert memory.get(record.id).content == ""
