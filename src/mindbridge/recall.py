@@ -69,6 +69,11 @@ _HONOURED: Mapping[str, frozenset[str]] = {
 _MAX_STEPS = 6
 _MAX_TERMS = 8
 _MAX_NEIGHBOURS = 10
+# How many of an anchor step's rows a `neighbors` step reads around. The store walks corpus order
+# twice per anchor with no index behind it, so the cost is anchors x (before + after): 500 anchors
+# at 10 and 10 measured 4.3 seconds of scanning. A sequence question is asked about the records
+# nearest what was found, so the deepest anchors buy nothing the shallowest do not.
+_MAX_NEIGHBOR_ANCHORS = 20
 DEFAULT_SIMILAR_K = 12
 DEFAULT_MAX_ROWS = 200
 
@@ -340,7 +345,11 @@ def _run(
             max_rows=step.max_rows,
         )
     if step.op == "neighbors":
-        anchors = () if step.of is None else tuple(hit.id for hit in by_step[step.of])
+        anchors = (
+            ()
+            if step.of is None
+            else tuple(hit.id for hit in by_step[step.of][:_MAX_NEIGHBOR_ANCHORS])
+        )
         if not anchors:
             return ()
         return reader.neighbors(

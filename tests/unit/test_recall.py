@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
 import pytest
 
 from mindbridge.infrastructure.local.store import _RECALL_MAX_TERM_CHARS
 from mindbridge.recall import (
+    _MAX_NEIGHBOR_ANCHORS,
     DEFAULT_MAX_ROWS,
     RecallPlan,
     RecallStep,
@@ -424,3 +426,34 @@ def test_a_primitive_that_refuses_its_arguments_is_a_read_that_did_not_happen() 
     assert result.executed[0] == RecallStepResult(op="match", rows=0, bounded=True)
     assert result.complete is False
     assert [hit.id for hit in result.hits] == ["s-1"]
+
+
+def test_a_neighbors_step_anchors_on_a_bounded_head_of_what_it_follows() -> None:
+    """The store scans corpus order twice per anchor, so the anchor list cannot be a whole set.
+
+    Measured: 500 anchors at 10 before and 10 after spent 4.3 seconds in index-less scans. The
+    question is about what sits next to what was found, and the deepest anchors of a large match
+    buy nothing the first ones do not.
+    """
+    reader = _Reader(
+        match=tuple(_hit(f"m-{index}", minutes=index) for index in range(50)),
+        neighbors=(_hit("n-1", minutes=-5),),
+    )
+    plan = parse_recall_plan(
+        json.dumps(
+            {
+                "shape": "sequence",
+                "steps": [
+                    {"op": "match", "terms": ["wrench"]},
+                    {"op": "neighbors", "of": "step:0", "before": 10, "after": 10},
+                ],
+            }
+        ),
+        reference_at=NOW,
+    )
+
+    assert plan is not None
+    execute(plan, reader)
+
+    anchors = cast(tuple[tuple[str, ...], int, int, int], reader.calls[1][1])[0]
+    assert anchors == tuple(f"m-{index}" for index in range(_MAX_NEIGHBOR_ANCHORS))
