@@ -890,7 +890,7 @@ class OpenAIModels:
         question: ModelInput | str,
         hits: Sequence[SearchHit],
         *,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
         """Answer only from supplied hits, preserving native media content parts."""
         mark_model_requests(0, token_usage_expected=0)
@@ -927,7 +927,7 @@ class OpenAIModels:
         question: ModelInput | str,
         hits: Sequence[SearchHit],
         *,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> Generator[str, None, tuple[SearchHit, ...]]:
         """Yield grounded text deltas while recording first-token and final usage data.
 
@@ -1025,7 +1025,7 @@ class OpenAIModels:
             answer_policy=answer_policy,
             forced=_forced_abstention(answer_policy, hits, grounded),
         )
-        # Only `best_effort` reports an answer of its own. Under `abstain` the streamed deltas
+        # Only `best_effort` reports an answer of its own. Under `strict` the streamed deltas
         # stay the answer they have always been, marker and all, so nothing about the default
         # path moves.
         return _GroundedHits(
@@ -1040,7 +1040,7 @@ class OpenAIModels:
         hits: Sequence[SearchHit],
         prepared: tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]],
         *,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
         stream: bool = False,
     ) -> tuple[object, tuple[SearchHit, ...], frozenset[Modality], int]:
         request, grounded, modalities = prepared
@@ -1090,7 +1090,7 @@ class OpenAIModels:
         grounded: Sequence[SearchHit],
         error: Exception,
         *,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]] | None:
         if not _is_short_video_rejection(error):
             return None
@@ -1129,7 +1129,7 @@ class OpenAIModels:
         hits: Sequence[SearchHit],
         *,
         omission_source_hits: Sequence[SearchHit] | None = None,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]] | AbstentionReason:
         question_input = ModelInput(text=question) if isinstance(question, str) else question
         if not isinstance(question_input, ModelInput):
@@ -1148,7 +1148,7 @@ class OpenAIModels:
         # `best_effort` asks the model even with nothing to ground on: the caller wants a guess
         # rather than a refusal, and `_forced_abstention` still reports that there was no
         # evidence behind it.
-        if not grounded and answer_policy == "abstain":
+        if not grounded and answer_policy == "strict":
             return (
                 AbstentionReason.NO_EVIDENCE
                 if not retrieved
@@ -2820,9 +2820,9 @@ def _answer_system_prompt(
     omitted_media: Mapping[str, Mapping[str, int]],
     evidence_payloads: Sequence[Mapping[str, object]],
     *,
-    answer_policy: AnswerPolicy = "abstain",
+    answer_policy: AnswerPolicy = "strict",
 ) -> str:
-    prompt = _GROUNDED_SYSTEM_PROMPT if answer_policy == "abstain" else _BEST_EFFORT_SYSTEM_PROMPT
+    prompt = _GROUNDED_SYSTEM_PROMPT if answer_policy == "strict" else _BEST_EFFORT_SYSTEM_PROMPT
     if any(hit.context is not None for hit in grounded):
         prompt += _QUALIFIED_EVIDENCE_PROMPT
     if any(
@@ -2840,7 +2840,7 @@ def _answer_result(
     answer: str,
     hits: tuple[SearchHit, ...],
     *,
-    answer_policy: AnswerPolicy = "abstain",
+    answer_policy: AnswerPolicy = "strict",
     forced: AbstentionReason | None = None,
 ) -> AnswerResult:
     reason = _abstention_reason(answer) or forced
@@ -2874,11 +2874,11 @@ def _forced_abstention(
 ) -> AbstentionReason | None:
     """Report the insufficiency a `best_effort` guess was made under.
 
-    Under `abstain` an ungrounded question never reaches the model, so the reason is returned
+    Under `strict` an ungrounded question never reaches the model, so the reason is returned
     before the call. Under `best_effort` the model answers anyway, and the reason is known here
     from the same two sequences rather than from whether the model remembered its marker.
     """
-    if answer_policy == "abstain" or grounded:
+    if answer_policy == "strict" or grounded:
         return None
     return (
         AbstentionReason.NO_EVIDENCE

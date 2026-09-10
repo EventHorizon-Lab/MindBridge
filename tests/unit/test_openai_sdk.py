@@ -4413,7 +4413,7 @@ def test_the_default_answer_policy_sends_the_same_request_as_asking_for_abstenti
     with httpx.Client(transport=_answer_policy_transport(requests, "Blue.")) as client:
         model = _model(_sdk_client(client))
         model.answer("What colour?", (hit,))
-        model.answer("What colour?", (hit,), answer_policy="abstain")
+        model.answer("What colour?", (hit,), answer_policy="strict")
 
     assert requests[0] == requests[1]
     assert requests[0]["messages"] == [

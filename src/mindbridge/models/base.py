@@ -335,7 +335,7 @@ class GenerationBackend(Protocol):
         question: ModelInput,
         hits: Sequence[SearchHit],
         *,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult: ...
 
     def close(self) -> None: ...
@@ -350,7 +350,7 @@ class StreamingGenerationBackend(Protocol):
         question: ModelInput,
         hits: Sequence[SearchHit],
         *,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> Iterator[str]: ...
 
 

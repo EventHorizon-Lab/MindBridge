@@ -277,7 +277,7 @@ class FakeMemory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
         self._fail()
         self.calls.append(
@@ -541,7 +541,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
             OCCURRED_FROM,
             OCCURRED_UNTIL,
         ),
-        ("ask", "What color?", 5, MemoryType.PROCEDURAL, NOW, True, "abstain"),
+        ("ask", "What color?", 5, MemoryType.PROCEDURAL, NOW, True, "strict"),
         ("get", "memory_1"),
         ("list", 7, "cursor_1"),
         ("delete", "memory_1"),
@@ -1666,4 +1666,4 @@ async def test_ask_memory_forwards_the_answer_policy_and_rejects_an_unknown_one(
 
     assert rejected.is_error is True
 
-    assert [call[-1] for call in memory.calls if call[0] == "ask"] == ["abstain", "best_effort"]
+    assert [call[-1] for call in memory.calls if call[0] == "ask"] == ["strict", "best_effort"]

@@ -174,7 +174,7 @@ class _FakeModels:
         question: ModelInput,
         hits: Sequence[SearchHit],
         *,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
         grounded = tuple(hits)
         self.answer_calls.append((question, grounded))
@@ -788,7 +788,7 @@ def test_memory_traces_end_to_end_stages_and_streaming_ttft(tmp_path: Path) -> N
             question: ModelInput,
             hits: Sequence[SearchHit],
             *,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> Iterator[str]:
             del question, hits
             record_model_usage(input_tokens=5, output_tokens=3, total_tokens=8)
@@ -981,7 +981,7 @@ def test_empty_stream_is_invalid_model_output(tmp_path: Path, chunks: tuple[str,
             question: ModelInput,
             hits: Sequence[SearchHit],
             *,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> Iterator[str]:
             del question, hits
             yield from chunks
@@ -1013,7 +1013,7 @@ def test_stream_ttft_requires_an_actual_model_request(tmp_path: Path) -> None:
             question: ModelInput,
             hits: Sequence[SearchHit],
             *,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> Iterator[str]:
             del question, hits
             mark_model_requests(0, token_usage_expected=0)
@@ -1048,7 +1048,7 @@ def test_streaming_answer_reports_only_the_hits_the_stream_used(tmp_path: Path) 
             question: ModelInput,
             hits: Sequence[SearchHit],
             *,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> Generator[str, None, tuple[SearchHit, ...]]:
             del question
             yield "grounded"
@@ -1070,7 +1070,7 @@ def test_streaming_answer_preserves_structured_abstention(tmp_path: Path) -> Non
             question: ModelInput,
             hits: Sequence[SearchHit],
             *,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> Generator[str, None, AnswerResult]:
             del question
             yield "unknown"
@@ -4781,7 +4781,7 @@ def test_no_hit_ask_routes_media_and_cannot_accept_fabricated_hits(tmp_path: Pat
             question: ModelInput,
             hits: Sequence[SearchHit],
             *,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             super().answer(question, hits)
             fabricated = SearchHit(
@@ -4820,7 +4820,7 @@ class _CountingStreamer(_FakeModels):
         question: ModelInput,
         hits: Sequence[SearchHit],
         *,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> Generator[str, None, tuple[SearchHit, ...]]:
         del question
         for part in ("the red ", "toolbox is ", "on the bench"):
@@ -4955,7 +4955,7 @@ def test_abandoning_ask_stream_closes_the_generation_stream_inside_the_operation
             question: ModelInput,
             hits: Sequence[SearchHit],
             *,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> Generator[str, None, tuple[SearchHit, ...]]:
             try:
                 yield from super().stream_answer(question, hits)
@@ -5025,7 +5025,7 @@ def test_ask_returns_only_retrieved_hits_the_answerer_used(tmp_path: Path) -> No
             question: ModelInput,
             hits: Sequence[SearchHit],
             *,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             super().answer(question, hits)
             fabricated = SearchHit(
@@ -5062,7 +5062,7 @@ def test_answering_reinforces_only_the_evidence_the_model_cited(tmp_path: Path) 
             question: ModelInput,
             hits: Sequence[SearchHit],
             *,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             super().answer(question, hits)
             return AnswerResult(answer="grounded", hits=(hits[0],))
@@ -5114,7 +5114,7 @@ def test_reinforce_on_answer_false_keeps_answering_free_of_side_effects(tmp_path
             question: ModelInput,
             hits: Sequence[SearchHit],
             *,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             super().answer(question, hits)
             return AnswerResult(answer="grounded", hits=(hits[0],))
@@ -6979,7 +6979,7 @@ def test_ask_hands_the_caller_chosen_answer_policy_to_the_answerer(tmp_path: Pat
             question: ModelInput,
             hits: Sequence[SearchHit],
             *,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             policies.append(answer_policy)
             return super().answer(question, hits, answer_policy=answer_policy)
@@ -6991,7 +6991,7 @@ def test_ask_hands_the_caller_chosen_answer_policy_to_the_answerer(tmp_path: Pat
         with pytest.raises(ValidationError, match="answer_policy"):
             memory.ask("what colour is the toolbox?", answer_policy="guess")  # type: ignore[arg-type]
 
-    assert policies == ["abstain", "best_effort"]
+    assert policies == ["strict", "best_effort"]
 
 
 def test_a_backend_written_before_answer_policy_still_answers_at_the_default(

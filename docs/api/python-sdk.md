@@ -344,7 +344,7 @@ ask(
     reference_at: datetime | None = None,
     scope: RetrievalScope | None = None,
     link_identities: bool = True,
-    answer_policy: AnswerPolicy = "abstain",
+    answer_policy: AnswerPolicy = "strict",
 ) -> AnswerResult
 
 ask_stream(
@@ -355,7 +355,7 @@ ask_stream(
     reference_at: datetime | None = None,
     scope: RetrievalScope | None = None,
     link_identities: bool = True,
-    answer_policy: AnswerPolicy = "abstain",
+    answer_policy: AnswerPolicy = "strict",
 ) -> Iterator[AnswerChunk]
 ```
 
@@ -381,7 +381,7 @@ parent. `index_ids` records the index candidates that admitted the parent; it do
 their route or enumerate every persisted part considered during exact score completion.
 
 `answer_policy` is the caller's, because abstaining is right for one caller and wrong for
-another. The default `"abstain"` refuses when the retrieved evidence is thin: `answer` is a fixed
+another. The default `"strict"` refuses when the retrieved evidence is thin: `answer` is a fixed
 sentence, `abstained` is true, and `abstention_reason` says why. `"best_effort"` instructs the
 answerer to commit to the single most likely answer the evidence supports instead -- for a
 multiple-choice question, always one of the offered options -- and to flag the low confidence
@@ -1158,14 +1158,14 @@ GenerationBackend.answer(
     question: ModelInput,
     hits: Sequence[SearchHit],
     *,
-    answer_policy: AnswerPolicy = "abstain",
+    answer_policy: AnswerPolicy = "strict",
 ) -> AnswerResult
 
 StreamingGenerationBackend.stream_answer(
     question: ModelInput,
     hits: Sequence[SearchHit],
     *,
-    answer_policy: AnswerPolicy = "abstain",
+    answer_policy: AnswerPolicy = "strict",
 ) -> Iterator[str]
 
 TranscriptionBackend.transcribe(
@@ -1226,7 +1226,7 @@ like a former it proposes and never writes storage. An `IDENTIFY` proposal carri
 evidence, and the kernel builds the typed assertion.
 
 `answer_policy` is keyword-only and defaulted on both generation protocols, and MindBridge sends
-it only when a caller asked for something other than `"abstain"`. A backend written against the
+it only when a caller asked for something other than `"strict"`. A backend written against the
 earlier two-argument signature therefore keeps answering; accept the argument to support
 `"best_effort"`, which otherwise fails the call with `ModelError`.
 
@@ -1388,13 +1388,13 @@ answer(
     question: ModelInput | str,
     hits: Sequence[SearchHit],
     *,
-    answer_policy: AnswerPolicy = "abstain",
+    answer_policy: AnswerPolicy = "strict",
 ) -> AnswerResult
 stream_answer(
     question: ModelInput | str,
     hits: Sequence[SearchHit],
     *,
-    answer_policy: AnswerPolicy = "abstain",
+    answer_policy: AnswerPolicy = "strict",
 ) -> Generator[str, None, tuple[SearchHit, ...]]
 transcribe(assets: Sequence[AssetRef]) -> tuple[str, ...]
 close() -> None

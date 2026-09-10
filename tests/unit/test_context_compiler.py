@@ -1977,7 +1977,7 @@ class _Answerer:
         question: ModelInput,
         hits: Sequence[SearchHit],
         *,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
         raise AssertionError("compile never generates text")
 

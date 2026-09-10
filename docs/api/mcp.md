@@ -141,7 +141,7 @@ rejected. The MCP-specific media bounds are listed below.
 | `search_memories` | required `query`; `limit=10`; `memory_type=None`; `reference_at=None`; `occurred_from=None`; `occurred_until=None`; `scope=None`; `explain=false` | `{"hits":[SearchHitResult,...],"trace":null}` | write, not idempotent |
 | `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None` | `AnswerResponse` | write, not idempotent |
 | `compile_context` | required `goal`; `budget=None`; `reference_at=None`; `scope=None`; `allow_partial_sources=false` | `ContextBundleResult` | write, not idempotent |
-| `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None`; `answer_policy="abstain"` | `AnswerResponse` | write, not idempotent |
+| `ask_memory` | required `question`; `limit=5`; `memory_type=None`; `reference_at=None`; `scope=None`; `answer_policy="strict"` | `AnswerResponse` | write, not idempotent |
 | `compile_context` | required `goal`; `budget=None`; `reference_at=None`; `scope=None` | `ContextBundleResult` | write, not idempotent |
 | `get_memory` | required `memory_id` | `MemoryResult` | read-only |
 | `list_memories` | `limit=100`; `cursor=None` | `PageResult` | read-only |
@@ -182,7 +182,7 @@ control plane's `QUERY_FAILURE` trigger reads; they are also not advertised as i
 tool has `open_world_hint=false`. `ask_memory` requires an answerer in the
 injected memory; without one it returns `model_error/backend_not_configured`. With the default
 `reinforce_on_answer=True`, it also reinforces the hits the answerer cites. Its `answer_policy`
-is `abstain` or `best_effort`: the default refuses when the evidence is thin, while `best_effort`
+is `strict` or `best_effort`: the default refuses when the evidence is thin, while `best_effort`
 commits to the most likely answer -- for a multiple-choice question, always one of the options --
 and still reports `abstained`, so an agent that must produce an answer keeps the confidence
 signal without losing the answer. Under `best_effort` a question that grounds nothing spends a

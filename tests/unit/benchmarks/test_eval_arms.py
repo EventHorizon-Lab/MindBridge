@@ -20,6 +20,7 @@ from opentelemetry.sdk.trace import ReadableSpan
 import mindbridge.benchmarks.eval as eval_module
 from mindbridge import (
     AnswerChunk,
+    AnswerPolicy,
     AnswerResult,
     AsyncMemory,
     ContextBudget,
@@ -1085,6 +1086,7 @@ def test_results_report_each_arm_beside_the_product_arm() -> None:
         eval_module._Arguments,
         SimpleNamespace(
             arms=(DEFAULT_ARM, "blind", "random"),
+            answer_policy=None,
             full_context_chars=24_000,
             ingest="add",
             deliberate=False,
@@ -1368,15 +1370,16 @@ def test_a_replayed_answer_still_carries_the_ranked_list_it_was_scored_from(
 
 
 @pytest.mark.parametrize(
-    ("task_name", "expected"),
+    ("task_name", "override", "expected"),
     [
-        ("m3-bench-robot", "best_effort"),
-        ("egolifeqa", "best_effort"),
-        ("atm-bench", "abstain"),
+        ("m3-bench-robot", None, "best_effort"),
+        ("atm-bench", None, "strict"),
+        ("atm-bench", "best_effort", "best_effort"),
+        ("m3-bench-robot", "strict", "strict"),
     ],
 )
 def test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path(
-    tmp_path: Path, task_name: str, expected: str
+    tmp_path: Path, task_name: str, override: str | None, expected: str
 ) -> None:
     """The whole chain: `_arm_answer` -> `AsyncMemory.ask_stream` -> `_BorrowedGenerationBackend`.
 
@@ -1395,7 +1398,7 @@ def test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path
             question: ModelInput,
             hits: Sequence[SearchHit],
             *,
-            answer_policy: str = "abstain",
+            answer_policy: str = "strict",
         ) -> AnswerResult:
             del question
             recorded.append(answer_policy)
@@ -1406,7 +1409,7 @@ def test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path
             question: ModelInput,
             hits: Sequence[SearchHit],
             *,
-            answer_policy: str = "abstain",
+            answer_policy: str = "strict",
         ) -> Generator[str, None, tuple[SearchHit, ...]]:
             del question
             recorded.append(answer_policy)
@@ -1421,10 +1424,12 @@ def test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path
 
     async def run() -> eval_module._AnswerOutcome | BaseException:
         async with AsyncMemory(
-            tmp_path,
-            embedder=_TinyEmbedder(),
-            answerer=cast(GenerationBackend, borrowed),
-            minimum_relevance=0,
+            Memory(
+                tmp_path,
+                embedder=_TinyEmbedder(),
+                answerer=cast(GenerationBackend, borrowed),
+                minimum_relevance=0,
+            )
         ) as memory:
             await memory.add("Ada signed the contract")
             answered = await _answer_many(
@@ -1435,6 +1440,7 @@ def test_the_task_policy_reaches_the_lent_answerer_through_the_real_harness_path
                 arm=PRODUCT_ARM,
                 task_name=task_name,
                 unit_id="unit",
+                answer_policy=cast(AnswerPolicy | None, override),
             )
             return answered[0]
 

@@ -1225,7 +1225,7 @@ async def test_memlens_question_date_is_a_reference_clock_not_query_text(tmp_pat
             *,
             limit: int,
             reference_at: datetime | None = None,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             assert limit == 5
             observed.append(reference_at)
@@ -1338,8 +1338,10 @@ async def test_answer_many_receives_the_fallback_reference_clock() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             assert limit == 5
+            del answer_policy
             observed.append(reference_at)
             return AnswerResult("Now")
 
@@ -1603,7 +1605,7 @@ class _FakeMemory:
         *,
         limit: int,
         reference_at: datetime | None = None,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
         del reference_at, answer_policy
         self.events.append(f"ask:{question}:{limit}")
@@ -2453,7 +2455,7 @@ async def test_runner_scores_the_actual_ranking_at_a_causal_cutoff(
             *,
             limit: int,
             reference_at: datetime | None = None,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             del question, limit, reference_at, answer_policy
             _record_retrieval_results((ranked,))
@@ -2577,7 +2579,7 @@ async def test_runner_applies_request_concurrency_across_units(tmp_path: Path) -
             *,
             limit: int,
             reference_at: datetime | None = None,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             nonlocal active, peak
             del question, limit, reference_at, answer_policy
@@ -2642,7 +2644,7 @@ async def test_standalone_search_reopens_warm_stores_after_every_answer(
             *,
             limit: int,
             reference_at: datetime | None = None,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             del limit, reference_at, answer_policy
             events.append(f"answer-start:{question}")
@@ -2733,7 +2735,7 @@ async def test_run_arms_defers_replay_until_every_task_answer_finishes(
             *,
             limit: int,
             reference_at: datetime | None = None,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             del limit, reference_at, answer_policy
             events.append(f"answer:{question}")
@@ -2809,6 +2811,7 @@ async def test_run_arms_defers_replay_until_every_task_answer_finishes(
             unit_concurrency=1,
             request_concurrency=1,
             recall_limit=3,
+            answer_policy=None,
             predict_only=False,
             log_samples=False,
             arms=(eval_module.DEFAULT_ARM,),
@@ -2915,7 +2918,7 @@ async def test_answer_many_latency_excludes_request_semaphore_wait() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             del limit, reference_at, answer_policy
             if question == "slow":
@@ -2957,7 +2960,7 @@ async def test_answer_many_reports_each_completed_answer_immediately() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             del limit, reference_at, answer_policy
             if question == "slow":
@@ -3002,7 +3005,7 @@ async def test_answer_many_reports_failed_outcome_immediately() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             del limit, reference_at, answer_policy
             if question == "failed":
@@ -3066,9 +3069,10 @@ async def test_unit_preserves_answers_before_a_systemic_query_embedding_failure(
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             nonlocal calls
-            del question, limit, reference_at
+            del question, limit, reference_at, answer_policy
             calls += 1
             if calls == 3:
                 raise ModelError(
@@ -3132,9 +3136,10 @@ async def test_generation_502_does_not_trigger_embedding_fail_fast() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             nonlocal calls
-            del question, limit, reference_at
+            del question, limit, reference_at, answer_policy
             calls += 1
             if calls == 1:
                 raise ModelError(
@@ -3174,7 +3179,7 @@ async def test_runner_reports_cached_progress_before_pending_answer_finishes(
             *,
             limit: int,
             reference_at: datetime | None = None,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             del limit, reference_at, answer_policy
             await release_slow.wait()
@@ -3327,7 +3332,7 @@ async def test_answer_many_preserves_structured_abstention() -> None:
             *,
             limit: int,
             reference_at: datetime | None = None,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> AnswerResult:
             del question, limit, reference_at, answer_policy
             return AnswerResult(
@@ -4839,6 +4844,7 @@ def _streaming_arguments(output_path: Path, **overrides: object) -> eval_module.
         "quiet": False,
         "log_samples": False,
         "recall_limit": 20,
+        "answer_policy": None,
         "resume": False,
         "run_id": "run",
         "seed": 7,
@@ -5177,5 +5183,5 @@ def test_only_the_two_tasks_whose_protocol_credits_no_abstention_ask_for_a_guess
     from mindbridge.benchmarks.prompts import BEST_EFFORT_TASKS
     from mindbridge.benchmarks.task_catalog import TASKS
 
-    assert {"m3-bench-robot", "egolifeqa"} == BEST_EFFORT_TASKS
+    assert {"m3-bench-robot"} == BEST_EFFORT_TASKS
     assert set(TASKS) >= BEST_EFFORT_TASKS

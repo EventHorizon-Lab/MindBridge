@@ -146,7 +146,7 @@ class AnswerRequest(StrictModel):
     scope: RetrievalScope | None = None
     # Abstention is the caller's policy, not the server's: `best_effort` commits to the most
     # likely answer and still reports `abstained`. The default keeps the refusal behaviour.
-    answer_policy: AnswerPolicy = "abstain"
+    answer_policy: AnswerPolicy = "strict"
 
 
 # The shared bounds under the name FastAPI publishes as the OpenAPI component; no fields and no
@@ -611,7 +611,7 @@ class _Memory(Protocol):
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult: ...
 
     def ask_stream(
@@ -623,7 +623,7 @@ class _Memory(Protocol):
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> Generator[AnswerChunk, None, AnswerResult]: ...
 
     def compile(

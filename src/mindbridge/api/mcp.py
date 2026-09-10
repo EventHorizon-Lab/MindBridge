@@ -183,7 +183,7 @@ _BUDGET_DESCRIPTION = (
     " with no deadline."
 )
 _ANSWER_POLICY_DESCRIPTION = (
-    "What to do when the retrieved memories are thin. `abstain`, the default, refuses and returns"
+    "What to do when the retrieved memories are thin. `strict`, the default, refuses and returns"
     " a fixed sentence with `abstained` true. `best_effort` instead commits to the most likely"
     " answer the evidence supports -- for a multiple-choice question, always one of the options --"
     " and still sets `abstained`, so you learn the answer was a guess without losing it. Choose"
@@ -624,7 +624,7 @@ def build_mcp_server(
         scope: Annotated[RetrievalScope | None, Field(description=_SCOPE_DESCRIPTION)] = None,
         answer_policy: Annotated[
             AnswerPolicy, Field(description=_ANSWER_POLICY_DESCRIPTION)
-        ] = "abstain",
+        ] = "strict",
     ) -> AnswerResponse:
         """Answer a question using only the memories retrieved for it.
 

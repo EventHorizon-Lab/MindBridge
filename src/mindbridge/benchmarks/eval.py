@@ -32,7 +32,7 @@ from importlib import metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile, gettempdir
 from threading import Event, Thread
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast, get_args, overload
 
 import yaml
 from opentelemetry import trace
@@ -307,6 +307,9 @@ class _Arguments:
     unit_concurrency: int
     request_concurrency: int
     recall_limit: int
+    # None means every task keeps the policy its own protocol calls for; a value overrides the
+    # whole table, which is how a run measures the policy itself rather than one task's protocol.
+    answer_policy: AnswerPolicy | None
     seed: int
     seeds: tuple[int, int, int, int]
     bootstrap_samples: int
@@ -472,6 +475,7 @@ class SampleResult:
     ranked_source_ids: tuple[str, ...] = ()
     ranked_source_ids_complete: bool = False
     dropped_hits: int | None = None
+    answer_policy: AnswerPolicy | None = None
     abstained: bool = False
     abstention_reason: str | None = None
     ingest_failures: tuple[FailureDetail, ...] = ()
@@ -512,7 +516,7 @@ class SampleResult:
             "dropped_hits": self.dropped_hits,
             "task": self.task,
             # The policy this sample's request carried; only the product arm reaches `ask`.
-            "answer_policy": (task_answer_policy(self.task) if self.arm == DEFAULT_ARM else None),
+            "answer_policy": self.answer_policy,
             "benchmark": self.benchmark,
             "dataset_sha256": self.dataset_sha256,
             "evaluation_sha256": self.evaluation_sha256,
@@ -960,7 +964,7 @@ class _BorrowedBackend:
         question: ModelInput,
         hits: Sequence[SearchHit],
         *,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> Iterator[str]:
         return cast(
             Iterator[str],
@@ -1057,7 +1061,7 @@ class _BorrowedGenerationBackend(_BorrowedBackend):
         question: ModelInput,
         hits: Sequence[SearchHit],
         *,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
         return cast(GenerationBackend, self._backend).answer(
             question, hits, answer_policy=answer_policy
@@ -2211,6 +2215,7 @@ async def _run_arms(
                 arms=arms,
                 full_context_chars=arguments.full_context_chars,
                 compile_budget=compile_budget,
+                answer_policy=arguments.answer_policy,
                 ingest_mode=arguments.ingest,
                 ingest_digest=_ingest_digest(task, arguments, memory_config),
                 deliberate=arguments.deliberate,
@@ -2244,6 +2249,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
     arms: Sequence[_Arm] = (PRODUCT_ARM,),
     full_context_chars: int = DEFAULT_FULL_CONTEXT_CHARS,
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
+    answer_policy: AnswerPolicy | None = None,
     ingest_mode: str = DEFAULT_INGEST_MODE,
     ingest_digest: str | None = None,
     deliberate: bool = False,
@@ -2316,6 +2322,7 @@ async def run_loaded_task(  # noqa: C901 - bounded workers also own one isolated
                 arms=arms,
                 full_context_chars=full_context_chars,
                 compile_budget=compile_budget,
+                answer_policy=answer_policy,
                 ingest_mode=ingest_mode,
                 checkpoint=checkpoint,
                 deliberate=deliberate,
@@ -2606,6 +2613,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
     arms: Sequence[_Arm] = (PRODUCT_ARM,),
     full_context_chars: int = DEFAULT_FULL_CONTEXT_CHARS,
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
+    answer_policy: AnswerPolicy | None = None,
     ingest_mode: str = DEFAULT_INGEST_MODE,
     checkpoint: _IngestCheckpoint | None = None,
     deliberate: bool = False,
@@ -2627,6 +2635,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                 arm=arm,
                 predict_only=predict_only,
                 log_samples=log_samples,
+                answer_policy=answer_policy,
             )
         )
     _report_completions(on_sample_completed, len(results))
@@ -2720,6 +2729,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                     log_samples=log_samples,
                     response_cache=response_cache,
                     compile_budget=compile_budget,
+                    answer_policy=answer_policy,
                     tracer=tracer,
                     on_sample_completed=on_sample_completed,
                 )
@@ -2749,6 +2759,7 @@ async def _run_unit(  # noqa: C901 - causal ingest and store-readiness share one
                     predict_only=predict_only,
                     log_samples=log_samples,
                     arm=arm,
+                    answer_policy=answer_policy,
                 )
     else:
         notify_store_ready()
@@ -2772,6 +2783,7 @@ async def _answer_arms(
     log_samples: bool,
     response_cache: ResponseCache | None,
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
+    answer_policy: AnswerPolicy | None = None,
     tracer: Tracer | None = None,
     on_sample_completed: Callable[[], None] | None = None,
 ) -> dict[tuple[str, str], SampleResult]:
@@ -2793,6 +2805,7 @@ async def _answer_arms(
             unit_id=unit.unit_id,
             context=context,
             compile_budget=compile_budget,
+            answer_policy=answer_policy,
             tracer=tracer,
             on_complete=on_sample_completed,
         )
@@ -2816,6 +2829,7 @@ async def _answer_arms(
                 predict_only=predict_only,
                 log_samples=log_samples,
                 arm=arm,
+                answer_policy=answer_policy,
             )
     return results
 
@@ -2828,6 +2842,7 @@ def _cached_results(
     arm: _Arm = PRODUCT_ARM,
     predict_only: bool,
     log_samples: bool,
+    answer_policy: AnswerPolicy | None = None,
 ) -> dict[tuple[str, str], SampleResult]:
     if cache is None:
         return {}
@@ -2856,6 +2871,7 @@ def _cached_results(
                 predict_only=predict_only,
                 log_samples=log_samples,
                 arm=arm,
+                answer_policy=answer_policy,
             )
     return results
 
@@ -3129,6 +3145,7 @@ async def _guarded_answer(
     recall_limit: int,
     context: str,
     compile_budget: ContextBudget,
+    answer_policy: AnswerPolicy | None,
     tracer: Tracer | None,
     on_answer: Callable[[EvalQuestion, _AnswerOutcome], None] | None,
     on_complete: Callable[[], None] | None,
@@ -3148,6 +3165,7 @@ async def _guarded_answer(
                     recall_limit=recall_limit,
                     context=context,
                     compile_budget=compile_budget,
+                    answer_policy=answer_policy,
                     tracer=tracer,
                     sample_id=sample_id,
                     started=time.perf_counter(),
@@ -3167,6 +3185,7 @@ async def _guarded_answer(
                         recall_limit=recall_limit,
                         context=context,
                         compile_budget=compile_budget,
+                        answer_policy=answer_policy,
                         tracer=tracer,
                         sample_id=sample_id,
                         started=started,
@@ -3199,6 +3218,7 @@ async def _answer_many(
     unit_id: str = "",
     context: str = "",
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
+    answer_policy: AnswerPolicy | None = None,
     tracer: Tracer | None = None,
 ) -> tuple[_AnswerOutcome | BaseException, ...]:
     semaphore = request_semaphore or asyncio.Semaphore(request_concurrency)
@@ -3219,6 +3239,7 @@ async def _answer_many(
                         recall_limit=recall_limit,
                         context=context,
                         compile_budget=compile_budget,
+                        answer_policy=answer_policy,
                         tracer=tracer,
                         on_answer=on_answer,
                         on_complete=on_complete,
@@ -3339,6 +3360,7 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
     started: float,
     answer_span: Span | None,
     compile_budget: ContextBudget = DEFAULT_COMPILE_BUDGET,
+    answer_policy: AnswerPolicy | None = None,
     tracer: Tracer | None = None,
 ) -> _AnswerOutcome:
     latency_started = time.perf_counter()
@@ -3420,7 +3442,7 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
         # Protocol alignment, not a scorer change: two tasks' official evaluations give no credit
         # for "unknown", so the request asks for a committed answer there. `task_answer_policy`
         # owns the mapping and its rationale.
-        answer_policy = task_answer_policy(task_name)
+        requested_policy = task_answer_policy(task_name, answer_policy)
         with _observe_retrieval_results(observe_retrieval):
             ask_stream = getattr(memory, "ask_stream", None)
             if ask_stream is None:
@@ -3428,7 +3450,7 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                     content,
                     limit=recall_limit,
                     reference_at=question.reference_at,
-                    answer_policy=answer_policy,
+                    answer_policy=requested_policy,
                 )
             else:
                 first_token_seen = False
@@ -3436,7 +3458,7 @@ async def _arm_answer(  # noqa: C901 - baseline and streamed product paths share
                     content,
                     limit=recall_limit,
                     reference_at=question.reference_at,
-                    answer_policy=answer_policy,
+                    answer_policy=requested_policy,
                 ):
                     if chunk.text.strip() and not first_token_seen:
                         first_token_seen = True
@@ -3528,6 +3550,7 @@ def _sample(
     predict_only: bool,
     log_samples: bool,
     arm: _Arm = PRODUCT_ARM,
+    answer_policy: AnswerPolicy | None = None,
 ) -> SampleResult:
     memory_ids: tuple[str, ...]
     evidence: tuple[EvidenceInterval, ...]
@@ -3647,6 +3670,10 @@ def _sample(
         metrics=metrics,
         scorer_protocol=scorer_protocol(task.spec.name),
         arm=arm.name,
+        # Only the generating product arm reaches `ask`, so a baseline row carries no request.
+        answer_policy=(
+            task_answer_policy(task.spec.name, answer_policy) if arm.name == DEFAULT_ARM else None
+        ),
         retrieval_candidates=len(ranked_source_ids),
         ranked_source_ids=tuple(ranked_source_ids),
         ranked_source_ids_complete=ranked_source_ids_complete,
@@ -4230,7 +4257,9 @@ def _task_rows(
                 # byte-indistinguishable from every earlier run of the same task. Only the
                 # product arm reaches `ask`, so the baseline arms carry no policy.
                 "answer_policy": (
-                    task_answer_policy(task.spec.name) if arm == DEFAULT_ARM else None
+                    task_answer_policy(task.spec.name, arguments.answer_policy)
+                    if arm == DEFAULT_ARM
+                    else None
                 ),
                 "benchmark": task.spec.benchmark,
                 "variant": task.spec.variant,
@@ -4348,6 +4377,7 @@ def _results(
         "unit_concurrency": arguments.unit_concurrency,
         "request_concurrency": arguments.request_concurrency,
         "recall_limit": arguments.recall_limit,
+        "answer_policy_override": arguments.answer_policy,
         # P5/P6: without this the configured consolidator was constructed, registered for close,
         # and never called, and nothing in the report said so.
         "deliberation": {
@@ -6146,6 +6176,15 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     parser.add_argument("--request-concurrency", type=_positive_int, default=None)
     parser.add_argument("--judge-concurrency", type=_positive_int, default=None)
     parser.add_argument("--recall-limit", type=_positive_int, default=None)
+    parser.add_argument(
+        "--answer-policy",
+        choices=get_args(AnswerPolicy),
+        default=None,
+        help=(
+            "override every task's answer policy; unset keeps each task's official protocol"
+            " (mindbridge.benchmarks.prompts.BEST_EFFORT_TASKS)"
+        ),
+    )
     parser.add_argument("--seed", type=_seed_values, default=None)
     parser.add_argument("--bootstrap-samples", type=_positive_int, default=None)
     parser.add_argument(
@@ -6278,6 +6317,7 @@ def _arguments(
     request_concurrency = _picked(parsed.request_concurrency, run.request_concurrency, 4)
     judge_concurrency = _picked(parsed.judge_concurrency, run.judge_concurrency, 8)
     recall_limit = _picked(parsed.recall_limit, run.recall_limit, 20)
+    answer_policy = _picked(parsed.answer_policy, run.answer_policy, None)
     full_context_chars = _picked(
         parsed.full_context_chars, run.full_context_chars, DEFAULT_FULL_CONTEXT_CHARS
     )
@@ -6369,6 +6409,7 @@ def _arguments(
         unit_concurrency=unit_concurrency,
         request_concurrency=request_concurrency,
         recall_limit=recall_limit,
+        answer_policy=answer_policy,
         seed=seeds[0],
         seeds=seeds,
         bootstrap_samples=bootstrap_samples,

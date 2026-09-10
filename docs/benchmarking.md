@@ -1029,14 +1029,13 @@ Three result fields carry a caveat that decides whether they can be quoted:
   none, is still not counted. Measured under the older exact-sentence detector, an EgoLifeQA slice
   reported 2 of 51 while 14 of 51 answers read as refusals; treat the field as a lower bound and
   read the predictions before drawing a conclusion about refusal rates.
-- **Two tasks ask the product for a committed answer rather than a refusal.**
+- **One task asks the product for a committed answer rather than a refusal.**
   `mindbridge.benchmarks.prompts.task_answer_policy` maps each task to the `answer_policy` the
-  runner passes into `Memory.ask`, and exactly two are `best_effort`: `m3-bench-robot` and
-  `egolifeqa`. This is protocol alignment on the request side, not a scorer change -- neither
-  task's official evaluation gives any credit for "unknown" (M3-Bench-Robot is judged against a
-  reference answer with no abstention class, EgoLifeQA is 4-way multiple choice expecting one of
-  the four letters) and neither ships a genuinely unanswerable item, so an abstention there is a
-  lost point rather than a correct report. Every other task keeps the product default `abstain`,
+  runner passes into `Memory.ask`, and one is `best_effort`: `m3-bench-robot`. This is protocol
+  alignment on the request side, not a scorer change -- its official evaluation gives no credit
+  for "unknown" (it is judged against a reference answer with no abstention class) and it ships
+  no genuinely unanswerable item, so an abstention there is a lost point rather than a correct
+  report. Every other task keeps the product default `strict`,
   because abstaining is part of what they measure: LongMemEval and MEMLENS carry abstention
   abilities, ATM-Bench scores abstention as a class, LoCoMo's category 5 is adversarial, and
   Mem-Gallery's `AR` mandates its own refusal wording. Under `best_effort` the answer is still
@@ -1044,7 +1043,9 @@ Three result fields carry a caveat that decides whether they can be quoted:
   the prediction changes from a refusal to the answerer's best guess. Each `results.jsonl` task
   row and each `samples.jsonl` sample row records the `answer_policy` its product arm requested
   (`null` for the baseline arms, which do not call `ask`), so a `best_effort` run is not
-  silently comparable with an earlier `abstain` run of the same task.
+  silently comparable with an earlier `strict` run of the same task. `--answer-policy`, or
+  `benchmark.run.answer_policy`, overrides the whole table for one run when the policy itself is
+  what is being measured; the resolved `config.yaml` records it as `answer_policy_override`.
 - **A task whose query prompt mandates a format or a refusal wording puts that wording into
   retrieval, not only into generation.** `EvalQuestion.content` is what the runner passes to
   `Memory.ask`, and `ask` takes one content input for both legs, so the instruction is matched

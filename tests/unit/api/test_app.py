@@ -360,7 +360,7 @@ class FakeMemory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
         self._fail()
         self.calls.append(
@@ -377,7 +377,7 @@ class FakeMemory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> Generator[AnswerChunk, None, AnswerResult]:
         self._fail()
         self.calls.append(
@@ -634,7 +634,7 @@ def test_resource_routes_map_the_public_memory_values() -> None:
             OCCURRED_FROM,
             OCCURRED_UNTIL,
         ),
-        ("ask", "What color is it?", 4, MemoryType.PROCEDURAL, NOW, False, "abstain"),
+        ("ask", "What color is it?", 4, MemoryType.PROCEDURAL, NOW, False, "strict"),
         ("delete", "memory_1"),
     ]
     assert memory.close_count == 0
@@ -661,7 +661,7 @@ def test_answer_stream_sends_deltas_then_one_grounded_result_with_transport_timi
     assert 'data: {"text":"is blue."}' in response.text
     assert response.text.count("event: result\n") == 1
     assert '"answer":"The toolbox is blue."' in response.text
-    assert memory.calls == [("ask_stream", "What color is it?", 4, None, None, False, "abstain")]
+    assert memory.calls == [("ask_stream", "What color is it?", 4, None, None, False, "strict")]
 
     span = next(
         span for span in exporter.get_finished_spans() if span.name == "mindbridge.http.request"
@@ -711,7 +711,7 @@ def test_answer_stream_failure_after_a_delta_ends_with_an_error_event() -> None:
             reference_at: datetime | None = None,
             scope: RetrievalScope | None = None,
             link_identities: bool = True,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> Generator[AnswerChunk, None, AnswerResult]:
             del question, limit, memory_type, reference_at, scope, link_identities, answer_policy
             yield AnswerChunk(text="partial answer")
@@ -760,7 +760,7 @@ async def test_answer_stream_closes_after_the_transport_send_fails(
             reference_at: datetime | None = None,
             scope: RetrievalScope | None = None,
             link_identities: bool = True,
-            answer_policy: AnswerPolicy = "abstain",
+            answer_policy: AnswerPolicy = "strict",
         ) -> Generator[AnswerChunk, None, AnswerResult]:
             del question, limit, memory_type, reference_at, scope, link_identities, answer_policy
             result = AnswerResult(answer="answer")
@@ -2056,4 +2056,4 @@ def test_answer_requests_carry_the_caller_chosen_answer_policy() -> None:
     assert default.status_code == 200
     assert chosen.status_code == 200
     assert rejected.status_code == 422
-    assert [call[-1] for call in memory.calls if call[0] == "ask"] == ["abstain", "best_effort"]
+    assert [call[-1] for call in memory.calls if call[0] == "ask"] == ["strict", "best_effort"]

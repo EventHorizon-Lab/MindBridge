@@ -14,7 +14,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `AnswerRequest`, and the MCP `ask_memory` tool, with the new `AnswerPolicy` alias exported from
   `mindbridge`. Abstaining is a policy the caller owns, not a fixed product behaviour: an
   unanswerable question deserves a refusal, while a multiple-choice caller, or one whose protocol
-  gives no credit for "unknown", loses the whole answer to one. The default `"abstain"` is
+  gives no credit for "unknown", loses the whole answer to one. The default `"strict"` is
   unchanged in behaviour and sends a byte-identical prompt. `"best_effort"` instructs the answerer
   to commit to the single most likely answer the evidence supports -- for a multiple-choice
   question, always one of the offered options -- and to flag low confidence with the structured
@@ -25,8 +25,10 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `AbstentionReason.NO_EVIDENCE`. `GenerationBackend.answer` and
   `StreamingGenerationBackend.stream_answer` take the same keyword-only argument, defaulted, so a
   custom backend only needs it once a caller opts in. The benchmark harness sets `"best_effort"`
-  for exactly `m3-bench-robot` and `egolifeqa`, whose official evaluations credit no abstention
-  and whose question sets hold no unanswerable item; every other task keeps `"abstain"`.
+  for exactly `m3-bench-robot`, whose official evaluation credits no abstention and whose
+  question set holds no unanswerable item; every other task keeps `"strict"`. `--answer-policy`
+  and `benchmark.run.answer_policy` override that table for one run, and both the task and the
+  sample rows record the policy the request carried.
 - Local storage advances to schema v18. Evidence is stored as clauses: a `CONSOLIDATE` operation's
   cited set is one conjunction, separate operations are alternatives, and withdrawing a source
   retires only the clauses it belonged to, so `(A AND B) OR C` keeps `C` when `A` goes. Derived
@@ -439,7 +441,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   a keyword-only `answer_policy` argument. Both protocols are `runtime_checkable`, and
   `isinstance` checks the method name rather than its signature, so a custom backend written
   against the two-argument signature keeps answering: MindBridge sends the keyword only when a
-  caller asks for something other than the default `"abstain"`, and passing `"best_effort"` to a
+  caller asks for something other than the default `"strict"`, and passing `"best_effort"` to a
   backend that does not accept it raises `ModelError` with `reason="model_failed"`. Accept the
   argument to support the policy.
 - The benchmark runner records the `answer_policy` each task's product arm requested, next to the

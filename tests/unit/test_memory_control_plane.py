@@ -3074,7 +3074,7 @@ class Abstainer:
         question: ModelInput,
         hits: Sequence[SearchHit],
         *,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
         return AnswerResult(
             answer="I do not know",

@@ -1533,12 +1533,12 @@ class Memory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
         """Answer a native or mixed-modal question only from retrieved memories.
 
         `answer_policy` decides what happens when the retrieved evidence is thin. The default,
-        `"abstain"`, refuses: `answer` is a fixed sentence and `abstained` is true. With
+        `"strict"`, refuses: `answer` is a fixed sentence and `abstained` is true. With
         `"best_effort"` the answerer commits to the most likely answer the evidence supports --
         for a multiple-choice question, always one of the options -- and still reports the same
         `abstained` and `abstention_reason`, so a caller whose protocol gives no credit for
@@ -1577,7 +1577,7 @@ class Memory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> Generator[AnswerChunk, None, AnswerResult]:
         """Answer as `ask()` does, but yield the answer while the model is still producing it.
 
@@ -7306,7 +7306,7 @@ class Memory:
         question: ModelInput,
         hits: Sequence[SearchHit],
         *,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> Generator[str, None, AnswerResult]:
         """Yield answer deltas in provider order and return the validated grounded result.
 
@@ -7337,7 +7337,7 @@ class Memory:
             # not that it takes this keyword. A backend written against the two-argument signature
             # keeps working as long as the default asks for nothing new.
             policy: dict[str, AnswerPolicy] = (
-                {} if answer_policy == "abstain" else {"answer_policy": answer_policy}
+                {} if answer_policy == "strict" else {"answer_policy": answer_policy}
             )
             try:
                 if isinstance(self._answerer, StreamingGenerationBackend):
@@ -7398,7 +7398,7 @@ class Memory:
                         # to carry that attribute cannot replace a caller's deltas there.
                         reported = (
                             None
-                            if answer_policy == "abstain"
+                            if answer_policy == "strict"
                             else getattr(used_hits, "answer", None)
                         )
                         if reported is not None:
@@ -8136,7 +8136,7 @@ class AsyncMemory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> AnswerResult:
         queued_at = perf_counter()
 
@@ -8166,7 +8166,7 @@ class AsyncMemory:
         reference_at: datetime | None = None,
         scope: RetrievalScope | None = None,
         link_identities: bool = True,
-        answer_policy: AnswerPolicy = "abstain",
+        answer_policy: AnswerPolicy = "strict",
     ) -> AsyncGenerator[AnswerChunk, None]:
         """Answer as `ask()` does, yielding chunks as the model produces them.
 
@@ -11805,7 +11805,7 @@ def _limit(value: object, *, maximum: int) -> None:
 
 def _answer_policy(value: object) -> None:
     if value not in get_args(AnswerPolicy):
-        raise ValidationError("answer_policy must be 'abstain' or 'best_effort'")
+        raise ValidationError("answer_policy must be 'strict' or 'best_effort'")
 
 
 def _normalized_vector(values: Sequence[float], dimension: int) -> tuple[float, ...]:
