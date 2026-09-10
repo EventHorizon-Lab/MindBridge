@@ -725,6 +725,22 @@ class StaleOperationError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class RecallDigest:
+    """What the active corpus looks like, for a caller that plans a read over it.
+
+    Small enough to send to a planner in one line, and cheap enough to answer per question: a
+    plan that asks for records outside the span, or for a modality nothing carries, is a plan
+    that reads nothing.
+    """
+
+    records: int
+    earliest: datetime | None
+    latest: datetime | None
+    modalities: tuple[str, ...]
+    named_identities: int
+
+
+@dataclass(frozen=True, slots=True)
 class StoredAsset:
     """Immutable metadata for one content-addressed local media asset."""
 
@@ -1141,6 +1157,11 @@ class LocalStore:
         # Idle connections only: one is in the pool exactly while nobody holds it.
         self._pool: list[sqlite3.Connection] = []
         self._pool_lock = Lock()
+        # Every commit invalidates the corpus digest. Counting it here rather than in the caller
+        # keeps the cache where writes are observable: one data directory has one live owner, so
+        # a commit this process did not make cannot exist.
+        self._write_generation = 0
+        self._digest: tuple[int, RecallDigest] | None = None
         self._directory_lock = DataDirectoryLock(self.data_dir)
         try:
             self._initialize_schema()
@@ -2692,6 +2713,47 @@ class LocalStore:
                 if _canonical_subject(_row_text(row, "name")) == wanted:
                     return _resolve_identity_id(connection, _row_text(row, "identity_id"))
         return None
+
+    def recall_digest(self) -> RecallDigest:
+        """Summarize the active corpus, recomputed only after a commit.
+
+        Three aggregate reads, none of them touching content or media: a count, the span of the
+        effective event time, and what modalities and named identities exist at all.
+        """
+        cached = self._digest
+        generation = self._write_generation
+        if cached is not None and cached[0] == generation:
+            return cached[1]
+        with self._read_transaction() as connection:
+            span = connection.execute(
+                f"""
+                SELECT COUNT(*) AS records,
+                       MIN({_RECALL_EVENT_TIME}) AS earliest,
+                       MAX(COALESCE(occurred_end, occurred_at, created_at)) AS latest
+                FROM memory_records
+                WHERE forgotten_at IS NULL
+                """
+            ).fetchone()
+            modalities = connection.execute(
+                """
+                SELECT DISTINCT modality
+                FROM memory_records
+                WHERE forgotten_at IS NULL
+                ORDER BY modality
+                """
+            ).fetchall()
+            named = connection.execute(
+                "SELECT COUNT(*) AS named FROM identities WHERE name IS NOT NULL"
+            ).fetchone()
+        digest = RecallDigest(
+            records=0 if span is None else int(span["records"]),
+            earliest=None if span is None else _optional_datetime_from_row(span, "earliest"),
+            latest=None if span is None else _optional_datetime_from_row(span, "latest"),
+            modalities=tuple(_row_text(row, "modality") for row in modalities),
+            named_identities=0 if named is None else int(named["named"]),
+        )
+        self._digest = (generation, digest)
+        return digest
 
     def _recall_memory_ids(
         self,
@@ -5343,6 +5405,7 @@ class LocalStore:
                 raise
             else:
                 connection.commit()
+                self._write_generation += 1
 
     @contextmanager
     def _read_transaction(self) -> Iterator[sqlite3.Connection]:

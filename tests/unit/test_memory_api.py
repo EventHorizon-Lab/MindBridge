@@ -75,6 +75,7 @@ from mindbridge.models.base import (
     StreamingGenerationBackend,
 )
 from mindbridge.models.openai_sdk import OpenAIModels
+from mindbridge.recall import fallback_plan
 from mindbridge.types import (
     AbstentionReason,
     AnswerPolicy,
@@ -129,6 +130,11 @@ class _FakeModels:
         self.embed_tasks: list[EmbedTask] = []
         self.answer_calls: list[tuple[ModelInput, tuple[SearchHit, ...]]] = []
         self.transcribe_calls: list[tuple[AssetRef, ...]] = []
+        # The recall plan this backend replies with, and every planning call it was asked for.
+        # None is a backend that plans nothing, which is what most of these tests want.
+        self.recall_plan: str | None = None
+        self.plan_error: ModelError | None = None
+        self.plan_calls: list[tuple[str, datetime, str]] = []
         self.embedding_model = model
         self.embedding_space = f"{model}:2:test"
         self._legacy_embedding_spaces: frozenset[str] = frozenset()
@@ -180,6 +186,18 @@ class _FakeModels:
         self.answer_calls.append((question, grounded))
         answer = f"Grounded in: {grounded[0].content}" if grounded else "I do not know."
         return AnswerResult(answer=answer, hits=grounded)
+
+    def plan_recall(
+        self,
+        question: str,
+        *,
+        reference_at: datetime,
+        corpus_digest: str,
+    ) -> str | None:
+        self.plan_calls.append((question, reference_at, corpus_digest))
+        if self.plan_error is not None:
+            raise self.plan_error
+        return self.recall_plan
 
     def transcribe(self, assets: Sequence[AssetRef]) -> tuple[str, ...]:
         batch = tuple(assets)
@@ -7025,3 +7043,135 @@ def test_a_backend_written_before_answer_policy_still_answers_at_the_default(
             assert memory.ask("what colour is the toolbox?").answer == "Legacy."
             with pytest.raises(ModelError):
                 memory.ask("what colour is the toolbox?", answer_policy="best_effort")
+
+
+class _PlannerlessAnswerer:
+    """A generation backend written before recall planning existed."""
+
+    generation_capabilities = ALL_INPUT_MODALITIES
+    generation_model = "planner-less"
+
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+        *,
+        answer_policy: AnswerPolicy = "strict",
+    ) -> AnswerResult:
+        del question, answer_policy
+        return AnswerResult(answer="answered", hits=tuple(hits))
+
+    def close(self) -> None:
+        return None
+
+
+def test_the_planner_is_told_the_clock_and_what_the_corpus_holds(tmp_path: Path) -> None:
+    """A plan that asks for a span or a modality nothing carries is a plan that reads nothing."""
+    models = _FakeModels()
+    reference = datetime(2026, 9, 10, 12, tzinfo=timezone.utc)
+    with _memory(tmp_path, models) as memory:
+        memory.add("a red wrench", occurred_at=datetime(2024, 9, 1, tzinfo=timezone.utc))
+        memory.add("a blue crate", occurred_at=datetime(2024, 9, 3, tzinfo=timezone.utc))
+
+        memory._recall_plan("what happened?", reference_at=reference, k=12)
+
+        question, clock, digest = models.plan_calls[0]
+        assert (question, clock) == ("what happened?", reference)
+        assert digest == (
+            "2 records; 2024-09-01T00:00:00.000000Z to 2024-09-03T00:00:00.000000Z; "
+            "modalities text; 0 named identities"
+        )
+
+
+def test_the_corpus_digest_is_recomputed_after_a_write_and_not_before(tmp_path: Path) -> None:
+    """It is cached on the store's commit counter, so it cannot go stale behind an ingest."""
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory:
+        assert memory._corpus_digest() == "empty"
+        unchanged = memory._corpus_digest()
+        memory.add("a red wrench", occurred_at=datetime(2024, 9, 1, tzinfo=timezone.utc))
+
+        assert unchanged == "empty"
+        assert memory._corpus_digest().startswith("1 records; ")
+
+
+def test_a_backend_that_cannot_plan_keeps_todays_single_search(tmp_path: Path) -> None:
+    """Route by capability: a third-party answerer is never called with a method it lacks."""
+    models = _FakeModels()
+    answerer = _PlannerlessAnswerer()
+    with Memory(tmp_path, embedder=models, answerer=answerer) as memory:
+        plan = memory._recall_plan(
+            "who signed?",
+            reference_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
+            k=9,
+        )
+
+    assert plan == fallback_plan("who signed?", k=9)
+
+
+def test_a_planner_failure_leaves_the_question_running(tmp_path: Path) -> None:
+    """Planning is a hint. A provider that refused it has said nothing about answering."""
+    models = _FakeModels()
+    models.plan_error = ModelError("planner unavailable", reason="model_failed", stage="plan")
+    with _memory(tmp_path, models) as memory:
+        plan = memory._recall_plan(
+            "how many times?",
+            reference_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
+            k=12,
+        )
+
+    assert plan == fallback_plan("how many times?", k=12)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        "",
+        "sorry, I cannot plan that",
+        '{"shape": "set", "steps": [{"op": "grep", "terms": ["a"]}]}',
+        '{"shape": "point", "steps": [{"op": "match", "terms": ["a"]}]}',
+    ],
+    ids=("nothing", "empty", "prose", "unknown-op", "point-asking-for-a-set"),
+)
+def test_a_plan_the_kernel_will_not_run_falls_back(tmp_path: Path, payload: str | None) -> None:
+    models = _FakeModels()
+    models.recall_plan = payload
+    with _memory(tmp_path, models) as memory:
+        plan = memory._recall_plan(
+            "how many times?",
+            reference_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
+            k=12,
+        )
+
+    assert plan == fallback_plan("how many times?", k=12)
+
+
+def test_a_usable_plan_is_the_plan_that_runs(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.recall_plan = json.dumps(
+        {
+            "shape": "set",
+            "steps": [
+                {
+                    "op": "match",
+                    "terms": ["wrench"],
+                    "time": ["2024-09-01", "2024-10-01"],
+                    "max_rows": 50,
+                },
+                {"op": "similar", "query": "how many wrenches", "k": 5},
+            ],
+        }
+    )
+    with _memory(tmp_path, models) as memory:
+        plan = memory._recall_plan(
+            "how many wrenches did I mention?",
+            reference_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
+            k=12,
+        )
+
+    assert plan.shape == "set"
+    assert [step.op for step in plan.steps] == ["match", "similar"]
+    assert plan.steps[0].terms == ("wrench",)
+    assert plan.steps[0].occurred_until == datetime(2024, 10, 1, tzinfo=timezone.utc)
+    assert plan.steps[1].k == 5

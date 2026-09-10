@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
@@ -352,6 +353,25 @@ class StreamingGenerationBackend(Protocol):
         *,
         answer_policy: AnswerPolicy = "strict",
     ) -> Iterator[str]: ...
+
+
+@runtime_checkable
+class RecallPlanningBackend(Protocol):
+    """Optional generation capability that plans how to retrieve for one question.
+
+    The return value is the model's own JSON text, which the kernel validates: a backend that
+    cannot plan, or one whose plan is unusable, costs the caller a fallback to plain similarity
+    search and nothing else. `corpus_digest` is one line describing what is in the store, so a
+    plan cannot ask for a time span or a modality that does not exist.
+    """
+
+    def plan_recall(
+        self,
+        question: str,
+        *,
+        reference_at: datetime,
+        corpus_digest: str,
+    ) -> str | None: ...
 
 
 @runtime_checkable

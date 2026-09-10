@@ -4406,6 +4406,96 @@ def _answer_policy_transport(
     return httpx.MockTransport(respond)
 
 
+def test_the_recall_planner_asks_for_json_at_temperature_zero() -> None:
+    """A plan decides which reads happen, so sampling it would read a different corpus twice.
+
+    The answer temperature is deliberately overridden: it is a prose control, and a composition
+    that wants varied answers must not get a varied retrieval program with them.
+    """
+    requests: list[dict[str, object]] = []
+    plan = '{"shape": "set", "steps": [{"op": "match", "terms": ["Cairo"]}]}'
+    with httpx.Client(transport=_answer_policy_transport(requests, plan)) as client:
+        returned = _model(_sdk_client(client), generation_temperature=0.8).plan_recall(
+            "how many times did I fly to Cairo?",
+            reference_at=NOW,
+            corpus_digest="30 records; modalities text",
+        )
+
+    assert returned == plan
+    payload = requests[0]
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["temperature"] == 0.0
+    messages = cast(list[dict[str, str]], payload["messages"])
+    assert messages[0]["content"] == openai_backend._RECALL_PLAN_SYSTEM_PROMPT
+    assert messages[1]["content"] == (
+        f"Reference time: {NOW.isoformat()}\n"
+        "Corpus: 30 records; modalities text\n"
+        "Question: how many times did I fly to Cairo?"
+    )
+
+
+def test_the_recall_planner_prompt_describes_every_op_and_shape() -> None:
+    """The kernel rejects an op it does not know, so the prompt is the whole vocabulary."""
+    prompt = openai_backend._RECALL_PLAN_SYSTEM_PROMPT
+
+    for op in ("similar", "match", "window", "neighbors", "entity"):
+        assert f'"op": "{op}"' in prompt
+    for shape in ("point", "set", "sequence", "entity", "composite"):
+        assert f"- {shape}:" in prompt
+
+
+def test_a_planner_that_replied_with_nothing_reports_an_invalid_response() -> None:
+    """It is reported, not smoothed over: the kernel's own fallback is what keeps `ask` running.
+
+    A backend may also decline by returning None, which the protocol allows; this one answers
+    through the shared JSON path, and an empty completion there is a provider fault like any
+    other -- retried once, then raised.
+    """
+    requests: list[dict[str, object]] = []
+    with (
+        httpx.Client(transport=_answer_policy_transport(requests, "   ")) as client,
+        pytest.raises(ModelError, match="recall plan response was invalid") as failure,
+    ):
+        _model(_sdk_client(client)).plan_recall(
+            "how many?",
+            reference_at=NOW,
+            corpus_digest="empty",
+        )
+
+    assert failure.value.reason == "response_invalid"
+    assert failure.value.stage == "plan"
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error"),
+    [
+        ({"question": "  "}, "question must be non-empty text"),
+        ({"reference_at": NOW.replace(tzinfo=None)}, "reference_at must be a timezone-aware"),
+        ({"corpus_digest": 3}, "corpus_digest must be text"),
+    ],
+    ids=("blank-question", "naive-clock", "digest-not-text"),
+)
+def test_the_recall_planner_rejects_an_unusable_request(
+    arguments: dict[str, object],
+    error: str,
+) -> None:
+    requests: list[dict[str, object]] = []
+    call: dict[str, object] = {
+        "question": "how many?",
+        "reference_at": NOW,
+        "corpus_digest": "empty",
+        **arguments,
+    }
+    with (
+        httpx.Client(transport=_answer_policy_transport(requests, "{}")) as client,
+        pytest.raises(ValidationError, match=error),
+    ):
+        _model(_sdk_client(client)).plan_recall(**call)  # type: ignore[arg-type]
+
+    assert requests == []
+
+
 def test_the_default_answer_policy_sends_the_same_request_as_asking_for_abstention() -> None:
     """`answer_policy` is opt-in: the default path must be byte-identical to what it was."""
     requests: list[dict[str, object]] = []

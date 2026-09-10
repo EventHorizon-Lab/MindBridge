@@ -137,6 +137,7 @@ from mindbridge.models.base import (
     FormationInput,
     GenerationBackend,
     ModelInput,
+    RecallPlanningBackend,
     SpeechAnalysis,
     SpeechBackend,
     StreamingGenerationBackend,
@@ -145,6 +146,7 @@ from mindbridge.models.base import (
     _modalities,
 )
 from mindbridge.plugins import MemoryConfig, MemoryPlugins
+from mindbridge.recall import RecallPlan, fallback_plan, parse_recall_plan
 from mindbridge.types import (
     KIND_MEMORY_TYPES,
     AbstentionReason,
@@ -7300,6 +7302,57 @@ class Memory:
             return tuple(
                 _normalized_vector(vector, self._embedding_dimension) for vector in vectors
             )
+
+    def _recall_plan(self, question: str, *, reference_at: datetime, k: int) -> RecallPlan:
+        """Ask the answerer how to read for this question, or keep today's single search.
+
+        Every way this can go wrong lands on the same fallback -- a backend that cannot plan, a
+        planner that fails, an empty completion, a plan the kernel will not run -- so the cost
+        of a bad planner is one model call, never a different answer. Model output is data: it
+        reaches `parse_recall_plan`, which decides what MindBridge does.
+        """
+        planner = self._answerer
+        if not isinstance(planner, RecallPlanningBackend) or not question.strip():
+            return fallback_plan(question, k=k)
+        model = getattr(planner, "generation_model", None)
+        with self._model_trace(
+            "generation",
+            "plan",
+            model=model if isinstance(model, str) else None,
+            batch_size=1,
+            modalities=(Modality.TEXT,),
+        ):
+            mark_model_requests(1)
+            try:
+                payload = planner.plan_recall(
+                    question,
+                    reference_at=reference_at,
+                    corpus_digest=self._corpus_digest(),
+                )
+            except ModelError:
+                # Planning is not answering. A provider that refused this call has said nothing
+                # about whether it can answer, and the fallback plan is the one `ask` has always
+                # run, so the question continues instead of failing on a hint.
+                return fallback_plan(question, k=k)
+        if payload is None:
+            return fallback_plan(question, k=k)
+        return parse_recall_plan(payload, reference_at=reference_at) or fallback_plan(question, k=k)
+
+    def _corpus_digest(self) -> str:
+        """Describe the active corpus in one line, so a plan cannot ask for what is not there."""
+        digest = self._store.recall_digest()
+        if not digest.records:
+            return "empty"
+        span = (
+            "no dated records"
+            if digest.earliest is None or digest.latest is None
+            else f"{_datetime_text(digest.earliest)} to {_datetime_text(digest.latest)}"
+        )
+        return (
+            f"{digest.records} records; {span}; "
+            f"modalities {', '.join(digest.modalities)}; "
+            f"{digest.named_identities} named identities"
+        )
 
     def _answer_chunks(  # noqa: C901 - streaming and non-streaming validation share one span
         self,
