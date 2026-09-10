@@ -326,7 +326,14 @@ class FaceBackend(Protocol):
 
 @runtime_checkable
 class GenerationBackend(Protocol):
-    """One thread-safe grounded-answer adapter over a provider SDK."""
+    """One thread-safe grounded-answer adapter over a provider SDK.
+
+    Both keyword arguments are defaulted and sent only when they are not their default, so a
+    backend written against the two-argument signature keeps answering. `exhaustive` says the
+    hits are every record a recall program's predicate matched, in time order, rather than a
+    ranking -- the one thing a grounded prompt cannot infer from the hits themselves and gets
+    wrong by describing their order as rank.
+    """
 
     @property
     def generation_capabilities(self) -> frozenset[Modality]: ...
@@ -337,6 +344,7 @@ class GenerationBackend(Protocol):
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> AnswerResult: ...
 
     def close(self) -> None: ...
@@ -352,6 +360,7 @@ class StreamingGenerationBackend(Protocol):
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> Iterator[str]: ...
 
 

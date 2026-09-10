@@ -129,6 +129,8 @@ class _FakeModels:
         self.embed_inputs: list[tuple[ModelInput, ...]] = []
         self.embed_tasks: list[EmbedTask] = []
         self.answer_calls: list[tuple[ModelInput, tuple[SearchHit, ...]]] = []
+        # Whether each answer was told its hits are a matched set in time order, not a ranking.
+        self.exhaustive_calls: list[bool] = []
         self.transcribe_calls: list[tuple[AssetRef, ...]] = []
         # The recall plan this backend replies with, and every planning call it was asked for.
         # None is a backend that plans nothing, which is what most of these tests want.
@@ -184,9 +186,11 @@ class _FakeModels:
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> AnswerResult:
         grounded = tuple(hits)
         self.answer_calls.append((question, grounded))
+        self.exhaustive_calls.append(exhaustive)
         answer = f"Grounded in: {grounded[0].content}" if grounded else "I do not know."
         if self.abstentions:
             self.abstentions -= 1
@@ -825,6 +829,7 @@ def test_memory_traces_end_to_end_stages_and_streaming_ttft(tmp_path: Path) -> N
             hits: Sequence[SearchHit],
             *,
             answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> Iterator[str]:
             del question, hits
             record_model_usage(input_tokens=5, output_tokens=3, total_tokens=8)
@@ -1018,6 +1023,7 @@ def test_empty_stream_is_invalid_model_output(tmp_path: Path, chunks: tuple[str,
             hits: Sequence[SearchHit],
             *,
             answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> Iterator[str]:
             del question, hits
             yield from chunks
@@ -1050,6 +1056,7 @@ def test_stream_ttft_requires_an_actual_model_request(tmp_path: Path) -> None:
             hits: Sequence[SearchHit],
             *,
             answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> Iterator[str]:
             del question, hits
             mark_model_requests(0, token_usage_expected=0)
@@ -1085,6 +1092,7 @@ def test_streaming_answer_reports_only_the_hits_the_stream_used(tmp_path: Path) 
             hits: Sequence[SearchHit],
             *,
             answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> Generator[str, None, tuple[SearchHit, ...]]:
             del question
             yield "grounded"
@@ -1107,6 +1115,7 @@ def test_streaming_answer_preserves_structured_abstention(tmp_path: Path) -> Non
             hits: Sequence[SearchHit],
             *,
             answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> Generator[str, None, AnswerResult]:
             del question
             yield "unknown"
@@ -4818,6 +4827,7 @@ def test_no_hit_ask_routes_media_and_cannot_accept_fabricated_hits(tmp_path: Pat
             hits: Sequence[SearchHit],
             *,
             answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> AnswerResult:
             super().answer(question, hits)
             fabricated = SearchHit(
@@ -4857,6 +4867,7 @@ class _CountingStreamer(_FakeModels):
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> Generator[str, None, tuple[SearchHit, ...]]:
         del question
         for part in ("the red ", "toolbox is ", "on the bench"):
@@ -4992,6 +5003,7 @@ def test_abandoning_ask_stream_closes_the_generation_stream_inside_the_operation
             hits: Sequence[SearchHit],
             *,
             answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> Generator[str, None, tuple[SearchHit, ...]]:
             try:
                 yield from super().stream_answer(question, hits)
@@ -5062,6 +5074,7 @@ def test_ask_returns_only_retrieved_hits_the_answerer_used(tmp_path: Path) -> No
             hits: Sequence[SearchHit],
             *,
             answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> AnswerResult:
             super().answer(question, hits)
             fabricated = SearchHit(
@@ -5099,6 +5112,7 @@ def test_answering_reinforces_only_the_evidence_the_model_cited(tmp_path: Path) 
             hits: Sequence[SearchHit],
             *,
             answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> AnswerResult:
             super().answer(question, hits)
             return AnswerResult(answer="grounded", hits=(hits[0],))
@@ -5151,6 +5165,7 @@ def test_reinforce_on_answer_false_keeps_answering_free_of_side_effects(tmp_path
             hits: Sequence[SearchHit],
             *,
             answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> AnswerResult:
             super().answer(question, hits)
             return AnswerResult(answer="grounded", hits=(hits[0],))
@@ -7016,6 +7031,7 @@ def test_ask_hands_the_caller_chosen_answer_policy_to_the_answerer(tmp_path: Pat
             hits: Sequence[SearchHit],
             *,
             answer_policy: AnswerPolicy = "strict",
+            exhaustive: bool = False,
         ) -> AnswerResult:
             policies.append(answer_policy)
             return super().answer(question, hits, answer_policy=answer_policy)
@@ -7075,6 +7091,7 @@ class _PlannerlessAnswerer:
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> AnswerResult:
         del question, answer_policy
         return AnswerResult(answer="answered", hits=tuple(hits))
@@ -7267,6 +7284,35 @@ def test_a_set_plan_grounds_the_whole_matched_set_in_time_order(tmp_path: Path) 
     assert [hit.content for hit in answered.hits] == ["a red wrench", "a blue wrench"]
     assert "Recall program (set): records containing wrench (2)." in question.text
     assert "every record those reads matched, in time order" in question.text
+
+
+@pytest.mark.parametrize(
+    ("shape", "step", "exhaustive"),
+    [
+        ("set", {"op": "match", "terms": ["wrench"]}, True),
+        ("point", {"op": "similar", "query": "the red wrench", "k": 3}, False),
+    ],
+    ids=("a-matched-set", "a-ranking"),
+)
+def test_the_answerer_is_told_whether_its_evidence_is_a_set_or_a_ranking(
+    tmp_path: Path,
+    shape: str,
+    step: dict[str, object],
+    exhaustive: bool,
+) -> None:
+    """The note says the rows are in time order, so the prompt has to agree with the note.
+
+    A backend cannot see this in the hits: the same `SearchHit` sequence is a ranking on one
+    question and a predicate's whole set on another, and only the plan knows which.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan(shape, step)
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        memory.ask("how many wrenches did I mention?", limit=2)
+
+    assert models.exhaustive_calls == [exhaustive]
 
 
 def test_a_truncated_set_tells_the_reader_it_is_not_a_set(tmp_path: Path) -> None:

@@ -39,7 +39,7 @@ from itertools import zip_longest
 from pathlib import Path
 from threading import Condition, RLock, local
 from time import perf_counter
-from typing import Literal, Protocol, TypeVar, cast, get_args
+from typing import Any, Literal, Protocol, TypeVar, cast, get_args
 
 from opentelemetry import trace
 from opentelemetry.trace import Span, Tracer
@@ -7539,7 +7539,15 @@ class Memory:
         )
         self._persist_transcripts(context.assets)
         with closing(
-            self._answer_chunks(question, routed_hits, answer_policy=context.answer_policy)
+            self._answer_chunks(
+                question,
+                routed_hits,
+                answer_policy=context.answer_policy,
+                # The reader cannot see that these rows are a predicate's whole set in time order
+                # rather than a ranking, and the note above says they are, so the prompt's own
+                # description of their order has to agree with it.
+                exhaustive=program is not None and program.plan.exhaustive,
+            )
         ) as deltas:
             result = yield from deltas
         return result, hits
@@ -7675,6 +7683,7 @@ class Memory:
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> Generator[str, None, AnswerResult]:
         """Yield answer deltas in provider order and return the validated grounded result.
 
@@ -7702,11 +7711,14 @@ class Memory:
             mark_model_requests(1)
             buffered = False
             # The protocols are `runtime_checkable`, so `isinstance` proves the method exists but
-            # not that it takes this keyword. A backend written against the two-argument signature
-            # keeps working as long as the default asks for nothing new.
-            policy: dict[str, AnswerPolicy] = (
+            # not that it takes these keywords. A backend written against the two-argument
+            # signature keeps working as long as the defaults ask for nothing new, so each one is
+            # sent only when the caller or the plan moved it off its default.
+            policy: dict[str, Any] = (
                 {} if answer_policy == "strict" else {"answer_policy": answer_policy}
             )
+            if exhaustive:
+                policy["exhaustive"] = True
             try:
                 if isinstance(self._answerer, StreamingGenerationBackend):
                     started = perf_counter()

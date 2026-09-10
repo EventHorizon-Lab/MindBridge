@@ -101,9 +101,13 @@ _BEST_EFFORT_SYSTEM_PROMPT = (
     "a line of its own before the answer, whatever language the question uses, and never anywhere "
     "else. " + _GROUNDED_EPILOGUE
 )
-_QUALIFIED_EVIDENCE_PROMPT = (
-    " Evidence labels are per-answer record aliases, not facts; their order is rank, "
-    "not chronology. Context valid_from/valid_until bound when a claim is valid, while recorded_at "
+# What the labels are, and then the one thing about them the reader gets wrong: what their order
+# means. A ranking's order is rank, and saying so stops a reader reading a timeline into it. An
+# exhaustive recall program's order is the program's -- the matched records in time order -- and
+# the user message says as much, so claiming rank there contradicts the evidence's own note.
+_EVIDENCE_LABELS = " Evidence labels are per-answer record aliases, not facts; their order is "
+_QUALIFIED_EVIDENCE_BODY = (
+    " Context valid_from/valid_until bound when a claim is valid, while recorded_at "
     "says when it was stored; neither is automatically occurred_at. Derived records sharing a "
     "source are not independent corroboration. A source_label identifies provenance origin, not "
     "automatically supporting evidence. An S label names a source whose content is not supplied; "
@@ -111,6 +115,12 @@ _QUALIFIED_EVIDENCE_PROMPT = (
     "a correction edge, not support. supporting_record_count counts unique cited record IDs, "
     "including omitted records, not independent observations or corroboration. Stored confidence "
     "is an assessment, not truth."
+)
+_QUALIFIED_EVIDENCE_PROMPT = _EVIDENCE_LABELS + "rank, not chronology." + _QUALIFIED_EVIDENCE_BODY
+_EXHAUSTIVE_EVIDENCE_PROMPT = (
+    _EVIDENCE_LABELS
+    + "the recall program's order, which is time order for the matched records."
+    + _QUALIFIED_EVIDENCE_BODY
 )
 _COMPACT_PROVENANCE_PROMPT = (
     " Omitted-source counts and pairwise shared-source counts do not reveal higher-order unions; "
@@ -976,10 +986,16 @@ class OpenAIModels:
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> AnswerResult:
         """Answer only from supplied hits, preserving native media content parts."""
         mark_model_requests(0, token_usage_expected=0)
-        prepared = self._answer_request(question, hits, answer_policy=answer_policy)
+        prepared = self._answer_request(
+            question,
+            hits,
+            answer_policy=answer_policy,
+            exhaustive=exhaustive,
+        )
         if isinstance(prepared, AbstentionReason):
             mark_model_requests(0, token_usage_expected=0)
             return AnswerResult(
@@ -1013,6 +1029,7 @@ class OpenAIModels:
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> Generator[str, None, tuple[SearchHit, ...]]:
         """Yield grounded text deltas while recording first-token and final usage data.
 
@@ -1021,7 +1038,12 @@ class OpenAIModels:
         is what a buffering caller reports.
         """
         mark_model_requests(0, token_usage_expected=0)
-        prepared = self._answer_request(question, hits, answer_policy=answer_policy)
+        prepared = self._answer_request(
+            question,
+            hits,
+            answer_policy=answer_policy,
+            exhaustive=exhaustive,
+        )
         if isinstance(prepared, AbstentionReason):
             mark_model_requests(0, token_usage_expected=0)
             yield UNKNOWN_ANSWER
@@ -1215,6 +1237,7 @@ class OpenAIModels:
         *,
         omission_source_hits: Sequence[SearchHit] | None = None,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]] | AbstentionReason:
         question_input = ModelInput(text=question) if isinstance(question, str) else question
         if not isinstance(question_input, ModelInput):
@@ -1299,6 +1322,7 @@ class OpenAIModels:
                         omitted_media,
                         evidence_payloads,
                         answer_policy=answer_policy,
+                        exhaustive=exhaustive,
                     ),
                 },
                 {"role": "user", "content": content},
@@ -2906,10 +2930,11 @@ def _answer_system_prompt(
     evidence_payloads: Sequence[Mapping[str, object]],
     *,
     answer_policy: AnswerPolicy = "strict",
+    exhaustive: bool = False,
 ) -> str:
     prompt = _GROUNDED_SYSTEM_PROMPT if answer_policy == "strict" else _BEST_EFFORT_SYSTEM_PROMPT
     if any(hit.context is not None for hit in grounded):
-        prompt += _QUALIFIED_EVIDENCE_PROMPT
+        prompt += _EXHAUSTIVE_EVIDENCE_PROMPT if exhaustive else _QUALIFIED_EVIDENCE_PROMPT
     if any(
         isinstance(context := payload.get("context"), Mapping)
         and "sources_not_in_context_count" in context

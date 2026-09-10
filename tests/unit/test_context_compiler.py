@@ -1978,6 +1978,7 @@ class _Answerer:
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> AnswerResult:
         raise AssertionError("compile never generates text")
 

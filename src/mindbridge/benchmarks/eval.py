@@ -965,10 +965,16 @@ class _BorrowedBackend:
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> Iterator[str]:
         return cast(
             Iterator[str],
-            cast(Any, self._backend).stream_answer(question, hits, answer_policy=answer_policy),
+            cast(Any, self._backend).stream_answer(
+                question,
+                hits,
+                answer_policy=answer_policy,
+                exhaustive=exhaustive,
+            ),
         )
 
     def close(self) -> None:
@@ -1062,9 +1068,10 @@ class _BorrowedGenerationBackend(_BorrowedBackend):
         hits: Sequence[SearchHit],
         *,
         answer_policy: AnswerPolicy = "strict",
+        exhaustive: bool = False,
     ) -> AnswerResult:
         return cast(GenerationBackend, self._backend).answer(
-            question, hits, answer_policy=answer_policy
+            question, hits, answer_policy=answer_policy, exhaustive=exhaustive
         )
 
 

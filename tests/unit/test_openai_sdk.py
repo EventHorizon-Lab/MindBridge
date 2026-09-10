@@ -4517,6 +4517,55 @@ def test_the_default_answer_policy_sends_the_same_request_as_asking_for_abstenti
     ) in openai_backend._GROUNDED_SYSTEM_PROMPT
 
 
+@pytest.mark.parametrize(
+    ("exhaustive", "expected", "refused"),
+    [
+        (False, "their order is rank, not chronology.", "recall program's order"),
+        (
+            True,
+            "their order is the recall program's order, which is time order for the matched "
+            "records.",
+            "order is rank",
+        ),
+    ],
+    ids=("a-ranking", "a-recall-program"),
+)
+def test_the_prompt_describes_the_evidence_order_the_caller_actually_supplied(
+    exhaustive: bool,
+    expected: str,
+    refused: str,
+) -> None:
+    """An exhaustive recall program hands over matched records in time order, not a ranking.
+
+    The user message says so in as many words, so a system prompt calling that order "rank, not
+    chronology" contradicts the evidence's own note about itself -- on exactly the question shape
+    whose answer depends on reading the set as a timeline.
+    """
+    requests: list[dict[str, object]] = []
+    hit = SearchHit(
+        id="memory_1",
+        content="the toolbox is blue",
+        score=0.0,
+        created_at=NOW,
+        context=MemoryContext(
+            kind=MemoryKind.EVENT,
+            basis=EvidenceBasis.OBSERVATION,
+            confidence=0.9,
+            valid_from=None,
+            valid_until=None,
+            recorded_at=NOW,
+        ),
+    )
+    with httpx.Client(transport=_answer_policy_transport(requests, "Blue.")) as client:
+        _model(_sdk_client(client)).answer("What colour?", (hit,), exhaustive=exhaustive)
+
+    system = cast(list[dict[str, str]], requests[0]["messages"])[0]["content"]
+    assert expected in system
+    assert refused not in system
+    # Everything else the labels need said about them is one body, shared by both orders.
+    assert "supporting_record_count counts unique cited record IDs" in system
+
+
 def test_both_policies_ask_for_a_whole_answer_in_the_shortest_complete_form() -> None:
     """Answer shaping is not a policy: a refusal-capable reader shapes its answers the same way.
 

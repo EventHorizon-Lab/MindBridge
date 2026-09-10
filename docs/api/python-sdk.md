@@ -1165,6 +1165,7 @@ GenerationBackend.answer(
     hits: Sequence[SearchHit],
     *,
     answer_policy: AnswerPolicy = "strict",
+    exhaustive: bool = False,
 ) -> AnswerResult
 
 StreamingGenerationBackend.stream_answer(
@@ -1172,6 +1173,7 @@ StreamingGenerationBackend.stream_answer(
     hits: Sequence[SearchHit],
     *,
     answer_policy: AnswerPolicy = "strict",
+    exhaustive: bool = False,
 ) -> Iterator[str]
 
 TranscriptionBackend.transcribe(
@@ -1231,10 +1233,13 @@ like a former it proposes and never writes storage. An `IDENTIFY` proposal carri
 `IdentityClaim` rather than a `FormationProposal`: the backend names the identity and cites the
 evidence, and the kernel builds the typed assertion.
 
-`answer_policy` is keyword-only and defaulted on both generation protocols, and MindBridge sends
-it only when a caller asked for something other than `"strict"`. A backend written against the
-earlier two-argument signature therefore keeps answering; accept the argument to support
-`"best_effort"`, which otherwise fails the call with `ModelError`.
+`answer_policy` and `exhaustive` are keyword-only and defaulted on both generation protocols, and
+MindBridge sends each one only when it is not its default. A backend written against the earlier
+two-argument signature therefore keeps answering; accept `answer_policy` to support
+`"best_effort"`, which otherwise fails the call with `ModelError`. `exhaustive` is true when a
+recall program produced the hits as every record its predicate matched, in time order, rather
+than as a ranking -- the bundled adapter uses it to describe the evidence order to the reader,
+which is the one thing about the hits a prompt cannot infer from the hits.
 
 The bundled OpenAI former receives compact observation aliases, enriched content and assets, plus
 the observation basis, confidence, explicit validity bounds, and spatial frame/anchor. It does not
@@ -1395,12 +1400,14 @@ answer(
     hits: Sequence[SearchHit],
     *,
     answer_policy: AnswerPolicy = "strict",
+    exhaustive: bool = False,
 ) -> AnswerResult
 stream_answer(
     question: ModelInput | str,
     hits: Sequence[SearchHit],
     *,
     answer_policy: AnswerPolicy = "strict",
+    exhaustive: bool = False,
 ) -> Generator[str, None, tuple[SearchHit, ...]]
 transcribe(assets: Sequence[AssetRef]) -> tuple[str, ...]
 close() -> None
