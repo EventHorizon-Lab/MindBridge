@@ -45,7 +45,7 @@ from mindbridge.models.base import (
     SpeechAnalysis,
     SpeechTurn,
 )
-from mindbridge.types import AssetRef, Blob, Modality, SpeakerSegment
+from mindbridge.types import AssetRef, Blob, MemoryIntent, Modality, SpeakerSegment
 
 _ALL_INPUT_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
 
@@ -1211,9 +1211,11 @@ def test_a_described_clip_is_shown_the_transcript_under_the_indexed_labels(tmp_p
     """A durable fact about a person is in the words, so the words travel with the stills.
 
     The labels the describer is shown have to be the labels the document prints, or a fact
-    naming `speaker_1` names nobody the reader can find.
+    naming `speaker_1` names nobody the reader can find. This clip's facts state no name, so the
+    document still prints the labels it was described under; a clip that does state one is
+    reindexed under that name, which is `test_a_stated_name_carries_to_every_later_clip`.
     """
-    describer = _StructuredDescriber()
+    describer = _StructuredDescriber("Shown: two people at a kitchen table", "Fact: nobody cooks")
     with Memory(
         tmp_path,
         embedder=_Embedder(),
@@ -1287,3 +1289,98 @@ def test_a_speaker_label_shown_to_the_describer_is_the_label_the_index_prints() 
 
     assert labels == {"identity_second": "speaker_1", "identity_first": "speaker_2"}
     assert projected == "speaker_1: hello\nspeaker_2: hi\nspeaker_1: again"
+
+
+def _speaker_identity(memory: Memory, memory_id: str, label: str) -> str:
+    """Resolve the identity behind one `speaker_N` label of a stored memory's own clip."""
+    segments = memory.speech(memory_id)
+    labels = _speaker_labels(segments)
+    return next(identity for identity, alias in labels.items() if alias == label)
+
+
+def test_a_stated_name_carries_to_every_later_clip_of_the_same_voice(tmp_path: Path) -> None:
+    """The lever the M3-Agent ablations measure: stable identity across clips, worth -11.2 to lose.
+
+    A recognizer mints an unstable `identity_*` per run, and the index prints `speaker_1`. Once
+    the dialogue states the name, the person is keyed under it everywhere -- including clips that
+    say nothing about who is talking, which is where the retrieval question is actually asked.
+    """
+    describer = _StructuredDescriber(
+        "Shown: two people at a kitchen table",
+        "Fact: speaker_1 is called Lily",
+    )
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        transcriber=_Diarised(),
+        vision_describer=describer,
+    ) as memory:
+        named = memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
+        identity_id = _speaker_identity(memory, named.id, "speaker_1")
+        assert memory.identity(identity_id) is not None
+        assert memory.identity(identity_id).name == "Lily"  # type: ignore[union-attr]
+
+        # A later clip of the same voice, whose own facts say nothing about a name.
+        describer.lines = ("Shown: the same table, later",)
+        anonymous = memory.add(Blob(b"kitchen-clip-two", "video/mp4", "later.mp4"))
+        asset_id = anonymous.assets[0].id
+        projected = _speech_retrieval_text(
+            _section(memory.get(anonymous.id).content, f"[speech identities:{asset_id}]"),
+            asset_id,
+        )
+
+        assert projected is not None
+        assert projected.startswith("Lily: my name is Lily")
+        assert "speaker_1" not in projected
+        # And the naming is an ordinary auditable operation, not a hidden write.
+        assert [record.operation.intent for record in memory.operations()] == [
+            MemoryIntent.IDENTIFY
+        ]
+
+
+def test_a_stated_name_never_replaces_the_one_a_host_registered(tmp_path: Path) -> None:
+    """A name is what the index keys a person under, so a mishearing must not propagate.
+
+    The fact came from a model reading a transcript. Letting it overwrite a standing name would
+    rewrite every document that person appears in, from one wrong word.
+    """
+    describer = _StructuredDescriber("Shown: a kitchen table")
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        transcriber=_Diarised(),
+        vision_describer=describer,
+    ) as memory:
+        first = memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
+        identity_id = _speaker_identity(memory, first.id, "speaker_1")
+        memory.register_identity(identity_id, "Mei")
+
+        describer.lines = ("Shown: a kitchen table", "Fact: speaker_1 is called Lily")
+        memory.add(Blob(b"kitchen-clip-two", "video/mp4", "later.mp4"))
+
+        assert memory.identity(identity_id).name == "Mei"  # type: ignore[union-attr]
+        # Re-stating the name a person already carries is a no-op, not a second assertion.
+        describer.lines = ("Shown: a kitchen table", "Fact: speaker_1 is called Mei")
+        memory.add(Blob(b"kitchen-clip-three", "video/mp4", "later-still.mp4"))
+        assert memory.identity(identity_id).name == "Mei"  # type: ignore[union-attr]
+        assert [record.operation.intent for record in memory.operations()] == [
+            MemoryIntent.IDENTIFY
+        ]
+
+
+def test_a_stated_name_binds_nothing_without_a_speech_backend(tmp_path: Path) -> None:
+    """No recognizer, no labels, nobody to name: the fact stays indexed text and nothing else.
+
+    Route by capability. A label is only resolvable through the diarisation that produced it, so
+    a composition with no speech backend must not invent a person to hang the name on.
+    """
+    describer = _StructuredDescriber(
+        "Shown: two people at a kitchen table",
+        "Fact: speaker_1 is called Lily",
+    )
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        record = memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
+        stored = memory.get(record.id).content
+
+        assert _section(stored, f"[facts:{record.assets[0].id}]") == "speaker_1 is called Lily"
+        assert memory.operations() == ()

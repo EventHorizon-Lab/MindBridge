@@ -59,6 +59,8 @@ from mindbridge._telemetry import (
     IDENTITY_IDENTITIES,
     IDENTITY_LINKED,
     IDENTITY_MATCHED,
+    IDENTITY_NAMES_BOUND,
+    IDENTITY_NAMES_REFUSED,
     IDENTITY_OBSERVATIONS,
     MODEL_MODULE,
     MODEL_TTFT,
@@ -455,6 +457,14 @@ _MAX_TEXT_CHARACTERS = 65_536
 # The one line prefix the describer's durable statements arrive under, inside the same string as
 # the visible description. See `_split_description`.
 _FACT_LINE_PREFIX = "Fact:"
+# The one fact shape that is not just indexed text but an assertion about a person: it binds a
+# diarised speaker label to a name the dialogue itself stated. Tolerant of how the label is
+# spelled, because the label is the model's echo of a prompt, and strict about the sentence,
+# because anything looser would rename people out of ordinary description.
+_NAME_BINDING = re.compile(
+    r"speakers?[ _-]?(?P<index>\d{1,3})\s+is\s+called\s+(?P<name>[^.;]+?)\s*[.;]?",
+    re.IGNORECASE,
+)
 _MAX_METADATA_BYTES = 262_144
 _TEXT_KEY_CHARACTERS = 2_048
 _TEXT_KEY_OVERLAP = 256
@@ -669,6 +679,10 @@ class _OperationAssets:
     speech_rollbacks: builtins.list[SpeechRollback]
     face_observations: dict[str, tuple[FaceObservation, ...]]
     descriptions: dict[str, str]
+    # Identity ID -> the name a caption's facts stated for that diarised speaker. Staged rather
+    # than applied on the spot: the naming assertion reindexes every memory that mentions the
+    # person, and this write's own memory does not exist until it commits.
+    speaker_names: dict[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -4697,6 +4711,7 @@ class Memory:
                     tuple(memory.content for memory in missing),
                     operation,
                 )
+                self._stage_speaker_names(described, operation)
                 missing = [
                     replace(
                         memory,
@@ -4810,6 +4825,10 @@ class Memory:
         rows_by_id = {memory.memory_id: memory for memory in authoritative}
         if rows_by_id.keys() != unique.keys():
             raise StorageError("written memories could not be read from SQLite", reason="io_failed")
+        # After the commit, and outside the speech-index guard: the naming assertion reindexes
+        # every memory that mentions the person, and this write's own memory has to be one of
+        # them -- `speaker_memory_ids` joins through `memory_assets`, which exists only now.
+        self._bind_speaker_names(operation)
         return tuple(self._memory_record(rows_by_id[memory.memory_id]) for memory in prepared)
 
     def _complete_formation(self, records: Sequence[MemoryRecord]) -> None:
@@ -4924,6 +4943,7 @@ class Memory:
             # Same order as `_add_prepared`: derived visual text has to exist before the fallback
             # guard decides whether this embedder can take the media at all.
             described = self._pending_visual_descriptions((memory.content,), operation)
+            self._stage_speaker_names(described, operation)
             memory = replace(
                 memory,
                 content=self._with_visual_descriptions(memory.content, described),
@@ -4990,6 +5010,9 @@ class Memory:
                 if operation.speech_updates:
                     self._persist_transcripts(operation)
                 self._persist_descriptions(operation)
+        # Same order as `_add_prepared`: after the commit, so the row this write just settled is
+        # one of the memories the naming assertion reindexes.
+        self._bind_speaker_names(operation)
         return enriched if committed else None
 
     def _form_sources(
@@ -5414,6 +5437,86 @@ class Memory:
         fresh = dict(zip((asset.asset_id for asset in pending), descriptions, strict=True))
         operation.descriptions.update(fresh)
         return {**cached, **fresh}
+
+    def _stage_speaker_names(
+        self,
+        descriptions: Mapping[str, str],
+        operation: _OperationAssets,
+    ) -> None:
+        """Collect the names a caption's facts stated for this write's own diarised speakers.
+
+        A stated name is the one distillation that is more than indexed text: it re-keys the
+        person in every document that mentions them, now and for every later clip that resolves
+        to the same voice, which is what carries an identity across clips at all.
+
+        Only a label this asset's own recognizer produced can be resolved, so a fact naming a
+        speaker who is not in this clip is dropped rather than guessed at. Cached descriptions
+        are read too: re-ingesting a corpus must reach the same named store as the first ingest,
+        and re-asserting a standing name is a no-op.
+        """
+        for asset_id, description in descriptions.items():
+            segments = operation.speech_segments.get(asset_id)
+            if not segments:
+                continue
+            identities = {label: identity for identity, label in _speaker_labels(segments).items()}
+            for fact in _split_description(description)[1].splitlines():
+                match = _NAME_BINDING.fullmatch(fact.strip())
+                if match is None:
+                    continue
+                identity_id = identities.get(f"speaker_{int(match['index'])}")
+                if identity_id is not None:
+                    operation.speaker_names.setdefault(identity_id, match["name"].strip())
+
+    def _bind_speaker_names(self, operation: _OperationAssets) -> None:
+        """Register the staged names, now that the memory carrying the voices is readable.
+
+        `register_identity` in all but name -- it lands the same `IDENTIFY` assertion through the
+        same commit, so it is auditable through `operations()` and reversible through
+        `rollback()` -- but it resolves and checks the person itself rather than raising on one
+        who has since been merged away, and it holds the existing operation instead of nesting a
+        second one inside this write.
+
+        A different standing name is never overwritten. The name came from a model reading a
+        transcript, and one mishearing would rewrite every document that person appears in; the
+        host's own `register_identity` stays the only thing that can replace a name. Nothing here
+        links identities either: `identity_link_min_assets` governs who is the same person, and a
+        name is not evidence about that.
+        """
+        bindings = dict(operation.speaker_names)
+        operation.speaker_names.clear()
+        bound = 0
+        refused = 0
+        for identity_id, name in bindings.items():
+            with _translate_storage_errors("read identity profile"):
+                profile = self._store.identity_profile(identity_id)
+            try:
+                proposed = None if profile is None else _identity_name(name)
+            except ValidationError:
+                proposed = None
+            if profile is None or proposed is None or profile.name == proposed:
+                continue
+            if profile.name is not None:
+                refused += 1
+                _LOGGER.warning(
+                    "a distilled fact called identity %s %r, which is already called %r; "
+                    "keeping the registered name",
+                    profile.identity_id,
+                    proposed,
+                    profile.name,
+                )
+                continue
+            with self._formation_lock, self._write_lock:
+                self._assert_identity_name(
+                    profile.identity_id,
+                    proposed,
+                    relationship=profile.relationship,
+                    operation=operation,
+                )
+            bound += 1
+        if bound or refused:
+            with self._trace("mindbridge.identity.names", kind="stage") as span:
+                span.set_attribute(IDENTITY_NAMES_BOUND, bound)
+                span.set_attribute(IDENTITY_NAMES_REFUSED, refused)
 
     def _stage_stream_description(
         self,
@@ -7868,6 +7971,7 @@ class Memory:
             speech_rollbacks=[],
             face_observations={},
             descriptions={},
+            speaker_names={},
         )
         try:
             yield assets

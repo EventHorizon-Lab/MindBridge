@@ -62,6 +62,12 @@ IDENTITY_CACHED = "mindbridge.identity.cached"
 IDENTITY_EVIDENCE_ASSETS = "mindbridge.identity.evidence_assets"
 IDENTITY_EVIDENCE_REQUIRED = "mindbridge.identity.evidence_required"
 IDENTITY_LINKED = "mindbridge.identity.linked"
+# Names a distillation read out of a clip's dialogue: how many were registered against a person
+# who had none, and how many were refused because that person already had a different one. The
+# refusals are the interesting half -- a name is what the index keys a person under, so a wrong
+# one propagates to every clip they appear in and has to be countable rather than only logged.
+IDENTITY_NAMES_BOUND = "mindbridge.identity.names_bound"
+IDENTITY_NAMES_REFUSED = "mindbridge.identity.names_refused"
 
 TOKEN_MODALITIES = ("text", "image", "video", "audio", "unattributed")
 
