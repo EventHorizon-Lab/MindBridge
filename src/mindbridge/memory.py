@@ -5388,7 +5388,10 @@ class Memory:
                 for content in contents
                 for asset in content.assets
                 if Modality(asset.modality) in self._vision_capabilities
-                and f"[visual description:{asset.asset_id}]\n" not in content.text
+                # Either derived section standing in the document means this asset is described:
+                # a caption that was all facts leaves no description marker behind, and asking
+                # for it again would buy the same text twice and append a duplicate section.
+                and not _has_stream_description(content.text, (asset,))
             }.values()
         )
         if not assets:
@@ -5595,7 +5598,7 @@ class Memory:
             section
             for asset in prepared.assets
             if asset.asset_id in descriptions
-            and f"[visual description:{asset.asset_id}]\n" not in prepared.text
+            and not _has_stream_description(prepared.text, (asset,))
             for section in _description_sections(asset.asset_id, descriptions[asset.asset_id])
         )
         if not sections:

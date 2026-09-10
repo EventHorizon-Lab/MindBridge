@@ -1476,3 +1476,26 @@ def test_a_sustained_refusal_gives_up_after_a_bounded_number_of_waits(
 
         assert describer.calls == 3, "one attempt per wait, plus the last one"
         assert memory.get(record.id).content == ""
+
+
+def test_a_caption_that_is_only_facts_is_not_described_or_appended_twice(tmp_path: Path) -> None:
+    """A facts-only caption leaves no description marker, which used to mean "not yet described".
+
+    Both derived sections have to count as evidence that the asset was described, or a second
+    write citing the same picture pays for the same text again and appends the facts twice.
+    """
+    describer = _StructuredDescriber("Fact: the yoga mat lives in the storage room")
+    picture = Blob(b"storage-room", "image/png", "storage.png")
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        first = memory.add(("morning note", picture))
+        stored = memory.get(first.id).content
+
+        assert "[visual description:" not in stored
+        assert stored.count("[facts:") == 1
+        assert describer.calls == 1
+
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as reopened:
+        again = reopened.add(("evening note", picture))
+
+        assert describer.calls == 1, "the same bytes were described again"
+        assert reopened.get(again.id).content.count("[facts:") == 1
