@@ -4,6 +4,7 @@ import asyncio
 import errno
 import inspect
 import json
+import logging
 import os
 import re
 import shutil
@@ -7245,6 +7246,59 @@ def test_recall_planning_off_asks_nobody_and_grounds_what_the_ranking_earned(
     assert question.text.startswith("which wrench is red?\n\nReference time for relative dates: ")
     assert question.text.count("\n\n") == 1
     assert "Recall program" not in question.text
+
+
+def test_planning_with_an_answerer_that_cannot_plan_is_said_once_and_keeps_the_fallback(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every planning failure resolves to the fallback plan, so a wiring bug reads exactly like a
+    planner that chose nothing. An answerer without `plan_recall` is not a planner failing but a
+    configuration lying, and that is said once, at wiring, rather than once per question."""
+
+    class Unplanning:
+        generation_capabilities = frozenset({Modality.TEXT})
+
+        def answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+            *,
+            answer_policy: str = "strict",
+            exhaustive: bool = False,
+        ) -> AnswerResult:
+            del question, answer_policy, exhaustive
+            return AnswerResult("red", tuple(hits))
+
+        def close(self) -> None:
+            return None
+
+    with (
+        caplog.at_level(logging.WARNING, logger="mindbridge.memory"),
+        Memory(
+            tmp_path / "unplanned",
+            embedder=_FakeEmbedder(),
+            answerer=Unplanning(),
+            recall_planning=True,
+        ) as memory,
+    ):
+        _dated_corpus(memory)
+        first = memory.ask("which wrench is red?", limit=2)
+        second = memory.ask("which wrench is blue?", limit=2)
+
+    assert [message for message in caplog.messages if "cannot plan" in message] == [
+        "recall_planning is on but the answerer cannot plan; every question runs the fallback plan"
+    ]
+    assert (first.answer, second.answer) == ("red", "red")
+
+    caplog.clear()
+    with (
+        caplog.at_level(logging.WARNING, logger="mindbridge.memory"),
+        _memory(tmp_path / "planned", recall_planning=True) as memory,
+    ):
+        _dated_corpus(memory)
+        memory.ask("which wrench is red?", limit=2)
+    assert not [message for message in caplog.messages if "cannot plan" in message]
 
 
 def test_a_point_plan_grounds_exactly_as_the_unplanned_path_does(tmp_path: Path) -> None:

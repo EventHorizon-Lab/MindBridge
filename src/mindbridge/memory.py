@@ -956,6 +956,18 @@ class Memory:
         self._face_analyzer = face_analyzer
         self._former = former
         self._consolidator = consolidator
+        if (
+            self._recall_planning
+            and answerer is not None
+            and not isinstance(answerer, RecallPlanningBackend)
+        ):
+            # Every planning failure resolves to the fallback plan on purpose, so an answerer that
+            # never declared `plan_recall` -- a wiring bug, not a planner failing -- would read
+            # exactly like a planner choosing nothing. Said once, here, not once per question.
+            _LOGGER.warning(
+                "recall_planning is on but the answerer cannot plan; every question runs the "
+                "fallback plan"
+            )
 
         try:
             (
