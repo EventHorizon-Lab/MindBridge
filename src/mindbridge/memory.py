@@ -7517,16 +7517,23 @@ class Memory:
         return result, hits
 
     def _recall_program(self, context: _RecallContext, *, attempted: str) -> RecallResult | None:
-        """Plan and run this question's reads, or None when planning is off."""
+        """Plan and run this question's reads, or None when planning is off.
+
+        Inside its own stage: the `mindbridge.retrieve` leg closes on the ranked hits, and the
+        planning call and the exhaustive reads happen after it -- a model call and a set of table
+        scans that a trace without this span attributes to nothing, leaving the operation's own
+        duration as the only evidence they ran at all.
+        """
         if not self._recall_planning:
             return None
-        plan = self._recall_plan(
-            context.prepared.text,
-            reference_at=context.reference,
-            k=context.limit,
-            attempted=attempted,
-        )
-        return execute(plan, _RecallReads(self, context))
+        with self._trace("mindbridge.recall", kind="stage"):
+            plan = self._recall_plan(
+                context.prepared.text,
+                reference_at=context.reference,
+                k=context.limit,
+                attempted=attempted,
+            )
+            return execute(plan, _RecallReads(self, context))
 
     def _grounded_recall(
         self,
@@ -11290,21 +11297,24 @@ def _with_recall_note(question: ModelInput, note: str | None) -> ModelInput:
 def _attempt_note(hits: Sequence[SearchHit], result: AnswerResult) -> str:
     """Describe what one round read and what it could not answer, for the next plan.
 
-    Labels and event times only: the planner decides which reads to make next, and handing it
-    the evidence text would make it summarize records instead of planning over them.
+    How much was read, over what dates, and why it was not enough. No evidence text: the planner
+    decides which reads to make next, and handing it records would make it summarize them
+    instead. No labels either -- the answer prompt numbers only the qualified subset of the
+    evidence, so an `E3` here would name a different record than the one the reader saw, or none.
     """
-    read = ", ".join(
-        f"E{index}"
-        + ("" if hit.occurred_at is None else f" at {hit.occurred_at.date().isoformat()}")
-        for index, hit in enumerate(hits, start=1)
+    dates = sorted(
+        hit.occurred_at.date().isoformat() for hit in hits if hit.occurred_at is not None
     )
+    span = ""
+    if dates:
+        span = f" dated {dates[0]}" + ("" if dates[0] == dates[-1] else f" to {dates[-1]}")
     reason = (
         "no usable evidence"
         if result.abstention_reason is None
         else (result.abstention_reason.value)
     )
     return (
-        f"read {len(hits)} records ({read or 'none'}) and reported {reason}; "
+        f"read {len(hits)} records{span} and reported {reason}; "
         "the answer was a low-confidence guess"
     )
 

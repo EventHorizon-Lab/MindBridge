@@ -7492,7 +7492,10 @@ def test_a_thin_best_effort_answer_buys_one_replan_round(tmp_path: Path) -> None
     assert len(models.plan_calls) == 2
     assert models.plan_calls[0][3] == ""
     assert "reported insufficient_evidence" in models.plan_calls[1][3]
-    assert "E1 at 2024-09-01, E2 at 2024-09-02" in models.plan_calls[1][3]
+    # A count and a date span, not labels: `E`-numbers here would not be the reader's, which are
+    # assigned to the qualified subset of the evidence and to nothing when none of it qualifies.
+    assert "read 2 records dated 2024-09-01 to 2024-09-02" in models.plan_calls[1][3]
+    assert "E1" not in models.plan_calls[1][3]
     assert len(models.answer_calls) == 2
     assert answered.abstained is False
 
@@ -7547,6 +7550,42 @@ def test_a_streaming_caller_sees_both_rounds_and_one_terminal_result(tmp_path: P
     assert len(finals) == 1
     assert finals[0].answer == deltas[1]
     assert finals[0].abstained is False
+
+
+def test_planning_and_the_reads_it_names_happen_inside_a_span(tmp_path: Path) -> None:
+    """The `mindbridge.retrieve` leg closes on the ranked hits; these run after it.
+
+    A planning call and a set of exhaustive table scans with no span of their own are latency
+    the trace cannot attribute: the operation gets longer and nothing says which leg grew.
+    """
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
+    with Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        recall_planning=True,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        _dated_corpus(memory)
+        memory.ask("how many wrenches?")
+    provider.shutdown()
+
+    spans = exporter.get_finished_spans()
+    recall = next(span for span in spans if span.name == "mindbridge.recall")
+    ask = next(span for span in spans if span.name == "mindbridge.ask")
+    assert recall.parent is not None
+    assert recall.parent.span_id == ask.context.span_id
+    planned = next(
+        span
+        for span in spans
+        if span.name == "mindbridge.model.generation" and span.parent is not None
+    )
+    assert planned.parent is not None
+    assert planned.parent.span_id == recall.context.span_id
 
 
 @pytest.mark.parametrize(
