@@ -19,7 +19,14 @@ from mcp.shared._otel import extract_trace_context
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from opentelemetry import trace as otel_trace
 from opentelemetry.trace import SpanKind, StatusCode, Tracer
-from pydantic import AwareDatetime, BaseModel, Field, JsonValue, StringConstraints
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StringConstraints,
+)
 
 from mindbridge import Memory
 from mindbridge.api.content import (
@@ -31,31 +38,21 @@ from mindbridge.api.content import (
 )
 from mindbridge.api.deliberation import deliberation_lifespan
 from mindbridge.api.messages import error_message
-from mindbridge.exceptions import MindBridgeError, ValidationError
+from mindbridge.exceptions import MindBridgeError
 from mindbridge.types import (
     AbstentionReason,
-    AffectCue,
-    AssetRef,
     ContextBudget,
-    ContextBundle,
-    ContextConflict,
-    ContextExcerpt,
-    ContextUnknown,
     ContextUnknownKind,
     FaceObservation,
     IdentityErasure,
     IdentityProfile,
     MemoryCapabilities,
     MemoryContext,
-    MemoryRecord,
     MemoryType,
     Modality,
-    NamedActor,
     ObservationContext,
-    ProvisionalActor,
     RetrievalScope,
     RetrievalTrace,
-    SearchHit,
     SpeakerSegment,
 )
 
@@ -223,7 +220,18 @@ _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
 
-class AssetResult(BaseModel):
+class _ToolResult(BaseModel):
+    """Every tool result reads the SDK value objects directly.
+
+    `from_attributes` is what keeps this file from carrying a hand-written copy of each dataclass:
+    a field added to `MemoryRecord` reaches the tool schema without a converter to edit, which is
+    the same thing `api.app._ResponseModel` does for REST.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AssetResult(_ToolResult):
     id: str
     modality: Modality
     media_type: str
@@ -232,7 +240,7 @@ class AssetResult(BaseModel):
     name: str | None = None
 
 
-class MemoryResult(BaseModel):
+class MemoryResult(_ToolResult):
     id: str
     content: str
     modality: Modality
@@ -262,25 +270,25 @@ class AffectCueResult(SearchHitResult):
     event_ids: tuple[str, ...] = ()
 
 
-class PageResult(BaseModel):
+class PageResult(_ToolResult):
     items: tuple[MemoryResult, ...]
     next_cursor: str | None = None
 
 
-class SearchResult(BaseModel):
+class SearchResult(_ToolResult):
     hits: tuple[SearchHitResult, ...]
     # Null unless the call asked for it, so the default result keeps the shape agents already read.
     trace: RetrievalTrace | None = None
 
 
-class AnswerResponse(BaseModel):
+class AnswerResponse(_ToolResult):
     answer: str
     hits: tuple[SearchHitResult, ...]
     abstained: bool
     abstention_reason: AbstentionReason | None
 
 
-class DeleteResult(BaseModel):
+class DeleteResult(_ToolResult):
     deleted: bool
 
 
@@ -289,35 +297,35 @@ class DeleteResult(BaseModel):
 # `forget_identity` wraps rather than returning `IdentityErasure` directly because the MCP SDK
 # cannot build a schema for a slotted dataclass as a top-level return type: it reads the slot
 # descriptors as defaults, rejects them, and silently publishes no output schema at all.
-class SpeechResult(BaseModel):
+class SpeechResult(_ToolResult):
     segments: tuple[SpeakerSegment, ...]
 
 
-class FacesResult(BaseModel):
+class FacesResult(_ToolResult):
     observations: tuple[FaceObservation, ...]
 
 
-class IdentityResult(BaseModel):
+class IdentityResult(_ToolResult):
     identity: IdentityProfile | None
 
 
-class RegisterResult(BaseModel):
+class RegisterResult(_ToolResult):
     registered: bool
 
 
-class UnlinkResult(BaseModel):
+class UnlinkResult(_ToolResult):
     restored_identity_id: str | None
 
 
-class ForgetResult(BaseModel):
+class ForgetResult(_ToolResult):
     erasure: IdentityErasure
 
 
-class ReinforceResult(BaseModel):
+class ReinforceResult(_ToolResult):
     reinforced: int
 
 
-class ContextBudgetResult(BaseModel):
+class ContextBudgetResult(_ToolResult):
     max_chars: int
     max_items: int
     max_media_items: int | None
@@ -327,7 +335,7 @@ class ContextBudgetResult(BaseModel):
     max_latency_ms: int | None
 
 
-class ContextConflictResult(BaseModel):
+class ContextConflictResult(_ToolResult):
     lineage_id: str
     subject: str | None
     predicate: str | None
@@ -335,14 +343,14 @@ class ContextConflictResult(BaseModel):
     memory_ids: tuple[str, ...]
 
 
-class ProvisionalActorResult(BaseModel):
+class ProvisionalActorResult(_ToolResult):
     """A recognized person in the evidence whom no visible naming assertion names."""
 
     identity_id: str
     memory_ids: tuple[str, ...]
 
 
-class NamedActorResult(BaseModel):
+class NamedActorResult(_ToolResult):
     """A person a currently visible naming assertion names, reached through other evidence."""
 
     identity_id: str
@@ -351,12 +359,12 @@ class NamedActorResult(BaseModel):
     naming_assertion_id: str | None
 
 
-class ContextUnknownResult(BaseModel):
+class ContextUnknownResult(_ToolResult):
     kind: ContextUnknownKind
     detail: str
 
 
-class TextSpanPieceResult(BaseModel):
+class TextSpanPieceResult(_ToolResult):
     role: Literal["context", "body"]
     start_codepoint: int
     end_codepoint: int
@@ -364,14 +372,14 @@ class TextSpanPieceResult(BaseModel):
     sha256: str
 
 
-class TextSpanSelectorResult(BaseModel):
+class TextSpanSelectorResult(_ToolResult):
     parent_content_sha256: str
     embedding_input_sha256: str
     recipe_version: str
     pieces: tuple[TextSpanPieceResult, ...]
 
 
-class ContextExcerptResult(BaseModel):
+class ContextExcerptResult(_ToolResult):
     source_memory_id: str
     matched_index_id: str
     content: str
@@ -385,7 +393,7 @@ class ContextExcerptResult(BaseModel):
     place_id: str | None
 
 
-class ContextBundleResult(BaseModel):
+class ContextBundleResult(_ToolResult):
     goal: str
     reference_at: AwareDatetime
     budget: ContextBudgetResult
@@ -563,7 +571,7 @@ def build_mcp_server(
                 occurred_until=occurred_until,
                 scope=scope,
             )
-            return SearchResult(hits=tuple(_search_hit_result(hit) for hit in hits))
+            return SearchResult.model_validate({"hits": hits})
         traced = memory.search_with_trace(
             content,
             limit=limit,
@@ -573,10 +581,7 @@ def build_mcp_server(
             occurred_until=occurred_until,
             scope=scope,
         )
-        return SearchResult(
-            hits=tuple(_search_hit_result(hit) for hit in traced.hits),
-            trace=traced.trace,
-        )
+        return SearchResult.model_validate({"hits": traced.hits, "trace": traced.trace})
 
     @server.tool(annotations=_NON_IDEMPOTENT_WRITE)
     @_stable_errors
@@ -628,12 +633,7 @@ def build_mcp_server(
             scope=scope,
             link_identities=embodied_operations,
         )
-        return AnswerResponse(
-            answer=result.answer,
-            hits=tuple(_search_hit_result(hit) for hit in result.hits),
-            abstained=result.abstained,
-            abstention_reason=result.abstention_reason,
-        )
+        return AnswerResponse.model_validate(result)
 
     # The same annotation `search_memories` carries, because it is the same side effect: the
     # shared retrieval path may cache a transcript for spoken query media. Compiling stores no
@@ -677,14 +677,14 @@ def build_mcp_server(
         transcript for spoken query media -- a cache of your own input, never a new memory --
         which is why it is not annotated read-only.
         """
-        return _bundle_result(
+        return ContextBundleResult.model_validate(
             memory.compile(
                 content_input(goal),
                 budget=context_budget(budget),
                 reference_at=reference_at,
                 scope=scope,
                 allow_partial_sources=allow_partial_sources,
-            )
+            ).document()
         )
 
     @server.tool(annotations=_READ_ONLY)
@@ -698,7 +698,7 @@ def build_mcp_server(
         with `memory_not_found` when the ID never existed or was deleted, and that verdict is
         permanent, so retrying an unknown ID never starts working. Changes nothing.
         """
-        return _memory_result(memory.get(memory_id))
+        return MemoryResult.model_validate(memory.get(memory_id))
 
     @server.tool(annotations=_READ_ONLY)
     @_stable_errors
@@ -724,10 +724,7 @@ def build_mcp_server(
         snapshot: memories added or deleted while you page can appear twice or not at all.
         """
         page = memory.list(limit=limit, cursor=cursor)
-        return PageResult(
-            items=tuple(_memory_result(record) for record in page.items),
-            next_cursor=page.next_cursor,
-        )
+        return PageResult.model_validate(page)
 
     _register_write_tools(server, memory, enabled=write_operations)
     _register_embodied_tools(server, memory, enabled=embodied_operations)
@@ -815,7 +812,7 @@ def _register_write_tools(server: MCPServer[None], memory: Memory, *, enabled: b
             memory_type=memory_type,
             context=context,
         )
-        return _memory_result(record)
+        return MemoryResult.model_validate(record)
 
     @server.tool(annotations=_DELETE)
     @_stable_errors
@@ -1145,98 +1142,6 @@ def _request_telemetry(tracer: Tracer) -> ServerMiddleware[Any]:
     return cast(ServerMiddleware[Any], observe)
 
 
-def _memory_result(record: MemoryRecord) -> MemoryResult:
-    return MemoryResult(
-        id=record.id,
-        content=record.content,
-        modality=record.modality,
-        memory_type=record.memory_type,
-        assets=tuple(_asset_result(asset) for asset in record.assets),
-        created_at=record.created_at,
-        occurred_at=record.occurred_at,
-        occurred_end=record.occurred_end,
-        metadata=cast(dict[str, JsonValue], dict(record.metadata)),
-        context=record.context,
-        place_id=record.place_id,
-        forgotten_at=record.forgotten_at,
-    )
-
-
-def _search_hit_result(hit: SearchHit) -> SearchHitResult:
-    return SearchHitResult(
-        id=hit.id,
-        content=hit.content,
-        modality=hit.modality,
-        memory_type=hit.memory_type,
-        assets=tuple(_asset_result(asset) for asset in hit.assets),
-        score=hit.score,
-        created_at=hit.created_at,
-        occurred_at=hit.occurred_at,
-        occurred_end=hit.occurred_end,
-        metadata=cast(dict[str, JsonValue], dict(hit.metadata)),
-        context=hit.context,
-        place_id=hit.place_id,
-        forgotten_at=hit.forgotten_at,
-    )
-
-
-def _affect_cue_result(cue: AffectCue) -> AffectCueResult:
-    # `dict(model)` is shallow, so the already-validated asset and context values are carried
-    # across rather than dumped and revalidated.
-    return AffectCueResult(
-        **dict(_search_hit_result(cue)),
-        event_ids=cue.event_ids,
-    )
-
-
-def _bundle_result(bundle: ContextBundle) -> ContextBundleResult:
-    """Publish `ContextBundle.document()`, the same projection REST and the CLI publish.
-
-    Only the sections need translating -- every other value is already what the tool schema
-    declares -- so a section added to the bundle reaches this tool without being named here.
-    """
-    document = bundle.document()
-    for name, value in document.items():
-        if isinstance(value, tuple):
-            document[name] = tuple(_bundle_entry(entry) for entry in value)
-    return ContextBundleResult.model_validate(document)
-
-
-def _bundle_entry(entry: object) -> object:
-    """Translate one entry of one bundle section; `frames` and `places` carry plain strings."""
-    # `AffectCue` is a `SearchHit`, so it is asked about first: the generic branch would drop
-    # the `event_ids` the cue exists to carry.
-    if isinstance(entry, AffectCue):
-        return _affect_cue_result(entry)
-    if isinstance(entry, ContextExcerpt):
-        return ContextExcerptResult.model_validate(entry, from_attributes=True)
-    if isinstance(entry, SearchHit):
-        return _search_hit_result(entry)
-    # A person a visible naming assertion names, reached through evidence other than the
-    # assertion itself, and a recognized person no visible assertion names: both travel in
-    # `actors` beside the ranked hits.
-    if isinstance(entry, NamedActor):
-        return NamedActorResult(
-            identity_id=entry.identity_id,
-            name=entry.name,
-            memory_ids=entry.memory_ids,
-            naming_assertion_id=entry.naming_assertion_id,
-        )
-    if isinstance(entry, ProvisionalActor):
-        return ProvisionalActorResult(identity_id=entry.identity_id, memory_ids=entry.memory_ids)
-    if isinstance(entry, ContextConflict):
-        return ContextConflictResult(
-            lineage_id=entry.lineage_id,
-            subject=entry.subject,
-            predicate=entry.predicate,
-            values=entry.values,
-            memory_ids=entry.memory_ids,
-        )
-    if isinstance(entry, ContextUnknown):
-        return ContextUnknownResult(kind=entry.kind, detail=entry.detail)
-    return entry
-
-
 # Which of `MemoryCapabilities.operations` one of the fifteen tools can actually reach, mirroring
 # `app._ROUTED_OPERATIONS`. Consolidation, cognitive forgetting and rollback stay with the owning
 # process (`docs/context-os.md`), so the greeting's prose and its JSON must agree that there is no
@@ -1310,24 +1215,6 @@ def _instructions(
             " ask_memory reach it while ingesting or answering:",
             json.dumps(capabilities.document(served=served), indent=2, sort_keys=True),
         )
-    )
-
-
-def _asset_result(asset: AssetRef) -> AssetResult:
-    if (
-        asset.modality is None
-        or asset.media_type is None
-        or asset.size_bytes is None
-        or asset.sha256 is None
-    ):
-        raise ValidationError("stored asset metadata is incomplete")
-    return AssetResult(
-        id=asset.id,
-        modality=asset.modality,
-        media_type=asset.media_type,
-        size_bytes=asset.size_bytes,
-        sha256=asset.sha256,
-        name=asset.name,
     )
 
 

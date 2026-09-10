@@ -7,7 +7,6 @@ pinned, the way the MM-Lifelong adapter pins question indices.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,8 +15,6 @@ from typing import Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, NonEmptyString
-
-MEM_GALLERY_ADAPTER_VERSION = "mem_gallery_official_v2"
 
 MemGalleryPoint = Literal["FR", "MR", "TR", "VR", "TTL", "VS", "CD", "KR", "AR"]
 _POINTS: frozenset[str] = frozenset(("FR", "MR", "TR", "VR", "TTL", "VS", "CD", "KR", "AR"))
@@ -152,26 +149,6 @@ def load_mem_gallery(dialog_directory: Path) -> tuple[MemGalleryTopic, ...]:
     if not paths:
         raise ValueError(f"no Mem-Gallery topic files under {dialog_directory}")
     return tuple(load_mem_gallery_topic(path) for path in paths)
-
-
-def mem_gallery_dialog_digest(dialog_directory: Path) -> str:
-    """Digest the concatenated per-file digests of `data/dialog`, in sorted order.
-
-    Shared by the CLI run manifest and the dataset-smoke summary so a run's manifest and a
-    smoke row cannot silently disagree about which release digest names -- each used to
-    compute this independently.
-    """
-    joined = "".join(sha256_file(path) for path in sorted(dialog_directory.glob("*.json")))
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
-
-
-def sha256_file(path: Path) -> str:
-    """Hash one release file without loading it into memory."""
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _require_known_references(

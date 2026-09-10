@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-import shutil
 import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
@@ -31,10 +30,11 @@ from mindbridge import (
     TextSpanSelector,
 )
 from mindbridge.api.app import ContextBundleResponse
-from mindbridge.api.mcp import _bundle_result
+from mindbridge.api.mcp import ContextBundleResult
 from mindbridge.cli import _bundle_value
 from mindbridge.exceptions import ModelError, ValidationError
 from mindbridge.infrastructure.local.store import (
+    _SCHEMA_VERSION,
     LocalStore,
     StoredTextSelector,
     UnsupportedSchemaError,
@@ -509,70 +509,14 @@ def test_selector_tampering_disables_excerpt_but_preserves_full_memory(
     assert roomy.excerpts == ()
 
 
-def test_schema17_migration_is_empty_idempotent_and_index_rebuild_does_not_embed(
+def test_constraint_free_selector_tables_are_rejected_at_the_current_version(
     tmp_path: Path,
 ) -> None:
-    embedder = _PartEmbedder()
-    with Memory(tmp_path, embedder=embedder, minimum_relevance=0.0) as memory:
-        memory.add(_long_source(), occurred_at=REFERENCE)
-    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
-        embedding_count = connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
-        connection.executescript(
-            """
-            DROP TABLE embedding_text_span_pieces;
-            DROP TABLE embedding_text_selectors;
-            PRAGMA user_version = 17;
-            """
-        )
+    """`_validate_text_selector_schema` is what refuses a table that lost its CHECK constraints.
 
-    reopened = _PartEmbedder()
-    with Memory(tmp_path, embedder=reopened, minimum_relevance=0.0):
-        assert reopened.calls == []
-    with LocalStore(tmp_path):
-        pass
-    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
-        assert (
-            connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == embedding_count
-        )
-        assert (
-            connection.execute("SELECT COUNT(*) FROM embedding_text_selectors").fetchone()[0] == 0
-        )
-
-    shutil.rmtree(tmp_path / "zvec")
-    rebuild = _PartEmbedder()
-    with Memory(tmp_path, embedder=rebuild, minimum_relevance=0.0):
-        assert rebuild.calls == []
-    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
-        assert (
-            connection.execute("SELECT COUNT(*) FROM embedding_text_selectors").fetchone()[0] == 0
-        )
-
-
-def test_partial_schema18_migration_rolls_back(tmp_path: Path) -> None:
-    with LocalStore(tmp_path):
-        pass
-    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
-        connection.executescript(
-            """
-            DROP TABLE embedding_text_span_pieces;
-            PRAGMA user_version = 17;
-            """
-        )
-
-    with pytest.raises(UnsupportedSchemaError, match="incomplete v18 text selector projection"):
-        LocalStore(tmp_path)
-    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
-        assert (
-            connection.execute(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embedding_text_selectors'"
-            ).fetchone()[0]
-            == 1
-        )
-
-
-def test_constraint_free_schema18_tables_are_rejected_without_upgrading(tmp_path: Path) -> None:
+    The declared version says nothing about the shape, so a store carrying the right names with
+    none of the guarantees has to be refused rather than written to.
+    """
     with LocalStore(tmp_path):
         pass
     with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
@@ -596,7 +540,6 @@ def test_constraint_free_schema18_tables_are_rejected_without_upgrading(tmp_path
                 end_codepoint INTEGER,
                 piece_sha256 TEXT
             );
-            PRAGMA user_version = 17;
             """
         )
         before = tuple(
@@ -610,21 +553,7 @@ def test_constraint_free_schema18_tables_are_rejected_without_upgrading(tmp_path
         LocalStore(tmp_path)
 
     with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
-        after = tuple(
-            connection.execute(
-                "SELECT type, name, sql FROM sqlite_master "
-                "WHERE name LIKE 'embedding_text_%' ORDER BY type, name"
-            )
-        )
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
-    assert after == before
-
-    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
-        connection.execute("PRAGMA user_version = 18")
-    with pytest.raises(UnsupportedSchemaError, match="invalid embedding_text_selectors table"):
-        LocalStore(tmp_path)
-    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
         assert (
             tuple(
                 connection.execute(
@@ -647,7 +576,7 @@ def test_excerpt_serializes_through_rest_mcp_and_cli_contracts(tmp_path: Path) -
         )
 
     rest = ContextBundleResponse.model_validate(bundle.document()).model_dump(mode="json")
-    mcp = _bundle_result(bundle).model_dump(mode="json")
+    mcp = ContextBundleResult.model_validate(bundle.document()).model_dump(mode="json")
     cli = cast(
         "dict[str, Any]",
         {name: _bundle_value(value) for name, value in bundle.document().items()},

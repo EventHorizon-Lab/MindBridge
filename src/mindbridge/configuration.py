@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -44,7 +44,7 @@ from mindbridge.models.openai_sdk import (
 )
 from mindbridge.models.opencv_face import OpenCVFaceAnalyzer
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
-from mindbridge.plugins import MemoryConfig, MemoryPlugins, MemorySettings
+from mindbridge.plugins import MemoryConfig, MemoryPlugins
 from mindbridge.types import Modality, RetentionPolicy
 
 _Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -271,10 +271,10 @@ class MindBridgeConfig(_ConfigModel):
     consolidation: OpenAIConsolidationConfig | None = None
     speech: SpeechProviderConfig | None = None
     face: OpenCVFaceConfig | None = None
-    settings: MemorySettings = Field(default_factory=MemorySettings)
+    settings: MemoryConfig = Field(default_factory=MemoryConfig)
     # Its own section rather than a `settings` field: every other setting shapes what recall
     # returns and can be changed back, and this one deletes. It reaches `Memory` as
-    # `MemorySettings.retention`, which is the same value under the name `from_plugins` reads;
+    # `MemoryConfig.retention`, which is the same value under the name `from_plugins` reads;
     # declaring it twice is refused rather than silently resolved.
     retention: RetentionPolicy | None = None
 
@@ -382,8 +382,7 @@ def _validated_config(value: MindBridgeConfig | Mapping[str, object]) -> MindBri
 
 
 def _openai_factory(values: dict[str, object]) -> OpenAIModels:
-    factory = cast(Callable[..., OpenAIModels], recipes._owned_openai_models)
-    return factory(**values)
+    return recipes._owned_openai_models(**values)
 
 
 def _openai_values(config: _OpenAIConfig) -> dict[str, object]:
@@ -410,7 +409,7 @@ def _build_embedding(config: EmbeddingProviderConfig) -> EmbeddingBackend:
         )
         if config.space is not None:
             values["embedding_space"] = config.space
-        return cast(EmbeddingBackend, _openai_factory(values))
+        return _openai_factory(values)
     if isinstance(config, JinaEmbeddingConfig):
         return JinaOmniEmbedder(
             dimension=config.dimension,
@@ -449,17 +448,17 @@ def _build_generation(config: OpenAIGenerationConfig) -> GenerationBackend:
         values["generation_video_limit"] = config.video_limit
     if config.min_video_seconds is not None:
         values["generation_min_video_seconds"] = config.min_video_seconds
-    return cast(GenerationBackend, _openai_factory(values))
+    return _openai_factory(values)
 
 
 def _build_formation(config: OpenAIFormationConfig) -> FormationBackend:
     # The bundled adapter reads the generation controls for `form`; `video_limit` is answer-only.
-    return cast(FormationBackend, _openai_factory(_completion_values(config)))
+    return _openai_factory(_completion_values(config))
 
 
 def _build_vision(config: OpenAIVisionConfig) -> VisionDescriptionBackend:
     # `describe` reads the same generation controls; its capability set is the visual one.
-    return cast(VisionDescriptionBackend, _openai_factory(_completion_values(config)))
+    return _openai_factory(_completion_values(config))
 
 
 def _build_consolidation(
@@ -479,8 +478,11 @@ def _build_consolidation(
     values = _completion_values(config.consolidation)
     for built, declared in ((answerer, config.generation), (former, config.formation)):
         if built is not None and declared is not None and _completion_values(declared) == values:
+            # The one cast the protocols cannot express: the reused object is known to be
+            # `OpenAIModels`, which implements every reasoning protocol, but it is typed here
+            # as the slot it was built for.
             return cast(ConsolidationBackend, built)
-    return cast(ConsolidationBackend, _openai_factory(values))
+    return _openai_factory(values)
 
 
 def _build_speech(config: SpeechProviderConfig) -> SpeechBackend | TranscriptionBackend:
@@ -490,7 +492,7 @@ def _build_speech(config: SpeechProviderConfig) -> SpeechBackend | Transcription
     values["transcription_model"] = config.model
     if config.space is not None:
         values["transcription_space"] = config.space
-    return cast(TranscriptionBackend, _openai_factory(values))
+    return _openai_factory(values)
 
 
 def _build_face(config: OpenCVFaceConfig) -> FaceBackend:

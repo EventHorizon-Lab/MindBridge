@@ -322,8 +322,7 @@ consolidator may propose and what the kernel refuses.
 
 ## Local memory settings
 
-The `settings` mapping is the value-only `MemorySettings` policy (`MemoryConfig` is a compatible
-alias):
+The `settings` mapping is the value-only `MemoryConfig` policy:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -461,7 +460,7 @@ apply-retention`, which is what keeps physical deletion an explicit act with an 
 Start with `apply_retention(dry_run=True)`, which names exactly what a real pass would remove and
 removes nothing.
 
-`MemoryConfig`/`MemorySettings` carries the same value under the name `retention`, which is what
+`MemoryConfig` carries the same value under the name `retention`, which is what
 `Memory.from_plugins()` and the `Memory(retention=...)` constructor argument read. Declaring it in
 both places is refused rather than silently resolved.
 

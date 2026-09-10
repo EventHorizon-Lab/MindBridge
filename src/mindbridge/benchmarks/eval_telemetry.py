@@ -1158,11 +1158,6 @@ class EvaluationTelemetry(SpanProcessor):
             values = self._tasks.get((task, arm), _TaskTelemetry())
             return values.json(question_count)
 
-    def known_arms(self, task: str) -> tuple[str, ...]:
-        """Return the arms that emitted at least one span for ``task``."""
-        with self._lock:
-            return tuple(sorted(arm for candidate, arm in self._tasks if candidate == task))
-
     def sample_grounding(self, sample_id: str) -> SampleGrounding | None:
         """Return one answer's budget loss, or None when no answer span was recorded."""
         with self._lock:

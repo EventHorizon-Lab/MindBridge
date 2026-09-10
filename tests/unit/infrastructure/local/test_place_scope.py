@@ -24,7 +24,6 @@ from pathlib import Path
 import pytest
 
 from mindbridge.infrastructure.local import LocalStore, StoredEmbedding, StoredMemory
-from mindbridge.infrastructure.local.store import _SCHEMA_VERSION
 
 _NOW = datetime(2026, 9, 2, 12, 0, 0, tzinfo=timezone.utc)
 _SPACE = "place-probe:2"
@@ -214,48 +213,3 @@ def test_changing_a_place_label_requeues_the_search_index(tmp_path: Path) -> Non
         # Rewriting the same label is not a change, so it still costs nothing.
         store.write_memory(_memory("relabelled", "the kettle is on", place_id="utility room"))
         assert store.pending_index_operations() == ()
-
-
-@pytest.mark.skipif(sqlite3.sqlite_version_info < (3, 35), reason="DROP COLUMN needs SQLite 3.35")
-def test_a_store_without_place_id_gains_the_column_and_keeps_its_memories(
-    tmp_path: Path,
-) -> None:
-    """The migration is additive: an existing store opens, keeps every row, and gains the axis."""
-    with LocalStore(tmp_path) as store:
-        store.write_memory(_memory("preserved", "A red tool is in drawer two", place_id="workshop"))
-    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
-        connection.executescript(
-            """
-            DROP INDEX memory_records_place_idx;
-            ALTER TABLE memory_records DROP COLUMN place_id;
-            PRAGMA user_version = 9;
-            """
-        )
-
-    with LocalStore(tmp_path) as store:
-        preserved = store.read_memory("preserved")
-        store.write_memory(_memory("after", "the kettle is on", place_id="kitchen"))
-        after = store.read_memories(("preserved", "after"), place_id="kitchen")
-        with closing(sqlite3.connect(store.database_path)) as connection:
-            columns = {row[1] for row in connection.execute("PRAGMA table_info(memory_records)")}
-            indexes = {row[1] for row in connection.execute("PRAGMA index_list(memory_records)")}
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            migrated_plan = "\n".join(
-                str(row[3])
-                for row in connection.execute(
-                    "EXPLAIN QUERY PLAN "
-                    "SELECT content FROM memory_records WHERE memory_id IN (?, ?) AND place_id = ?",
-                    ("preserved", "after", "kitchen"),
-                )
-            )
-
-    assert preserved is not None and preserved.content == "A red tool is in drawer two"
-    # The dropped label is gone with the dropped column; the axis, not the value, is restored.
-    assert preserved.place_id is None
-    assert "place_id" in columns
-    assert version == _SCHEMA_VERSION
-    # The restored index is usable straight away, on rows written after the migration. Without
-    # this the column alone would come back and every upgraded store would silently scan.
-    assert [memory.memory_id for memory in after] == ["after"]
-    assert "memory_records_place_idx" in indexes
-    assert "memory_records_place_idx (place_id=? AND memory_id=?)" in migrated_plan

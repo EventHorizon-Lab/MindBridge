@@ -164,12 +164,7 @@ def atm_capture_time(media_name: str) -> datetime:
 
 def load_atm_bench(dataset_path: Path) -> tuple[AtmBenchQuestion, ...]:
     """Load `atm-bench.json` or `atm-bench-hard.json`."""
-    return _questions(dataset_path, require_pool=False)
-
-
-def load_atm_niah_pool(pool_path: Path) -> tuple[AtmBenchQuestion, ...]:
-    """Load one NIAH pool, refusing a pool that has lost a gold evidence item."""
-    return _questions(pool_path, require_pool=True)
+    return _questions(dataset_path)
 
 
 def load_atm_emails(emails_path: Path) -> tuple[AtmEmail, ...]:
@@ -224,24 +219,7 @@ def atm_email_block(email: AtmEmail) -> str:
     )
 
 
-def atm_evidence_id_from_block(summary: str) -> str | None:
-    """Read the evidence ID a serialized block's leading `ID: <id>` line names, or None.
-
-    Every SGM and email block opens with exactly this line for this purpose: `recall`'s own
-    evidence list only ever names media MindBridge itself observed, so it has nothing for an
-    email or an sgm-arm write, both of which land as `remember` text instead. Reading this line
-    back out of a recalled memory's summary keeps those two visible to retrieval-recall.
-    A summary that does not open with the marker -- e.g. the raw arm's own perception-derived
-    text -- names no evidence and returns None.
-    """
-    first_line, _, _ = summary.partition("\n")
-    if not first_line.startswith("ID: "):
-        return None
-    evidence_id = first_line.removeprefix("ID: ")
-    return evidence_id or None
-
-
-def _questions(path: Path, *, require_pool: bool) -> tuple[AtmBenchQuestion, ...]:
+def _questions(path: Path) -> tuple[AtmBenchQuestion, ...]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(raw, dict):
         raw = raw.get("qas", raw)
@@ -253,18 +231,7 @@ def _questions(path: Path, *, require_pool: bool) -> tuple[AtmBenchQuestion, ...
     for question in questions:
         for evidence_id in question.evidence_ids:
             atm_evidence_kind(evidence_id)
-        if require_pool:
-            _require_niah_pool(question)
     return questions
-
-
-def _require_niah_pool(question: AtmBenchQuestion) -> None:
-    if not question.niah_evidence_ids:
-        raise ValueError("ATM-Bench NIAH pools must carry niah_evidence_ids")
-    if not set(question.evidence_ids) <= set(question.niah_evidence_ids):
-        raise ValueError(
-            f"ATM-Bench NIAH pool must contain every gold evidence for {question.question_id}"
-        )
 
 
 def _question(raw: _RawQuestion) -> AtmBenchQuestion:

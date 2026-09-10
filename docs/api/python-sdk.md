@@ -173,7 +173,7 @@ resolve_memory_config(
 
 `MemoryPlugins` contains `embedder` plus optional `answerer`, `transcriber`, `vision_describer`,
 `face_analyzer`, `former`, and `consolidator`. `MemoryConfig` contains the value-only constructor
-settings; `MemorySettings` is its public alias. `MemoryComposition` contains `data_dir`, `plugins`, and
+settings. `MemoryComposition` contains `data_dir`, `plugins`, and
 `settings`; call `close()` unless its plugins have been transferred to a `Memory`.
 
 ### Content contract
@@ -1012,12 +1012,12 @@ semantics and complete examples.
 
 ### Root import inventory
 
-These are the 126 supported names exported by `mindbridge`:
+These are the 125 supported names exported by `mindbridge`:
 
 | Group | Names |
 | --- | --- |
 | Memory | `Memory`, `AsyncMemory`, `AsyncOmniPrefetch`, `AsyncCaptureStream`, `AsyncAudioStream`, `AsyncVisionStream` |
-| Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemorySettings`, `MemoryPlugins`, `resolve_memory_config` |
+| Composition | `MindBridgeConfig`, `MemoryComposition`, `MemoryConfig`, `MemoryPlugins`, `resolve_memory_config` |
 | Content and records | `ContentAtom`, `ContentInput`, `Blob`, `AssetRef`, `StreamInput`, `MemoryRecord`, `SearchHit`, `AnswerResult`, `AnswerChunk`, `Page`, `ObservationContext`, `MemoryContext`, `RetrievalScope`, `SpatialContext`, `SpeakerSegment`, `IdentityProfile`, `IdentityClaim`, `IdentityErasure`, `FaceObservation`, `MemoryCapabilities`, `PendingCapture`, `PrefetchResult`, `StreamCommit`, `TracedSearchResult`, `RetrievalTrace`, `RetrievalCandidateTrace`, `FormationProposal`, `ContextBudget`, `ContextBundle`, `ContextExcerpt`, `ContextPresentation`, `ContextSymbol`, `ContextCitation`, `TextSpanSelector`, `TextSpanPiece`, `ContextConflict`, `ContextUnknown`, `AffectCue`, `NamedActor`, `ProvisionalActor`, `IdentityChange`, `MemoryOperation`, `MemoryOperationRecord`, `ConsolidationReport`, `ConsolidationCandidate`, `DeliberationReport`, `ConsentClaim`, `ExportBundle`, `RetentionPolicy`, `RetentionReport` |
 | Stream input | `AudioStreamPacket`, `PCMChunk`, `VADPacket`, `ASRPartial`, `AcousticBoundary`, `VisionStreamPacket`, `VisionFrame`, `VisionPartial`, `SceneBoundary`, `StreamEvent` |
 | Enums | `Modality`, `MemoryType`, `EvidenceBasis`, `MemoryKind`, `MemoryIntent`, `MemoryTrigger`, `SpatialAnchor`, `ContextUnknownKind`, `ContextSymbolNamespace`, `ContextSymbolCoverage`, `ContextSymbolRole`, `AbstentionReason`, `IndexQuantization`, `RetrievalMode`, `RetrievalRejection`, `StreamPhase`, `AudioBoundary`, `VisionBoundary`, `EmbedTask`, `MemoryOutcome`, `ConsentState` |

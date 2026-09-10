@@ -11,11 +11,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, m
 
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, NonEmptyString
 
-BEAM_ADAPTER_VERSION = "beam_official_v1"
-
 BeamTier = Literal["100K", "500K", "1M", "10M"]
-BEAM_TIERS: tuple[BeamTier, ...] = ("100K", "500K", "1M", "10M")
-
 # The ten keys of `probing_questions.json`. Upstream's `run_evaluation.py`
 # dispatches on this key and has no default branch, so an unrecognised
 # category is a corpus problem rather than something to score generically.

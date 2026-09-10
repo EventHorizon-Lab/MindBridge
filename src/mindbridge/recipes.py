@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from importlib import import_module
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from mindbridge.exceptions import ValidationError
 from mindbridge.models.base import (
@@ -188,46 +188,8 @@ class _OwnedClientModels(OpenAIModels):
 
     __slots__ = ("_owned_client", "_owned_client_closed")
 
-    def __init__(
-        self,
-        client: OpenAI,
-        *,
-        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
-        embedding_space: str | None = None,
-        embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION,
-        embedding_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
-        embedding_request_format: Literal["input", "messages"] = "input",
-        generation_model: str = DEFAULT_GENERATION_MODEL,
-        generation_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
-        transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL,
-        transcription_space: str | None = None,
-        generation_seed: int | None = None,
-        generation_temperature: float | None = None,
-        generation_max_tokens: int | None = None,
-        generation_video_limit: int | None = 8,
-        generation_min_video_seconds: float | None = None,
-        generation_extra_body: Mapping[str, object] | None = None,
-        generation_stream: bool = False,
-    ) -> None:
-        super().__init__(
-            client,
-            embedding_model=embedding_model,
-            embedding_space=embedding_space,
-            embedding_dimension=embedding_dimension,
-            embedding_capabilities=embedding_capabilities,
-            embedding_request_format=embedding_request_format,
-            generation_model=generation_model,
-            generation_capabilities=generation_capabilities,
-            transcription_model=transcription_model,
-            transcription_space=transcription_space,
-            generation_seed=generation_seed,
-            generation_temperature=generation_temperature,
-            generation_max_tokens=generation_max_tokens,
-            generation_video_limit=generation_video_limit,
-            generation_min_video_seconds=generation_min_video_seconds,
-            generation_extra_body=generation_extra_body,
-            generation_stream=generation_stream,
-        )
+    def __init__(self, client: OpenAI, **controls: object) -> None:
+        super().__init__(client, **cast("Any", controls))
         self._owned_client = client
         self._owned_client_closed = False
 
@@ -240,61 +202,26 @@ class _OwnedClientModels(OpenAIModels):
         self._owned_client.close()
 
 
-def _owned_openai_models(
-    *,
-    base_url: str | None = None,
-    api_key: str | None = None,
-    timeout: float | None = None,
-    max_retries: int | None = None,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
-    embedding_space: str | None = None,
-    embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION,
-    embedding_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
-    embedding_request_format: Literal["input", "messages"] = "input",
-    generation_model: str = DEFAULT_GENERATION_MODEL,
-    generation_capabilities: frozenset[Modality] = frozenset({Modality.TEXT}),
-    transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL,
-    transcription_space: str | None = None,
-    generation_seed: int | None = None,
-    generation_temperature: float | None = None,
-    generation_max_tokens: int | None = None,
-    generation_video_limit: int | None = 8,
-    generation_min_video_seconds: float | None = None,
-    generation_extra_body: Mapping[str, object] | None = None,
-    generation_stream: bool = False,
-) -> OpenAIModels:
-    """Build the SDK adapter and own the client created for declarative composition."""
-    connection = {
-        key: value
-        for key, value in {
-            "base_url": base_url,
-            "api_key": api_key,
-            "timeout": timeout,
-            "max_retries": max_retries,
-        }.items()
-        if value is not None
-    }
-    client = _openai_client(**connection) if connection else _openai_client()
+# What the SDK client takes rather than the adapter; everything else is an adapter control.
+_CONNECTION = ("base_url", "api_key", "timeout", "max_retries")
+
+
+def _owned_openai_models(**controls: object) -> OpenAIModels:
+    """Build the SDK adapter and own the client created for declarative composition.
+
+    Every adapter control passes through unnamed, so a control `OpenAIModels` gains is reachable
+    declaratively at once instead of after this signature is remembered too -- which is how the
+    documented `min_video_seconds` once shipped unreachable. An unknown name still fails loudly:
+    the adapter raises `TypeError` for it on the first `from_config`.
+    """
+    connection = {}
+    for name in _CONNECTION:
+        value = controls.pop(name, None)
+        if value is not None:
+            connection[name] = value
+    client = _openai_client(**connection)
     try:
-        return _OwnedClientModels(
-            client,
-            embedding_model=embedding_model,
-            embedding_space=embedding_space,
-            embedding_dimension=embedding_dimension,
-            embedding_capabilities=embedding_capabilities,
-            embedding_request_format=embedding_request_format,
-            generation_model=generation_model,
-            generation_capabilities=generation_capabilities,
-            transcription_model=transcription_model,
-            transcription_space=transcription_space,
-            generation_seed=generation_seed,
-            generation_temperature=generation_temperature,
-            generation_max_tokens=generation_max_tokens,
-            generation_video_limit=generation_video_limit,
-            generation_min_video_seconds=generation_min_video_seconds,
-            generation_extra_body=generation_extra_body,
-            generation_stream=generation_stream,
-        )
+        return _OwnedClientModels(client, **controls)
     except BaseException:
         client.close()
         raise

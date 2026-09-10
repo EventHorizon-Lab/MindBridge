@@ -65,7 +65,6 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "MemoryType",
         "MemoryConfig",
         "MemoryComposition",
-        "MemorySettings",
         "MindBridgeConfig",
         "MemoryPlugins",
         "Modality",
@@ -323,7 +322,7 @@ def test_dependency_surface_is_exact() -> None:
             "torchaudio",
             "torchvision",
         },
-        "server": {"fastapi", "starlette", "uvicorn"},
+        "server": {"fastapi", "starlette"},
         "mcp": {"mcp"},
     }
     declared = set(EXTRAS) | {_name(item) for item in DEPENDENCIES}

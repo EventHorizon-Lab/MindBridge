@@ -9,7 +9,6 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from mindbridge.benchmarks._contracts import ContractModel, NonEmptyString
 
-MM_LIFELONG_ADAPTER_VERSION = "mm_lifelong_official_v1"
 MMLifelongSplit = Literal["day_test", "week_test", "month_train", "month_val"]
 
 

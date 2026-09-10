@@ -9,7 +9,6 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter
 
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, NonEmptyString
 
-SUPERMEMORY_VQA_ADAPTER_VERSION = "supermemory_vqa_official_v3"
 SUPERMEMORY_UNANSWERABLE_CHOICE = "This question can not be answered."
 
 

@@ -37,7 +37,6 @@ from mindbridge import (
     MemoryOperation,
     MemoryPlugins,
     MemoryRecord,
-    MemorySettings,
     MemoryTrigger,
     MindBridgeConfig,
     Modality,
@@ -92,8 +91,6 @@ def test_declarative_config_is_typed_strict_and_keeps_local_policy_separate(
         index_quantization=IndexQuantization.FP16,
         retrieval_mode=RetrievalMode.LEXICAL,
     )
-    assert MemorySettings is MemoryConfig
-
     with pytest.raises(PydanticValidationError, match="extra_forbidden"):
         MindBridgeConfig.model_validate(
             {
@@ -861,11 +858,12 @@ def test_declarative_generation_slot_carries_every_control_through_the_real_fact
 ) -> None:
     """A control is only wired if it survives the recipe factory, which no adapter test sees.
 
-    `_owned_openai_models` names every adapter control as an explicit keyword, so a control added
-    to `_build_generation` and forgotten there raises `TypeError` on the first `from_config`.
-    Every other configuration test monkeypatches that factory away, which is how the documented
-    `min_video_seconds` shipped unreachable. Only the SDK client is faked here, so the real
-    factory runs and the built adapter has to answer.
+    `_owned_openai_models` forwards every adapter control it is given, so a control added to
+    `_build_generation` cannot be forgotten there, and an unknown name still raises `TypeError`
+    from the adapter on the first `from_config`. Every other configuration test monkeypatches
+    that factory away, which is how the documented `min_video_seconds` shipped unreachable when
+    the factory still restated the signature by hand. Only the SDK client is faked here, so the
+    real factory runs and the built adapter has to answer.
     """
 
     def respond(request: httpx.Request) -> httpx.Response:

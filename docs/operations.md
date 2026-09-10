@@ -67,8 +67,10 @@ replays the queue without embedding historical content again. An unsupported sch
 unrecognized model, vector-space, dimension, analysis-space, or index-recipe mismatch fails at
 open instead of mixing state.
 
-Restore with the original MindBridge version and configuration first. Perform an upgrade as a
-separate backed-up step because a recognized embedding recipe migration may re-embed records.
+Restore with the original MindBridge version and configuration first. A backup is the only way
+forward across a schema change, because a directory is never converted in place. Perform an
+upgrade as a separate backed-up step because a recognized embedding recipe migration may
+re-embed records.
 
 ## Index maintenance and repair
 
@@ -299,18 +301,22 @@ index settings:
 1. Create and restore-test a backup.
 2. Stop the owner.
 3. Upgrade code and configuration together.
-4. Start one owner and let only recognized schema or recipe migrations run.
+4. Start one owner and let only recognized recipe migrations run.
 5. Verify records, media, retrieval, and telemetry before restoring traffic.
 
 Never bypass compatibility checks by editing `PRAGMA user_version`, `store_metadata`, or the
 outbox.
 
-Schema 17 migrates each schema-16 flat evidence interval into a singleton clause version. Current
-clauses remain the authoritative `OR` of complete `AND` member sets; the flat
-`memory_evidence` rows are their compatibility union. The migration is atomic, retains active and
-retired intervals, and refuses a partial clause-table shape instead of filling it in around
-unknown data. Zvec remains derived: rebuilding a missing index reads the SQLite embeddings and
-current clause projection without calling the embedding model again.
+**There is no schema upgrade path.** A data directory carrying any schema version other than the
+one this build writes is refused on open, with the version it found in the message; it is never
+converted in place. To move a store to a newer MindBridge, export it with the version that wrote
+it and re-ingest, or keep that version installed to read the directory. The refusal is permanent
+rather than transient, so a retry never starts working.
+
+Current clauses remain the authoritative `OR` of complete `AND` member sets; the flat
+`memory_evidence` rows are their compatibility union. Zvec remains derived: rebuilding a missing
+index reads the SQLite embeddings and current clause projection without calling the embedding
+model again.
 
 Clause versions are append-only transaction history. An inverse written by operation rollback
 points to the exact predecessor version it restores. This lets operations reverse newest first
@@ -318,22 +324,14 @@ while an unrelated later update, including an equal-valued one, still blocks an 
 Physical `delete()` remains unlogged and irreversible; clause history does not recreate erased
 records.
 
-The schema-16 to schema-17 migration is automatic, transactional, and idempotent. Opening a store
-with schema 17 is an upgrade: an older SDK that only recognizes schema 16 cannot open it, and there
-is no automatic downgrade. Make and test a backup before upgrading; never use a copied benchmark
-archive as the live migration target. From schema 17 on, a derived record whose basis is not a
-host assertion is visible only while it has an active evidence clause. The migration counts the
-records that end up with none and logs a warning with that count; they stay stored and readable by
-ID, but drop out of retrieval until evidence is added or they are deleted.
+A derived record whose basis is not a host assertion is visible only while it has an active
+evidence clause. Such a record stays stored and readable by ID, but drops out of retrieval until
+evidence is added or it is deleted.
 
-Schema 18 adds `embedding_text_selectors` and `embedding_text_span_pieces`. A selector belongs to
-one newly written pure-text raw embedding part and stores a parent-content digest, reconstructed
+Schema 18 declares `embedding_text_selectors` and `embedding_text_span_pieces`. A selector belongs
+to one pure-text raw embedding part and stores a parent-content digest, reconstructed
 embedding-input digest, recipe, and ordered code-point ranges with piece digests. It does not
-duplicate parent text. The schema-17 migration creates both tables transactionally and leaves them
-empty: old embedding rows have no durable locator, so startup never guesses offsets and never calls
-the embedding model. Reopening schema 18 is idempotent. A partial or incompatible selector-table
-shape is refused after checking primary keys, foreign keys, check constraints, and the piece index;
-the failed migration rolls back without advancing the version or retaining new DDL. Deleting an
-embedding cascades its selectors. Zvec rebuild still reads existing SQLite vectors and does not
-create selectors or re-embed content. An SDK that only supports schema 17 cannot open an upgraded
-store, and there is no automatic downgrade or physical-delete recovery.
+duplicate parent text. Reopening a schema-18 store is idempotent. A partial or incompatible
+selector-table shape is refused after checking primary keys, foreign keys, check constraints, and
+the piece index, and nothing is written. Deleting an embedding cascades its selectors. Zvec rebuild
+reads existing SQLite vectors and does not create selectors or re-embed content.

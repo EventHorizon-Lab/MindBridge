@@ -17,8 +17,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   candidates get their dense score completed from the stored vectors, and `allow_partial_sources`
   can admit digest-bound raw-text excerpts. Rolling back an operation whose output was already
   deleted now succeeds, and deleting one of several alternatives no longer cascades into a claim
-  that a still-supported but hidden trait continues to ground. Older stores migrate on open; a
-  newer schema is refused.
+  that a still-supported but hidden trait continues to ground. Any other schema version is
+  refused on open.
 - `mindbridge-bench eval --tasks es-memeval` now evaluates the pinned ES-MemEval EvoEmo QA task:
   18 physically isolated seeker histories, 1,427 questions across the five published capabilities,
   automatic digest-verified GitHub acquisition, session-level evidence recall, the published
@@ -418,6 +418,20 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- MCP tool results are validated from the SDK value objects, the way REST already builds its
+  responses, instead of through hand-written per-field converters. The published tool schemas and
+  their field names are unchanged, and a field added to a value object now reaches both transports
+  without a converter to edit.
+- The CLI builds its documents from the value objects' declared fields with one timestamp encoder,
+  rather than restating each field a third time. Output is unchanged except that `faces` prints
+  `observed_at_ms` in the position the value object declares it.
+- `Memory.from_plugins` and `AsyncMemory.from_plugins` unpack `MemoryPlugins` and `MemoryConfig`
+  instead of naming all twenty-six constructor arguments twice each. The declarative recipe
+  factory forwards adapter controls the same way, so a control `OpenAIModels` gains is reachable
+  from configuration without a second signature to update.
+- Schema upgrades run from one table keyed by version rather than seventeen unrolled branches. A
+  step that fails to advance `user_version` now fails as that unsupported version instead of
+  falling through to the same error at the end.
 - Audited `mindbridge-bench eval` against the pinned Video-MME-v2, BEAM, PersonaMem-v3, and
   OpenEQA evaluators. Video-MME-v2 now reports official 0--100 accuracy and grouped rating; BEAM
   uses its event-equivalence and ordering composite; OpenEQA maps the released 1--5 judge mark to
@@ -1048,6 +1062,21 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Removed
 
+- Every schema migration. A data directory is created at the current schema or refused, and never
+  converted in place: the refusal names the version it found and says to re-create the directory
+  and re-ingest, or to open it with the MindBridge version that wrote it. This removes seventeen
+  upgrade steps, their DDL, and the twenty-five tests that drove them. **A `data_dir` written by
+  an earlier build of this unreleased version cannot be opened by this one.** Nothing has been
+  released, so no published version is affected.
+- `MemorySettings`, the alias for `MemoryConfig`. Declarative `settings` and
+  `Memory.from_plugins(config=...)` are unchanged; the class keeps one public name.
+- `uvicorn` from the `server` and `all` extras. MindBridge never imports an ASGI server, so the
+  deployment installs the one it runs; `docs/deployment.md` shows it beside the command.
+- Benchmark code with no caller: the durable evaluation journal, the library half of the paired
+  replay helper (the research driver in `benchmarks/paired_replay.py` is unaffected), and the
+  second scoring runners in the Video-MME-v2 and EgoTempo adapters that `mindbridge-bench eval`
+  replaced. Ten unread `*_ADAPTER_VERSION` constants and the `BENCHMARK_PROMPTS` registry go with
+  them; the prompts themselves and every task in the catalog are unchanged.
 - Video-MME, EgoLifeQA, EgoMemReason, and MemEye benchmark tasks, adapters, media preparation, and
   the EgoMemReason submission artifact. Video-MME-v2 remains supported.
 - The custom OpenAI HTTP client, single-key REST authenticator, and CLI TLS termination.

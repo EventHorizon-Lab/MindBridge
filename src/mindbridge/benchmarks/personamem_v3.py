@@ -23,8 +23,6 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, m
 
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, NonEmptyString
 
-PERSONAMEM_V3_ADAPTER_VERSION = "personamem_v3_official_v1"
-
 # The five engagement logs, in the order their events are merged before the
 # chronological sort. `calendar.json` is a modification stream with a
 # different shape and is read separately.
