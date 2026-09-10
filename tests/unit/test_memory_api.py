@@ -7330,6 +7330,37 @@ def test_an_entity_plan_falls_back_to_the_name_as_text_when_no_identity_carries_
     assert "records about Lily (1)" in question.text
 
 
+@pytest.mark.parametrize(
+    "step",
+    [
+        {"op": "match", "terms": ["wrench" * 40]},
+        {"op": "entity", "name": "Lily" * 60},
+    ],
+    ids=("over-long-term", "over-long-name"),
+)
+def test_a_plan_the_store_would_refuse_answers_from_the_ranking_instead_of_raising(
+    tmp_path: Path,
+    step: dict[str, object],
+) -> None:
+    """Plan text is a model's output, so a read the store rejects may not surface as an error.
+
+    The store refuses a match term over its own limit with a `ValueError`, which nothing on the
+    answer path catches; the plan is unrunnable at validation instead, and the question keeps the
+    single search `ask` has always made.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", step)
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        answered = memory.ask("how many wrenches?", limit=2)
+
+    question, grounded = models.answer_calls[-1]
+    assert answered.answer.startswith("Grounded in: ")
+    assert len(grounded) == 2
+    assert "Recall program" not in question.text
+
+
 def test_an_exhaustive_read_keeps_the_callers_own_scope(tmp_path: Path) -> None:
     """A plan may narrow what `ask` reads; it may never widen it past what the caller allowed."""
     models = _FakeModels()

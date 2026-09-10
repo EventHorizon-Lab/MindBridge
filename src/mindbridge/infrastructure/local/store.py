@@ -127,6 +127,9 @@ _RECALL_FOLD_FUNCTION = "mindbridge_fold"
 # One primitive call reads at most this many rows whatever the caller asks for. It bounds the
 # hydration behind it, not the scan: a substring predicate reads the table either way.
 _RECALL_MAX_ROWS = 500
+# The longest term a match predicate accepts. A folded substring this long is a paragraph rather
+# than a term, and a plan that asks for one is asking `similar` to do a set read's work.
+_RECALL_MAX_TERM_CHARS = 200
 _MEMORY_TYPES = frozenset({"semantic", "episodic", "procedural"})
 _ASSET_MODALITIES = frozenset({"image", "video", "audio"})
 _SHA256_HEX_LENGTH = 64
@@ -9443,8 +9446,8 @@ def _recall_terms(terms: Sequence[str]) -> tuple[str, ...]:
     for term in terms:
         if not isinstance(term, str) or not term.strip():
             raise ValueError("every term must be non-empty text")
-        if len(term) > 200:
-            raise ValueError("a term must be at most 200 characters")
+        if len(term) > _RECALL_MAX_TERM_CHARS:
+            raise ValueError(f"a term must be at most {_RECALL_MAX_TERM_CHARS} characters")
         folded.append(_recall_fold(term.strip()))
     return tuple(dict.fromkeys(folded))
 

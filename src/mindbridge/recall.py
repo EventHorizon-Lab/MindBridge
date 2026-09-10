@@ -21,9 +21,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from typing import Literal, Protocol, TypeVar, cast
 
-# The store's own bound on one primitive read. Imported rather than restated so a plan can never
-# ask for more rows than the read will return.
+# The store's own bounds on one primitive read. Imported rather than restated so a plan can never
+# ask for more rows than the read will return, nor for a term the read will refuse.
 from mindbridge.infrastructure.local.store import _RECALL_MAX_ROWS as RECALL_MAX_ROWS
+from mindbridge.infrastructure.local.store import (
+    _RECALL_MAX_TERM_CHARS as RECALL_MAX_TERM_CHARS,
+)
 from mindbridge.types import MemoryType, Modality, SearchHit
 
 RecallShape = Literal["point", "set", "sequence", "entity", "composite"]
@@ -229,10 +232,19 @@ def execute(plan: RecallPlan, reader: RecallReader) -> RecallResult:
     ranked: dict[str, SearchHit] = {}
     by_step: list[tuple[SearchHit, ...]] = []
     for step in plan.steps:
-        rows = _run(step, reader, by_step)
-        by_step.append(rows)
         bound = step.k if step.op == "similar" else step.max_rows
-        executed.append(RecallStepResult(op=step.op, rows=len(rows), bounded=len(rows) >= bound))
+        try:
+            rows = _run(step, reader, by_step)
+        except ValueError:
+            # A primitive rejecting its own arguments is a read that did not happen. Every field
+            # reaching one came from a model's plan text, and `ask()` raising a bare `ValueError`
+            # from that would make model output an exception; reporting the step as bounded says
+            # the truth instead, which is that rows this predicate matches were never read.
+            rows, bounded = (), True
+        else:
+            bounded = len(rows) >= bound
+        by_step.append(rows)
+        executed.append(RecallStepResult(op=step.op, rows=len(rows), bounded=bounded))
         target = ranked if step.op == "similar" else exhaustive
         for hit in rows:
             target.setdefault(hit.id, hit)
@@ -417,7 +429,9 @@ def _usable(step: RecallStep) -> RecallStep | None:
         return None
     if step.op == "neighbors" and (step.of is None or step.before + step.after == 0):
         return None
-    if step.op == "entity" and not step.name:
+    # The name reaches the store as a match term when no identity carries it, so the same length
+    # the store refuses is the length that makes an entity step unrunnable here.
+    if step.op == "entity" and (not step.name or len(step.name) > RECALL_MAX_TERM_CHARS):
         return None
     return step
 
@@ -427,12 +441,23 @@ def _text(value: object) -> str | None:
 
 
 def _terms(value: object) -> tuple[str, ...] | None:
+    """Keep the terms the store will accept, dropping the rest rather than raising.
+
+    The count is capped and so is the length: the store refuses a term over
+    `RECALL_MAX_TERM_CHARS` with a `ValueError`, and a planner that pasted a paragraph into
+    `terms` must not turn model output into an exception out of `ask()`. A `match` step left with
+    no term at all is unusable, which `_usable` turns into the fallback plan.
+    """
     if value is None:
         return ()
     if not isinstance(value, list):
         return None
     terms = tuple(
-        dict.fromkeys(term.strip() for term in value if isinstance(term, str) and term.strip())
+        dict.fromkeys(
+            term.strip()
+            for term in value
+            if isinstance(term, str) and term.strip() and len(term.strip()) <= RECALL_MAX_TERM_CHARS
+        )
     )
     return terms[:_MAX_TERMS]
 

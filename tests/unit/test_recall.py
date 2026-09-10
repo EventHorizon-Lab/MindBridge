@@ -6,10 +6,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from mindbridge.infrastructure.local.store import _RECALL_MAX_TERM_CHARS
 from mindbridge.recall import (
     DEFAULT_MAX_ROWS,
     RecallPlan,
     RecallStep,
+    RecallStepResult,
     execute,
     fallback_plan,
     parse_recall_plan,
@@ -155,6 +157,8 @@ def test_a_full_plan_parses_every_op_with_its_own_fields() -> None:
         {"shape": "set", "steps": [{"op": "entity", "name": None}]},
         {"shape": "set", "steps": [{"op": "similar", "query": "q"}], "notes": "hi"},
         {"shape": "set", "steps": [{"op": "similar", "query": "q"}] * 7},
+        {"shape": "set", "steps": [{"op": "match", "terms": ["x" * 201]}]},
+        {"shape": "entity", "steps": [{"op": "entity", "name": "L" * 201}]},
     ],
     ids=[
         "unknown-shape",
@@ -176,6 +180,8 @@ def test_a_full_plan_parses_every_op_with_its_own_fields() -> None:
         "entity-without-a-name",
         "unknown-top-level-key",
         "too-many-steps",
+        "term-longer-than-the-store-accepts",
+        "name-longer-than-the-store-accepts",
     ],
 )
 def test_an_unrunnable_plan_falls_back_instead_of_running_something_else(
@@ -372,3 +378,49 @@ def test_a_step_whose_anchor_read_nothing_reads_nothing_itself() -> None:
 
     assert [name for name, _arguments in reader.calls] == ["match"]
     assert result.hits == ()
+
+
+def test_a_term_the_store_accepts_at_its_limit_still_plans() -> None:
+    """The cap is the store's own, so the longest term it takes is still a runnable plan."""
+    payload = json.dumps(
+        {"shape": "set", "steps": [{"op": "match", "terms": ["x" * _RECALL_MAX_TERM_CHARS]}]}
+    )
+
+    plan = parse_recall_plan(payload, reference_at=NOW)
+
+    assert plan is not None
+    assert plan.steps[0].terms == ("x" * _RECALL_MAX_TERM_CHARS,)
+
+
+def test_a_primitive_that_refuses_its_arguments_is_a_read_that_did_not_happen() -> None:
+    """A store `ValueError` must not leave `ask()` raising on model-authored plan text.
+
+    The step reads nothing and is reported as bounded: the rows its predicate matched were never
+    read, so the other steps' rows are not a complete set and no count is licensed over them.
+    """
+
+    class Refusing(_Reader):
+        def match(self, terms: Sequence[str], **arguments: object) -> tuple[SearchHit, ...]:
+            del terms, arguments
+            raise ValueError("a term must be at most 200 characters")
+
+    reader = Refusing(similar=(_hit("s-1"),))
+    plan = parse_recall_plan(
+        json.dumps(
+            {
+                "shape": "composite",
+                "steps": [
+                    {"op": "match", "terms": ["cairo"]},
+                    {"op": "similar", "query": "cairo"},
+                ],
+            }
+        ),
+        reference_at=NOW,
+    )
+
+    assert plan is not None
+    result = execute(plan, reader)
+
+    assert result.executed[0] == RecallStepResult(op="match", rows=0, bounded=True)
+    assert result.complete is False
+    assert [hit.id for hit in result.hits] == ["s-1"]
