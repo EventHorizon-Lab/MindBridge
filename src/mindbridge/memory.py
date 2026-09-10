@@ -34,7 +34,7 @@ from contextlib import AbstractContextManager, closing, contextmanager, suppress
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, fields, replace
 from datetime import date, datetime, time, timedelta, timezone
-from functools import partial
+from functools import lru_cache, partial
 from itertools import zip_longest
 from pathlib import Path
 from threading import Condition, RLock, local
@@ -105,6 +105,7 @@ from mindbridge.infrastructure.local.store import (
     IdentityLink,
     IndexCandidate,
     IndexDocument,
+    IndexOperation,
     LocalStore,
     SpeechRollback,
     StaleOperationError,
@@ -275,18 +276,29 @@ _LEGACY_INDEX_RECIPES = frozenset(
         ),
     }
 )
-# One drain applies this many outbox rows before flushing Zvec. A flush is a fixed ~45 ms
+# One drain hydrates and applies this many outbox rows per read. A flush is a fixed ~50 ms
 # fsync-class operation whatever it carries -- one document costs the same as a thousand -- and it
 # also creates one durable segment, which every later search pays for until an optimize merges it
-# away. Both costs are therefore per *flush*, so the batch is the largest one the index writes in
-# a single call: 1024 documents. `ZvecIndex.upsert` chunks anything larger, so this is a
-# memory-for-flushes choice and not a safety bound. Raising it from 256 quartered both the flush
-# count and the segment count of a bulk `add_many` (8 000 memories: 32 flushes and 32 segments
-# became 8 and 8) for about 32 MiB of transient hydration at 1024 dimensions.
+# away. Both costs are therefore per *flush*, so a bulk write applies rows in the largest batch
+# the index writes in a single call, 1024 documents, and flushes once per batch. `ZvecIndex.upsert`
+# chunks anything larger, so this is a memory-for-flushes choice and not a safety bound. Raising
+# it from 256 quartered both the flush count and the segment count of a bulk `add_many` (8 000
+# memories: 32 flushes and 32 segments became 8 and 8) for about 32 MiB of transient hydration at
+# 1024 dimensions.
 _OUTBOX_BATCH_SIZE = 1_024
+# Applied-but-unflushed outbox rows that trigger the Zvec flush. Zvec answers dense and full-text
+# queries from unflushed writes (and hides unflushed deletes), so a public write only has to
+# *apply* its rows to be visible; the ~50 ms flush is taken once per this many rows or at
+# `close()`, and rows are acknowledged in SQLite only after that flush, exactly as before. A
+# single `add` therefore no longer pays a flush and no longer leaves one segment behind. Must stay
+# below `_OUTBOX_BATCH_SIZE`: a drain reads the oldest rows first and skips the applied ones, so
+# the applied set must fit in one read with room for fresh rows or a backlog could never advance.
+# ponytail: 256 caps the replay after a crash at 256 idempotent upserts; raise it if segment count
+# ever matters more than that.
+_INDEX_FLUSH_OPERATIONS = 256
 # `add_stream` group commit bounds. Every item still commits to SQLite on its own, and the Zvec
-# flush that follows it is deferred until one of these two bounds is reached, so a stream pays one
-# fsync-class operation per group instead of one per observation. Both bounds are fixed rather
+# apply that follows it is deferred until one of these two bounds is reached, so a stream pays one
+# outbox drain per group instead of one per observation. Both bounds are fixed rather
 # than configurable: a caller cannot choose better values without knowing what a Zvec flush costs,
 # and the visible behaviour they trade against - when a committed item enters the index - is
 # already forced by `search`, which drains before it reads.
@@ -852,6 +864,7 @@ class Memory:
             ) from error
 
         self._closed = False
+        self._unflushed_operations: dict[int, IndexOperation] = {}
         try:
             with self._write_lock:
                 self._drain_outbox()
@@ -4439,7 +4452,10 @@ class Memory:
             self._operation(),
             self._write_lock,
         ):
-            self._drain_outbox()
+            # Flushed and acknowledged first: the checkpoint below queues every embedding that has
+            # no pending row, so an applied-but-unacknowledged row would otherwise keep its
+            # embedding out of the rebuild's replay if the rebuild fails.
+            self._drain_outbox(flush=True)
             with _translate_storage_errors("checkpoint a search-index rebuild"):
                 self._store.queue_all_embeddings()
             memory_count = 0
@@ -4455,7 +4471,7 @@ class Memory:
                 self._index.rebuild(documents(), batch_size=_REINDEX_PAGE_SIZE)
             # Adds may commit SQLite while the rebuild owns the Zvec boundary. Replay instead of
             # blindly acknowledging so records committed after its SQLite scan cannot be lost.
-            self._drain_outbox()
+            self._drain_outbox(flush=True)
             return memory_count
 
     def optimize(self) -> None:
@@ -4465,7 +4481,7 @@ class Memory:
             self._operation(),
             self._write_lock,
         ):
-            self._drain_outbox()
+            self._drain_outbox(flush=True)
             with _translate_index_errors("optimize the search index"):
                 self._index.optimize()
                 self._index.flush()
@@ -4486,6 +4502,12 @@ class Memory:
                 failures = []
                 try:
                     self._cleanup_pending_assets()
+                except Exception as error:
+                    failures.append(error)
+                # Rows a failed flush leaves pending are durable in SQLite and replay on open.
+                try:
+                    if self._unflushed_operations:
+                        self._flush_index()
                 except Exception as error:
                     failures.append(error)
                 failures.extend(self._close_resources())
@@ -7544,18 +7566,19 @@ class Memory:
             with _translate_storage_errors("delete orphaned media metadata"):
                 self._store.delete_asset_if_unreferenced(asset.asset_id)
 
-    def _drain_outbox(self, *, force: bool = False) -> None:
-        """Apply current SQLite truth, then acknowledge the exact durable operation batch.
+    def _drain_outbox(self, *, force: bool = False, flush: bool = False) -> None:
+        """Apply current SQLite truth to Zvec; flush and acknowledge once enough has been applied.
 
         Skipped inside an `add_stream` group, whose own bounds force it. Skipping only leaves
-        rows pending: they are still durable in SQLite and the next drain applies them.
+        rows pending: they are still durable in SQLite and the next drain applies them. `flush`
+        makes the applied rows durable and acknowledged now instead of at the batch bound.
         """
         if not force and self._deferring:
             return
         with self._trace("mindbridge.index.sync", kind="stage"):
-            self._apply_outbox()
+            self._apply_outbox(flush=flush)
 
-    def _apply_outbox(self) -> None:
+    def _apply_outbox(self, *, flush: bool) -> None:
         while True:
             with self._trace(
                 "mindbridge.index.sync.sqlite.read",
@@ -7563,9 +7586,16 @@ class Memory:
                 failure_stage="index.sync",
             ):
                 with _translate_storage_errors("read the search-index outbox"):
-                    operations = self._store.pending_index_operations(limit=_OUTBOX_BATCH_SIZE)
+                    pending = self._store.pending_index_operations(limit=_OUTBOX_BATCH_SIZE)
+                # Rows already applied and waiting for the batched flush stay pending in SQLite
+                # until that flush acknowledges them, so they are not re-hydrated here.
+                operations = tuple(
+                    operation
+                    for operation in pending
+                    if operation.operation_id not in self._unflushed_operations
+                )
                 if not operations:
-                    return
+                    break
                 last_by_embedding = {operation.embedding_id: operation for operation in operations}
                 current = sorted(
                     last_by_embedding.values(), key=lambda operation: operation.operation_id
@@ -7615,38 +7645,59 @@ class Memory:
                     self._index.delete(deleted_ids)
                 if documents:
                     self._index.upsert(documents)
-            with (
-                self._trace(
-                    "mindbridge.index.sync.zvec.flush",
-                    kind="stage",
-                    failure_stage="index.sync",
-                ),
-                _translate_index_errors("update the search index"),
-            ):
-                self._index.flush()
-            with (
-                self._trace(
-                    "mindbridge.index.sync.zvec.optimize",
-                    kind="stage",
-                    failure_stage="index.sync",
-                ),
-                _translate_index_errors("update the search index"),
-            ):
-                self._index.optimize_if_needed()
-            with (
-                self._trace(
-                    "mindbridge.index.sync.sqlite.ack",
-                    kind="stage",
-                    failure_stage="index.sync",
-                ),
-                _translate_storage_errors("acknowledge the search-index outbox"),
-            ):
-                acknowledged = self._store.acknowledge_index_operations(operations)
-            if acknowledged != len(operations):
-                raise StorageError(
-                    "search-index outbox changed while it was being acknowledged",
-                    reason="flush_failed",
-                )
+            self._unflushed_operations.update(
+                (operation.operation_id, operation) for operation in operations
+            )
+            # A deletion is made durable before its call returns: an erased record must not stay
+            # in the index, nor be named by a pending outbox row, for the sake of write latency.
+            if deleted_ids or len(self._unflushed_operations) >= _INDEX_FLUSH_OPERATIONS:
+                self._flush_index()
+        if flush and self._unflushed_operations:
+            self._flush_index()
+
+    def _flush_index(self) -> None:
+        """Make the applied Zvec changes durable, then acknowledge exactly their outbox rows.
+
+        A flush that fails leaves the rows both pending in SQLite and applied in memory, so the
+        next drain retries the flush without re-applying them. After a flush that succeeded the
+        set is cleared before the optimize and acknowledge steps: if either fails the rows are
+        re-applied (an idempotent upsert or delete) and acknowledged by the next drain, and a
+        compaction inside `optimize_if_needed` can never run over unflushed documents.
+        """
+        operations = tuple(self._unflushed_operations.values())
+        with (
+            self._trace(
+                "mindbridge.index.sync.zvec.flush",
+                kind="stage",
+                failure_stage="index.sync",
+            ),
+            _translate_index_errors("update the search index"),
+        ):
+            self._index.flush()
+        self._unflushed_operations.clear()
+        with (
+            self._trace(
+                "mindbridge.index.sync.zvec.optimize",
+                kind="stage",
+                failure_stage="index.sync",
+            ),
+            _translate_index_errors("update the search index"),
+        ):
+            self._index.optimize_if_needed()
+        with (
+            self._trace(
+                "mindbridge.index.sync.sqlite.ack",
+                kind="stage",
+                failure_stage="index.sync",
+            ),
+            _translate_storage_errors("acknowledge the search-index outbox"),
+        ):
+            acknowledged = self._store.acknowledge_index_operations(operations)
+        if acknowledged != len(operations):
+            raise StorageError(
+                "search-index outbox changed while it was being acknowledged",
+                reason="flush_failed",
+            )
 
     def _index_documents(self) -> Iterator[IndexDocument]:
         after: tuple[datetime, str] | None = None
@@ -11445,6 +11496,11 @@ def _lexical_relevance(
     }
 
 
+# Every search re-derives the terms of ~100 hydrated candidates whose content has not changed
+# since the last search that ranked them; the terms are a pure function of the text.
+# ponytail: bounded by entries, not bytes -- a 16 KB record costs 16 KB of cache; shrink or key by
+# (memory_id, updated_at) if resident memory ever matters more than the ~0.4 ms per search.
+@lru_cache(maxsize=4096)
 def _lexical_terms(value: str) -> frozenset[str]:
     """Split text into words, plus adjacent-character bigrams for runs `\\w+` cannot split.
 

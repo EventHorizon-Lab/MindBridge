@@ -22,6 +22,7 @@ from collections.abc import (
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from itertools import groupby, zip_longest
 from pathlib import Path
 from threading import Lock
@@ -9537,6 +9538,9 @@ def validate_asset_name(value: str) -> str:
     return value
 
 
+# Hydration re-canonicalizes metadata the store itself wrote, so the round trip is a no-op that a
+# search pays ~140 times; the result is a pure function of the text, and invalid JSON is not cached.
+@lru_cache(maxsize=1024)
 def _canonical_object_json(value: str) -> str:
     try:
         decoded: object = json.loads(value, parse_constant=_reject_json_constant)
