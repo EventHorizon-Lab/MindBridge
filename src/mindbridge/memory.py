@@ -63,6 +63,12 @@ from mindbridge._telemetry import (
     MODEL_MODULE,
     MODEL_TTFT,
     OPERATION_TTFT,
+    RECALL_COMPLETE,
+    RECALL_EXHAUSTIVE_ROWS,
+    RECALL_FALLBACK,
+    RECALL_OPS,
+    RECALL_REPLAN,
+    RECALL_SHAPE,
     SPAN_KIND,
     TRACER_NAME,
     VISION_BATCHES_FAILED,
@@ -7562,14 +7568,29 @@ class Memory:
         """
         if not self._recall_planning:
             return None
-        with self._trace("mindbridge.recall", kind="stage"):
+        with self._trace("mindbridge.recall", kind="stage") as span:
+            question, k = context.prepared.text, context.limit
             plan = self._recall_plan(
-                context.prepared.text,
+                question,
                 reference_at=context.reference,
-                k=context.limit,
+                k=k,
                 attempted=attempted,
             )
-            return execute(plan, _RecallReads(self, context))
+            program = execute(plan, _RecallReads(self, context))
+            span.set_attributes(
+                {
+                    RECALL_SHAPE: plan.shape,
+                    RECALL_OPS: tuple(step.op for step in plan.steps),
+                    RECALL_EXHAUSTIVE_ROWS: len(program.exhaustive),
+                    RECALL_COMPLETE: program.complete,
+                    RECALL_REPLAN: bool(attempted),
+                    # Every way planning can fail resolves to this same plan, so equality with it
+                    # is the only signal that says the planner did not decide this question --
+                    # which is what a result claiming the feature ran has to be read against.
+                    RECALL_FALLBACK: plan == fallback_plan(question, k=k),
+                }
+            )
+            return program
 
     def _grounded_recall(
         self,

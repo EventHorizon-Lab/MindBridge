@@ -476,6 +476,8 @@ class SampleResult:
     ranked_source_ids_complete: bool = False
     dropped_hits: int | None = None
     answer_policy: AnswerPolicy | None = None
+    # The shape of the recall plan this answer was grounded on; None unless the run planned.
+    recall_shape: str | None = None
     abstained: bool = False
     abstention_reason: str | None = None
     ingest_failures: tuple[FailureDetail, ...] = ()
@@ -514,6 +516,7 @@ class SampleResult:
             "ranked_source_ids": self.ranked_source_ids,
             "ranked_source_ids_complete": self.ranked_source_ids_complete,
             "dropped_hits": self.dropped_hits,
+            "recall_shape": self.recall_shape,
             "task": self.task,
             # The policy this sample's request carried; only the product arm reaches `ask`.
             "answer_policy": self.answer_policy,
@@ -950,32 +953,34 @@ class _BaselineGenerator:
         await self._client.close()
 
 
+# The optional capabilities `Memory` probes with `isinstance` against a `runtime_checkable`
+# protocol, which reads attributes with `inspect.getattr_static`: a method reached only through
+# `__getattr__` is invisible to it, and one declared on the proxy claims a capability the pooled
+# backend may not have. `plan_recall` was hidden that way, so every harness question silently
+# answered from the fallback point plan; `stream_answer` was declared unconditionally, so a
+# pooled backend without it failed the call instead of taking the buffered path. Binding the
+# ones the pool really has onto the proxy instance declares exactly its own capabilities. Every
+# required protocol member stays an explicit declaration below, because a property cannot be
+# forwarded this way -- reading it here would snapshot its value.
+_OPTIONAL_CAPABILITY_METHODS = ("plan_recall", "stream_answer")
+
+
 class _BorrowedBackend:
     """Forward a shared backend while making per-store ``close`` a no-op."""
 
     def __init__(self, backend: object) -> None:
         self._backend = backend
+        for name in _OPTIONAL_CAPABILITY_METHODS:
+            # A subclass that wraps the call itself owns the name; anything else binds the
+            # pooled backend's own method, which also keeps its real signature.
+            if hasattr(type(self), name):
+                continue
+            method = getattr(backend, name, None)
+            if callable(method):
+                setattr(self, name, method)
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._backend, name)
-
-    def stream_answer(
-        self,
-        question: ModelInput,
-        hits: Sequence[SearchHit],
-        *,
-        answer_policy: AnswerPolicy = "strict",
-        exhaustive: bool = False,
-    ) -> Iterator[str]:
-        return cast(
-            Iterator[str],
-            cast(Any, self._backend).stream_answer(
-                question,
-                hits,
-                answer_policy=answer_policy,
-                exhaustive=exhaustive,
-            ),
-        )
 
     def close(self) -> None:
         return None
@@ -2101,11 +2106,19 @@ def _with_grounding_loss(
     samples: Sequence[SampleResult],
     telemetry: EvaluationTelemetry,
 ) -> tuple[SampleResult, ...]:
-    """Attach each answer's inline-budget loss, so it reads apart from retrieval loss."""
+    """Attach each answer's inline-budget loss, so it reads apart from retrieval loss.
+
+    The recall plan's shape rides along: it is the same per-sample join, and a per-question
+    shape is what tells a reader which question classes the planner actually reshaped.
+    """
     return tuple(
         sample
         if (grounding := telemetry.sample_grounding(sample.sample_id)) is None
-        else replace(sample, dropped_hits=grounding.dropped_hits)
+        else replace(
+            sample,
+            dropped_hits=grounding.dropped_hits,
+            recall_shape=grounding.recall_shape,
+        )
         for sample in samples
     )
 

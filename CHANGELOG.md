@@ -30,7 +30,13 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   replace is held back and reaches the caller only if it is the round that stands. A backend
   without the new optional `RecallPlanningBackend.plan_recall` capability, a planner error, and
   any plan the kernel will not run all fall back to the single search `ask` has always made, so
-  the default path is unchanged.
+  the default path is unchanged. The `mindbridge.recall` stage span carries the plan's shape, its
+  op list, the number of exhaustive rows, whether the set was complete, whether the round was a
+  replan, and whether the plan was the fallback -- because every failure resolves to that same
+  fallback, so nothing else distinguishes a planner that ran from one that was never reached.
+  `mindbridge-bench eval` aggregates those into a `recall` block per task under `performance`
+  (plan count, plans by shape, fallback count, replan count, incomplete count, exhaustive-row
+  distribution) and stamps each sample's own plan shape into `samples.jsonl` as `recall_shape`.
 - Every grounded answer prompt now asks for the whole question to be answered, in the shortest
   complete form, with a list holding exactly the items the hits support. Measured on questions
   the reader did answer rather than refuse: a question asking for two things came back with one,
@@ -813,6 +819,17 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Fixed
 
+- `recall_planning` now actually plans under `mindbridge-bench eval`. The harness lends one
+  answerer to every isolated store through a forwarding proxy, and `Memory` probes the optional
+  `RecallPlanningBackend` capability with `isinstance` against a `runtime_checkable` protocol --
+  which reads attributes with `inspect.getattr_static`, so the proxy's `plan_recall`, reachable
+  only through `__getattr__`, was invisible and every question silently answered from the
+  fallback point plan: measured, exactly one generation call for each of 31 questions and the
+  same twelve hits the unplanned baseline grounded on. The proxy now declares the optional
+  capabilities its pooled backend really has, and only those, so a pool that cannot plan is still
+  reported as unable to plan. The same declaration fixes the mirror image: `stream_answer` was
+  declared unconditionally, so a pooled backend without it failed the call instead of taking the
+  buffered path.
 - The live `mindbridge-bench eval` progress bar no longer appears frozen while a unit rebuilds,
   ingests, deliberates, or waits for its first answer. It preserves the truthful completed-sample
   count while refreshing elapsed time once a second and summarizing every active unit by phase.

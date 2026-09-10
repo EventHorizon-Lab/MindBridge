@@ -8,7 +8,7 @@ import platform
 import resource
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -33,6 +33,11 @@ from mindbridge._telemetry import (
     MODEL_RESPONSE_SYSTEM_FINGERPRINTS,
     MODEL_TTFT,
     OPERATION_TTFT,
+    RECALL_COMPLETE,
+    RECALL_EXHAUSTIVE_ROWS,
+    RECALL_FALLBACK,
+    RECALL_REPLAN,
+    RECALL_SHAPE,
     SPAN_KIND,
     TOKEN_AUDIO_SECONDS,
     TOKEN_CACHED_INPUT,
@@ -91,6 +96,7 @@ JUDGE_PURPOSE = "judge"
 ANSWER_SPAN = "mindbridge.ask"
 SEARCH_E2E_SPAN = "mindbridge.search"
 ASK_RETRIEVAL_SPAN = "mindbridge.retrieve"
+RECALL_SPAN = "mindbridge.recall"
 # Compatibility export for callers that imported the former ambiguous name. Result documents
 # expose it only as a deprecated alias of ``ask_retrieval_core``.
 SEARCH_SPAN = ASK_RETRIEVAL_SPAN
@@ -106,10 +112,15 @@ _INPUT_MODALITIES = "mindbridge.input.modalities"
 
 @dataclass(frozen=True, slots=True)
 class SampleGrounding:
-    """How much retrieved evidence one answer's inline context budget removed."""
+    """How much retrieved evidence one answer's inline context budget removed.
+
+    `recall_shape` is the shape of the last recall plan this answer ran -- the one it was
+    grounded on -- and is None when the run did not plan at all.
+    """
 
     dropped_hits: int
     media_elided_hits: int
+    recall_shape: str | None = None
 
 
 @dataclass(slots=True)
@@ -589,6 +600,15 @@ class _TaskTelemetry:
     ingest_attempted_items: int = 0
     ingest_successful_items: int = 0
     ingest_error_count: int = 0
+    # Recall-planning activation, populated only when `recall_planning` is on: without it a
+    # result document cannot tell a planner that ran and chose a point plan from a planner that
+    # was never reached, which is exactly how a hidden `plan_recall` capability read.
+    recall_shapes: dict[str, int] = field(default_factory=dict)
+    recall_plan_count: int = 0
+    recall_fallback_count: int = 0
+    recall_replan_count: int = 0
+    recall_incomplete_count: int = 0
+    recall_exhaustive_rows: _Samples = field(default_factory=_Samples)
 
     def add(self, span: ReadableSpan) -> None:  # noqa: C901 - one pass classifies every dimension
         attributes = span.attributes or {}
@@ -620,6 +640,8 @@ class _TaskTelemetry:
             self._add_time_to_searchable(attributes)
         elif span.name == BENCHMARK_COMPILE_SPAN:
             self._add_compile_bundle(attributes)
+        elif span.name == RECALL_SPAN:
+            self._add_recall_plan(attributes)
         elif span.name == BENCHMARK_JUDGE_SPAN:
             self.judge.add(span)
             sample = _string_attribute(attributes, BENCHMARK_SAMPLE)
@@ -675,6 +697,19 @@ class _TaskTelemetry:
         value = _float_attribute(attributes, CAPTURE_TIME_TO_SEARCHABLE)
         if value is not None:
             self.time_to_searchable_ms.add(value)
+
+    def _add_recall_plan(self, attributes: Mapping[str, AttributeValue]) -> None:
+        shape = _string_attribute(attributes, RECALL_SHAPE)
+        if shape is None:
+            return
+        self.recall_plan_count += 1
+        self.recall_shapes[shape] = self.recall_shapes.get(shape, 0) + 1
+        self.recall_fallback_count += attributes.get(RECALL_FALLBACK) is True
+        self.recall_replan_count += attributes.get(RECALL_REPLAN) is True
+        self.recall_incomplete_count += attributes.get(RECALL_COMPLETE) is not True
+        rows = _int_attribute(attributes, RECALL_EXHAUSTIVE_ROWS)
+        if rows is not None:
+            self.recall_exhaustive_rows.add(rows)
 
     def _add_compile_bundle(self, attributes: Mapping[str, AttributeValue]) -> None:
         chars = _int_attribute(attributes, BENCHMARK_COMPILE_CHARS)
@@ -898,6 +933,23 @@ class _TaskTelemetry:
             "bundle_media_items": self.compile_media_items.json(),
         }
 
+    def _recall_json(self) -> dict[str, object]:
+        return {
+            **self._span_latency_json(RECALL_SPAN),
+            "measures": (
+                "recall-planning activation: how many plans ran, in what shape, how many were "
+                "the fallback plan every planning failure resolves to, how many were a replan "
+                "round, and how many claimed a set no read completed; empty unless the run sets "
+                "recall_planning"
+            ),
+            "plan_count": self.recall_plan_count,
+            "shapes": dict(sorted(self.recall_shapes.items())),
+            "fallback_count": self.recall_fallback_count,
+            "replan_count": self.recall_replan_count,
+            "incomplete_count": self.recall_incomplete_count,
+            "exhaustive_rows": self.recall_exhaustive_rows.json(),
+        }
+
     def _nodes_json(
         self,
         nodes: Mapping[str, _Durations],
@@ -1000,6 +1052,7 @@ class _TaskTelemetry:
             "time_to_searchable_ms": self._time_to_searchable_json(),
             "formation": self._span_latency_json(SETTLE_SPAN),
             "compile": self._compile_json(),
+            "recall": self._recall_json(),
             "nodes": self._nodes_json(self.nodes, self.node_breakdowns),
             "diagnostic": {
                 "excluded_from_product_metrics": True,
@@ -1139,12 +1192,22 @@ class EvaluationTelemetry(SpanProcessor):
                     _string_attribute(attributes, SPAN_KIND) == "model"
                     and _int_attribute(attributes, MODEL_REQUEST_COUNT) != 0
                 ):
-                    grounding = SampleGrounding(
+                    grounding = replace(
+                        grounding,
                         dropped_hits=grounding.dropped_hits
                         + (_int_attribute(attributes, GROUNDING_HITS_DROPPED) or 0),
                         media_elided_hits=grounding.media_elided_hits
                         + (_int_attribute(attributes, GROUNDING_MEDIA_ELIDED) or 0),
                     )
+                shape = (
+                    None
+                    if span.name != RECALL_SPAN
+                    else _string_attribute(attributes, RECALL_SHAPE)
+                )
+                if shape is not None:
+                    # The last plan a replanned question ran is the one its answer was grounded
+                    # on, so a later round overwrites an earlier one.
+                    grounding = replace(grounding, recall_shape=shape)
                 self._samples[sample] = grounding
 
     def result(
