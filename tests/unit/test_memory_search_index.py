@@ -30,7 +30,12 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from mindbridge import Memory, RetrievalScope
-from mindbridge._telemetry import VISION_BATCHES_FAILED, VISION_BATCHES_RETRIED
+from mindbridge._telemetry import (
+    IDENTITY_NAMES_BOUND,
+    IDENTITY_NAMES_REFUSED,
+    VISION_BATCHES_FAILED,
+    VISION_BATCHES_RETRIED,
+)
 from mindbridge.exceptions import ModelError
 from mindbridge.infrastructure.local.store import LocalStore
 from mindbridge.memory import (
@@ -1226,8 +1231,13 @@ def test_a_described_clip_carries_its_durable_facts_as_their_own_section(tmp_pat
         assert described.startswith("Shown: two people at a kitchen table")
         assert "Hongqiao" in described
         assert "Fact:" not in described, "a fact must not stay inside the description"
+        # The label is projected to the name this same write's own facts just staged, the same
+        # projection transcript prose gets -- see `_project_fact_labels`. The binding line reads
+        # a little redundant rendered that way ("Lily is called Lily"), which is the accepted
+        # cost of one write-time pass rather than a second special case for the line that is the
+        # assertion itself.
         assert _section(stored, f"[facts:{asset_id}]") == (
-            "speaker_1 is called Lily\nLily is allergic to peanuts"
+            "Lily is called Lily\nLily is allergic to peanuts"
         )
         # The verbatim asset stays attached: the sections are additional keys, not a replacement.
         assert record.assets[0].sha256 is not None
@@ -1452,6 +1462,87 @@ def test_a_stated_name_never_replaces_the_one_a_host_registered(tmp_path: Path) 
         assert [record.operation.intent for record in memory.operations()] == [
             MemoryIntent.IDENTIFY
         ]
+
+
+def test_a_stated_name_with_a_few_words_is_bound_in_full(tmp_path: Path) -> None:
+    """A short multi-word name is not truncated to its first word.
+
+    The binding is bounded by length, not by word count: up to four words is still one name.
+    """
+    describer = _StructuredDescriber(
+        "Shown: two people at a kitchen table",
+        "Fact: speaker_1 is called Mary Jane",
+    )
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        transcriber=_Diarised(),
+        vision_describer=describer,
+    ) as memory:
+        named = memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
+        identity_id = _speaker_identity(memory, named.id, "speaker_1")
+
+        assert memory.identity(identity_id).name == "Mary Jane"  # type: ignore[union-attr]
+
+
+def test_a_stated_name_does_not_swallow_the_clause_that_follows_it(tmp_path: Path) -> None:
+    """A name is a handful of words, not everything up to the next period.
+
+    The old pattern captured every character up to a period or semicolon, so a fact that kept
+    talking past the name in the same sentence ("...and works in marketing") bound the whole
+    clause as the name. Bounded to a few words, that sentence fails to match at all, and nothing
+    is bound rather than something wrong.
+    """
+    describer = _StructuredDescriber(
+        "Shown: two people at a kitchen table",
+        "Fact: speaker_1 is called Lily and works in marketing",
+    )
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        transcriber=_Diarised(),
+        vision_describer=describer,
+    ) as memory:
+        named = memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
+        identity_id = _speaker_identity(memory, named.id, "speaker_1")
+
+        assert memory.identity(identity_id).name is None  # type: ignore[union-attr]
+        assert memory.operations() == ()
+
+
+def test_a_fact_naming_a_label_nobody_produced_is_counted_not_silently_dropped(
+    tmp_path: Path,
+) -> None:
+    """A fact naming `speaker_5` when the clip only produced two speakers names nobody.
+
+    That drop used to vanish with no trace once the label failed to resolve to an identity.
+    It is the same kind of event as the "already named" refusal `_bind_speaker_names` already
+    counted, so both land on `IDENTITY_NAMES_REFUSED`.
+    """
+    describer = _StructuredDescriber(
+        "Shown: two people at a kitchen table",
+        "Fact: speaker_5 is called Nobody",
+    )
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        transcriber=_Diarised(),
+        vision_describer=describer,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
+    provider.shutdown()
+
+    spans = [
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.identity.names"
+    ]
+    assert len(spans) == 1
+    attributes = spans[0].attributes or {}
+    assert attributes.get(IDENTITY_NAMES_BOUND) == 0
+    assert attributes.get(IDENTITY_NAMES_REFUSED) == 1
 
 
 def test_a_stated_name_binds_nothing_without_a_speech_backend(tmp_path: Path) -> None:

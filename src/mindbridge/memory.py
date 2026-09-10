@@ -461,9 +461,13 @@ _FACT_LINE_PREFIX = "Fact:"
 # The one fact shape that is not just indexed text but an assertion about a person: it binds a
 # diarised speaker label to a name the dialogue itself stated. Tolerant of how the label is
 # spelled, because the label is the model's echo of a prompt, and strict about the sentence,
-# because anything looser would rename people out of ordinary description.
+# because anything looser would rename people out of ordinary description. The name itself is
+# bounded to a handful of words rather than "everything up to a period": an unbounded run
+# swallows whatever clause follows ("speaker_1 is called Lily and works in marketing" named the
+# whole clause), and a name that long fails to match at all rather than binding the wrong text.
 _NAME_BINDING = re.compile(
-    r"speakers?[ _-]?(?P<index>\d{1,3})\s+is\s+called\s+(?P<name>[^.;]+?)\s*[.;]?",
+    r"speakers?[ _-]?(?P<index>\d{1,3})\s+is\s+called\s+"
+    r"(?P<name>[^\s.;,]+(?: [^\s.;,]+){0,3})\s*[.;]?",
     re.IGNORECASE,
 )
 # Seconds to wait before describing a throttled or overloaded batch again. Coarse and short: the
@@ -694,6 +698,11 @@ class _OperationAssets:
     # than applied on the spot: the naming assertion reindexes every memory that mentions the
     # person, and this write's own memory does not exist until it commits.
     speaker_names: dict[str, str]
+    # A naming fact that named nobody: a label no recognizer in this clip produced, an identity
+    # that no longer exists by binding time, or a name that failed validation. Counted rather
+    # than only logged, alongside the refusals `_bind_speaker_names` already counts for a name
+    # that conflicts with one a person already carries.
+    speaker_names_refused: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -4726,7 +4735,9 @@ class Memory:
                 missing = [
                     replace(
                         memory,
-                        content=self._with_visual_descriptions(memory.content, described),
+                        content=self._with_visual_descriptions(
+                            memory.content, described, operation
+                        ),
                     )
                     for memory in missing
                 ]
@@ -4957,7 +4968,7 @@ class Memory:
             self._stage_speaker_names(described, operation)
             memory = replace(
                 memory,
-                content=self._with_visual_descriptions(memory.content, described),
+                content=self._with_visual_descriptions(memory.content, described, operation),
             )
             if Modality.AUDIO not in self._embedding_capabilities:
                 # Same rescue set `_add_prepared` allows, so a composition `add()` accepts is not
@@ -5498,9 +5509,11 @@ class Memory:
         to the same voice, which is what carries an identity across clips at all.
 
         Only a label this asset's own recognizer produced can be resolved, so a fact naming a
-        speaker who is not in this clip is dropped rather than guessed at. Cached descriptions
-        are read too: re-ingesting a corpus must reach the same named store as the first ingest,
-        and re-asserting a standing name is a no-op.
+        speaker who is not in this clip is dropped rather than guessed at -- counted into
+        `operation.speaker_names_refused`, the same drop tally `_bind_speaker_names` adds to and
+        reports, so a fact naming a label nobody produced is not simply invisible. Cached
+        descriptions are read too: re-ingesting a corpus must reach the same named store as the
+        first ingest, and re-asserting a standing name is a no-op.
         """
         for asset_id, description in descriptions.items():
             segments = operation.speech_segments.get(asset_id)
@@ -5512,8 +5525,37 @@ class Memory:
                 if match is None:
                     continue
                 identity_id = identities.get(f"speaker_{int(match['index'])}")
-                if identity_id is not None:
-                    operation.speaker_names.setdefault(identity_id, match["name"].strip())
+                if identity_id is None:
+                    operation.speaker_names_refused += 1
+                    continue
+                operation.speaker_names.setdefault(identity_id, match["name"].strip())
+
+    def _known_speaker_names(self, asset_id: str, operation: _OperationAssets) -> dict[str, str]:
+        """Map this asset's `speaker_N` labels to whatever name is already known for them.
+
+        "Known now" is a name this very batch's own facts just staged (`operation.speaker_names`)
+        or a name an already-registered identity carries on its recognized segments; a name a
+        later write asserts is not, which is the write-time/retrieval-time split documented on
+        `_project_fact_labels`.
+        """
+        segments = operation.speech_segments.get(asset_id)
+        if not segments:
+            return {}
+        names: dict[str, str] = {}
+        for identity_id, label in _speaker_labels(segments).items():
+            name = operation.speaker_names.get(identity_id)
+            if name is None:
+                name = next(
+                    (
+                        segment.speaker_name
+                        for segment in segments
+                        if segment.speaker_id == identity_id and segment.speaker_name
+                    ),
+                    None,
+                )
+            if name:
+                names[label] = name
+        return names
 
     def _bind_speaker_names(self, operation: _OperationAssets) -> None:
         """Register the staged names, now that the memory carrying the voices is readable.
@@ -5541,7 +5583,14 @@ class Memory:
                 proposed = None if profile is None else _identity_name(name)
             except ValidationError:
                 proposed = None
-            if profile is None or proposed is None or profile.name == proposed:
+            if profile is None or proposed is None:
+                # The identity a staged name resolved to has since vanished (merged or deleted),
+                # or the stated name failed validation. Either way the fact named nobody, which
+                # is worth counting apart from a silent `continue` even though there is nobody
+                # left to warn about by name.
+                operation.speaker_names_refused += 1
+                continue
+            if profile.name == proposed:
                 continue
             if profile.name is not None:
                 refused += 1
@@ -5561,6 +5610,8 @@ class Memory:
                     operation=operation,
                 )
             bound += 1
+        refused += operation.speaker_names_refused
+        operation.speaker_names_refused = 0
         if bound or refused:
             with self._trace("mindbridge.identity.names", kind="stage") as span:
                 span.set_attribute(IDENTITY_NAMES_BOUND, bound)
@@ -5590,6 +5641,7 @@ class Memory:
         self,
         prepared: _PreparedContent,
         descriptions: Mapping[str, str],
+        operation: _OperationAssets,
     ) -> _PreparedContent:
         """Union derived visual text into the indexed document, whatever the embedder can take.
 
@@ -5609,7 +5661,11 @@ class Memory:
             for asset in prepared.assets
             if asset.asset_id in descriptions
             and not _has_stream_description(prepared.text, (asset,))
-            for section in _description_sections(asset.asset_id, descriptions[asset.asset_id])
+            for section in _description_sections(
+                asset.asset_id,
+                descriptions[asset.asset_id],
+                self._known_speaker_names(asset.asset_id, operation),
+            )
         )
         if not sections:
             return prepared
@@ -10436,17 +10492,43 @@ def _has_stream_description(text: str, assets: Sequence[StoredAsset]) -> bool:
     )
 
 
-def _description_sections(asset_id: str, description: str) -> tuple[str, ...]:
+_NO_NAMES: Mapping[str, str] = {}
+
+
+def _description_sections(
+    asset_id: str, description: str, names: Mapping[str, str] = _NO_NAMES
+) -> tuple[str, ...]:
     """Render one caption as the document sections it becomes, what-is-shown first.
 
     A caption whose visible half is empty still contributes its facts, and one with no facts is
     exactly the single section this produced before facts existed.
+
+    `names` projects the facts half through whatever `speaker_N` -> name binding this write
+    already knows, the same way transcript prose is projected (`_speech_retrieval_text`) -- see
+    `_project_fact_labels` for why this projection runs once, here, and never again.
     """
     visible, facts = _split_description(description)
+    if facts and names:
+        facts = _project_fact_labels(facts, names)
     return (
         *((f"[visual description:{asset_id}]\n{visible}",) if visible else ()),
         *((f"[facts:{asset_id}]\n{facts}",) if facts else ()),
     )
+
+
+def _project_fact_labels(facts: str, names: Mapping[str, str]) -> str:
+    """Replace a speaker label with the name already known for it, at write time only.
+
+    Unlike `[speech identities:]`, which `_retrieval_text` re-projects from the current name on
+    every index rebuild, `[facts:]` is rendered once, when the memory is written, from whatever
+    names this write already knows -- its own newly staged ones and any identity already named
+    before it. A name a *later* clip asserts does not retroactively rewrite an earlier one's
+    stored facts; only the identity's own projected name (`identities()`, `[speech identities:]`)
+    stays current for a person the store keeps renaming.
+    """
+    for label, name in names.items():
+        facts = re.sub(rf"\b{re.escape(label)}\b", name, facts)
+    return facts
 
 
 def _split_description(description: str) -> tuple[str, str]:
