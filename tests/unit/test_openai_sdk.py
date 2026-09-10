@@ -4427,6 +4427,22 @@ def test_the_default_answer_policy_sends_the_same_request_as_asking_for_abstenti
     ) in openai_backend._GROUNDED_SYSTEM_PROMPT
 
 
+def test_both_policies_ask_for_a_whole_answer_in_the_shortest_complete_form() -> None:
+    """Answer shaping is not a policy: a refusal-capable reader shapes its answers the same way.
+
+    Three losses measured on questions the reader did answer -- half of a two-part question, a
+    phrase padded into prose, a list padded past the evidence -- so the instruction lives in the
+    shared epilogue and every grounded system prompt carries it.
+    """
+    for prompt in (
+        openai_backend._GROUNDED_SYSTEM_PROMPT,
+        openai_backend._BEST_EFFORT_SYSTEM_PROMPT,
+    ):
+        assert "Answer every part of the question that was asked" in prompt
+        assert "shortest complete answer" in prompt
+        assert "include exactly the items the hits support" in prompt
+
+
 def test_best_effort_asks_for_a_committed_answer_and_reports_the_marker_separately() -> None:
     requests: list[dict[str, object]] = []
     hit = SearchHit(

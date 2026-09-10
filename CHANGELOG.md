@@ -10,6 +10,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Added
 
+- Every grounded answer prompt now asks for the whole question to be answered, in the shortest
+  complete form, with a list holding exactly the items the hits support. Measured on questions
+  the reader did answer rather than refuse: a question asking for two things came back with one,
+  a phrase-sized answer arrived as prose, and a list arrived padded with plausible items no hit
+  supported. The instruction is one sentence in the shared epilogue, so both answer policies
+  carry it.
 - `answer_policy` on `Memory.ask()`, `Memory.ask_stream()`, their `AsyncMemory` twins, REST
   `AnswerRequest`, and the MCP `ask_memory` tool, with the new `AnswerPolicy` alias exported from
   `mindbridge`. Abstaining is a policy the caller owns, not a fixed product behaviour: an

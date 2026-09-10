@@ -77,7 +77,14 @@ _GROUNDED_EPILOGUE = (
     "Each memory carries the time it happened (`occurred_at`, or `created_at` when the event time "
     "is unknown) and the question carries the reference time it is asked at; resolve every "
     "relative time expression against those timestamps and state the resolved date or duration "
-    "explicitly."
+    "explicitly. "
+    # Three shapes of loss measured on answered questions, none of them retrieval: a question
+    # asking for two things answered with one, a phrase-sized answer padded into prose the judge
+    # then has to unwrap, and a list padded with plausible items no hit supports.
+    "Answer every part of the question that was asked -- one asking for two things, such as a "
+    "date and a time, is not answered by either alone -- give the shortest complete answer, a "
+    "word or a phrase rather than a sentence unless the question asks you to explain, and when "
+    "the answer is a list include exactly the items the hits support and no others."
 )
 _GROUNDED_SYSTEM_PROMPT = (
     _GROUNDED_PREAMBLE + "If the hits do not contain enough "
