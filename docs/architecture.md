@@ -213,6 +213,17 @@ merging, splitting, or erasing an identity re-enqueues the affected memories thr
 durable outbox, and a stale field can only cost recall: SQLite reapplies both predicates during
 hydration and decides.
 
+With `recall_planning` enabled, `ask()` adds a second retrieval semantics beside that ranking.
+The answerer is asked for a recall plan -- a question shape and bounded reads -- and the reads
+that are not `similar` are answered by predicate rather than by rank: substring matching over
+`content`, an event-time window, the records adjacent in corpus order, or the records one
+identity is in. They read SQLite only, hydrate through the same authoritative scoped read as
+every other hit, and are bounded by an explicit row count. The evidence set is a union with ID
+dedup and no recomputed score -- exhaustive rows in time order, then similarity rows by rank --
+and the answer prompt states which reads produced it and whether the set is complete, because
+completeness is what licenses a count or a list. Any missing capability, planner failure, or
+plan the kernel will not run falls back to the single ranked search, which is the default.
+
 `search_with_trace()` exposes bounded ranking signals and terminal rejection reasons without
 copying memory content or metadata into the trace. `ask()` uses the same retrieval path, applies
 the evidence budget, routes the question and hits through the generation backend's declared

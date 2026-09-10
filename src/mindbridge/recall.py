@@ -55,7 +55,9 @@ _FIELDS: frozenset[str] = frozenset(
     }
 )
 _HONOURED: Mapping[str, frozenset[str]] = {
-    "similar": frozenset({"query", "k", "time", "memory_type"}),
+    # `similar` carries no filters: it ranks the caller's own question, which already carries the
+    # temporal window and scope the caller asked with, and `k` is only how deep to rank it.
+    "similar": frozenset({"query", "k"}),
     "match": frozenset({"terms", "any_of", "time", "modality", "memory_type", "max_rows"}),
     "window": frozenset({"time", "modality", "memory_type", "max_rows"}),
     "neighbors": frozenset({"of", "before", "after", "max_rows"}),
@@ -139,15 +141,7 @@ class RecallResult:
 class RecallReader(Protocol):
     """The reads a recall program may make. `Memory` implements it over its own store."""
 
-    def similar(
-        self,
-        query: str,
-        *,
-        k: int,
-        occurred_from: datetime | None,
-        occurred_until: datetime | None,
-        memory_type: MemoryType | None,
-    ) -> tuple[SearchHit, ...]: ...
+    def similar(self, query: str, *, k: int) -> tuple[SearchHit, ...]: ...
 
     def match(
         self,
@@ -250,6 +244,61 @@ def execute(plan: RecallPlan, reader: RecallReader) -> RecallResult:
     )
 
 
+def recall_note(result: RecallResult, *, omitted: int = 0) -> str:
+    """State the program and whether its evidence is a complete set.
+
+    A count or a list is only licensed by completeness, and the reader cannot see the predicate
+    that produced its evidence. So the reads are named, and either the set is declared complete
+    or the shortfall is: measured, an answerer given an incomplete set with no warning states a
+    total for it anyway.
+    """
+    reads = "; ".join(
+        _step_note(step, outcome)
+        for step, outcome in zip(result.plan.steps, result.executed, strict=True)
+    )
+    if result.complete and not omitted:
+        completeness = (
+            "The evidence below is every record those reads matched, in time order, so a count "
+            "or a list over it is complete."
+        )
+    else:
+        shortfall = (
+            f"{omitted} further matched records are not shown"
+            if omitted
+            else "some matching records were not read"
+        )
+        completeness = (
+            f"{shortfall}, so the evidence is not a complete set: answer from what is shown and "
+            "do not state a total."
+        )
+    return f"Recall program ({result.plan.shape}): {reads}. {completeness}"
+
+
+def _step_note(step: RecallStep, outcome: RecallStepResult) -> str:
+    if step.op == "match":
+        detail = f"records containing {', '.join(step.terms)}"
+    elif step.op == "window":
+        detail = "records in the time span"
+    elif step.op == "neighbors":
+        detail = f"the {step.before} before and {step.after} after each of them"
+    elif step.op == "entity":
+        detail = f"records about {step.name}"
+    else:
+        detail = "the top-ranked records for the question"
+    return f"{detail}{_span_note(step)} ({outcome.rows})"
+
+
+def _span_note(step: RecallStep) -> str:
+    start, until = step.occurred_from, step.occurred_until
+    if start is not None and until is not None:
+        return f" between {start.isoformat()} and {until.isoformat()}"
+    if start is not None:
+        return f" since {start.isoformat()}"
+    if until is not None:
+        return f" before {until.isoformat()}"
+    return ""
+
+
 def _run(
     step: RecallStep,
     reader: RecallReader,
@@ -257,13 +306,7 @@ def _run(
 ) -> tuple[SearchHit, ...]:
     """Dispatch one step, or read nothing when its own inputs are missing."""
     if step.op == "similar":
-        return reader.similar(
-            step.query or "",
-            k=step.k,
-            occurred_from=step.occurred_from,
-            occurred_until=step.occurred_until,
-            memory_type=step.memory_type,
-        )
+        return reader.similar(step.query or "", k=step.k)
     if step.op == "match":
         return reader.match(
             step.terms,

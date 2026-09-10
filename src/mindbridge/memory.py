@@ -146,7 +146,14 @@ from mindbridge.models.base import (
     _modalities,
 )
 from mindbridge.plugins import MemoryConfig, MemoryPlugins
-from mindbridge.recall import RecallPlan, fallback_plan, parse_recall_plan
+from mindbridge.recall import (
+    RecallPlan,
+    RecallResult,
+    execute,
+    fallback_plan,
+    parse_recall_plan,
+    recall_note,
+)
 from mindbridge.types import (
     KIND_MEMORY_TYPES,
     AbstentionReason,
@@ -685,6 +692,150 @@ class _SearchOutcome:
     matched_dense_index_ids: tuple[tuple[str, str], ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class _RecallContext:
+    """What one answering round needs, so a second round repeats nothing but the reading."""
+
+    prepared: _PreparedContent
+    routed: ModelInput
+    assets: _OperationAssets
+    # The ranked hits this question already earned. A plan's `similar` step is this list, cut to
+    # its own depth: the ranking is over the question as asked, media and temporal window
+    # included, and re-running it against a rewritten query would be query rewriting -- a
+    # separate mechanism, measured separately, and a measured null here.
+    ranked: tuple[SearchHit, ...]
+    limit: int
+    reference: datetime
+    scope: RetrievalScope | None
+    memory_type: MemoryType | None
+    link_identities: bool
+    answer_policy: AnswerPolicy
+
+
+class _RecallReads:
+    """Run a recall plan's reads against one `Memory`, inside its open operation.
+
+    The exhaustive ops read SQLite through the store's own primitives and are hydrated the way
+    every other hit is. They carry no relevance score, because they earned none: they are in the
+    evidence set because they match the question's predicate, not because they ranked.
+    """
+
+    def __init__(self, memory: Memory, context: _RecallContext) -> None:
+        self._memory = memory
+        self._context = context
+
+    def similar(self, query: str, *, k: int) -> tuple[SearchHit, ...]:
+        del query
+        return self._context.ranked[:k]
+
+    def match(
+        self,
+        terms: Sequence[str],
+        *,
+        any_of: bool,
+        occurred_from: datetime | None,
+        occurred_until: datetime | None,
+        modality: Modality | None,
+        memory_type: MemoryType | None,
+        max_rows: int,
+        identity_id: str | None = None,
+    ) -> tuple[SearchHit, ...]:
+        scope = self._context.scope or RetrievalScope()
+        return self._hits(
+            self._memory._store.match_memories(
+                tuple(terms),
+                any_of=any_of,
+                occurred_from=occurred_from,
+                occurred_until=occurred_until,
+                modality=None if modality is None else modality.value,
+                memory_type=self._memory_type(memory_type),
+                max_rows=max_rows,
+                valid_at=scope.valid_at,
+                known_at=scope.known_at,
+                near=scope.near,
+                radius_m=scope.radius_m,
+                place_id=scope.place_id,
+                identity_id=identity_id or scope.identity_id,
+            )
+        )
+
+    def window(
+        self,
+        *,
+        occurred_from: datetime,
+        occurred_until: datetime,
+        modality: Modality | None,
+        memory_type: MemoryType | None,
+        max_rows: int,
+    ) -> tuple[SearchHit, ...]:
+        scope = self._context.scope or RetrievalScope()
+        return self._hits(
+            self._memory._store.memories_in_window(
+                occurred_from=occurred_from,
+                occurred_until=occurred_until,
+                modality=None if modality is None else modality.value,
+                memory_type=self._memory_type(memory_type),
+                max_rows=max_rows,
+                valid_at=scope.valid_at,
+                known_at=scope.known_at,
+                near=scope.near,
+                radius_m=scope.radius_m,
+                place_id=scope.place_id,
+                identity_id=scope.identity_id,
+            )
+        )
+
+    def neighbors(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        before: int,
+        after: int,
+        max_rows: int,
+    ) -> tuple[SearchHit, ...]:
+        scope = self._context.scope or RetrievalScope()
+        return self._hits(
+            self._memory._store.neighbor_memories(
+                tuple(memory_ids),
+                before=before,
+                after=after,
+                max_rows=max_rows,
+                valid_at=scope.valid_at,
+                known_at=scope.known_at,
+                near=scope.near,
+                radius_m=scope.radius_m,
+                place_id=scope.place_id,
+                identity_id=scope.identity_id,
+            )
+        )
+
+    def entity(self, name: str, *, max_rows: int) -> tuple[SearchHit, ...]:
+        """Read what is known about one person, by identity when the name resolves to one.
+
+        A name no identity carries is not an error: the store may hold the person only as words
+        in other people's memories, so the read degrades to matching the name as text.
+        """
+        identity_id = self._memory._store.identity_id_for_name(name)
+        return self.match(
+            () if identity_id is not None else (name,),
+            any_of=True,
+            occurred_from=None,
+            occurred_until=None,
+            modality=None,
+            memory_type=None,
+            max_rows=max_rows,
+            identity_id=identity_id,
+        )
+
+    def _memory_type(self, requested: MemoryType | None) -> str | None:
+        """The caller's own `memory_type` wins: a plan may not widen the question's scope."""
+        chosen = self._context.memory_type or requested
+        return None if chosen is None else chosen.value
+
+    def _hits(self, memories: Sequence[StoredMemory]) -> tuple[SearchHit, ...]:
+        return tuple(self._memory._search_hit(memory, 0.0) for memory in memories)
+
+
 class Memory:
     """Persist and retrieve native text, image, video, audio, and omni memories."""
 
@@ -705,6 +856,9 @@ class Memory:
         minimum_relevance: float = _DEFAULT_CONFIG.minimum_relevance,
         ambiguity_margin: float = _DEFAULT_CONFIG.ambiguity_margin,
         evidence_budget_chars: int | None = _DEFAULT_CONFIG.evidence_budget_chars,
+        recall_planning: bool = _DEFAULT_CONFIG.recall_planning,
+        recall_set_budget_chars: int = _DEFAULT_CONFIG.recall_set_budget_chars,
+        recall_rounds: int = _DEFAULT_CONFIG.recall_rounds,
         decay_half_life_days: float | None = _DEFAULT_CONFIG.decay_half_life_days,
         reinforce_on_answer: bool = _DEFAULT_CONFIG.reinforce_on_answer,
         speaker_similarity: float = _DEFAULT_CONFIG.speaker_similarity,
@@ -749,16 +903,15 @@ class Memory:
         self._identity_link_min_assets = _positive_int(
             identity_link_min_assets, "identity_link_min_assets"
         )
-        if not isinstance(index_speech, bool):
-            raise ValidationError("index_speech must be a boolean")
-        self._index_speech = index_speech
+        self._index_speech = _strict_bool(index_speech, "index_speech")
         self._minimum_relevance = _unit_interval(minimum_relevance, "minimum_relevance")
         self._ambiguity_margin = _unit_interval(ambiguity_margin, "ambiguity_margin")
         self._evidence_budget = _evidence_budget(evidence_budget_chars)
+        self._recall_planning = _strict_bool(recall_planning, "recall_planning")
+        self._recall_set_budget = _positive_int(recall_set_budget_chars, "recall_set_budget_chars")
+        self._recall_rounds = _positive_int(recall_rounds, "recall_rounds")
         self._decay_half_life = _decay_half_life(decay_half_life_days)
-        if not isinstance(reinforce_on_answer, bool):
-            raise ValidationError("reinforce_on_answer must be a boolean")
-        self._reinforce_on_answer = reinforce_on_answer
+        self._reinforce_on_answer = _strict_bool(reinforce_on_answer, "reinforce_on_answer")
         self._memory_budget_records = (
             None
             if memory_budget_records is None
@@ -1719,43 +1872,50 @@ class Memory:
                         self._recognize_speech(speech_assets, assets)
                     hits = prepared_search().hits
                     _record_retrieval_results(hits)
-            hits = _grounding_hits(hits, limit, budget_chars=self._evidence_budget)
-            # Every question the answerer reads as text gets the reference time, not just the ones
-            # whose phrasing a parser recognized. "How long ago did grandpa visit?" narrows no
-            # retrieval window and names no date, yet it is exactly the question the reader cannot
-            # answer without knowing when it is being asked. Applied after routing, because that
-            # is what decides whether the reader gets text at all -- a spoken question becomes
-            # text there -- and because routing appends speech identities and transcripts, which
-            # would otherwise land after the line documented as final.
-            routed = self._route_generation(prepared, assets)
-            routed_question = _with_reference_time(routed, reference) if routed.text else routed
-            routed_hits = (
-                self._route_generation_hits(hits, assets, link_identities=link_identities)
-                if hits
-                else ()
+            round_context = _RecallContext(
+                prepared=prepared,
+                # Every question the answerer reads as text gets the reference time, not just the
+                # ones whose phrasing a parser recognized. "How long ago did grandpa visit?"
+                # narrows no retrieval window and names no date, yet it is exactly the question
+                # the reader cannot answer without knowing when it is being asked. Applied after
+                # routing, because that is what decides whether the reader gets text at all -- a
+                # spoken question becomes text there -- and because routing appends speech
+                # identities and transcripts, which would otherwise land after the line
+                # documented as final.
+                routed=self._route_generation(prepared, assets),
+                assets=assets,
+                ranked=hits,
+                limit=limit,
+                reference=reference,
+                scope=scope,
+                memory_type=_optional_memory_type(memory_type),
+                link_identities=link_identities,
+                answer_policy=answer_policy,
             )
-            self._persist_transcripts(assets)
-            # `closing` rather than plain iteration: an abandoned stream throws `GeneratorExit`
-            # at the yield below, and without this the inner generator would only be closed
-            # when the cleared frame drops its last reference. That defers closing the
-            # provider's response and ends `mindbridge.model.generation` after its own parent,
-            # which loses the call's model usage and emits a malformed trace.
-            with closing(
-                self._answer_chunks(routed_question, routed_hits, answer_policy=answer_policy)
-            ) as deltas:
-                while True:
-                    try:
-                        delta = next(deltas)
-                    except StopIteration as complete:
-                        result = complete.value
-                        break
-                    if delta.strip() and not operation_ttft_recorded:
-                        operation_ttft_ms = (perf_counter() - started) * 1_000.0
-                        if queue_time_ms is not None:
-                            operation_ttft_ms += queue_time_ms
-                        span.set_attribute(OPERATION_TTFT, operation_ttft_ms)
-                        operation_ttft_recorded = True
-                    yield AnswerChunk(text=delta)
+            attempted = ""
+            for attempt in range(self._recall_rounds if self._recall_planning else 1):
+                # `closing` rather than plain iteration: an abandoned stream throws
+                # `GeneratorExit` at the yield below, and without this the inner generator would
+                # only be closed when the cleared frame drops its last reference. That defers
+                # closing the provider's response and ends `mindbridge.model.generation` after
+                # its own parent, which loses the call's model usage and emits a malformed trace.
+                with closing(self._recall_round(round_context, attempted=attempted)) as deltas:
+                    while True:
+                        try:
+                            delta = next(deltas)
+                        except StopIteration as complete:
+                            result, hits = complete.value
+                            break
+                        if delta.strip() and not operation_ttft_recorded:
+                            operation_ttft_ms = (perf_counter() - started) * 1_000.0
+                            if queue_time_ms is not None:
+                                operation_ttft_ms += queue_time_ms
+                            span.set_attribute(OPERATION_TTFT, operation_ttft_ms)
+                            operation_ttft_recorded = True
+                        yield AnswerChunk(text=delta)
+                if not self._replan_wanted(result, round_context, attempt=attempt):
+                    break
+                attempted = _attempt_note(hits, result)
             used_ids = {hit.id for hit in result.hits}
             grounding = tuple(hit for hit in hits if hit.id in used_ids)
             # Reinforcement is part of answering, so it stays inside the operation and runs
@@ -7303,7 +7463,102 @@ class Memory:
                 _normalized_vector(vector, self._embedding_dimension) for vector in vectors
             )
 
-    def _recall_plan(self, question: str, *, reference_at: datetime, k: int) -> RecallPlan:
+    def _recall_round(
+        self,
+        context: _RecallContext,
+        *,
+        attempted: str,
+    ) -> Generator[str, None, tuple[AnswerResult, tuple[SearchHit, ...]]]:
+        """Ground one attempt at this question and yield its answer deltas.
+
+        With `recall_planning` off there is exactly one attempt and this is the sequence `ask`
+        has always run: the ranking's own grounding window, the routed question with the
+        reference clock last, then the answer.
+        """
+        program = self._recall_program(context, attempted=attempted)
+        hits, note = self._grounded_recall(program, context)
+        routed = context.routed
+        question = (
+            _with_reference_time(_with_recall_note(routed, note), context.reference)
+            if routed.text
+            else routed
+        )
+        routed_hits = (
+            self._route_generation_hits(
+                hits,
+                context.assets,
+                link_identities=context.link_identities,
+            )
+            if hits
+            else ()
+        )
+        self._persist_transcripts(context.assets)
+        with closing(
+            self._answer_chunks(question, routed_hits, answer_policy=context.answer_policy)
+        ) as deltas:
+            result = yield from deltas
+        return result, hits
+
+    def _recall_program(self, context: _RecallContext, *, attempted: str) -> RecallResult | None:
+        """Plan and run this question's reads, or None when planning is off."""
+        if not self._recall_planning:
+            return None
+        plan = self._recall_plan(
+            context.prepared.text,
+            reference_at=context.reference,
+            k=context.limit,
+            attempted=attempted,
+        )
+        return execute(plan, _RecallReads(self, context))
+
+    def _grounded_recall(
+        self,
+        program: RecallResult | None,
+        context: _RecallContext,
+    ) -> tuple[tuple[SearchHit, ...], str | None]:
+        """Choose the grounding window the question's shape asks for.
+
+        A ranking question keeps the window the ranking earned. A question that asked for every
+        matching record grounds on the set instead, up to `recall_set_budget_chars`, and carries
+        a line saying what the set is -- because a reader cannot see the predicate that produced
+        its evidence, and a count over a silently truncated set is a wrong answer stated
+        confidently.
+        """
+        if program is None or not program.plan.exhaustive:
+            budget = self._evidence_budget
+            return _grounding_hits(context.ranked, context.limit, budget_chars=budget), None
+        hits, omitted = _budgeted_recall(program, self._recall_set_budget)
+        return hits, recall_note(program, omitted=omitted)
+
+    def _replan_wanted(
+        self,
+        result: AnswerResult,
+        context: _RecallContext,
+        *,
+        attempt: int,
+    ) -> bool:
+        """Spend another round only on the failure the first round's own answer reported.
+
+        A committed answer the answerer flagged as thin is the one case where reading again is
+        known to be worth a call: under `strict` the same signal is already the caller's
+        reported refusal, and re-reading behind their back would answer a question they were
+        told could not be answered.
+        """
+        return (
+            self._recall_planning
+            and context.answer_policy == "best_effort"
+            and result.abstained
+            and attempt + 1 < self._recall_rounds
+        )
+
+    def _recall_plan(
+        self,
+        question: str,
+        *,
+        reference_at: datetime,
+        k: int,
+        attempted: str = "",
+    ) -> RecallPlan:
         """Ask the answerer how to read for this question, or keep today's single search.
 
         Every way this can go wrong lands on the same fallback -- a backend that cannot plan, a
@@ -7323,11 +7578,16 @@ class Memory:
             modalities=(Modality.TEXT,),
         ):
             mark_model_requests(1)
+            # The protocol is `runtime_checkable`, so `isinstance` proves the method exists and
+            # not that it takes this keyword. A backend written against the shorter signature
+            # keeps planning as long as the first round asks for nothing new.
+            previous: builtins.dict[str, str] = {} if not attempted else {"attempted": attempted}
             try:
                 payload = planner.plan_recall(
                     question,
                     reference_at=reference_at,
                     corpus_digest=self._corpus_digest(),
+                    **previous,
                 )
             except ModelError:
                 # Planning is not answering. A provider that refused this call has said nothing
@@ -10960,6 +11220,58 @@ def _batch_values(
     return batch
 
 
+def _budgeted_recall(
+    program: RecallResult,
+    budget_chars: int,
+) -> tuple[tuple[SearchHit, ...], int]:
+    """Ground on the set the program produced, chronologically, up to the character budget.
+
+    Exhaustive rows come first because they are the answer's shape; similarity rows spend what
+    is left. The returned count is how many rows the budget left out, which is what turns a
+    complete set into an incomplete one for the reader.
+    """
+    selected: builtins.list[SearchHit] = []
+    spent = 0
+    omitted = 0
+    for hit in program.hits:
+        cost = len(hit.content)
+        if selected and spent + cost > budget_chars:
+            omitted += 1
+            continue
+        selected.append(hit)
+        spent += cost
+    return tuple(selected), omitted
+
+
+def _with_recall_note(question: ModelInput, note: str | None) -> ModelInput:
+    """Append what the evidence set is, before the reference clock's own final line."""
+    if note is None or not question.text:
+        return question
+    return replace(question, text=f"{question.text}\n\n{note}")
+
+
+def _attempt_note(hits: Sequence[SearchHit], result: AnswerResult) -> str:
+    """Describe what one round read and what it could not answer, for the next plan.
+
+    Labels and event times only: the planner decides which reads to make next, and handing it
+    the evidence text would make it summarize records instead of planning over them.
+    """
+    read = ", ".join(
+        f"E{index}"
+        + ("" if hit.occurred_at is None else f" at {hit.occurred_at.date().isoformat()}")
+        for index, hit in enumerate(hits, start=1)
+    )
+    reason = (
+        "no usable evidence"
+        if result.abstention_reason is None
+        else (result.abstention_reason.value)
+    )
+    return (
+        f"read {len(hits)} records ({read or 'none'}) and reported {reason}; "
+        "the answer was a low-confidence guess"
+    )
+
+
 def _with_reference_time(question: ModelInput, reference_at: datetime) -> ModelInput:
     """Append the answering clock as the final line of what the reader is handed."""
     note = f"Reference time for relative dates: {reference_at.isoformat(timespec='seconds')}"
@@ -11809,6 +12121,13 @@ def _decay_half_life(days: float | None) -> timedelta | None:
 def _identifier(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         raise ValidationError(f"{name} must be non-empty and trimmed")
+    return value
+
+
+def _strict_bool(value: object, name: str) -> bool:
+    """Read a switch as the boolean it is: a truthy value is a mistake, not a silent yes."""
+    if not isinstance(value, bool):
+        raise ValidationError(f"{name} must be a boolean")
     return value
 
 

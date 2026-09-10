@@ -36,16 +36,8 @@ class _Reader:
         self.rows = rows
         self.calls: list[tuple[str, object]] = []
 
-    def similar(
-        self,
-        query: str,
-        *,
-        k: int,
-        occurred_from: datetime | None,
-        occurred_until: datetime | None,
-        memory_type: MemoryType | None,
-    ) -> tuple[SearchHit, ...]:
-        self.calls.append(("similar", (query, k, occurred_from, occurred_until, memory_type)))
+    def similar(self, query: str, *, k: int) -> tuple[SearchHit, ...]:
+        self.calls.append(("similar", (query, k)))
         return self.rows.get("similar", ())
 
     def match(

@@ -362,7 +362,10 @@ class RecallPlanningBackend(Protocol):
     The return value is the model's own JSON text, which the kernel validates: a backend that
     cannot plan, or one whose plan is unusable, costs the caller a fallback to plain similarity
     search and nothing else. `corpus_digest` is one line describing what is in the store, so a
-    plan cannot ask for a time span or a modality that does not exist.
+    plan cannot ask for a time span or a modality that does not exist. `attempted` describes what
+    an earlier round of the same question already read and why it was not enough; it is empty on
+    the first round and sent only when it is not, so a backend written against the shorter
+    signature keeps planning.
     """
 
     def plan_recall(
@@ -371,6 +374,7 @@ class RecallPlanningBackend(Protocol):
         *,
         reference_at: datetime,
         corpus_digest: str,
+        attempted: str = "",
     ) -> str | None: ...
 
 
