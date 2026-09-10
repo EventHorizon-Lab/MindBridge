@@ -452,6 +452,9 @@ _MODEL_STAGES = {
     "vision": "describe",
 }
 _MAX_TEXT_CHARACTERS = 65_536
+# The one line prefix the describer's durable statements arrive under, inside the same string as
+# the visible description. See `_split_description`.
+_FACT_LINE_PREFIX = "Fact:"
 _MAX_METADATA_BYTES = 262_144
 _TEXT_KEY_CHARACTERS = 2_048
 _TEXT_KEY_OVERLAP = 256
@@ -5374,7 +5377,25 @@ class Memory:
             return dict(cached)
         try:
             descriptions = self._vision_descriptions(
-                tuple(self._resolved_model_input(_asset_content(asset)) for asset in pending)
+                tuple(
+                    self._resolved_model_input(
+                        replace(
+                            _asset_content(asset),
+                            # Whatever this write already knows the clip says, under the same
+                            # `speaker_N` labels the index projection prints. A durable fact
+                            # about a person is in the words, not the pixels: four stills say
+                            # two people are at a table, and only the dialogue says which one
+                            # is called Lily. Empty for an image and for any composition with
+                            # no speech backend, which then describes pixels exactly as before.
+                            text=_speaker_prose(
+                                asset.asset_id,
+                                operation.speech_segments.get(asset.asset_id, ()),
+                            )
+                            or "",
+                        )
+                    )
+                    for asset in pending
+                )
             )
         except ModelError as error:
             _LOGGER.warning(
@@ -5426,12 +5447,18 @@ class Memory:
         recommended omni composition the one that stored the empty string as its whole BM25
         document, so a stronger embedder deleted the lexical half of the dense+lexical union.
         Union does not lose here; replacement does.
+
+        One caption becomes up to two sections: what the pixels show, and the durable facts
+        distilled from them and from the clip's words. They are separate because they are
+        different claims -- one is observation, the other a distillation that outlives the clip --
+        and a reader that cannot tell them apart cannot correct the wrong one.
         """
         sections = tuple(
-            f"[visual description:{asset.asset_id}]\n{descriptions[asset.asset_id]}"
+            section
             for asset in prepared.assets
             if asset.asset_id in descriptions
             and f"[visual description:{asset.asset_id}]\n" not in prepared.text
+            for section in _description_sections(asset.asset_id, descriptions[asset.asset_id])
         )
         if not sections:
             return prepared
@@ -7220,10 +7247,14 @@ class Memory:
                 reason="backend_not_configured",
             )
         inputs = tuple(inputs)
+        # Media only: an input's text is the context this write derived for the visual, and a
+        # describer's capability set is narrowed to image and video at construction, so counting
+        # text as required would refuse every described clip that arrived with a transcript.
         unsupported = frozenset(
-            modality
+            asset.modality
             for value in inputs
-            for modality in value.modalities - self._vision_capabilities
+            for asset in value.assets
+            if asset.modality is not None and asset.modality not in self._vision_capabilities
         )
         if unsupported:
             names = ", ".join(sorted(modality.value for modality in unsupported))
@@ -10183,16 +10214,24 @@ def _stored_canonical_parts(
     """
     cuts: dict[int, str] = {}
     for asset in assets:
+        markers: tuple[tuple[str, str], ...]
         if asset.modality == Modality.AUDIO.value:
-            kind, marker = "audio_transcript", f"[transcript:{asset.asset_id}]\n"
+            markers = (("audio_transcript", f"[transcript:{asset.asset_id}]\n"),)
         elif asset.modality in {Modality.IMAGE.value, Modality.VIDEO.value}:
-            kind, marker = "visual_description", f"[visual description:{asset.asset_id}]\n"
+            # Both derived visual sections cut, and both under the kind that reaches the text
+            # keys: a facts section folded into the description part would key differently on
+            # the settle path than the same content did on the add path.
+            markers = (
+                ("visual_description", f"[visual description:{asset.asset_id}]\n"),
+                ("visual_description", f"[facts:{asset.asset_id}]\n"),
+            )
         else:
             continue
-        found = text.find(f"\n\n{marker}")
-        start = found + 2 if found >= 0 else (0 if text.startswith(marker) else -1)
-        if start >= 0:
-            cuts[start] = kind
+        for kind, marker in markers:
+            found = text.find(f"\n\n{marker}")
+            start = found + 2 if found >= 0 else (0 if text.startswith(marker) else -1)
+            if start >= 0:
+                cuts[start] = kind
     if not cuts:
         return (("text", text),) if text else ()
     ordered = sorted(cuts.items())
@@ -10215,9 +10254,45 @@ def _has_stream_transcript(text: str, assets: Sequence[StoredAsset]) -> bool:
 def _has_stream_description(text: str, assets: Sequence[StoredAsset]) -> bool:
     return any(
         asset.modality in {Modality.IMAGE.value, Modality.VIDEO.value}
-        and f"[visual description:{asset.asset_id}]\n" in text
+        and (
+            f"[visual description:{asset.asset_id}]\n" in text
+            or f"[facts:{asset.asset_id}]\n" in text
+        )
         for asset in assets
     )
+
+
+def _description_sections(asset_id: str, description: str) -> tuple[str, ...]:
+    """Render one caption as the document sections it becomes, what-is-shown first.
+
+    A caption whose visible half is empty still contributes its facts, and one with no facts is
+    exactly the single section this produced before facts existed.
+    """
+    visible, facts = _split_description(description)
+    return (
+        *((f"[visual description:{asset_id}]\n{visible}",) if visible else ()),
+        *((f"[facts:{asset_id}]\n{facts}",) if facts else ()),
+    )
+
+
+def _split_description(description: str) -> tuple[str, str]:
+    """Separate a caption's visible description from its `Fact:` lines.
+
+    The describer answers with one string per visual because that is the contract that survives
+    a video arriving as several stills -- asked for a per-still or per-section reply, a measured
+    endpoint returned one item per still and the whole batch was rejected. So the two halves
+    travel as labelled lines in one string and are cut apart here, on the write path, which is
+    also where the cache stores them as one row per asset.
+    """
+    lines = description.splitlines()
+    facts = "\n".join(
+        stripped
+        for line in lines
+        if line.startswith(_FACT_LINE_PREFIX)
+        and (stripped := line[len(_FACT_LINE_PREFIX) :].strip())
+    )
+    visible = "\n".join(line for line in lines if not line.startswith(_FACT_LINE_PREFIX))
+    return visible.strip(), facts
 
 
 def _derived_text(text: str, assets: Sequence[StoredAsset]) -> str:
@@ -10253,25 +10328,61 @@ def _speech_identity_text(
         segments = segments_by_asset[asset]
         if not segments:
             continue
-        evidence = {
-            "asset_id": asset,
-            "segments": [
-                {
-                    "start_ms": segment.start_ms,
-                    "end_ms": segment.end_ms,
-                    "text": segment.text,
-                    "speaker_id": segment.speaker_id,
-                    "speaker_name": segment.speaker_name,
-                    "identity_score": segment.identity_score,
-                }
-                for segment in segments
-            ],
-        }
         sections.append(
             f"[speech identities:{asset}]\n"
-            + json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+            + json.dumps(
+                _speech_evidence(asset, segments), ensure_ascii=False, separators=(",", ":")
+            )
         )
     return "\n\n".join(sections)
+
+
+def _speech_evidence(asset_id: str, segments: Sequence[SpeakerSegment]) -> dict[str, object]:
+    """Shape one asset's speaker evidence: the form the document holds and the projection reads."""
+    return {
+        "asset_id": asset_id,
+        "segments": [
+            {
+                "start_ms": segment.start_ms,
+                "end_ms": segment.end_ms,
+                "text": segment.text,
+                "speaker_id": segment.speaker_id,
+                "speaker_name": segment.speaker_name,
+                "identity_score": segment.identity_score,
+            }
+            for segment in segments
+        ],
+    }
+
+
+def _speaker_prose(asset_id: str, segments: Sequence[SpeakerSegment]) -> str | None:
+    """Render one asset's turns as the prose the index carries, or None when nothing was said.
+
+    Routed through the stored evidence shape and `_speech_retrieval_text` rather than formatted
+    here, so the labels a describer is shown are byte-for-byte the labels the searchable document
+    prints. Anything else and a fact naming `speaker_2` would name a different person than the
+    transcript the reader sees.
+    """
+    if not segments:
+        return None
+    return _speech_retrieval_text(
+        json.dumps(_speech_evidence(asset_id, segments), ensure_ascii=False), asset_id
+    )
+
+
+def _speaker_labels(segments: Sequence[SpeakerSegment]) -> dict[str, str]:
+    """Map each per-run identity ID to the stable `speaker_N` label the projection prints.
+
+    Mirrors the aliasing rule inside `_speech_retrieval_text`, which is what writes those labels
+    into the document; a distilled fact naming `speaker_2` can only be resolved back to a person
+    by the same rule, so a test pins the two against each other.
+    """
+    labels: dict[str, str] = {}
+    for segment in segments:
+        speaker_id = segment.speaker_id
+        if speaker_id is not None and speaker_id.startswith("identity_"):
+            labels.setdefault(speaker_id, f"speaker_{len(labels) + 1}")
+    return labels
 
 
 def _face_identity_text(

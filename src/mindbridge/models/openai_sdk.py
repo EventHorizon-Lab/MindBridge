@@ -159,16 +159,39 @@ _MAX_FORMATION_PROPOSALS = 64
 # concrete nouns a later question could plausibly use, and nothing about the request itself. A
 # prose preamble ("This image shows ...") spends the document's first words on terms no query
 # contains.
-_VISION_SYSTEM_PROMPT = """Describe each supplied visual so a keyword search can find it later.
+#
+# Labelled lines rather than free prose, because the measured failure is not ranking: a question
+# asks for the readable sign, the count of people, or the date on the clock, and prose mentions
+# whichever of those the model found interesting. Naming the slots makes an omission the model's
+# to refuse rather than a silent one. `Fact:` lines are the decontextualized half -- what is
+# still true after the clip ends -- and are asked for only where a transcript travels with the
+# visual, which is where a durable statement about a person comes from.
+_VISION_SYSTEM_PROMPT = """Describe each supplied visual so a keyword search can find it later,
+and distil what stays true after it.
 
-Write one or two plain sentences per visual naming only what is visible: the objects, people,
-readable text, actions, and setting. Do not interpret, guess at intent, estimate anything you
-cannot see, or refer to the image, the frames, or this request. A video arrives as ordered stills
-from one clip, under one visual number; describe it as one scene, in the order the stills run.
+Write these labelled lines for each visual, in this order, at most one line each, naming only
+what is visible. Leave a line out rather than writing a placeholder or a guess:
+  Shown: the objects, people, actions, and setting, in plain nouns
+  Text: every readable word, transcribed exactly as written
+  Counts: how many of each salient object and person
+  Place: place cues -- signs, room, venue, landmark, street, city
+  When: a visible date, clock, or time-of-day cue
+  Tags: comma-separated index terms a later question might use
+Do not interpret, guess at intent, estimate anything you cannot see, or refer to the image, the
+frames, or this request. A video arrives as ordered stills from one clip, under one visual
+number; describe it as one scene, in the order the stills run.
+
+A visual that arrives with a transcript gets `Fact:` lines after the labelled ones, one fact per
+line, at most eight. A fact is one short declarative statement that is still true beyond this
+clip: who somebody is, their role, what they prefer or must avoid, where a thing is kept, how two
+people are related. Name a person by the speaker label the transcript uses. Write
+`Fact: <speaker label> is called <Name>` only where the dialogue itself states that name. Write
+no fact the visual and the transcript do not support, and none about what is only happening now.
 
 Reply with JSON {"descriptions": ["...", "..."]} holding exactly one string per numbered visual --
-one per visual, never one per still -- in the order supplied. Never leave a string empty; if a
-visual is unreadable, say what little is visible."""
+one per visual, never one per still -- in the order supplied, each string carrying that visual's
+lines separated by newlines. Never leave a string empty; if a visual is unreadable, say what
+little is visible."""
 # Pinned so the sampler is not a source of caption drift. Not a reproducibility guarantee: a
 # measured endpoint returned four distinct completions for four identical requests at these
 # values, so a caller that needs identical documents across ingests caches by asset instead.
@@ -675,11 +698,16 @@ class OpenAIModels:
         """Caption every supplied visual in one chat completion, for the text index.
 
         The write path calls this so that an image-only memory has a full-text document at all.
-        What travels is pixels and an ordinal: no memory ID, file name, or path, because the
-        caption is stored beside the caller's own text and anything else in the prompt becomes
-        provenance leaked into a searchable document. A video is sent as the same four ordered
-        stills the generation path samples, never as the file -- one caption still describes the
-        whole clip.
+        What travels is pixels, an ordinal, and whatever context the caller put on the input's
+        `text` -- in practice the clip's diarised transcript: no memory ID, file name, or path,
+        because the caption is stored beside the caller's own text and anything else in the
+        prompt becomes provenance leaked into a searchable document. A video is sent as the same
+        four ordered stills the generation path samples, never as the file -- one caption still
+        describes the whole clip.
+
+        A caption is one string per visual holding labelled lines separated by single newlines,
+        never a blank line: the write path splits it into the memory's description and facts
+        sections, and a blank line inside it would end the section it belongs to.
 
         The request asks for `temperature` 0 and a fixed `seed` unless the composition set its
         own, which removes the sampler as a cause of drift. It does **not** make captions
@@ -700,7 +728,20 @@ class OpenAIModels:
         if not batch:
             return ()
         modalities = frozenset(modality for value in batch for modality in value.modalities)
-        _require_capabilities("vision", modalities, self.vision_capabilities)
+        # Only the media are a routing question. A visual's derived context travels as this
+        # input's `text`, which every chat completion takes, while `vision_capabilities` is
+        # narrowed to the visual modalities -- so requiring text of it would refuse a request
+        # the endpoint accepts. `modalities` still carries it, because it is billed input.
+        _require_capabilities(
+            "vision",
+            frozenset(
+                asset.modality
+                for value in batch
+                for asset in value.assets
+                if asset.modality is not None
+            ),
+            self.vision_capabilities,
+        )
         assets = tuple(asset for value in batch for asset in value.assets)
         _require_consistent_assets(assets)
         # Video files are never uploaded by this operation. Verify the source descriptors first,
@@ -1644,6 +1685,12 @@ def _default_vision_space(
     `_VISION_SYSTEM_PROMPT` is inside the digest on purpose: it decides what a caption contains,
     it is still being iterated on, and a store keyed on the model alone would serve captions
     written under an older prompt forever, inside the indexed document, with nothing to notice it.
+
+    The `v2` label is the same statement out loud. v1 asked for one or two plain sentences; v2
+    asks for labelled lines and, where a transcript travels with the visual, `Fact:` lines that
+    the write path splits into their own `[facts:<asset_id>]` section. The digest already made
+    that a different space; the name says so where a person reads it, and re-ingesting a corpus
+    described under v1 pays for every caption again rather than mixing two shapes in one index.
     """
     payload = json.dumps(
         {
@@ -1659,8 +1706,8 @@ def _default_vision_space(
         sort_keys=True,
         separators=(",", ":"),
     )
-    digest = hashlib.sha256(f"mindbridge-vision-v1:{payload}".encode()).hexdigest()[:16]
-    return f"{model}:mindbridge-vision-v1:{digest}"
+    digest = hashlib.sha256(f"mindbridge-vision-v2:{payload}".encode()).hexdigest()[:16]
+    return f"{model}:mindbridge-vision-v2:{digest}"
 
 
 def _default_reasoning_recipe(
@@ -2299,7 +2346,7 @@ def _invalid_formation_response() -> ModelError:
 
 
 def _vision_content(inputs: Sequence[ModelInput]) -> list[dict[str, object]]:
-    """Number each visual and inline it, saying how many stills the visual arrived as.
+    """Number each visual, inline it, and follow it with whatever context arrived as text.
 
     A video is replaced by its ordered stills, so one visual can carry several image parts, and
     the count has to be in the marker rather than left to the reader. Asked for "one description
@@ -2307,6 +2354,13 @@ def _vision_content(inputs: Sequence[ModelInput]) -> list[dict[str, object]]:
     four descriptions on every attempt, which the output contract rejected whole -- the request was
     billed and the caption was lost. Naming the count is what makes one caption per clip the
     obvious reading.
+
+    `ModelInput.text` is the visual's own already-derived context -- in practice the clip's
+    diarised transcript, which the write path computed before describing. It is what a durable
+    fact about a person can be read from at all: four stills say two people are at a table, and
+    only the words say which of them is called Lily and which is allergic to peanuts. It follows
+    the stills so that the labelled description is still written from pixels, and it is labelled
+    as a transcript so the caption never quotes it as visible text.
     """
     parts: list[dict[str, object]] = []
     cache: dict[str, str] = {}
@@ -2319,6 +2373,14 @@ def _vision_content(inputs: Sequence[ModelInput]) -> list[dict[str, object]]:
         )
         parts.append({"type": "text", "text": marker})
         parts.extend(visual)
+        if value.text:
+            parts.append(
+                {
+                    "type": "text",
+                    "text": f"Visual {position} transcript, speaker labels as diarised:\n"
+                    + value.text,
+                }
+            )
     return parts
 
 
@@ -2357,9 +2419,20 @@ def _vision_captions(content: str, count: int) -> tuple[str, ...]:
         or any(not isinstance(value, str) or not value.strip() for value in values)
     ):
         raise _invalid_json_response("vision description", "describe")
-    # One line of index terms: a caption crosses a memory's text document, where an embedded
-    # newline would split a section marker away from what it labels.
-    return tuple(" ".join(cast(str, value).split()) for value in values)
+    return tuple(_caption_lines(cast(str, value)) for value in values)
+
+
+def _caption_lines(caption: str) -> str:
+    """Keep the caption's labelled lines and nothing that could split it into two sections.
+
+    A caption crosses a memory's text document, whose sections are separated by a blank line and
+    introduced by a marker line. A single newline inside the caption is therefore free -- and is
+    what carries the labelled structure -- while a blank line inside it would end the section and
+    leave the rest of the caption unlabelled, so blank lines are dropped rather than preserved.
+    Whitespace inside a line is collapsed for the same reason it always was: it is index terms.
+    """
+    lines = (" ".join(line.split()) for line in caption.splitlines())
+    return "\n".join(line for line in lines if line)
 
 
 def _vision_retry_instruction(content: str, count: int) -> str:

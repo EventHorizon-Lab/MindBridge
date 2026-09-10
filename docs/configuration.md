@@ -215,6 +215,17 @@ whatever the caller wrote, each section carrying a `[visual description:<asset_i
 `get` shows which assets were described, and the asset is still embedded natively: the derived
 text is added to the record, never substituted for it.
 
+A caption is labelled lines rather than prose -- what is shown, readable text transcribed exactly,
+counts, place cues, a visible date or clock, and index tags -- because a question days later asks
+for the sign or the count, and free prose names whichever of those the model found interesting. A
+visual described while a speech backend is configured is also shown that clip's diarised
+transcript, and answers with `Fact:` lines: short declarative statements that stay true after the
+clip ends ("Lily is allergic to peanuts", "the yoga mat lives in the storage room"). Those land in
+their own `[facts:<asset_id>]` section, so the distillation is correctable separately from the
+observation, and where the dialogue itself states a diarised speaker's name that fact also
+registers the name against the recognized identity, so every later clip resolving to the same
+person is indexed under it.
+
 Three things bound what it costs and what it can do:
 
 - `modalities` is the visual capability set and accepts only `image` and `video`. An asset outside

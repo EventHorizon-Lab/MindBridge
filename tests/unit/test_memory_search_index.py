@@ -34,10 +34,18 @@ from mindbridge.memory import (
     _MAX_TEXT_CHARACTERS,
     _lexical_query_terms,
     _lexical_relevance,
+    _speaker_labels,
+    _speech_evidence,
     _speech_retrieval_text,
 )
-from mindbridge.models.base import EmbedTask, ModelInput
-from mindbridge.types import AssetRef, Blob, Modality
+from mindbridge.models.base import (
+    EmbedTask,
+    ModelInput,
+    SpeakerEmbedding,
+    SpeechAnalysis,
+    SpeechTurn,
+)
+from mindbridge.types import AssetRef, Blob, Modality, SpeakerSegment
 
 _ALL_INPUT_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
 
@@ -1079,3 +1087,203 @@ def test_evidence_budget_skips_an_oversized_extra_and_keeps_a_later_fit() -> Non
     # This is the live ask budget's unit: text characters plus any text-equivalent media cost.
     # It intentionally is not represented as a model-token guarantee.
     assert sum(evidence_cost(hit) for hit in grounded) == 3
+
+
+class _StructuredDescriber:
+    """A describer that answers in the labelled-line shape and records the context it was given.
+
+    Every real caption crosses the write path as one string per visual, so the labelled lines and
+    the `Fact:` lines arrive together and are cut apart by `_split_description`. This fake keeps
+    that shape, and keeps `ModelInput.text` so a test can assert what the model was shown.
+    """
+
+    vision_capabilities = frozenset({Modality.IMAGE, Modality.VIDEO})
+    vision_model = "fake-describer"
+    vision_space = "fake-describer:structured-v2"
+
+    _DEFAULT = (
+        "Shown: two people at a kitchen table with a laptop",
+        'Text: "Hongqiao" on a station sign',
+        "Counts: 2 people, 1 laptop",
+        "Place: kitchen, sign reads Hongqiao",
+        "When: wall clock at 14:30",
+        "Tags: kitchen, laptop, station sign",
+        "Fact: speaker_1 is called Lily",
+        "Fact: Lily is allergic to peanuts",
+    )
+
+    def __init__(self, *lines: str) -> None:
+        self.lines = lines or self._DEFAULT
+        self.context: list[str] = []
+        self.calls = 0
+
+    def describe(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+        batch = tuple(inputs)
+        self.calls += 1
+        self.context.extend(value.text for value in batch)
+        return tuple("\n".join(self.lines) for _ in batch)
+
+    def close(self) -> None:
+        return None
+
+
+class _Diarised:
+    """A speech backend answering with two distinguishable speakers per asset."""
+
+    transcription_capabilities = frozenset({Modality.AUDIO, Modality.VIDEO})
+    transcription_model = "fake-funasr"
+    transcription_space = "fake-funasr:speech:test"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+        batch = tuple(assets)
+        self.calls += 1
+        return tuple(
+            SpeechAnalysis(
+                turns=(
+                    SpeechTurn(0, 900, "my name is Lily", "0"),
+                    SpeechTurn(900, 1800, "and I cannot eat peanuts", "0"),
+                    SpeechTurn(1800, 2700, "noted", "1"),
+                ),
+                speakers=(
+                    SpeakerEmbedding("0", (1.0, 0.0)),
+                    SpeakerEmbedding("1", (0.0, 1.0)),
+                ),
+            )
+            for _asset in batch
+        )
+
+    def close(self) -> None:
+        return None
+
+
+def _section(content: str, marker: str) -> str:
+    """Read back one derived section of a stored document by its marker line."""
+    for section in content.split("\n\n"):
+        head, separator, body = section.partition("\n")
+        if separator and head == marker:
+            return body
+    raise AssertionError(f"{marker} missing from {content!r}")
+
+
+def test_a_described_clip_carries_its_durable_facts_as_their_own_section(tmp_path: Path) -> None:
+    """The distilled half of a caption is indexed, and indexed separately from the observed half.
+
+    Media reach the index only through their description, and a question asked days later is
+    about the durable claim ("who is allergic to peanuts"), not about what a frame showed. Both
+    halves are unioned into the document -- the asset stays attached and authoritative -- and
+    they are separate sections so a reader can tell the distillation from the observation.
+    """
+    embedder = _Embedder()
+    describer = _StructuredDescriber()
+    with Memory(
+        tmp_path,
+        embedder=embedder,
+        transcriber=_Diarised(),
+        vision_describer=describer,
+    ) as memory:
+        record = memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
+        stored = memory.get(record.id).content
+        asset_id = record.assets[0].id
+
+        described = _section(stored, f"[visual description:{asset_id}]")
+        assert described.startswith("Shown: two people at a kitchen table")
+        assert "Hongqiao" in described
+        assert "Fact:" not in described, "a fact must not stay inside the description"
+        assert _section(stored, f"[facts:{asset_id}]") == (
+            "speaker_1 is called Lily\nLily is allergic to peanuts"
+        )
+        # The verbatim asset stays attached: the sections are additional keys, not a replacement.
+        assert record.assets[0].sha256 is not None
+
+        # Both halves reach the lexical route. "peanuts" is only ever said in the facts.
+        assert record.id in _lexical_matches(memory, "peanuts")
+        assert record.id in _lexical_matches(memory, "Hongqiao")
+        # And both reach the embedder as their own retrieval key.
+        keys = [value.text for value in embedder.document_inputs]
+        assert any(text.startswith(f"[facts:{asset_id}]") for text in keys)
+        assert any(text.startswith(f"[visual description:{asset_id}]") for text in keys)
+
+
+def test_a_described_clip_is_shown_the_transcript_under_the_indexed_labels(tmp_path: Path) -> None:
+    """A durable fact about a person is in the words, so the words travel with the stills.
+
+    The labels the describer is shown have to be the labels the document prints, or a fact
+    naming `speaker_1` names nobody the reader can find.
+    """
+    describer = _StructuredDescriber()
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        transcriber=_Diarised(),
+        vision_describer=describer,
+    ) as memory:
+        record = memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
+        asset_id = record.assets[0].id
+        projected = _speech_retrieval_text(
+            _section(memory.get(record.id).content, f"[speech identities:{asset_id}]"),
+            asset_id,
+        )
+
+    assert describer.context == [
+        "speaker_1: my name is Lily\nspeaker_1: and I cannot eat peanuts\nspeaker_2: noted"
+    ]
+    assert describer.context[0] == projected, "the describer saw labels the document does not use"
+
+
+def test_a_described_image_is_shown_no_transcript_and_still_yields_a_description(
+    tmp_path: Path,
+) -> None:
+    """An image has no words, so it travels as pixels alone, exactly as it did before facts."""
+    describer = _StructuredDescriber("Shown: a red bicycle", "Tags: bicycle, fence")
+    with Memory(tmp_path, embedder=_Embedder(), vision_describer=describer) as memory:
+        record = memory.add(Blob(b"bicycle-frame", "image/png"))
+        stored = memory.get(record.id).content
+
+    assert describer.context == [""]
+    assert (
+        stored
+        == f"[visual description:{record.assets[0].id}]\nShown: a red bicycle\nTags: bicycle, fence"
+    )
+    assert "[facts:" not in stored
+
+
+def test_a_media_memory_derives_no_section_at_all_without_a_describer(tmp_path: Path) -> None:
+    """Route by capability: with no describer the document is what it was before facts existed.
+
+    Deriving text is a paid model call per visual, so it must follow from configuration and from
+    nothing else. A speech backend is configured here, which is the composition most likely to
+    grow a section by accident, since the transcript is exactly what the describer would be shown.
+    """
+    embedder = _Embedder()
+    with Memory(tmp_path, embedder=embedder, transcriber=_Diarised()) as memory:
+        record = memory.add(Blob(b"kitchen-clip", "video/mp4", "kitchen.mp4"))
+        stored = memory.get(record.id).content
+
+    asset_id = record.assets[0].id
+    assert "[facts:" not in stored
+    assert "[visual description:" not in stored
+    assert stored.startswith(f"[speech identities:{asset_id}]")
+    assert all("[facts:" not in value.text for value in embedder.document_inputs)
+
+
+def test_a_speaker_label_shown_to_the_describer_is_the_label_the_index_prints() -> None:
+    """`_speaker_labels` resolves a fact's label, so it must not drift from the projection.
+
+    The projection is what writes `speaker_2` into a searchable document; the label map is what
+    turns a distilled `speaker_2 is called Lily` back into a person. Two rules would silently
+    name the wrong one.
+    """
+    asset_id = "a" * 64
+    segments = (
+        SpeakerSegment(asset_id, 0, 900, "hello", speaker_id="identity_second"),
+        SpeakerSegment(asset_id, 900, 1800, "hi", speaker_id="identity_first"),
+        SpeakerSegment(asset_id, 1800, 2700, "again", speaker_id="identity_second"),
+    )
+    labels = _speaker_labels(segments)
+    projected = _speech_retrieval_text(json.dumps(_speech_evidence(asset_id, segments)), asset_id)
+
+    assert labels == {"identity_second": "speaker_1", "identity_first": "speaker_2"}
+    assert projected == "speaker_1: hello\nspeaker_2: hi\nspeaker_1: again"
