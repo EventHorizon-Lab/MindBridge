@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
@@ -12,6 +12,7 @@ from mindbridge.recall import (
     _MAX_NEIGHBOR_ANCHORS,
     DEFAULT_MAX_ROWS,
     RecallPlan,
+    RecallRows,
     RecallStep,
     RecallStepResult,
     execute,
@@ -34,15 +35,30 @@ def _hit(identifier: str, *, minutes: int = 0, score: float = 0.5) -> SearchHit:
 
 
 class _Reader:
-    """Records every read a plan makes and replays a scripted answer for each op."""
+    """Records every read a plan makes and replays a scripted answer for each op.
 
-    def __init__(self, **rows: tuple[SearchHit, ...]) -> None:
+    `selected` scripts a read whose predicate selected more records than it returned rows for,
+    which is what the caller's own scope does to a hydrated read; by default a read selects
+    exactly the rows it answers with.
+    """
+
+    def __init__(
+        self,
+        *,
+        selected: Mapping[str, int] | None = None,
+        **rows: tuple[SearchHit, ...],
+    ) -> None:
         self.rows = rows
+        self.selected = dict(selected or {})
         self.calls: list[tuple[str, object]] = []
 
-    def similar(self, query: str, *, k: int) -> tuple[SearchHit, ...]:
+    def _answer(self, op: str) -> RecallRows:
+        rows = self.rows.get(op, ())
+        return RecallRows(rows, self.selected.get(op, len(rows)))
+
+    def similar(self, query: str, *, k: int) -> RecallRows:
         self.calls.append(("similar", (query, k)))
-        return self.rows.get("similar", ())
+        return self._answer("similar")
 
     def match(
         self,
@@ -54,9 +70,9 @@ class _Reader:
         modality: Modality | None,
         memory_type: MemoryType | None,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]:
+    ) -> RecallRows:
         self.calls.append(("match", (tuple(terms), any_of, modality, memory_type, max_rows)))
-        return self.rows.get("match", ())
+        return self._answer("match")
 
     def window(
         self,
@@ -66,9 +82,9 @@ class _Reader:
         modality: Modality | None,
         memory_type: MemoryType | None,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]:
+    ) -> RecallRows:
         self.calls.append(("window", (occurred_from, occurred_until, modality, max_rows)))
-        return self.rows.get("window", ())
+        return self._answer("window")
 
     def neighbors(
         self,
@@ -77,13 +93,13 @@ class _Reader:
         before: int,
         after: int,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]:
+    ) -> RecallRows:
         self.calls.append(("neighbors", (tuple(memory_ids), before, after, max_rows)))
-        return self.rows.get("neighbors", ())
+        return self._answer("neighbors")
 
-    def entity(self, name: str, *, max_rows: int) -> tuple[SearchHit, ...]:
+    def entity(self, name: str, *, max_rows: int) -> RecallRows:
         self.calls.append(("entity", (name, max_rows)))
-        return self.rows.get("entity", ())
+        return self._answer("entity")
 
 
 def test_the_fallback_plan_is_todays_behaviour() -> None:
@@ -402,7 +418,7 @@ def test_a_primitive_that_refuses_its_arguments_is_a_read_that_did_not_happen() 
     """
 
     class Refusing(_Reader):
-        def match(self, terms: Sequence[str], **arguments: object) -> tuple[SearchHit, ...]:
+        def match(self, terms: Sequence[str], **arguments: object) -> RecallRows:
             del terms, arguments
             raise ValueError("a term must be at most 200 characters")
 
@@ -457,3 +473,27 @@ def test_a_neighbors_step_anchors_on_a_bounded_head_of_what_it_follows() -> None
 
     anchors = cast(tuple[tuple[str, ...], int, int, int], reader.calls[1][1])[0]
     assert anchors == tuple(f"m-{index}" for index in range(_MAX_NEIGHBOR_ANCHORS))
+
+
+def test_a_read_the_bound_truncated_stays_bounded_when_a_scope_drops_a_row() -> None:
+    """Completeness follows the selection, not the rows the caller was allowed to see.
+
+    The bound is applied while the IDs are selected and the caller's bitemporal, spatial and
+    metric scope is applied while they are hydrated, so a truncated read can come back shorter
+    than its own bound. Reading that as "everything the predicate matched" is what lets a count
+    be stated over a set the answer does not hold.
+    """
+    reader = _Reader(
+        match=(_hit("m-1", minutes=0),),
+        selected={"match": 3},
+    )
+    plan = parse_recall_plan(
+        json.dumps({"shape": "set", "steps": [{"op": "match", "terms": ["a"], "max_rows": 3}]}),
+        reference_at=NOW,
+    )
+
+    assert plan is not None
+    result = execute(plan, reader)
+
+    assert result.executed[0] == RecallStepResult(op="match", rows=1, bounded=True)
+    assert result.complete is False

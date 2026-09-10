@@ -7368,6 +7368,38 @@ def test_a_read_that_filled_its_own_bound_is_reported_as_incomplete(tmp_path: Pa
     assert "some matching records were not read" in question.text
 
 
+def test_a_read_a_scope_shrank_below_its_bound_is_still_reported_as_truncated(
+    tmp_path: Path,
+) -> None:
+    """The bound is applied in SQL, the caller's scope after it, so rows alone cannot say.
+
+    Here the predicate filled its bound and the spatial scope then dropped every row it selected.
+    Deciding completeness from the rows would announce an empty evidence set as "every record
+    those reads matched", which is the strongest possible licence to state a total.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"], "max_rows": 2})
+    elsewhere = SpatialContext(
+        frame_id="workshop",
+        anchor=SpatialAnchor.OBSERVER,
+        x=0.0,
+        y=0.0,
+        z=0.0,
+    )
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        memory.ask(
+            "how many wrenches?",
+            scope=RetrievalScope(near=elsewhere, radius_m=1.0),
+        )
+
+    question, grounded = models.answer_calls[-1]
+    assert grounded == ()
+    assert "some matching records were not read" in question.text
+    assert "every record those reads matched" not in question.text
+
+
 def test_a_sequence_plan_grounds_the_records_around_what_it_found(tmp_path: Path) -> None:
     models = _FakeModels()
     models.recall_plan = _plan(

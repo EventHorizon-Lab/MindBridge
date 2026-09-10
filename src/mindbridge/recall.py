@@ -19,7 +19,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
-from typing import Literal, Protocol, TypeVar, cast
+from typing import Literal, NamedTuple, Protocol, TypeVar, cast
 
 # The store's own bounds on one primitive read. Imported rather than restated so a plan can never
 # ask for more rows than the read will return, nor for a term the read will refuse.
@@ -114,13 +114,28 @@ class RecallPlan:
         return any(step.op in _EXHAUSTIVE_OPS for step in self.steps)
 
 
+class RecallRows(NamedTuple):
+    """What one read answered with: the rows, and how many records it selected.
+
+    `selected` is the count the row bound was applied to. It is `len(rows)` for a read nothing
+    filtered afterwards, and larger when the caller's scope dropped a selected row during
+    hydration -- which is why completeness is decided from it and never from the rows.
+    """
+
+    rows: tuple[SearchHit, ...]
+    selected: int
+
+
 @dataclass(frozen=True, slots=True)
 class RecallStepResult:
     """What one executed step read, for the trace and the grounding prompt."""
 
     op: RecallOp
     rows: int
-    # True when the read returned exactly its bound, so rows beyond it were never read.
+    # True when the read selected as many records as its bound allowed, so records beyond it were
+    # never read. Decided on the selection rather than on the rows: a scope filter can shrink a
+    # truncated read below its own bound, and reading that as "everything" is what licenses a
+    # total over a set the caller does not hold.
     bounded: bool
 
 
@@ -147,9 +162,15 @@ class RecallResult:
 
 
 class RecallReader(Protocol):
-    """The reads a recall program may make. `Memory` implements it over its own store."""
+    """The reads a recall program may make. `Memory` implements it over its own store.
 
-    def similar(self, query: str, *, k: int) -> tuple[SearchHit, ...]: ...
+    Every read answers with its rows and the number of records its predicate selected. The two
+    differ when the caller's own bitemporal, spatial or metric scope drops a selected row while
+    it is hydrated, which happens after the row bound was applied -- so only the selection count
+    can say whether rows beyond the bound exist, and only it may decide completeness.
+    """
+
+    def similar(self, query: str, *, k: int) -> RecallRows: ...
 
     def match(
         self,
@@ -161,7 +182,7 @@ class RecallReader(Protocol):
         modality: Modality | None,
         memory_type: MemoryType | None,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]: ...
+    ) -> RecallRows: ...
 
     def window(
         self,
@@ -171,7 +192,7 @@ class RecallReader(Protocol):
         modality: Modality | None,
         memory_type: MemoryType | None,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]: ...
+    ) -> RecallRows: ...
 
     def neighbors(
         self,
@@ -180,9 +201,9 @@ class RecallReader(Protocol):
         before: int,
         after: int,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]: ...
+    ) -> RecallRows: ...
 
-    def entity(self, name: str, *, max_rows: int) -> tuple[SearchHit, ...]: ...
+    def entity(self, name: str, *, max_rows: int) -> RecallRows: ...
 
 
 def fallback_plan(question: str, *, k: int = DEFAULT_SIMILAR_K) -> RecallPlan:
@@ -239,17 +260,16 @@ def execute(plan: RecallPlan, reader: RecallReader) -> RecallResult:
     for step in plan.steps:
         bound = step.k if step.op == "similar" else step.max_rows
         try:
-            rows = _run(step, reader, by_step)
+            rows, selected = _run(step, reader, by_step)
         except ValueError:
             # A primitive rejecting its own arguments is a read that did not happen. Every field
             # reaching one came from a model's plan text, and `ask()` raising a bare `ValueError`
-            # from that would make model output an exception; reporting the step as bounded says
-            # the truth instead, which is that rows this predicate matches were never read.
-            rows, bounded = (), True
-        else:
-            bounded = len(rows) >= bound
+            # from that would make model output an exception; reporting the step as having filled
+            # its bound says the truth instead, which is that records this predicate matches were
+            # never read.
+            rows, selected = (), bound
         by_step.append(rows)
-        executed.append(RecallStepResult(op=step.op, rows=len(rows), bounded=bounded))
+        executed.append(RecallStepResult(op=step.op, rows=len(rows), bounded=selected >= bound))
         target = ranked if step.op == "similar" else exhaustive
         for hit in rows:
             target.setdefault(hit.id, hit)
@@ -320,7 +340,7 @@ def _run(
     step: RecallStep,
     reader: RecallReader,
     by_step: Sequence[tuple[SearchHit, ...]],
-) -> tuple[SearchHit, ...]:
+) -> RecallRows:
     """Dispatch one step, or read nothing when its own inputs are missing."""
     if step.op == "similar":
         return reader.similar(step.query or "", k=step.k)
@@ -336,7 +356,7 @@ def _run(
         )
     if step.op == "window":
         if step.occurred_from is None or step.occurred_until is None:
-            return ()
+            return RecallRows((), 0)
         return reader.window(
             occurred_from=step.occurred_from,
             occurred_until=step.occurred_until,
@@ -351,14 +371,16 @@ def _run(
             else tuple(hit.id for hit in by_step[step.of][:_MAX_NEIGHBOR_ANCHORS])
         )
         if not anchors:
-            return ()
+            return RecallRows((), 0)
         return reader.neighbors(
             anchors,
             before=step.before,
             after=step.after,
             max_rows=step.max_rows,
         )
-    return () if step.name is None else reader.entity(step.name, max_rows=step.max_rows)
+    if step.name is None:
+        return RecallRows((), 0)
+    return reader.entity(step.name, max_rows=step.max_rows)
 
 
 def _chronological(hit: SearchHit) -> tuple[datetime, str]:

@@ -106,6 +106,7 @@ from mindbridge.infrastructure.local.store import (
     IndexCandidate,
     IndexDocument,
     LocalStore,
+    RecallRead,
     SpeechRollback,
     StaleOperationError,
     StoredAsset,
@@ -149,6 +150,7 @@ from mindbridge.plugins import MemoryConfig, MemoryPlugins
 from mindbridge.recall import (
     RecallPlan,
     RecallResult,
+    RecallRows,
     execute,
     fallback_plan,
     parse_recall_plan,
@@ -729,9 +731,10 @@ class _RecallReads:
         self._memory = memory
         self._context = context
 
-    def similar(self, query: str, *, k: int) -> tuple[SearchHit, ...]:
+    def similar(self, query: str, *, k: int) -> RecallRows:
         del query
-        return self._context.ranked[:k]
+        rows = self._context.ranked[:k]
+        return RecallRows(rows, len(rows))
 
     def match(
         self,
@@ -744,7 +747,7 @@ class _RecallReads:
         memory_type: MemoryType | None,
         max_rows: int,
         identity_id: str | None = None,
-    ) -> tuple[SearchHit, ...]:
+    ) -> RecallRows:
         scope = self._context.scope or RetrievalScope()
         return self._hits(
             self._memory._store.match_memories(
@@ -772,7 +775,7 @@ class _RecallReads:
         modality: Modality | None,
         memory_type: MemoryType | None,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]:
+    ) -> RecallRows:
         scope = self._context.scope or RetrievalScope()
         return self._hits(
             self._memory._store.memories_in_window(
@@ -797,7 +800,7 @@ class _RecallReads:
         before: int,
         after: int,
         max_rows: int,
-    ) -> tuple[SearchHit, ...]:
+    ) -> RecallRows:
         scope = self._context.scope or RetrievalScope()
         return self._hits(
             self._memory._store.neighbor_memories(
@@ -814,7 +817,7 @@ class _RecallReads:
             )
         )
 
-    def entity(self, name: str, *, max_rows: int) -> tuple[SearchHit, ...]:
+    def entity(self, name: str, *, max_rows: int) -> RecallRows:
         """Read what is known about one person, by identity when the name resolves to one.
 
         A name no identity carries is not an error: the store may hold the person only as words
@@ -837,8 +840,17 @@ class _RecallReads:
         chosen = self._context.memory_type or requested
         return None if chosen is None else chosen.value
 
-    def _hits(self, memories: Sequence[StoredMemory]) -> tuple[SearchHit, ...]:
-        return tuple(self._memory._search_hit(memory, 0.0) for memory in memories)
+    def _hits(self, read: RecallRead) -> RecallRows:
+        """Hydrate one primitive's rows, keeping the count its predicate selected.
+
+        The rows can be fewer than the selection: the bound is applied in SQL and the caller's
+        bitemporal, spatial and metric scope is applied by the one hydrating read behind it. Only
+        the selection count says whether the bound truncated anything.
+        """
+        return RecallRows(
+            tuple(self._memory._search_hit(memory, 0.0) for memory in read),
+            read.selected,
+        )
 
 
 class Memory:

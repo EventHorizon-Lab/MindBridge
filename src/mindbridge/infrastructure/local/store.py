@@ -743,6 +743,32 @@ class RecallDigest:
     named_identities: int
 
 
+class RecallRead(tuple["StoredMemory", ...]):
+    """The rows one recall primitive returned, carrying how many IDs its predicate selected.
+
+    A tuple of memories, so every caller reads it as the row sequence it always was. `selected`
+    is the count `max_rows` was applied to in SQL, and it exceeds the rows themselves whenever a
+    bitemporal, spatial or metric scope drops one during hydration -- a scope that has exactly
+    one implementation, in `read_memories`, and so cannot be pushed into the selecting statement.
+
+    That difference is the only thing that can say whether rows beyond the bound exist. Deciding
+    it from the row count instead reports a read the bound truncated as a read that returned
+    everything, which is how a caller states a total over a set it does not hold.
+    """
+
+    selected: int
+
+    def __new__(
+        cls,
+        memories: Sequence[StoredMemory] = (),
+        *,
+        selected: int | None = None,
+    ) -> RecallRead:
+        read = super().__new__(cls, memories)
+        read.selected = len(read) if selected is None else selected
+        return read
+
+
 @dataclass(frozen=True, slots=True)
 class StoredAsset:
     """Immutable metadata for one content-addressed local media asset."""
@@ -2542,7 +2568,7 @@ class LocalStore:
         radius_m: float | None = None,
         place_id: str | None = None,
         identity_id: str | None = None,
-    ) -> tuple[StoredMemory, ...]:
+    ) -> RecallRead:
         """Return every active memory whose content contains the terms, oldest first.
 
         This is the exhaustive counterpart to search: the answer is defined by the predicate and
@@ -2552,7 +2578,9 @@ class LocalStore:
         words its own record holds. No terms means the predicate is the time window alone.
 
         The scope arguments are `read_memories`'s, and hydration goes through it, so bitemporal,
-        place, identity and metric scope have exactly one implementation.
+        place, identity and metric scope have exactly one implementation. Because that read runs
+        after `max_rows` has already been applied, the returned `RecallRead` carries how many IDs
+        were selected: a caller can only tell a truncated set from a complete one from that count.
         """
         folded = _recall_terms(terms)
         _require_recall_window(occurred_from, occurred_until, require_both=False)
@@ -2568,14 +2596,17 @@ class LocalStore:
             place_id=place_id,
             identity_id=identity_id,
         )
-        return self._hydrate_recall(
-            selected,
-            valid_at=valid_at,
-            known_at=known_at,
-            near=near,
-            radius_m=radius_m,
-            place_id=place_id,
-            identity_id=identity_id,
+        return RecallRead(
+            self._hydrate_recall(
+                selected,
+                valid_at=valid_at,
+                known_at=known_at,
+                near=near,
+                radius_m=radius_m,
+                place_id=place_id,
+                identity_id=identity_id,
+            ),
+            selected=len(selected),
         )
 
     def memories_in_window(
@@ -2592,7 +2623,7 @@ class LocalStore:
         radius_m: float | None = None,
         place_id: str | None = None,
         identity_id: str | None = None,
-    ) -> tuple[StoredMemory, ...]:
+    ) -> RecallRead:
         """Return every active memory whose event time overlaps the window, oldest first.
 
         The window is half-open, start inclusive, and it is required: a window primitive with no
@@ -2629,7 +2660,7 @@ class LocalStore:
         radius_m: float | None = None,
         place_id: str | None = None,
         identity_id: str | None = None,
-    ) -> tuple[StoredMemory, ...]:
+    ) -> RecallRead:
         """Return the active memories adjacent to the anchors in corpus order, oldest first.
 
         Corpus order is `(effective event time, rowid)`. `memory_records` is a rowid table and
@@ -2643,7 +2674,7 @@ class LocalStore:
             _require_identifier(memory_id, "memory_id")
         _require_recall_neighbors(before, after, max_rows)
         if not anchors:
-            return ()
+            return RecallRead()
         # ponytail: two statements per anchor, each an index-less ordered scan bounded by
         # `before`/`after`. Anchors are bounded by the caller's plan; if a plan ever wants
         # hundreds, a single window-function query over the whole ordered set is the upgrade.
@@ -2651,7 +2682,7 @@ class LocalStore:
         with self._read_transaction() as connection:
             identity_clause, identity_parameters = _identity_scope(connection, identity_id)
             if identity_clause is None:
-                return ()
+                return RecallRead()
             for memory_id in anchors:
                 position = connection.execute(
                     f"""
@@ -2682,14 +2713,18 @@ class LocalStore:
                 if memory_id not in anchor_ids
             )
         )
-        return self._hydrate_recall(
-            ordered[:max_rows],
-            valid_at=valid_at,
-            known_at=known_at,
-            near=near,
-            radius_m=radius_m,
-            place_id=place_id,
-            identity_id=identity_id,
+        selected = ordered[:max_rows]
+        return RecallRead(
+            self._hydrate_recall(
+                selected,
+                valid_at=valid_at,
+                known_at=known_at,
+                near=near,
+                radius_m=radius_m,
+                place_id=place_id,
+                identity_id=identity_id,
+            ),
+            selected=len(selected),
         )
 
     def identity_id_for_name(self, name: str) -> str | None:
