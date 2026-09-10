@@ -296,7 +296,7 @@ def recall_note(result: RecallResult, *, omitted: int = 0) -> str:
     if result.complete and not omitted:
         completeness = (
             "The evidence below is every record those reads matched, in time order, so a count "
-            "or a list over it is complete."
+            "or a list over those records is complete."
         )
     else:
         shortfall = (
@@ -305,10 +305,16 @@ def recall_note(result: RecallResult, *, omitted: int = 0) -> str:
             else "some matching records were not read"
         )
         completeness = (
-            f"{shortfall}, so the evidence is not a complete set: answer from what is shown and "
-            "do not state a total."
+            f"{shortfall}, so the matched records are not a complete set: answer from what is "
+            "shown and do not state a total."
         )
-    return f"Recall program ({result.plan.shape}): {reads}. {completeness}"
+    # The matched records never replace the ranking's own window, so the reader is holding both
+    # and has to be told which is which: a top-ranked record is not a record the predicate
+    # matched, and counting one as if it were is the same wrong total by another route.
+    return (
+        f"Recall program ({result.plan.shape}): {reads}. {completeness} The top-ranked records "
+        "for the question follow them, and are not part of what those reads matched."
+    )
 
 
 def _step_note(step: RecallStep, outcome: RecallStepResult) -> str:

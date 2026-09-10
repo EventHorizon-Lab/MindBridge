@@ -7852,13 +7852,18 @@ class Memory:
         program: RecallResult | None,
         context: _RecallContext,
     ) -> tuple[tuple[SearchHit, ...], str | None]:
-        """Choose the grounding window the question's shape asks for.
+        """Widen the grounding window by whatever the question's shape asks for beyond it.
 
         A ranking question keeps the window the ranking earned. A question that asked for every
-        matching record grounds on the set instead, up to `recall_set_budget_chars`, and carries
-        a line saying what the set is -- because a reader cannot see the predicate that produced
-        its evidence, and a count over a silently truncated set is a wrong answer stated
-        confidently.
+        matching record adds that set to it, up to `recall_set_budget_chars`, and carries a line
+        saying what the set is -- because a reader cannot see the predicate that produced its
+        evidence, and a count over a silently truncated set is a wrong answer stated confidently.
+
+        The set is added to the ranked window, never substituted for it. Grounding a plan on its
+        exhaustive rows alone cost every question whose reads returned few rows the window it
+        already had: measured on ATM-Hard, 12 grounded records down to 1, 2, 4 and 5, and one
+        down to a refusal the unplanned path had answered. A plan says what else is relevant; it
+        never says the ranking was wrong.
         """
         if program is None or not program.plan.exhaustive:
             budget = self._evidence_budget
@@ -7872,6 +7877,9 @@ class Memory:
             if self._evidence_budget is None
             else min(self._recall_set_budget, self._evidence_budget),
             media_limit=_RECALL_MEDIA_FACTOR * context.limit,
+            # Exactly what the unplanned path grounds, this question's modality floor included,
+            # so no plan can cost a question the evidence it already had.
+            required=_grounding_hits(context.ranked, context.limit),
         )
         return hits, recall_note(program, omitted=omitted)
 
@@ -11692,32 +11700,45 @@ def _budgeted_recall(
     budget_chars: int,
     *,
     media_limit: int,
+    required: Sequence[SearchHit],
 ) -> tuple[tuple[SearchHit, ...], int]:
-    """Ground on the set the program produced, chronologically, up to the character budget.
+    """Union the program's set with the window the ranking earned, inside one budget.
 
-    Exhaustive rows come first because they are the answer's shape; similarity rows spend what is
-    left. The returned count is how many of the *exhaustive* rows were left out, which is what
-    turns a complete set into an incomplete one for the reader -- a ranking cut short is still a
-    ranking, and counting one of its rows as a missing "matched record" told a reader holding
-    every record its predicate matched that it did not have them.
+    Exhaustive rows come first because they are the answer's shape; ranked rows follow by rank,
+    deduplicated by ID. `required` is the window the unplanned path would have grounded, and it
+    is admitted whatever either bound says: it is evidence the question already had, so the
+    budget may only trim exhaustive rows beyond it and a plan can never ground less than no plan.
+
+    The returned count is how many of the *exhaustive* rows were left out, which is what turns a
+    complete set into an incomplete one for the reader -- a ranking cut short is still a ranking,
+    and counting one of its rows as a missing "matched record" told a reader holding every record
+    its predicate matched that it did not have them.
 
     Media rows are capped separately. An exhaustive read can name every clip in a corpus, and
     each media row reaching the answer call carries face and speech recognition -- writes, paid
     again on every replan round -- so a set's media rows stop at `media_limit` while its text
-    rows do not.
+    rows do not. The cap bounds what the predicate added, never the ranked window, whose size is
+    `limit` and which the unplanned path hands over regardless.
     """
+    exhaustive_ids = {hit.id for hit in program.exhaustive}
+    ranked = {hit.id: hit for hit in (*program.ranked, *required) if hit.id not in exhaustive_ids}
+    required_ids = {hit.id for hit in required}
     selected: builtins.list[SearchHit] = []
     spent = 0
     media = 0
     omitted = 0
-    for index, hit in enumerate(program.hits):
+    for index, hit in enumerate((*program.exhaustive, *ranked.values())):
+        exhaustive_row = index < len(program.exhaustive)
         cost = evidence_cost(hit)
-        if (selected and spent + cost > budget_chars) or (hit.assets and media >= media_limit):
-            omitted += 1 if index < len(program.exhaustive) else 0
+        if hit.id not in required_ids and (
+            (selected and spent + cost > budget_chars)
+            or (exhaustive_row and hit.assets and media >= media_limit)
+        ):
+            omitted += 1 if exhaustive_row else 0
             continue
         selected.append(hit)
         spent += cost
-        media += 1 if hit.assets else 0
+        media += 1 if exhaustive_row and hit.assets and hit.id not in required_ids else 0
     return tuple(selected), omitted
 
 

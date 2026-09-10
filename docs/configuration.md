@@ -362,7 +362,7 @@ The `settings` mapping is the value-only `MemoryConfig` policy:
 | `ambiguity_margin` | `0.01` | Withhold an unresolved top-two tie when `limit=1` |
 | `evidence_budget_chars` | `None` | Widen `ask` grounding while the evidence fits this budget; raises a floor, never a ceiling; `None` grounds on exactly `limit` |
 | `recall_planning` | `False` | Ask the answerer for a recall plan before retrieving, and ground on the set, sequence or entity it names; off means `ask` runs the one search it always has |
-| `recall_set_budget_chars` | `30000` | Characters of evidence a set, sequence or entity plan may ground on, never more than `evidence_budget_chars` when that is set; a point plan keeps `limit`. Read only when `recall_planning` is on |
+| `recall_set_budget_chars` | `30000` | Characters of evidence a set, sequence or entity plan may add to the ranked window, never more than `evidence_budget_chars` when that is set; a point plan keeps `limit`. Read only when `recall_planning` is on |
 | `recall_rounds` | `2` | Plan-and-answer rounds one `ask` may spend; the second runs only when the first answer was a low-confidence guess under `answer_policy="best_effort"`. `1` disables it. Read only when `recall_planning` is on |
 | `decay_half_life_days` | `None` | Optional positive half-life for query-time decay |
 | `reinforce_on_answer` | `True` | Count the evidence `ask()` cited, so retrieval favours it later |
@@ -417,14 +417,17 @@ hits are never dropped, this setting can only enlarge a prompt: to bound one, lo
 leave the budget at `None`. Setting it also removes `limit`'s effect on prompt size, since the
 budget refills the window to the same width whatever `limit` was.
 
-A set, sequence or entity recall plan grounds on its own matched set instead of the ranked window,
-and `recall_set_budget_chars` bounds that set with the same text-equivalent cost. It is a ceiling
-rather than a floor: when `evidence_budget_chars` is also set, the lower of the two applies, so a
-caller who bounded the prompt bounded it for every question shape. Media rows carry one further
-bound. Grounding a media row runs face and speech recognition over it, which are writes and are
-paid again on a replan round, so a set keeps at most twice `limit` media rows however many its
-predicate matched; its text rows are unaffected, and the rows either bound dropped are reported to
-the reader as matched records not shown.
+A set, sequence or entity recall plan grounds on its own matched set *in addition to* the ranked
+window -- the same `limit` hits and modality floor the unplanned path grounds -- and
+`recall_set_budget_chars` bounds what the plan added with the same text-equivalent cost. It is a
+ceiling rather than a floor: when `evidence_budget_chars` is also set, the lower of the two
+applies, so a caller who bounded the prompt bounded it for every question shape. Neither bound may
+trim the ranked window, which is evidence the question already had, so planning can never ground
+less than not planning. Media rows carry one further bound. Grounding a media row runs face and
+speech recognition over it, which are writes and are paid again on a replan round, so the matched
+set keeps at most twice `limit` media rows however many its predicate matched -- the ranked window,
+whose width is `limit`, is outside that cap. Text rows are unaffected, and the matched rows either
+bound dropped are reported to the reader as matched records not shown.
 
 Pass an OpenTelemetry tracer through the separate `tracer=` argument of `Memory.from_config()` or
 `Memory(...)`; it is not a setting. See [operations](operations.md#telemetry) for exporter setup

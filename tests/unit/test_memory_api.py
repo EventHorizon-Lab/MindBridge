@@ -7222,6 +7222,21 @@ def _dated_corpus(memory: Memory) -> None:
     memory.add("a green crate", occurred_at=DAY + timedelta(days=2))
 
 
+def _partly_matched_corpus(memory: Memory) -> None:
+    """Five dated records whose matched set and ranked window overlap only partly.
+
+    The fake embedder's only axis is the word "red", so nothing containing it ranks for a
+    question that does not: the two red wrenches are reachable by predicate and never by rank,
+    and the crate and the pallet the other way round. That is the shape the union rule is about,
+    and the shape a single corpus of interchangeable records cannot show.
+    """
+    memory.add("a red wrench", occurred_at=DAY)
+    memory.add("a red wrench, spare", occurred_at=DAY + timedelta(days=1))
+    memory.add("a blue wrench", occurred_at=DAY + timedelta(days=2))
+    memory.add("a green crate", occurred_at=DAY + timedelta(days=3))
+    memory.add("a green pallet", occurred_at=DAY + timedelta(days=4))
+
+
 def _plan(shape: str, *steps: dict[str, object]) -> str:
     return json.dumps({"shape": shape, "steps": list(steps)})
 
@@ -7286,6 +7301,96 @@ def test_a_set_plan_grounds_the_whole_matched_set_in_time_order(tmp_path: Path) 
     assert "every record those reads matched, in time order" in question.text
 
 
+def test_a_set_plan_adds_its_matched_rows_to_the_window_the_ranking_earned(
+    tmp_path: Path,
+) -> None:
+    """A predicate that matched one record must not cost the question its other evidence.
+
+    Measured on ATM-Hard: a plan whose exhaustive reads returned a few rows used to ground on
+    only those rows, and the questions whose ranked window held the gold lost it -- 12 grounded
+    records down to 1, 2, 4 and 5. The set is what the predicate adds; the window is what the
+    question already had.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan("set", {"op": "match", "terms": ["blue"]})
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _dated_corpus(memory)
+
+        answered = memory.ask("how many wrenches did I mention?", limit=2)
+
+    question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [
+        # The one record the predicate matched, then the two the ranking earned.
+        "a blue wrench",
+        "a red wrench",
+        "a green crate",
+    ]
+    assert [hit.content for hit in answered.hits] == [hit.content for hit in grounded]
+    # The reader is holding both, so the note has to separate them: counting a top-ranked record
+    # as one the predicate matched is the same wrong total the completeness line exists to stop.
+    assert "records containing blue (1)" in question.text
+    assert "The top-ranked records for the question follow them" in question.text
+
+
+def test_a_set_plan_that_matched_nothing_grounds_exactly_as_the_unplanned_path_does(
+    tmp_path: Path,
+) -> None:
+    """A predicate that matched nothing has said nothing, least of all that there is no evidence.
+
+    This is the worst case of grounding on the exhaustive rows alone: on ATM-Hard it turned a
+    question the unplanned path answered into a refusal, because the evidence set the reader was
+    given was empty while the ranking held twelve records.
+    """
+    planned = _FakeModels()
+    planned.recall_plan = _plan("set", {"op": "match", "terms": ["zebra"]})
+    plain = _FakeModels()
+    with _memory(tmp_path / "planned", planned, recall_planning=True) as memory:
+        _dated_corpus(memory)
+        answered = memory.ask("how many wrenches did I mention?", limit=2)
+    with _memory(tmp_path / "plain", plain) as memory:
+        _dated_corpus(memory)
+        memory.ask("how many wrenches did I mention?", limit=2)
+
+    _planned_question, planned_hits = planned.answer_calls[-1]
+    _plain_question, plain_hits = plain.answer_calls[-1]
+    assert [hit.content for hit in planned_hits] == [hit.content for hit in plain_hits]
+    assert answered.answer.startswith("Grounded in: ")
+
+
+def test_the_grounded_set_is_the_matched_rows_in_time_order_then_the_ranking(
+    tmp_path: Path,
+) -> None:
+    """One order, whatever produced a row: the predicate's set in time, then rank, then nothing.
+
+    A record both reads found is in the set once, and it keeps the earlier seat -- the note calls
+    the leading rows a complete set, so a matched record listed among the ranked tail instead
+    would contradict it.
+    """
+    models = _FakeModels()
+    models.recall_plan = _plan(
+        "set",
+        {"op": "match", "terms": ["wrench"]},
+        {"op": "similar", "query": "wrenches", "k": 3},
+    )
+    with _memory(tmp_path, models, recall_planning=True) as memory:
+        _partly_matched_corpus(memory)
+
+        memory.ask("how many wrenches did I mention?", limit=5)
+
+    _question, grounded = models.answer_calls[-1]
+    assert [hit.content for hit in grounded] == [
+        # Matched, in time order. The blue wrench keeps its seat here although it ranked fourth,
+        # and the two red wrenches were also the top of the ranking.
+        "a red wrench",
+        "a red wrench, spare",
+        "a blue wrench",
+        # Ranked, by rank: the pallet ranked third, the crate fifth.
+        "a green pallet",
+        "a green crate",
+    ]
+    assert len({hit.id for hit in grounded}) == len(grounded)
+
+
 @pytest.mark.parametrize(
     ("shape", "step", "exhaustive"),
     [
@@ -7316,16 +7421,27 @@ def test_the_answerer_is_told_whether_its_evidence_is_a_set_or_a_ranking(
 
 
 def test_a_truncated_set_tells_the_reader_it_is_not_a_set(tmp_path: Path) -> None:
-    """The count the budget dropped is the difference between an answer and a wrong total."""
+    """The count the budget dropped is the difference between an answer and a wrong total.
+
+    What the budget may drop is a matched record beyond the ranked window. The window itself is
+    what the question would have been answered from with no plan at all, so a budget that
+    trimmed it would make planning a way to lose evidence.
+    """
     models = _FakeModels()
     models.recall_plan = _plan("set", {"op": "match", "terms": ["wrench"]})
     with _memory(tmp_path, models, recall_planning=True, recall_set_budget_chars=20) as memory:
-        _dated_corpus(memory)
+        _partly_matched_corpus(memory)
 
-        memory.ask("how many wrenches did I mention?")
+        memory.ask("how many wrenches did I mention?", limit=3)
 
     question, grounded = models.answer_calls[-1]
-    assert [hit.content for hit in grounded] == ["a red wrench"]
+    assert [hit.content for hit in grounded] == [
+        # Two matched records, and the pallet the ranking found: the blue wrench is the matched
+        # record the budget had no room for, and it is outside the three-record window.
+        "a red wrench",
+        "a red wrench, spare",
+        "a green pallet",
+    ]
     assert "1 further matched records are not shown" in question.text
     assert "do not state a total" in question.text
 
@@ -7341,16 +7457,22 @@ def test_a_cut_similarity_row_does_not_make_the_matched_set_incomplete(tmp_path:
     models.recall_plan = _plan(
         "set",
         {"op": "match", "terms": ["wrench"]},
-        {"op": "similar", "query": "wrenches", "k": 3},
+        {"op": "similar", "query": "wrenches", "k": 5},
     )
-    with _memory(tmp_path, models, recall_planning=True, recall_set_budget_chars=30) as memory:
-        _dated_corpus(memory)
+    with _memory(tmp_path, models, recall_planning=True, recall_set_budget_chars=60) as memory:
+        _partly_matched_corpus(memory)
 
-        memory.ask("how many wrenches did I mention?", limit=3)
+        memory.ask("how many wrenches did I mention?", limit=2)
 
     question, grounded = models.answer_calls[-1]
-    # Both matched records are grounded; the crate is a ranking row the budget had no room for.
-    assert [hit.content for hit in grounded] == ["a red wrench", "a blue wrench"]
+    # Every matched record is grounded, and so is the two-record window; the crate ranked fifth,
+    # outside the window, and is what the budget had no room for.
+    assert [hit.content for hit in grounded] == [
+        "a red wrench",
+        "a red wrench, spare",
+        "a blue wrench",
+        "a green pallet",
+    ]
     assert "every record those reads matched, in time order" in question.text
     assert "do not state a total" not in question.text
 
@@ -7365,12 +7487,16 @@ def test_a_set_plan_grounds_within_the_callers_own_evidence_budget(tmp_path: Pat
         recall_planning=True,
         evidence_budget_chars=20,
     ) as memory:
-        _dated_corpus(memory)
+        _partly_matched_corpus(memory)
 
-        memory.ask("how many wrenches did I mention?")
+        memory.ask("how many wrenches did I mention?", limit=3)
 
     question, grounded = models.answer_calls[-1]
-    assert [hit.content for hit in grounded] == ["a red wrench"]
+    assert [hit.content for hit in grounded] == [
+        "a red wrench",
+        "a red wrench, spare",
+        "a green pallet",
+    ]
     assert "1 further matched records are not shown" in question.text
 
 
@@ -7459,7 +7585,12 @@ def test_a_sequence_plan_grounds_the_records_around_what_it_found(tmp_path: Path
         memory.ask("what did I say just before the crate?")
 
     question, grounded = models.answer_calls[-1]
-    assert [hit.content for hit in grounded] == ["a blue wrench", "a green crate"]
+    # The adjacent pair in corpus order, then the one ranked record neither read had already.
+    assert [hit.content for hit in grounded] == [
+        "a blue wrench",
+        "a green crate",
+        "a red wrench",
+    ]
     assert "the 1 before and 0 after each of them (1)" in question.text
 
 
@@ -7476,7 +7607,12 @@ def test_an_entity_plan_falls_back_to_the_name_as_text_when_no_identity_carries_
         memory.ask("what do I know about Lily?")
 
     question, grounded = models.answer_calls[-1]
-    assert [hit.content for hit in grounded] == ["Lily brought the red wrench"]
+    # The record about Lily leads; the crate is the ranked window, which the entity read adds to
+    # rather than replaces.
+    assert [hit.content for hit in grounded] == [
+        "Lily brought the red wrench",
+        "a green crate arrived",
+    ]
     assert "records about Lily (1)" in question.text
 
 
@@ -7540,7 +7676,7 @@ def test_a_thin_best_effort_answer_buys_one_replan_round(tmp_path: Path) -> None
     assert "reported insufficient_evidence" in models.plan_calls[1][3]
     # A count and a date span, not labels: `E`-numbers here would not be the reader's, which are
     # assigned to the qualified subset of the evidence and to nothing when none of it qualifies.
-    assert "read 2 records dated 2024-09-01 to 2024-09-02" in models.plan_calls[1][3]
+    assert "read 3 records dated 2024-09-01 to 2024-09-03" in models.plan_calls[1][3]
     assert "E1" not in models.plan_calls[1][3]
     assert len(models.answer_calls) == 2
     assert answered.abstained is False

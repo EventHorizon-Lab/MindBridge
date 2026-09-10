@@ -121,10 +121,11 @@ class MemoryConfig:
     # express the question -- a count, a list of "all", an adjacency, everything about a person.
     # With it off, `ask` runs exactly the one search it always has.
     recall_planning: _StrictBool = False
-    # How many characters of evidence a set, sequence or entity plan may ground on. A point
-    # question keeps `limit` (and `evidence_budget_chars`); a question that asks for every
-    # matching record needs a window that follows the answer's shape instead, and this is what
-    # bounds it. Only read when `recall_planning` is on.
+    # How many characters of evidence a set, sequence or entity plan may add to the ranked
+    # window. A point question keeps `limit` (and `evidence_budget_chars`); a question that asks
+    # for every matching record needs more than a window of that width, and this is what bounds
+    # what it adds. It never trims the window itself -- that is what the question would have been
+    # answered from with no plan at all. Only read when `recall_planning` is on.
     recall_set_budget_chars: _PositiveInt = 30_000
     # How many plan-and-answer rounds one `ask` may spend. The second round exists for the case
     # the first round's own answer diagnoses -- a low-confidence guess under

@@ -20,8 +20,15 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   evidence set is a union with ID dedup and no recomputed score: exhaustive rows in time order up
   to `recall_set_budget_chars` -- never past `evidence_budget_chars` when a caller set one, and
   never more than twice `limit` media rows, since grounding media runs recognition over it -- then
-  similarity rows by rank. The prompt states what the reads were and whether the set is complete,
-  so a count is licensed by completeness instead of guessed, and a new defaulted `exhaustive`
+  the ranked window the unplanned path would have grounded, by rank. The plan adds to that window
+  and never replaces it: measured on ATM-Hard, grounding a set plan on its exhaustive rows alone
+  cost every question whose reads returned few rows the evidence it already had -- 12 grounded
+  records down to 1, 2, 4 and 5, and one down to a refusal the unplanned path had answered -- so
+  the window is admitted whatever either budget says and the media cap bounds the matched set
+  alone. Completeness remains a claim about the exhaustive reads only, and the note now says that
+  the question's top-ranked records follow the matched ones and are not part of that set. The
+  prompt states what the reads were and whether the set is complete, so a count is licensed by
+  completeness instead of guessed, and a new defaulted `exhaustive`
   keyword on `GenerationBackend.answer` and `StreamingGenerationBackend.stream_answer` tells a
   reader that its evidence order is the program's rather than a ranking's. Under
   `answer_policy="best_effort"`, an answer the answerer flagged as thin buys one replan round
