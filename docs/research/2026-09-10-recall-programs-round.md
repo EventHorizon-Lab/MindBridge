@@ -65,6 +65,7 @@ control on the new code; "P1" is best effort; "R1/R2" add planning to S0/P1; "W1
 | planning, best effort (R2 vs P1) | memlens-32k dev (60) | 0.4667 | 0.4667 | +0.000 [−0.050, +0.050] | 1/1/58 |
 | planning, best effort (R2 vs P1) | m3-bench-robot dev (312) | 0.4551 | 0.4519 | −0.003 [−0.032, +0.025] | 9/10/293 |
 | vision keys, best effort (W1P1 vs P1) | m3-bench-robot dev (313) | 0.4551 | 0.4505 | −0.003 [−0.043, +0.037] | 20/21/271 |
+| vision keys + planning, best effort (W1R2 vs P1) | m3-bench-robot dev (310) | 0.4551 | 0.4194 | −0.036 [−0.084, +0.010] | 18/29/263 |
 | vision keys, strict (raw media) | atm-bench-main dev (300) | 0.5959 | 0.5920 | −0.004 | 20/21/259 |
 | vision keys, strict (raw media) | atm-bench-hard (31) | 0.2116 | 0.1932 | −0.018 | 3/4/24 |
 | MemLens pixels, strict | memlens-32k dev (60) | 0.3000 | 0.2833 | −0.017 [−0.100, +0.067] | 3/4/53 |
