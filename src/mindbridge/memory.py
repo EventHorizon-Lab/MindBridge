@@ -68,6 +68,7 @@ from mindbridge._telemetry import (
     SPAN_KIND,
     TRACER_NAME,
     VISION_BATCHES_FAILED,
+    VISION_BATCHES_RETRIED,
     _record_retrieval_results,
     current_model_request_count,
     mark_model_requests,
@@ -470,6 +471,11 @@ _NAME_BINDING = re.compile(
 # these failures reaches us, and what is left to wait out is a provider throttling a whole ingest
 # rather than one request. Module-level so a test can shorten it.
 _VISION_RETRY_BACKOFF = (1.0, 4.0, 16.0)
+# A describer is shown this write's own transcript as context, under the same labels the index
+# prints (`_speaker_prose`), so a fact naming a speaker resolves to the same person. Uncapped,
+# one long clip's words would dominate the token budget every visual in it pays; cut at a line
+# boundary so a turn is never split mid-sentence.
+_MAX_DESCRIBE_CONTEXT_CHARACTERS = 12_000
 _MAX_METADATA_BYTES = 262_144
 _TEXT_KEY_CHARACTERS = 2_048
 _TEXT_KEY_OVERLAP = 256
@@ -5452,18 +5458,22 @@ class Memory:
                     # words, not the pixels: four stills say two people are at a table, and only
                     # the dialogue says which one is called Lily. Empty for an image and for any
                     # composition with no speech backend, which then describes pixels as before.
-                    text=_speaker_prose(
-                        asset.asset_id,
-                        operation.speech_segments.get(asset.asset_id, ()),
-                    )
-                    or "",
+                    # Capped: an unbounded transcript would let one long clip's words dominate the
+                    # token budget every visual in it pays.
+                    text=_truncated_describe_context(
+                        _speaker_prose(
+                            asset.asset_id,
+                            operation.speech_segments.get(asset.asset_id, ()),
+                        )
+                        or ""
+                    ),
                 )
             )
             for asset in pending
         )
         for wait in _VISION_RETRY_BACKOFF:
             try:
-                return self._vision_descriptions(inputs)
+                return self._vision_descriptions(inputs, final=False)
             except ModelError as error:
                 if not _transient_vision_failure(error):
                     raise
@@ -7385,7 +7395,17 @@ class Memory:
                 )
             return tuple(described[asset_id] for asset_id in asset_ids)
 
-    def _vision_descriptions(self, inputs: Sequence[ModelInput]) -> tuple[str, ...]:
+    def _vision_descriptions(
+        self, inputs: Sequence[ModelInput], *, final: bool = True
+    ) -> tuple[str, ...]:
+        """Describe one batch, and account a failure as lost or merely retried.
+
+        A caller still inside its retry budget passes ``final=False``: a transient failure there
+        is going to be attempted again, so it is counted on `VISION_BATCHES_RETRIED` rather than
+        `VISION_BATCHES_FAILED`. Anything else -- the last attempt, or a failure no retry could
+        fix -- is final regardless of what the caller passed, because no further attempt follows
+        it either way.
+        """
         if self._vision_describer is None:
             raise ModelError(
                 "vision description backend is not configured",
@@ -7421,7 +7441,10 @@ class Memory:
             try:
                 return _validated_descriptions(self._vision_describer.describe(inputs), inputs)
             except Exception as error:
-                span.set_attribute(VISION_BATCHES_FAILED, 1)
+                if not final and isinstance(error, ModelError) and _transient_vision_failure(error):
+                    span.set_attribute(VISION_BATCHES_RETRIED, 1)
+                else:
+                    span.set_attribute(VISION_BATCHES_FAILED, 1)
                 if isinstance(error, MindBridgeError):
                     raise
                 raise ModelError(
@@ -10504,6 +10527,18 @@ def _speech_evidence(asset_id: str, segments: Sequence[SpeakerSegment]) -> dict[
             for segment in segments
         ],
     }
+
+
+def _truncated_describe_context(text: str) -> str:
+    """Cap what a describer is shown of a clip's own words at a bounded character budget.
+
+    Cut at a line boundary -- each line is one speaker's turn (see `_speaker_prose`) -- so a
+    truncated context still ends on a whole turn rather than a sentence sliced in half.
+    """
+    if len(text) <= _MAX_DESCRIBE_CONTEXT_CHARACTERS:
+        return text
+    cut = text.rfind("\n", 0, _MAX_DESCRIBE_CONTEXT_CHARACTERS)
+    return text[:cut] if cut > 0 else text[:_MAX_DESCRIBE_CONTEXT_CHARACTERS]
 
 
 def _speaker_prose(asset_id: str, segments: Sequence[SpeakerSegment]) -> str | None:

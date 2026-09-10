@@ -251,8 +251,9 @@ Three things bound what it costs and what it can do:
   caption text back or accepts a wrong-length list. A second failure, or any other failure, leaves
   the memory
   stored **without** a caption rather than failing the write. Losing derived text must never lose
-  an observation the caller handed over. Those batches are counted on the vision span as
-  `mindbridge.vision.failed_batches`, so the loss is measurable rather than silent. The failure is
+  an observation the caller handed over. The batch that finally gives up -- the one that actually
+  cost a memory its caption -- is counted on the vision span as `mindbridge.vision.failed_batches`,
+  so the loss is measurable rather than silent. The failure is
   not negatively cached, but re-adding the same already-embedded memory is idempotent and does not
   revisit its caption. Repairing an existing captionless record therefore requires rebuilding it;
   the retry improves new writes and does not backfill old ones.
@@ -263,7 +264,11 @@ Three things bound what it costs and what it can do:
   own `max_retries` budget is spent inside each of those attempts, so `max_retries` on this slot
   raises the per-attempt budget and is worth setting above the SDK default for a long ingest. A
   provider that throttles a corpus throttles it for minutes, which is long enough for a
-  fail-open to store an entire ingest with no captions behind one log line.
+  fail-open to store an entire ingest with no captions behind one log line. An attempt that fails
+  but still has a wait left is not a lost caption, only a paid retry, so it is counted apart on
+  `mindbridge.vision.retried_batches` rather than summed into `failed_batches` -- the two answer
+  different questions, "how many memories lost their caption" against "what did a long ingest pay
+  waiting one out".
 - Captions are not reproducible. The request pins `temperature` 0 and a fixed `seed` unless the
   slot sets its own, but a measured endpoint returned four different completions for four
   identical requests at those values. A caption becomes indexed text, so anything that needs two

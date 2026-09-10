@@ -22,15 +22,21 @@ import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import cast
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from mindbridge import Memory, RetrievalScope
+from mindbridge._telemetry import VISION_BATCHES_FAILED, VISION_BATCHES_RETRIED
 from mindbridge.exceptions import ModelError
 from mindbridge.infrastructure.local.store import LocalStore
 from mindbridge.memory import (
     _LEXICAL_FULL_COVERAGE,
     _LEXICAL_FULL_COVERAGE_RELEVANCE,
+    _MAX_DESCRIBE_CONTEXT_CHARACTERS,
     _MAX_TEXT_CHARACTERS,
     _lexical_query_terms,
     _lexical_relevance,
@@ -1164,6 +1170,29 @@ class _Diarised:
         return None
 
 
+_LONG_TURN_TEXT = "the quick brown fox jumps over the lazy dog by the riverbank at dawn today"
+
+
+class _VerboseDiarised:
+    """A speech backend whose one speaker talks long enough to exceed the describe-context cap."""
+
+    transcription_capabilities = frozenset({Modality.AUDIO, Modality.VIDEO})
+    transcription_model = "fake-funasr-verbose"
+    transcription_space = "fake-funasr-verbose:speech:test"
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+        turns = tuple(
+            SpeechTurn(index * 900, (index + 1) * 900, _LONG_TURN_TEXT, "0") for index in range(150)
+        )
+        return tuple(
+            SpeechAnalysis(turns=turns, speakers=(SpeakerEmbedding("0", (1.0, 0.0)),))
+            for _asset in assets
+        )
+
+    def close(self) -> None:
+        return None
+
+
 def _section(content: str, marker: str) -> str:
     """Read back one derived section of a stored document by its marker line."""
     for section in content.split("\n\n"):
@@ -1266,6 +1295,30 @@ def test_a_described_clip_is_shown_the_transcript_under_the_indexed_labels(tmp_p
         "speaker_1: my name is Lily\nspeaker_1: and I cannot eat peanuts\nspeaker_2: noted"
     ]
     assert describer.context[0] == projected, "the describer saw labels the document does not use"
+
+
+def test_a_long_transcript_shown_to_the_describer_is_capped_at_a_line_boundary(
+    tmp_path: Path,
+) -> None:
+    """One long clip's own words must not dominate the token budget every visual in it pays.
+
+    Cut at `_MAX_DESCRIBE_CONTEXT_CHARACTERS`, and at a line boundary -- each line is one
+    speaker turn -- so the cut context still ends on a whole turn.
+    """
+    describer = _StructuredDescriber("Shown: a long conversation")
+    with Memory(
+        tmp_path,
+        embedder=_Embedder(),
+        transcriber=_VerboseDiarised(),
+        vision_describer=describer,
+    ) as memory:
+        memory.add(Blob(b"long-clip", "video/mp4", "long.mp4"))
+
+    assert len(describer.context) == 1
+    shown = describer.context[0]
+    assert len(shown) <= _MAX_DESCRIBE_CONTEXT_CHARACTERS
+    assert shown, "some context should still survive the cap"
+    assert all(line == f"speaker_1: {_LONG_TURN_TEXT}" for line in shown.split("\n"))
 
 
 def test_a_described_image_is_shown_no_transcript_and_still_yields_a_description(
@@ -1446,6 +1499,10 @@ def _rate_limited() -> ModelError:
     return ModelError("slow down", reason="rate_limited", stage="describe")
 
 
+def _out_of_quota() -> ModelError:
+    return ModelError("no quota", reason="quota_exhausted", stage="describe")
+
+
 class _UpstreamFailure(Exception):
     """Stands in for the provider SDK's own 5xx exception, which carries a status code."""
 
@@ -1509,6 +1566,43 @@ def test_a_sustained_refusal_gives_up_after_a_bounded_number_of_waits(
 
         assert describer.calls == 3, "one attempt per wait, plus the last one"
         assert memory.get(record.id).content == ""
+
+
+def test_waiting_out_a_throttled_describe_is_counted_apart_from_losing_the_caption(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`failed_batches` answers "how many memories lost their caption", so an attempt is not one.
+
+    Retrying inside the fail-open turned one lost batch into three of them, and a counter that
+    sums attempts cannot tell a provider that throttled an ingest from one that ate it. The
+    attempts are still worth counting -- they are what a long ingest pays -- under their own name.
+    """
+    monkeypatch.setattr("mindbridge.memory._VISION_RETRY_BACKOFF", (0.0, 0.0))
+    cases = (
+        (_ThrottledDescriber(2, _rate_limited()), 0, 2),
+        (_ThrottledDescriber(99, _rate_limited()), 1, 2),
+        (_ThrottledDescriber(99, _out_of_quota()), 1, 0),
+    )
+    for index, (describer, failed, retried) in enumerate(cases):
+        provider = TracerProvider()
+        exporter = InMemorySpanExporter()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        with Memory(
+            tmp_path / f"case-{index}",
+            embedder=_Embedder(),
+            vision_describer=describer,
+            tracer=provider.get_tracer("test"),
+        ) as memory:
+            memory.add(Blob(b"bicycle-frame", "image/png"))
+        provider.shutdown()
+
+        counted = {VISION_BATCHES_FAILED: 0, VISION_BATCHES_RETRIED: 0}
+        for span in exporter.get_finished_spans():
+            for name in counted:
+                counted[name] += cast(int, (span.attributes or {}).get(name, 0))
+
+        assert counted[VISION_BATCHES_FAILED] == failed, describer.error.reason
+        assert counted[VISION_BATCHES_RETRIED] == retried, describer.error.reason
 
 
 def test_a_caption_that_is_only_facts_is_not_described_or_appended_twice(tmp_path: Path) -> None:
