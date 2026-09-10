@@ -96,6 +96,13 @@ harness maps per task (protocol alignment: every reference system answers). Sepa
 in the grounded prompt: answer the whole question (every component asked), prefer a short phrase to a
 sentence unless asked to explain, list only items the evidence supports. No dataset strings in `src/`.
 
+The shaping line was implemented, measured, and removed. Under `strict` it cost LoCoMo
+0.747 -> 0.545 with abstention rising 9.9 % -> 36.2 %, MemLens 0.300 -> 0.283 with abstention
+32 % -> 52 %, and ATM-hard-sgm abstention 35 % -> 48 %: asking for the shortest complete answer
+taught the reader to refuse rather than to answer short. `strict` is byte-identical to the prompt
+that predates `answer_policy`, and `best_effort` differs from it only by its own abstention
+instruction.
+
 ### 3.5 Identity-anchored decontextualized keys (write path)
 
 Extend the existing opt-in vision describer so a media memory gains, as additional content sections

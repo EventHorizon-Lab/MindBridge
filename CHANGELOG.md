@@ -37,20 +37,19 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   `mindbridge-bench eval` aggregates those into a `recall` block per task under `performance`
   (plan count, plans by shape, fallback count, replan count, incomplete count, exhaustive-row
   distribution) and stamps each sample's own plan shape into `samples.jsonl` as `recall_shape`.
-- Every grounded answer prompt now asks for the whole question to be answered, in the shortest
-  complete form, with a list holding exactly the items the hits support. Measured on questions
-  the reader did answer rather than refuse: a question asking for two things came back with one,
-  a phrase-sized answer arrived as prose, and a list arrived padded with plausible items no hit
-  supported. The instruction is one sentence in the shared epilogue, so both answer policies
-  carry it.
 - `answer_policy` on `Memory.ask()`, `Memory.ask_stream()`, their `AsyncMemory` twins, REST
   `AnswerRequest`, and the MCP `ask_memory` tool, with the new `AnswerPolicy` alias exported from
   `mindbridge`. Abstaining is a policy the caller owns, not a fixed product behaviour: an
   unanswerable question deserves a refusal, while a multiple-choice caller, or one whose protocol
   gives no credit for "unknown", loses the whole answer to one. The default `"strict"` is
-  unchanged in behaviour and keeps its abstention instruction word for word; the prompt around it
-  is not byte-identical, because the answer-shaping sentence below was added to both policies at
-  the same time. `"best_effort"` instructs the answerer to commit to the single most likely answer
+  unchanged in behaviour, keeps its abstention instruction word for word, and its whole prompt is
+  byte-identical to the one that predates the policy. An answer-shaping sentence -- answer every
+  component asked, prefer a short phrase to a sentence, list only items the hits support -- was
+  added to both policies here and then measured harmful and removed: under `strict` it cost
+  LoCoMo 0.747 -> 0.545 with abstention rising 9.9 % -> 36.2 %, MemLens 0.300 -> 0.283 with
+  abstention 32 % -> 52 %, and ATM-hard-sgm abstention 35 % -> 48 %. Asking for the shortest
+  complete answer taught the reader to refuse rather than to answer short, so neither policy
+  shapes answers. `"best_effort"` instructs the answerer to commit to the single most likely answer
   the evidence supports -- for a multiple-choice question, always one of the offered options --
   and to flag low confidence with the structured marker on its own line before the answer, which
   MindBridge reads and removes. The result then carries the same `abstained` and
